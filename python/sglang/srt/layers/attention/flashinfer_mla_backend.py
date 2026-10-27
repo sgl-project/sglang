@@ -752,11 +752,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                     )
                 else:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer, KVWriteLoc.for_batch(forward_batch), k, v
                     )
         if q_rope is not None:
@@ -788,7 +788,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
-                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+                k_buf = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -824,14 +824,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         KVWriteLoc.for_batch(forward_batch),
                         k,
                         k_rope,
                     )
                 else:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_batch(forward_batch),
                         k,
@@ -849,7 +849,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+        k_buffer = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out

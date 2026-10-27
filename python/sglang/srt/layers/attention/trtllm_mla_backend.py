@@ -1126,7 +1126,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Same raw per-layer buffer the decode kernel reads below (bf16-only
         # gate means store_dtype == dtype, so no view); get_key_buffer applies
         # the hybrid pool's full-attention layer-id mapping.
-        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_raw = self.kv_layers.read(layer.layer_id).key()
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
         if not set_mla_kv_concat_q_covered(
             kv_buffer=kv_2d,
@@ -1169,7 +1169,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         # fp8 view of the pool's uint8 store; same buffer the decode kernel
         # reads below.
-        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_raw = self.kv_layers.read(layer.layer_id).key()
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
         if not set_mla_kv_concat_q_fp8_covered(
             kv_buffer=kv_2d,
@@ -1296,7 +1296,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     q_rope=q_rope,
                 )
             if query is None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                 )
 
@@ -1324,7 +1324,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query = query.unsqueeze(1)
 
         # Prepare KV cache inline
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
@@ -1490,7 +1490,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            self.token_to_kv_pool.set_mla_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store_mla(
                 layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
             )
 
@@ -1535,7 +1535,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.kv_layers.read(layer.layer_id).key()
             kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
             q = q.to(self.data_type)

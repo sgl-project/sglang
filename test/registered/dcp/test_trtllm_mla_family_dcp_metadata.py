@@ -20,6 +20,8 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,6 +31,13 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
 DCP_RANK = 2
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 class _RealVerifyPath(Exception):
@@ -112,9 +121,9 @@ class _DCPMetadataTests:
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
 
-        backend.token_to_kv_pool = SimpleNamespace(set_mla_kv_buffer=real_path)
+        backend.token_to_kv_pool = _routed(SimpleNamespace(set_mla_kv_buffer=real_path))
         backend._run_decode_kernel = real_path
-        layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
+        layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, v_head_dim=v_head_dim)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc=None,
@@ -468,9 +477,11 @@ class TestFusedFp8WriteGate(CustomTestCase):
             patch.object(
                 backend,
                 "token_to_kv_pool",
-                SimpleNamespace(
-                    get_key_buffer=lambda _: torch.zeros(
-                        (8, 576), dtype=torch.uint8, device="cuda"
+                _routed(
+                    SimpleNamespace(
+                        get_key_buffer=lambda _: torch.zeros(
+                            (8, 576), dtype=torch.uint8, device="cuda"
+                        )
                     )
                 ),
                 create=True,

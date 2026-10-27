@@ -444,14 +444,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(forward_batch),
                     k,
                     v,
                 )
         bs = forward_batch.batch_size
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
@@ -528,12 +528,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer, KVWriteLoc.for_batch(forward_batch), k, v
                     )
 
             bs = forward_batch.batch_size
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.kv_layers.read(layer.layer_id).key()
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # prepare_for_draft_extend always emits the fixed q window.

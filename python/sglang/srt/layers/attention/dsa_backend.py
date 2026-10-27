@@ -2240,7 +2240,7 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer,
                     cache_loc,
                     k,
@@ -2264,7 +2264,7 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.kv_layers.read(layer.layer_id).key()
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2609,7 +2609,7 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer,
                     cache_loc,
                     k,
@@ -2617,7 +2617,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.kv_layers.read(layer.layer_id).key()
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -3956,9 +3956,9 @@ class DeepseekSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+            self.kv_layers.layer(layer.layer_id).store_mla(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         kv_cache = k_cache.view(
             -1, self.physical_page_size, self.kv_cache_dim
         ).unsqueeze(1)

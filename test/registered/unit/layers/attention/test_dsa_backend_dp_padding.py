@@ -13,11 +13,20 @@ from sglang.srt.layers.attention.dsa_backend import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 class TestDSABackendDPPadding(CustomTestCase):
@@ -178,9 +187,9 @@ class TestDSABackendDPPadding(CustomTestCase):
         backend = SimpleNamespace(
             forward_metadata=metadata,
             kv_cache_dtype=torch.bfloat16,
-            token_to_kv_pool=SimpleNamespace(
-                get_key_buffer=lambda _layer_id: torch.zeros((24, 3))
-            ),
+            kv_layers=_routed(
+                SimpleNamespace(get_key_buffer=lambda _layer_id: torch.zeros((24, 3)))
+            ).layer_router,
             physical_page_size=1,
             kv_cache_dim=3,
             use_fused_topk=False,
