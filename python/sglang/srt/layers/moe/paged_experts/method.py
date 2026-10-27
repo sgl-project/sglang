@@ -7,10 +7,22 @@ import logging
 import torch
 
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
-from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, format_for
+from sglang.srt.layers.moe.paged_experts.formats import (
+    FORMATS,
+    ExpertFormat,
+    after_loading,
+    expert_params,
+    format_for,
+)
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
+from sglang.srt.layers.moe.paged_experts.runners import (
+    contract_for,
+    runner_config,
+    runner_of,
+)
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -54,7 +66,9 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self.num_experts = num_experts
         self.num_resident = num_resident
         self.policy = LRUPolicy(num_resident)
-        self.store = None  # built once the base method has created the expert tensors
+        self.checkpoint_params = ()  # found once the base method has created them
+        self.contract = None  # follows from the runner the base method builds
+        self.store = None  # built once the contract is known
         self.executor = None  # built once the store holds the paged layout
         # Some steps may run inside a CUDA graph: decide one-wave steps on the device, so
         # the graph can capture them.
@@ -75,6 +89,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         # so the native expert-id remap never sees ids >= K.
         layer.num_local_experts = self.num_resident
         layer._num_local_routed = layer._num_global_routed = self.num_resident
+        self.native_loader = extra.get("weight_loader")
         self.base_method.create_weights(
             layer=layer,
             num_experts=self.num_resident,
@@ -89,21 +104,29 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             "Online weight updates are not supported with --enable-paged-experts: "
             "experts already on the GPU would keep the old weights."
         )
-        self.format.check_params(layer=layer, num_slots=self.num_resident)
-        # A store that only stages the checkpoint layout for a repack need not be pinned.
-        self.store = HostExpertStore(
-            layer=layer,
-            names=self.format.checkpoint_params,
-            num_experts=self.num_experts,
-            pin=not self.format.repacks_after_loading,
-        )
-        for name in self.format.checkpoint_params:
-            getattr(layer, name).weight_loader = self._make_host_loader(
-                layer=layer, name=name
-            )
+        for name in self.format.freed:
+            setattr(layer, name, None)
+        self.checkpoint_params = expert_params(layer, self.num_resident)
+        for name in self.checkpoint_params:
+            param = getattr(layer, name)
+            loader = self._make_host_loader(layer=layer, name=name)
+            if isinstance(param, BasevLLMParameter):
+                param._weight_loader = loader  # behind a read-only property
+            else:
+                param.weight_loader = loader
 
     def _make_host_loader(self, layer, name):
-        def weight_loader(param, loaded_weight, weight_name, shard_id, expert_id):
+        def weight_loader(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
+            expert_id = kwargs.get("expert_id", rest[0] if rest else None)
+            if expert_id is None:
+                # A stacked checkpoint tensor (e.g. gpt-oss) holds every expert at once: the
+                # call goes as made to the layer's native loader, on the whole host store.
+                stacked = torch.nn.Parameter(self.store.host[name], requires_grad=False)
+                stacked.__dict__.update(param.__dict__)
+                self.native_loader(
+                    stacked, loaded_weight, weight_name, shard_id, *rest, **kwargs
+                )
+                return
             # Reuse the native per-expert loader (sharding, w1/w3 placement, scale layout)
             # on a one-row view of the host store, so host rows have exactly the native GPU
             # layout. The row carries the parameter's loader tags (e.g. ``quant_method``).
@@ -124,41 +147,52 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def create_moe_runner(self, layer, moe_runner_config):
         self.base_method.create_moe_runner(
             layer=layer,
-            moe_runner_config=self.format.contract.runner_config(
-                moe_runner_config=moe_runner_config, num_slots=self.num_resident
-            ),
+            moe_runner_config=runner_config(moe_runner_config, self.num_resident),
         )
-        self.runner = self.base_method.runner
-        self.format.contract.check(base_method=self.base_method)
+        self.runner = runner_of(self.base_method, layer)
+        self.contract = contract_for(self.runner)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
+        # A store that only stages the checkpoint layout for a repack need not be pinned.
+        self.store = HostExpertStore(
+            layer=layer,
+            names=self.checkpoint_params,
+            num_experts=self.num_experts,
+            pin=not self.contract.repacks,
+        )
+        # What a loader leaves unwritten (e.g. padding for a kernel) keeps the values the base
+        # method created, as on the GPU.
+        for name, host in self.store.host.items():
+            host.copy_(getattr(layer, name).data[:1].cpu().expand_as(host))
 
     def process_weights_after_loading(self, layer):
-        self.store = self.format.after_loading(
+        self.store = after_loading(
             layer=layer,
             base_method=self.base_method,
             store=self.store,
             num_slots=self.num_resident,
+            repacks=self.contract.repacks,
+            unpaged=self.format.unpaged,
         )
         residency = None
         if self.graphs:
             residency = DeviceResidency(
                 num_experts=self.num_experts,
                 num_slots=self.num_resident,
-                device=getattr(layer, self.format.paged_params[0]).device,
+                device=getattr(layer, next(iter(self.store.host))).device,
             )
             self.store.bind_device_gather(layer)
             self.device_executor = DeviceExecutor(
-                base_method=self.base_method,
+                base_method=self.format.runner_method(self.base_method),
                 store=self.store,
                 residency=residency,
-                contract=self.format.contract,
+                contract=self.contract,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
         self.executor = EagerExecutor(
-            base_method=self.base_method,
+            base_method=self.format.runner_method(self.base_method),
             store=self.store,
             policy=self.policy,
-            contract=self.format.contract,
+            contract=self.contract,
             num_experts=self.num_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             device_residency=residency,
@@ -220,11 +254,16 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             ).hidden_states
         )
 
-    _run_eager_into = eager_on_graph(True)(_run_eager_into_impl)
+    # Capture runs a break only to record its buffers, before any captured kernel has run:
+    # the routing ids are not computed yet, so the waves are skipped then (warmup and replay
+    # run them).
+    _run_eager_into = eager_on_graph(True, capture_stub=lambda *args, **kwargs: None)(
+        _run_eager_into_impl
+    )
 
 
 def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
-    expert_format = format_for(base_method)
+    expert_format = format_for(layer, base_method)
     check_paged_experts_compat(layer=layer, expert_format=expert_format)
     num_experts = layer.num_local_experts
     num_resident = min(get_exec().moe.paged_experts_num_resident, num_experts)
@@ -300,8 +339,8 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         )
     if expert_format is None:
         problems.append(
-            "only unquantized (bf16/fp16), block-quantized FP8 and GPTQ experts are "
-            f"supported, got {type(layer.quant_method).__name__}"
+            f"{type(layer.quant_method).__name__} experts are not supported; supported are "
+            + ", ".join(fmt.label for fmt in FORMATS)
         )
     if get_exec().moe.enable_fused_moe_sum_all_reduce:
         problems.append(

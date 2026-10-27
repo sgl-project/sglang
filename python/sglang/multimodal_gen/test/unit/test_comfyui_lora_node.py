@@ -33,7 +33,13 @@ def _load_nodes():
     comfy_api_input = types.ModuleType("comfy_api.input")
     comfy_api_input.VideoInput = type("VideoInput", (), {})
     comfy_api.input = comfy_api_input
+    comfy = types.ModuleType("comfy")
+    comfy.model_management = types.ModuleType("comfy.model_management")
+    comfy.utils = types.ModuleType("comfy.utils")
     stubs = {
+        "comfy": comfy,
+        "comfy.model_management": comfy.model_management,
+        "comfy.utils": comfy.utils,
         "folder_paths": folder_paths,
         "comfy_api": comfy_api,
         "comfy_api.input": comfy_api_input,

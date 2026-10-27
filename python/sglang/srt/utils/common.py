@@ -219,8 +219,9 @@ def is_host_cpu_arm64() -> bool:
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+        return False
+    return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
 @lru_cache(maxsize=1)
@@ -1035,14 +1036,21 @@ def get_device_name(device_id: int = 0) -> str:
 
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
-    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
-    the device name: the GB200/GB300 superchips. Used to auto-select
-    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
-    v2 multinode, DCP fi_a2a)."""
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink). Used to
+    auto-select fabric-dependent communication paths (NCCL cuMem/MNNVL, custom
+    all-reduce v2 multinode, DCP fi_a2a).
+
+    The GB200/GB300 superchips are recognized by device name. Other NVLink
+    fabric parts (SM107 systems report a generic device name) are recognized
+    by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
-    return any(tag in name for tag in ("GB200", "GB300"))
+    if any(tag in name for tag in ("GB200", "GB300")):
+        return True
+    from sglang.srt.utils.cuda_vmm_utils import is_gpu_fabric_ready
+
+    return is_gpu_fabric_ready(torch.device("cuda", 0))
 
 
 def is_fi_a2a_supported(
@@ -1997,6 +2005,7 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
     content_hash: Optional[str] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 GLM_MEDIA_CONFIG_KEYS = (
@@ -2011,6 +2020,7 @@ GLM_MEDIA_CONFIG_KEYS = (
 class VideoData:
     url: str
     preprocess_kwargs: Optional[Dict] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -2988,8 +2998,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
@@ -3337,6 +3348,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
         ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
         ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.multimodal.modality", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         (
@@ -4501,6 +4513,7 @@ def get_physical_cpus_by_numa():
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
