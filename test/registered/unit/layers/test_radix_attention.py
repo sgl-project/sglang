@@ -222,7 +222,6 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: None,
         _begin_new_segment=lambda: None,
     )
