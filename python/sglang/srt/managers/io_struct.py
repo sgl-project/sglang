@@ -555,6 +555,18 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            # A single request's media lists hold its own items, while a batch reads
+            # one entry per request; nested lists already have the batch form.
+            for field_name in (
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_hashes",
+                "mm_content_hashes",
+            ):
+                value = getattr(self, field_name)
+                if isinstance(value, list) and value and not isinstance(value[0], list):
+                    setattr(self, field_name, [value])
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""

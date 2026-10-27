@@ -529,6 +529,29 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
 
+    def test_single_request_parallel_sampling_keeps_all_media(self):
+        """With n > 1, every sample of one request gets all of its media items.
+
+        Flat lists were read as one item per sample: two images failed the batch
+        size check, and two videos kept only the first one.
+        """
+        flat = {
+            "image_data": ["a.png", "b.png"],
+            "video_data": ["v1.mp4", "v2.mp4"],
+            "audio_data": ["a1.wav"],
+            "mm_hashes": ["00aa", "00bb"],
+        }
+        nested = {name: [values] for name, values in flat.items()}
+        for media in (flat, nested):
+            with self.subTest(nested=media is nested):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3], sampling_params={"n": 2}, **media
+                )
+                req.normalize_batch_and_arguments()
+                for sample in (req[0], req[1]):
+                    for name, values in flat.items():
+                        self.assertEqual(getattr(sample, name), values)
+
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
         req = copy.deepcopy(self.base_req)
