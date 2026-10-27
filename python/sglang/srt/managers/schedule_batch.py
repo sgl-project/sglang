@@ -3638,7 +3638,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         there. The old slot is freed after the forward in
         mamba_lazy_post_decode_at_boundary.
         """
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         for i, req in enumerate(self.reqs):
             buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
@@ -3650,14 +3650,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
-            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                new_slot = None
-            else:
-                # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
-            if new_slot is not None:
-                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+            # No evict-retry: a transient slot is not worth evicting a cached
+            # checkpoint for; on failure tracking degrades in place.
+            took = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
+                storage.take_tracking_slot(req, other_idx)
+            )
+            if took:
                 req.kv.mamba_next_track_idx = other_idx
             else:
                 # The in-flight write invalidates the keep slot's old checkpoint.
@@ -3669,7 +3667,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         and whose result path never frees them."""
         if self.mamba_track_mask_cpu is None:
             return
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         for req, at_boundary in zip(self.reqs, self.mamba_track_mask_cpu):
             if not at_boundary:
                 continue
@@ -3679,8 +3677,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            self.token_to_kv_pool_allocator.state_slots.free(buf[next_idx].unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, next_idx, -1)
+            storage.release_tracking_slot(req, next_idx)
             req.kv.mamba_next_track_idx = 1 - next_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
@@ -3694,7 +3691,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         scatter position is recorded on the batch and rides the result-queue
         copy (forward isolation restores batch fields).
         """
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         track_positions: List[int] = []
         for req in self.reqs:
             buf = req.kv.mamba_ping_pong_track_buffer
@@ -3709,16 +3706,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             other_idx = 1 - req.kv.mamba_next_track_idx
             has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
             if not has_pending:
-                if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                    new_slot = None
-                else:
-                    # No evict-retry: a transient slot is not worth
-                    # evicting a cached checkpoint for.
-                    new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
-                if new_slot is not None:
-                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                    has_pending = True
-                else:
+                # No evict-retry: a transient slot is not worth evicting a
+                # cached checkpoint for.
+                has_pending = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
+                    storage.take_tracking_slot(req, other_idx)
+                )
+                if not has_pending:
                     req.kv.mamba_last_track_seqlen = None
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(

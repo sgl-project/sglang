@@ -368,6 +368,33 @@ class StaticKVStorage:
     def release_rehomed_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)
 
+    # -- a running request's state tracking: the scheduler decides when a
+    # request crosses a tracking boundary; the storage hands out and takes back
+    # the slots its ping-pong pair needs, and keeps the table's columns in step.
+
+    def take_tracking_slot(self, req, position: int) -> bool:
+        """Give ``req`` a tracking slot at ``position`` of its ping-pong pair;
+        False when no state slot is free (tracking then stays in place)."""
+        slot = self._allocator.state_slots.alloc(1)
+        if slot is None:
+            return False
+        self.requests.set_mamba_ping_pong_slot(req, position, slot[0])
+        return True
+
+    def release_tracking_slot(self, req, position: int) -> None:
+        """Give back the tracking slot at ``position`` of ``req``'s pair and
+        empty that position."""
+        self._allocator.state_slots.free(
+            req.kv.mamba_ping_pong_track_buffer[position].unsqueeze(0)
+        )
+        self.requests.set_mamba_ping_pong_slot(req, position, -1)
+
+    def release_state_slot(self, req) -> None:
+        """Give back the state slot ``req`` took before its KV (a request that
+        does not run after all)."""
+        self._allocator.state_slots.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+        req.kv.mamba_pool_idx = None
+
     # -- the prefix tree's state effects: the tree decides, the storage executes --
 
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
