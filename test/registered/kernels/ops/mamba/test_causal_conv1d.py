@@ -580,13 +580,14 @@ def test_triton_update_state_dtype(state_dtype, width, mode):
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("seqlen", [1, 8, 257])
-def test_triton_prefill_state_dtype(state_dtype, width, seqlen):
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_triton_prefill_state_dtype(state_dtype, width, seqlen, input_dtype):
     """Cover short-window stitching, chunk boundaries, and cold/warm cache writes."""
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 
     torch.manual_seed(43)
     dim = 128
-    x = torch.randn(2 * seqlen, dim, device="cuda", dtype=torch.bfloat16).T
+    x = torch.randn(2 * seqlen, dim, device="cuda", dtype=input_dtype).T
     weight = torch.randn(dim, width, device="cuda", dtype=x.dtype)
     state = torch.randn(3, width - 1, dim, device="cuda", dtype=state_dtype).transpose(
         1, 2

@@ -435,19 +435,25 @@ def test_causal_conv1d_varlen(
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
 
 
-def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
-    """Initial states may be bf16 even when the current hidden states are fp16."""
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("seqlens", [[1, 2], [7, 9]])
+def test_causal_conv1d_varlen_mixed_input_and_state_dtype(
+    input_dtype, state_dtype, seqlens
+):
+    """Warm/cold cache branches must agree across input and state dtypes."""
     device = get_device()
     torch.manual_seed(0)
     dim, width = 64, 4
-    seqlens = [7, 9]
-    query_start_loc = torch.tensor([0, 7, 16], dtype=torch.int32, device=device)
-    x = torch.randn(dim, sum(seqlens), dtype=torch.float16, device=device)
-    weight = torch.randn(dim, width, dtype=torch.float16, device=device)
-    bias = torch.randn(dim, dtype=torch.float16, device=device)
+    query_start_loc = torch.tensor(
+        [0, seqlens[0], sum(seqlens)], dtype=torch.int32, device=device
+    )
+    x = torch.randn(dim, sum(seqlens), dtype=input_dtype, device=device)
+    weight = torch.randn(dim, width, dtype=input_dtype, device=device)
+    bias = torch.randn(dim, dtype=input_dtype, device=device)
 
     conv_states = torch.randn(
-        4, width - 1, dim, dtype=torch.bfloat16, device=device
+        4, width - 1, dim, dtype=state_dtype, device=device
     ).transpose(1, 2)
     conv_states_ref = conv_states.clone()
     cache_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)

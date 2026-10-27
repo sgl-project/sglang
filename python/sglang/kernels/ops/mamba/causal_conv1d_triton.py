@@ -254,8 +254,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
                 tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
+                # Keep both operands in the cache dtype: bf16/fp16 promotion
+                # otherwise disagrees with the cold-cache branch below.
                 new_conv_state = tl.where(
-                    mask, conv_state, loaded_x
+                    mask, conv_state, loaded_x.to(conv_states_ptr.dtype.element_ty)
                 )  # BUG in 'tl.where'  which requires a barrier before this
                 conv_states_ptrs_target = (
                     conv_states_base
