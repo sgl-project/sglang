@@ -2045,23 +2045,48 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
-            if envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_EAGER_CONNECT.get():
-                self._eager_connect(agent_name)
+            if envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_PEER_WARMUP.get():
+                self._warm_up_peer(agent_name)
 
-    def _eager_connect(self, agent_name: str) -> None:
+    def _warm_up_peer(self, agent_name: str) -> None:
+        src_prep = self.prep_handles.get("")
+        dst_prep = self.prep_handles.get(agent_name)
+        if src_prep is None or dst_prep is None:
+            return
+        info = self.decode_kv_args_table[agent_name]
+        num_layers = len(self.kv_args.kv_item_lens)
+        num_slots_dst = (
+            info.dst_num_slots
+            if info.dst_num_slots is not None
+            else self._num_slots_src
+        )
+        dummy_slot = np.zeros(1, dtype=np.int32)
         start = time.monotonic()
         try:
-            self.agent.make_connection(agent_name)
-        except Exception as e:
-            logger.warning(
-                "NIXL eager connect to %s failed, falling back to lazy connect: %s",
-                agent_name,
-                e,
+            handle = self.agent.make_prepped_xfer(
+                "WRITE",
+                src_prep,
+                repeat_indices_over_layers(dummy_slot, num_layers, self._num_slots_src),
+                dst_prep,
+                repeat_indices_over_layers(dummy_slot, num_layers, num_slots_dst),
             )
+            self._post_xfer(handle, "NIXL peer warm-up post failed")
+            deadline = start + envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get()
+            state = self.agent.check_xfer_state(handle)
+            while state not in ("DONE", "ERR") and time.monotonic() < deadline:
+                time.sleep(0.001)
+                state = self.agent.check_xfer_state(handle)
+        except Exception as e:
+            logger.warning("NIXL warm-up transfer to %s failed: %s", agent_name, e)
             return
-        logger.debug(
-            "NIXL eager connect to %s took %.3fs",
+        if state not in ("DONE", "ERR"):
+            logger.warning("NIXL warm-up transfer to %s did not settle", agent_name)
+            return
+        self.agent.release_xfer_handle(handle)
+        logger.info(
+            "NIXL warm-up transfer to %s: %s in %.3fs",
             agent_name,
+            state,
             time.monotonic() - start,
         )
 

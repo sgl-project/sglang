@@ -1142,12 +1142,19 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
 
-class TestNixlEagerConnect(CustomTestCase):
-    def _add_peer(self, agent):
+class TestNixlPeerWarmup(CustomTestCase):
+    NUM_LAYERS = 4
+    SRC_SLOTS = 10
+    DST_SLOTS = 7
+
+    def _add_peer(self, agent, *, prepped=True):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = agent
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.decode_kv_args_table = {}
+        mgr.prep_handles = {"": "src-prep", "decode-0": "dst-prep"} if prepped else {}
+        mgr.kv_args = SimpleNamespace(kv_item_lens=[64] * self.NUM_LAYERS)
+        mgr._num_slots_src = self.SRC_SLOTS
         mgr.requires_dcp_relayout = MagicMock(return_value=False)
         mgr.check_peer_aux_buffer_count = MagicMock()
         mgr._prepare_payload_xfer = MagicMock()
@@ -1159,6 +1166,7 @@ class TestNixlEagerConnect(CustomTestCase):
                 dst_dcp_size=1,
                 dst_dcp_rank=0,
                 dst_aux_ptrs=[],
+                dst_num_slots=self.DST_SLOTS,
             )
         )
         return mgr
@@ -1166,17 +1174,41 @@ class TestNixlEagerConnect(CustomTestCase):
     def test_disabled_by_default(self):
         agent = MagicMock()
         self._add_peer(agent)
-        agent.make_connection.assert_not_called()
+        agent.make_prepped_xfer.assert_not_called()
 
-    def test_connect_failure_keeps_peer_registered(self):
-        """A failed eager connect must not raise out of the bootstrap thread."""
+    def test_writes_only_the_reserved_slot_of_every_layer(self):
+        """The warm-up must never write a decode KV slot other than reserved slot 0."""
         agent = MagicMock()
-        agent.make_connection.side_effect = RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
-        with envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_EAGER_CONNECT.override(True):
+        agent.transfer.return_value = "PROC"
+        agent.check_xfer_state.side_effect = ["PROC", "DONE"]
+        with envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_PEER_WARMUP.override(True):
+            self._add_peer(agent)
+        op, src_prep, src_idx, dst_prep, dst_idx = (
+            agent.make_prepped_xfer.call_args.args
+        )
+        self.assertEqual((op, src_prep, dst_prep), ("WRITE", "src-prep", "dst-prep"))
+        np.testing.assert_array_equal(
+            src_idx, np.arange(self.NUM_LAYERS) * self.SRC_SLOTS
+        )
+        np.testing.assert_array_equal(
+            dst_idx, np.arange(self.NUM_LAYERS) * self.DST_SLOTS
+        )
+        agent.release_xfer_handle.assert_called_once()
+
+    def test_failure_keeps_peer_registered(self):
+        """A failed warm-up must not raise out of the bootstrap thread."""
+        agent = MagicMock()
+        agent.transfer.side_effect = RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+        with envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_PEER_WARMUP.override(True):
             mgr = self._add_peer(agent)
-        agent.make_connection.assert_called_once_with("decode-0")
         self.assertIn("decode-0", mgr.decode_kv_args_table)
-        mgr._prepare_payload_xfer.assert_called_once()
+        agent.release_xfer_handle.assert_not_called()
+
+    def test_skips_peers_without_prepped_dlists(self):
+        agent = MagicMock()
+        with envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_PEER_WARMUP.override(True):
+            self._add_peer(agent, prepped=False)
+        agent.make_prepped_xfer.assert_not_called()
 
 
 if __name__ == "__main__":
