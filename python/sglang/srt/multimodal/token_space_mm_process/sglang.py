@@ -177,8 +177,6 @@ class TokenSpaceSGLangProcessor:
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         mm_items = get_new_expanded_mm_items(mm_items)
-        if self._core.precompute_hash_before_cpu_transfer:
-            self._feature_transport.precompute_hashes_before_cpu_transfer(mm_items)
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
         input_ids_list = input_ids.tolist()
         params = self._core.strategy.mm_token_expansion_params
