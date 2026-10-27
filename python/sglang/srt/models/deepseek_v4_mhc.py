@@ -638,6 +638,14 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _mega_mhc_serves(rows: int) -> bool:
+    if rows <= 0:
+        return False
+    if get_platform().device_capability != (10, 7):
+        return True
+    return get_forward().is_extend_in_batch or is_in_prefill_graph_scope()
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -655,8 +663,7 @@ def _post_fusion(
         and next.norm_fusable
         and next.hc is not None
         and _can_use_mega_mhc(cfg)
-        and y.shape[0] > 0
-        and y.shape[0] >= envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL_MIN_ROWS.get()
+        and _mega_mhc_serves(y.shape[0])
     ):
         next_hc = next.hc
         y_fp8 = y_sf = None
