@@ -81,6 +81,7 @@ class OllamaServing:
             messages,
             tokenize=True,
             add_generation_prompt=True,
+            return_dict=False,
         )
 
         # Convert options to sampling params

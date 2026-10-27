@@ -12,7 +12,6 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 ARG MAX_JOBS=16
 
 # Replace the stock SGLang with the upstream muse-spark branch.
-# This branch must include the Muse Spark Docker patch helpers used below.
 # Align the runtime with Muse Spark's PyTorch pin before compiling its extensions.
 # The base has Torch 2.13 and matching older TorchVision/DeepEP binaries.
 WORKDIR /sgl-workspace
@@ -47,20 +46,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libdw-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# DeepGEMM dev includes PR #92: TRT-LLM weights and scales are shared upstream.
-# Retain Muse post-expert norm and tuning on top of that API; the wheel version
-# 0.2.1.post1+muse.cbe1727 satisfies the SGLang pin and identifies this source.
-# Use the patch and checksum helper from the same muse-spark checkout as SGLang.
-# Pin the source revision required by the helper; rebuild the extension and JIT headers.
+# DeepGEMM release/v0.2.3 includes shared TRT-LLM weights and post-expert norm.
+# Pin the release source so the extension and JIT headers use the same API.
 RUN git clone https://github.com/sgl-project/DeepGEMM.git /tmp/muse-deep-gemm \
     && cd /tmp/muse-deep-gemm \
-    && git checkout --detach cbe1727eacd9ad704795584ce1421dd1f5a8d67e \
-    && bash /sgl-workspace/sglang-muse-spark/docker/muse_spark/apply_deep_gemm_patches.sh /tmp/muse-deep-gemm \
-    && TVM_FFI_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST//;/ }" MAX_JOBS="${MAX_JOBS}" \
-        bash build_sgl_deep_gemm.sh \
+    && git checkout --detach e6f9bd6a95eec26022a7397b7b194fe0da374df8 \
+    && MAX_JOBS="${MAX_JOBS}" bash build_sgl_deep_gemm.sh \
     && python3 -m pip install --no-cache-dir --no-deps --force-reinstall dist/sgl_deep_gemm-*.whl \
     && cd /sgl-workspace \
-    && python3 -c "from importlib.metadata import version; from sglang.srt.layers.moe.muse_spark_megamoe import require_muse_megamoe_patch; assert version('sgl-deep-gemm') == '0.2.1.post1+muse.cbe1727'; require_muse_megamoe_patch()" \
+    && python3 -c "from importlib.metadata import version; assert version('sgl-deep-gemm') == '0.2.3'" \
     && rm -rf /tmp/muse-deep-gemm
 
 # The muse-spark branch also requires NVSHMEM Python bindings absent from the base.
