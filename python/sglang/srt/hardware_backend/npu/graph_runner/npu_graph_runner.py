@@ -392,7 +392,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 _meta = getattr(_attn, "forward_metadata", None)
                 _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
 
-            if _meta_list is not None:
+            if is_target_verify and _meta_list is not None:
                 # The live DFlash metadata already includes the verify block.
                 seq_lens = list(_meta_list)
             else:
