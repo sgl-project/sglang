@@ -249,7 +249,7 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
             path = os.path.join(directory, "shapes.bin")
             recorder = StepShapeRecorder(path)
             recorder.record(fb, is_draft_worker=False, forward_id=7)
-            self.assertEqual(recorder.buffered_bytes, 16 + 3 * 8)
+            self.assertEqual(recorder.buffered_bytes, 20 + 3 * 8)
             recorder.flush()
             recorder.flush()
             records = read_step_shape_records(path)
@@ -259,6 +259,7 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         self.assertFalse(record.draft)
         self.assertEqual(record.batch_size, 3)
         self.assertEqual(record.forward_id, 7)
+        self.assertIsNone(record.elapsed_us)
         self.assertEqual(record.q.tolist(), [4, 4, 4])
         self.assertEqual(record.k.tolist(), [10, 20, 100])
         self.assertEqual(record.q_sum, 12)
@@ -304,6 +305,64 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         self.assertEqual(records[1].batch_size, 0)
         self.assertEqual(records[1].q.tolist(), [])
         self.assertEqual(records[1].k_median, None)
+
+    def test_step_shape_timing_updates_the_matching_record(self):
+        import os
+        import tempfile
+
+        from sglang.srt.model_executor.step_shape_log import (
+            StepShapeRecorder,
+            _TimingHandle,
+            read_step_shape_records,
+        )
+
+        class _Event:
+            def __init__(self, elapsed_ms):
+                self.elapsed_ms = elapsed_ms
+
+            def elapsed_time(self, other):
+                return other.elapsed_ms
+
+        first = _fb(ForwardMode.DECODE, batch_size=1, seq_lens_cpu=[10])
+        second = _fb(ForwardMode.DECODE, batch_size=1, seq_lens_cpu=[20])
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "shapes.bin")
+            recorder = StepShapeRecorder(path)
+            first_offset = recorder.record(first, is_draft_worker=False, forward_id=11)
+            second_offset = recorder.record(
+                second, is_draft_worker=False, forward_id=12
+            )
+            recorder._complete_timing(
+                _TimingHandle(first_offset, _Event(0), _Event(1.25))
+            )
+            recorder._complete_timing(
+                _TimingHandle(second_offset, _Event(0), _Event(2.5))
+            )
+            recorder.flush()
+            records = read_step_shape_records(path)
+
+        self.assertEqual([record.forward_id for record in records], [11, 12])
+        self.assertEqual([record.elapsed_us for record in records], [1250, 2500])
+
+    def test_step_shape_v1_log_is_still_readable(self):
+        import os
+        import struct
+        import tempfile
+
+        from sglang.srt.model_executor.step_shape_log import read_step_shape_records
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "shapes-v1.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"SGLSTEP1")
+                handle.write(struct.pack("<QBBHI", 1, 2, 0, 1, 7))
+                handle.write(struct.pack("<ii", 1, 10))
+            records = read_step_shape_records(path)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].elapsed_us, None)
+        self.assertEqual(records[0].q.tolist(), [1])
+        self.assertEqual(records[0].k.tolist(), [10])
 
 
 class TestStepSpanGating(CustomTestCase):

@@ -1812,19 +1812,19 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
-    def _record_step_shape(self, forward_batch: ForwardBatch) -> None:
+    def _record_step_shape(self, forward_batch: ForwardBatch) -> int | None:
         """Append one binary step record. Disabled after the first check when off."""
         recorder = self._step_shape_recorder
         if recorder is None:
             if self._step_shape_checked:
-                return
+                return None
             self._step_shape_checked = True
             mode = envs.SGLANG_LOG_STEP_SHAPES.get().lower()
             if mode not in ("summary", "vector"):
-                return
+                return None
             parallel = get_parallel()
             if parallel.tp_rank != 0 or parallel.attn_cp_rank != 0:
-                return
+                return None
             from sglang.srt.model_executor.step_shape_log import (
                 get_step_shape_recorder,
             )
@@ -1832,8 +1832,8 @@ class ModelRunner:
             recorder = get_step_shape_recorder()
             self._step_shape_recorder = recorder
             if recorder is None:
-                return
-        recorder.record(
+                return None
+        return recorder.record(
             forward_batch,
             is_draft_worker=self.is_draft_worker,
             forward_id=self.forward_pass_id,
@@ -1851,7 +1851,7 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
-        self._record_step_shape(forward_batch)
+        step_shape_offset = self._record_step_shape(forward_batch)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1887,12 +1887,21 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+            step_timer = (
+                self._step_shape_recorder.begin_timing(step_shape_offset)
+                if self._step_shape_recorder is not None
+                else None
             )
+            try:
+                output = self._forward_raw(
+                    forward_batch,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
+            finally:
+                if self._step_shape_recorder is not None:
+                    self._step_shape_recorder.finish_timing(step_timer)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
