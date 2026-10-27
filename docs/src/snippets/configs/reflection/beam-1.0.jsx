@@ -42,9 +42,9 @@ export const config = {
   },
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"beam","messages":[{"role":"user","content":"Hello"}]}'`,
   dockerImages: {
-    b300: "lmsysorg/sglang:beam",
-    gb300: "lmsysorg/sglang:beam",
-    h200: "lmsysorg/sglang:beam",
+    b300: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev",
+    h200: "lmsysorg/sglang:dev",
   },
   github: {
     cookbookModel: "reflection/Beam-1.0-501B-A23B",
