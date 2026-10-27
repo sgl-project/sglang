@@ -228,6 +228,18 @@ def _broadcast_indexer_topk_from_rank0(
     return topk_indices
 
 
+def _skips_eager_idle(forward_batch: ForwardBatch) -> bool:
+    """Whether the indexer returns all-invalid rows without running: an eager
+    IDLE forward (a DP-attention rank padded with no requests) has no valid
+    page-table rows or lengths to score. On ROCm the paged top-k v2 kernel
+    faulted on them in the idle NextN draft forward under DP2 x DCP2."""
+    return (
+        (_is_cuda or _is_hip)
+        and forward_batch.forward_mode.is_idle()
+        and not get_is_capture_mode()
+    )
+
+
 def _make_eager_idle_topk_result(
     x: torch.Tensor, index_topk: int, return_indices: bool
 ) -> Optional[torch.Tensor]:
@@ -1921,11 +1933,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # DSA page-table rows to index. Return invalid rows with the physical DP
         # shape so later MLP/EP collectives still agree across ranks.
         x_meta = x[0] if isinstance(x, tuple) else x
-        if (
-            _is_cuda
-            and forward_batch.forward_mode.is_idle()
-            and not get_is_capture_mode()
-        ):
+        if _skips_eager_idle(forward_batch):
             topk_result = _make_eager_idle_topk_result(
                 x_meta, self.index_topk, return_indices
             )
