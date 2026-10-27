@@ -533,6 +533,9 @@ class Envs:
     # DSpark opt-in: apply the simulated correct_len / bonus inside the folded verify epilogue
     # (CUDA/HIP graph) instead of falling back to the eager accept + commit path.
     SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(False)
+    # DSpark opt-in: with SGLANG_SIMULATE_ACC_LEN set, skip the sampling accept (draft/target
+    # softmax + rejection) whose correct_len the simulation overwrites anyway.
+    SGLANG_ENABLE_DSPARK_SIMULATE_SKIP_SAMPLING = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 

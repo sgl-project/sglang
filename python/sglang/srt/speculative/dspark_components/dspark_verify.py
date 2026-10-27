@@ -200,9 +200,12 @@ class TargetVerifyExecutor:
             return self.verify_epilogue.read_accept(bs)
 
         simulate = self._simulated_correct_len is not None
-        # Simulated acceptance overwrites correct_len below, so a sampling accept
-        # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate else sampling_info
+        # Simulated acceptance overwrites correct_len below; skipping the sampling
+        # accept (draft/target softmax + rejection) is opt-in so default runs keep its cost.
+        skip_accept_sampling = (
+            simulate and envs.SGLANG_ENABLE_DSPARK_SIMULATE_SKIP_SAMPLING.get()
+        )
+        accept_sampling_info = None if skip_accept_sampling else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
