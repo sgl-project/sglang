@@ -29,178 +29,6 @@ class SegLaMeta:
     mask: Optional[torch.Tensor] = None  # Currently not supported
 
 
-# fused
-@triton.jit
-def seg_la_kernel(
-    Q,
-    K,
-    V,
-    S,
-    Out,
-    softmax_scale,
-    stride_q,
-    stride_k,
-    stride_v,
-    stride_s,
-    stride_o,
-    s_offsets,
-    q_offsets,
-    q_lengths,
-    s_scales,
-    decay_scales,
-    HEAD_DIM: tl.constexpr,
-    SPLIT_DIM: tl.constexpr,
-    BLOCK: tl.constexpr,
-    EVEN: tl.constexpr,
-    DECOUPLE: tl.constexpr,
-):
-    bid = tl.program_id(0)
-    hid = tl.program_id(1)
-    sid = tl.program_id(2)
-
-    # s_scale is 0 (prefill) or 1 (decode)
-    s_scale = tl.load(s_scales + bid)
-    q_length = tl.load(q_lengths + bid)
-    q_offset = tl.load(q_offsets + bid)
-    s_offset = tl.load(s_offsets + bid)
-    decay_scale = -tl.load(decay_scales + hid)
-
-    offs_b = tl.arange(0, BLOCK)
-    offs_d = tl.arange(0, HEAD_DIM)
-    offs_s = tl.arange(0, SPLIT_DIM)
-
-    if s_offset == -1:
-        return
-
-    q_ptrs = (
-        Q
-        + q_offset * stride_q
-        + hid * HEAD_DIM
-        + (offs_b[:, None] * stride_q + offs_d[None, :])
-    )
-    k_ptrs = (
-        K
-        + q_offset * stride_k
-        + hid * HEAD_DIM
-        + (offs_b[:, None] * stride_k + offs_d[None, :])
-    )
-    v_ptrs = (
-        V
-        + q_offset * stride_v
-        + hid * HEAD_DIM
-        + sid * SPLIT_DIM
-        + (offs_b[:, None] * stride_v + offs_s[None, :])
-    )
-    out_ptrs = (
-        Out
-        + q_offset * stride_o
-        + hid * HEAD_DIM
-        + sid * SPLIT_DIM
-        + (offs_b[:, None] * stride_o + offs_s[None, :])
-    )
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + sid * SPLIT_DIM
-        + (offs_d[:, None] * HEAD_DIM + offs_s[None, :])
-    )
-    state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
-
-    if BLOCK > 1:
-        for n in range(0, q_length, BLOCK):
-            n = tl.multiple_of(n, BLOCK)
-
-            if EVEN:
-                q = tl.load(q_ptrs + n * stride_q).to(tl.float32)
-                k = tl.trans(tl.load(k_ptrs + n * stride_k)).to(tl.float32)
-                v = tl.load(v_ptrs + n * stride_k).to(tl.float32)
-            else:
-                q = tl.load(
-                    q_ptrs + n * stride_q,
-                    mask=(n + offs_b)[:, None] < q_length,
-                    other=0.0,
-                ).to(tl.float32)
-                k = tl.trans(
-                    tl.load(
-                        k_ptrs + n * stride_k,
-                        mask=(n + offs_b)[:, None] < q_length,
-                        other=0.0,
-                    )
-                ).to(tl.float32)
-                v = tl.load(
-                    v_ptrs + n * stride_k,
-                    mask=(n + offs_b)[:, None] < q_length,
-                    other=0.0,
-                ).to(tl.float32)
-
-            if DECOUPLE:
-                # only work with small scales
-                if EVEN:
-                    b = BLOCK
-                else:
-                    b = min(BLOCK, q_length - n)
-                b_offs = b - 1 - offs_b
-
-                edb = tl.exp(decay_scale * b_offs)
-                decays = tl.where(b_offs >= 0, edb, 0)
-                inv_decays = tl.where(b_offs >= 0, 1 / edb, 0)
-
-                q = q * inv_decays[:, None]
-                k = k * decays[None, :]
-                qk = tl.dot(q, k) * softmax_scale
-                qk = tl.where(offs_b[None, :] <= offs_b[:, None], qk, 0.0)
-                o = tl.dot(qk, v)
-
-                block_decay = tl.exp(decay_scale * b)
-                block_decay_plus = block_decay * softmax_scale
-                o = tl.dot(q, state) * block_decay_plus + o
-
-                state = state * block_decay + tl.dot(k, v)
-            else:
-                qk = tl.dot(q, k) * softmax_scale
-                decays = tl.exp(decay_scale * (offs_b[:, None] - offs_b[None, :]))
-                decays = tl.where(offs_b[None, :] <= offs_b[:, None], decays, 0.0)
-                qk *= decays
-                o = tl.dot(qk, v)
-
-                decay_arr = tl.exp(decay_scale * (offs_b[:, None] + 1)) * softmax_scale
-                o = tl.dot(q * decay_arr, state, acc=o)
-
-                if EVEN:
-                    b = BLOCK
-                else:
-                    b = min(BLOCK, q_length - n)
-                b_offs = b - 1 - offs_b
-                b_offs = tl.where(b_offs >= 0, b_offs, 10000)
-                decays = tl.exp(decay_scale * b_offs)
-                block_decay = tl.exp(decay_scale * b)
-                state = state * block_decay + tl.dot(k * decays[None, :], v)
-
-            if EVEN:
-                tl.store(out_ptrs + n * stride_o, o.to(Out.dtype.element_ty))
-            else:
-                tl.store(
-                    out_ptrs + n * stride_o,
-                    o.to(Out.dtype.element_ty),
-                    mask=(n + offs_b)[:, None] < q_length,
-                )
-
-        tl.store(s_ptrs, state.to(S.dtype.element_ty))
-
-    else:
-        q = tl.trans(tl.load(q_ptrs)).to(tl.float32) * softmax_scale
-        k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
-        v = tl.load(v_ptrs).to(tl.float32)
-        state = state * tl.exp(decay_scale) + k * v
-
-        o = tl.sum(q * state, axis=0, keep_dims=True)
-
-        tl.store(out_ptrs, o.to(Out.dtype.element_ty))
-
-        tl.store(s_ptrs, state.to(S.dtype.element_ty))
-
-
 # used for prefilling
 @triton.jit
 def seg_la_p_kernel(
@@ -691,7 +519,6 @@ def seg_la_fwd(
     track_lens=None,
     track_state_indices=None,
     softmax_scale=None,
-    decouple=False,
 ):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
@@ -706,7 +533,6 @@ def seg_la_fwd(
 
     if MAX_LENGTH > 1:
         # prefill with partitioning q/k/v
-        # BLOCK should <= 64 with decouple
         K_SPLIT_DIM = 32
         V_SPLIT_DIM = 32 if bs <= 2 else 64
 
@@ -884,61 +710,4 @@ def seg_la_fwd(
         else:
             o = tmp[0]
 
-    # if fallback:
-    #     # prefill/decode with partitioning v only
-    #     o = torch.empty(q.shape, device=q.device, dtype=q.dtype)
-    #     if MAX_LENGTH == 1:
-    #         # decode
-    #         BLOCK = 1
-    #         EVEN = False
-    #         SPLIT_DIM = 32
-    #         num_warps = 8
-    #         num_stages = 2
-    #         num_dim_block = HEAD_DIM // SPLIT_DIM
-    #         grid = (batch, kv_heads, num_dim_block)
-    #     else:
-    #         # prefill
-    #         if decouple:
-    #             BLOCK = 64
-    #             SPLIT_DIM = 16
-    #         else:
-    #             BLOCK = HEAD_DIM
-    #             SPLIT_DIM = 32
-    #         # EVEN = all([x % BLOCK == 0 for x in meta.qls])
-    #         EVEN = False
-    #         num_warps = 8
-    #         num_stages = 2
-    #         # prop = torch.cuda.get_device_properties(q.device.index)
-    #         # arch = prop.major * 10 + prop.minor
-    #         # if arch not in (80, 90):
-    #         #     num_stages = 1
-
-    #         num_dim_block = HEAD_DIM // SPLIT_DIM
-    #         grid = (batch, kv_heads, num_dim_block)
-
-    #     seg_la_kernel[grid](
-    #         q,
-    #         k,
-    #         v,
-    #         s,
-    #         o,
-    #         softmax_scale,
-    #         q.stride(0),
-    #         k.stride(0),
-    #         v.stride(0),
-    #         s.stride(0),
-    #         o.stride(0),
-    #         meta.s_offsets,
-    #         meta.q_offsets,
-    #         meta.q_lengths,
-    #         meta.s_scales,
-    #         decay_scales,
-    #         HEAD_DIM=HEAD_DIM,
-    #         SPLIT_DIM=SPLIT_DIM,
-    #         BLOCK=BLOCK,
-    #         EVEN=EVEN,
-    #         DECOUPLE=decouple,
-    #         num_warps=num_warps,
-    #         num_stages=num_stages
-    #     )
     return o

@@ -32,7 +32,7 @@ import torch
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 _RESERVED_BYTES = 64 << 20
 _FINAL_BYTES = 16 << 20
@@ -180,6 +180,9 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
             kvcache.finalize_backing(
                 SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
             )
+            # Move the grow-down allocator's frontier into the backed range
+            # before allocating; it still reflects the larger reservation.
+            allocator.resize(SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES))
             handed = allocator.alloc(_PAGE_SIZE)
             self.assertIsNotNone(handed)
             with self.assertRaisesRegex(RuntimeError, "non-empty"):

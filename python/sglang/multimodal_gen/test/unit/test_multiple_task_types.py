@@ -5,6 +5,7 @@ import argparse
 import io
 import pickle
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -207,9 +208,7 @@ def http_client(monkeypatch, tmp_path, request):
 
     async def generate(client, req, **kwargs):
         admitted.append(req)
-        path = req.output_file_path()
-        Image.new("RGB", (64, 64)).save(path)
-        return [path], OutputBatch()
+        return [req.output_file_path()], OutputBatch(output_image_bytes=[png_bytes()])
 
     async def upload(paths):
         return [None] * len(paths)
@@ -384,6 +383,48 @@ def test_http_rejects_out_of_range_frame_interpolation_exp(http_client, multipar
     assert response.status_code == 400, response.text
     assert "frame_interpolation_exp" in response.text
     assert admitted == []
+
+
+@pytest.mark.parametrize(
+    "endpoint,field",
+    [
+        ("images/generations", "upscaling_model_path"),
+        ("videos", "upscaling_model_path"),
+        ("videos", "frame_interpolation_model_path"),
+    ],
+)
+def test_http_rejects_url_postprocess_model_paths(http_client, endpoint, field):
+    """A client-supplied URL must not make the server fetch it (SSRF)."""
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/" + endpoint,
+        json={"prompt": "p", "size": "64x64", field: "http://169.254.169.254/x.pth"},
+    )
+    assert response.status_code == 400, response.text
+    assert field in response.text
+    assert admitted == []
+
+
+def test_http_cloud_upload_failure_is_502_and_temp_output_is_removed(
+    http_client, monkeypatch, tmp_path
+):
+    """A failed upload is a server error, and with no output_path the generated
+    file must not outlive the request in a leaked temp directory."""
+    client, admitted, _ = http_client
+    image_api.get_global_server_args().output_path = None
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", True)
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(temp_root))
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "p", "size": "64x64", "response_format": "url"},
+    )
+    assert response.status_code == 502, response.text
+    generated = Path(admitted[0].output_file_path())
+    assert temp_root in generated.parents
+    assert not generated.exists()
+    assert not any(temp_root.iterdir())
 
 
 def test_http_accepts_max_frame_interpolation_exp(http_client):

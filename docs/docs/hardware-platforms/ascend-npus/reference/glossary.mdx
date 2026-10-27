@@ -13,17 +13,20 @@ you will encounter throughout the Ascend NPU documentation. Refer back here when
 
 SGLang supports the following Ascend inference hardware:
 
-| Hardware                  | Devices | Dies per card | Memory configuration                 |
-| ------------------------- | ------- | ------------- | ------------------------------------ |
-| Ascend A3 Series Products | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die) |
+| Hardware                  | Devices | Dies per card | Memory configuration                            |
+| ------------------------- | ------- | ------------- | ----------------------------------------------- |
+| Ascend A3 Series Products | 16      | 2             | 8(cards) × 2(dies/card) × 64(GB/die)            |
+| Ascend 950PR/DT Series    | 8       | 1             | 8(cards) × 1(die/card) — HBM depends on the chip |
 
 <Note>
-Throughout these docs, **A3 Series** is used as shorthand for the hardware above.
+Throughout these docs, **A3 Series** and **950PR/DT Series** are used as shorthand for the hardware above.
 Docker image tags use `a3` for the A3 Series. For example, `main-cann9.1.0-a3`.
 {/* TODO: CANN 9.1.0 has no stable image yet, so the example temporarily uses the daily build tag. Once the stable image is published, switch it back to a stable release tag. */}
+Tags for the 950PR/DT Series use `950`. For example, `main-cann9.1.0-950`.
 
 On the A3 Series, each card has 2 dies, giving 16 devices per node.
 Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 Series means `--tp-size 8`.
+On the 950PR/DT Series, each card is a single die, so card count, device count, and `--tp-size` match one-to-one.
 </Note>
 
 ### NPU
@@ -32,6 +35,7 @@ Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 
 The terms "NPU" and "davinci" are used interchangeably in commands and error logs.
 
 On the A3 Series, devices are numbered `/dev/davinci0` through `/dev/davinci15` (16 devices).
+On the 950PR/DT Series, each card exposes a single device, numbered `/dev/davinci0` through `/dev/davinci7` (8 devices).
 
 On an A3 Series server, run `npu-smi info` to view NPU information such as device
 health, memory usage, and chip status. If the command is not found or reports no devices,
@@ -50,14 +54,16 @@ to install it.
 
 ## Quantization and precision
 
-| Notation  | Meaning                                                            |
-| --------- | ------------------------------------------------------------------ |
-| **W8A8**  | 8-bit weights, 8-bit activations                                   |
-| **W4A8**  | 4-bit weights, 8-bit activations                                   |
-| **W4A16** | 4-bit weights, 16-bit activations                                  |
-| **BF16**  | Brain Floating Point 16 — 16-bit format optimized for ML workloads |
-| **FP8**   | 8-bit Floating Point — not supported on the A3 Series |
-| **INT8**  | 8-bit Integer quantization                                         |
+| Notation    | Meaning                                                                                     |
+| ----------- | ------------------------------------------------------------------------------------------- |
+| **W8A8**    | 8-bit weights, 8-bit activations                                                            |
+| **W4A8**    | 4-bit weights, 8-bit activations                                                            |
+| **W4A16**   | 4-bit weights, 16-bit activations                                                           |
+| **BF16**    | Brain Floating Point 16 — 16-bit format optimized for ML workloads                          |
+| **FP8**     | 8-bit Floating Point — not supported on the A3 Series (on Ascend, FP8-class quantization goes through MXFP8 below) |
+| **MXFP8**   | Microscaling FP8 (OCP MX block-scaled format) — requires the 950PR/DT Series                |
+| **MXFP4**   | Microscaling FP4 (OCP MX block-scaled format) — requires the 950PR/DT Series                |
+| **INT8**    | 8-bit Integer quantization                                                                  |
 
 To apply quantization, use `--quantization modelslim` for W8A8 INT8, or load a pre-quantized
 checkpoint directly from a model hub.
