@@ -384,6 +384,14 @@ class FlashAttentionBackend(AttentionBackend):
             and get_memory().disable_radix_cache
             and not self.use_mla
         )
+        # That path calls self.flash_attn_varlen_func, bound to the backend's
+        # version at init, so it cannot send the wider layers to FA4.
+        if self.fa3_upgrades_to_fa4 and self.fa_skip_kv_cache:
+            raise ValueError(
+                f"The fa3 backend runs head_dim {model_head_dim} layers on FA4, "
+                "which the embedding no-KV-cache path does not support. Enable "
+                "chunked prefill or the radix cache, or use the fa4 backend."
+            )
 
         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
         # attention modes can change live cache_seqlens/num_splits across ranks.
