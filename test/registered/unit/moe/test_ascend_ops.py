@@ -81,7 +81,7 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_gather",
                 side_effect=fake_all_gather,
-            )
+            ),
         ):
             row_sizes = AscendOpsDispatcher._allgather_row_sizes(
                 2, group=None, device=torch.device("cpu")
