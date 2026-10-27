@@ -758,12 +758,7 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
-        # Unified full-page CP replicas share keys and elect one CP writer.
-        # Legacy keys include the CP rank and retain a writer for each copy.
-        return not self.storage_config.is_storage_writer or (
-            self.storage_config.unified_suffixes is not None
-            and self.storage_config.attn_cp_rank != 0
-        )
+        return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
         self,

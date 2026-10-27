@@ -70,10 +70,15 @@ class HiCacheStorageConfig:
 
     @property
     def is_storage_writer(self) -> bool:
-        """MLA replicas share one writer per DCP shard, in the first DCP group.
+        """Select one writer for each shared storage object.
 
-        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        Unified full-page CP replicas share keys and use CP rank 0. Legacy
+        keys include the CP rank, so every CP copy retains its own writer.
+        MLA uses one writer per DCP shard in the first DCP group; with DCP
+        disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
+        if self.unified_suffixes is not None and self.attn_cp_rank != 0:
+            return False
         return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
@@ -532,10 +537,9 @@ class HiCacheFile(HiCacheStorage):
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
         if storage_config.unified_suffixes is not None:
-            # Match the controller's writer election: unified full-page CP
-            # replicas share keys, and MLA also replicates across TP ranks.
-            owns_unified = attn_cp_rank == 0 and storage_config.is_storage_writer
-            owned_suffixes = (self.config_suffix,) if owns_unified else ()
+            owned_suffixes = (
+                (self.config_suffix,) if storage_config.is_storage_writer else ()
+            )
         else:
             # Each rank owns its TP-sharded state; selected DCP writers
             # also own their shared MLA shard files.

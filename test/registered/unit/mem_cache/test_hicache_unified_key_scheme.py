@@ -276,6 +276,9 @@ class TestControllerUnifiedKeys(CustomTestCase):
                             model_name="org/model",
                             unified_suffixes=["shared"] if unified else None,
                         )
+                        self.assertEqual(
+                            config.is_storage_writer, (tp_rank, cp_rank) in expected
+                        )
                         memory = SimpleNamespace(
                             hicache_storage_key_scheme=(
                                 "unified" if unified else "rank-suffix"
