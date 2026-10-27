@@ -14,7 +14,6 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -22,14 +21,11 @@ from .scoring import (
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
-    get_index_k_cache,
     prefill_requests,
-    quantize_index_q,
     select_decode,
     write_prefill,
 )
 from .types import (
-    CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
 )
@@ -60,9 +56,6 @@ class FullTopKIndexer:
             self._deep_gemm_prefill(inputs)
         else:
             self._torch_prefill(inputs)
-
-    def topk_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
-        self._deep_gemm_prefill_captured(inputs)
 
     def topk_decode(self, inputs: DecodeInputs) -> None:
         if self.use_deep_gemm_decode:
@@ -156,42 +149,3 @@ class FullTopKIndexer:
             )
             return
         select_decode(inputs, d, inputs.indexer.index_topk)
-
-    def _deep_gemm_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
-        indexer = inputs.indexer
-        metadata = inputs.paged_metadata
-        assert indexer.n_local_heads == indexer.n_heads
-        q_fp4, q_sf = quantize_index_q(inputs.q)
-        num_tokens, num_heads = q_fp4.shape[0], q_fp4.shape[1]
-        q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
-        q_sf = q_sf.view(num_tokens, 1, num_heads)
-        weights = inputs.weights.float()
-        page_size = metadata.compressed_page_size
-        k_cache = get_index_k_cache(
-            token_to_kv_pool=self.token_to_kv_pool,
-            layer_id=inputs.layer_id,
-            page_size=page_size,
-        )
-
-        width = metadata.max_compressed_seq_len
-        lens = metadata.compressed_seq_lens
-        page_table = metadata.page_table
-        topk = min(indexer.index_topk, width)
-        for rows, plan in metadata.row_chunks():
-            logits = deep_gemm_fp4_paged_mqa_logits(
-                (q_fp4[rows], q_sf[rows]),
-                k_cache,
-                weights[rows],
-                lens[rows],
-                page_table[rows],
-                plan,
-                width,
-            )
-            topk_transform_paged_torch(
-                logits,
-                lens[rows],
-                page_table[rows],
-                inputs.out_page_indices[rows, :topk],
-                page_size,
-                inputs.out_raw_indices[rows, :topk],
-            )
