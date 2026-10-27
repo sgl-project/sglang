@@ -5,14 +5,12 @@ from unittest import mock
 
 import torch
 import torch_npu  # noqa: F401
-
-from sglang.kernels.ops.speculative.dflash import (
+from sgl_kernel_npu.sample import (
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.kernels.ops.speculative.dspark.dispatch import (
-    inputs_on_cuda,
-    inputs_on_npu,
-)
+from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     SoftmaxTemp,
@@ -63,7 +61,9 @@ class TestDSparkNpuDispatch(CustomTestCase):
                         )
                         expected = BuildOutTokens.torch(**reference)
                         with mock.patch.object(
-                            sample, "build_out_tokens", wraps=sample.build_out_tokens
+                            sample,
+                            "build_out_tokens_triton",
+                            wraps=sample.build_out_tokens_triton,
                         ) as kernel:
                             actual = BuildOutTokens.execute(**inputs)
                         kernel.assert_called_once_with(**inputs)
@@ -74,11 +74,10 @@ class TestDSparkNpuDispatch(CustomTestCase):
     def test_placement_uses_first_tensor(self):
         cpu = torch.zeros(1)
         npu = cpu.npu()
-        self.assertFalse(inputs_on_npu(None, cpu, npu))
-        self.assertTrue(inputs_on_npu(None, npu, cpu))
         self.assertFalse(inputs_on_cuda(None, cpu, npu))
+        self.assertTrue(inputs_on_cuda(None, npu, cpu))
         with self.assertRaises(AssertionError):
-            inputs_on_npu(1, flag=True)
+            inputs_on_cuda(1, flag=True)
 
     def test_markov_greedy_matches_native_rounding(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
@@ -132,7 +131,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         )
         torch.testing.assert_close(actual.cpu(), expected, rtol=3e-5, atol=1e-7)
 
-    def test_sampled_tokens_match_same_noise_reference(self):
+    def test_sampled_tokens_match_philox_reference(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             base = torch.randn(8, 4097, device="npu", dtype=dtype)
             bias = torch.randn_like(base)
@@ -140,15 +139,8 @@ class TestDSparkNpuDispatch(CustomTestCase):
             temperatures[::2] = 0
             kept = torch.empty_like(base)
             offset = torch.tensor([7], device="npu")
-            torch.manual_seed(123)
-            noise = torch.empty(base.shape, device="npu").exponential_().cpu()
             value = (base.cpu().float() + bias.cpu().float()).to(dtype).float()
-            safe = temperatures.cpu().clamp_min(1e-5)
-            score = value / safe[:, None] - noise.log()
-            score[temperatures.cpu() == 0] = value[temperatures.cpu() == 0]
-            expected = score.argmax(-1)
-            torch.manual_seed(123)
-            actual = MarkovSampleStep.execute(
+            kwargs = dict(
                 base_logits=base,
                 bias=bias,
                 temperatures=temperatures,
@@ -158,6 +150,25 @@ class TestDSparkNpuDispatch(CustomTestCase):
                 step_dtype=dtype,
                 logits_out=kept,
             )
+            expected = MarkovSampleStep.torch(
+                **dict(
+                    kwargs,
+                    base_logits=base.cpu(),
+                    bias=bias.cpu(),
+                    temperatures=temperatures.cpu(),
+                    offset=offset.cpu(),
+                    logits_out=torch.empty_like(kept, device="cpu"),
+                )
+            )
+            from sgl_kernel_npu import sample
+
+            with mock.patch.object(
+                sample,
+                "markov_sample_step_triton",
+                wraps=sample.markov_sample_step_triton,
+            ) as kernel:
+                actual = MarkovSampleStep.execute(**kwargs)
+            kernel.assert_called_once_with(**kwargs)
             self.assertTrue(torch.equal(actual.cpu(), expected))
             self.assertTrue(torch.equal(kept.cpu(), value.to(dtype)))
 
@@ -172,7 +183,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         )
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_sampling_gathers_logits_before_drawing_full_vocabulary_noise(self):
+    def test_sampling_gathers_logits_before_sampling(self):
         base = torch.randn(3, 260, device="npu", dtype=torch.bfloat16)
         bias = torch.randn_like(base)
         remote = torch.randn_like(base)
@@ -180,11 +191,18 @@ class TestDSparkNpuDispatch(CustomTestCase):
         kept = torch.empty(3, 513, device="npu", dtype=base.dtype)
         local = (base.float() + bias.float()).to(base.dtype)
         value = torch.cat((local.cpu(), remote.cpu()), dim=1)[:, :513].float()
-        torch.manual_seed(123)
-        noise = torch.empty(kept.shape, device="npu").exponential_().cpu()
-        score = value / temperatures.cpu().clamp_min(1e-5)[:, None] - noise.log()
-        score[0] = value[0]
-        torch.manual_seed(123)
+        expected = MarkovSampleStep.torch(
+            base_logits=base.cpu(),
+            bias=bias.cpu(),
+            temperatures=temperatures.cpu(),
+            key=12345,
+            offset=torch.tensor([7]),
+            step=2,
+            step_dtype=base.dtype,
+            logits_out=torch.empty(3, 513, dtype=base.dtype),
+            gather=lambda partial: partial,
+            gather_logits=lambda shard: torch.cat((shard, remote.cpu()), dim=1),
+        )
         actual = MarkovSampleStep.execute(
             base_logits=base,
             bias=bias,
@@ -197,10 +215,10 @@ class TestDSparkNpuDispatch(CustomTestCase):
             gather=lambda partial: partial,
             gather_logits=lambda shard: torch.cat((shard, remote), dim=1),
         )
-        self.assertTrue(torch.equal(actual.cpu(), score.argmax(-1)))
+        self.assertTrue(torch.equal(actual.cpu(), expected))
         self.assertTrue(torch.equal(kept.cpu(), value.to(base.dtype)))
 
-    def test_sampling_graph_replay_advances_native_rng(self):
+    def test_sampling_graph_replay_reads_updated_offset(self):
         base = torch.zeros(32, 257, device="npu")
         kwargs = dict(
             base_logits=base,
@@ -219,13 +237,14 @@ class TestDSparkNpuDispatch(CustomTestCase):
             with torch.npu.graph(graph):
                 output = MarkovSampleStep.execute(**kwargs)
         torch.npu.current_stream().wait_stream(stream)
-        previous = None
-        for _ in range(3):
-            graph.replay()
-            current = output.cpu()
-            if previous is not None:
-                self.assertFalse(torch.equal(current, previous))
-            previous = current
+        graph.replay()
+        previous = output.cpu()
+        graph.replay()
+        self.assertTrue(torch.equal(output.cpu(), previous))
+        kwargs["offset"].fill_(8)
+        graph.replay()
+        current = output.cpu()
+        self.assertFalse(torch.equal(current, previous))
 
 
 if __name__ == "__main__":
