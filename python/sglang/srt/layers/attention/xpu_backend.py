@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -178,6 +179,15 @@ class XPUAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
         self.topk = get_spec().speculative_eagle_topk or 0
+        # NGRAM merges several corpus matches into one tree, so its drafts branch
+        # even at --speculative-ngram-max-bfs-breadth 1 (topk == 1); verify must
+        # apply custom_mask.
+        self.verify_uses_tree_mask = (
+            self.topk > 1
+            or SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_ngram()
+        )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
@@ -444,7 +454,7 @@ class XPUAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self.verify_uses_tree_mask:
                 # The DSpark draft block forward reuses TARGET_VERIFY but feeds
                 # spec_info.num_tokens_per_req queries/req (gamma), which differs
                 # from the global speculative_num_draft_tokens used by the target
@@ -785,13 +795,13 @@ class XPUAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        # We do cascade attention for Target Verify with topk > 1
+        # We do cascade attention for tree-masked Target Verify (topk > 1, or NGRAM)
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
+            and self.verify_uses_tree_mask
             and not is_hybrid_swa
         )
 
