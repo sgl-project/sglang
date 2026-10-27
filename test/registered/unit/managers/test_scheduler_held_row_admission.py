@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -133,6 +134,47 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_pending_pp_stop_does_not_stop_later_candidates(self):
+        for stopping in (False, True):
+            with self.subTest(stopping=stopping):
+                a, b = _Req(False), _Req(False)
+                for req, rid in ((a, "a"), (b, "b")):
+                    req.rid = rid
+                    req.cache_request_handle = CacheRequestHandle(rid, 0)
+                    req.time_stats = Mock()
+                s = self._scheduler(DisaggregationMode.PREFILL, [], None, [a, b])
+                s.enable_hicache_storage = True
+                s._prefetch_after_device_hit_loss = lambda req: False
+                polled = []
+
+                def poll(handle):
+                    polled.append(handle.rid)
+                    return handle.rid == "b"
+
+                s.tree_cache.check_prefetch_progress = poll
+                s.tree_cache.prefetch_stop_pending = lambda handle: stopping
+                s.tree_cache.pop_prefetch_loaded_span = lambda handle: (0, None)
+                with (
+                    get_context().override_server_args(
+                        pp_max_micro_batch_size=NUM_ROWS
+                    ),
+                    patch.object(ScheduleBatch, "init_new", side_effect=_BatchBuilt),
+                    patch("sglang.srt.managers.scheduler.set_time_batch"),
+                ):
+                    if stopping:
+                        batch, _ = s._get_new_batch_prefill_raw(
+                            None, ScheduleBatch(reqs=[])
+                        )
+                        self.assertIsNone(batch)
+                        self.assertEqual(polled, ["a"])
+                        self.assertEqual(s.waiting_queue, [a, b])
+                    else:
+                        # Ordinary query/timeout waits still let ready b run.
+                        with self.assertRaises(_BatchBuilt):
+                            s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=[]))
+                        self.assertEqual(polled, ["a", "b"])
+                        self.assertEqual(s.waiting_queue, [a])
 
 
 if __name__ == "__main__":

@@ -26,10 +26,18 @@
 4. The loop folds a batch of available ACKs along PP0 → … → PP-last → PP0.
    A stage with fewer ACKs shortens the batch; it never waits for local I/O.
    PP0 forwards the agreed results before the native cache-event drain.
-5. Native stop-policy evaluation requests I/O termination. Cache-mode PP keeps
+5. Cache-mode PP best_effort may stop after the first positive common I/O batch
+   is visible. Query/queued I/O remains pending; misses and failed reads still
+   retire through native query/terminal-ACK handling. This is a PP progress
+   floor, not a full-fetch requirement or fixed wait. Timeout retains its native
+   deadline and wait_complete its natural completion. Cache-mode PP keeps
    the request pending until the ordered query drain (no I/O launched) or the
    final agreed ACK retires the operation. The native finalizer then inserts the
    usable prefix; scheduler selection and H2D consume it through the usual path.
+   After a candidate requests stop, selection pauses its scan there until the
+   result arrives, leaving later candidates' I/O running. Ordinary readiness
+   waits still allow the scan to continue. No second queue or capacity credit
+   is introduced.
 
 The ring reuses the native P2P helpers and WORLD group with a distinct message
 tag. Returns and send-buffer retirement are delayed by `pp_loop_size`, so the
@@ -57,8 +65,9 @@ checks are unchanged (local ACK availability must not make ranks disagree).
   native all-or-nothing verification at the queried endpoint. No arbitrary
   post-publication full-prefix truncation or new model restriction is introduced.
 - Remove Gate leases, credits, filtered candidates, chunk-layout replay and
-  Gate-specific request/configuration restrictions. Restore native policy,
-  storage retry, wait-metric, allocator, matcher and DSA backend paths.
+  Gate-specific request/configuration restrictions. Keep policy evaluation in
+  the cache with the PP progress floor above; reuse native storage retry,
+  wait-metric, allocator, matcher and DSA backend paths.
 - Existing native restrictions/assumptions still apply. This does not repair
   pre-existing native L2 divergence or add support for unsupported model layouts.
 
@@ -93,9 +102,19 @@ The non-PP immediate-finalization path and buffer ticket path are unchanged.
 The shared lifecycle fixture covers best_effort and expired timeout with
 unfinished queries, partial/full ACKs, and abort-before-terminal cleanup.
 All eight cases fail before the fix and pass after it; the four related
-CPU/Gloo suites pass 52 tests and 75 subtests. GPU performance recovery for
-this fix remains to be measured. A pre-query best_effort cancellation can
-still produce zero storage hits; this change does not turn it into wait_complete.
+CPU/Gloo suites pass 52 tests and 75 subtests. Its Beijing N4000 run completed
+4000/4000 with88.348% hit and9.858s TTFT: partial recovery. GPU traces then
+showed some positive queries still stopped before their FIFO I/O turn.
+
+2026-10-27 stop-boundary follow-up: best_effort now waits for positive progress
+already agreed by the existing ACK path; no unsynchronized worker flag is used
+for scheduling. A stopped candidate pauses native selection until it is settled,
+instead of stopping later requests before its token/chunk budget is charged.
+The shared lifecycle regression covers partial results, zero-progress failure,
+query misses and abort. The existing scheduler fixture verifies that a stopped
+candidate holds the scan while an ordinary pending request still permits a
+ready follower. Eight related CPU/Gloo suites pass110 tests and141 subtests.
+This follow-up's GPU/performance validation is pending.
 
 The 4cd986a replacement completed one N4000 best_effort run in Singapore and
 one N4000 timeout run in Beijing, both without HTTP failures. They are not

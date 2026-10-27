@@ -4184,6 +4184,11 @@ class Scheduler(
                 )
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
+                    if self.tree_cache.prefetch_stop_pending(req.cache_request_handle):
+                        # Keep this admission candidate until its PP result arrives.
+                        # Scanning farther would stop IO for later candidates before
+                        # add_one_req has charged this one's token/chunk budget.
+                        break
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute

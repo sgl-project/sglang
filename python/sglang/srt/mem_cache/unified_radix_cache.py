@@ -2287,7 +2287,13 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
-            return True
+            # PP must observe a common IO batch before stopping a cache fetch.
+            # Query/queued IO is not a zero-length result. A miss or failed read
+            # still retires through the native query/terminal-ACK drain.
+            return (
+                self.cache_controller.pp_prefetch_consensus is None
+                or operation.completed_tokens > 0
+            )
         if self.prefetch_stop_policy == "wait_complete":
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
@@ -2379,6 +2385,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if staged is not None:
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
+
+    def prefetch_stop_pending(self, request: CacheRequestHandle) -> bool:
+        if (
+            self.cache_controller is None
+            or self.cache_controller.pp_prefetch_consensus is None
+        ):
+            return False
+        info = self.ongoing_prefetch.get(request)
+        return info is not None and info.operation.is_terminated()
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
