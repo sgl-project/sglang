@@ -2109,8 +2109,15 @@ def biased_grouped_topk_gpu(
         assert hidden_states.shape[0] == gating_output.shape[0], (
             f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         )
-        bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        # Preserve fp32 bias precision on both routers; dispatch must not change
+        # a token's routing when its batch crosses the radix4 size limit.
+        if correction_bias.dtype == torch.float32:
+            route_logits = gating_output.to(torch.float32)
+            route_bias = correction_bias
+        else:
+            route_logits = gating_output
+            route_bias = correction_bias.to(dtype=gating_output.dtype)
 
         if envs.SGLANG_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4
@@ -2119,28 +2126,17 @@ def biased_grouped_topk_gpu(
             # ungrouped) is the only config covered for now; anything else
             # falls back to aiter.
             if moe_route_radix4.available() and moe_route_radix4.covered(
-                gating_output, bias, topk, num_expert_group, topk_group
+                route_logits, route_bias, topk, num_expert_group, topk_group
             ):
                 return moe_route_radix4.route_radix4(
-                    gating_output, bias, topk, renormalize, scaling
+                    route_logits, route_bias, topk, renormalize, scaling
                 )
 
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-        # Don't re-downcast an fp32 correction bias at the aiter boundary: an
-        # offset bias loses too many levels in bf16 and reorders top-k. Cast the
-        # gating logits up instead. Gated on the bias dtype rather than the
-        # architecture, so a bias that arrives as bf16 is byte-identical to
-        # before, as is the radix4 path above.
-        if correction_bias.dtype == torch.float32:
-            aiter_gating_output = gating_output.to(torch.float32)
-            aiter_bias = correction_bias
-        else:
-            aiter_gating_output = gating_output
-            aiter_bias = bias
         aiter_biased_grouped_topk(
-            aiter_gating_output,
-            aiter_bias,
+            route_logits,
+            route_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -2903,10 +2899,12 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
+    # An fp32 bias stays fp32: biased_grouped_topk_gpu then routes in fp32.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and correction_bias.dtype != torch.float32
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
