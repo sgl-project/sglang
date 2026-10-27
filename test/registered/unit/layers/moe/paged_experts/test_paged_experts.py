@@ -511,7 +511,9 @@ class TestResidency(CustomTestCase):
         state.step.fill_(8)
         policy = LRUPolicy(4)
 
-        state.load_into(policy)
+        counts = torch.zeros(E + 1, dtype=torch.int32)
+        counts[11] = 3
+        self.assertEqual(state.load_into(policy, counts), counts.tolist())
         self.assertEqual(
             list(policy.resident.items()), [(2, 1), (5, 3), (9, 0), (7, 2)]
         )
