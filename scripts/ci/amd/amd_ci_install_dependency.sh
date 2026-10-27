@@ -165,6 +165,13 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# serving_responses.py imports responses_tools/beam.py, which needs
+# ResponseFunctionShellToolCall from openai>=2.8.0. pyproject_other.toml still
+# pins openai==2.6.1, so the Responses handler fails to import and every
+# /v1/responses request returns 500. Drop this once pyproject_other.toml moves
+# to 2.8.0.
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "openai==2.8.0"
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
