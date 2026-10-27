@@ -749,8 +749,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
-        *,
-        ragged_verify_layout: Optional[RaggedVerifyLayout],
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:

@@ -133,8 +133,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
-        *args,
         ragged_verify_layout=None,
+        *args,
         **kwargs,
     ):
         if ragged_verify_layout is not None:
