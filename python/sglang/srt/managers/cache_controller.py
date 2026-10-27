@@ -302,6 +302,10 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    # Class-level default so controllers built without __init__ (e.g. test stubs)
+    # still take the non-dedup path.
+    mla_dedup: Optional[MLAHostDedupContext] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,

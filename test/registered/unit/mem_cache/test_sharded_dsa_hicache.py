@@ -79,6 +79,7 @@ class TestShardedDSAHiCache(CustomTestCase):
             mem_pool_device_allocator=Mock(),
             _num_tokens_by_pool=lambda op: {"kv": 64},
             _transfer_num_bytes=lambda op: 0,
+            mla_dedup=None,
         )
         self.assertEqual(HiCacheController.start_loading(cc), 0)
         self.assertEqual(events, ["prepare", "fence", "describe", "submit"])
