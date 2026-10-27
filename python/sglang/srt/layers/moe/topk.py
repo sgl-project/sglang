@@ -2546,31 +2546,6 @@ def capture_routed_experts_if_allowed(
         )
 
 
-def _eplb_map_and_record_fused_if_recording(
-    topk_ids: torch.Tensor,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
-    layer_id: Optional[int],
-    num_token_non_padded: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    if (
-        expert_location_dispatch_info is None
-        or expert_location_dispatch_info.ep_dispatch_algorithm != "static"
-        or layer_id is None
-        or torch.compiler.is_compiling()
-    ):
-        return None
-    load_buffer = (
-        get_global_expert_distribution_recorder().get_current_pass_count_buffer(
-            layer_id
-        )
-    )
-    if load_buffer is None:
-        return None
-    return topk_ids_logical_to_physical_and_record(
-        topk_ids, expert_location_dispatch_info, load_buffer, num_token_non_padded
-    )
-
-
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2653,12 +2628,21 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
-            fused_topk_ids = _eplb_map_and_record_fused_if_recording(
-                topk_ids=topk_ids,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                layer_id=layer_id,
-                num_token_non_padded=num_token_non_padded,
-            )
+            fused_topk_ids = None
+            if (
+                expert_location_dispatch_info is not None
+                and layer_id is not None
+                and not torch.compiler.is_compiling()
+            ):
+                recorder = get_global_expert_distribution_recorder()
+                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                if load_buffer is not None:
+                    fused_topk_ids = topk_ids_logical_to_physical_and_record(
+                        topk_ids,
+                        expert_location_dispatch_info,
+                        load_buffer,
+                        num_token_non_padded,
+                    )
             if fused_topk_ids is not None:
                 topk_ids = fused_topk_ids
                 _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
