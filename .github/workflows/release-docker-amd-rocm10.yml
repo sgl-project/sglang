@@ -164,7 +164,13 @@ jobs:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          image_tag="v${VERSION}-rocm101-mi45x-${DATE}"
+          # TEMPORARY: test tag with the RCCL commit. Remove before merge.
+          rccl_commit=$(sed -n 's/^ENV RCCL_COMMIT_DEFAULT="\([0-9a-f]*\)"$/\1/p' docker/rocm.Dockerfile)
+          if [ -z "$rccl_commit" ]; then
+            echo "::error::Could not find RCCL_COMMIT_DEFAULT in docker/rocm.Dockerfile"
+            exit 1
+          fi
+          image_tag="v${VERSION}-rocm101-mi45x-${DATE}-rccl-${rccl_commit:0:7}_test"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -180,16 +186,7 @@ jobs:
             --no-cache
           docker push "rocm/sgl-dev:${image_tag}"
 
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+      # TEMPORARY: no lmsysorg/sglang-rocm push for the test image.
 
   # gfx1250 (MI45x) runs on the same schedule as the pair above but stays a
   # separate job: no MI450 runner pool consumes the image, so a bring-up build
