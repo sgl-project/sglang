@@ -41,6 +41,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -876,7 +877,8 @@ class TestCPUGraph(CustomTestCase):
             "--torch-compile-max-bs",
             "2",
             "--cuda-graph-bs-decode",
-            "1,2",
+            "1",
+            "2",
             "--cuda-graph-backend-prefill",
             "full",
             "--cuda-graph-bs-prefill",
@@ -885,7 +887,7 @@ class TestCPUGraph(CustomTestCase):
         min_throughput=7,
     )
     def test_latency_torch_compile_cpu(self):
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        return DEFAULT_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -894,7 +896,6 @@ class TestCPUGraph(CustomTestCase):
         n_numa_node = len(cpu_ids_by_node)
         env = copy.deepcopy(os.environ)
         env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
-        env["SGLANG_TORCH_DYNAMIC_SHAPE"] = "1"
         process = popen_launch_server(
             model,
             base_url,
@@ -909,11 +910,12 @@ class TestCPUGraph(CustomTestCase):
                 "--disable-overlap-schedule",
                 "--enable-torch-compile",
                 "--cuda-graph-bs-decode",
-                "1,2",
+                "1",
+                "2",
                 "--cuda-graph-backend-prefill",
                 "full",
-                "--cuda-graph-max-bs-prefill",
-                "512",
+                "--cuda-graph-bs-prefill",
+                "128",
                 "--tp",
                 f"{n_numa_node}",
             ],

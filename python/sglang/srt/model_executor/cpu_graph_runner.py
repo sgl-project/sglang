@@ -2022,7 +2022,7 @@ class CPUGraphRunner:
             self._prefill_graph_model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=True,
+            dynamic=self.enable_dynamic_graph,
             model_forward=(
                 self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
