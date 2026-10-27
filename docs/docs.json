@@ -1696,6 +1696,12 @@
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
+                  },
+                  {
+                    "group": "HY-Nomas",
+                    "pages": [
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
+                    ]
                   }
                 ]
               },
