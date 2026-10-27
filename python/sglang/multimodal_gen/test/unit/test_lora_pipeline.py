@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
     LoraMergeCache,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+    load_peft_config,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -48,6 +51,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
     pipeline.loaded_adapter_files = {}
+    pipeline.loaded_adapter_configs = {}
     pipeline.loaded_adapter_alphas = {"adapter": None}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
@@ -144,9 +148,17 @@ def test_merge_cache_only_accepts_cpu_backed_weights(tmp_path, monkeypatch):
     roots.add(cache_root())
     pipeline.loaded_adapter_alphas["adapter"] = 16
     roots.add(cache_root())
+    assert len(roots) == 3
+
+    # Editing the config on disk must not move the key until the adapter is
+    # reloaded, since the loaded weights were normalized with the old config.
+    before = cache_root()
     (tmp_path / "adapter_config.json").write_text('{"use_rslora": true}')
-    roots.add(cache_root())
-    assert len(roots) == 4
+    assert cache_root() == before
+    pipeline.loaded_adapter_configs["adapter"] = load_peft_config(
+        str(tmp_path / "low.safetensors")
+    )
+    assert cache_root() != before
 
     resident_layer = BaseLayerWithLoRA(
         torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False

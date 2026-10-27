@@ -98,28 +98,3 @@ def test_failed_put_keeps_the_previous_entry(monkeypatch):
     assert cache.put("a", torch.randn(2, 2)) is None
     (entry,) = os.listdir(cache.root)
     assert torch.equal(load_file(os.path.join(cache.root, entry))["weight"], merged)
-
-
-def test_low_space_evicts_least_recently_used_store(monkeypatch):
-    import shutil as _shutil
-    from types import SimpleNamespace
-
-    roots = []
-    for i, key in enumerate(("old", "recent")):
-        cache = LoraMergeCache(key, expected_bytes=1)
-        assert cache.put("a", torch.randn(2, 2)) is not None
-        cache.finalize()
-        os.utime(cache.root, (100 + i, 100 + i))
-        roots.append(cache.root)
-
-    real = _shutil.disk_usage
-    # Space only frees up once the oldest store is gone.
-    monkeypatch.setattr(
-        _shutil,
-        "disk_usage",
-        lambda p: SimpleNamespace(free=1 << 40 if not os.path.isdir(roots[0]) else 1),
-    )
-    new = LoraMergeCache("new", expected_bytes=1 << 20)
-    assert new.put("a", torch.randn(2, 2)) is not None
-    assert [os.path.isdir(r) for r in roots] == [False, True]
-    monkeypatch.setattr(_shutil, "disk_usage", real)

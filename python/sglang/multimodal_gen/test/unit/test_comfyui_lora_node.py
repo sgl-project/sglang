@@ -107,6 +107,7 @@ def _one_layer_pipeline():
     p._temporarily_disable_offload = lambda *a, **k: nullcontext([])
     p.loaded_adapter_paths = {"A": "/A", "B": "/B"}
     p.loaded_adapter_files = {}
+    p.loaded_adapter_configs = {}
     p.loaded_adapter_alphas = {"A": None, "B": None}
     p.lora_adapters = {
         name: {

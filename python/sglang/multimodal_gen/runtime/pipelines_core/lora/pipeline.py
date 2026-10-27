@@ -168,6 +168,7 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
+    loaded_adapter_configs: dict[str, dict]  # nickname -> PEFT config at load
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
@@ -200,6 +201,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
         self.loaded_adapter_files = {}
+        self.loaded_adapter_configs = {}
         self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
@@ -1076,6 +1078,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_files[lora_nickname] = lora_local_path
+        self.loaded_adapter_configs[lora_nickname] = adapter_config
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
@@ -1390,12 +1393,16 @@ class LoRAPipeline(ComposedPipelineBase):
             # Sharded weights would need per-rank stores; not worth it until a
             # multi-GPU consumer deployment exists.
             return None
-        # The effective alpha and PEFT config change the merged delta too.
+        # The effective alpha and PEFT config change the merged delta too. Use the
+        # config snapshotted at load, since the weights were normalized with it.
         adapters = [
             (
                 file,
                 strength,
-                (self.loaded_adapter_alphas.get(n), load_peft_config(file)),
+                (
+                    self.loaded_adapter_alphas.get(n),
+                    self.loaded_adapter_configs.get(n),
+                ),
             )
             for file, n, strength in zip(files, nicknames, strengths)
         ]
