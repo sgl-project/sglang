@@ -914,9 +914,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._full_per_token, self._full_fixed_per_token = fp4_costs(
                 model_config.get_num_kv_heads(tp_size), model_config.head_dim
             )
-            self._swa_per_token, self._swa_fixed_per_token = fp4_costs(
-                model_config.get_swa_num_kv_heads(tp_size), model_config.swa_head_dim
-            )
+            if get_exec().kernel.swa_kv_cache_dtype == "fp8_e4m3":
+                # FP8 SWA rows: one byte per element, no block scales.
+                self._swa_per_token = model_config.get_swa_num_kv_heads(tp_size) * (
+                    model_config.swa_head_dim + model_config.swa_v_head_dim
+                )
+            else:
+                self._swa_per_token, self._swa_fixed_per_token = fp4_costs(
+                    model_config.get_swa_num_kv_heads(tp_size),
+                    model_config.swa_head_dim,
+                )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0

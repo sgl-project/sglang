@@ -574,5 +574,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "swa_kv_cache_dtype",
 )
 # fmt: on

@@ -276,6 +276,18 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    swa_kv_cache_dtype: A[
+        str,
+        Arg(
+            help=(
+                "KV-cache dtype for the sliding-window layers of a hybrid SWA "
+                "model. 'auto' uses --kv-cache-dtype. 'fp8_e4m3' keeps those "
+                "layers in FP8 while the full-attention layers use "
+                "--kv-cache-dtype=nvfp4."
+            ),
+            choices=["auto", "fp8_e4m3"],
+        ),
+    ] = "auto"
     sampling_backend: A[
         Optional[str],
         Arg(

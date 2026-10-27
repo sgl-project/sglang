@@ -130,3 +130,69 @@ def test_hybrid_swa_pool_raw_buffers_route_per_sub_pool():
         assert k_scale.data_ptr() == expected[2].data_ptr(), layer_id
         assert bool(k_fp4[loc].any()) == written, layer_id
         assert bool(v_scale.view(torch.uint8)[loc].any()) == written, layer_id
+
+
+@torch.inference_mode()
+def test_hybrid_swa_pool_with_fp8_swa_layers():
+    """With a separate FP8 SWA dtype, the sliding-window sub-pool is a plain FP8
+    pool without the NVFP4 method or block scales, while the full sub-pool keeps
+    native NVFP4."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        _trtllm_native_nvfp4_kv_buffer,
+    )
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        NVFP4KVCacheMethod,
+    )
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    page_size, heads, head_dim, size = 16, 2, 128, 64
+    full_ids, swa_ids = [1, 3], [0, 2]
+    method = NVFP4KVCacheMethod(num_layers=4, device="cuda", page_size=page_size)
+    method.configure_attention_backends("trtllm_mha", "trtllm_mha")
+    pool = SWAKVPool(
+        size=size,
+        size_swa=size,
+        page_size=page_size,
+        dtype=torch.float4_e2m1fn_x2,
+        head_num=heads,
+        head_dim=head_dim,
+        swa_attention_layer_ids=swa_ids,
+        full_attention_layer_ids=full_ids,
+        device="cuda",
+        swa_dtype=torch.float8_e4m3fn,
+        quant_method=method,
+    )
+    assert pool.full_kv_pool.quant_method is method
+    assert pool.swa_kv_pool.dtype == torch.float8_e4m3fn
+    assert pool.swa_kv_pool.quant_method is not method
+    assert pool.swa_kv_pool.model_layer_ids == tuple(swa_ids)
+
+    torch.manual_seed(4)
+    k = torch.randn(8, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    full_loc = torch.arange(page_size, page_size + 8, device="cuda")
+    swa_loc = full_loc + page_size
+    write_loc = KVWriteLoc(
+        full_loc, window_locs={SWAKVPool.WINDOW_SUB_POOL: swa_loc}, physical=True
+    )
+    for layer_id in (1, 2):
+        pool.set_kv_buffer(
+            SimpleNamespace(layer_id=layer_id), write_loc, k, v, None, None
+        )
+
+    # Sliding-window layer 2: raw FP8 cast at the SWA slots.
+    k_swa, v_swa = pool.get_kv_buffer(2)
+    k_fp8 = k_swa.view(torch.float8_e4m3fn)[swa_loc]
+    v_fp8 = v_swa.view(torch.float8_e4m3fn)[swa_loc]
+    assert torch.equal(
+        k_fp8.view(torch.uint8), k.to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+    assert torch.equal(
+        v_fp8.view(torch.uint8), v.to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+
+    # Full layer 1: native NVFP4 data and block scales at the full slots.
+    k_fp4, _, k_scale, _ = _trtllm_native_nvfp4_kv_buffer(pool, 1)
+    assert k_fp4[full_loc].any()
+    assert k_scale.view(torch.uint8).any()

@@ -101,6 +101,21 @@ Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attentio
 
 Models with sliding-window layers keep their hybrid SWA memory pool with an NVFP4 KV cache: the full-attention and sliding-window sub-pools both store packed FP4 with native block scales.
 
+### FP8 sliding-window layers with an NVFP4 KV cache
+
+With `--swa-kv-cache-dtype fp8_e4m3`, the sliding-window layers of a hybrid SWA model store FP8 E4M3 rows while the full-attention layers keep NVFP4. Sliding-window layers hold only their window per request, so most of the capacity comes from the full-attention pool, while much of the NVFP4 error comes from the many sliding-window layers. It requires `trtllm_mha` for prefill and decode and does not support `--enable-unified-memory`.
+
+The capacity gain over an FP8 cache depends on how much memory the sliding-window pool gets. On a model with many sliding-window layers, the default `--swa-full-tokens-ratio` (0.8) gives them most of the KV bytes, so storing them in FP8 keeps little of NVFP4's gain; with a small ratio such as 0.1 it keeps most of it, as long as the sliding-window pool still covers the window of your concurrent requests. How much accuracy it recovers depends on the model, so check it on your own workload.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path reflection/Beam-1.0-501B-A23B-NVFP4 \
+    --tp-size 4 \
+    --kv-cache-dtype nvfp4 \
+    --swa-kv-cache-dtype fp8_e4m3 \
+    --swa-full-tokens-ratio 0.1
+```
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.

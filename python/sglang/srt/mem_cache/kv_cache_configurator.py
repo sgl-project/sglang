@@ -2695,6 +2695,17 @@ class KVCacheConfigurator:
                     "head geometry yet."
                 )
             kwargs["quant_method"] = quant_method
+        swa_dtype = None
+        if get_exec().kernel.swa_kv_cache_dtype == "fp8_e4m3":
+            if quant_method is None or self.is_hybrid_swa_compress:
+                raise NotImplementedError(
+                    "--swa-kv-cache-dtype fp8_e4m3 needs an NVFP4 KV cache and "
+                    "SWA layers with the full layers' head geometry."
+                )
+            # FP8 SWA layers are plain MHA rows; only the full sub-pool holds
+            # NVFP4 data and block scales.
+            swa_dtype = torch.float8_e4m3fn
+            swa_pool_class = MHATokenToKVPool
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
@@ -2719,6 +2730,8 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            swa_dtype=swa_dtype,
+            full_kv_pool_class=mha_pool_class if swa_dtype is not None else None,
             **kwargs,
         )
         return token_to_kv_pool

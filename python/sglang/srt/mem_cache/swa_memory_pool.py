@@ -75,6 +75,7 @@ class SWAKVPool(BaseSWAKVPool):
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
         enable_memory_saver: bool = False,
+        swa_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
         self.size = size
@@ -127,6 +128,10 @@ class SWAKVPool(BaseSWAKVPool):
                 "allocation_label": "SWA",
                 **kwargs,
             }
+            if swa_dtype is not None:
+                # A separate SWA dtype stores plain rows without the full
+                # pool's quantization recipe.
+                swa_kv_pool_kwargs.pop("quant_method", None)
 
         self.full_kv_pool = full_kv_pool_class(
             size=size,
@@ -136,7 +141,7 @@ class SWAKVPool(BaseSWAKVPool):
         )
         self.swa_kv_pool = swa_kv_pool_class(
             size=size_swa,
-            dtype=dtype,
+            dtype=swa_dtype if swa_dtype is not None else dtype,
             layer_num=self.swa_layer_nums,
             **swa_kv_pool_kwargs,
         )
