@@ -331,7 +331,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         one resolving another dtype refuses instead of reading the rows as
         that dtype."""
         bf16 = self._swa_allocator(with_draft_region=True)
-        with self.assertRaisesRegex(ValueError, "draft KV dtype must match"):
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=bf16,
@@ -349,7 +349,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         self.assertEqual(pools.token_to_kv_pool.dtype, torch.float8_e4m3fn)
         self.assertEqual(pools.token_to_kv_pool.store_dtype, torch.uint8)
-        with self.assertRaisesRegex(ValueError, "draft KV dtype must match"):
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=alloc,
