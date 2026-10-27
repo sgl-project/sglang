@@ -30,7 +30,7 @@ from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
-# backend-specific: the gfx950 step-bias and TP-shard argmax kernels run only on ROCm.
+# backend-specific: the gfx950 TP-shard argmax kernel runs only on ROCm.
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = get_device()
@@ -487,30 +487,6 @@ def _case_qo_indptr(tc):
     tc.assertEqual(got.qo_indptr[:2].tolist(), [0, 3])
 
 
-def _case_markov_step_bias(tc):
-    # One kernel for the w1 gather and the w2 GEMV: within bf16 rounding of the
-    # embedding + F.linear pair, for row counts across its row blocks, a vocab
-    # with a ragged last tile, and a [bs, gamma] token block keeping its shape.
-    from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import MarkovStepBias
-
-    g = torch.Generator(device=DEVICE).manual_seed(21)
-    vocab, rank = 5003, 256
-    w1 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.5).to(torch.bfloat16)
-    w2 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.02).to(
-        torch.bfloat16
-    )
-    for shape in ((1,), (5,), (48,), (130,), (3, 7)):
-        tokens = _ri(0, vocab, shape, g=g)
-        got = MarkovStepBias.triton(token_ids=tokens, w1_weight=w1, w2_weight=w2)
-        ref = MarkovStepBias.torch(token_ids=tokens, w1_weight=w1, w2_weight=w2)
-        tc.assertEqual(got.shape, (*shape, vocab))
-        exact = (w1[tokens].double() @ w2.double().t()).to(torch.bfloat16)
-        for other in (ref, exact):
-            torch.testing.assert_close(
-                got.float(), other.float(), rtol=2**-7, atol=1e-6
-            )
-
-
 def _case_scatter_compact_to_strided(tc):
     torch.manual_seed(19)
     t, bs, dim = 6, 8, 4096
@@ -589,10 +565,7 @@ _CASES = [
     ("qo_indptr", _case_qo_indptr),
     # gfx950-only DSpark kernels; CUDA never runs them
     *(
-        [
-            ("markov_step_bias", _case_markov_step_bias),
-            ("tp_shard_row_argmax", _case_tp_shard_row_argmax),
-        ]
+        [("tp_shard_row_argmax", _case_tp_shard_row_argmax)]
         if torch.version.hip
         else []
     ),
