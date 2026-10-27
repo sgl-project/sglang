@@ -27,6 +27,23 @@ def _hold_filesystem_lock(path: str, ready, release) -> None:
         release.wait(timeout=10)
 
 
+def _probe_toolchain(crate, lock_path: str, environment: dict, start) -> None:
+    os.environ.update(environment)
+    start.wait(timeout=10)
+    rust_extension._build_context(crate, toolchain_lock=Path(lock_path))
+
+
+def _fake_toolchain(root: Path, script: str) -> str:
+    """Put `cargo` and `rustc` stand-ins running `script` first on a PATH."""
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    for name in ("cargo", "rustc"):
+        executable = bin_dir / name
+        executable.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+        executable.chmod(0o755)
+    return f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+
+
 class _FailingExtensionLoader(importlib.abc.Loader):
     def create_module(self, spec):
         return None
@@ -437,6 +454,9 @@ crate-type = ["cdylib"]
                     "features": ("python", "inspection"),
                     "build_fingerprint": {"native": "abi"},
                     "extension_module": "demo._inspection",
+                    "toolchain_lock": (root / "cache").resolve()
+                    / "locks"
+                    / "toolchain.lock",
                 },
             )
             self.assertEqual(
@@ -572,6 +592,62 @@ crate-type = ["cdylib"]
                 thread.join(timeout=5)
             self.assertEqual(process.exitcode, 0)
             self.assertTrue(acquired.is_set())
+
+    def test_toolchain_probes_of_concurrent_processes_do_not_overlap(self):
+        # Each stand-in probe marks itself in flight for 0.3 s and records any probe
+        # that starts while another is in flight, as racing rustup installs would.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = rust_extension._discover_crate(self._workspace(root), "demo._core")
+            state = root / "state"
+            state.mkdir()
+            path = _fake_toolchain(
+                root,
+                'if mkdir "$PROBE_STATE/in-flight" 2>/dev/null; then\n'
+                '  sleep 0.3; rmdir "$PROBE_STATE/in-flight"\n'
+                'else\n  touch "$PROBE_STATE/overlap"; sleep 0.3\nfi\n'
+                "echo stand-in 1.0\n",
+            )
+            context = multiprocessing.get_context("fork")
+            start = context.Event()
+            processes = [
+                context.Process(
+                    target=_probe_toolchain,
+                    args=(
+                        crate,
+                        os.fspath(root / "locks" / "toolchain.lock"),
+                        {"PATH": path, "PROBE_STATE": os.fspath(state)},
+                        start,
+                    ),
+                )
+                for _ in range(4)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=30)
+            self.assertEqual([process.exitcode for process in processes], [0] * 4)
+            self.assertFalse((state / "overlap").exists())
+
+    def test_toolchain_probe_that_never_returns_fails_within_the_timeout(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = _fake_toolchain(root, "exec sleep 30\n")
+            started = time.monotonic()
+            with (
+                mock.patch.dict(os.environ, {"PATH": path}),
+                mock.patch.object(
+                    rust_extension, "_TOOLCHAIN_PROBE_TIMEOUT_SECONDS", 0.5
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "failed to query the Rust toolchain"
+                ),
+            ):
+                rust_extension._command_version(
+                    "cargo", "--version", "--verbose", cwd=root
+                )
+            self.assertLess(time.monotonic() - started, 10)
 
     def test_failed_import_does_not_poison_sys_modules(self):
         module_name = "demo._broken_core"

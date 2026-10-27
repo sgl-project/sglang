@@ -15,7 +15,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +41,9 @@ _BUILD_ENVIRONMENT_VARIABLES = (
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTFLAGS",
 )
+# A version query that can install the pinned toolchain may download it; a probe
+# that outlives this fails like a missing toolchain instead of blocking startup.
+_TOOLCHAIN_PROBE_TIMEOUT_SECONDS = 300
 
 _RUST_WORKSPACE = Path(__file__).resolve().parents[4] / "rust"
 
@@ -122,13 +125,14 @@ def load_rust_extension(
 
     crate = _discover_crate(workspace, python_module)
     features = tuple(dict.fromkeys((*crate.features, *additional_features)))
+    cache_root = _cache_root(cache_dir)
     context = _build_context(
         crate,
         features=features,
         build_fingerprint=build_fingerprint,
         extension_module=load_module,
+        toolchain_lock=cache_root / "locks" / "toolchain.lock",
     )
-    cache_root = _cache_root(cache_dir)
     extension_path = _cached_extension_path(
         cache_root, crate, context.fingerprint, load_module
     )
@@ -249,18 +253,23 @@ def _build_context(
     features: tuple[str, ...] | None = None,
     build_fingerprint: Mapping[str, object] | None = None,
     extension_module: str | None = None,
+    toolchain_lock: Path | None = None,
 ) -> _BuildContext:
     if features is None:
         features = crate.features
     if extension_module is None:
         extension_module = crate.python_module
     source_digest = _source_digest(crate.workspace, crate.source_inputs)
-    toolchain = {
-        "cargo": _command_version(
-            "cargo", "--version", "--verbose", cwd=crate.workspace
-        ),
-        "rustc": _command_version("rustc", "-vV", cwd=crate.workspace),
-    }
+    # rustup's cargo/rustc proxies install the toolchain pinned by rust-toolchain.toml
+    # on first use, and concurrent installs into one RUSTUP_HOME race. Probe one
+    # process at a time so that only the first one installs.
+    with _filesystem_lock(toolchain_lock) if toolchain_lock else nullcontext():
+        toolchain = {
+            "cargo": _command_version(
+                "cargo", "--version", "--verbose", cwd=crate.workspace
+            ),
+            "rustc": _command_version("rustc", "-vV", cwd=crate.workspace),
+        }
     python_abi = {
         "cache_tag": sys.implementation.cache_tag,
         "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
@@ -337,8 +346,13 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             capture_output=True,
             text=True,
             cwd=cwd,
+            timeout=_TOOLCHAIN_PROBE_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         raise RuntimeError(
             f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`"
         ) from exc
