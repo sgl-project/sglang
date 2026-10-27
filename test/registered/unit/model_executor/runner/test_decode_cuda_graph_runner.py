@@ -23,7 +23,6 @@ lightweight stand-in (with the real precedence helper bound) so no model or
 server is constructed.
 """
 
-import contextlib
 import os
 import tempfile
 import unittest
@@ -109,134 +108,6 @@ class TestInitProfileBatchMode(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
             self.assertIsNone(fake_self._profile_trace_tag)
-
-
-class TestBeamBatchesRunEager(CustomTestCase):
-    def test_trie_and_shared_context_batches_skip_graphs(self):
-        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
-        runner.ragged_verify_mode = False
-        for levels, metadata in ((object(), None), (None, object())):
-            with self.subTest(levels=levels, metadata=metadata):
-                forward_batch = SimpleNamespace(
-                    replace_embeds=None,
-                    spec_info=None,
-                    batch_size=4,
-                    beam_trie_levels=levels,
-                    beam_attention_metadata=metadata,
-                )
-                self.assertFalse(runner.can_run_graph(forward_batch))
-
-
-class TestTrieGraphIsolation(CustomTestCase):
-    @staticmethod
-    def runner(width=1):
-        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
-        runner.ragged_verify_mode = False
-        runner.require_mlp_tp_gather = False
-        runner.require_mlp_sync = False
-        runner.disable_padding = True
-        runner.enable_pdmux = False
-        runner.record_nolora_graph = False
-        runner.attention_graph_variants = None
-        runner.is_encoder_decoder = False
-        runner.enable_two_batch_overlap = False
-        runner.captured_req_width = width
-        runner.model_runner = SimpleNamespace(
-            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
-        )
-        runner.backend = SimpleNamespace(can_run=mock.Mock(return_value=True))
-        runner._beam_trie_graph_state = SimpleNamespace(
-            can_replay=mock.Mock(
-                side_effect=AssertionError("non-trie path inspected trie state")
-            )
-        )
-        return runner
-
-    def test_normal_and_speculative_replay_keep_ordinary_keys(self):
-        from sglang.srt.model_executor.runner.shape_key import ShapeKey
-
-        for width in (1, 2, 4, 8):
-            with self.subTest(captured_request_width=width):
-                runner = self.runner(width)
-                forward = SimpleNamespace(
-                    replace_embeds=None,
-                    spec_info=None
-                    if width == 1
-                    else SimpleNamespace(num_tokens_per_req=width),
-                    batch_size=2,
-                    beam_trie_levels=None,
-                    beam_attention_metadata=None,
-                )
-                self.assertTrue(runner.can_run_graph(forward))
-                key = runner.backend.can_run.call_args.args[1]
-                self.assertIs(type(key), ShapeKey)
-                runner._beam_trie_graph_state.can_replay.assert_not_called()
-                if width > 1:
-                    forward.spec_info.num_tokens_per_req = width + 1
-                    self.assertFalse(runner.can_run_graph(forward))
-
-    def test_inherited_capture_prepare_never_receives_beam_keyword(self):
-        class LegacyDraftRunner(DecodeCudaGraphRunner):
-            def capture_prepare(self, size, stream_idx=None, num_tokens=None):
-                self.prepared = (size, stream_idx, num_tokens)
-                return self.prepared_batch, self.prepared_backend, None
-
-        runner = LegacyDraftRunner.__new__(LegacyDraftRunner)
-        runner.captured_req_width = 2
-        runner.ragged_verify_mode = False
-        runner.pp_size = 1
-        runner.dllm_uses_input_embeds = False
-        runner.dllm_input_preparation = None
-        runner.prepared_batch = SimpleNamespace(
-            lora_ids=None,
-            dp_local_start_pos=None,
-            dp_local_num_tokens=None,
-            global_dp_buffer_len=None,
-            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
-            global_num_tokens_cpu=None,
-            input_ids=torch.zeros(4, dtype=torch.int64),
-            positions=torch.arange(4),
-        )
-        runner.prepared_backend = SimpleNamespace(
-            init_forward_metadata_out_graph=mock.Mock(),
-            init_forward_metadata_in_graph=mock.Mock(),
-        )
-        runner.tbo_plugin = SimpleNamespace(capture_one_batch_size=mock.Mock())
-        runner.deepep_adapter = SimpleNamespace(capture=mock.Mock())
-        runner._record_in_graph_metadata_prep_done = mock.Mock()
-        runner.model_runner = SimpleNamespace(
-            lora_manager=None,
-            canary_manager=None,
-            capture_head_hooks=[],
-            capture_tail_hooks=[],
-            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
-        )
-        keys = []
-        runner.backend = SimpleNamespace(
-            capture_one=lambda key, run_once, **_kwargs: (keys.append(key), run_once())
-        )
-        forward = mock.Mock(return_value=object())
-        with (
-            mock.patch.object(
-                mod,
-                "get_exec",
-                return_value=SimpleNamespace(
-                    graph=SimpleNamespace(debug_cuda_graph=False)
-                ),
-            ),
-            mock.patch.object(
-                mod,
-                "forward_context",
-                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
-            ),
-            mock.patch.object(mod, "set_dp_buffer_len"),
-            mock.patch.object(mod, "set_is_extend_in_batch"),
-            mock.patch.object(mod, "maybe_flashinfer_autotune_speculative_draft"),
-        ):
-            runner.capture_one_shape(2, forward)
-        self.assertEqual(runner.prepared, (2, None, 4))
-        self.assertIs(type(keys[0]), mod.ShapeKey)
-        forward.assert_called_once()
 
 
 class TestInitProfileOriginalMode(CustomTestCase):
@@ -771,17 +642,7 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
     KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
 
-    def _replay(
-        self,
-        glue,
-        *,
-        raw_bs=2,
-        bs=2,
-        skip=True,
-        staged=False,
-        beam_trie=False,
-        beam_metadata=None,
-    ):
+    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
         runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
@@ -797,8 +658,6 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         runner.seq_len_fill_value = 1
         runner.is_encoder_decoder = False
         runner._global_num_tokens_for_graph = lambda num_tokens: None
-        if beam_trie:
-            runner._beam_trie_graph_state = SimpleNamespace(levels=torch.arange(16))
         views = []
 
         def build_view(**kwargs):
@@ -807,17 +666,13 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
         with mock.patch.object(mod, "build_replay_fb_view", build_view):
             runner._init_replay_attn_metadata(
-                SimpleNamespace(
-                    forward_mode=mod.ForwardMode.TARGET_VERIFY,
-                    beam_trie_levels=object() if beam_trie else None,
-                ),
+                SimpleNamespace(forward_mode=mod.ForwardMode.TARGET_VERIFY),
                 raw_bs=raw_bs,
                 bs=bs,
                 num_tokens=12,
                 glue_key=self.KEY,
                 early_staged=staged,
                 attention_variant=None,
-                **({"beam_metadata": beam_metadata} if beam_trie else {}),
             )
         return views, eager
 
@@ -842,65 +697,6 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=1)
         self.assertEqual((glue.calls, eager), ([], views))
-
-    def test_trie_metadata_uses_its_staged_buffers_without_glue(self):
-        for staged in (False, True):
-            for metadata in (None, object()):
-                with self.subTest(staged=staged, shared_metadata=metadata is not None):
-                    glue = _RecordingGlue(captured_keys=[self.KEY])
-                    views, eager = self._replay(
-                        glue,
-                        staged=staged,
-                        beam_trie=True,
-                        beam_metadata=metadata,
-                    )
-                    self.assertEqual(glue.calls, [])
-                    self.assertEqual(eager, views)
-                    self.assertEqual(len(views), 1)
-                    torch.testing.assert_close(
-                        views[0].beam_trie_levels, torch.arange(12)
-                    )
-                    self.assertIs(views[0].beam_attention_metadata, metadata)
-
-
-class TestReplayOutputFields(CustomTestCase):
-    def test_slices_trie_normalizer_and_speculative_hidden_states(self):
-        output = mod.LogitsProcessorOutput(
-            next_token_logits=torch.arange(12).reshape(4, 3),
-            hidden_states=torch.arange(8).reshape(4, 2),
-            last_hidden_states=torch.arange(8).reshape(4, 2) + 100,
-            beam_normalizer=torch.arange(4, dtype=torch.float32),
-        )
-        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
-        runner.model_runner = SimpleNamespace(device_timer=None)
-        runner.model_context = contextlib.nullcontext
-        runner._replay_attn_backend = mock.Mock()
-        runner._resolve_shared_read_ends = mock.Mock(return_value=None)
-        runner.load_batch = mock.Mock()
-        runner.backend = SimpleNamespace(
-            replay_session=contextlib.nullcontext,
-            replay=mock.Mock(return_value=output),
-        )
-        runner._replay_graph_key = object()
-        runner._process_output_after_replay = lambda result, _batch: result
-        runner.raw_num_token = 2
-        runner.is_dllm = False
-        with (
-            mock.patch.dict(os.environ, {"SGLANG_LOG_DECODE_GRAPH_KEY": "0"}),
-            mock.patch.object(
-                mod, "device_timer_ctx", return_value=contextlib.nullcontext()
-            ),
-        ):
-            result = runner.execute(
-                SimpleNamespace(forward_mode=mod.ForwardMode.DECODE)
-            )
-        for name in (
-            "next_token_logits",
-            "hidden_states",
-            "last_hidden_states",
-            "beam_normalizer",
-        ):
-            torch.testing.assert_close(getattr(result, name), getattr(output, name)[:2])
 
 
 if __name__ == "__main__":
