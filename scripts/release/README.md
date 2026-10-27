@@ -100,6 +100,18 @@ python scripts/release/bump_docs_install_version.py 0.5.13
 - `docs/docs/get-started/install.mdx` (Get the source)
 - `docs/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
 
+### `bump_sgl_amd_mono_version.py`
+Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) (the `monokernels_hip` extra, which the gfx950 ROCm image also checks out) at a branch head or a full commit SHA, `main` by default. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which opens a PR labeled `run-ci` when sgl-amd-mono's `main` has moved, then closes the bump PR it replaces and cancels that PR's unfinished runs. Closing a bump PR without merging it keeps the bot from reopening one for that commit.
+
+**Usage:**
+```bash
+python scripts/release/bump_sgl_amd_mono_version.py            # head of main
+python scripts/release/bump_sgl_amd_mono_version.py <full-sha>
+```
+
+**Files updated:**
+- `python/pyproject_other.toml`
+
 ### `bump_kernel_version.py`
 Updates the `sglang-kernel` release version across all relevant files following the pattern from [PR #10732](https://github.com/sgl-project/sglang/pull/10732).
 
