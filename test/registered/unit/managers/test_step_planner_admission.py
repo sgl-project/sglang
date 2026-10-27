@@ -66,7 +66,11 @@ def _req(rid, *, priority=0, max_new_tokens=8, holds_row=False):
         sampling_params=SimpleNamespace(
             max_new_tokens=max_new_tokens, ignore_eos=False
         ),
-        time_stats=SimpleNamespace(wait_queue_entry_time=0),
+        time_stats=SimpleNamespace(
+            wait_queue_entry_time=0,
+            observe_storage_prefetch_ready=Mock(),
+            observe_storage_staging_ready=Mock(),
+        ),
         kv=SimpleNamespace(holds_mamba=False, holds_kv=holds_row, kv_allocated_len=8),
         init_next_round_input=Mock(),
     )

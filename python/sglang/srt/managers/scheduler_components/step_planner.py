@@ -519,6 +519,7 @@ class StepPlanner:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
+                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -556,13 +557,12 @@ class StepPlanner:
             ):
                 self._revert_match(req)
                 continue
-            if (
-                hicache_storage_enabled()
-                and buffer_pipeline is not None
-                and not buffer_pipeline.prepare_staged_prefetch(req)
-            ):
-                self._revert_match(req)
-                continue
+            if hicache_storage_enabled() and buffer_pipeline is not None:
+                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
+                req.time_stats.observe_storage_staging_ready(staging_ready)
+                if not staging_ready:
+                    self._revert_match(req)
+                    continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(chunked_req is not None),
