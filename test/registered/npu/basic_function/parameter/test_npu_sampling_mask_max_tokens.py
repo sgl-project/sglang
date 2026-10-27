@@ -254,9 +254,7 @@ class TestNpuSamplingMaskMaxTokensPD(TestDisaggregationBase):
             self.assertLessEqual(len(mask), _SAMPLING_MASK_MAX_TOKENS)
 
     def test_pd_rejects_top_k_exceeding_cap(self):
-        response = _post_generate(
-            self.lb_url, {"top_k": _SAMPLING_MASK_MAX_TOKENS + 1}
-        )
+        response = _post_generate(self.lb_url, {"top_k": _SAMPLING_MASK_MAX_TOKENS + 1})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn(
             "return_sampling_mask requires top_k=1 for greedy sampling",
