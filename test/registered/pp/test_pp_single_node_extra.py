@@ -13,6 +13,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_free_port_below_ephemeral
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -199,13 +200,13 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 class TestQwenMoePPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23336"  # different ports to avoid conflicts
         cls.model_name = "Qwen/Qwen3-30B-A3B"  # replace with your Qwen Model if needed
 
     def run_gsm8k_test(self, pp_size):
+        base_url = f"http://127.0.0.1:{get_free_port_below_ephemeral()}"
         process = popen_launch_server(
             self.model_name,
-            self.base_url,
+            base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--pp-size",
@@ -217,7 +218,7 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
+                base_url=base_url,
                 model=self.model_name,
                 eval_name="gsm8k",
                 api="completion",
