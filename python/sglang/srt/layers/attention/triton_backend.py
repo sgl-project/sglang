@@ -227,8 +227,7 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         # Window layers read and write the window sub-pool's ids.
         self.use_sliding_window_kv_pool = (
-            self.token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
-            is not None
+            self.kv_layers.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
         )
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
@@ -1670,9 +1669,9 @@ class TritonAttnBackend(AttentionBackend):
             loc = loc_info
             kwargs = {}
         if k_scale is None and v_scale is None:
-            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
+            self.kv_layers.layer(layer.layer_id).store(layer, loc, k, v, **kwargs)
         else:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
@@ -1708,11 +1707,10 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if k is None and v is None:
-            pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if (
                 self.use_sliding_window_kv_pool
-                and pool.layer_router.route(layer.layer_id).sub_pool
+                and self.kv_layers.route(layer.layer_id).sub_pool
                 == IdSpaceKind.SLIDING_WINDOW
             ):
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
@@ -1720,7 +1718,7 @@ class TritonAttnBackend(AttentionBackend):
                     "sliding-window write loc"
                 )
                 cache_loc = self.forward_metadata.swa_out_cache_loc
-            k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
+            k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
         elif k is None or v is None:
@@ -1739,7 +1737,7 @@ class TritonAttnBackend(AttentionBackend):
                     # doesn't accept scale parameters. Clone to protect k from mutation
                     # since it's used later in the attention kernel.
                     k_scaled = k.clone().div_(layer.k_scale)
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         loc_info,
                         k_scaled,
@@ -1877,8 +1875,8 @@ class TritonAttnBackend(AttentionBackend):
                 k.contiguous(),
                 v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.kv_layers.read(layer.layer_id).key(),
+                self.kv_layers.read(layer.layer_id).value(),
                 self.forward_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
@@ -1905,8 +1903,8 @@ class TritonAttnBackend(AttentionBackend):
             k.contiguous() if self.dllm_attention is None else k,
             v.contiguous() if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -2044,8 +2042,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_buffer = self.kv_layers.read(layer.layer_id).key()
+        v_buffer = self.kv_layers.read(layer.layer_id).value()
 
         current_out = torch.zeros(
             (total_tokens, local_heads, layer.v_head_dim),
@@ -2210,12 +2208,11 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos = None
 
         extend_kv_indices = forward_batch.out_cache_loc
-        pool = self.token_to_kv_pool
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
             and self.use_sliding_window_kv_pool
-            and pool.layer_router.route(layer.layer_id).sub_pool
+            and self.kv_layers.route(layer.layer_id).sub_pool
             == IdSpaceKind.SLIDING_WINDOW
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
@@ -2275,8 +2272,8 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             k_descale,
             v_descale,
             self.forward_metadata.qo_indptr,
@@ -2342,7 +2339,7 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
@@ -2453,8 +2450,8 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.attn_lse.fill_(-float("inf"))
             self.decode_attention_fwd(
                 q_for_decode,
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.kv_layers.read(layer.layer_id).key(),
+                self.kv_layers.read(layer.layer_id).value(),
                 o_for_decode,
                 kv_indptr,
                 kv_indices,
@@ -2486,8 +2483,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
