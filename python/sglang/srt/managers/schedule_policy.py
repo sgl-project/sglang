@@ -1267,7 +1267,7 @@ class PrefillAdder:
         leaves its demand counted — conservative (under-admission) by design.
         """
         allocator = self.token_to_kv_pool_allocator
-        if getattr(allocator, "c128_attn_allocator", None) is None:
+        if not hasattr(type(allocator), "c128_prefill_need_pages"):
             return True
         need = allocator.c128_prefill_need_pages(prefix_len, seq_len)
         if need == 0:
@@ -1308,10 +1308,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # DSV4 NPU C128 gate (see _c128_gate). seq here is prefix + extend by
-        # construction: len(prefix_indices) + (len(fill_ids) - len(prefix_indices)).
-        if not self._c128_gate(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        ):
+        # construction: req.prefix_len + (len(fill_ids) - req.prefix_len).
+        if not self._c128_gate(req.prefix_len, len(req.full_untruncated_fill_ids)):
             return AddReqResult.OTHER
 
         def add_req_state(r, insert_sort=False):
