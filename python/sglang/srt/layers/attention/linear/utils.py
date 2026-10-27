@@ -128,19 +128,25 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     target_verify path: request slot i owns scratch row i.
 
     The scratch is allocated with one extra padding row (the `+1` in
-    MambaPool.SpeculativeState, index `pool_size`). Warmup and MLP-sync
-    batches can be padded past the pool capacity — under DP attention
-    `get_eager_max_batch_size` ceil-aligns the eager warmup bs to attn_tp —
-    and the verify kernels index this table positionally up to that padded
-    bs. Size the table to the padded maximum and clamp every out-of-pool row
-    onto the padding row: pad rows race onto one discard row, which is
-    value-irrelevant (same convention as the ragged-verify ghost row).
+    MambaPool.SpeculativeState, index `pool_size`). Eager and CUDA graph
+    batches can be padded past the pool capacity. Graph alignment can exceed
+    eager alignment even without MLP-sync. The verify kernels index this
+    table positionally up to the padded batch size, so cover both maxima
+    and clamp every out-of-pool row onto the padding row. Pad rows share
+    one discard row whose value is irrelevant, as in ragged verify.
     """
     import torch
 
-    from sglang.srt.utils.common import get_eager_max_batch_size
+    from sglang.srt.utils.common import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
 
-    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
+    padded_bs = max(
+        pool_size,
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
+    )
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

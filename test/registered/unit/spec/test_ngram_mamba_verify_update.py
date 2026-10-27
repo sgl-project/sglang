@@ -362,5 +362,36 @@ class TestMtpVerifyHookSignature(CustomTestCase):
             )
 
 
+class TestVerifyIntermediateStateIndices(CustomTestCase):
+    def test_padding_rows_use_reserved_scratch_row(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            build_verify_intermediate_state_indices,
+        )
+
+        # Graph-only padding is the regression; also retain eager padding
+        # and the unpadded/already-aligned cases.
+        cases = [
+            (5, 5, 8, [0, 1, 2, 3, 4, 5, 5, 5]),
+            (5, 8, 6, [0, 1, 2, 3, 4, 5, 5, 5]),
+            (5, 5, 5, [0, 1, 2, 3, 4]),
+            (8, 8, 8, list(range(8))),
+        ]
+        for pool_size, eager_bs, graph_bs, expected in cases:
+            with (
+                self.subTest(pool_size=pool_size, eager_bs=eager_bs, graph_bs=graph_bs),
+                patch(
+                    "sglang.srt.utils.common.get_eager_max_batch_size",
+                    return_value=eager_bs,
+                ),
+                patch(
+                    "sglang.srt.utils.common.get_cuda_graph_max_batch_size",
+                    return_value=graph_bs,
+                ),
+            ):
+                indices = build_verify_intermediate_state_indices(pool_size, "cpu")
+                self.assertEqual(indices.dtype, torch.int32)
+                self.assertEqual(indices.tolist(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
