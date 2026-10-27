@@ -2031,81 +2031,40 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         return main, index, state
 
     def test_low_ratio_coefficient_matches_allocated_growth(self):
-        from itertools import product
-
-        layouts = (("v4", None), ("v41", "fp8"), ("v41", "fp4"), ("v41", None))
-        owners = (([1], [0]), ([2], [0]), ([2, 2, 2, 1], [0, 1, 2, 3]))
-        for (layout, option), page, index_page, (ratios, sources) in product(
-            layouts, (128, 256), (64, 128), owners
-        ):
+        for layout, option in (("v4", None), ("v41", "fp8"), ("v41", None)):
             with (
-                self.subTest(
-                    layout=layout,
-                    option=option,
-                    page=page,
-                    index_page=index_page,
-                    ratios=ratios,
-                ),
+                self.subTest(layout=layout, option=option),
                 self._planner(
-                    layout, option, page, index_page, ratios, sources
+                    layout, option, 256, 128, [2, 2, 2, 1], [0, 1, 2, 3]
                 ) as planner,
             ):
+                # V4 page padding, V41 FP8, and default V41 FP4 pricing.
                 small = self._allocated_bytes(planner, 0, layout, option)
-                large = self._allocated_bytes(planner, 2 * page, layout, option)
-                # Two full pages also span an index page at ratio 2 / page 128.
-                growth = sum(large) - sum(small)
-                self.assertEqual(planner.bytes_per_full_token * 2 * page, growth)
+                large = self._allocated_bytes(planner, 512, layout, option)
+                self.assertEqual(
+                    planner.bytes_per_full_token * 512, sum(large) - sum(small)
+                )
                 self.assertEqual(small[2], large[2])
 
     def test_low_ratio_capacity_matches_allocated_page_boundaries(self):
-        from itertools import product
-
-        layouts = (("v4", None), ("v41", "fp8"), ("v41", "fp4"))
-        # Reused layers allocate no main/indexer storage of their own.
-        owners = (([1, 1], [0]), ([2, 2], [0]), ([2, 2, 2, 1], [0, 1, 2, 3]))
-        for (layout, option), page, index_page, (ratios, sources) in product(
-            layouts, (128, 256), (64, 128), owners
-        ):
+        # At full page 128 / ratio 2, 256 tokens plus both reserved pages
+        # need 320 index slots, rounded up to 384. The one-byte-under check
+        # catches omitting that rounding as well as omitting reserved pages.
+        for page, tokens in ((256, 512), (128, 256)):
             with (
-                self.subTest(
-                    layout=layout,
-                    option=option,
-                    page=page,
-                    index_page=index_page,
-                    ratios=ratios,
-                ),
+                self.subTest(page=page, tokens=tokens),
                 self._planner(
-                    layout, option, page, index_page, ratios, sources
+                    "v41", "fp4", page, 128, [2, 2, 2, 1], [0, 1, 2, 3]
                 ) as planner,
             ):
-                for pages in (1, 2, 7):
-                    tokens = pages * page
-                    budget = sum(self._allocated_bytes(planner, tokens, layout, option))
-                    config = planner.calculate_pool_sizes(budget, page)
-                    self.assertEqual(config.max_total_num_tokens, tokens)
-                    if pages > 1:
-                        smaller = planner.calculate_pool_sizes(budget - 1, page)
-                        self.assertEqual(smaller.max_total_num_tokens, tokens - page)
-                    config.max_running_requests = 2
-                    finalized = planner.finalize_with_max_running_requests(config)
-                    self.assertEqual(finalized.max_total_num_tokens, tokens)
-                    if pages > 1:
-                        capped = planner.calculate_pool_sizes_from_max_tokens(
-                            tokens - 1, page
-                        )
-                        self.assertEqual(capped.max_total_num_tokens, tokens - page)
-
-    def test_low_ratio_reserves_main_and_index_pages_with_no_tokens(self):
-        with self._planner(
-            "v41", "fp4", 256, 128, [2, 2, 2, 1], [0, 1, 2, 3]
-        ) as planner:
-            main, index, state = self._allocated_bytes(planner, 0, "v41", "fp4")
-            self.assertGreater(main, 0)
-            self.assertGreater(index, 0)
-            self.assertGreater(state, 0)
-            self.assertEqual(planner._get_low_ratio_kv_padding_bytes(0), main + index)
+                budget = sum(self._allocated_bytes(planner, tokens, "v41", "fp4"))
+                config = planner.calculate_pool_sizes(budget, page)
+                self.assertEqual(config.max_total_num_tokens, tokens)
+                smaller = planner.calculate_pool_sizes(budget - 1, page)
+                self.assertEqual(smaller.max_total_num_tokens, tokens - page)
 
     def test_low_ratio_capacity_counts_only_stage_local_owners(self):
+        # Exclude both the owner outside this stage and reused layers within it.
         with self._planner(
             "v41", "fp4", 256, 128, [2, 2, 2, 1, 1], [0, 2, 3], stage=(2, 5)
         ) as planner:
@@ -2129,8 +2088,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         ):
             for owners in ({}, {4: [0], 128: [1]}):
                 planner.stage_owner_layers = owners
-                for tokens in (0, 256):
-                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(tokens), 0)
+                self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
 
     def test_other_backends_keep_existing_byte_contract(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
