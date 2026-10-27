@@ -1,6 +1,8 @@
 """Byte-exact pageable D2H packing, including fragmented host allocations."""
 
+import gc
 import unittest
+import weakref
 
 import torch
 
@@ -15,6 +17,38 @@ from sglang.srt.mem_cache.pool_host.staged_direct import (
 
 
 class TestStagedDirectBackup(unittest.TestCase):
+    @staticmethod
+    def _staging_weakrefs(host):
+        backup, loader = host._staged_direct_backup, host._staged_direct_load
+        objects = [
+            backup,
+            loader,
+            backup.host,
+            backup.packed,
+            loader.host,
+            loader.cpu,
+            loader.gpu,
+        ]
+        # Views can disappear while their backing allocation remains alive.
+        # Track the owning tensors as well, including aliases held by the pool.
+        for tensor in (backup.host, loader.host):
+            while tensor._base is not None:
+                tensor = tensor._base
+            objects.append(tensor)
+        return [weakref.ref(obj) for obj in objects]
+
+    def _assert_destroy_releases_staging(self, host):
+        refs = self._staging_weakrefs(host)
+        host.destroy()
+        gc.collect()
+        self.assertIsNone(host._staged_direct_backup)
+        self.assertIsNone(host._staged_direct_load)
+        self.assertTrue(all(ref() is None for ref in refs))
+        # Keep the pool alive to distinguish explicit teardown from GC.
+        host.destroy()
+        self.assertTrue(host._destroyed)
+        self.assertTrue(all(ref() is None for ref in refs))
+
     def test_runs_preserve_source_order(self):
         self.assertEqual(list(contiguous_page_runs([])), [])
         self.assertEqual(
@@ -126,6 +160,7 @@ class TestStagedDirectBackup(unittest.TestCase):
                 self.assertFalse(host.pin_memory)
                 self.assertIsNotNone(host._staged_direct_backup)
                 self.assertIsNotNone(host._staged_direct_load)
+                self._assert_destroy_releases_staging(host)
             finally:
                 host.destroy()
 
@@ -188,6 +223,7 @@ class TestStagedDirectBackup(unittest.TestCase):
                     self.assertTrue(torch.equal(before, after[:2]))
                 self.assertIsNotNone(host._staged_direct_backup)
                 self.assertIsNotNone(host._staged_direct_load)
+                self._assert_destroy_releases_staging(host)
             finally:
                 host.destroy()
                 anchor.destroy()

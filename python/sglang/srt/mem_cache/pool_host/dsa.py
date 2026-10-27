@@ -261,6 +261,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.index_k_with_scale_buffer = None
         self.index_k_data_refs = []
         super().destroy()
+        # Transfers have drained before teardown; drop staging-owned host views
+        # and device buffers while the pool object may still be referenced.
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
 
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num

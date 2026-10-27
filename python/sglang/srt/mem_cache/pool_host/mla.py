@@ -286,6 +286,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self._staged_direct_backup = None
         self._staged_direct_load = None
 
+    def destroy(self):
+        if getattr(self, "_destroyed", False):
+            return
+        # As with host unregistration, callers must drain transfers first.
+        super().destroy()
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
+        # Transfer views also retain the host allocation after kv_buffer clears.
+        self.data_refs = None
+        self.data_ptrs = None
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
