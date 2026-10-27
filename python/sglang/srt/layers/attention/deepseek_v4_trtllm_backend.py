@@ -36,7 +36,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import ceil_align, ceil_div
+from sglang.srt.utils import ceil_align, ceil_div, print_info_once
 
 try:
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
@@ -220,6 +220,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     """DSV4 attention through the trtllm-gen sparse MLA kernel."""
 
     trtllm_attn: bool = True
+    # FlashInfer kernel choice (--dsv4-trtllm-flashinfer-backend); set in __init__.
+    trtllm_fi_backend: str = "trtllm-gen"
 
     def __init__(
         self,
@@ -251,6 +253,14 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self.trtllm_counter_buffer = _get_trtllm_counter_buffer(
             model_runner, self.device
         )
+        self.trtllm_fi_backend = get_exec().kernel.dsv4_trtllm_flashinfer_backend
+        if self.trtllm_fi_backend == "auto":
+            from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+
+            # This backend runs only on SM10x; FlashInfer raises for an SM10x
+            # outside SM100/SM103/SM107 (SM12x's "auto" is another call surface).
+            resolved = _resolve_dsv4_sparse_mla_backend(self.device, "auto")
+            print_info_once(f"DSv4 trtllm attention: FlashInfer 'auto' -> {resolved!r}")
         self.trtllm_graph_output_buffer: torch.Tensor | None = None
         self.trtllm_eager_output_buffer: torch.Tensor | None = None
         # (buffer, rows, real rows) whose pad tail is already zero (kernel writes [:real]).
@@ -544,7 +554,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            backend="trtllm-gen",
+            backend=self.trtllm_fi_backend,
             # The kernel loads sparse_topk_lens before griddepcontrol.wait, so
             # it must not overlap the tail refresh that just wrote them.
             enable_pdl=False if refreshed else None,
@@ -656,7 +666,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            backend="trtllm-gen",
+            backend=self.trtllm_fi_backend,
             enable_pdl=False if refreshed else None,  # as in decode
         )
         return out_padded if out_padded is not None else out.view(sum_q, num_heads, 512)

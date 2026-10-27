@@ -1515,6 +1515,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>sgl-kernel</code>, <code>torch</code>, <code>flashinfer</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsv4-trtllm-flashinfer-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer backend that `--dsv4-attn-backend trtllm` requests from `trtllm_batch_decode_sparse_mla_dsv4`. `trtllm-gen` pins the trtllm-gen kernels; `auto` (SM100/SM103/SM107 only) lets FlashInfer choose and logs its choice at startup.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`trtllm-gen`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>trtllm-gen</code>, <code>auto</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-deepseek-v4-fp4-indexer`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the experimental FP4 C4 indexer path for DeepSeek V4. When unset, SGLang keeps the default DeepSeek V4 indexer path. Requires SM100 GPUs with DeepGEMM FP4 indexer support.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>

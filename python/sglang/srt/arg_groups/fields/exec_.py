@@ -342,6 +342,16 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    dsv4_trtllm_flashinfer_backend: A[
+        str,
+        Arg(
+            help="FlashInfer backend that --dsv4-attn-backend trtllm requests from "
+            "trtllm_batch_decode_sparse_mla_dsv4. 'trtllm-gen' (default) pins the "
+            "trtllm-gen kernels; 'auto' (SM100/SM103/SM107) lets FlashInfer choose "
+            "and logs its choice at startup.",
+            choices=["trtllm-gen", "auto"],
+        ),
+    ] = "trtllm-gen"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
