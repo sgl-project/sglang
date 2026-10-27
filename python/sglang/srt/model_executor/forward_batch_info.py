@@ -2084,16 +2084,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_prefix_lens = self._pad_tensor_to_size(
                 self.extend_prefix_lens, bs
             )
+        # Rebind, never extend in place: pre-pad attention plans hold these lists,
+        # and extend_logprob_start_lens_cpu aliases the ScheduleBatch's list.
         if self.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu.extend(
-                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            self.extend_seq_lens_cpu = self.extend_seq_lens_cpu + [dummy_extend_len] * (
+                bs - len(self.extend_seq_lens_cpu)
             )
         if self.extend_prefix_lens_cpu is not None:
-            self.extend_prefix_lens_cpu.extend(
-                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            self.extend_prefix_lens_cpu = self.extend_prefix_lens_cpu + [0] * (
+                bs - len(self.extend_prefix_lens_cpu)
             )
         if self.extend_logprob_start_lens_cpu is not None:
-            self.extend_logprob_start_lens_cpu.extend(
+            self.extend_logprob_start_lens_cpu = self.extend_logprob_start_lens_cpu + (
                 [0] * (bs - len(self.extend_logprob_start_lens_cpu))
             )
 
@@ -2251,6 +2253,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        # Full aux capture keeps both outputs on the same token rows.
+        if (
+            logits_output.hidden_states is not None
+            and logits_output.last_hidden_states is not None
+        ):
+            logits_output.last_hidden_states = logits_output.last_hidden_states[
+                : logits_output.hidden_states.shape[0]
+            ]
 
     @property
     def can_run_tbo(self):
