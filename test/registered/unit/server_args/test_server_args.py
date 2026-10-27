@@ -48,6 +48,7 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     handle_kv_cache_sharding,
     validate_kv_shard_attention_backend,
 )
+from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -118,7 +119,7 @@ from sglang.test.test_utils import (
     enter_scope,
 )
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
@@ -221,6 +222,28 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(separated._radix_eviction_policy_explicitly_set)
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
+    def test_amd_monokernel_flag_spellings_in_config_and_cli(self):
+        """The deprecated --monokernel-backend amd and --enable-amd-monokernel share a
+        dest; a config file must accept either key, true or false, not reject both."""
+        cases = (
+            ("monokernel-backend: amd\n", [], True),
+            ("enable-amd-monokernel: true\n", [], True),
+            ("enable-amd-monokernel: false\n", [], False),
+            (None, ["--enable-amd-monokernel"], True),
+            (None, ["--monokernel-backend", "amd"], True),
+        )
+        for config, cli, expected in cases:
+            with self.subTest(config=config, cli=cli):
+                argv = ["--model-path", "dummy", *cli]
+                if config is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False
+                    ) as f:
+                        f.write(config)
+                    self.addCleanup(os.unlink, f.name)
+                    argv += ["--config", f.name]
+                self.assertIs(prepare_server_args(argv).enable_amd_monokernel, expected)
 
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
@@ -493,6 +516,14 @@ class TestPrepareServerArgs(CustomTestCase):
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-min-bs must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval_min_bs=-1
+            ).resolve_once()
 
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
@@ -1271,6 +1302,28 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
+
+
+class TestLoraForwardDomains(unittest.TestCase):
+    def test_rejects_concurrent_forwards(self):
+        for runner in ("auto", "lora_cutedsl"):
+            for options in (
+                {"enable_pdmux": True},
+                {"enable_two_batch_overlap": True},
+            ):
+                with self.subTest(runner=runner, options=options):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        tp_size=2,
+                        enable_lora=True,
+                        lora_backend="triton_v2",
+                        moe_runner_backend=runner,
+                        max_lora_rank=8,
+                        lora_target_modules=["down_proj"],
+                        **options,
+                    )
+                    with self.assertRaises(ValueError):
+                        check_lora_server_args(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -2345,6 +2398,26 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_dcp_storage_rejects_buffer_only(self):
+        for dcp_size in (2, 8):
+            for backend in ("file", "mooncake"):
+                with self.subTest(dcp_size=dcp_size, backend=backend):
+                    args = self._make_args(
+                        enable_hierarchical_cache=True,
+                        hicache_host_memory_mode="buffer_only",
+                        hicache_storage_backend=backend,
+                        dcp_size=dcp_size,
+                        tp_size=dcp_size,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                            return_value=True,
+                        ),
+                        self.assertRaisesRegex(NotImplementedError, "buffer_only"),
+                    ):
+                        handle_hicache(args)
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through
@@ -2455,6 +2528,42 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "dcp_mooncake_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "layer_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "layer_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first_direct",
+                    "hicache_io_backend": "direct",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "unified_memory_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -2494,7 +2603,11 @@ class TestHiCacheArgs(CustomTestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 args = self._make_args(**case["overrides"])
-                handle_hicache(args)
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    handle_hicache(args)
                 self._assert_hicache_fields(
                     args,
                     expected_io_backend=case["expected_io_backend"],
@@ -3997,6 +4110,23 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ]
         return args
 
+    def test_sharding_defaults_to_python_when_backend_is_unset(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertEqual(
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
+            )
+
+    def test_unsharded_launch_keeps_the_general_backend_default(self):
+        args = self._args(enable_kv_cache_sharding=False)
+        with patch.dict(os.environ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
+            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
+
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
 
@@ -4082,6 +4212,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         args = self._args(enable_hisparse=True)
 
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
+            handle_kv_cache_sharding(args)
+
+    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        args = self._args(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):
@@ -4512,14 +4654,14 @@ class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
-    """The graph-captured TP LM-head all-to-all must not run with NCCL's
-    graph buffer registration: registered graph-pool temporaries deadlock the
-    exchange under DP-rank ramps."""
+    """A decode graph that can capture a collective must not run with NCCL's
+    graph buffer registration: the registered graph-pool temporaries alias
+    tensors the pool hands out later, and replay then deadlocks."""
 
     def _resolve(self, **kwargs):
         # The handler reads the DP-adjusted prefill knobs the pipeline would
         # have settled by then; the dummy-model pipeline itself returns early.
-        server_args = ServerArgs(
+        fields = dict(
             model_path="dummy",
             attn_dp_size=2,
             tp_size=2,
@@ -4527,8 +4669,9 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(backend=Backend.DISABLED)
             ),
-            **kwargs,
         )
+        fields.update(kwargs)
+        server_args = ServerArgs(**fields)
         parallel_hook.handle_data_parallelism(server_args)
         return server_args
 
@@ -4548,9 +4691,9 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
             self.assertEqual(os.environ["NCCL_GRAPH_REGISTER"], "1")
             self.assertIn("NCCL_GRAPH_REGISTER=1", "\n".join(logs.output))
 
-    def test_without_all_to_all_env_is_untouched(self):
-        # Unified serving keeps the all-to-all off by default, and a decode
-        # node with the DP LM head never takes the all-to-all.
+    def test_without_all_to_all_registration_still_defaults_off(self):
+        # The hazard is the graph-captured collective, not the feature that
+        # happens to issue it, so the default holds with the all-to-all off.
         for kwargs in (
             {},
             {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
@@ -4561,7 +4704,67 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                 self.assertFalse(
                     resolution_result(server_args, "enable_tp_lm_head_all_to_all")
                 )
-                self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+                self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_plain_tp_defaults_off(self):
+        # The motivating shape: plain TP with the all-to-all and memory saver off.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(
+                attn_dp_size=1,
+                tp_size=2,
+                enable_tp_lm_head_all_to_all=False,
+                enable_memory_saver=False,
+            )
+            self.assertFalse(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_pausable_graph_pool_defaults_off(self):
+        # Isolates the torch_memory_saver trigger: the all-to-all stays off, so
+        # only the remapped graph pool can account for the default.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(enable_memory_saver=True)
+            self.assertFalse(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_prefill_only_capture_defaults_off(self):
+        # Decode capture off, prefill still capturing into the same pausable
+        # pool: the collective is in a graph either way, so the registration has
+        # to go regardless of which phase holds it.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            self._resolve(
+                enable_memory_saver=True,
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(backend=Backend.DISABLED),
+                    prefill=PhaseConfig(backend=Backend.FULL),
+                ),
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
+    def test_single_rank_env_is_untouched(self):
+        # One rank issues no collective, so a capture registers nothing.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            self._resolve(attn_dp_size=1, tp_size=1)
+            self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+    def test_disabled_decode_graph_env_is_untouched(self):
+        # Without a decode graph no registration outlives the collective.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            self._resolve(
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(backend=Backend.DISABLED),
+                    prefill=PhaseConfig(backend=Backend.DISABLED),
+                )
+            )
+            self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
