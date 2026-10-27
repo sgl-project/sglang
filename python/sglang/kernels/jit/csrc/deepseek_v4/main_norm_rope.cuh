@@ -444,6 +444,15 @@ constexpr uint32_t kFusedKV41WarpsPerCTA = 4;
 // Below this many tokens the block-per-token kernel is as fast (decode, short prefill).
 constexpr uint32_t kFusedKV41MinTokens = 2048;
 
+// HIP's __shfl_xor_sync traps if a masked lane has returned, and a returned warp idles half a wave64
+SGL_DEVICE float shfl_xor_in_warp(float value, uint32_t lane_mask) {
+#ifndef USE_ROCM
+  return __shfl_xor_sync(0xffffffffu, value, lane_mask);
+#else
+  return __shfl_xor(value, lane_mask);
+#endif
+}
+
 template <
     typename DType,
     int64_t kHeadDim,
@@ -510,7 +519,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   for (uint32_t mask = 2; mask >= 1; mask >>= 1) {
 #pragma unroll
     for (uint32_t p = 0; p < kPairs; ++p)
-      sums[p] += __shfl_xor_sync(0xffffffffu, sums[p], mask);
+      sums[p] += shfl_xor_in_warp(sums[p], mask);
   }
 #pragma unroll
   for (uint32_t half = kPairs / 2; half >= 1; half >>= 1) {
@@ -521,7 +530,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   float sum_of_squares = sums[0];
 #pragma unroll
   for (uint32_t mask = 16; mask >= 4; mask >>= 1)
-    sum_of_squares += __shfl_xor_sync(0xffffffffu, sum_of_squares, mask);
+    sum_of_squares += shfl_xor_in_warp(sum_of_squares, mask);
   const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
   // As in the reference: round the normed values, rotate the RoPE tail, round again.

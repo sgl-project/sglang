@@ -126,9 +126,13 @@ class DeviceExecutor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         r = self.residency
-        topk_ids = dispatch_output.topk_output.topk_ids
+        topk_output = dispatch_output.topk_output
+        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
+        run_ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+        run_w = torch.empty(topk_ids.shape, dtype=torch.float32, device=topk_ids.device)
         paged_experts_decide(
             topk_ids.flatten().to(torch.int32),
+            topk_weights.flatten().to(torch.float32),
             r.step,
             r.slot_expert,
             r.expert_slot,
@@ -136,11 +140,19 @@ class DeviceExecutor:
             r.src,
             r.dst,
             r.count,
+            run_ids.view(-1),
+            run_w.view(-1),
         )
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
-        # Every routed expert is now resident; padding (-1) stays masked.
-        slots = r.expert_slot[topk_ids.clamp(min=0)].masked_fill(topk_ids < 0, -1)
-        partial = run_on_slots(self.base_method, layer, dispatch_output, slots)
+        # Every routed expert is now resident; padding got slot 0 and weight 0.
+        wave_output = dispatch_output._replace(
+            topk_output=topk_output._replace(
+                topk_ids=run_ids, topk_weights=run_w.to(topk_weights.dtype)
+            )
+        )
+        partial = self.base_method.apply(
+            layer=layer, dispatch_output=wave_output
+        ).hidden_states
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=partial,
