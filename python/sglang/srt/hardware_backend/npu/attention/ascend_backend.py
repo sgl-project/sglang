@@ -101,6 +101,8 @@ class ForwardMetadata:
     # seq len inputs
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
+    # FIA Host KV lengths: global for ordinary MLA, rank-local for MLA DCP.
+    # In graph mode this seeds capture; Runner rebinds the live replay list.
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
@@ -529,7 +531,9 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
-        seq_lens_cpu = (
+        # Capture reads the graph's device prefix once. Replay uses the live
+        # Host input: DFlash/DSPARK already include verify KV, other inputs do not.
+        host_seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
         if in_capture:
@@ -538,7 +542,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
-                prefix_lens_cpu=seq_lens_cpu,
+                prefix_lens_cpu=host_seq_lens_cpu,
                 spec_info=forward_batch.spec_info,
             )
             if (
@@ -546,13 +550,16 @@ class AscendAttnBackend(AttentionBackend):
                 and forward_batch.forward_mode.is_target_verify()
                 and _is_dflash_verify(forward_batch.spec_info)
             ):
-                # Match the DFlash worker's Host bound for page-table preparation.
-                seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
+                # _init consumed prefix lengths. _apply expects the worker's
+                # DFlash/DSPARK Host convention, including the verify block.
+                host_seq_lens_cpu = (
+                    host_seq_lens_cpu + self.speculative_num_draft_tokens
+                )
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=host_seq_lens_cpu,
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
@@ -701,19 +708,19 @@ class AscendAttnBackend(AttentionBackend):
 
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
-            global_kv_lens_cpu = metadata.seq_lens_cpu_int
-            local_seq_lens_cpu, metadata.block_tables = (
+            global_host_kv_lens_cpu = metadata.seq_lens_cpu_int
+            local_host_kv_lens_cpu, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
-                    global_kv_lens_cpu, forward_batch.req_pool_indices
+                    global_host_kv_lens_cpu, forward_batch.req_pool_indices
                 )
             )
-            metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
+            metadata.seq_lens_cpu_list = local_host_kv_lens_cpu.tolist()
             if forward_batch.forward_mode.is_target_verify():
                 query_len = int(forward_batch.spec_info.draft_token_num)
                 # Pinned Host storage keeps this async copy from waiting on NPU work.
                 metadata.dcp_spec_seq_lens = (
                     get_dcp_chain_spec_lens(
-                        global_kv_lens_cpu,
+                        global_host_kv_lens_cpu,
                         query_len,
                         self.dcp_size,
                         self.dcp_rank,
@@ -968,19 +975,25 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         if self.dense_mla_dcp_target:
-            seq_lens_cpu = prefix_lens_cpu.cpu()
+            # Capture-only Host seed. The caller already copied device prefixes
+            # to CPU; these additions do not advance the request's actual length.
+            global_host_kv_lens_cpu = prefix_lens_cpu
             if forward_mode.is_target_verify():
-                seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
+                global_host_kv_lens_cpu = (
+                    global_host_kv_lens_cpu + self.speculative_num_draft_tokens
+                )
             elif forward_mode.is_decode_or_idle() and spec_info is not None:
-                seq_lens_cpu = seq_lens_cpu + self.speculative_step_id + 1
-            local_seq_lens = get_dcp_lens(
-                seq_lens_cpu,
+                global_host_kv_lens_cpu = (
+                    global_host_kv_lens_cpu + self.speculative_step_id + 1
+                )
+            local_host_kv_lens_cpu = get_dcp_lens(
+                global_host_kv_lens_cpu,
                 self.dcp_size,
                 self.dcp_rank,
                 interleave_size=self.page_size,
             )
-            metadata.seq_lens_cpu_list = local_seq_lens.tolist() + [0] * (
-                bs - local_seq_lens.numel()
+            metadata.seq_lens_cpu_list = local_host_kv_lens_cpu.tolist() + [0] * (
+                bs - local_host_kv_lens_cpu.numel()
             )
         else:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
@@ -1157,7 +1170,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[:bs, total_pages:].fill_(0)
 
         if self.dense_mla_dcp_target:
-            # Use the existing Host lengths for table bounds without a device readback.
+            # Per-iteration table bounds use Host KV lengths. The capture Host
+            # list stays unchanged here; Runner prepares graph.update's live list.
             _, block_tables = self._get_kv_lens_and_block_tables(
                 attention_kv_lens_cpu,
                 req_pool_indices[:bs],
@@ -1219,16 +1233,19 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        # Device-derived KV lengths drive query visibility independently of the
+        # Host table bound, which can lead the device tensor under overlap.
+        device_kv_lens = seq_lens
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            device_kv_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_offset_npu
+            device_kv_lens = seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
                 local_query_lens = get_dcp_chain_spec_lens(
-                    seq_lens[:bs],
+                    device_kv_lens[:bs],
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
@@ -1253,10 +1270,10 @@ class AscendAttnBackend(AttentionBackend):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:
-                    kv_lens = seq_lens[:bs]
+                    kv_lens = device_kv_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         if not self.dense_mla_dcp_target:
-            metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+            metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
 
         self.forward_metadata = metadata
 
