@@ -149,6 +149,9 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.amd import (
+    deepseek_v4_token_parallel as token_parallel,
+)
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
@@ -2234,7 +2237,12 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
+        tp_state = token_parallel.token_parallel_state(forward_batch)
+        if tp_state is not None:
+            x, qkv_a = token_parallel.project_inputs(self, x, tp_state)
+            x_linear = x
+            q_lora = qkv_a[..., : self.q_lora_rank]
+        elif self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
@@ -2692,6 +2700,11 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
 
+        # Under token-parallel prefill x holds this rank's rows; attention covers all T.
+        tp_state = token_parallel.token_parallel_state(forward_batch)
+        assert tp_state is None or not (enable_multi_stream or low_ratio_multi_stream)
+        num_tokens = x.shape[0] if tp_state is None else tp_state.num_tokens
+
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
         if self.use_mega_attention:
@@ -2728,7 +2741,7 @@ class MQALayer(MqaAttentionBase):
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
-                else self._kernel_num_heads(x.shape[0])
+                else self._kernel_num_heads(num_tokens)
             )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
@@ -2740,9 +2753,9 @@ class MQALayer(MqaAttentionBase):
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
                     # the per-forward memset.
-                    q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+                    q_padded = x.new_zeros(num_tokens, kernel_num_heads, self.head_dim)
                 else:
-                    q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
+                    q_padded = x.new_empty(num_tokens, kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
@@ -3050,10 +3063,15 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return self._project_wo_b(o, defer_all_reduce, tp_state=tp_state)
 
-    def _project_wo_b(self, o, defer_all_reduce: bool = False):
+    def _project_wo_b(self, o, defer_all_reduce: bool = False, tp_state=None):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+
+        if tp_state is not None:
+            # Partial sums over all T go back to this rank's rows.
+            o, _ = self.wo_b(o.flatten(1), skip_all_reduce=True)
+            return tp_state.reduce_scatter(o)
 
         defer_all_reduce = defer_all_reduce and (
             self.attn_tp_size > 1
@@ -4488,6 +4506,15 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 positions,
             )
+        tp_state = token_parallel.enter_token_parallel(
+            self,
+            forward_batch,
+            hidden_states,
+            input_ids,
+            eligible=not (run_tbo or capture_dspark),
+        )
+        if tp_state is not None:
+            hidden_states = tp_state.scatter(hidden_states)
         last_pre = None
         tail = None
         if self.hc_pre_from_prev_sublayer:
@@ -4571,6 +4598,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
+            if tp_state is not None:
+                hidden_states = tp_state.all_gather(hidden_states)
+                token_parallel.exit_token_parallel(forward_batch)
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.

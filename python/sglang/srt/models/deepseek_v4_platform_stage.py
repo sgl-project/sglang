@@ -15,6 +15,9 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models.deepseek_common.amd import (
+    deepseek_v4_token_parallel as token_parallel,
+)
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     _gfx95_dense_post_attention_norm,
     apply_attention_mhc,
@@ -295,6 +298,12 @@ class NonCudaDecoderMixin:
             )
         else:
             x_quant = None
+        # Token-parallel prefill hands attention this rank's rows: it all-gathers its
+        # input projections and reduce-scatters wo_b back to these rows.
+        assert (
+            x_quant is None
+            or token_parallel.token_parallel_state(forward_batch) is None
+        )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -333,6 +342,12 @@ class NonCudaDecoderMixin:
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
+        tp_state = token_parallel.token_parallel_state(forward_batch)
+        if tp_state is not None:
+            assert not return_moe_output
+            return token_parallel.run_moe(
+                self.mlp, hidden_states, forward_batch, tp_state
+            )
         prepared = MoeRowTransport(
             self.mlp,
             hidden_states,
