@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -30,6 +32,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -40,8 +43,6 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -211,10 +212,14 @@ def build_kv_host_pool(
         kwargs.update(mha_kwargs)
     parallel = get_parallel()
     if parallel.dcp_enabled:
-        assert use_mla, (
-            "HiCache + DCP is only wired for the MLA host pool; the MHA host "
-            "pool has no DCP index translation."
-        )
+        if not use_mla and (
+            kv_host_pool_cls is not MHATokenToKVPoolHost
+            or host_input.dtype not in (torch.bfloat16, torch.float16)
+            or mtp_draft_device_pools
+        ):
+            raise ValueError(
+                "MHA HiCache + DCP requires a standard FP16/BF16 host pool without drafts."
+            )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
     return kv_host_pool_cls(

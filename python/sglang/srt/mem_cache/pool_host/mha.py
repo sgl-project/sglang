@@ -28,6 +28,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import (
     KVScaleLayout,
     MHABufferInfo,
@@ -152,6 +153,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         pool_label: str = "kv",
         head_group_num: int = 1,
         host_token_capacity: int | None = None,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -222,6 +225,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type=allocator_type,
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
         self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
         self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)
@@ -433,6 +438,14 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if not is_draft and not 0 <= layer_id < self.target_layer_num:
             return
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
+        if host_indices.numel() == 0:
+            return
         host_layer_id = layer_id
 
         if io_backend != "kernel_ascend":
@@ -579,6 +592,14 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
+        if host_indices.numel() == 0:
+            return
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.
