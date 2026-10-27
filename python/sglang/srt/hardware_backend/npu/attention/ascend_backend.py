@@ -727,7 +727,7 @@ class AscendAttnBackend(AttentionBackend):
                         interleave_size=self.page_size,
                     )
                     .pin_memory()
-                    .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                    .to(device=self.device, non_blocking=True)
                 )
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
