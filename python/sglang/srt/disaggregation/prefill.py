@@ -504,11 +504,11 @@ class PrefillBootstrapQueue:
     def can_prefill_before_bootstrap(self, req: Req) -> bool:
         """Check eligibility; pause and metadata admission stay in the shared queue."""
         return (
-            req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+            req.disagg.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
             or get_disagg().disaggregation_decode_allocation_policy
             == "prefill_complete"
         ) and not (
-            _uses_write_through_cache(self.scheduler.tree_cache)
+            _uses_write_through_cache(self.tree_cache)
             and req.swa_branching_seqlen is not None
             and req.swa_branching_seqlen > req.kv.cache_protected_len
         )
