@@ -1181,11 +1181,30 @@ class LowRatioCompressAscendBackendMixin:
                 layer, x, q_lora, pos, forward_batch, candidate=True
             )
             fm.dsv41_candidate_blocks = blocks
+            lengths = None
         elif indexer.uses_candidates:
-            topk = self._dsv41_index_qsli_topk(layer, x, q_lora, pos, forward_batch)
+            topk, lengths = self._dsv41_index_qsli_topk(
+                layer, x, q_lora, pos, forward_batch
+            )
         else:
             topk, _ = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
+            lengths = None
         setattr(fm, f"c{ratio}_topk_indices", topk)
+        # MQSMLA needs the *exact* valid prefix of cmp_sparse_indices (README
+        # L109). QSLI only fills the candidate tokens, far fewer than the visible
+        # length, so a consumer layer publishes its own count; the full-top-k
+        # paths keep using the visible length.
+        setattr(
+            fm,
+            f"c{ratio}_topk_length",
+            (
+                self._dsv41_cmp_topk_length(forward_batch, ratio)
+                if lengths is None
+                else (lengths * indexer.candidate_block_size)
+                .clamp_max(int(self._dsv4_index_topk))
+                .to(torch.int32)
+            ),
+        )
         # No indexer-topk capture here: get_num_indexer_layers() sizes that
         # capturer from the ratio-4 layers (model_config.py L482-L484), which
         # DeepSeek-V4.1 has none of, so the capturer is disabled for it -- and
@@ -1520,7 +1539,9 @@ class LowRatioCompressAscendBackendMixin:
             layout_k="PA_BBND",
             return_value=False,
         )
-        return indices.view(t, topk).to(torch.int32)
+        # The valid prefix is the candidate tokens, not the visible length: the
+        # caller publishes it as cmp_topk_length.
+        return indices.view(t, topk).to(torch.int32), candidate_lengths
 
     def _dsv41_index_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """QLI dispatch tables, one per low ratio (the ``[1024]`` int32 tensor the
@@ -1823,6 +1844,9 @@ class LowRatioCompressAscendBackendMixin:
             # Reserved by the operator (README L107); derived like the rest so
             # the value is live rather than capture-time.
             compressed_lens = (forward_batch.seq_lens // compress_ratio).to(torch.int32)
+            topk_length = getattr(fm, f"c{compress_ratio}_topk_length", None)
+            if topk_length is None:
+                topk_length = self._dsv41_cmp_topk_length(forward_batch, compress_ratio)
             attn_kwargs.update(
                 cmp_kv=pool.get_compress_buffer(layer.layer_id, False).view(
                     torch.uint8
@@ -1833,11 +1857,10 @@ class LowRatioCompressAscendBackendMixin:
                 ),
                 # seqused_cmp_kv is reserved by the operator (README L107).
                 seqused_cmp_kv=compressed_lens,
-                # One length per query row, capped by index_topk (recipes
-                # attention_data.py L891-L904).
-                cmp_topk_length=self._dsv41_cmp_topk_length(
-                    forward_batch, compress_ratio
-                ),
+                # The indexer publishes the exact valid prefix per row (QLI: the
+                # visible length capped by index_topk; QSLI: the candidate
+                # tokens), which MQSMLA requires (README L109).
+                cmp_topk_length=topk_length,
             )
         attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
         return attn_out
