@@ -67,22 +67,23 @@ sgl-eval run gsm8k \\
   },
 
   // LFM3 support ships on SGLang `main`; not yet in a tagged release, so the
-  // nightly dev image is the pinned Docker path.
+  // pinned Docker path is the PR-head dev image built from #46858. No pip
+  // release carries LFM3 yet — NVIDIA cells are Docker-only for now.
   dockerImages: {
-    h100: "lmsysorg/sglang:dev",
-    h200: "lmsysorg/sglang:dev",
-    b200: "lmsysorg/sglang:dev",
-    b300: "lmsysorg/sglang:dev",
-    gb200: "lmsysorg/sglang:dev",
-    gb300: "lmsysorg/sglang:dev",
+    h100: "lmsysorg/sglang:dev-lfm3",
+    h200: "lmsysorg/sglang:dev-lfm3",
+    b200: "lmsysorg/sglang:dev-lfm3",
+    b300: "lmsysorg/sglang:dev-lfm3",
+    gb200: "lmsysorg/sglang:dev-lfm3",
+    gb300: "lmsysorg/sglang:dev-lfm3",
     // DGX Spark (GB10, sm121) needs a CUDA 13 build.
-    "dgx-spark": "lmsysorg/sglang:dev-cu13",
+    "dgx-spark": "lmsysorg/sglang:dev-cu13-lfm3",
     // mi* intentionally unmapped: no published ROCm image carries LFM3 support
     // yet, so `runModes` below hides the Docker tab on AMD.
   },
 
   runModes: (s) => (["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw)
-    ? ["python"] : ["python", "docker"]),
+    ? ["python"] : ["docker"]),
 
   // Prefills the issue template's `model` field on "Submit verified cell".
   github: {

@@ -10,32 +10,20 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install).
+
+<Note>
+LFM3 support ships on SGLang `main` and is **not yet in a tagged release**, so `pip install sglang` will not include it. Use the Docker image below (recommended), or install from source — on AMD, source install is currently the only path, and the command panel's **Python** output assumes an environment built that way.
+</Note>
 
 <Tabs>
 
-<Tab title="Python (pip / uv)">
-
-```bash Command
-pip install --upgrade pip
-pip install uv
-uv pip install --prerelease=allow sglang
-```
-
-<Note>
-LFM3 support — the `Lfm3ForCausalLM` and `Lfm3VlForConditionalGeneration` model classes — ships on SGLang `main` and is not yet in a tagged release. If your installed release predates it, install from source or use the Docker dev image.
-</Note>
-
-Then run the **Python** output of the command panel below in that environment.
-
-</Tab>
-
 <Tab title="Docker">
 
-LFM3 support ships in the nightly SGLang dev image:
+LFM3 support ships in the dev image built from the model support PR:
 
 ```bash Command
-docker pull lmsysorg/sglang:dev
+docker pull lmsysorg/sglang:dev-lfm3
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
@@ -47,7 +35,7 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
     --ipc=host \
-    lmsysorg/sglang:dev \
+    lmsysorg/sglang:dev-lfm3 \
     sglang serve <use args below>
 ```
 
