@@ -20,8 +20,10 @@ here in the new region-spec shape and asserted against the same expected
 output dicts. Any divergence indicates a regression in the new executor."""
 
 import copy
+import json
 import random
 import unittest
+from unittest import mock
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
@@ -29,7 +31,7 @@ from sglang.srt.parser.chat_parsing.response_templates import load_response_temp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 cohere_template = {
@@ -1603,6 +1605,26 @@ class ToolArgCoercionTest(unittest.TestCase):
         # Non-boolean text stays a string rather than silently becoming False.
         self.assertEqual(_coerce("maybe", ("boolean",)), "maybe")
 
+    def test_coerce_number_keeps_large_integers_exact(self):
+        for raw in ("9007199254740993", "-9007199254740993"):
+            self.assertEqual(_coerce(raw, ("number",)), int(raw))
+
+    def test_coerce_string_union_keeps_text_that_is_not_json_of_another_type(self):
+        # Any text is a valid string, so text that only a permissive cast would accept stays a string ...
+        for raw, types in [("007", ("string", "integer")), ("123_456", ("integer", "string")), (" 7", ("string", "integer")),
+                           ("1", ("string", "boolean")), ("True", ("string", "boolean")), ("None", ("string", "null"))]:
+            self.assertEqual(_coerce(raw, types), raw)
+        # ... while exact JSON of another declared type keeps its precedence.
+        self.assertEqual(_coerce("7", ("string", "integer")), 7)
+        self.assertIs(_coerce("true", ("string", "boolean")), True)
+        self.assertIsNone(_coerce("null", ("string", "null")))
+
+    def test_coerce_keeps_text_when_json_decoding_hits_the_recursion_limit(self):
+        # How deeply JSON must nest to exhaust the decoder depends on the Python version.
+        with mock.patch("json.loads", side_effect=RecursionError):
+            for types in [("array",), ("object",)]:
+                self.assertEqual(_coerce("[[1]]", types), "[[1]]")
+
     def test_coerce_object_array_require_matching_json(self):
         # A JSON object body is only accepted for an `object` param, a JSON array only for `array`.
         self.assertEqual(_coerce("[1, 2]", ("object",)), "[1, 2]")
@@ -1782,6 +1804,88 @@ class ToolArgCoercionTest(unittest.TestCase):
         with_tools = parse_response(model_out, cohere_template, prefix="", tools=_SET_ALARM_TOOLS)
         self.assertEqual(without, with_tools)
         self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True})
+
+    def test_json_strings_stay_strings_where_the_schema_allows_one(self):
+        # A decoded JSON string is explicit, so a string union keeps it, while other params still cast it ...
+        tools = _set_alarm_tools(label={"type": ["string", "integer"]}, hour={"type": "integer"})
+        json_body = '<tool_call>{"name": "set_alarm", "arguments": {"label": "123", "hour": "7"}}</tool_call>'
+        json_values = (
+            "<tool_call>\n<function=set_alarm>\n"
+            '<parameter=label>\n"123"\n</parameter>\n'
+            '<parameter=hour>\n"7"\n</parameter>\n'
+            "</function>\n</tool_call>"
+        )
+        for model_out, template in [(json_body, smollm_template), (json_values, qwen3_template)]:
+            with self.subTest(model_out=model_out):
+                parsed = parse_response(model_out, template, prefix="", tools=tools)
+                self.assertEqual(_first_tool_args(parsed), {"label": "123", "hour": 7})
+        # ... unlike raw text, which could be either type.
+        raw_text = "<tool_call>\n<function=set_alarm>\n<parameter=label>\n123\n</parameter>\n</tool_call>"
+        parsed = parse_response(raw_text, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=tools)
+        self.assertEqual(_first_tool_args(parsed), {"label": 123})
+
+
+_CALL_TRANSFORM = {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}}
+_JSON_BODY_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {"tool_calls": {"open_pattern": r"<call:(?P<name>\w+)>", "close": "</call>", "repeats": True, "content": "json", "transform": _CALL_TRANSFORM}},
+}
+_XML_BODY_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {"tool_calls": {
+        "open_pattern": r"<call:(?P<name>\w+)>", "close": "</call>", "repeats": True, "content": "xml-inline",
+        "content_args": {"tag_pattern": r'<p name="(?P<key>[^"]+)">(?P<value>.*?)</p>'}, "transform": _CALL_TRANSFORM,
+    }},
+}
+_QUOTED_END_TEMPLATE = copy.deepcopy(_XML_BODY_TEMPLATE)
+_QUOTED_END_TEMPLATE["fields"]["tool_calls"]["content_args"]["tag_pattern"] = r'<arg:(?P<key>\w+)>(?P<value>.*?)"X'
+_OBJECT_TOOLS = [{"type": "function", "function": {"name": "f", "strict": True, "parameters": {"type": "object", "properties": {
+    "obj": {"type": "object"}, "v": {"type": "object"}, "w": {"type": "object"}}}}}]
+
+
+class ConstrainedToolBodyTest(CustomTestCase):
+    """Under a grammar that keeps tool-call bodies well-formed, a closer inside a JSON string, a strict tool's JSON
+    value or a parameter name is part of the call; without it the first closer still ends the call."""
+
+    def _calls(self, template, chunks, constrained, tools=None):
+        parser = ResponseParser(template, prefix="", tools=tools, constrained=constrained)
+        for chunk in chunks:
+            parser.feed(chunk)
+        message, _ = parser.finalize()
+        return [(call["function"]["name"], call["function"]["arguments"]) for call in message.get("tool_calls", [])]
+
+    def test_closers_inside_bodies_are_content_only_under_the_grammar(self):
+        """A quote in a parameter's end must not let a JSON value absorb the parameters
+        after it."""
+        cases = [
+            (_JSON_BODY_TEMPLATE, '<call:f>{"a": "x</call>y"}</call>', None, [("f", {"a": "x</call>y"})], []),
+            (_XML_BODY_TEMPLATE, '<call:f><p name="obj">{"a": "x</p></call>y"}</p></call>', _OBJECT_TOOLS,
+             [("f", {"obj": {"a": "x</p></call>y"}})], [("f", {"obj": '{"a": "x'})]),
+            (_XML_BODY_TEMPLATE, '<call:f><p name="a</call>b">x</p></call>', None, [("f", {"a</call>b": "x"})], [("f", {})]),
+            (_QUOTED_END_TEMPLATE, '<call:f><arg:v>{"x": "a\\"Xb"}"X<arg:w>{"x": "</call>"}"X</call>', _OBJECT_TOOLS,
+             [("f", {"v": {"x": 'a"Xb'}, "w": {"x": "</call>"}})], [("f", {"v": '{"x": "a\\'})]),
+            (_QUOTED_END_TEMPLATE, '<call:f><arg:v>{"x": "Xy"}"X<arg:w>{}"X</call>', _OBJECT_TOOLS,
+             [("f", {"v": {"x": "Xy"}, "w": {}})], [("f", {"v": '{"x": ', "w": {}})]),
+        ]
+        for template, text, tools, constrained, unconstrained in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self._calls(template, [text], False, tools), unconstrained)
+                # Every split of the stream reads the same calls as the whole text.
+                for chunks in [[text[:i], text[i:]] for i in range(len(text))] + [list(text)]:
+                    self.assertEqual(self._calls(template, chunks, True, tools), constrained, chunks)
+
+    def test_body_cut_off_under_the_grammar_yields_no_call(self):
+        # A length cut leaves a well-formed body open, so it yields no call.
+        self.assertEqual(self._calls(_JSON_BODY_TEMPLATE, ['<call:f>{"a": "x</call>'], True), [])
+
+    def test_json_completion_distinguishes_quote_closers(self):
+        template = copy.deepcopy(_JSON_BODY_TEMPLATE)
+        template["fields"]["tool_calls"]["close"] = '"END'
+        for value in ({"x": '"END'}, ['"END'], '"END', 7, True, None):
+            text = '<call:f>' + json.dumps(value) + '"END'
+            for chunks in [[text[:i], text[i:]] for i in range(len(text))] + [list(text)]:
+                with self.subTest(value=value, chunks=chunks):
+                    self.assertEqual(self._calls(template, chunks, True), [("f", value)])
 
 
 if __name__ == "__main__":
