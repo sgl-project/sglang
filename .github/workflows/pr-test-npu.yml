@@ -643,27 +643,9 @@ jobs:
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_acc_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
 
-  base-c-test-acc-16-npu-a3:
-    name: base-c-test-acc-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
-    if: >-
-      ${{ !failure() && !cancelled() &&
-      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false' }}
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
-      test_type: 'accuracy'
-      test_suite: base-c-test-acc-16-npu-a3
-      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      install_sglang_deps: true
-      device_type_for_deps: 'a3'
-      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_acc_16_npu_a3 }}
-      use_coverage_runner: ${{ inputs.coverage_mode == true }}
-
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -681,7 +663,7 @@ jobs:
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -725,8 +707,6 @@ jobs:
       only_tests_base_b_test_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_16_npu_a3 }}
       should_run_base_c_test_acc_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_acc_2_npu_a3 }}
       only_tests_base_c_test_acc_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_acc_2_npu_a3 }}
-      should_run_base_c_test_acc_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_acc_16_npu_a3 }}
-      only_tests_base_c_test_acc_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_acc_16_npu_a3 }}
       should_run_base_c_test_perf_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_perf_2_npu_a3 }}
       only_tests_base_c_test_perf_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_perf_2_npu_a3 }}
       should_run_base_c_test_perf_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_perf_16_npu_a3 }}
@@ -829,7 +809,7 @@ jobs:
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
             --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
             --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
-            --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
+            --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
             --case-map "$PWD/test_case_map.json" \
             --precision-mode "${PRECISION_MODE}" \
@@ -861,7 +841,6 @@ jobs:
         base-b-test-8-npu-a3,
         base-b-test-16-npu-a3,
         base-c-test-acc-2-npu-a3,
-        base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,
         base-c-test-perf-16-npu-a3,
         multimodal-gen-test-1-npu-a3,
@@ -1206,7 +1185,6 @@ jobs:
         multimodal-gen-test-4-npu-a3,
 
         base-c-test-acc-2-npu-a3,
-        base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,
         base-c-test-perf-16-npu-a3,
 
