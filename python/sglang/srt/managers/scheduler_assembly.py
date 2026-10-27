@@ -161,7 +161,7 @@ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.runtime_context import (
@@ -235,7 +235,7 @@ class SchedulerParts:
     workers: Workers
     external_corpus_manager: Any
     limits: RequestLimits
-    kv_event_lora_names: LoRANameTable
+    kv_event_lora_names: KvEventLoraNames
     kv: KvResources
     capacity: KvCapacity
     disable_radix_cache: bool
@@ -428,7 +428,7 @@ def assemble_scheduler(
 
     # KV cache and the mode owners over it
     # The table that maps lora_id to adapter name for KV events.
-    kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
+    kv_event_lora_names = KvEventLoraNames.from_lora_refs(get_lora().lora_paths)
     result = kv_cache_builder.build_kv_cache(
         server_args=server_args,
         model_config=model_config,
@@ -903,6 +903,7 @@ def assemble_scheduler(
         workers=workers,
         dp_tp_group=dp_tp_group,
         limits=limits,
+        kv_event_lora_names=kv_event_lora_names,
     )
     step_planner = StepPlanner(
         core_lists=lists,

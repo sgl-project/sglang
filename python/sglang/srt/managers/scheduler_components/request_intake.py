@@ -14,6 +14,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.disaggregation.kv_events import is_kv_publisher_rank
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     TransferBackend,
@@ -42,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_mm,
+    get_observability,
     get_parallel,
     get_schedule,
     get_serving,
@@ -77,6 +79,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
+    from sglang.srt.mem_cache.events import KvEventLoraNames
 logger = logging.getLogger(__name__)
 
 
@@ -115,12 +118,16 @@ class RequestIntake:
         workers: Workers,
         dp_tp_group: Any,
         limits: RequestLimits,
+        kv_event_lora_names: KvEventLoraNames,
     ):
         spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
         transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
         sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
+        enable_kv_cache_events = is_kv_publisher_rank(
+            get_observability().kv_events_config
+        )
         self.lists = core_lists
         self.counters = counters
         self.tree_cache = kv.tree_cache
@@ -150,6 +157,8 @@ class RequestIntake:
         self.max_queued_requests = limits.max_queued_requests
         self.chunked_prefill_size = limits.chunked_prefill_size
         self.sampling_mask_max_tokens = sampling_mask_max_tokens
+        self.kv_event_lora_names = kv_event_lora_names
+        self.enable_kv_cache_events = enable_kv_cache_events
         self._last_logged_elastic_radix_namespace: Optional[str] = None
 
     @staticmethod
@@ -479,6 +488,12 @@ class RequestIntake:
                 namespace,
             )
 
+    def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
+        # Keyed by the final extra_key, so it must run after elastic namespacing.
+        # Only a cache whose events are taken prunes the table.
+        if self.enable_kv_cache_events and self.tree_cache.supports_prefix_sharing():
+            self.kv_event_lora_names.register(req, lora_name)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -649,6 +664,7 @@ class RequestIntake:
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             self._reject(
@@ -1138,6 +1154,7 @@ class RequestIntake:
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             self._reject(

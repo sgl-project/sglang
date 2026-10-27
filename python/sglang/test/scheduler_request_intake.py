@@ -10,6 +10,7 @@ from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_intake import RequestIntake
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -36,6 +37,7 @@ def make_request_intake(**deps) -> RequestIntake:
             tp_worker=SimpleNamespace(get_pad_input_ids_func=lambda: None)
         ),
         dp_tp_group=SimpleNamespace(cpu_group=None, rank_in_group=0, first_rank=0),
+        kv_event_lora_names=KvEventLoraNames(),
     )
     limits = dict(
         max_req_len=4096,
@@ -52,6 +54,7 @@ def make_request_intake(**deps) -> RequestIntake:
         spec_algorithm=SpeculativeAlgorithm.NONE,
         transfer_backend=TransferBackend.MOONCAKE,
         sampling_mask_max_tokens=64,
+        enable_kv_cache_events=False,
     )
     for name in config:
         if name in deps:
