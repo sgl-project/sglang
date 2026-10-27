@@ -66,7 +66,9 @@ class _SamplingMetadataTestBase(CustomTestCase):
         super().setUp()
         exec_context = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=True),
+            features=SimpleNamespace(
+                enable_custom_logit_processor=True, enable_watermark=False
+            ),
         )
         context_patch = patch(
             "sglang.srt.sampling.sampling_batch_info.get_exec",

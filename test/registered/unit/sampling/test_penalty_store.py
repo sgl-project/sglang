@@ -86,7 +86,9 @@ class _BuildTestCase(CustomTestCase):
         super().setUp()
         self.exec_ns = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=True),
+            features=SimpleNamespace(
+                enable_custom_logit_processor=True, enable_watermark=False
+            ),
         )
         exec_patch = patch(
             "sglang.srt.sampling.sampling_batch_info.get_exec",
