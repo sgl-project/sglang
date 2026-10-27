@@ -37,7 +37,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -127,6 +127,7 @@ class DeepseekMoE(nn.Module):
             top_k=self.top_k,
             layer_id=layer_id,
             renormalize=config.norm_topk_prob,
+            output_format=TopKOutputFormat.STANDARD,
         )
         self.experts = nn.ModuleList(
             [

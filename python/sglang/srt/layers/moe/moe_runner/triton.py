@@ -162,6 +162,7 @@ class TritonRunnerCore(MoeRunnerCore):
             activation=self.config.activation,
             is_gated=self.config.is_gated,
             no_combine=self.config.no_combine,
+            no_combine_keep_router_weight=self.config.no_combine_keep_router_weight,
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             routed_scaling_factor=self.config.routed_scaling_factor,

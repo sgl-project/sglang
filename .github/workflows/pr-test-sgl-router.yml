@@ -6,10 +6,10 @@ name: PR Test (sgl-router)
 #     fires on every PR synchronize / push, so the run record always
 #     appears as a check on the PR (no more "workflow silently didn't
 #     fire" mystery debugging). Path-based skip decisions are made
-#     inside the `sgl-router-gate` job below, where we can log the
+#     inside the `sgl-router-changes` job below, where we can log the
 #     reason. Same for the `run-ci` label gate — moved off the
 #     workflow trigger and into the gate job so its outcome is
-#     observable.
+#     observable, and now fails (rather than skips) when it is missing.
 #
 #   * `push` on `main` keeps firing so post-merge runs still record
 #     against the default branch.
@@ -29,21 +29,17 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  # Stage 0 — decide whether to run the heavy tiers. Always runs
-  # (cheap, ubuntu-latest), and emits a single `should_run` output
-  # consumed by every tier below. Reasons it might evict downstream
-  # work:
-  #   * `pull_request` event without the `run-ci` label (budget gate)
-  #   * No files matching the sgl-router paths changed in this PR
-  # Either outcome is logged on the gate job's page, so operators can
-  # see *why* the tiers were skipped instead of guessing.
-  sgl-router-gate:
-    name: gate
+  # Stage 0a — path detection. Always runs (cheap, ubuntu-latest) and
+  # emits a single `should_run` output consumed by every tier below.
+  # It only answers "does this PR touch sgl-router?"; the `run-ci`
+  # label is checked by the separate gate job so that a missing label
+  # fails that job instead of silently skipping the tiers (see below).
+  sgl-router-changes:
+    name: changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
-      paths_changed: ${{ steps.paths.outputs.sgl_router }}
-      has_run_ci_label: ${{ steps.label.outputs.has_run_ci }}
     steps:
       - uses: actions/checkout@v4
       # `dorny/paths-filter` computes the diff against the PR base
@@ -53,51 +49,62 @@ jobs:
       # the gate is observable.
       - name: Detect sgl-router path changes
         id: paths
+        if: github.event_name != 'workflow_dispatch'
         uses: dorny/paths-filter@v3
         with:
           filters: |
             sgl_router:
-              - 'experimental/sgl-router/**'
+              - 'sgl-router/**'
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
+              - 'rust/sglang-api-types/**'
+              - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
+              - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
-      # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
-      # that happen to touch the sgl-router dir) still need the
-      # opt-in label before consuming the H100 / kind tiers below.
-      # `push` events on main and `workflow_dispatch` skip this gate.
-      - name: Check run-ci label
-        id: label
-        run: |
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
-            echo "Non-PR event (${{ github.event_name }}); label gate bypassed."
-            exit 0
-          fi
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}" == "true" ]]; then
-            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
-            echo "PR has run-ci label; downstream tiers will run."
-          else
-            echo "has_run_ci=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::PR is missing the 'run-ci' label; skipping sgl-router tiers. Apply the label to opt in."
-          fi
       - name: Decide
         id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PATHS_CHANGED: ${{ steps.paths.outputs.sgl_router }}
         run: |
-          paths='${{ steps.paths.outputs.sgl_router }}'
-          label='${{ steps.label.outputs.has_run_ci }}'
-          if [[ "$paths" == "true" && "$label" == "true" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "Both path filter and run-ci label match; running tiers."
-          else
+            echo "Manual dispatch; running sgl-router tiers."
+          elif [[ "$PATHS_CHANGED" != "true" ]]; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping tiers (paths_changed=$paths, has_run_ci=$label)."
+            echo "No sgl-router-related changes; skipping tiers."
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "sgl-router-related changes detected; running tiers."
           fi
+
+  # Stage 0b — `run-ci` label gate, shared with `pr-test.yml`. Cheap
+  # workflow runs (e.g. docs-only PRs that happen to touch the
+  # sgl-router dir) still need the opt-in label before consuming the
+  # H100 / kind tiers below. `push` on main and `workflow_dispatch`
+  # pass straight through.
+  #
+  # `pr-gate.yml` fetches the PR's labels live and FAILS when `run-ci`
+  # is missing. Both matter for `/tag-and-rerun-ci`: the slash handler
+  # adds the label with GITHUB_TOKEN, which fires no `labeled` event,
+  # then reruns the PR's unsuccessful runs. A rerun replays the original
+  # event payload, so a gate reading `github.event.pull_request.labels`
+  # would skip again, and a run that concluded `success` with every
+  # tier skipped is never rerun at all. Failing here on the live label
+  # set makes the rerun both happen and pick the label up.
+  sgl-router-gate:
+    name: gate
+    needs: sgl-router-changes
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
 
   sgl-router-lint:
     name: tier-1 — lint
-    needs: sgl-router-gate
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
       # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage
@@ -131,22 +138,22 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo check --locked --workspace --all-targets
 
       - name: cargo clippy
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: cargo fmt
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt --all -- --check
@@ -156,7 +163,7 @@ jobs:
         run: cargo install --locked cargo-deny@0.19.6
 
       - name: cargo deny check
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo deny check licenses bans sources advisories
 
       - name: Show sccache stats
@@ -165,8 +172,8 @@ jobs:
 
   sgl-router-build-and-test:
     name: tier-2 — build + test
-    needs: [sgl-router-gate, sgl-router-lint]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-lint]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
@@ -204,14 +211,14 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo build (record wall time)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           START=$(date +%s)
           cargo build --locked --release --all-targets
@@ -221,7 +228,7 @@ jobs:
           echo "::notice title=Tier-2 build duration::${BUILD_SECONDS}s"
 
       - name: cargo test
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         # Skip the tokenizer parity_matrix test here: ubuntu-latest has
         # no HuggingFace cache, so the matrix would hard-fail (see the
         # test docstring). The e2e job runs it after pytest populates
@@ -243,13 +250,13 @@ jobs:
       # through to a no-diff "pass" when no fixture was actually
       # regenerated.
       - name: kv_events hash parity fixture (drift check)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           set -euo pipefail
           python3 tests/scripts/generate_kv_events_hash_parity.py
           if ! git diff --exit-code -- tests/fixtures/kv_events_hash_parity.json; then
             echo "::error::kv_events hash parity fixture drifted." \
-              "Re-run experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py" \
+              "Re-run sgl-router/tests/scripts/generate_kv_events_hash_parity.py" \
               "and commit the updated tests/fixtures/kv_events_hash_parity.json."
             exit 1
           fi
@@ -266,8 +273,8 @@ jobs:
 
   sgl-router-docker-build-test:
     name: tier-3 — docker (placeholder)
-    needs: [sgl-router-gate, sgl-router-build-and-test]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -284,8 +291,8 @@ jobs:
   # the GPU/cluster runners from spinning up.
   sgl-router-k8s-integration:
     name: tier-3 — k8s integration
-    needs: [sgl-router-gate, sgl-router-build-and-test]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -301,20 +308,20 @@ jobs:
           curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
           chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
       - name: Build router image
-        run: docker build -t sgl-router:e2e -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
+        run: docker build -t sgl-router:e2e -f sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
       - name: Build fake_worker image
         run: |
           docker build -t sgl-router-fake-worker:e2e \
-            -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
-            experimental/sgl-router/tests/e2e/k8s_integration/
+            -f sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
+            sgl-router/tests/e2e/k8s_integration/
       - name: Bootstrap kind + deploy
-        run: bash experimental/sgl-router/tests/e2e/k8s_integration/setup.sh
+        run: bash sgl-router/tests/e2e/k8s_integration/setup.sh
       - name: Set up Python
         run: |
           python3 -m venv /tmp/e2e-venv
-          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
+          /tmp/e2e-venv/bin/pip install -r sgl-router/tests/e2e/k8s_integration/requirements.txt
       - name: Run E2E
-        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
+        run: /tmp/e2e-venv/bin/pytest sgl-router/tests/e2e/k8s_integration/ -v --tb=short
       - name: Dump cluster + router diagnostics on failure
         if: failure()
         run: |
@@ -331,8 +338,8 @@ jobs:
 
   sgl-router-e2e:
     name: tier-3 — e2e
-    needs: [sgl-router-gate, sgl-router-build-and-test]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
     steps:
@@ -342,10 +349,10 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
       - name: cargo build (release)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           source "$HOME/.cargo/env"
           cargo build --locked --release --workspace
@@ -363,7 +370,7 @@ jobs:
 
       - name: Install e2e test dependencies
         run: |
-          python3 -m pip install -r experimental/sgl-router/tests/e2e/requirements.txt
+          python3 -m pip install -r sgl-router/tests/e2e/requirements.txt
 
       # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
       # suite is owned by the `sgl-router-k8s-integration` job which has
@@ -374,7 +381,7 @@ jobs:
       # image pull) must not surface as e2e failures on H100, and e2e
       # flakes (model load, HF auth) must not surface as k8s failures.
       - name: Run e2e
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -382,7 +389,7 @@ jobs:
             --ignore=tests/e2e/k8s_integration
 
       - name: Tokenizer parity matrix (uses HF cache populated by e2e)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -392,25 +399,43 @@ jobs:
   sgl-router-finish:
     name: finish
     needs:
+      - sgl-router-changes
       - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
-    # `always()` lets `finish` run after upstream `skipped` outcomes
-    # (when the gate decided to skip). The downstream-skipped path is
-    # an explicit success — the workflow was correctly bypassed for a
-    # PR that didn't need full CI. The downstream-failure /
-    # downstream-cancelled path is a real fail. We also accept the
-    # gate's `skipped` (impossible today, kept for symmetry) and
-    # require the gate itself to have succeeded.
-    if: |
-      always() &&
-      needs.sgl-router-gate.result == 'success' &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
+    # `always()` lets `finish` run after upstream `skipped` outcomes.
+    # Two outcomes are a success: every tier passed, or the PR touches
+    # no sgl-router path and every tier was skipped. Anything else,
+    # including a gate that failed for a missing `run-ci` label, fails
+    # the run, so `/tag-and-rerun-ci` sees an unsuccessful run to rerun.
+    if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: All required checks completed
-        run: echo "OK"
+      - name: Check required results
+        env:
+          CHANGES_RESULT: ${{ needs.sgl-router-changes.result }}
+          SHOULD_RUN: ${{ needs.sgl-router-changes.outputs.should_run }}
+          GATE_RESULT: ${{ needs.sgl-router-gate.result }}
+          LINT_RESULT: ${{ needs.sgl-router-lint.result }}
+          BUILD_RESULT: ${{ needs.sgl-router-build-and-test.result }}
+          DOCKER_RESULT: ${{ needs.sgl-router-docker-build-test.result }}
+          K8S_RESULT: ${{ needs.sgl-router-k8s-integration.result }}
+          E2E_RESULT: ${{ needs.sgl-router-e2e.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "::error::sgl-router path detection did not succeed ($CHANGES_RESULT)."
+            exit 1
+          fi
+          tiers="$GATE_RESULT $LINT_RESULT $BUILD_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
+          if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success" ]]; then
+            echo "All sgl-router checks passed."
+          elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped" ]]; then
+            echo "No sgl-router-related changes; tiers skipped."
+          else
+            echo "::error::Unexpected sgl-router results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, build=$BUILD_RESULT, docker=$DOCKER_RESULT, k8s=$K8S_RESULT, e2e=$E2E_RESULT."
+            exit 1
+          fi
