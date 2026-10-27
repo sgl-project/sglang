@@ -379,54 +379,82 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            is_target_verify = forward_batch.forward_mode.is_target_verify()
-            _meta_list = None
-            if (
-                is_target_verify
-                and not mla_dcp_graph
-                and self.model_runner.spec_algorithm.is_dflash()
-            ):
-                # Only ordinary DFlash refreshes this list at replay. MLA DCP
-                # retains a rank-local capture seed, so it needs live batch lengths.
-                _attn = self._replay_attn_backend()
-                _meta = getattr(_attn, "forward_metadata", None)
-                _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
-
-            if is_target_verify and _meta_list is not None:
-                # The live DFlash metadata already includes the verify block.
-                seq_lens = list(_meta_list)
-            else:
+            if mla_dcp_graph:
+                mla_backend = get_mla_dcp_backend(self._replay_attn_backend())
+                # This is the live FIA Host input, not the capture-time metadata
+                # list. Normalize to global KV lengths before DCP localization.
                 if forward_batch.seq_lens_cpu is not None:
+                    # DFlash/DSPARK already include the verify block in the Host bound.
                     global_host_kv_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
-                    # DCP's DFlash/DSPARK Host lengths already include verify KV.
-                    if is_target_verify and not (
-                        mla_dcp_graph
-                        and self.model_runner.spec_algorithm.is_dflash_family()
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        and not self.model_runner.spec_algorithm.is_dflash_family()
                     ):
                         global_host_kv_lens_cpu = (
                             global_host_kv_lens_cpu + self.captured_req_width
                         )
                 else:
-                    device_prefix_lens = forward_batch.seq_lens
-                    if mla_dcp_graph:
-                        device_prefix_lens = device_prefix_lens[: self.raw_bs]
-                    global_host_kv_lens_cpu = device_prefix_lens.cpu()
-                    # Device lengths are prefixes; verify always adds its width.
-                    if is_target_verify:
+                    # Device lengths are prefix-only; read them back only without a mirror.
+                    global_host_kv_lens_cpu = forward_batch.seq_lens[
+                        : self.raw_bs
+                    ].cpu()
+                    if forward_batch.forward_mode.is_target_verify():
                         global_host_kv_lens_cpu = (
                             global_host_kv_lens_cpu + self.captured_req_width
                         )
-
-                host_kv_lens_cpu = global_host_kv_lens_cpu
-                if mla_dcp_graph:
-                    mla_backend = get_mla_dcp_backend(self._replay_attn_backend())
-                    host_kv_lens_cpu = get_dcp_lens(
-                        global_host_kv_lens_cpu,
-                        mla_backend.dcp_size,
-                        mla_backend.dcp_rank,
-                        interleave_size=mla_backend.page_size,
+                local_host_kv_lens_cpu = get_dcp_lens(
+                    global_host_kv_lens_cpu,
+                    mla_backend.dcp_size,
+                    mla_backend.dcp_rank,
+                    interleave_size=mla_backend.page_size,
+                )
+                # replay_with_input_update consumes a Python list; graph-only
+                # padded requests must keep zero lengths.
+                seq_lens = local_host_kv_lens_cpu.tolist() + [0] * (
+                    self.bs - local_host_kv_lens_cpu.numel()
+                )
+            elif forward_batch.forward_mode.is_target_verify():
+                # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
+                # replay; other algorithms keep the capture-time list, so
+                # recompute from the live batch as before — reading the
+                # backend list there would replay stale capture-time lengths.
+                if self.model_runner.spec_algorithm.is_dflash():
+                    _attn = self._replay_attn_backend()
+                    _meta = getattr(_attn, "forward_metadata", None)
+                    _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
+                else:
+                    _meta_list = None
+                if _meta_list is not None:
+                    # graph.update must carry the exact KV length already
+                    # computed in forward_metadata.seq_lens_cpu_list (it
+                    # already includes the draft block for DFlash); do not
+                    # recompute and double-add here.
+                    seq_lens = list(_meta_list)
+                else:
+                    # Hybrid attention wrappers may not expose replay metadata.
+                    # Prefer the live CPU mirror to avoid a blocking D2H copy;
+                    # fall back to device lengths when the mirror is unavailable.
+                    if forward_batch.seq_lens_cpu is not None:
+                        seq_lens_cpu = (
+                            forward_batch.seq_lens_cpu[: self.raw_bs]
+                            + self.captured_req_width
+                        )
+                    else:
+                        seq_lens_cpu = (
+                            forward_batch.seq_lens.cpu() + self.captured_req_width
+                        )
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            else:
+                # Reuse the live CPU mirror when available to avoid
+                # a blocking D2H copy.
+                if forward_batch.seq_lens_cpu is not None:
+                    seq_lens = forward_batch.seq_lens_cpu[: self.raw_bs].tolist() + [
+                        0
+                    ] * (self.bs - self.raw_bs)
+                else:
+                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                        self.bs - self.raw_bs
                     )
-                seq_lens = host_kv_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
