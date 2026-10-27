@@ -28,6 +28,7 @@ from sglang.srt.configs.moe_model_registry import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
@@ -690,8 +691,6 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
                 "environment value or lower --chunked-prefill-size/"
                 "--max-prefill-tokens."
             )
-
-    from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
 
     masked_capacity = get_deepep_v2_masked_tokens_per_rank()
     graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)

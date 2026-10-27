@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import deepep_v2
+from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
 from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -160,8 +161,6 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
 
     def test_masked_capacity_defaults_to_and_is_capped_by_dispatch(self):
         """Decode slabs are sized by the masked capacity, never above the buffer's."""
-        from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
-
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(8192):
             self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 8192)
             with envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.override(768):
