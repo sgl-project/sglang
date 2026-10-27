@@ -3352,11 +3352,9 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_direct_mode_rejected_across_nodes(self):
-        # direct is NVLink-only; multi-node must ask for hybrid up front.
-        args = self._args(moe_runner_backend="deep_gemm", nnodes=2)
-        with self.assertRaisesRegex(ValueError, "--deepep-v2-mode hybrid"):
-            handle_a2a_moe(args)
+    def test_both_modes_accepted_across_nodes(self):
+        """DeepEP V2.5 direct mode reaches remote peers over RDMA, so multi-node must not force hybrid."""
+        handle_a2a_moe(self._args(moe_runner_backend="deep_gemm", nnodes=2))
         handle_a2a_moe(
             self._args(
                 moe_runner_backend="deep_gemm", nnodes=2, deepep_v2_mode="hybrid"
@@ -3456,6 +3454,16 @@ class TestDeepEPv2Args(CustomTestCase):
             speculative_algorithm="EAGLE",
         )
         with self.assertRaisesRegex(ValueError, "speculative draft backend"):
+            validate_deepep_v2_speculative_draft(args)
+
+    def test_dspark_draft_shares_the_target_backend(self):
+        """DSpark draft stages run in the target's DeepEP v2 path; not a separate draft backend."""
+        for draft_backend in (None, "deepep_v2"):
+            args = self._args(
+                moe_runner_backend="deep_gemm",
+                speculative_algorithm="DSPARK",
+                speculative_moe_a2a_backend=draft_backend,
+            )
             validate_deepep_v2_speculative_draft(args)
 
     def test_ngram_does_not_inherit_a_draft_backend(self):

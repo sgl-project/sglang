@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from typing import NamedTuple, Optional
 
 import torch
@@ -21,6 +22,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPv2Fp8ScaleFormat,
     get_deepep_v2_fp8_scale_format,
+    get_deepep_v2_masked_tokens_per_rank,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -30,6 +32,9 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+# Used when DeepEP cannot size SMs itself (no `ibstat` for the RDMA bandwidth).
+# Measured working in a B300 2x8 EP16 smoke; not tuned.
+_NO_IBSTAT_NUM_SMS = 32
 # Must match DeepGEMM's contiguous expert alignment.
 _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
@@ -37,8 +42,34 @@ _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
 
 
+def _import_deepep_v25():
+    # sgl-deep-ep-v25 ships DeepEP 2.5 as `deep_ep_v25`, next to sgl-deep-ep
+    # (`deep_ep`: V1 + DeepEP 2.1). Returns None when it is not installed.
+    try:
+        from deep_ep_v25 import EPBuffer
+    except ModuleNotFoundError as exc:
+        if exc.name == "deep_ep_v25":
+            return None
+        raise
+    return EPBuffer
+
+
 try:
-    from deep_ep import ElasticBuffer
+    try:
+        ElasticBuffer = _import_deepep_v25()
+    except Exception as exc:  # deep_ep_v25's import-time host checks
+        logger.warning(
+            "sgl-deep-ep-v25 is installed but failed to import; falling back to "
+            "deep_ep: %s",
+            exc,
+        )
+        ElasticBuffer = None
+    if ElasticBuffer is None:
+        try:
+            # DeepEP >= 2.5 renamed ElasticBuffer to EPBuffer; dispatch/combine are unchanged.
+            from deep_ep import EPBuffer as ElasticBuffer
+        except ImportError:
+            from deep_ep import ElasticBuffer
 
     use_deepep_v2 = True
 except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
@@ -94,8 +125,8 @@ def _raise_deepep_v2_import_error() -> None:
         else ""
     )
     raise ImportError(
-        "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
-        "https://github.com/deepseek-ai/DeepEP." + detail
+        "DeepEP v2 (ElasticBuffer) is not available. Install sgl-deep-ep-v25 "
+        "(DeepEP 2.5) or sgl-deep-ep (DeepEP 2.1)." + detail
     )
 
 
@@ -119,8 +150,6 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # Multi-node is rejected with direct in server-args validation, so a hybrid
-    # mode here already covers every multi-node run.
     return get_exec().moe.deepep_v2_mode == "hybrid"
 
 
@@ -139,6 +168,20 @@ def _quantize_for_deepep_v2_dispatch(
     )
 
 
+def _resolve_num_sms(*, num_rdma_ranks: int) -> int:
+    num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+    # DeepEP's automatic choice reads RDMA bandwidth from `ibstat` once a buffer
+    # spans RDMA ranks; without it that estimate divides by zero on dispatch.
+    if num_sms == 0 and num_rdma_ranks > 1 and shutil.which("ibstat") is None:
+        logger.warning(
+            "DeepEP v2: `ibstat` not found; using %d SMs. Install infiniband-diags "
+            "or set SGLANG_DEEPEP_V2_NUM_SMS.",
+            _NO_IBSTAT_NUM_SMS,
+        )
+        num_sms = _NO_IBSTAT_NUM_SMS
+    return num_sms
+
+
 class DeepEPv2Buffer:
     """Facade for the process-wide ElasticBuffer stored in runtime resources."""
 
@@ -151,7 +194,7 @@ class DeepEPv2Buffer:
         buffers = get_resources().buffers
         state = buffers.get(cls._STATE_KEY)
         if state is None:
-            state = SimpleNamespace(buffer=None, key=None)
+            state = SimpleNamespace(buffer=None, key=None, num_topk=0, num_sms=0)
             buffers[cls._STATE_KEY] = state
         return state
 
@@ -170,18 +213,25 @@ class DeepEPv2Buffer:
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
-        # A key change rebuilds ElasticBuffer collectively on every rank.
+        # A key change rebuilds ElasticBuffer collectively on every rank. The top-k
+        # only sizes the buffer, so layers with a smaller top-k (the DSpark draft)
+        # share it instead of rebuilding on every target/draft switch.
         key = (
             group,
             hidden_size,
-            router_topk,
             num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch,
             allow_hybrid_mode,
             dist.get_world_size(group),
         )
-        if state.buffer is not None and state.key == key:
+        if (
+            state.buffer is not None
+            and state.key == key
+            and state.num_topk >= router_topk
+        ):
             return state.buffer
+        if state.buffer is not None and state.key == key:
+            router_topk = max(router_topk, state.num_topk)
 
         # Native explicit teardown is unavailable unless explicitly_destroy=True.
         cls.destroy()
@@ -201,6 +251,8 @@ class DeepEPv2Buffer:
         # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
+        state.num_topk = router_topk
+        state.num_sms = _resolve_num_sms(num_rdma_ranks=buffer.num_rdma_ranks)
         logger.info(
             "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
@@ -220,6 +272,13 @@ class DeepEPv2Buffer:
         state = cls._state()
         state.buffer = None
         state.key = None
+        state.num_topk = 0
+        state.num_sms = 0
+
+    @classmethod
+    def num_sms(cls) -> int:
+        """SM count for dispatch/combine of the current buffer (0 lets DeepEP choose)."""
+        return cls._state().num_sms
 
 
 class _DeepEPv2Impl:
@@ -234,6 +293,7 @@ class _DeepEPv2Impl:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         activation_scale_block_size: int = _SCALE_BLOCK_SIZE,
+        num_max_masked_tokens_per_rank: Optional[int] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -243,6 +303,10 @@ class _DeepEPv2Impl:
         self.scale_format = scale_format
         self.activation_scale_block_size = activation_scale_block_size
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.num_max_masked_tokens_per_rank = min(
+            num_max_masked_tokens_per_rank or num_max_dispatch_tokens_per_rank,
+            num_max_dispatch_tokens_per_rank,
+        )
         self.use_fp8_dispatch = use_fp8_dispatch
         self._handle = None
         self._pad_empty_combine = False
@@ -310,10 +374,18 @@ class _DeepEPv2Impl:
             )
         _ensure_deepep_v2_available()
         topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        # DeepEP 2.5 keeps topk_idx in the handle without copying (and rejects
+        # do_handle_copy), so hand it a tensor no caller can reuse before combine.
+        topk_ids = topk_output.topk_ids.to(torch.int64, copy=True)
         self._validate_common(hidden_states, topk_ids)
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
+        if use_masked and hidden_states.shape[0] > self.num_max_masked_tokens_per_rank:
+            raise ValueError(
+                f"DeepEP v2 masked dispatch of {hidden_states.shape[0]} rows exceeds "
+                f"SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK="
+                f"{self.num_max_masked_tokens_per_rank}."
+            )
         use_expand_layout = is_decode or self._prefill_expand_enabled
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
@@ -361,7 +433,7 @@ class _DeepEPv2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
-            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
+            num_sms=DeepEPv2Buffer.num_sms(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
@@ -410,8 +482,8 @@ class _DeepEPv2Impl:
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # Every rank can send its full dispatch capacity to one expert.
-            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
+            # Every rank can send its full masked capacity to one expert.
+            masked_max_m = self.num_max_masked_tokens_per_rank * ep_group_size
             total_expanded = recv_capacity
 
         # Publish ownership only after the returned metadata is validated.
@@ -491,6 +563,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch=use_fp8_dispatch,
             activation_scale_block_size=activation_scale_block_size,
+            num_max_masked_tokens_per_rank=get_deepep_v2_masked_tokens_per_rank(),
         )
 
     def dispatch(

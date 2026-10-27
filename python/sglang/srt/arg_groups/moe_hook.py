@@ -28,6 +28,7 @@ from sglang.srt.configs.moe_model_registry import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
@@ -429,11 +430,6 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
-        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
-            raise ValueError(
-                "--deepep-v2-mode direct is NVLink-only and cannot run across "
-                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
-            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,
@@ -622,14 +618,18 @@ def handle_a2a_moe(server_args: Any):
 
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
-    """Reject an explicit or inherited DeepEP v2 draft backend."""
+    """Reject an explicit or inherited DeepEP v2 draft backend, except DSpark."""
     view = resolved_view(server_args)
     draft_backend = view.speculative_moe_a2a_backend
-    if draft_backend is None and view.speculative_algorithm:
+    if view.speculative_algorithm:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
-        if not algorithm.is_ngram():
+        # DSpark draft stages run in the target's MoE path and share its
+        # ElasticBuffer (sized for the larger top-k), so they need no own backend.
+        if algorithm.is_dspark():
+            return
+        if draft_backend is None and not algorithm.is_ngram():
             draft_backend = view.moe_a2a_backend
     if draft_backend == "deepep_v2":
         raise ValueError(
@@ -694,13 +694,15 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
                 "--max-prefill-tokens."
             )
 
+    masked_capacity = get_deepep_v2_masked_tokens_per_rank()
     graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
     graph_tokens = graph_bs * tokens_per_req
-    if graph_tokens > capacity:
+    if graph_tokens > masked_capacity:
         raise ValueError(
-            "DeepEP v2 per-rank decode CUDA graph exceeds "
-            "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
-            f"required={graph_tokens}, capacity={capacity} "
+            "DeepEP v2 per-rank decode CUDA graph exceeds the masked dispatch "
+            "capacity (SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK, capped by "
+            "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK): "
+            f"required={graph_tokens}, capacity={masked_capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
             "the environment value or lower --cuda-graph-max-bs-decode."
         )

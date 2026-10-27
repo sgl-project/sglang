@@ -876,7 +876,8 @@ class ExecMoe(msgspec.Struct):
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
-        "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
+        "`direct` (every peer reached directly: NVLink in-node, RDMA across nodes) "
+        "or `hybrid` (RDMA to one peer per remote node, then NVLink forwarding). "
         "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
         "inference phase, independent of this knob; not equivalent to DeepEP v1 "
         "normal/low_latency.",

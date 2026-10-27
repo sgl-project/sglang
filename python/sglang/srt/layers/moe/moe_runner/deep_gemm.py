@@ -310,6 +310,12 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
             )
 
+    def activation_group_size(self) -> int:
+        """Group size of the FP8 activations the grouped GEMMs consume."""
+        # FP4 experts pair 1x32 weights with 1x128 activations (recipe_a), so a
+        # [32, 32] checkpoint block size must not leak into activation quant.
+        return self.block_shape[1] if self.use_mxfp8 else 128
+
     def scale_recipes(
         self,
         *,
@@ -422,7 +428,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
-        scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+        scale_block_size = quant_info.activation_group_size()
 
         if all_tokens == 0:
             if trace_deepep_v2_contig:
@@ -746,7 +752,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         use_mxfp8 = quant_info.use_mxfp8
-        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        scale_block_size = quant_info.activation_group_size()
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
@@ -869,6 +875,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_size=down_input.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
         )
+        if trace_deepep_v2_masked:
+            logger.warning(
+                "DeepEP v2 masked runner down input: x=%s scale=%s scale_stride=%s "
+                "scale_dtype=%s recipe_a=%s recipe_b=%s",
+                tuple(down_input.shape),
+                tuple(down_input_scale.shape),
+                down_input_scale.stride(),
+                down_input_scale.dtype,
+                recipe_a_down,
+                recipe_b,
+            )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
@@ -1610,6 +1627,46 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
         if use_packed:
             down_input_scale = down_input_scale.transpose(-1, -2)
+        return down_input, down_input_scale
+
+    # The DSV4 JIT kernel packs four scale groups per int32, so D = 2304
+    # (DeepSeek-V4.1-Flash, G = 18) takes the masked Triton kernel; it only
+    # touches rows below masked_m, unlike a clamp over the whole slab.
+    if (
+        swiglu_limit is not None
+        and not swizzle
+        and not silu_mul_keep_fp32
+        and G % 4 != 0
+    ):
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
+            silu_and_mul_masked_post_quant_fwd,
+        )
+
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
+        # Rows past masked_m stay unwritten, and DeepGEMM's UE8M0 packing below
+        # faults on NaN scales, so they must not hold garbage.
+        down_input_scale = torch.zeros(
+            (E, N, G), device=hidden_states_device, dtype=torch.float32
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            swiglu_limit=swiglu_limit,
+        )
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            import deep_gemm.utils.layout
+
+            down_input_scale = (
+                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    down_input_scale
+                )
+            )
         return down_input, down_input_scale
 
     # Only explicit precision requests opt additional callers into this kernel;
