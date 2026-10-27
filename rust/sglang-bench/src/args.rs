@@ -5,7 +5,9 @@
 //! has for surfaces this port does not implement (the TRT / gserver / truss
 //! backends, the image, mooncake, agentic-trace and generated-shared-prefix
 //! datasets, LoRA, profiling by stage) are absent rather than accepted and
-//! ignored: a silently dropped flag would report a benchmark nobody ran.
+//! ignored: a silently dropped flag would report a benchmark nobody ran. The
+//! `timed-trace` dataset and its `--timed-trace-*` flags are vLLM's, so one
+//! trace and one command line serve both clients.
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
@@ -51,6 +53,12 @@ pub enum DatasetName {
     /// The first turn of each ShareGPT conversation, with its reply's length
     /// as the output length.
     Sharegpt,
+    /// A JSONL trace with per-request arrival timestamps and prefix-hash ids
+    /// (the Mooncake layout). Prompts are token ids expanded from the hashes
+    /// and sent as `input_ids`; requests fire at their trace timestamps.
+    #[serde(alias = "timed_trace")]
+    #[value(alias = "timed_trace")]
+    TimedTrace,
 }
 
 #[derive(Debug, Deserialize, Parser)]
@@ -93,7 +101,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "sharegpt")]
     pub dataset_name: DatasetName,
 
-    /// Path to a local ShareGPT JSON. Empty downloads and caches it.
+    /// Path to a local ShareGPT JSON, or the JSONL trace for `timed-trace`.
+    /// Empty downloads and caches ShareGPT.
     #[arg(long, default_value = "")]
     pub dataset_path: String,
 
@@ -127,7 +136,32 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0)]
     pub random_range_ratio: f64,
 
+    /// Tokens per `hash_ids` entry of a timed trace. Each hash expands to a
+    /// chunk this long, the last one partial, so a prompt is exactly its
+    /// `input_length`.
+    #[arg(long, default_value_t = 16)]
+    pub timed_trace_chunk_hash_size: usize,
+
+    /// Multiplies a timed trace's timestamps into seconds (0.001 for a trace
+    /// in milliseconds).
+    #[arg(long, default_value_t = 1.0)]
+    pub timed_trace_sec_multiplier: f64,
+
+    /// Field names in the timed trace, for traces that spell them differently.
+    #[arg(long, default_value = "timestamp")]
+    pub timed_trace_label_timestamp: String,
+
+    #[arg(long, default_value = "input_length")]
+    pub timed_trace_label_input_length: String,
+
+    #[arg(long, default_value = "output_length")]
+    pub timed_trace_label_output_length: String,
+
+    #[arg(long, default_value = "hash_ids")]
+    pub timed_trace_label_hash_ids: String,
+
     /// Requests per second, Poisson-paced. `inf` sends everything at once.
+    /// Not for `timed-trace`, whose arrivals come from the trace.
     #[arg(long, default_value = "inf")]
     pub request_rate: String,
 
@@ -187,16 +221,18 @@ pub struct Args {
     #[arg(long = "header", value_name = "KEY: VALUE")]
     pub headers: Vec<String>,
 
-    /// Send `input_ids` instead of `text`. Only for the random datasets.
+    /// Send `input_ids` instead of `text`. Only for the random datasets;
+    /// `timed-trace` always sends ids.
     /// The response side follows automatically: a server launched with
     /// `--skip-tokenizer-init` returns `output_ids` and no text, and tokens
     /// are then counted from the ids.
     #[arg(long)]
     pub tokenize_prompt: bool,
 
-    /// Vocabulary size for `random-ids` with `--tokenize-prompt`. Given, no
-    /// tokenizer is loaded at all, so the client needs no model files; the
-    /// retokenized totals are then reported as 0.
+    /// Vocabulary size for the datasets that build token ids: `random-ids`
+    /// with `--tokenize-prompt`, and `timed-trace`. Given, no tokenizer is
+    /// loaded at all, so the client needs no model files; the retokenized
+    /// totals are then reported as 0.
     #[arg(long)]
     pub vocab_size: Option<u32>,
 
@@ -306,11 +342,16 @@ impl DatasetName {
             Self::Random => "random",
             Self::RandomIds => "random-ids",
             Self::Sharegpt => "sharegpt",
+            Self::TimedTrace => "timed-trace",
         }
     }
 
     pub fn is_random(self) -> bool {
         matches!(self, Self::Random | Self::RandomIds)
+    }
+
+    pub fn is_timed_trace(self) -> bool {
+        self == Self::TimedTrace
     }
 }
 
@@ -375,7 +416,9 @@ impl Args {
             self.random_range_ratio
         );
         anyhow::ensure!(
-            !self.tokenize_prompt || self.dataset_name.is_random(),
+            !self.tokenize_prompt
+                || self.dataset_name.is_random()
+                || self.dataset_name.is_timed_trace(),
             "--tokenize-prompt is only supported by the random datasets"
         );
         anyhow::ensure!(
@@ -396,9 +439,41 @@ impl Args {
         if let Some(size) = self.vocab_size {
             anyhow::ensure!(size > 0, "--vocab-size must be at least 1");
             anyhow::ensure!(
-                self.tokenize_prompt && self.dataset_name == DatasetName::RandomIds,
-                "--vocab-size is only meaningful with --tokenize-prompt --dataset-name random-ids; \
-                 every other dataset needs the tokenizer"
+                (self.tokenize_prompt && self.dataset_name == DatasetName::RandomIds)
+                    || self.dataset_name.is_timed_trace(),
+                "--vocab-size is only meaningful with --tokenize-prompt --dataset-name random-ids \
+                 or --dataset-name timed-trace; every other dataset needs the tokenizer"
+            );
+        }
+        if self.dataset_name.is_timed_trace() {
+            anyhow::ensure!(
+                !self.dataset_path.is_empty(),
+                "--dataset-name timed-trace needs --dataset-path, the JSONL trace"
+            );
+            anyhow::ensure!(
+                self.backend.api() != Api::OpenaiChat,
+                "timed-trace sends input_ids, which a chat backend cannot carry"
+            );
+            anyhow::ensure!(
+                self.timed_trace_chunk_hash_size > 0,
+                "--timed-trace-chunk-hash-size must be at least 1"
+            );
+            anyhow::ensure!(
+                self.timed_trace_sec_multiplier.is_finite()
+                    && self.timed_trace_sec_multiplier > 0.0,
+                "--timed-trace-sec-multiplier must be finite and positive, got {}",
+                self.timed_trace_sec_multiplier
+            );
+            // A rate the trace overrides would still be stamped on the result.
+            anyhow::ensure!(
+                self.parse_request_rate()?.is_infinite(),
+                "--request-rate does not apply to timed-trace; arrivals come from the trace timestamps"
+            );
+            // The trace's output_length is the measured quantity; stopping at
+            // EOS would turn it into a ceiling.
+            anyhow::ensure!(
+                !self.disable_ignore_eos,
+                "--disable-ignore-eos does not apply to timed-trace, which runs each request to its output_length"
             );
         }
         Ok(())
@@ -566,6 +641,38 @@ mod tests {
             ])
             .validate()
             .is_err()
+        );
+    }
+
+    /// timed-trace takes its arrivals and lengths from the trace, so the flags
+    /// that would shape a synthetic run are refused rather than stamped on a
+    /// result they did not produce; the tokenizer-free path is allowed since
+    /// the prompts are ids by construction.
+    #[test]
+    fn timed_trace_refuses_the_flags_the_trace_overrides() {
+        let base = ["--dataset-name", "timed-trace", "--dataset-path", "t.jsonl"];
+        let with = |extra: &[&str]| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(extra);
+            args(&argv).validate()
+        };
+        assert!(with(&[]).is_ok());
+        assert!(with(&["--vocab-size", "1000"]).is_ok());
+        assert!(with(&["--tokenize-prompt"]).is_ok());
+        assert!(with(&["--backend", "vllm"]).is_ok());
+        assert!(with(&["--request-rate", "10"]).is_err());
+        assert!(with(&["--disable-ignore-eos"]).is_err());
+        assert!(with(&["--backend", "sglang-oai-chat"]).is_err());
+        assert!(with(&["--timed-trace-sec-multiplier", "0"]).is_err());
+        assert!(with(&["--timed-trace-chunk-hash-size", "0"]).is_err());
+        assert!(
+            args(&["--dataset-name", "timed-trace"]).validate().is_err(),
+            "the trace path is required"
+        );
+        // vLLM's spelling of the dataset name is accepted too.
+        assert_eq!(
+            args(&["--dataset-name", "timed_trace"]).dataset_name,
+            DatasetName::TimedTrace
         );
     }
 

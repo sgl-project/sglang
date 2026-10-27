@@ -91,10 +91,11 @@ cp target/release/libsglang_bench.so \
   `lmdeploy-chat` (`/v1/chat/completions`), streaming and not.
 - **Protocols**: `--protocol http` (default) and `--protocol grpc`, the Rust
   server's `sglang.api.v1` service (below).
-- **Datasets**: `random`, `random-ids`, `sharegpt`.
-- Poisson request pacing (`--request-rate`), a concurrency cap, warmup, cache
-  flush, profiler start/stop, the readiness probe, `--extra-request-body`,
-  custom headers, and API-key auth.
+- **Datasets**: `random`, `random-ids`, `sharegpt`, and `timed-trace`, a
+  token-exact replay of a timestamped trace (below).
+- Poisson request pacing (`--request-rate`) or trace-timestamp pacing, a
+  concurrency cap, warmup, cache flush, profiler start/stop, the readiness
+  probe, `--extra-request-body`, custom headers, and API-key auth.
 - The full metric set, including the per-second peak-throughput and
   peak-concurrency windows, with NumPy's percentile interpolation and
   population standard deviation so the numbers line up with the Python
@@ -114,6 +115,43 @@ loads no tokenizer at all and needs no model files; the retokenized totals
 then report 0, since there is no text to re-encode. That combination takes
 the tokenizer and detokenizer out of the measurement on both ends, which is
 the datapath `sglang-server` is built around.
+
+### Trace replay
+
+`--dataset-name timed-trace` replays a JSONL trace with one request per line:
+
+```jsonl
+{"timestamp": 12.4, "input_length": 42, "output_length": 8, "hash_ids": [981, 4412, 7]}
+```
+
+The layout, the expansion rule and the `--timed-trace-*` flags are vLLM's
+`timed_trace`, so one trace and one command line serve both clients and the
+token counts they report agree. Prompts carry no text: each hash id expands to
+`--timed-trace-chunk-hash-size` token ids (the last chunk partial, so a prompt
+is exactly its `input_length`), seeded from the hash, so rows that share a hash
+prefix share a token prefix and the server's prefix cache sees the trace's
+reuse. Ids go on the wire as `input_ids`, which is why `--vocab-size` stands in
+for the tokenizer here as it does for `random-ids`, and why a chat backend is
+refused. Each request runs to its `output_length` (`ignore_eos` is forced), so
+the counted totals are the trace's.
+
+Requests fire at their timestamps, measured from the first row and scaled by
+`--timed-trace-sec-multiplier` (0.001 for a trace in milliseconds), each on an
+absolute deadline so a late dispatch does not shift the rest. `--request-rate`
+is refused for this dataset: a rate the trace overrides would still be stamped
+on the result. The trace's own field names are set with
+`--timed-trace-label-{timestamp,input-length,output-length,hash-ids}`.
+
+```bash
+python -m sglang.benchmark.rust_client \
+  --backend sglang --dataset-name timed-trace --dataset-path trace.jsonl \
+  --num-prompts 1000 --timed-trace-chunk-hash-size 16 \
+  --timed-trace-sec-multiplier 0.001 --vocab-size 163840
+```
+
+The Python client's `mooncake` dataset reads the same files but builds text
+prompts from the hash ids through the chat template, so its token counts are
+the tokenizer's, not the trace's; `timed-trace` is the token-exact replay.
 
 ### gRPC
 
@@ -137,9 +175,10 @@ Flags for these are absent rather than accepted and ignored, because a
 silently dropped flag would report a benchmark nobody ran.
 
 - **Backends**: `trt`, `gserver`, `truss`, and the embedding backends.
-- **Datasets**: `image`, `mmmu`, `mooncake`, `agentic-trace`,
-  `generated-shared-prefix`, `custom`, `openai`, `longbench-v2`,
-  `speed-bench`, and trace-timestamp replay.
+- **Datasets**: `image`, `mmmu`, `mooncake` (its text-prompt replay;
+  `timed-trace` covers the same files token-exactly), `agentic-trace`,
+  `generated-shared-prefix`, `custom`, `openai`, `longbench-v2`, and
+  `speed-bench`.
 - Multi-turn replay, LoRA request distributions, `--cache-report`,
   `--plot-throughput`, PD-separated profiling, and the per-stage profiler
   options.
