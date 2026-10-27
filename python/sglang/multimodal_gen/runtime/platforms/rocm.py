@@ -7,6 +7,7 @@ This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
 
+import os
 import types
 from functools import lru_cache
 from typing import Any
@@ -241,6 +242,20 @@ class RocmPlatform(Platform):
                     count,
                 )
 
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                maybe_optimize_qwen_image_vae,
+                maybe_optimize_wan_vae,
+            )
+
+            vae = maybe_optimize_wan_vae(vae)
+            vae = maybe_optimize_qwen_image_vae(vae)
+        except Exception:
+            logger.warning(
+                "Failed to apply the Wan VAE fast path; using the unmodified VAE.",
+                exc_info=True,
+            )
+
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
@@ -337,6 +352,30 @@ class RocmPlatform(Platform):
 
         T_out = (T - kt) // stride_t + 1
 
+        if weight_2d.is_contiguous(memory_format=torch.channels_last):
+            # NHWC: gather the Kt frames (and cast) in one copy into
+            # [N*T_out, H, W, Kt*C_in]; the conv output then folds back to a
+            # channels_last_3d tensor without another copy.
+            compute_dtype = torch.bfloat16 if compute_bf16 else weight_2d.dtype
+            unfolded = torch.empty(
+                (N, T_out, H, W, kt, C_in),
+                dtype=compute_dtype,
+                device=x_padded.device,
+            )
+            unfolded.copy_(
+                x_padded.permute(0, 2, 3, 4, 1)
+                .unfold(1, kt, stride_t)
+                .permute(0, 1, 2, 3, 5, 4)
+            )
+            unfolded = unfolded.view(N * T_out, H, W, kt * C_in).permute(0, 3, 1, 2)
+            w = weight_2d.to(compute_dtype)
+            b = bias.to(compute_dtype) if bias is not None else None
+            out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
+            if out.dtype != orig_dtype:
+                out = out.to(orig_dtype)
+            _, _, H_out, W_out = out.shape
+            return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
+
         # (N, C_in, T, H, W) -> (N, T_out, Kt, C_in, H, W) -> (N*T_out, Kt*C_in, H, W)
         unfolded = x_padded.unfold(2, kt, stride_t)
         unfolded = unfolded.permute(0, 2, 5, 1, 3, 4).reshape(
@@ -414,6 +453,14 @@ class RocmPlatform(Platform):
                 .reshape(child.out_channels, kt * child.in_channels, kh, kw)
                 .contiguous()
             )
+            if child.weight.is_contiguous(memory_format=torch.channels_last_3d):
+                weight_2d = weight_2d.to(memory_format=torch.channels_last)
+                if use_bf16:
+                    weight_2d = weight_2d.to(torch.bfloat16)
+                # PyTorch only runs MIOpen convs in NHWC under this flag (read
+                # per call); without it the channels_last conv2d transposes to
+                # NCHW and back and runs 1.4-2.9x slower on these shapes.
+                os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
             child.register_buffer("_weight_2d", weight_2d)
 
             def _patched_forward(

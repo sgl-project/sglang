@@ -27,6 +27,33 @@ class TestRocmConv3dPatchEpilogueKwargs(unittest.TestCase):
                     patched(x, cache_x, **kwargs), ref(x, cache_x, **kwargs)
                 )
 
+    def test_channels_last_weight_runs_nhwc_and_keeps_channels_last_3d(self):
+        torch.manual_seed(0)
+        ref = WanCausalConv3d(8, 16, 3, padding=1)
+        patched = WanCausalConv3d(8, 16, 3, padding=1)
+        patched.load_state_dict(ref.state_dict())
+        patched.weight.data = patched.weight.data.contiguous(
+            memory_format=torch.channels_last_3d
+        )
+        self.assertEqual(RocmPlatform._replace_conv3d_with_conv2d(patched), 1)
+        self.assertTrue(
+            patched._weight_2d.is_contiguous(memory_format=torch.channels_last)
+        )
+
+        x = torch.randn(1, 8, 3, 12, 12).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+        cache_x = torch.randn(1, 8, 2, 12, 12)
+        residual = torch.randn(1, 16, 3, 12, 12)
+        for kwargs in ({}, {"residual": residual}, {"skip_bias": True}):
+            with self.subTest(kwargs=list(kwargs)), torch.no_grad():
+                out = patched(x, cache_x, **kwargs)
+                torch.testing.assert_close(out, ref(x, cache_x, **kwargs))
+                if not kwargs:
+                    self.assertTrue(
+                        out.is_contiguous(memory_format=torch.channels_last_3d)
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
