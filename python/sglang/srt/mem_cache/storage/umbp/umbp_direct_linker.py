@@ -14,7 +14,6 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -24,6 +23,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
+    apply_hit_policy,
 )
 from sglang.srt.runtime_context import (
     get_model,
@@ -427,26 +427,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return page_exists
 
-    @staticmethod
-    def _apply_hit_policy(
-        valid_pages: list[int], page_exists: list[bool], transfer: PoolTransfer
-    ) -> list[int]:
-        present_prefix = [0]
-        for present in page_exists:
-            present_prefix.append(present_prefix[-1] + int(present))
-
-        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-            return [end for end in valid_pages if present_prefix[end] == end]
-        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-            trailing = max(1, len(transfer.keys or ()))
-            return [
-                end
-                for end in valid_pages
-                if present_prefix[end] - present_prefix[max(0, end - trailing)]
-                == end - max(0, end - trailing)
-            ]
-        raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
-
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
@@ -464,7 +444,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # scheduler's prefill batch build, and DP-attention ranks are
             # lockstep, so every extra key is stall charged to all of them.
             page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer)
-            valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
+            valid_pages = apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break
 
