@@ -1689,7 +1689,6 @@ def aiter_w8a8_block_fp8_linear(
                 weight=ptpc_weight,
                 weight_scale=weight._ptpc_scale,
                 bias=bias,
-                allow_smallm_kernel=True,
             )
             return out.to(input.dtype).view(*output_shape)
     elif ptpc_weight is not None and input_scale.shape == (input_2d.shape[0], 1):
@@ -1699,7 +1698,6 @@ def aiter_w8a8_block_fp8_linear(
             weight=ptpc_weight,
             weight_scale=weight._ptpc_scale,
             bias=bias,
-            allow_smallm_kernel=True,
         )
         return out.view(*output_shape)
 
@@ -2827,16 +2825,6 @@ def can_auto_enable_marlin_fp8() -> bool:
         return False
 
 
-def _ptpc_gemm(q_input, weight, x_scale, weight_scale, dtype, allow_smallm_kernel):
-    if allow_smallm_kernel and smallm_fp8_gemm_supported(
-        q_input, weight, x_scale, dtype
-    ):
-        return smallm_fp8_gemm(q_input, weight, x_scale, weight_scale, dtype)
-    return aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, dtype
-    )
-
-
 def apply_fp8_ptpc_linear(
     input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
@@ -2848,7 +2836,6 @@ def apply_fp8_ptpc_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
-    allow_smallm_kernel: bool = False,
 ) -> torch.Tensor:
     """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
     # Handle pre-quantized (fp8_tensor, scale[, bf16]) tuple from fused RMSNorm+Quant.
@@ -2857,8 +2844,8 @@ def apply_fp8_ptpc_linear(
         q_input, x_scale = input[0], input[1]
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        output = _ptpc_gemm(
-            q_input, weight, x_scale, weight_scale, torch.bfloat16, allow_smallm_kernel
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
         )
         if bias is not None:
             output = output + bias
@@ -2879,8 +2866,8 @@ def apply_fp8_ptpc_linear(
         # weight is in (N, K)
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    output = _ptpc_gemm(
-        q_input, weight, x_scale, weight_scale, input.dtype, allow_smallm_kernel
+    output = aiter.gemm_a8w8_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, None, input.dtype
     )
     if bias is not None:
         output = output + bias
