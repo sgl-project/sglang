@@ -14,8 +14,7 @@ use dynamo_renderer::{RenderedPrompt, RenderedSegment};
 use serde_json::{Map, Value, json};
 use tokenizers::{AddedVocabulary, Tokenizer};
 
-use super::pydantic_dump::pydantic_bool;
-use super::schema_types::normalize_json_schema_types;
+use super::pydantic_dump::{function_dump, pydantic_bool};
 use crate::py::python_json_compact;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -104,13 +103,18 @@ pub(crate) fn render(
         Value::Array(messages) => messages.clone(),
         _ => return Err("messages must be an array".into()),
     };
-    // Pydantic lowercases message roles.
     for message in &mut messages {
+        // Pydantic lowercases message roles.
         if let Some(role) = message["role"].as_str() {
             message["role"] = role.to_lowercase().into();
         }
+        // `_process_messages` renders a null content as "".
+        if message.get("content").is_none_or(Value::is_null) {
+            message["content"] = "".into();
+        }
     }
-    // SGLang's trailing-assistant rule, as `_handle_last_assistant_message`.
+    // SGLang's trailing-assistant rule, as `_handle_last_assistant_message`; the
+    // turn's tool calls are discarded.
     let mut task_prefix = None;
     if let Some(content) = messages
         .last()
@@ -125,6 +129,8 @@ pub(crate) fn render(
             messages.pop();
             task_prefix = Some(content);
             continue_final = false;
+        } else if let Some(last) = messages.last_mut().and_then(Value::as_object_mut) {
+            last.remove("tool_calls");
         }
     }
 
@@ -218,14 +224,14 @@ fn effort(
 ) -> Result<(Option<String>, Option<u32>), String> {
     let requested = Some(&request["chat_template_kwargs"]["reasoning_effort"])
         .filter(|effort| !effort.is_null())
-        .cloned()
+        .map(numeric_effort)
         // pydantic's `Literal[...] | float` coerces numeric request efforts to floats.
         .or_else(|| requested_effort(request).map(request_effort_value))
         .or_else(|| {
             defaults
                 .get("reasoning_effort")
                 .filter(|effort| !effort.is_null())
-                .cloned()
+                .map(numeric_effort)
         })
         .filter(|effort| effort != "none")
         .or_else(|| env_effort(v41));
@@ -256,7 +262,7 @@ const TIERS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
 ];
 
-/// `SGLANG_DSV4_REASONING_EFFORT` / `SGLANG_DSV41_REASONING_EFFORT`: digits are a budget.
+/// `SGLANG_DSV4_REASONING_EFFORT` / `SGLANG_DSV41_REASONING_EFFORT`.
 fn env_effort(v41: bool) -> Option<Value> {
     let name = if v41 {
         "SGLANG_DSV41_REASONING_EFFORT"
@@ -265,13 +271,25 @@ fn env_effort(v41: bool) -> Option<Value> {
     };
     let raw = std::env::var(name).ok()?;
     let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
+    (!raw.is_empty()).then(|| numeric_effort(&raw.into()))
+}
+
+/// `serving_deepseek_recipe._numeric_effort`: a numeric string effort ("30",
+/// "0.3") as the number it spells.
+fn numeric_effort(effort: &Value) -> Value {
+    let Some(text) = effort.as_str().map(str::trim) else {
+        return effort.clone();
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    match text.split_once('.') {
+        None if digits(text) => text
+            .parse::<u64>()
+            .map_or_else(|_| effort.clone(), |n| json!(n)),
+        Some((whole, fraction)) if digits(whole) && digits(fraction) => text
+            .parse::<f64>()
+            .map_or_else(|_| effort.clone(), |n| json!(n)),
+        _ => effort.clone(),
     }
-    Some(match raw.parse::<u64>() {
-        Ok(budget) if raw.chars().all(|c| c.is_ascii_digit()) => json!(budget),
-        _ => raw.into(),
-    })
 }
 
 /// `deepseek_recipe_renderer.parse_effort_budget`.
@@ -326,33 +344,10 @@ fn handler_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
         .map(Some)
 }
 
-/// `Tool.model_dump()` after `_validate_request` normalizes the schema types,
-/// with the null fields `serving_deepseek_recipe` strips left out.
+/// `Tool.model_dump()`, with the null fields `serving_deepseek_recipe` strips left out.
 fn tool_dump(tool: &Value) -> Result<Value, String> {
-    let source = &tool["function"];
-    let name = source["name"]
-        .as_str()
-        .ok_or("tool function requires name")?;
-    let mut function = Map::new();
-    if let Some(description) = source.get("description").filter(|d| !d.is_null()) {
-        function.insert("description".into(), description.clone());
-    }
-    function.insert("name".into(), name.into());
-    if let Some(parameters) = source.get("parameters").filter(|p| !p.is_null()) {
-        let mut parameters = parameters.clone();
-        normalize_json_schema_types(&mut parameters);
-        function.insert("parameters".into(), parameters);
-    }
-    let strict = source.get("strict").map_or(Ok(false), pydantic_bool)?;
-    function.insert("strict".into(), strict.into());
-    // `Tool._propagate_defer_loading` copies the tool's flag into the function.
-    if let Some(defer) = [source.get("defer_loading"), tool.get("defer_loading")]
-        .into_iter()
-        .flatten()
-        .find(|value| !value.is_null())
-    {
-        function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
-    }
+    let mut function = function_dump(tool)?;
+    function.retain(|_, value| !value.is_null());
     let mut dump = Map::new();
     dump.insert(
         "type".into(),
