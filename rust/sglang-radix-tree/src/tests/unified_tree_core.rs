@@ -1,3 +1,6 @@
+use crate::cache_action::{
+    BackupKV, FreeDeviceKV, RecoverSwaWithLockedFull, UpdatePendingBackupOnNodeSplit,
+};
 use std::sync::Mutex;
 
 use tch::Tensor;
@@ -5,7 +8,7 @@ use tch::Tensor;
 use super::*;
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
-use crate::test_utils::{accumulate_step, action_kinds, matched_device_indices};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
@@ -314,7 +317,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -330,7 +333,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -366,7 +369,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) {
         let tracked = tracker[&SWA];
         self.host_eviction_calls
@@ -383,7 +386,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) {
         let tracked = tracker[&SWA];
         self.host_eviction_calls
@@ -440,7 +443,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -456,7 +459,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -522,7 +525,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -538,7 +541,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -599,7 +602,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -615,7 +618,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -682,7 +685,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         self.evictions.lock().unwrap().push((node_id, target));
@@ -730,7 +733,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -2444,12 +2447,13 @@ fn insert_full_overlap_frees_the_duplicates() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3], &[20, 21, 22]));
     assert_eq!(result.prefix_len, 3);
     // Nothing was consumed by any component: the whole overlap is duplicate.
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
@@ -2463,12 +2467,13 @@ fn insert_prev_prefix_len_narrows_the_dup_window() {
         prev_prefix_len: 2,
         ..insert_params(&vec![1, 2, 3], &[20, 21, 22])
     });
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[22i64])));
 }
 
@@ -2479,12 +2484,13 @@ fn insert_extends_an_existing_prefix() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     assert_eq!(result.prefix_len, 3);
     // The existing node's overlap is duplicate; the new suffix is kept.
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5]));
@@ -2506,12 +2512,13 @@ fn insert_prev_prefix_len_spans_a_multi_node_walk() {
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
     assert_eq!(result.prefix_len, 5);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[33i64, 34])));
 }
@@ -2528,12 +2535,13 @@ fn insert_prev_prefix_len_narrows_mid_node_on_a_multi_node_walk() {
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
     assert_eq!(result.prefix_len, 5);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[34i64])));
 }
@@ -2680,9 +2688,11 @@ fn insert_threshold_crossing_emits_the_backup_kv_action() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![leaf]]);
@@ -2701,7 +2711,7 @@ fn external_linker_hashes_new_nodes_and_triggers_offload_action() {
     let result = tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let leaf = result.last_device_node_id.unwrap();
     assert!(result.cache_actions.iter().any(|action| {
-        matches!(action, CacheAction::BackupKV(backup) if backup.node_ids == vec![leaf])
+        matches!(action.as_any().downcast_ref::<BackupKV>(), Some(backup) if backup.node_ids == vec![leaf])
     }));
 
     let transfers = tc
@@ -3090,10 +3100,7 @@ fn write_back_defers_swa_window_backup_until_eviction() {
         let backups: Vec<&BackupKV> = result
             .cache_actions
             .iter()
-            .filter_map(|action| match action {
-                CacheAction::BackupKV(backup) => Some(backup),
-                _ => None,
-            })
+            .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
             .collect();
         assert!(backups.is_empty());
     }
@@ -3168,16 +3175,15 @@ fn split_updates_pending_backup_with_or_without_a_tree_ack() {
             let prefix_id = result.best_match_node_id;
             assert_ne!(prefix_id, tail_id);
             if pending || buffer_only {
-                assert!(matches!(
-                    result.cache_actions.as_slice(),
-                    [CacheAction::UpdatePendingBackupOnNodeSplit {
+                assert!(
+                    matches!(result.cache_actions.as_slice(), [action] if matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit {
                         ack_id,
                         old_node_id,
                         new_node_id,
                         new_child_node_id,
-                    }] if *ack_id == pending.then_some(tail_id) && *old_node_id == tail_id
-                        && *new_node_id == prefix_id && *new_child_node_id == tail_id
-                ));
+                    }) if *ack_id == pending.then_some(tail_id) && *old_node_id == tail_id
+                        && *new_node_id == prefix_id && *new_child_node_id == tail_id))
+                );
             } else {
                 assert!(result.cache_actions.is_empty());
             }
@@ -4063,16 +4069,21 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     let new_node_id = result
         .cache_actions
         .iter()
-        .find_map(|action| match action {
-            CacheAction::UpdatePendingBackupOnNodeSplit {
-                ack_id,
-                new_node_id,
-                ..
-            } => {
-                assert_eq!(*ack_id, Some(leaf));
-                Some(*new_node_id)
+        .find_map(|action| {
+            match action
+                .as_any()
+                .downcast_ref::<UpdatePendingBackupOnNodeSplit>()
+            {
+                Some(UpdatePendingBackupOnNodeSplit {
+                    ack_id,
+                    new_node_id,
+                    ..
+                }) => {
+                    assert_eq!(*ack_id, Some(leaf));
+                    Some(*new_node_id)
+                }
+                _ => None,
             }
-            _ => None,
         })
         .expect("the split relocates the pending write-through");
     // Nothing reaches the host tier before the ack.
@@ -4531,10 +4542,9 @@ fn insert_host_refill_preserves_split_actions_and_lengths() {
     assert_eq!(result.total_len, 2);
     assert!(result.inserted_host_node.is_some());
     assert!(!result.host_insert_dropped);
-    assert!(matches!(
-        result.cache_actions.as_slice(),
-        [CacheAction::UpdatePendingBackupOnNodeSplit { ack_id, .. }] if *ack_id == Some(leaf)
-    ));
+    assert!(
+        matches!(result.cache_actions.as_slice(), [action] if matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit { ack_id, .. }) if *ack_id == Some(leaf)))
+    );
 }
 
 #[test]
@@ -5614,12 +5624,13 @@ fn insert_page_size_two_splits_mid_page_divergence_at_the_page_boundary() {
     // The keys share 3 atoms but pages quantize the overlap down to 2.
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 9], &[20, 21, 22, 29]));
     assert_eq!(result.prefix_len, 2);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21])));
     let prefix = tc
@@ -8641,12 +8652,13 @@ fn insert_unevicts_a_tombstoned_deep_node() {
             .device_value(tc.arena.resolve(leaf).expect("live test node"), FULL)
             .equal(&Tensor::from_slice(&[33i64, 34]))
     );
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[30i64, 31, 32])));
 }
 
@@ -8658,12 +8670,13 @@ fn insert_ragged_key_onto_an_existing_prefix_page_size_two() {
     assert_eq!(result.prefix_len, 2);
     // The ragged tail never enters: no new leaf, the aligned span is duplicate.
     assert_eq!(tc.arena.len(), 2);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21])));
 }
 
@@ -8675,16 +8688,18 @@ fn insert_ragged_key_traverses_a_node_before_the_tail_page_size_two() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34]));
     assert_eq!(result.prefix_len, 4);
     assert_eq!(tc.arena.len(), 3);
-    let [
-        CacheAction::FreeDeviceKV(freed_head),
-        CacheAction::FreeDeviceKV(freed_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV per walked node, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV {
+        indices: freed_head,
+    } = expect_action::<FreeDeviceKV>(action0.as_ref());
+    let FreeDeviceKV {
+        indices: freed_tail,
+    } = expect_action::<FreeDeviceKV>(action1.as_ref());
     assert!(freed_head[0].equal(&Tensor::from_slice(&[30i64, 31])));
     assert!(freed_tail[0].equal(&Tensor::from_slice(&[32i64, 33])));
 }
@@ -8714,7 +8729,7 @@ fn deferrable_dup_frees_ride_the_final_step_without_suspension() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let step = tc.begin_insert(&insert_params(&vec![1, 2, 3, 4], &[20, 21, 22, 13]));
-    assert_eq!(action_kinds(&step.actions), vec!["FreeDeviceKV"]);
+    assert_eq!(action_kinds(&step.actions), vec!["free_device_kv"]);
     let result = step
         .result
         .expect("a deferrable-only walk completes in one step");
@@ -8749,11 +8764,9 @@ fn walk_backup_crossing_suspends_then_resume_completes() {
     assert!(tc.has_ongoing_insert());
     assert_eq!(
         action_kinds(&step.actions),
-        vec!["FreeDeviceKV", "BackupKV"]
+        vec!["free_device_kv", "backup_kv"]
     );
-    let CacheAction::BackupKV(backup) = &step.actions[1] else {
-        unreachable!();
-    };
+    let backup = expect_action::<BackupKV>(step.actions[1].as_ref());
     assert_eq!(backup.node_ids, vec![tc.arena.node(a).id]);
 
     let done = tc.resume_insert();
@@ -8841,7 +8854,7 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
     assert!(step.result.is_none());
     assert_eq!(
         action_kinds(&step.actions),
-        vec!["FreeDeviceKV", "BackupKV"]
+        vec!["free_device_kv", "backup_kv"]
     );
     // The barrier's backup host-evicts the on-path H-leaf before committing.
     let mut tracker = HashMap::from([(FULL, 0)]);
@@ -8889,9 +8902,11 @@ fn aborted_barrier_crossing_refires_on_the_next_insert() {
     let backups: Vec<_> = step
         .actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![tc.arena.node(a).id]]);
@@ -8959,9 +8974,11 @@ fn one_insert_walk_fires_two_crossings_around_a_backuped_middle() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![top], vec![deep]]);
@@ -9518,17 +9535,17 @@ fn caller_owned_overlap_drains_split_and_backup_before_duplicate_frees() {
     );
     assert_eq!(
         action_kinds(&walk.pending_actions),
-        vec!["UpdatePendingBackupOnNodeSplit"]
+        vec!["update_pending_backup_on_node_split"]
     );
     assert!(!walk.has_barrier_actions_since(0));
-    walk.pending_actions.push(CacheAction::BackupKV(BackupKV {
+    walk.pending_actions.push(Box::new(BackupKV {
         node_ids: vec![node.id],
     }));
     assert!(walk.has_barrier_actions_since(0));
     let actions = std::mem::take(&mut walk.pending_actions);
     assert_eq!(
         action_kinds(&actions),
-        vec!["UpdatePendingBackupOnNodeSplit", "BackupKV"]
+        vec!["update_pending_backup_on_node_split", "backup_kv"]
     );
     assert_eq!(tc.arena.node(head).parent(), tc.arena.root());
     assert_eq!(
@@ -9550,10 +9567,8 @@ fn caller_owned_overlap_drains_split_and_backup_before_duplicate_frees() {
     ));
     let step = walk.finish();
     assert_eq!(step.result.unwrap().prefix_len, 2);
-    assert_eq!(action_kinds(&step.actions), vec!["FreeDeviceKV"]);
-    let CacheAction::FreeDeviceKV(frees) = &step.actions[0] else {
-        unreachable!()
-    };
+    assert_eq!(action_kinds(&step.actions), vec!["free_device_kv"]);
+    let FreeDeviceKV { indices: frees } = expect_action::<FreeDeviceKV>(step.actions[0].as_ref());
     assert!(frees[0].equal(&Tensor::from_slice(&[20i64, 21])));
     assert!(!tc.has_ongoing_insert());
     tc.sanity_check(&[], &[]);
@@ -9577,7 +9592,7 @@ fn caller_owned_walk_can_abort_after_split_without_claiming_donor() {
     drop(walk);
     assert_eq!(
         action_kinds(&actions),
-        vec!["UpdatePendingBackupOnNodeSplit"]
+        vec!["update_pending_backup_on_node_split"]
     );
     assert!(!tc.has_ongoing_insert());
     assert!(tc.end_insert().is_empty());
@@ -9590,7 +9605,7 @@ fn caller_owned_walk_can_abort_after_split_without_claiming_donor() {
     assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
     let result = tc.insert(&params);
     assert_eq!(result.prefix_len, 2);
-    assert_eq!(action_kinds(&result.cache_actions), vec!["FreeDeviceKV"]);
+    assert_eq!(action_kinds(&result.cache_actions), vec!["free_device_kv"]);
     tc.sanity_check(&[], &[]);
 }
 
@@ -9675,15 +9690,12 @@ fn overlap_context_reaches_swa_before_it_replaces_unlocked_full_ids() {
     );
     assert!(walk.has_barrier_actions_since(start));
     let actions = std::mem::take(&mut walk.pending_actions);
-    assert_eq!(action_kinds(&actions), vec!["RecoverSwaWithLockedFull"]);
-    let CacheAction::RecoverSwaWithLockedFull {
+    assert_eq!(action_kinds(&actions), vec!["recover_swa_with_locked_full"]);
+    let RecoverSwaWithLockedFull {
         node_id: actual_node_id,
         kept_full,
         incoming_full,
-    } = &actions[0]
-    else {
-        unreachable!()
-    };
+    } = expect_action::<RecoverSwaWithLockedFull>(actions[0].as_ref());
     assert_eq!(*actual_node_id, node_id);
     assert!(kept_full.equal(&kept));
     assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21])));

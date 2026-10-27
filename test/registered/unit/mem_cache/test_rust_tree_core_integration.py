@@ -5611,3 +5611,72 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
+    binding = mem_cache.RustUnifiedTreeCoreBinding(
+        mem_cache.TreeCoreInitParamsBinding(
+            page_size=1, swa_sliding_window_size=8, enable_hicache=True
+        ),
+        [0, 1],
+    )
+    binding.set_has_swa_host_pool()
+    key = array("q", range(5))
+    prefix = binding.insert(
+        mem_cache.InsertParamsBinding(key=key[:2], value=torch.tensor([10, 11]))
+    ).last_device_node
+    binding.set_component_device_value(prefix, 1, torch.tensor([110, 111]))
+    tail = binding.insert(
+        mem_cache.InsertParamsBinding(
+            key=key, value=torch.arange(10, 15), prev_prefix_len=2
+        )
+    ).last_device_node
+    binding.set_component_device_value(tail, 1, torch.tensor([112, 113, 114]))
+    for node, host in (
+        (prefix, torch.arange(310, 312)),
+        (tail, torch.arange(312, 315)),
+    ):
+        _, transfers = binding.build_backup_spec(node)
+        transfer = transfers[1][0]
+        transfers[1][0] = (transfer[0], transfer[2] + 100, *transfer[2:])
+        binding.mark_write_through_pending([node], node)
+        binding.commit_backup(node, host, transfers)
+        binding.finish_write_through([node], node)
+    binding.demote(tail)
+    binding.demote(prefix)
+
+    kv_transfer, transfers = binding.build_load_back_spec(tail)
+    transfer = transfers[1][0]
+    transfers[1][0] = (*transfer[:2], torch.arange(50, 55), *transfer[3:])
+    actions = binding.commit_load_back(
+        tail, torch.arange(40, 45), kv_transfer, transfers
+    )
+    receipt = binding.inc_lock_ref(tail)
+    assert isinstance(actions, list) and len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, tuple) and len(action) == 3
+    assert action[0] == "rebuild_full_to_swa_mapping"
+    assert isinstance(action[1], list) and isinstance(action[2], list)
+    assert [value.tolist() for value in action[1]] == [[40, 41], [42, 43, 44]]
+    assert [value.tolist() for value in action[2]] == [[50, 51], [52, 53, 54]]
+    binding.dec_lock_ref(
+        tail,
+        mem_cache.DecLockRefParamsBinding(
+            node_id=receipt.node_id,
+            skipped_lock_components=receipt.skipped_lock_components,
+            component_lock_uuids=receipt.component_lock_uuids,
+            component_host_lock_uuids=receipt.component_host_lock_uuids,
+        ),
+    )
+    binding.finish_load_back(tail)
+    binding.sanity_check([], [])
+
+    chunk = action[2][1]
+    storage_ref = chunk.untyped_storage()._weak_ref()
+    try:
+        binding.reset()
+        assert chunk.tolist() == [52, 53, 54]
+        del chunk, action, actions
+        assert torch.UntypedStorage._expired(storage_ref)
+    finally:
+        torch.UntypedStorage._free_weak_ref(storage_ref)
