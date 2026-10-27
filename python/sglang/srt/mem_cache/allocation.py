@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.runtime_context import attention_backends, get_memory, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -46,6 +46,7 @@ if _is_cpu:
     from sgl_kernel import assign_req_to_token_pool_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -401,8 +403,8 @@ def alloc_for_extend(
 
     # Admission already charged HiSparse scratch; allocate it with the request
     # slot so subsequent scheduling sees the remaining physical capacity.
-    if batch.hisparse_coordinator is not None:
-        batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -789,7 +791,7 @@ def alloc_for_spec_decode(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
             allocator = tree_cache.token_to_kv_pool_allocator
-            if batch is not None and batch.hisparse_coordinator is not None:
+            if batch is not None and get_memory().enable_hisparse:
                 # Spec decode reserves logical target slots here. Target verify
                 # later binds those slots to HiSparse's extra page; allocating
                 # target physical pages first both wastes memory and breaks the

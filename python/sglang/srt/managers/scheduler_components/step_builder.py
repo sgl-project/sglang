@@ -18,6 +18,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.scheduler_components.bundles import KvResources, Workers
     from sglang.srt.managers.scheduler_components.engine_state import (
@@ -36,6 +37,7 @@ class StepBuilder:
         future_map: FutureMap,
         counters: LaunchCounters,
         workers: Workers,
+        hisparse_coordinator: Optional[HiSparseCoordinator],
         model_config: ModelConfig,
         device: str,
     ):
@@ -50,6 +52,8 @@ class StepBuilder:
         self.counters = counters
         self.tp_worker = workers.tp_worker
         self.model_worker = workers.model_worker
+        # HiSparse spec decoding allocates each new request slot's scratch.
+        self.hisparse_coordinator = hisparse_coordinator
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.device = device
@@ -83,7 +87,7 @@ class StepBuilder:
             )
 
         new_slot_reqs = [req for req in can_run_list if not req.kv.holds_kv]
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(self.hisparse_coordinator)
         if new_slot_reqs and not self.spec_algorithm.is_none():
             # A slot taken now may still name its previous request's draft
             # state; forget it before this step's forward publishes the slot.

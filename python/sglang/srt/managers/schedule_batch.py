@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.req_state import DisaggReqState
     from sglang.srt.dllm.req_state import DllmReqState
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
@@ -2995,7 +2996,9 @@ class ScheduleBatch:
                 continue
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(
+        self, hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    ):
         self.forward_mode = ForwardMode.EXTEND
 
         # Init tensors
@@ -3057,7 +3060,7 @@ class ScheduleBatch:
             ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
+            self, hisparse_coordinator
         )
 
         # Set fields

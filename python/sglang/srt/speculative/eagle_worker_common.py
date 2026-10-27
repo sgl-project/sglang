@@ -733,8 +733,9 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens = batch.seq_lens + accept_lens
-    if batch.hisparse_coordinator is not None:
-        batch.hisparse_coordinator.commit_spec_accept_tokens(
+    hisparse_coordinator = target_worker.model_runner.hisparse_coordinator
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.commit_spec_accept_tokens(
             batch=batch,
             accept_indices=accept_index,
         )

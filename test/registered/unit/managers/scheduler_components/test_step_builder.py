@@ -32,6 +32,7 @@ def _new_step_builder() -> StepBuilder:
         future_map=None,
         counters=LaunchCounters(),
         workers=SimpleNamespace(tp_worker=None, model_worker=None),
+        hisparse_coordinator=None,
         model_config=None,
         device="cpu",
     )

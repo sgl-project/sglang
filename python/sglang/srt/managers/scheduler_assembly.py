@@ -710,6 +710,7 @@ def assemble_scheduler(
         future_map=future_map,
         counters=counters,
         workers=workers,
+        hisparse_coordinator=mode_owners.hisparse_coordinator,
         model_config=model_config,
         device=device,
     )

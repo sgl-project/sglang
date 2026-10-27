@@ -88,7 +88,13 @@ _DECLARED = {
         "KvResources",
     ],
     "LoraAdmission": ["Workers"],
-    "StepBuilder": ["KvResources", "FutureMap", "Workers", "LaunchCounters"],
+    "StepBuilder": [
+        "KvResources",
+        "FutureMap",
+        "Workers",
+        "LaunchCounters",
+        "HiSparse",
+    ],
     "DPAttnAdapter": ["Workers", "EngineFlags", "StepBuilder"],
     "BatchResultProcessor": [
         "OutputStreamer",
