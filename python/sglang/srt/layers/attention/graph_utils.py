@@ -88,7 +88,8 @@ def allocate_attention_outputs(layer, query, value, index_query):
     """Allocate graph-owned buffers before entering the eager attention region."""
     rows = query.shape[0]
     sparse = index_query is not None
-    dtype = query.dtype if sparse or value is None else value.dtype
+    # Follow v, not q: qk-norm may emit q in FP8 while the backend writes bf16.
+    dtype = query.dtype if value is None else value.dtype
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         dtype = torch.bfloat16
     shape = (
@@ -98,7 +99,9 @@ def allocate_attention_outputs(layer, query, value, index_query):
     )
     output = torch.empty(shape, dtype=dtype, device=query.device)
     index_output = (
-        query.new_empty((rows, index_query.shape[1] * index_query.shape[2]))
+        query.new_empty(
+            (rows, index_query.shape[1] * index_query.shape[2]), dtype=dtype
+        )
         if sparse
         else None
     )

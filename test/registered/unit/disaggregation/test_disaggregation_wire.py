@@ -68,7 +68,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -358,6 +358,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_data_ptrs=[[0x1000]],
             state_item_lens=[[32]],
             state_layer_ids=[[]],
+            aux_data_ptrs=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -380,6 +381,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
                 return info, manager._publish_peer_registration("decode", info)
