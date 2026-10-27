@@ -8,9 +8,12 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.configs.model_config import is_qwen3_5
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -158,11 +161,7 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "HiSparse host pool is constructed without DCP translation."
         )
     if not use_mla_backend(server_args):
-        raise NotImplementedError(
-            "HiCache with --dcp-size > 1 is only supported for MLA models: "
-            "the index translation lives in MLATokenToKVPoolHost, and the "
-            "MHA host pool has none."
-        )
+        _validate_mha_dcp_hicache(server_args)
     logger.info(
         "HiCache + DCP enabled: host pool uses widened "
         "logical slot accounting with per-rank physical translation at "
@@ -248,6 +247,64 @@ def resolve_hicache_key_scheme(server_args: Any):
         resolutions["hicache_io_backend"] = "kernel"
     if resolutions:
         declare_resolution(server_args, "_resolve_hicache_key_scheme", **resolutions)
+
+
+def _validate_mha_dcp_hicache(server_args: Any) -> None:
+    """Admit the validated dense-KV/GDN L2 path without widening MLA support."""
+    cfg = resolving_view(server_args)
+    unsupported = []
+    if not get_platform().is_cuda:
+        unsupported.append("non-CUDA devices")
+    if cfg.attention_backend != "triton" or any(
+        backend not in (None, "triton")
+        for backend in (cfg.prefill_attention_backend, cfg.decode_attention_backend)
+    ):
+        unsupported.append("attention backends other than Triton")
+    auto_fp16 = cfg.kv_cache_dtype == "auto" and cfg.dtype in ("float16", "half")
+    if cfg.kv_cache_dtype != "bf16" and not auto_fp16:
+        unsupported.append("KV dtypes other than bf16 or auto with float16 compute")
+    if (cfg.hicache_mem_layout, cfg.hicache_io_backend) not in (
+        ("page_first", "kernel"),
+        ("page_first_direct", "direct"),
+    ):
+        unsupported.append(
+            "host layout / IO pairs other than page_first/kernel or page_first_direct/direct"
+        )
+    if cfg.hicache_write_policy != "write_through":
+        unsupported.append("write policies other than write_through")
+    if (
+        cfg.hicache_host_memory_mode != "cache"
+        or cfg.hicache_storage_backend is not None
+    ):
+        unsupported.append("L3 storage or buffer_only host memory")
+    if cfg.speculative_algorithm is not None:
+        unsupported.append("speculative decoding")
+    if cfg.disaggregation_mode != "null":
+        unsupported.append("PD disaggregation")
+    if (
+        cfg.pp_size != 1
+        or cfg.dp_size != 1
+        or cfg.attn_dp_size != 1
+        or cfg.ep_size != 1
+    ):
+        unsupported.append("PP, DP, attention DP or EP")
+    if cfg.enable_unified_memory or cfg.enable_kv_cache_sharding:
+        unsupported.append("unified memory or prefill KV sharding")
+    model = model_config_of(server_args)
+    if model.is_hybrid_swa:
+        unsupported.append("sliding-window attention")
+    if getattr(model.hf_text_config, "indexer_n_heads", 0):
+        unsupported.append("sparse attention indexers")
+    # Qwen3.5 adjusts its K/V projections for DCP. Other models retain their
+    # TP-only projection layout, which must already match the DCP pool.
+    if not is_qwen3_5(model.hf_config) and model.get_num_kv_heads(
+        cfg.tp_size, cfg.dcp_size
+    ) != model.get_num_kv_heads(cfg.tp_size):
+        unsupported.append("a KV-head layout not provided by the model's projections")
+    if unsupported:
+        raise NotImplementedError(
+            "MHA/GQA HiCache + DCP does not support " + ", ".join(unsupported)
+        )
 
 
 def resolve_layout_io_compatibility(server_args: Any):
