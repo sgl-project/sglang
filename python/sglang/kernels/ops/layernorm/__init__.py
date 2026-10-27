@@ -83,8 +83,8 @@ register_kernel(
     )
 )
 
-# Muse Spark fused norms. The per-layer ops are inventoried through their class
-# methods; the NVFP4 quant op through its module-level instance.
+# Muse Spark and Beam fused norms. The per-layer ops are inventoried through
+# their class methods; the NVFP4 quant op through its module-level instance.
 for _op, _target, _backends in (
     (
         "muse_spark_norm_gate",
@@ -100,6 +100,11 @@ for _op, _target, _backends in (
         "muse_spark_rmsnorm_nvfp4_quant",
         "muse_spark_rmsnorm_nvfp4_quant:_FUSED_NORM_FP4_QUANT",
         ("torch", "jit", "helion"),
+    ),
+    (
+        "beam_sandwich_residual_rmsnorm",
+        "beam_fused:BeamSandwichResidualRMSNormOp",
+        ("torch", "triton"),
     ),
 ):
     for _bk in _backends:
