@@ -51,7 +51,6 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram_config import EngramConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -999,14 +998,15 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        config = EngramConfig.from_dict(get_exec().offload.engram_config)
-        if config.lookup == "peer_read" and self.tp_size > 1:
+        # Resolved by server args (_resolve_engram_config); None before that.
+        config = get_exec().offload.engram_config or {}
+        if config.get("lookup") == "peer_read" and self.tp_size > 1:
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
-        elif config.placement == "cpu":
-            layout = "shared" if config.replication == "per_node" else "per_rank"
+        elif config.get("placement") == "cpu":
+            layout = "shared" if config["replication"] == "per_node" else "per_rank"
             self._init_host_table(num_embeddings, dim, layer_id, layout)
         else:
             self.weight = nn.Parameter(

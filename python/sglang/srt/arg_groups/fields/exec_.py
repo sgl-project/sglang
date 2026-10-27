@@ -1122,20 +1122,10 @@ class ExecOffload(msgspec.Struct):
     engram_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="DeepSeek-V4.1 Engram tables as a JSON object; omitted keys "
-            "keep their defaults. 'placement': 'gpu' (default) or 'cpu' (pinned "
-            "host memory read in place, leaving the HBM to the KV cache). "
-            "'replication': 'none' (default; one table, its rows split across "
-            "the TP group) or 'per_node' (each node holds the whole table, "
-            "mapped by its ranks; needs placement 'cpu' and one node). "
-            "'lookup', with replication 'none': 'collective' (default; each "
-            "rank looks up its own rows and a reduction assembles them) or "
-            "'peer_read' (each rank reads its rows from the owning GPU's "
-            "shard; needs placement 'gpu' and CUDA). Example: "
-            '\'{"placement": "cpu"}\'. Replaces the deprecated '
-            "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE, "
-            "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT and "
-            "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.",
+            help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
+            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "collective|peer_read; an omitted key takes the first value. "
+            "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),
     ] = None
