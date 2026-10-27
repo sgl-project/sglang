@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -101,6 +101,18 @@ class ExpertLocationMetadata:
         assert num_layers_0 == num_layers_1 == num_layers_2
         assert num_logical_experts_0 == num_logical_experts_1
         assert num_physical_experts_0 == num_physical_experts_1
+
+        # table[layer][expert] lists the expert's physical ids on all ranks.
+        self._logical_to_all_physical_cache: Tuple[
+            Optional[torch.Tensor],
+            Optional[Tuple[int, int, int]],
+            List[List[Tuple[int, ...]]],
+        ] = (None, None, [])
+
+    def __setstate__(self, state):
+        # A copied or unpickled map can reuse the cached address and version.
+        self.__dict__.update(state)
+        self._logical_to_all_physical_cache = (None, None, [])
 
     # -------------------------------- construction ------------------------------------
 
@@ -346,8 +358,8 @@ class ExpertLocationMetadata:
         logical_expert_id: int,
         require_global_experts: bool = False,
     ) -> List[int]:
-        # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
-        cpu_map = self.logical_to_all_physical_map_cpu
+        # Use CPU copy to avoid GPU-to-CPU sync on every call, which is expensive in update weights scenario
+        cpu_map = self.physical_to_logical_map_cpu
         # Draft workers can query MoE layers whose layer_id lies beyond the
         # target-sized expert map; fall back to the identity mapping (no EPLB
         # rebalancing for those layers) instead of indexing out of range.
@@ -367,11 +379,48 @@ class ExpertLocationMetadata:
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
-        return [
-            physical_expert_id
-            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
-            if physical_expert_id != -1
-        ]
+        num_logical_experts = self.num_logical_experts
+        if not 0 <= logical_expert_id < num_logical_experts:
+            raise IndexError(
+                f"{logical_expert_id=} is not one of the "
+                f"{num_logical_experts} logical experts"
+            )
+        # Every replica on every rank: logical_to_all_physical_map may narrow the
+        # dispatch candidates to one replica, but the loaders must fill every slot.
+        # No table for inference tensors: writes to them may leave _version as it is.
+        # Checked on every lookup, as assigning .data can turn a cached map into one.
+        if cpu_map.is_inference():
+            return (cpu_map[layer_id] == logical_expert_id).nonzero().flatten().tolist()
+        # Read before tolist(), so a write during the build invalidates the table.
+        try:
+            version = cpu_map._version
+        except RuntimeError:
+            # An inference tensor swapped in by another thread after the check.
+            if not cpu_map.is_inference():
+                raise
+            return (cpu_map[layer_id] == logical_expert_id).nonzero().flatten().tolist()
+        pointer = cpu_map.data_ptr()
+        built_from, built_key, table = self._logical_to_all_physical_cache
+        if (
+            built_from is not cpu_map
+            or built_key[0] != pointer
+            or built_key[1] != version
+            or built_key[2] != num_logical_experts
+        ):
+            table = [
+                _compute_logical_to_all_physical_ids(
+                    physical_to_logical_map=row,
+                    num_logical_experts=num_logical_experts,
+                )
+                for row in cpu_map.tolist()
+            ]
+            # Set as one tuple: a concurrent lookup never mixes two builds.
+            self._logical_to_all_physical_cache = (
+                cpu_map,
+                (pointer, version, num_logical_experts),
+                table,
+            )
+        return [*table[layer_id][logical_expert_id]]
 
 
 def format_expert_location_layout(
@@ -606,6 +655,17 @@ def _pad_nested_array(arr, pad_value):
         for outer in arr
     ]
     return padded
+
+
+def _compute_logical_to_all_physical_ids(
+    physical_to_logical_map: List[int], num_logical_experts: int
+) -> List[Tuple[int, ...]]:
+    ans = [[] for _ in range(num_logical_experts)]
+    for physical_expert_id, logical_expert_id in enumerate(physical_to_logical_map):
+        # --init-expert-location accepts entries such as -1, which hold no expert.
+        if 0 <= logical_expert_id < num_logical_experts:
+            ans[logical_expert_id].append(physical_expert_id)
+    return [tuple(physical_expert_ids) for physical_expert_ids in ans]
 
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)
