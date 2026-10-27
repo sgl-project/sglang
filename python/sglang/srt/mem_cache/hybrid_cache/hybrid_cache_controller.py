@@ -959,7 +959,7 @@ class HybridCacheController(BaseHiCacheController):
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
             if t.indices_from_pool is None and t.host_indices is not None:
-                source_len[t.name] = len(t.host_indices)
+                source_len[t.name] = source_len.get(t.name, 0) + len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
             if entry is None:
@@ -1814,21 +1814,28 @@ class HybridCacheController(BaseHiCacheController):
                     pool.device_indices = kv_device_indices
                 continue
 
-            source = next(
-                (
-                    transfer
-                    for transfer in extra_pools
-                    if transfer.indices_from_pool is None
-                    and transfer.name == pool.indices_from_pool
-                ),
-                None,
-            )
-            if source is None:
+            sources = [
+                transfer
+                for transfer in extra_pools
+                if transfer.indices_from_pool is None
+                and transfer.name == pool.indices_from_pool
+            ]
+            if not sources:
                 rollback_allocated()
                 return None
-            pool.host_indices = source.host_indices
+            # Mamba load-back can restore one checkpoint to both a radix slot
+            # and an active request slot. Sidecars must follow both copies.
+            pool.host_indices = (
+                sources[0].host_indices
+                if len(sources) == 1
+                else torch.cat([source.host_indices for source in sources])
+            )
             if pool.device_indices is None:
-                pool.device_indices = source.device_indices
+                pool.device_indices = (
+                    sources[0].device_indices
+                    if len(sources) == 1
+                    else torch.cat([source.device_indices for source in sources])
+                )
         return extra_pools
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
