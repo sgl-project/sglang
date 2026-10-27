@@ -74,9 +74,17 @@ def drop_folded_rows(
         ]
         if hidden is not None:
             logits_output.hidden_states = hidden[keep]
+            if logits_output.last_hidden_states is not None:
+                logits_output.last_hidden_states = logits_output.last_hidden_states[
+                    keep
+                ]
     elif hidden is not None and hidden.shape[0] >= folded.num_rows:
         # MLP-sync padding rows, if any, follow the real rows and are dropped too.
         logits_output.hidden_states = hidden[folded.keep_rows]
+        if logits_output.last_hidden_states is not None:
+            logits_output.last_hidden_states = logits_output.last_hidden_states[
+                folded.keep_rows
+            ]
 
 
 def _tail_rows_on_original(
@@ -103,6 +111,7 @@ def run_encoder_swa_replay(worker, batch):
     rows = _reset_windows_and_collect_hits(batch=batch, window=window)
     if not rows:
         return
+    assert batch.engram_staged_rows is None, "staged engram rows need a folded replay"
     # One forward replays every hitting request; each request's window is
     # floored at its own start, so the result matches per-request replays.
     replay = _build_replay_batch(batch=batch, runner=runner, rows=rows)

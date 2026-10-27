@@ -47,6 +47,7 @@ _TRITON_KERNELS = [
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
+    ("table_qk_norm_rope", "table_qk_norm_rope_"),
     ("dsv4.attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4.attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4.attn_metadata_kernels", "build_causal_swa_page_indices"),
@@ -75,7 +76,7 @@ del _mod, _fn
 register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))}
@@ -123,7 +124,7 @@ def qwen38_qsa_sm121_varlen(
             "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
             "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
         )
-    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
+    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.KDA)(
         q,
         k,
         v,
@@ -277,6 +278,15 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+# Called through ops.attention.kda_fused_decode_gfx950, which checks for gfx950.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_decode_gfx950",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.kda_decode_gfx950:kda_decode_gfx950",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
@@ -391,6 +401,13 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.update_msa_v1_decode_plan",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.msa_v1.decode_plan:update_msa_v1_decode_plan",
     )
 )
 
@@ -519,6 +536,15 @@ register_kernel(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
             for sm in ((10, 0), (10, 3))
         ),
+    )
+)
+# Called through ops.attention.linear.kda_gfx950_prefill, which checks for gfx950.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_prefill_gfx950",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.kda_prefill_gfx950:kda_prefill_gfx950",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
 register_kernel(

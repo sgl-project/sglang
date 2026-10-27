@@ -3,7 +3,9 @@
 //
 // decide: for a step whose routed (token, expert) entries fit the K slots, keep every resident
 // expert the step uses, give each missing expert the least recently used slot the step does not
-// need, and write the page-in plan (src expert -> dst slot, count) to device buffers.
+// need, and write the page-in plan (src expert -> dst slot, count) to device buffers. It also
+// writes the runner's inputs: each routed entry's slot and router weight, slot 0 and weight 0 for
+// padding, so no further kernel is needed to build them.
 // gather: copy the planned experts from the pinned host store into their slots, for every paged
 // tensor of a layer in one launch. The count is read on the device, so a replayed graph moves
 // exactly the experts its decide chose.
@@ -24,7 +26,8 @@ namespace {
 // One warp. The evictions depend on each other and are committed one at a time by lane 0; each
 // victim search and the per-entry bookkeeping are spread over the warp.
 __global__ void paged_experts_decide_kernel(
-    const int32_t* topk,  // [T] routed expert ids of the step (negative: padding)
+    const int32_t* topk,   // [T] routed expert ids of the step (negative: padding)
+    const float* weights,  // [T] their router weights
     int T,
     int E,
     int K,
@@ -34,7 +37,9 @@ __global__ void paged_experts_decide_kernel(
     int32_t* slot_lastuse,  // [K] step each slot was last used
     int32_t* src,           // [K] out: experts to page in
     int32_t* dst,           // [K] out: their slots
-    int32_t* count) {       // [1] out: number of page-ins
+    int32_t* count,         // [1] out: number of page-ins
+    int32_t* run_ids,       // [T] out: slot of each entry (0 for padding)
+    float* run_w) {         // [T] out: weight of each entry (0 for padding)
   const int lane = threadIdx.x;
   int now = 0;
   if (lane == 0) now = ++(*step);
@@ -83,6 +88,13 @@ __global__ void paged_experts_decide_kernel(
     __syncwarp();  // the next search reads this eviction
   }
   if (lane == 0) *count = n;
+  __syncwarp();  // the slots of the experts paged in above
+  for (int i = lane; i < T; i += 32) {
+    const int e = topk[i];
+    const int s = (e < 0 || e >= E) ? -1 : expert_slot[e];
+    run_ids[i] = s >= 0 ? s : 0;
+    run_w[i] = s >= 0 ? weights[i] : 0.f;
+  }
 }
 
 template <typename T>
@@ -95,9 +107,9 @@ copy_rows(const T* host, T* gpu, long row, int n, const int32_t* src, const int3
 }
 
 __global__ void paged_experts_gather_kernel(
-    const int64_t* hosts,  // [P] UVA device pointer of each paged tensor's host store
-    const int64_t* gpus,   // [P] each paged tensor's K-slot GPU table
-    const int64_t* words,  // [P] 4-byte words per expert of each tensor
+    const int64_t* hosts,      // [P] UVA device pointer of each paged tensor's host store
+    const int64_t* gpus,       // [P] each paged tensor's K-slot GPU table
+    const int64_t* row_bytes,  // [P] bytes per expert of each tensor, even
     int P,
     const int32_t* src,
     const int32_t* dst,
@@ -106,22 +118,32 @@ __global__ void paged_experts_gather_kernel(
   const long stride = static_cast<long>(gridDim.x) * blockDim.x;
   const long tid = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
   for (int p = 0; p < P; ++p) {
-    const long row = words[p];
-    if (row % 4 == 0) {  // 16-byte rows: copy in float4, which the host link needs
+    const long bytes = row_bytes[p];
+    if (bytes % 16 == 0) {  // copy in float4, which the host link needs
       copy_rows(
           reinterpret_cast<const float4*>(hosts[p]),
           reinterpret_cast<float4*>(gpus[p]),
-          row / 4,
+          bytes / 16,
           n,
           src,
           dst,
           tid,
           stride);
-    } else {  // small per-expert scalars
+    } else if (bytes % 4 == 0) {  // small per-expert scalars
       copy_rows(
           reinterpret_cast<const int32_t*>(hosts[p]),
           reinterpret_cast<int32_t*>(gpus[p]),
-          row,
+          bytes / 4,
+          n,
+          src,
+          dst,
+          tid,
+          stride);
+    } else {  // 16-bit per-expert scalars (e.g. an NVFP4 Marlin global scale)
+      copy_rows(
+          reinterpret_cast<const int16_t*>(hosts[p]),
+          reinterpret_cast<int16_t*>(gpus[p]),
+          bytes / 2,
           n,
           src,
           dst,
@@ -133,13 +155,16 @@ __global__ void paged_experts_gather_kernel(
 
 void paged_experts_decide(
     tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView weights,
     tvm::ffi::TensorView step,
     tvm::ffi::TensorView slot_expert,
     tvm::ffi::TensorView expert_slot,
     tvm::ffi::TensorView slot_lastuse,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
-    tvm::ffi::TensorView count) {
+    tvm::ffi::TensorView count,
+    tvm::ffi::TensorView run_ids,
+    tvm::ffi::TensorView run_w) {
   using namespace sglang::host;
 
   SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"num_entries"}, One = {"one"};
@@ -153,13 +178,15 @@ void paged_experts_decide(
       .verify(slot_lastuse)
       .verify(src)
       .verify(dst);
-  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk).verify(run_ids);
+  TensorMatcher({T}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(weights).verify(run_w);
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(step).verify(count);
   RuntimeCheck(T.unwrap() <= K.unwrap(), "paged_experts_decide needs at most K routed entries, got ", T.unwrap());
 
   LaunchKernel(1, 32, device_.unwrap())(
       paged_experts_decide_kernel,
       static_cast<const int32_t*>(topk.data_ptr()),
+      static_cast<const float*>(weights.data_ptr()),
       static_cast<int>(T.unwrap()),
       static_cast<int>(E.unwrap()),
       static_cast<int>(K.unwrap()),
@@ -169,13 +196,15 @@ void paged_experts_decide(
       static_cast<int32_t*>(slot_lastuse.data_ptr()),
       static_cast<int32_t*>(src.data_ptr()),
       static_cast<int32_t*>(dst.data_ptr()),
-      static_cast<int32_t*>(count.data_ptr()));
+      static_cast<int32_t*>(count.data_ptr()),
+      static_cast<int32_t*>(run_ids.data_ptr()),
+      static_cast<float*>(run_w.data_ptr()));
 }
 
 void paged_experts_gather(
     tvm::ffi::TensorView hosts,
     tvm::ffi::TensorView gpus,
-    tvm::ffi::TensorView words,
+    tvm::ffi::TensorView row_bytes,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView count) {
@@ -184,7 +213,7 @@ void paged_experts_gather(
   SymbolicSize P = {"num_tensors"}, K = {"num_slots"}, One = {"one"};
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
-  TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(hosts).verify(gpus).verify(words);
+  TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(hosts).verify(gpus).verify(row_bytes);
   TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(src).verify(dst);
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(count);
 
@@ -195,7 +224,7 @@ void paged_experts_gather(
       paged_experts_gather_kernel,
       static_cast<const int64_t*>(hosts.data_ptr()),
       static_cast<const int64_t*>(gpus.data_ptr()),
-      static_cast<const int64_t*>(words.data_ptr()),
+      static_cast<const int64_t*>(row_bytes.data_ptr()),
       static_cast<int>(P.unwrap()),
       static_cast<const int32_t*>(src.data_ptr()),
       static_cast<const int32_t*>(dst.data_ptr()),

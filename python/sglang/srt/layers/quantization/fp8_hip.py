@@ -53,6 +53,21 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             ue8m0_weight_scale(layer.weight_scale_inv.data),
         )
         _prepare_flydsl_mxfp8(layer)
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
+            aiter_preshuffle_supported,
+        )
+
+        n, k = layer.weight.shape
+        layer.mxfp8_aiter_preshuffled = aiter_preshuffle_supported(n, k)
+        if layer.mxfp8_aiter_preshuffled:
+            # same bytes in aiter's (16, 16) tile order; the scales stay compact row-major
+            copy_or_rebind_param(
+                layer, "weight", shuffle_weight(layer.weight.data, (16, 16))
+            )
+            # mxfp8_flydsl_gfx95 reads the plain [N, K] weight
+            layer.weight_scale_mx_flydsl = None
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -116,6 +131,7 @@ def apply_dense(
             weight_scale_ue8m0=layer.weight_scale_mx_e8m0,
             input_scale=input_scale,
             bias=bias,
+            weight_preshuffled=getattr(layer, "mxfp8_aiter_preshuffled", False),
         )
     if mxfp8_ready and input_scale is None:
         return method.w8a8_mxfp8_linear(

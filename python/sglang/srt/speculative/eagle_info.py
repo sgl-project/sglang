@@ -125,6 +125,11 @@ class EagleVerifyInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            # The translator tiles the gather over token blocks, sized from
+            # the length sum (an upper bound on the longest live row) while
+            # it is still a host int.
+            num_token_blocks=None,
+            kv_lens_sum=paged_kernel_lens_sum,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -429,6 +434,10 @@ class EagleDraftExtendInput(SpecInput):
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Captured while the length sum is still a host int (None -> the
+        # translator sizes from its table width).
+        host_kv_lens_sum = paged_kernel_lens_sum
+
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
@@ -443,5 +452,7 @@ class EagleDraftExtendInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            num_token_blocks=None,
+            kv_lens_sum=host_kv_lens_sum,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
