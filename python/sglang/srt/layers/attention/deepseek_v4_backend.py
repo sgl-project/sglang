@@ -593,10 +593,7 @@ class DSV4AttnMetadata:
         # call reads rows [:num_tokens] only.
         if swa_width > SWA_WINDOW:
             self.trtllm_swa_lens = pool.view(
-                "d_swa_lens_wide",
-                num_tokens,
-                fill=SWA_WINDOW,
-                rows_written_by_caller=True,
+                "d_swa_lens_wide", num_tokens, fill=SWA_WINDOW, constant=True
             )
             torch.clamp(self.swa_topk_lengths, min=SWA_WINDOW, out=self.trtllm_swa_lens)
         else:
@@ -610,11 +607,15 @@ class DSV4AttnMetadata:
             # The tail and lens are refreshed per layer;
             # when topk_v2 writes the c4 tail itself, the lens are set once per step.
             self.trtllm_c4_indices = pool.view(
-                "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + self._c4_table_width()
+                "d_c4",
+                num_tokens,
+                fill=-1,
+                width=SWA_WINDOW + self._c4_table_width(),
+                constant=True,
             )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             self.trtllm_c4_lens = pool.view(
-                "d_c4_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
+                "d_c4_lens", num_tokens, fill=SWA_WINDOW, constant=True
             )
             if self._c4_topk_writes_table():
                 torch.add(

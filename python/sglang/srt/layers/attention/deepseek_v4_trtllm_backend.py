@@ -201,7 +201,9 @@ class TrtllmSparseTablePool:
     ) -> torch.Tensor:
         """Rows [:rows] come from ``src``, from the caller (who then writes every
         column the kernel can read), or are re-inerted; rows [rows, rows_pad)
-        are re-inerted too, except in a ``constant`` role, which nothing writes."""
+        are re-inerted too. A ``constant`` view re-inerts nothing: its rows keep
+        their fill or the caller writes them before any read, and the kernel
+        reads no row past ``rows``."""
         rows_pad = ceil_align(rows, 64)
         numel = rows_pad * max(width, 1)
         padded = self._parent(role, numel, fill)[:numel]
