@@ -732,21 +732,6 @@ class ModelConfig:
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
 
-        # MiniMax-M3.1 Quark marks routed experts as FP4 here, not with
-        # routed_experts_quant_method.
-        global_weight_config = (
-            quantization_config.get("global_quant_config") or {}
-        ).get("weight") or {}
-        if (
-            not self.is_fp4_experts
-            and getattr(self.hf_config, "model_type", None) == "minimax_m3_vl"
-            and str(global_weight_config.get("dtype", "")).lower() == "fp4"
-        ):
-            self.is_fp4_experts = True
-            logger.info(
-                "Detected MiniMax-M3 Quark mixed layout: routed experts are MXFP4."
-            )
-
         # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
         if (
             not self.is_fp4_experts

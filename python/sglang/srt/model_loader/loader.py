@@ -251,7 +251,6 @@ def _get_quantization_config(
         elif quant_config.get_name() == "humming":
             quant_config.is_fp4_experts = model_config.is_fp4_experts
         elif quant_config.get_name() == "quark" and model_config.is_fp4_experts:
-            # So the fused MoE loader can requantize the FP8 shared expert.
             quant_config.is_fp4_experts = True
         if not _is_npu:
             major, minor = get_device_capability()
