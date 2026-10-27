@@ -132,8 +132,9 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
-    # Rejection sampling with the single-CG runner only, else None (the presence
-    # of draft_probs selects the in-graph proposal branch in _run_step_body).
+    # Set when the graphs sample the rejection-sampling proposal (see
+    # samples_in_graph), else None; draft_probs selects that branch in
+    # _run_step_body. sampling_seed is also None without deterministic inference.
     temperatures: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
     sampling_seed: Optional[torch.Tensor]
@@ -384,7 +385,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
     def _sample_draft_proposal(self, ret, bs: int):
-        """In-graph Leviathan proposal (single-CG runner + rejection sampling):
+        """In-graph Leviathan proposal (rejection sampling with topk 1):
         q = softmax(logits / T) written straight into this step's draft_probs
         slot, then X ~ q. The accept test coin*q(X) < p(X) is unbiased only if
         q is exactly the distribution X was drawn from -- q here IS the
@@ -550,9 +551,18 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
     Not itself a DecodeCudaGraphRunner -- it only routes work to the per-step
     runners.
+
+    Under rejection sampling with topk 1, each step's graph also draws the
+    proposal X ~ q (_sample_draft_proposal) and writes q into
+    buffers.draft_probs; prepare() stages the temperatures and sampling seeds
+    sampling_info cannot deliver in-graph. Seeded draws are keyed by request
+    position and draft step; unseeded draws use the graph-registered Philox
+    generator, so each replay gets fresh draws.
     """
 
     rotates_in_graph = False
+    # Whether this runner's graphs may capture the rejection-sampling proposal.
+    captures_proposal = True
 
     def __init__(self, eagle_worker: MultiLayerEagleDraftWorker):
         self.eagle_worker = eagle_worker
@@ -572,8 +582,15 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self._out_cache_loc_virtual = None
         self._kv_loc_plan = None
         self._kv_loc_cols = None
+        self.buffers: Optional[MultiLayerEagleDraftExtendInputBuffers] = None
 
         self._init_and_capture()
+
+    @property
+    def samples_in_graph(self) -> bool:
+        """Whether the graphs draw the proposal X ~ q and write q; the worker
+        then neither resamples nor recomputes q."""
+        return self.buffers is not None and self.buffers.draft_probs is not None
 
     def _create_runner(self, step: int) -> MultiLayerEagleDraftExtendCudaGraphRunner:
         return MultiLayerEagleDraftExtendCudaGraphRunner(self.eagle_worker, step)
@@ -695,7 +712,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             )
 
             if (
-                self.rotates_in_graph
+                (self.rotates_in_graph or self.captures_proposal)
                 and self.eagle_worker.use_rejection_sampling
                 and self.eagle_worker.topk == 1
             ):
@@ -988,13 +1005,8 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
     may run between captured steps. seq_lens / req_pool_indices / extend_seq_lens
     are chain-constant (only input_ids rotates).
 
-    Rejection sampling is supported by sampling X ~ q inside the graph
-    (_sample_draft_proposal, selected by the draft_probs buffer's presence):
-    the captured rotation then carries the sampled token, prepare() stages the
-    temperatures and sampling seeds cannot be delivered in-graph, and the
-    worker clones the per-step q off buffers.draft_probs after replay. Seeded
-    draws are keyed by request position and draft step; unseeded draws keep
-    using the graph-registered Philox generator.
+    Under rejection sampling each step samples X ~ q in-graph, as the per-step
+    graphs do, and the captured rotation carries the sampled token.
     """
 
     rotates_in_graph = True
