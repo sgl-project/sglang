@@ -1,12 +1,51 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+
+
+def _dtypes_reaching_aiter(bias_dtype, device):
+    """(logits, bias) dtypes the aiter router receives from select_experts."""
+    seen = {}
+
+    def fake_aiter_biased_grouped_topk(gating_output, correction_bias, w, ids, *args):
+        seen["dtypes"] = (gating_output.dtype, correction_bias.dtype)
+        w.zero_()
+        ids.zero_()
+
+    config = TopKConfig(
+        top_k=2,
+        use_grouped_topk=True,
+        topk_group=1,
+        num_expert_group=1,
+        correction_bias=torch.randn(16, dtype=bias_dtype, device=device),
+    )
+    with (
+        patch.object(topk_module, "_use_aiter", True),
+        patch.object(topk_module, "_is_cuda", False),
+        patch.object(
+            topk_module, "biased_grouped_topk", topk_module.biased_grouped_topk_gpu
+        ),
+        patch.object(
+            topk_module,
+            "aiter_biased_grouped_topk",
+            fake_aiter_biased_grouped_topk,
+            create=True,
+        ),
+    ):
+        select_experts(
+            hidden_states=torch.randn(4, 8, dtype=torch.bfloat16, device=device),
+            router_logits=torch.randn(4, 16, dtype=torch.bfloat16, device=device),
+            topk_config=config,
+        )
+    return seen["dtypes"]
 
 
 class CorrectionBiasCacheTestMixin:
@@ -51,6 +90,19 @@ class CorrectionBiasCacheTestMixin:
         result = config.correction_bias_for_dtype(torch.float32)
 
         self.assertEqual(result.data_ptr(), correction_bias.data_ptr())
+
+    def test_fp32_bias_routes_in_fp32_on_aiter(self):
+        """bf16 logits must not drag an fp32 bias down to bf16 before aiter."""
+        self.assertEqual(
+            _dtypes_reaching_aiter(torch.float32, self.device),
+            (torch.float32, torch.float32),
+        )
+
+    def test_other_bias_routes_in_logits_dtype_on_aiter(self):
+        self.assertEqual(
+            _dtypes_reaching_aiter(torch.float16, self.device),
+            (torch.bfloat16, torch.bfloat16),
+        )
 
 
 class TestCorrectionBiasCacheCPU(CorrectionBiasCacheTestMixin, CustomTestCase):
