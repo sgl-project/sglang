@@ -65,22 +65,6 @@ def nvfp4_f32_to_e2m1(x):
 
 
 @triton.jit
-def nvfp4_quantize_rows(x, N: tl.constexpr, D: tl.constexpr, global_scale=1.0):
-    """Quantize ``[N, D]`` fp32 rows; returns (payload ``[N, D//2]`` uint8,
-    scales ``[N, D//16]`` uint8 holding E4M3 bits)."""
-    NBLK: tl.constexpr = D // 16
-    blocks = tl.reshape(x, (N, NBLK, 16))
-    amax = tl.max(tl.abs(blocks), axis=2)
-    scale_e4m3 = (amax / (6.0 * global_scale)).to(tl.float8e4nv)
-    scale = scale_e4m3.to(tl.float32)
-    inv = tl.where(amax != 0.0, 1.0 / (scale * global_scale), 0.0)
-    codes = nvfp4_f32_to_e2m1(blocks * inv[:, :, None])
-    lo, hi = tl.split(tl.reshape(codes, (N, D // 2, 2)))
-    payload = lo | (hi << 4)
-    return payload, scale_e4m3.to(tl.uint8, bitcast=True)
-
-
-@triton.jit
 def nvfp4_slot_offsets(
     slots,
     stride_page,
