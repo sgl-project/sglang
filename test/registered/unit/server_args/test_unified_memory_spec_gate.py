@@ -33,7 +33,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _PlainHFConfig:
@@ -93,7 +93,6 @@ _VERIFY_BACKENDS = (
     "triton",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
     "flashmla",
     "flashinfer",
     "fa3",

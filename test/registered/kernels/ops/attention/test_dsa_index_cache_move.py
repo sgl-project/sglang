@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.mem_cache.dsa_cache_layer_split import (
     LayerSplitDSATokenToKVPool,
     LayerSplitIndexKeyCache,
@@ -28,7 +28,7 @@ def _logical_offsets(loc: int, page_size: int = PAGE_SIZE) -> torch.Tensor:
     page, token = divmod(loc, page_size)
     page_base = page * page_size * PAYLOAD_BYTES
     cols = torch.arange(INDEX_HEAD_DIM, dtype=torch.int64)
-    if index_buf_accessor._use_aiter_preshuffle:
+    if dsa_index_k_cache._use_aiter_preshuffle:
         tile = 16
         k_offsets = (
             page_base

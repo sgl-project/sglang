@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class NoHostRead(torch.Tensor):
@@ -236,7 +236,15 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
         batch = ScheduleBatch(
-            reqs=[SimpleNamespace(rid="one", lora_id=None, token_type_ids=None)],
+            reqs=[
+                SimpleNamespace(
+                    rid="one",
+                    lora_id=None,
+                    token_type_ids=None,
+                    extend_end=65,
+                    full_untruncated_fill_ids=[3] * 65,
+                )
+            ],
             device="cpu",
             forward_mode=ForwardMode.EXTEND,
             input_ids=torch.tensor([3]),

@@ -29,7 +29,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -89,7 +88,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -179,7 +178,7 @@ class _PrefillSharedExpertCall:
         self.done = torch.cuda.Event(external=True)
         self.output = None
 
-    def launch(self, module, hidden_states):
+    def launch(self, module, hidden_states) -> None:
         main_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.stream):
             if self.graph is None:
@@ -190,10 +189,9 @@ class _PrefillSharedExpertCall:
                 self.output.record_stream(main_stream)
             else:
                 self.graph.replay()
-        return self.output
 
 
-def _capture_prefill_shared_expert(module, hidden_states, call):
+def _capture_prefill_shared_expert(module, hidden_states, call) -> None:
     call.graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(
         call.graph,
@@ -205,14 +203,13 @@ def _capture_prefill_shared_expert(module, hidden_states, call):
         call.done.record()
     # The ready record belongs to the preceding main-stream graph. Do not
     # replay here: that graph has only been captured, not launched yet.
-    return call.output
 
 
 @eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
-def _launch_prefill_shared_expert(module, hidden_states, call):
+def _launch_prefill_shared_expert(module, hidden_states, call) -> None:
     # BCG retains this call, its graph, events and output until graph cleanup.
     # A replay launches on the same explicit stream for every layer.
-    return call.launch(module, hidden_states)
+    call.launch(module, hidden_states)
 
 
 def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
@@ -223,6 +220,19 @@ def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
         # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
         and projection.bias is None
         and isinstance(projection.quant_method, UnquantizedLinearMethod)
+    )
+
+
+def _publishes_weight_storage() -> bool:
+    # Transfer-engine seeds and ModelExpress instances publish parameter
+    # addresses for remote readers right after weight loading.
+    model_config = get_model()
+    return (
+        model_config.remote_instance_weight_loader_start_seed_via_transfer_engine
+        or (
+            model_config.load_format == "remote_instance"
+            and model_config.remote_instance_weight_loader_backend == "modelexpress"
+        )
     )
 
 
@@ -290,6 +300,10 @@ class NemotronHMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
                 config,
@@ -345,7 +359,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
         forward_batch: ForwardBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if (
@@ -360,21 +373,16 @@ class NemotronHMoE(nn.Module):
             and is_in_breakable_cuda_graph()
             and is_sm120()
         ):
-            return self._forward_core_prefill_overlap(
-                hidden_states, num_token_non_padded
-            )
+            return self._forward_core_prefill_overlap(hidden_states)
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            return self._forward_core_shared_routed_overlap(
-                hidden_states, num_token_non_padded
-            )
-        return self._forward_core_normal(hidden_states, num_token_non_padded)
+            return self._forward_core_shared_routed_overlap(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
         # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
@@ -388,12 +396,6 @@ class NemotronHMoE(nn.Module):
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            ),
         )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -403,7 +405,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core_shared_routed_overlap(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
@@ -423,12 +424,6 @@ class NemotronHMoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if not self.is_nextn
-                    else None
-                ),
             )
             if self.use_latent_moe:
                 hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -440,28 +435,20 @@ class NemotronHMoE(nn.Module):
     def _forward_core_prefill_overlap(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # A multi-stream graph per hybrid segment creates one internal stream
         # per executable. Keep each graph linear and launch shared experts on
         # one explicit stream, preserving overlap with the routed experts.
         call = _PrefillSharedExpertCall(_get_or_create_alt_stream(self.device_module))
         call.ready.record()
-        shared_output = _launch_prefill_shared_expert(
-            self.shared_experts, hidden_states, call
-        )
+        _launch_prefill_shared_expert(self.shared_experts, hidden_states, call)
+        shared_output = call.output
         router_logits = torch.mm(
             hidden_states, self.gate.weight.t(), out_dtype=torch.float32
         )
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            ),
         )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -505,11 +492,6 @@ class NemotronHMoE(nn.Module):
         # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(
             hidden_states,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
             forward_batch=forward_batch,
         )
 
@@ -967,7 +949,12 @@ class NemotronHForCausalLM(nn.Module):
     ):
         super().__init__()
         lora_config = None
-        self._use_nvfp4_phase_layout = envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get()
+        self._use_nvfp4_phase_layout = envs.SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT.get()
+        if self._use_nvfp4_phase_layout and _publishes_weight_storage():
+            raise ValueError(
+                "NVFP4 phase layout rewrites FC2 weight storage in place; "
+                "it cannot be combined with remote-instance weight publication"
+            )
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(
@@ -1142,11 +1129,11 @@ class NemotronHForCausalLM(nn.Module):
     def prepare_for_forward(self, forward_batch: ForwardBatch) -> None:
         if not getattr(self, "_use_nvfp4_phase_layout", False):
             return
-        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import Nvfp4LayoutCycle
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             _flashinfer_autotune_active,
             _sm120_mtp_mma_supported,
         )
+        from sglang.srt.models.nemotron_h_nvfp4_layout import Nvfp4LayoutCycle
 
         cycle = getattr(self, "_nvfp4_layout", None)
         if cycle is None:

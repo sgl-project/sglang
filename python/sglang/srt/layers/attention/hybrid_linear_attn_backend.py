@@ -1311,10 +1311,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
         elif not forward_batch.forward_mode.is_draft_extend_v2():
             self.linear_attn_backend.init_forward_metadata(forward_batch)
-        if static_forward_batch is not None:
-            self.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=static_forward_batch.positions.shape[0]
-            )
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1560,7 +1556,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
         if getattr(mamba_pool, "replayssm_is_kda", False):
-            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )
 
