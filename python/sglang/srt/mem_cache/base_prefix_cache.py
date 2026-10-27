@@ -315,6 +315,11 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Deepest non-root node visited, including nodes rejected by validators.
+    last_visited_node_id: Optional[int] = None
+    # Reusable prefix length in FULL's device-value scan, before node-boundary
+    # or auxiliary constraints. None means no shorter prefix was reported.
+    full_device_match_len: Optional[int] = None
 
 
 def zero_match_result(
@@ -334,6 +339,8 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        last_visited_node_id=None,
+        full_device_match_len=None,
     )
 
 

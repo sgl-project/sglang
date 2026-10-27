@@ -10,6 +10,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
@@ -83,6 +84,10 @@ class _DummyKVCache(KVCache):
 class _DummyModel:
     """Minimal stand-in so that `inspect.signature(model.forward)` and
     `getattr(model, ...)` calls in ModelRunner.__init__ don't crash."""
+
+    # The model loader sets this on every Torch model, and the graph runners
+    # read it during warmup. No Torch MoE layers exist here, so nothing is fused.
+    shared_experts_config = SharedExpertsConfig()
 
     @staticmethod
     def forward():
@@ -332,7 +337,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"zero GPU KV cache allocation)"
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None):
+    def alloc_memory_pool(self, memory_pool_config=None, *, draft_parallel_layout=None):
         """No-op: MLX manages its own KV cache."""
         pass
 

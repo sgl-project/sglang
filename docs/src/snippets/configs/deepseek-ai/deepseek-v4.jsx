@@ -1,5 +1,9 @@
 // Single `export const config` literal — no spreads/calls/IIFE (Mintlify re-evals at hydration).
 // Cells are denormalized: no `--nnodes`/`--node-rank`/`--dist-init-addr`/`--host`/`--port` literals — engine injects them.
+//
+// ASCEND (A3/A5): single-node recipes transcribed from local runs, kept
+// `in-progress` until they are re-run on a release build. TODO(NPU) marks what
+// is still missing (images, Playground gating).
 
 export const config = {
   modelName: "DeepSeek-V4",
@@ -15,6 +19,9 @@ export const config = {
     "dgx-spark",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
+    // Huawei Ascend (catalog entry + NPU docker block come from the engine).
+    // TODO(NPU): cite the recipe provenance for the cells at the bottom.
+    "a3", "a5"
   ],
 
   // Model-specific GPUs the shared HARDWARE_CATALOG doesn't carry — the engine
@@ -26,6 +33,12 @@ export const config = {
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
+  // Mintlify strips module-level statements, so shared predicates live as
+  // properties on the exported object (same pattern as kimi-k3).
+  isNpuHw(s) {
+    return !!s && (s.hw === "a3" || s.hw === "a5");
+  },
+
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
@@ -33,10 +46,21 @@ export const config = {
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
     { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
+  // Quantization switches by platform, the way kimi-k3's does: CUDA/ROCm see
+  // FP8 / FP4 / NVFP4. Ascend is resolved per chip — the A3 Series serves the
+  // ModelSlim W8A8 checkpoint, the 950PR/DT Series (a5) serves the FP8 one.
+  // `showWhen` on a legacy match dim is enough — the engine filters the row
+  // before rendering, and a hidden pick is re-seated on the next visible option,
+  // so switching hardware never leaves a value the other platform cannot run.
   quantizations: [
-    { id: "fp8", label: "FP8" },
-    { id: "fp4", label: "FP4" },
-    { id: "nvfp4", label: "NVFP4" },
+    { id: "fp8", label: "FP8",
+      showWhen: (s) => !config.isNpuHw(s) || s.hw === "a5" },
+    { id: "fp4", label: "FP4", showWhen: (s) => !config.isNpuHw(s) },
+    // A3 Series only: the ModelScope W8A8 build is the only Ascend checkpoint
+    // wired for this model; the 950PR/DT runs the FP8 checkpoint above.
+    { id: "modelslim", label: "Modelslim (W8A8)", subtitle: "ModelScope NPU checkpoint",
+      showWhen: (s) => s.hw === "a3" },
+    { id: "nvfp4", label: "NVFP4", showWhen: (s) => !config.isNpuHw(s) },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -167,6 +191,10 @@ export const config = {
   },
 
   modelNames: {
+    // A3 Series serves the ModelScope W8A8 build; the 950PR/DT (a5) serves the
+    // official FP8 checkpoint.
+    "flash-official|modelslim": "Eco-Tech/DeepSeek-V4-Flash-0731-w8a8",
+    "flash-official|fp8": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
@@ -340,6 +368,8 @@ sgl-eval run mmmu_pro \\
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261016",
     mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261016",
+    // TODO(NPU): `a3:` / `a5:` images (kimi-k3: quay.io/ascend/sglang:
+    // main-cann9.1.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -472,10 +502,17 @@ sgl-eval run mmmu_pro \\
             envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
             flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            hide: { hw: ["mi300x", "mi355x"] } },
+            hide: { hw: ["mi300x", "mi355x"] },
+            // FlashInfer is a CUDA kernel. On NPU the option stays visible but
+            // greyed, so the reason reaches the reader instead of the chip just
+            // vanishing (kimi-k3 carries the same rule).
+            disable: [{ when: { hw: ["a3", "a5"] },
+              reason: "FlashInfer is a CUDA kernel and is not supported on NPU." }] },
           { id: "marlin",            label: "Marlin (W4A16)",
             flags: ["--moe-runner-backend marlin"],
-            hide: { hw: ["mi300x", "mi355x"] } },
+            hide: { hw: ["mi300x", "mi355x"] },
+            disable: [{ when: { hw: ["a3", "a5"] },
+              reason: "Marlin is a CUDA kernel and is not supported on NPU." }] },
         ],
       },
       // DeepGEMM MegaMoE only: the ROCm build is quantized through the backend
@@ -4082,5 +4119,105 @@ sgl-eval run mmmu_pro \\
       pd: true, nnodes: 1, verified: false, env: [], flags: [] },
     { match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
       pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+
+    // Ascend, transcribed from the recipes that were actually run (single node).
+    // TODO(NPU): images; keep `in-progress` until re-run on a release build.
+    {
+      match: { hw: "a3", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FAST_KERNEL=0",
+        "SGLANG_DSV4_FP4_EXPERTS=False",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--page-size 128",
+        "--device npu",
+        "--attention-backend dsv4",
+        "--watchdog-timeout 9000",
+        "--mem-fraction-static 0.7",
+        "--prefill-max-requests 160",
+        "--max-prefill-tokens 65536",
+        "--chunked-prefill-size 131072",
+        "--max-running-requests 160",
+        "--dp-size 16",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--quantization modelslim",
+        "--enable-dp-lm-head",
+        "--kv-cache-dtype bfloat16",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-attention-backend ascend",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-bs-decode 1 2 4 8 10",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "a5", variant: "flash-official", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "HCCL_BUFFSIZE=2048",
+        "HCCL_SOCKET_IFNAME=lo",
+        "GLOO_SOCKET_IFNAME=lo",
+        "HCCL_INTRA_DMA_ENABLE=1",
+        "SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False",
+        "FORCE_DRAFT_MODEL_NON_QUANT=1",
+        "SGLANG_DSV4_FP4_EXPERTS=True",
+        "SGLANG_OPT_FUSE_WQA_WKV=0",
+        "SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch",
+        "SGLANG_OPT_USE_FUSED_HASH_TOPK=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_PRE=False",
+        "SGLANG_OPT_DEEPGEMM_HC_PRENORM=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_POST=False",
+        "SGLANG_OPT_FP8_WO_A_GEMM=False",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
+        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100",
+        "SGLANG_ENABLE_WAR_BARRIER=1",
+        "SGLANG_FORCE_COARSE_WAR_BARRIER=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--page-size 128",
+        "--tp-size 4",
+        "--device npu",
+        "--attention-backend dsv4",
+        "--watchdog-timeout 9000",
+        "--mem-fraction-static 0.72",
+        "--max-running-requests 64",
+        "--chunked-prefill-size 65536",
+        "--max-prefill-tokens 65536",
+        "--cuda-graph-bs-decode 1 2 4 8 10 16",
+        "--kv-cache-dtype auto",
+        "--enable-dp-lm-head",
+        "--disable-radix-cache",
+        "--enable-dp-attention",
+        "--dp-size 4",
+        "--reasoning-parser deepseek-v4",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-draft-model-quantization fp8",
+        "--speculative-draft-attention-backend ascend",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-dspark-block-size 5",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
   ],
 };

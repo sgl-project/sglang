@@ -11,10 +11,15 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCachePreallocMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -25,6 +30,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -38,6 +44,7 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
@@ -98,7 +105,7 @@ def _cache_query_ranks(rank, rendezvous):
         torch.distributed.destroy_process_group()
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.host_memory_mode = "buffer_only"
@@ -372,6 +379,49 @@ class TestPPPrefetchTicket(unittest.TestCase):
                     # The already-ongoing operation must not issue another query.
                     cache.prefetch_from_storage(handle, 0, tokens)
                     self.assertTrue(c.pp_prefetch_command_queue.empty())
+
+    def test_decode_query_keeps_hit_boundary_and_retry_identity(self):
+        """Decode must not query beyond its promised hit or bind a retry as attempt 0."""
+        c, cache = self.c, self.cache
+        c.host_memory_mode = cache.host_memory_mode = "cache"
+        cache.buffer_pipeline = None
+        cache.tree_core.page_size = cache.prefetch_threshold = 4
+        cache.tree_core.prefetch_anchor_info.return_value = (None, None)
+        cache.hicache_storage_pass_prefix_keys = False
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache.inc_host_lock_ref = Mock()
+        c.prefetch_rate_limited = lambda: False
+        decode = SimpleNamespace(tree_cache=cache)
+        for bigram in (False, True):
+            with self.subTest(bigram=bigram):
+                cache.tree_core.is_eagle = bigram
+                handle = CacheRequestHandle(str(bigram), 0)
+                req = SimpleNamespace(
+                    rid=handle.rid,
+                    cache_request_handle=handle,
+                    origin_input_ids=list(range(20 + int(bigram))),
+                    storage_prefetch_retry_attempts=2,
+                    extra_key="adapter",
+                    cache_salt="tenant",
+                )
+                match = DecodePrefixMatch(torch.arange(4), 0, 8, 0, 0)
+
+                DecodeHiCachePreallocMixin._start_hicache_prefetch(decode, req, match)
+
+                self.assertTrue(match.prefetch_registered)
+                ticket = c.pp_prefetch_command_queue.get_nowait()
+                operation = cache.ongoing_prefetch[handle].operation
+                self.assertIs(
+                    c.pp_prefetch_states[ticket.key].cache_operation, operation
+                )
+                self.assertEqual(ticket.key, (handle, 2))
+                self.assertEqual(len(operation.token_ids), 8)
+                self.assertEqual(operation.storage_start, 4)
+                self.assertEqual(
+                    list(ticket.prefetch_key.raw_token_ids()),
+                    list(range(12 + int(bigram))),
+                )
+                self.assertTrue(c.pp_prefetch_command_queue.empty())
 
     def test_query_and_completion_sync_scopes(self):
         c = self.c
@@ -682,6 +732,51 @@ class TestPPPrefetchTicket(unittest.TestCase):
                             )
                         else:
                             c.mem_pool_host.free.assert_not_called()
+
+    def test_checkpoint_vote_stays_within_capacity_capped_hit(self):
+        """A stage whose hit is capped to free host space must not vote for
+        restorable checkpoints past that cap, or the agreed hit outgrows the
+        buffers it allocated."""
+        c = self.c
+        stored_pages, free_pages = 8, 2
+        c.mem_pool_host.available_size.return_value = free_pages * 4
+        c.mem_pool_host.get_pool.side_effect = lambda name: Mock(
+            page_size=4 if name == PoolName.KV else 1
+        )
+
+        def query(operation):
+            hashes = get_storage_hash_str(
+                operation.token_ids, operation.last_hash, page_size=4
+            )
+            operation.all_hash_values = hashes
+            operation.query_pool_hit_pages = {PoolName.KV: stored_pages}
+            operation.pool_storage_result.restorable_prefix_pages = list(
+                range(1, stored_pages + 1)
+            )
+            return hashes[:stored_pages], stored_pages * 4
+
+        c._storage_hit_query.side_effect = query
+        votes = []
+        c._all_reduce.side_effect = lambda tensor, *_: votes.append(tensor.tolist())
+        kda = PoolTransfer(
+            PoolName.MAMBA, keys=["kda"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        c.submit_prefetch(
+            CacheRequestHandle("capped", 0),
+            RadixKey(array("q", range(stored_pages * 4 + 1))),
+            None,
+            None,
+            [],
+            [kda],
+        )
+        self.run_commands(c.pp_prefetch_states["capped"].ticket)
+
+        operation = c.prefetch_buffer.get_nowait()
+        self.assertEqual(votes[0][: stored_pages + 1], [1, 1, 1] + [0] * 6)
+        self.assertEqual(operation.host_indices.numel(), free_pages * 4)
+        self.assertEqual(operation.storage_hit_count, free_pages * 4)
+        self.assertEqual(len(operation.hash_value), free_pages)
+        self.assertFalse(operation.is_terminated())
 
     def test_local_miss_or_query_error_completes_before_next_ticket(self):
         """A stage miss/error must complete admission without breaking ACK order."""

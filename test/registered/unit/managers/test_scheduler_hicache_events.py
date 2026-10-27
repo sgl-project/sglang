@@ -3,7 +3,7 @@
 import unittest
 from concurrent.futures import Future
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, call
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -14,13 +14,13 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from test_request_class_override_points import _recv, _scheduler
+
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 
-from test_request_class_override_points import _recv, _scheduler
-
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
@@ -91,37 +91,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             filter_batch=lambda: None,
         )
 
-    def test_feature_gates(self):
-        for hierarchical, flexkv, linker, storage in (
-            (False, False, False, False),
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (True, False, False, True),
-        ):
-            with (
-                self.subTest(
-                    hierarchical=hierarchical,
-                    flexkv=flexkv,
-                    linker=linker,
-                    storage=storage,
-                ),
-                patch(
-                    "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(enable_flexkv=flexkv),
-                ),
-            ):
-                self.calls.reset_mock()
-                s = self.scheduler
-                s.enable_hierarchical_cache = hierarchical
-                s.enable_unified_cache_external_linker = linker
-                s.enable_hicache_storage = storage
-                s._process_hicache_events()
-                expected = [call.drain()] if hierarchical or flexkv or linker else []
-                if storage:
-                    expected.append(call.retry())
-                self.assertEqual(self.calls.mock_calls, expected)
-
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler
         s.resolve_waiting_queue_bootstrap = Mock()
@@ -165,7 +134,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
-            self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
+            self.calls.mock_calls,
+            [
+                call.drain(),
+                call.retry(),
+                call.defer(self.running_batch),
+            ],
         )
 
     def test_pp_prefill_drains_before_admission(self):

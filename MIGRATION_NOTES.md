@@ -120,3 +120,18 @@ The 4cd986a replacement completed one N4000 best_effort run in Singapore and
 one N4000 timeout run in Beijing, both without HTTP failures. They are not
 same-machine policy ablations, nor model-accuracy acceptance. Earlier opt-in
 Gate benchmark results likewise do not qualify this different completion path.
+
+2026-10-27 main integration: merged community main at
+`449617bc94a5d4ae23ad62d0da2f842e711ca983`. Decode prefetch now preserves both
+main's confirmed `storage_hit_end` and the shared query's `storage_attempt`.
+Main's removal of redundant tests is retained alongside the PP query, grammar,
+stop-boundary and terminal-ACK regressions. A native decode-to-query regression
+covers regular and EAGLE bigram keys: omitting either argument fails both
+variants, while the combined resolution passes.
+
+The seven related CPU/Gloo suites pass 75 tests in isolated processes using the
+existing v0.5.21-cu130 image (Python 3.12.3 / Torch 2.13.0), with the merged source
+mounted read-only. The image's missing `parameterized` dependency was supplied
+from a temporary test-only directory. Ruff, isort, Python syntax and the feature
+diff whitespace checks pass. This integration does not add GPU, model-accuracy
+or performance qualification.

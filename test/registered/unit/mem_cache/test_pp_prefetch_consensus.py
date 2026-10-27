@@ -6,7 +6,8 @@ from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from queue import Queue
-from types import MethodType, SimpleNamespace as NS
+from types import MethodType
+from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
