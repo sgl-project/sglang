@@ -349,8 +349,7 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
     run_post_process_pass(server_args, validate_ascend_ops_config)
 
-    resolved = resolved_view(server_args)
-    a2a_backend = resolved.moe_a2a_backend
+    a2a_backend = resolved_view(server_args).moe_a2a_backend
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True

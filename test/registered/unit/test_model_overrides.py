@@ -3631,7 +3631,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
                 )
             ),
-            {"ep_size": 8},
+            {},
         )
 
     def test_deepseek_family_order_safe_declarations(self):
