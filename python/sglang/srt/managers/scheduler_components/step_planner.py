@@ -206,6 +206,7 @@ class StepPlanner:
         prefill_delayer: Optional[PrefillDelayer],
         dynamic_chunk_sizer: Optional[DynamicChunkSizer],
         limits: RequestLimits,
+        prefill_adder_class: type[PrefillAdder],
     ):
         spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -248,6 +249,7 @@ class StepPlanner:
         # A PD role switch replaces the owners in place.
         self.mode_owners = mode_owners
         self.request_intake = request_intake
+        self.prefill_adder_class = prefill_adder_class
         self.prefill_delayer = prefill_delayer
         self.prefill_bs_tracker = prefill_bs_tracker
         self.min_free_slots_delayer = min_free_slots_delayer
@@ -428,7 +430,7 @@ class StepPlanner:
 
         # A mixed step reserves its decode part before prefill admission.
         decode_part = self._plan_decode_part(slot, chunked_prefill_size)
-        adder = PrefillAdder(
+        adder = self.prefill_adder_class(
             get_schedule().page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,

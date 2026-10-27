@@ -143,7 +143,12 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     commit_step_counters,
 )
-from sglang.srt.managers.scheduler_assembly import assemble_scheduler, build_pp_ring
+from sglang.srt.managers.scheduler_assembly import (
+    assemble_scheduler,
+    build_pp_ring,
+    default_component_classes,
+)
+from sglang.srt.managers.scheduler_components.bundles import ComponentClasses
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     CHECK_REQUEST_LISTS,
 )
@@ -215,7 +220,7 @@ class Scheduler:
         port_args: PortArgs,
     ):
         self.parts, self.mode, self.hub = assemble_scheduler(
-            server_args, port_args, self.loop_schedules()
+            server_args, port_args, self.loop_schedules(), self.component_classes()
         )
         self.init_loop_state()
         self.init_request_dispatcher()
@@ -232,6 +237,11 @@ class Scheduler:
             ring_intake_disagg_prefill=self.process_bootstrapped_queue,
             ring_release_disagg_prefill=self.process_prefill_transfer_queue,
         )
+
+    def component_classes(self) -> ComponentClasses:
+        """The component classes the assembly builds; a subclass swaps one
+        with `dataclasses.replace(super().component_classes(), ...)`."""
+        return default_component_classes()
 
     def init_loop_state(self) -> None:
         # The stage recorder the scheduler_stage_method decorator reads.

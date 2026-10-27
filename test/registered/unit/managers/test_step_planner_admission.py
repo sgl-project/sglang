@@ -135,8 +135,8 @@ class _PlannerCase(CustomTestCase):
             self.adders.append(adder)
             return adder
 
+        self.make_adder = make_adder
         for target, kwargs in (
-            ("PrefillAdder", dict(side_effect=make_adder)),
             ("set_time_batch", {}),
             ("PrefillStats", {}),
         ):
@@ -147,6 +147,7 @@ class _PlannerCase(CustomTestCase):
 
     def _planner(self) -> StepPlanner:
         s = StepPlanner.__new__(StepPlanner)
+        s.prefill_adder_class = self.make_adder
         s.counters = LaunchCounters()
         s.counters.processed_tokens_counter = 0
         s.flags = EngineFlags()

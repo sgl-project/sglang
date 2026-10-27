@@ -55,6 +55,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_policy import (
+    PrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components import worker_setup
@@ -301,8 +302,21 @@ class SchedulerHub:
     internal_state: SchedulerInternalStateController
 
 
+def default_component_classes() -> ComponentClasses:
+    """The component classes of a plain `Scheduler`."""
+    return ComponentClasses(
+        rust_server=RustServer,
+        output_streamer=SchedulerOutputStreamer,
+        prefill_adder=PrefillAdder,
+        request_intake=RequestIntake,
+    )
+
+
 def assemble_scheduler(
-    server_args: ServerArgs, port_args: PortArgs, schedules: LoopSchedules
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    schedules: LoopSchedules,
+    component_classes: ComponentClasses,
 ) -> Tuple[SchedulerParts, SchedulerMode, SchedulerHub]:
     """Build the scheduler's parts, its mode and its hub, in that order."""
     scheduler_startup_begin = time.perf_counter()
@@ -318,10 +332,6 @@ def assemble_scheduler(
     skip_tokenizer_init = get_serving().skip_tokenizer_init
     spec_algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     reject_modes_without_pipeline_support()
-    component_classes = ComponentClasses(
-        rust_server=RustServer,
-        output_streamer=SchedulerOutputStreamer,
-    )
     model_config = ModelConfig.from_server_args(server_args)
     # ZBAL switches the allocator, so it precedes any torch allocation.
     worker_setup.init_zbal_on_npu()
@@ -885,7 +895,7 @@ def assemble_scheduler(
     )
 
     # The rest of the hub over the mode owners
-    request_intake = RequestIntake(
+    request_intake = component_classes.request_intake(
         core_lists=lists,
         counters=counters,
         kv=kv,
@@ -930,6 +940,7 @@ def assemble_scheduler(
         prefill_delayer=prefill_delayer,
         dynamic_chunk_sizer=dynamic_chunk_sizer,
         limits=limits,
+        prefill_adder_class=component_classes.prefill_adder,
     )
     # Built after the request registry and the mode owners, which they read.
     weight_updater = SchedulerWeightUpdaterManager(

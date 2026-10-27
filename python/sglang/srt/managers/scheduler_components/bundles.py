@@ -114,10 +114,15 @@ class SchedulerServices:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ComponentClasses:
-    """The classes a `Scheduler` subclass swaps through its `get_*_class`
-    override points, resolved once at construction. Whoever builds one of these
-    objects, the scheduler or a component, takes its class from here; a
-    component takes it as a constructor argument (`prefill_adder_class=...`)."""
+    """The classes a `Scheduler` subclass swaps through its
+    `component_classes` override point, read once by the assembly. Whoever
+    builds one of these objects, the assembly or a component, takes its class
+    from here; a component takes it as a constructor argument
+    (`prefill_adder_class=...`)."""
 
     rust_server: type
     output_streamer: type
+    # The step planner builds one per prefill admission pass.
+    prefill_adder: type
+    # Builds each generation request through its `create_generation_req`.
+    request_intake: type

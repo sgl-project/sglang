@@ -14,11 +14,11 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def make_request_intake(**deps) -> RequestIntake:
-    """An intake over empty core lists, with no mode owners and inert
-    collaborators; `deps` replaces any constructor argument, service, request
-    limit, or config value the intake reads (spec algorithm, transfer backend,
-    sampling mask cap)."""
+def make_request_intake(intake_class: type = RequestIntake, **deps) -> RequestIntake:
+    """An intake of `intake_class` over empty core lists, with no mode owners
+    and inert collaborators; `deps` replaces any constructor argument, service,
+    request limit, or config value the intake reads (spec algorithm, transfer
+    backend, sampling mask cap)."""
     args = dict(
         core_lists=CoreLists(),
         counters=LaunchCounters(),
@@ -70,7 +70,7 @@ def make_request_intake(**deps) -> RequestIntake:
             services[name] = deps.pop(name)
     args["services"] = SimpleNamespace(**services)
     args.update(deps)
-    intake = RequestIntake(**args)
+    intake = intake_class(**args)
     for name, value in config.items():
         setattr(intake, name, value)
     return intake

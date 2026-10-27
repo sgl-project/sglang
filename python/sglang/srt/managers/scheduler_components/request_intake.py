@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import sys
 from array import array
@@ -494,6 +495,14 @@ class RequestIntake:
         if self.enable_kv_cache_events and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
+    def create_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """The request of a generation input on every path (plain, session,
+        unknown session): `Req(*args, **kwargs)`. A subclass builds its own
+        `Req` subclass, with request-local state taken from `recv_req`."""
+        return Req(*args, **kwargs)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -538,7 +547,8 @@ class RequestIntake:
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = Req(
+            req = self.create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -628,6 +638,7 @@ class RequestIntake:
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=disaggregation_mode,
+                req_factory=functools.partial(self.create_generation_req, recv_req),
             )
             if get_memory().enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -649,7 +660,8 @@ class RequestIntake:
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = Req(
+            req = self.create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,

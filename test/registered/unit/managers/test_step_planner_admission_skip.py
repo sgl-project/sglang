@@ -94,16 +94,12 @@ class _AdmissionCase(CustomTestCase):
             self.adders.append(adder)
             return adder
 
-        adder_patch = patch(
-            "sglang.srt.managers.scheduler_components.step_planner.PrefillAdder",
-            side_effect=make_adder,
-        )
-        adder_patch.start()
-        self.addCleanup(adder_patch.stop)
+        self.make_adder = make_adder
         self.planner = self._planner()
 
     def _planner(self) -> StepPlanner:
         s = StepPlanner.__new__(StepPlanner)
+        s.prefill_adder_class = self.make_adder
         s.counters = LaunchCounters()
         s.counters.processed_tokens_counter = 0
         s.flags = EngineFlags()
