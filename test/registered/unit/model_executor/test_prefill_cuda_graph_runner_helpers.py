@@ -226,9 +226,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         ngram_eos_token_id=None,
                         holder=holder,
                     )
-                else:
-                    for replay in capture.cuda_graph._break_fns:
-                        replay()
+                    self.assertIsNone(holder.batch)
+                for replay in capture.cuda_graph._break_fns:
+                    replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
