@@ -505,7 +505,7 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
-    torch._dynamo.config.assume_static_by_default = False
+    torch._dynamo.config.assume_static_by_default = True
     register_inductor_fallback_ops()
     monkey_patch_torch_compile()
 
@@ -528,8 +528,15 @@ _CPU_COMPILE_FAKE_TP_SIZE: int = 1
 
 
 def register_cpu_compile_fake(op_name: str):
-    _CPU_COMPILE_FAKE_OPS.add(op_name)
-    return torch.library.register_fake(f"sgl_kernel::{op_name}")
+    def decorator(fn):
+        try:
+            torch.library.register_fake(f"sgl_kernel::{op_name}")(fn)
+            _CPU_COMPILE_FAKE_OPS.add(op_name)
+        except (RuntimeError, AttributeError):
+            pass
+        return fn
+
+    return decorator
 
 
 def register_inductor_fallback_ops():
