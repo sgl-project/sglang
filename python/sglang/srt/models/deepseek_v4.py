@@ -910,17 +910,7 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
-    # A decoder tail graph's capture pass hands the break activations its
-    # segments never computed; the indexer would select candidate blocks from
-    # them and index pages past the live context. Its replay runs the body.
-    if not in_replay_tail_graph():
-        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
-
-
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
-    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
-)
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(deepseek_v4_low_ratio_sources)
 
 
 def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
