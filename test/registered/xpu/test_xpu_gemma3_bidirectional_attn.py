@@ -218,5 +218,36 @@ class TestXPUGemma3ImageBlockIds(CustomTestCase):
         )
 
 
+@unittest.skipUnless(
+    hasattr(torch, "xpu") and torch.xpu.is_available(), "requires an Intel XPU"
+)
+class TestXPUGemma4ImageBlockIds(CustomTestCase):
+    def test_gemma4_sets_image_block_ids_on_xpu_backend(self):
+        """Gemma 4 must hand the XPU backend the same image-block ids as Gemma 3,
+        not fall back to causal attention (its old Triton-only path)."""
+        from unittest import mock
+
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import gemma4_mm
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.bidirectional_block_ids = None
+        forward_batch = _image_batch([0, 0], [300, 120], [[(5, 284)], []])
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        input_ids = torch.zeros(420, dtype=torch.long, device="xpu")
+
+        with mock.patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+            gemma4_mm.Gemma4ForConditionalGeneration.prepare_attn_masks(
+                SimpleNamespace(), forward_batch, input_ids, torch.bfloat16
+            )
+
+        self.assertIsNotNone(backend.bidirectional_block_ids)
+        torch.testing.assert_close(
+            backend.bidirectional_block_ids,
+            _build_block_ids(forward_batch, input_ids.device),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
