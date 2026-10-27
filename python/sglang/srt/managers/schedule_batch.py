@@ -3367,9 +3367,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
-            # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            # Restarting after partial output would append generation B to
+            # generation A in the tokenizer's accumulated response.
+            abort_input_embeds_with_output = (
+                req.input_embeds is not None and req.send_token_offset > 0
+            )
+            backup_saved = self.release_req(
+                idx,
+                len(sorted_indices),
+                offload_kv=not abort_input_embeds_with_output,
+            )
+            if backup_saved and not abort_input_embeds_with_output:
                 retracted_reqs.append(req)
+                continue
+
+            if abort_input_embeds_with_output:
+                message = (
+                    "Retracted an input_embeds request after partial output was "
+                    "sent. Retry the request to avoid mixing generations."
+                )
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
             else:
                 # No backup exists and the device KV is already freed, so the
                 # request cannot resume.
@@ -3382,11 +3399,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     message = "Retraction host KV pool exhausted. Aborting the request."
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-                req.to_finish = FINISH_ABORT(message, status_code=status_code)
-                reqs_to_abort.append(req)
-                logger.warning(
-                    "retract_decode: aborted request %s: %s", req.rid, message
-                )
+            req.to_finish = FINISH_ABORT(message, status_code=status_code)
+            reqs_to_abort.append(req)
+            logger.warning("retract_decode: aborted request %s: %s", req.rid, message)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
