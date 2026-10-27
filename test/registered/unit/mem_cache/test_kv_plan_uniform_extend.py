@@ -8,10 +8,11 @@ import torch
 from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, suite="extra-a-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

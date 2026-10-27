@@ -10,11 +10,16 @@ from test_unified_mamba_views import _make_pool
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=18, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestMambaCompaction(CustomTestCase):

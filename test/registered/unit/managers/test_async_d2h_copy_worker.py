@@ -23,10 +23,11 @@ from sglang.srt.utils.common import (
     is_confidential_compute,
     is_pin_memory_available,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=13, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "AsyncD2HCopyWorker requires CUDA")
