@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import mlx.core as mx
 
-_METALLIB_NAME = "sgl_metal_kernels.metallib"
+_METALLIB_NAME = "_metal.metallib"
 
 try:
     from . import _metal

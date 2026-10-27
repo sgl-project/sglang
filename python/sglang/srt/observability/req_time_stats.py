@@ -42,6 +42,7 @@ from sglang.srt.observability.trace_async import (
     is_async_tracing_available,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVTransferMetric
@@ -664,6 +665,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
     queue_duration_s: float = 0.0
 
+    # Poll-observed waits; staging can include a re-prefetch and overlap prefetch.
+    # None means unmeasured (including stats received from an older scheduler).
+    storage_prefetch_wait_s: Optional[float] = None
+    storage_staging_wait_s: Optional[float] = None
+    _storage_prefetch_wait: Optional[PollTimer] = None
+    _storage_staging_wait: Optional[PollTimer] = None
+
     has_timing_data: bool = False
 
     def __getstate__(self) -> object:
@@ -678,6 +686,20 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
             "queue_duration_s": self.queue_duration_s,
+            "storage_prefetch_wait_s": (
+                self.storage_prefetch_wait_s
+                if not (
+                    self._storage_prefetch_wait and self._storage_prefetch_wait.running
+                )
+                else None
+            ),
+            "storage_staging_wait_s": (
+                self.storage_staging_wait_s
+                if not (
+                    self._storage_staging_wait and self._storage_staging_wait.running
+                )
+                else None
+            ),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -737,10 +759,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
         self.queue_duration_s = 0.0
+        self.storage_prefetch_wait_s = None
+        self.storage_staging_wait_s = None
+        self._storage_prefetch_wait = None
+        self._storage_staging_wait = None
+
+    def observe_storage_prefetch_ready(self, ready: bool):
+        """Accumulate first blocked poll to the subsequent ready poll, per episode."""
+        if self._storage_prefetch_wait is not None:
+            self.storage_prefetch_wait_s += self._storage_prefetch_wait.observe(ready)
+
+    def observe_storage_staging_ready(self, ready: bool):
+        if self._storage_staging_wait is not None:
+            self.storage_staging_wait_s += self._storage_staging_wait.observe(ready)
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.wait_queue_entry_time == 0.0:
+            if self.enable_metrics and self.disagg_mode != DisaggregationMode.DECODE:
+                self.storage_prefetch_wait_s = 0.0
+                self.storage_staging_wait_s = 0.0
+                self._storage_prefetch_wait = PollTimer()
+                self._storage_staging_wait = PollTimer()
             if self.enable_metrics or self.trace_ctx.tracing_enable:
                 if self.disagg_mode == DisaggregationMode.PREFILL:
                     stage = RequestStage.PREFILL_BOOTSTRAP
@@ -1172,6 +1212,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
+        if self.storage_prefetch_wait_s is not None and not (
+            self._storage_prefetch_wait and self._storage_prefetch_wait.running
+        ):
+            meta_data["storage_prefetch_wait"] = self.storage_prefetch_wait_s
+        if self.storage_staging_wait_s is not None and not (
+            self._storage_staging_wait and self._storage_staging_wait.running
+        ):
+            meta_data["storage_staging_wait"] = self.storage_staging_wait_s
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time

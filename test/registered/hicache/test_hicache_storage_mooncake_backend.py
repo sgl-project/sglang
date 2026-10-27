@@ -1,7 +1,7 @@
 """
 Benchmark tests for HiCache Storage with Mooncake backend.
 Usage:
-    python3.10 -m pytest test/registered/hicache/test_hicache_storage_mooncake_backend.py -v
+    python3 -m pytest test/registered/hicache/test_hicache_storage_mooncake_backend.py -v
 """
 
 import os
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     get_gpu_count,
 )
 
-register_cuda_ci(est_time=391, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=396, stage="base-b", runner_config="2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):

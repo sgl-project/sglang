@@ -3,11 +3,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
-from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
-from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+from sglang.kernels.ops.lora.dense.embedding_lora_a import embedding_lora_a_fwd
+from sglang.kernels.ops.lora.dense.gate_up_lora_b import gate_up_lora_b_fwd
+from sglang.kernels.ops.lora.dense.qkv_lora_b import qkv_lora_b_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -377,7 +377,7 @@ class TritonLoRABackend(BaseLoRABackend):
             permutation=torch.zeros(max_tokens, dtype=torch.int32, device=self.device),
         )
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
@@ -414,7 +414,7 @@ class TritonLoRABackend(BaseLoRABackend):
     def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
         local_batch_info = getattr(self, "cuda_graph_batch_info", None)
         assert local_batch_info is not None, (
-            "init_cuda_graph_batch_info must run before DP-attention graph init"
+            "init_decode_cuda_graph_batch_info must run before DP-attention graph init"
         )
         max_global_num_tokens = max_num_tokens * get_parallel().attn_dp_size
         self.cuda_graph_global_batch_info = build_token_lora_batch_info(
