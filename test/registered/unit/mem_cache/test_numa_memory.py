@@ -64,6 +64,15 @@ class TestNumaMemory(CustomTestCase):
                     ([0, 2], 96 * 1024**3),
                 )
 
+    def test_filesystem_mapping_uses_cpuset_not_task_binding(self):
+        with patch.object(
+            numa_memory, "_get_numa_policy", return_value=(2, {0}, {0, 2})
+        ):
+            self.assertEqual(
+                numa_memory._numa_memory_capacity(self.root, use_task_policy=False),
+                ([0, 2], 96 * 1024**3),
+            )
+
     def test_bind_is_intersected_with_cpuset(self):
         self.assertEqual(
             self.capacity(policy_nodes={0, 2}, allowed_nodes={2, 65}),

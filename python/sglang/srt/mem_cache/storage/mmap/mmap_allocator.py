@@ -179,7 +179,6 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
     """
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
-    check_numa_memory_capacity(n_bytes)
 
     # Note: hugepages are not directly supported with /dev/shm mmap files
     # without mounting hugetlbfs there, so we fall back to plain page size.
@@ -194,6 +193,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
 
     # Create an anonymous shared memory file descriptor via memfd_create
     fd = None
+    use_task_policy = True
     try:
         # MFD_CLOEXEC is standard on Linux 3.17+
         fd = os.memfd_create(
@@ -201,6 +201,9 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
             flags=getattr(os, "MFD_CLOEXEC", 1),
         )
     except (AttributeError, OSError):
+        # /dev/shm can have a mount policy that overrides task binding.
+        # Without that policy, only the cpuset capacity is a safe upper bound.
+        use_task_policy = False
         # Fallback to creating a file in /dev/shm if memfd_create is not supported
         shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
         try:
@@ -213,6 +216,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
             raise OSError(f"Failed to create shm file: {e}")
 
     try:
+        check_numa_memory_capacity(n_bytes, use_task_policy=use_task_policy)
         os.ftruncate(fd, alloc_bytes)
         mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
     except Exception as e:

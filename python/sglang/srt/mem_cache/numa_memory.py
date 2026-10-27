@@ -57,7 +57,9 @@ def _parse_nodes(value):
     return nodes
 
 
-def _numa_memory_capacity(sysfs_root=Path("/sys/devices/system/node")):
+def _numa_memory_capacity(
+    sysfs_root=Path("/sys/devices/system/node"), *, use_task_policy=True
+):
     """Return (nodes, total bytes), or None when there is no known restriction.
 
     This is total physical capacity, not an estimate of reclaimable/free RAM.
@@ -72,7 +74,7 @@ def _numa_memory_capacity(sysfs_root=Path("/sys/devices/system/node")):
         # Unknown flags retain the cpuset ceiling without interpreting the
         # policy mask. For example, NUMA balancing can return a saved user mask
         # whose dynamic rebinding cannot be recovered from these two queries.
-        if mode & ~_MPOL_MODE_FLAGS == _MPOL_BIND:
+        if use_task_policy and mode & ~_MPOL_MODE_FLAGS == _MPOL_BIND:
             if mode & _MPOL_F_RELATIVE_NODES and allowed_nodes:
                 # get_mempolicy returns the original relative mask for this flag.
                 # Match Linux's nodes_fold + nodes_onto mapping into the cpuset.
@@ -102,13 +104,17 @@ def _numa_memory_capacity(sysfs_root=Path("/sys/devices/system/node")):
         return None
 
 
-def check_numa_memory_capacity(requested_bytes: int) -> None:
+def check_numa_memory_capacity(
+    requested_bytes: int, *, use_task_policy: bool = True
+) -> None:
     """Reject a new mapping that cannot fit in its permitted NUMA nodes.
 
     A request below this ceiling may still exceed currently available memory.
     This check does not reserve memory or replace HiCache's host/cgroup budget.
+    For a filesystem mapping with an unknown mount policy, use_task_policy=False
+    checks only the cpuset ceiling: the mount policy can override task binding.
     """
-    capacity = _numa_memory_capacity()
+    capacity = _numa_memory_capacity(use_task_policy=use_task_policy)
     if capacity is None:
         return
     nodes, total = capacity

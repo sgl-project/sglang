@@ -9,8 +9,10 @@ import ctypes
 import ctypes.util
 import mmap
 import os
+import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 
 import torch
 
@@ -86,9 +88,9 @@ class TestMmapAllocator(unittest.TestCase):
 
 
 class TestNumaAllocationGuard(CustomTestCase):
-    def test_rejects_oversized_mapping_before_allocator_entry(self):
+    def test_rejects_oversized_mapping_before_prefaulting(self):
         # The synthetic limit is 32 KiB. Even a regression requests only 36 KiB;
-        # sentinels additionally prevent mmap/hugepage/SHM allocation.
+        # sentinels prevent mapping or sizing a backing file.
         for allocate in (mmap_allocator.alloc_mmap, mmap_allocator.alloc_shm):
             for hugepages in ("", "2MB", "1GB"):
                 with (
@@ -114,15 +116,87 @@ class TestNumaAllocationGuard(CustomTestCase):
                     unittest.mock.patch.object(
                         mmap_allocator.os,
                         "memfd_create",
-                        side_effect=AssertionError("reached SHM allocation"),
+                        return_value=12345,
                         create=True,
                     ) as shm,
+                    unittest.mock.patch.object(mmap_allocator.os, "close") as close,
+                    unittest.mock.patch.object(
+                        mmap_allocator.os,
+                        "ftruncate",
+                        side_effect=AssertionError("reached ftruncate"),
+                    ) as truncate,
                 ):
                     with self.assertRaisesRegex(ValueError, "permitted NUMA nodes"):
                         allocate((9, 1024), torch.float32)
                     plain.assert_not_called()
                     huge.assert_not_called()
-                    shm.assert_not_called()
+                    truncate.assert_not_called()
+                    if allocate is mmap_allocator.alloc_shm:
+                        shm.assert_called_once()
+                        close.assert_called_once_with(12345)
+                    else:
+                        shm.assert_not_called()
+                        close.assert_not_called()
+
+    def test_shm_filesystem_fallback_uses_only_cpuset_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "has_memory").write_text("0-2")
+            for node, kib in enumerate((32, 64, 128)):
+                path = root / f"node{node}"
+                path.mkdir()
+                (path / "meminfo").write_text(f"Node {node} MemTotal: {kib} kB")
+            capacity = numa_memory._numa_memory_capacity
+            # Task bind permits 32 KiB, cpuset permits 96 KiB. A tmpfs mount
+            # policy can use the latter. Neither trial reaches a real mapping.
+            for memfd_error in (AttributeError("unavailable"), OSError("denied")):
+                for kib in (36, 100):
+                    with (
+                        self.subTest(error=memfd_error, kib=kib),
+                        unittest.mock.patch.object(
+                            numa_memory,
+                            "_get_numa_policy",
+                            return_value=(2, {0}, {0, 1}),
+                        ),
+                        unittest.mock.patch.object(
+                            numa_memory,
+                            "_numa_memory_capacity",
+                            side_effect=lambda **kw: capacity(root, **kw),
+                        ),
+                        unittest.mock.patch.object(
+                            mmap_allocator.os,
+                            "memfd_create",
+                            side_effect=memfd_error,
+                            create=True,
+                        ),
+                        unittest.mock.patch.object(
+                            mmap_allocator.os,
+                            "open",
+                            return_value=12345,
+                        ),
+                        unittest.mock.patch.object(mmap_allocator.os, "unlink"),
+                        unittest.mock.patch.object(mmap_allocator.os, "close") as close,
+                        unittest.mock.patch.object(
+                            mmap_allocator.os,
+                            "ftruncate",
+                        ) as truncate,
+                        unittest.mock.patch.object(
+                            mmap_allocator,
+                            "_mmap_prefaulted",
+                            side_effect=RuntimeError("mapping intercepted"),
+                        ) as mapping,
+                    ):
+                        error = RuntimeError if kib == 36 else ValueError
+                        message = "mapping intercepted" if kib == 36 else "total RAM"
+                        with self.assertRaisesRegex(error, message):
+                            mmap_allocator.alloc_shm((kib * 256,), torch.float32)
+                        close.assert_called_once_with(12345)
+                        if kib == 36:
+                            truncate.assert_called_once_with(12345, 36 * 1024)
+                            mapping.assert_called_once()
+                        else:
+                            truncate.assert_not_called()
+                            mapping.assert_not_called()
 
     def test_small_mapping_still_allocates(self):
         with (
