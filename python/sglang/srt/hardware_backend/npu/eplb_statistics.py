@@ -37,10 +37,6 @@ class NpuEplbCommunication:
     def group(self) -> torch.distributed.ProcessGroup | None:
         return get_eplb_device_group()
 
-    @property
-    def device(self) -> str:
-        return distribution.get_device_namespace().device
-
 
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""

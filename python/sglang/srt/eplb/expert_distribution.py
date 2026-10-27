@@ -754,10 +754,9 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 @dataclass(frozen=True)
 class _EplbCommunication:
-    """Communication group and device for expert statistics."""
+    """Communication group for expert statistics."""
 
     group: Optional[torch.distributed.ProcessGroup] = None
-    device: str = "cuda"
 
 
 class _Accumulator(ABC):
@@ -1071,13 +1070,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=self._communication.device,
+                device=get_device_namespace().device,
             )
         else:
             avg_rate_tensor = torch.empty(
                 1,
                 dtype=torch.float32,
-                device=self._communication.device,
+                device=get_device_namespace().device,
             )
         torch.distributed.broadcast(
             avg_rate_tensor, src=0, group=self._communication.group
