@@ -571,21 +571,47 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce, staged through the TP group's own
-# CustomAllReduceV2 push plane (tiny batches only; no dedicated workspace).
+# Fused finalize + shared add + TP all-reduce, staged through a CustomAllReduceV2
+# push plane: the TP group's own, or a dedicated push-only one.
+
+_fused_all_reduce_comm = None
 
 
-def register_fused_all_reduce_comm() -> None:
-    """Hand the TP group's push plane to the fusion kernels, once per process.
-    Must run before graph capture; unregistered means everything runs unfused."""
+def register_fused_all_reduce_comm(
+    *, max_push_size: Optional[int] = None, max_push_blocks: Optional[int] = None
+) -> None:
+    """Hand a push plane to the fusion kernels, once per process: the TP group's
+    own, or with ``max_push_size`` a dedicated push-only plane of that slot size
+    and ``max_push_blocks`` row counters. Must run before graph capture;
+    unregistered means everything runs unfused."""
+    global _fused_all_reduce_comm
+    if _fused_all_reduce_comm is not None:
+        return
     from sglang.kernels.ops.communication import all_reduce_fusion
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
 
-    ca_comm = get_parallel().tp_group.ca_comm
-    if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-        all_reduce_fusion.register_comm(ca_comm.obj)
+    comm = get_parallel().tp_group.ca_comm
+    if (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and max_push_size is not None
+    ):
+        from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+
+        comm = CustomAllReduceV2(
+            comm.group,
+            comm.device,
+            max_pull_size=0,
+            max_pull_blocks=0,
+            max_push_size=max_push_size,
+            max_push_blocks=max_push_blocks,
+        )
+        register_comm_cleanup(comm)
+    if isinstance(comm, CustomAllReduceV2) and not comm.disabled:
+        all_reduce_fusion.register_comm(comm.obj)
+        _fused_all_reduce_comm = comm
     else:
         log_info_on_rank0(
             logger,
@@ -603,9 +629,9 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    if all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is None:
+    comm = _fused_all_reduce_comm
+    if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    comm = get_parallel().tp_group.ca_comm
     return (
         num_tokens <= 384
         and num_tokens <= comm.config.num_push_blocks
