@@ -39,8 +39,8 @@ def _inputs(m: int, seed: int):
     return x, residual, post, comb, pre, weight
 
 
-@pytest.mark.parametrize("m", [1, 6, 48, 128, 129, 198, 336, 384])
-@pytest.mark.parametrize("threads", [160, 320, 640])
+@pytest.mark.parametrize("m", [1, 6, 48, 128, 129, 198, 336, 384, 480, 768, 960, 1024])
+@pytest.mark.parametrize("threads", [None, 160, 320, 640])
 @pytest.mark.parametrize("quant", [False, True])
 def test_matches_unfused(m: int, threads: int, quant: bool):
     from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
