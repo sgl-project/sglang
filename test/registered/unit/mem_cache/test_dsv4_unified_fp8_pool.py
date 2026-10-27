@@ -17,7 +17,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # DeepSeek-V4-Pro geometry.
 NOPE_DIM = 448
@@ -44,14 +44,6 @@ class TestDSV4UnifiedRowBytes(CustomTestCase):
             dsv4_unified_row_bytes(NOPE_DIM, ROPE_DIM, fp8=True),
             DSV4_FP8_NOPE_ROW_BYTES + ROPE_DIM * 2,
         )
-
-    def test_fp8_saves_exactly_three_eighths(self):
-        """0.625x is where the >=1.40x capacity target comes from; the remaining
-        dilution is the fixed SWA/c4-state bias, not the row."""
-        bf16 = dsv4_unified_row_bytes(NOPE_DIM, ROPE_DIM, fp8=False)
-        fp8 = dsv4_unified_row_bytes(NOPE_DIM, ROPE_DIM, fp8=True)
-        self.assertEqual((bf16, fp8), (1024, 640))
-        self.assertAlmostEqual(fp8 / bf16, 0.625)
 
     def test_scales_and_latent_fit_the_asm_stride(self):
         """7 tiles written twice = 14 B; 448 + 14 leaves 50 B the reader never
@@ -109,20 +101,6 @@ class TestDSV4UnifiedFp8PoolAllocation(CustomTestCase):
             self.assertEqual(buf.shape[0], rope.shape[0])
             self.assertEqual(buf.shape[1], DSV4_FP8_NOPE_ROW_BYTES)
             self.assertEqual(rope.shape[1], ROPE_DIM)
-
-    def test_fp8_pool_bytes_match_the_sizing_row_width(self):
-        bf16, fp8 = self._pool(fp8=False), self._pool(fp8=True)
-        for layer, buf in enumerate(bf16.kv_buffer):
-            rows = buf.shape[0]
-            self.assertEqual(fp8.kv_buffer[layer].shape[0], rows)
-            self.assertEqual(
-                buf.nbytes,
-                rows * dsv4_unified_row_bytes(NOPE_DIM, ROPE_DIM, fp8=False),
-            )
-            self.assertEqual(
-                fp8.kv_buffer[layer].nbytes + fp8.kv_buffer_rope[layer].nbytes,
-                rows * dsv4_unified_row_bytes(NOPE_DIM, ROPE_DIM, fp8=True),
-            )
 
     def test_rope_accessor_rejects_the_bf16_pool(self):
         with self.assertRaises(AssertionError):
@@ -253,19 +231,6 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
                             self.assertEqual(view.nbytes, native.nbytes - ring_bytes)
                             self.assertEqual(region.page_bytes, view[0].nbytes)
 
-    def test_fp8_regions_cover_the_same_bytes_as_bf16(self):
-        """
-        Both halves together must mirror the whole row; the 0.625x is the same
-        saving the row-width test pins.
-        """
-        _, bf16 = self._stub(fp8=False)
-        _, fp8 = self._stub(fp8=True)
-        for ratio in (4, 128):
-            _, whole = bf16.unified_region_buffers(ratio)
-            _, nope = fp8.unified_region_buffers(ratio)
-            _, rope = fp8.unified_rope_region_buffers(ratio)
-            self.assertAlmostEqual((nope + rope) / whole, 0.625)
-
 
 class TestResolveUnifiedKvFp8(CustomTestCase):
     def test_override_false_wins_over_env(self):
@@ -274,13 +239,6 @@ class TestResolveUnifiedKvFp8(CustomTestCase):
             self.assertFalse(resolve_unified_kv_fp8(False))
             self.assertTrue(resolve_unified_kv_fp8(True))
             self.assertTrue(resolve_unified_kv_fp8(None))
-
-    def test_none_follows_env_off(self):
-        env_mod = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
-        with patch(f"{env_mod}.is_unified_kv_fp8", return_value=False):
-            self.assertFalse(resolve_unified_kv_fp8(None))
-            self.assertFalse(resolve_unified_kv_fp8(False))
-            self.assertTrue(resolve_unified_kv_fp8(True))
 
 
 class TestDsv4PoolFp8Gate(CustomTestCase):

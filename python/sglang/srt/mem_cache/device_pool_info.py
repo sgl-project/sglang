@@ -218,6 +218,38 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
             )
 
 
+class PageRowBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Packed page rows: one ``row_bytes`` uint8 row per (layer, page).
+
+    ``slab`` is ``[layers, num_pages, row_bytes]`` and ``rows[i]`` is ``slab[i]``;
+    a row holds every component of that page, such as payloads and scales.
+    """
+
+    slab: torch.Tensor
+    rows: tuple[torch.Tensor, ...]
+    row_bytes: int
+    page_size: int
+    num_pages: int
+
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        layers = len(self.rows)
+        expected = (layers, self.num_pages, self.row_bytes)
+        if (
+            tuple(self.slab.shape) != expected
+            or self.slab.dtype != torch.uint8
+            or not self.slab.is_contiguous()
+            or (layer_ids is not None and len(layer_ids) != layers)
+        ):
+            raise ValueError(
+                f"Page rows: slab shape={tuple(self.slab.shape)}, "
+                f"dtype={self.slab.dtype}, layer_ids={layer_ids}; "
+                f"expected contiguous uint8 {expected}"
+            )
+        for layer, row in enumerate(self.rows):
+            if row.data_ptr() != self.slab[layer].data_ptr():
+                raise ValueError(f"Page rows: rows[{layer}] is not slab[{layer}]")
+
+
 class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     pool_name: PoolName
     indices_from_pool: PoolName
@@ -227,6 +259,7 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
         MambaStateBufferInfo
         | MHABufferInfo
         | MLABufferInfo
+        | PageRowBufferInfo
         | DSV4PagedBufferInfo
         | DSV4CheckpointBufferInfo
     )
