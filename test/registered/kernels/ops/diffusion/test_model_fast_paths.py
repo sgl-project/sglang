@@ -2429,6 +2429,68 @@ def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, ope
 
 
 # -------------------------------------------------------------------------
+# Joy -- high-mode image MLP epilogue on SM120
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="Joy's large image GEMM epilogue is enabled on SM120 only",
+)
+@torch.no_grad()
+def test_joy_image_mlp_quality_restore_and_dynamic_lora():
+    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+    from sglang.multimodal_gen.runtime.layers.mlp import MLP
+    from sglang.multimodal_gen.runtime.models.dits import joy_image
+
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    torch.manual_seed(42)
+    mlp = MLP(4096, 16384).to(device="cuda", dtype=torch.bfloat16)
+    for parameter in mlp.parameters():
+        parameter.normal_(0, 0.01)
+    x = torch.randn(1, 7168, 4096, device="cuda", dtype=torch.bfloat16)
+    reference = mlp(x)
+    with patch.object(
+        joy_image, "fused_linear_gelu_tanh", wraps=joy_image.fused_linear_gelu_tanh
+    ) as fused:
+        torch.testing.assert_close(
+            joy_image._joy_image_mlp(mlp, x, True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 1
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, False), reference)
+        # Smaller text/token counts must keep their original, faster projection.
+        text = x[:, :1053].contiguous()
+        assert torch.equal(joy_image._joy_image_mlp(mlp, text, True), mlp(text))
+        assert fused.call_count == 1
+
+        compiled = torch.compile(
+            joy_image._joy_image_mlp, backend="eager", fullgraph=True
+        )
+        assert torch.equal(compiled(mlp, x, True), reference)
+        assert fused.call_count == 1
+
+        wrapper = wrap_with_lora_layer(mlp.fc_in, lora_rank=4, lora_alpha=4)
+        wrapper.set_lora_weights(
+            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
+            torch.randn(16384, 4, device=x.device, dtype=x.dtype) * 0.02,
+            merge_weights=False,
+        )
+        mlp.fc_in = wrapper
+        adapted = mlp(x)
+        assert not torch.equal(adapted, reference)
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, True), adapted)
+        assert fused.call_count == 1
+        wrapper.disable_lora = True
+        joy_image._joy_image_mlp(mlp, x, True)
+        assert fused.call_count == 2
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, False), reference)
+
+
+# -------------------------------------------------------------------------
 # Wan -- fused q/k/v GEMM, FFN residual chain, text K/V once per loop
 # -------------------------------------------------------------------------
 

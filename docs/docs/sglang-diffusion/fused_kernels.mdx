@@ -177,6 +177,16 @@ this path. This kernel does not enable model-level BCG support for FLUX.2.
 | `bias_silu`, `bias_glu` | Triton | bit-exact | Sana GLUMB conv bias + SiLU / GLU post-processing |
 | `linear_gelu_tanh` | AOT (cublasLt) | not bit-exact, request-gated | bias-add and tanh-GELU folded into the GEMM epilogue |
 
+Joy Image Edit opts into this epilogue only at `quality="high"` on SM120,
+including RTX PRO 6000 Blackwell. Its BF16 image MLP uses the fused path for
+batch 1 with at least 7168 image tokens and a 4096-to-16384 projection.
+The native single-reference image buckets contain 7168 to 8192 tokens.
+The smaller text MLP retains its separate projection and activation.
+The epilogue changes BF16 rounding;
+`exact` and `lossless` retain the original image MLP. Quantized projections,
+active dynamic LoRA, other shapes or devices, and `torch.compile` also use
+the original path. This does not add model-level BCG support.
+
 ### Attention
 
 | Operator | Backend | Notes |
@@ -243,7 +253,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
-| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper |
+| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper; image linear+GELU at `quality=high` on SM120 |
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
