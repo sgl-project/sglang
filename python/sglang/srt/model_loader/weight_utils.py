@@ -1571,6 +1571,9 @@ def gguf_quant_weights_iterator(
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
             param = torch.tensor(weight)
+            if weight_type == gguf.GGMLQuantizationType.BF16:
+                # gguf-py exposes BF16 data as raw bytes.
+                param = param.view(torch.bfloat16)
             yield name, param
 
 

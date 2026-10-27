@@ -879,6 +879,47 @@ class TestGemma4AttentionOverrides(CustomTestCase):
         self.assertEqual(text_config.swa_v_head_dim, 128)
         self.assertEqual(text_config.swa_num_key_value_heads, 2)
 
+    def test_text_only_config_preserves_full_and_sliding_attention_shapes(self):
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        config = self._make_config().text_config
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            parsed = get_config(directory, trust_remote_code=False)
+
+        self.assertEqual(parsed.head_dim, 256)
+        self.assertEqual(parsed.num_key_value_heads, 4)
+        self.assertEqual(parsed.swa_head_dim, 128)
+        self.assertEqual(parsed.swa_num_key_value_heads, 2)
+        self.assertFalse(parsed.is_heterogeneous)
+
+    def test_gguf_preserves_shared_kv_layers_and_logit_softcap(self):
+        """Preserve the metadata used by the Bolt E4B Q4_K_M checkpoint."""
+        import os
+
+        import gguf
+
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "gemma4.gguf")
+            writer = gguf.GGUFWriter(path, "gemma4")
+            writer.add_block_count(6)
+            writer.add_embedding_length(64)
+            writer.add_feed_forward_length(128)
+            writer.add_head_count(4)
+            writer.add_head_count_kv(2)
+            writer.add_uint32("gemma4.attention.shared_kv_layers", 2)
+            writer.add_float32("gemma4.final_logit_softcapping", 30.0)
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            config = get_config(path, trust_remote_code=False)
+
+        self.assertEqual(config.num_kv_shared_layers, 2)
+        self.assertEqual(config.final_logit_softcapping, 30.0)
+
     def test_per_layer_spec_is_dropped_so_later_reads_do_not_raise(self):
         config = self._make_config()
 

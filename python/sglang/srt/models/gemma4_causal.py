@@ -88,6 +88,25 @@ Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
 
 
+class Gemma4GGUFEmbedding(VocabParallelEmbedding):
+    def __init__(self, num_embeddings, embedding_dim, embed_scale, quant_config):
+        super().__init__(num_embeddings, embedding_dim, quant_config=quant_config)
+        self.embed_scale = embed_scale
+
+    def forward(self, input_ids):
+        return super().forward(input_ids) * self.embed_scale
+
+
+def make_gemma4_embedding(
+    num_embeddings, embedding_dim, padding_idx, *, embed_scale, quant_config
+):
+    if quant_config is None or quant_config.get_name() != "gguf":
+        return Gemma4TextScaledWordEmbedding(
+            num_embeddings, embedding_dim, padding_idx, embed_scale=embed_scale
+        )
+    return Gemma4GGUFEmbedding(num_embeddings, embedding_dim, embed_scale, quant_config)
+
+
 def load_tied_lm_head(
     loaded_weight, *, params_dict, loaded_params, head_param_name="lm_head.weight"
 ):
@@ -885,11 +904,12 @@ class Gemma4TextModel(PreTrainedModel):
                 )
 
         if self.pp_group.is_first_rank:
-            self.embed_tokens = Gemma4TextScaledWordEmbedding(
+            self.embed_tokens = make_gemma4_embedding(
                 config.vocab_size,
                 config.hidden_size,
                 self.padding_idx,
                 embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
+                quant_config=quant_config,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -899,11 +919,12 @@ class Gemma4TextModel(PreTrainedModel):
             and self.hidden_size_per_layer_input
             and self.hidden_size_per_layer_input > 0
         ):
-            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = make_gemma4_embedding(
                 self.vocab_size_per_layer_input,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
                 self.padding_idx,
                 embed_scale=self.hidden_size_per_layer_input**0.5,
+                quant_config=quant_config,
             )
 
             self.per_layer_model_projection = ReplicatedLinear(
@@ -1190,6 +1211,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # checkpoint embedding into lm_head explicitly, so the tie is a no-op
         # here when PP is active.
         if self.pp_group.world_size > 1:
+            return
+        if isinstance(self.model.embed_tokens, Gemma4GGUFEmbedding):
+            # The head already shares the packed embedding module.
             return
         super().tie_weights(*args, **kwargs)
 

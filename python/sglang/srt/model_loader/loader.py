@@ -7,6 +7,7 @@ from __future__ import annotations
 # ruff: noqa: SIM117
 import collections
 import concurrent.futures
+import copy
 import dataclasses
 import fnmatch
 import gc
@@ -3065,6 +3066,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        elif model_type == "gemma4_text":
+            model_type = "gemma4"
         elif model_type == "qwen3_moe":
             model_type = "qwen3moe"
         arch = None
@@ -3076,13 +3079,20 @@ class GGUFModelLoader(BaseModelLoader):
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
+        dummy_config = config
+        if model_type == "gemma4":
+            dummy_config = copy.deepcopy(config)
+            # SGLang keeps K/V projections in shared-KV layers.
+            dummy_config.num_kv_shared_layers = 0
         with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
+            dummy_model = AutoModelForCausalLM.from_config(dummy_config)
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}
         for hf_name in state_dict:
             name, suffix = hf_name.rsplit(".", 1)
+            if model_type == "gemma4" and suffix == "layer_scalar":
+                name, suffix = hf_name, "weight"
             gguf_name = name_map.get_name(name)
             gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
         return gguf_to_hf_name_map

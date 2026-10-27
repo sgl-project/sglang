@@ -1,4 +1,4 @@
-"""Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
+"""Unit tests for weight loading, shard indexes, and GGUF tensor decoding."""
 
 import json
 import os
@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
+    gguf_quant_weights_iterator,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
 )
@@ -218,6 +219,60 @@ class TestInitializeDummyWeights(CustomTestCase):
         self.assertTrue(torch.equal(model.w13_weight_scale_2, torch.ones(4, 2)))
         self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
         self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
+
+
+class TestGGUFTensors(CustomTestCase):
+    def test_unquantized_gguf_tensors_preserve_values_and_logical_shape(self):
+        import gguf
+
+        for dtype, quant_type in (
+            (torch.bfloat16, gguf.GGMLQuantizationType.BF16),
+            (torch.float16, gguf.GGMLQuantizationType.F16),
+            (torch.float32, gguf.GGMLQuantizationType.F32),
+        ):
+            with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as directory:
+                expected = torch.tensor([[1.5, -2.0], [0.25, 4.0]], dtype=dtype)
+                data = (
+                    expected.view(torch.uint8).numpy()
+                    if dtype == torch.bfloat16
+                    else expected.numpy()
+                )
+                path = os.path.join(directory, "weights.gguf")
+                writer = gguf.GGUFWriter(path, "llama")
+                writer.add_tensor("blk.0.ffn_down.weight", data, raw_dtype=quant_type)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                weights = dict(
+                    gguf_quant_weights_iterator(
+                        path, {"blk.0.ffn_down.weight": "model.proj.weight"}
+                    )
+                )
+                name = (
+                    "model.proj.weight"
+                    if dtype == torch.float32
+                    else "model.proj.qweight"
+                )
+                torch.testing.assert_close(weights[name], expected, rtol=0, atol=0)
+
+                from sglang.srt.layers.quantization.gguf import (
+                    apply_gguf_embedding,
+                    fused_mul_mat_gguf,
+                )
+
+                inputs = torch.tensor([[2.0, -1.0]], dtype=dtype)
+                output = fused_mul_mat_gguf(inputs, weights[name], quant_type)
+                torch.testing.assert_close(
+                    output, torch.tensor([[5.0, -3.5]], dtype=dtype), rtol=0, atol=0
+                )
+                token_ids = torch.tensor([1, 0, 1])
+                embeddings = apply_gguf_embedding(
+                    token_ids, weights[name], quant_type, hidden_size=2
+                )
+                torch.testing.assert_close(
+                    embeddings, expected[token_ids], rtol=0, atol=0
+                )
 
 
 if __name__ == "__main__":

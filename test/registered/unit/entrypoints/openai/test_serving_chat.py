@@ -274,6 +274,24 @@ class TestChatTemplateCache(CustomTestCase):
 
 
 class ServingChatTestCase(CustomTestCase):
+    def test_gemma4_text_disables_skipping_special_tokens(self):
+        for model_type, skip_special_tokens in (
+            ("gemma4_text", False),
+            ("gemma4", False),
+            ("llama", True),
+        ):
+            with self.subTest(model_type=model_type):
+                self.tm.model_config.hf_config.model_type = model_type
+                chat = OpenAIServingChat(self.tm, self.template_manager)
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    input_ids=[1],
+                    skip_special_tokens=True,
+                )
+                chat._process_messages(request, is_multimodal=False)
+                self.assertEqual(request.skip_special_tokens, skip_special_tokens)
+
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
