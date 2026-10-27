@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -1181,30 +1182,13 @@ class LowRatioCompressAscendBackendMixin:
                 layer, x, q_lora, pos, forward_batch, candidate=True
             )
             fm.dsv41_candidate_blocks = blocks
-            lengths = None
-        elif indexer.uses_candidates:
-            topk, lengths = self._dsv41_index_qsli_topk(
-                layer, x, q_lora, pos, forward_batch
-            )
+        elif indexer.uses_candidates and not os.environ.get(
+            "SGLANG_DSV41_DISABLE_QSLI"
+        ):
+            topk = self._dsv41_index_qsli_topk(layer, x, q_lora, pos, forward_batch)
         else:
             topk, _ = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
-            lengths = None
         setattr(fm, f"c{ratio}_topk_indices", topk)
-        # MQSMLA needs the *exact* valid prefix of cmp_sparse_indices (README
-        # L109). QSLI only fills the candidate tokens, far fewer than the visible
-        # length, so a consumer layer publishes its own count; the full-top-k
-        # paths keep using the visible length.
-        setattr(
-            fm,
-            f"c{ratio}_topk_length",
-            (
-                self._dsv41_cmp_topk_length(forward_batch, ratio)
-                if lengths is None
-                else (lengths * indexer.candidate_block_size)
-                .clamp_max(int(self._dsv4_index_topk))
-                .to(torch.int32)
-            ),
-        )
         # No indexer-topk capture here: get_num_indexer_layers() sizes that
         # capturer from the ratio-4 layers (model_config.py L482-L484), which
         # DeepSeek-V4.1 has none of, so the capturer is disabled for it -- and
@@ -1511,10 +1495,11 @@ class LowRatioCompressAscendBackendMixin:
                 "before the index layers."
             )
         topk = self._dsv4_index_topk
+        qsli_k = self._dsv41_qsli_cache(layer)
         indices, _ = _ds41_ops().quant_sparse_lightning_indexer(
             q_packed,
             # QSLI takes the record rows without the singleton head axis.
-            self._dsv41_qsli_cache(layer).squeeze(-2),
+            qsli_k.squeeze(-2),
             w,
             descale_q,
             candidate_indices,
@@ -1539,9 +1524,28 @@ class LowRatioCompressAscendBackendMixin:
             layout_k="PA_BBND",
             return_value=False,
         )
-        # The valid prefix is the candidate tokens, not the visible length: the
-        # caller publishes it as cmp_topk_length.
-        return indices.view(t, topk).to(torch.int32), candidate_lengths
+        scored = indices.view(t, topk).to(torch.int32)
+        if (
+            os.environ.get("SGLANG_DSV41_DEBUG_QSLI")
+            and layer.layer_id not in self._dsv41_debugged
+        ):
+            self._dsv41_debugged.add(layer.layer_id)
+            visible = forward_batch.seq_lens // ratio
+            print(
+                f"[dsv41] qsli layer={layer.layer_id} ratio={ratio} rows={t}\n"
+                f"[dsv41]   k shape={tuple(qsli_k.shape)} "
+                f"stride0/544={qsli_k.stride(0) // 544}\n"
+                f"[dsv41]   page_table={tuple(page_table.shape)} "
+                f"max={int(page_table.max())}\n"
+                f"[dsv41]   visible_max={int(visible.max())} "
+                f"scored_min={int(scored.min())} scored_max={int(scored.max())} "
+                f"neg={int((scored < 0).sum())}\n"
+                f"[dsv41]   candidates={tuple(candidate_indices.shape)} "
+                f"block_len min/max="
+                f"{int(candidate_lengths.min())}/{int(candidate_lengths.max())}",
+                flush=True,
+            )
+        return scored
 
     def _dsv41_index_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """QLI dispatch tables, one per low ratio (the ``[1024]`` int32 tensor the
@@ -1844,9 +1848,6 @@ class LowRatioCompressAscendBackendMixin:
             # Reserved by the operator (README L107); derived like the rest so
             # the value is live rather than capture-time.
             compressed_lens = (forward_batch.seq_lens // compress_ratio).to(torch.int32)
-            topk_length = getattr(fm, f"c{compress_ratio}_topk_length", None)
-            if topk_length is None:
-                topk_length = self._dsv41_cmp_topk_length(forward_batch, compress_ratio)
             attn_kwargs.update(
                 cmp_kv=pool.get_compress_buffer(layer.layer_id, False).view(
                     torch.uint8
@@ -1857,10 +1858,13 @@ class LowRatioCompressAscendBackendMixin:
                 ),
                 # seqused_cmp_kv is reserved by the operator (README L107).
                 seqused_cmp_kv=compressed_lens,
-                # The indexer publishes the exact valid prefix per row (QLI: the
-                # visible length capped by index_topk; QSLI: the candidate
-                # tokens), which MQSMLA requires (README L109).
-                cmp_topk_length=topk_length,
+                # One length per query row, from the position, capped by
+                # index_topk (recipes attention_data.py L892-L905). The reference
+                # uses this same upper bound for the QSLI layers too, so the -1
+                # suffix inside it is expected to be skipped.
+                cmp_topk_length=self._dsv41_cmp_topk_length(
+                    forward_batch, compress_ratio
+                ),
             )
         attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
         return attn_out
@@ -2304,6 +2308,8 @@ class DeepseekV4AscendAttnBackend(
         # QSLI's 544B/8-token K records, allocated on first write; see
         # _dsv41_qsli_cache.
         self._dsv41_qsli_caches: dict = {}
+        # Layers whose QSLI geometry has already been dumped (SGLANG_DSV41_DEBUG_QSLI).
+        self._dsv41_debugged: set = set()
         if getattr(model_runner, "is_draft_worker", False):
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
