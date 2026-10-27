@@ -40,6 +40,12 @@ def resolve_linear_attn_cp(server_args: Any) -> None:
             f"Linear-attention prefill CP is not integrated with {architecture}. "
             "Supported models: Qwen3-Next, Kimi-Linear, and Kimi-K3."
         )
+    if get_platform().is_npu and architecture not in _KIMI_K3_MODELS:
+        # Only Kimi-K3 carries the NPU full-sequence CP model code today.
+        raise ValueError(
+            f"Linear-attention prefill CP on NPU is only integrated with "
+            f"Kimi-K3, got {architecture}."
+        )
     if cfg.cp_strategy != "zigzag":
         raise ValueError("Linear-attention prefill CP requires --cp-strategy zigzag.")
 
@@ -66,7 +72,11 @@ def resolve_linear_attn_cp(server_args: Any) -> None:
             if enabled:
                 raise ValueError(f"--{flag} is not supported with Kimi-K3 prefill CP.")
         prefill_backend, _ = attention_backends_of(view)
-        if prefill_backend not in ("fa3", "fa4"):
+        if get_platform().is_npu:
+            # NPU runs absorbed MLA in the model-side NPU module
+            # (deepseek_v2_attention_mla_npu) .
+            pass
+        elif prefill_backend not in ("fa3", "fa4"):
             raise ValueError(
                 "Kimi-K3 prefill CP requires --prefill-attention-backend fa3 or fa4 "
                 "(or --attention-backend fa3 or fa4) for absorbed MLA."
