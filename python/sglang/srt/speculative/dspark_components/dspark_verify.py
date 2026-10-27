@@ -42,6 +42,12 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    CudaGraphBufferRegistry,
+    GraphBuffer,
+    PaddingPolicy,
+    RefreshMode,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -598,6 +604,13 @@ class DsparkVerifyEpilogue:
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
+        self.stride = int(verify_num_draft_tokens)
+        self.gamma = self.stride - 1
+        self.graph_buffers = CudaGraphBufferRegistry(
+            device=device,
+            max_bs=self.max_bs,
+            max_num_tokens=self.max_bs * self.stride,
+        )
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -609,38 +622,48 @@ class DsparkVerifyEpilogue:
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
         self.simulate_fold = bool(simulate_fold) and simulated_correct_len is not None
-        self.sim_temperatures_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.float32, device=device
+        self._register_buffer(
+            "sim_temperatures_buf",
+            (self.max_bs,),
+            torch.float32,
+            RefreshMode.BEFORE_REPLAY,
         )
-        self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
-        self._sim_greedy_bs: Optional[int] = None
-        self.stride = int(verify_num_draft_tokens)
+        self._register_buffer(
+            "sim_seed_buf", (1,), torch.int32, RefreshMode.BEFORE_REPLAY
+        )
         self._fused_argmax = bool(fused_argmax)
-        self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
-        self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
-        self.verify_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int64, device=device
+        self._register_buffer(
+            "inject_gate_buf", (1,), torch.int32, RefreshMode.BEFORE_REPLAY
         )
-        self.draft_tokens_buf = torch.zeros(
-            (self.max_bs * self.gamma,), dtype=torch.int64, device=device
+        self._register_buffer(
+            "verify_lens_buf",
+            (self.max_bs,),
+            torch.int64,
+            RefreshMode.BEFORE_REPLAY,
+            padding_policy=PaddingPolicy.ZERO,
         )
-        self.correct_len_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int64, device=device
+        self._register_buffer(
+            "draft_tokens_buf",
+            (self.max_bs * self.gamma,),
+            torch.int64,
+            RefreshMode.IN_GRAPH,
         )
-        self.bonus_buf = torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
-        self.cap_trim_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
-        )
-        self.commit_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
-        )
-        self.new_seq_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int64, device=device
-        )
-        self.out_tokens_buf = torch.zeros(
-            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        for name, dtype in (
+            ("correct_len_buf", torch.int64),
+            ("bonus_buf", torch.int64),
+            ("cap_trim_lens_buf", torch.int32),
+            ("commit_lens_buf", torch.int32),
+            ("new_seq_lens_buf", torch.int64),
+            ("gated_commit_lens_buf", torch.int32),
+        ):
+            self._register_buffer(name, (self.max_bs,), dtype, RefreshMode.IN_GRAPH)
+        self._register_buffer(
+            "out_tokens_buf",
+            (self.max_bs, self.stride),
+            torch.int64,
+            RefreshMode.IN_GRAPH,
         )
         # Under the accept-site broadcast the fused tail serves only simulate_fold,
         # whose broadcast inputs (length, draw) the kernel can take.
@@ -657,23 +680,43 @@ class DsparkVerifyEpilogue:
             )
         self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
         self._accept_tail_logged: set[int] = set()
-        self.gated_commit_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int32, device=device
-        )
-        self.block_accept_lens_buf = (
-            torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
-            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
-            else None
-        )
+        self.block_accept_lens_buf: Optional[torch.Tensor] = None
+        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get():
+            self._register_buffer(
+                "block_accept_lens_buf",
+                (self.max_bs,),
+                torch.int32,
+                RefreshMode.IN_GRAPH,
+            )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
         self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
-        self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+
+    def _register_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        refresh: RefreshMode,
+        *,
+        padding_policy: PaddingPolicy = PaddingPolicy.KEEP_PAD,
+    ) -> torch.Tensor:
+        return self.graph_buffers.register_buffer(
+            GraphBuffer(
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                capture_value=0,
+                padding_policy=padding_policy,
+                refresh=refresh,
+            ),
+            owner=self,
+        )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -700,35 +743,23 @@ class DsparkVerifyEpilogue:
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
-        self._static_step_state = None
         if verify_lens is None:
-            self.verify_lens_buf.zero_()
+            self.graph_buffers.stage_fill("verify_lens_buf", 0)
         else:
-            bs = verify_lens.shape[0]
-            self.verify_lens_buf[:bs].copy_(verify_lens)
-            if bs < self.max_bs:
-                self.verify_lens_buf[bs:].zero_()
-        self.inject_gate_buf.fill_(1 if armed else 0)
+            self.graph_buffers.stage("verify_lens_buf", verify_lens)
+        self.graph_buffers.stage_fill("inject_gate_buf", int(armed))
 
     def begin_static_step(self, bs: int, armed: bool) -> None:
-        state = (bs, armed)
-        if self._static_step_state == state:
-            return
-        self.verify_lens_buf[:bs].fill_(self.stride)
-        self.verify_lens_buf[bs:].zero_()
-        self.inject_gate_buf.fill_(int(armed))
-        self._static_step_state = state
+        self.graph_buffers.stage_fill("verify_lens_buf", self.stride, num_rows=bs)
+        self.graph_buffers.stage_fill("inject_gate_buf", int(armed))
 
     def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
         """The step's bonus temperatures (None: greedy) and seed, before replay."""
         if temperatures is None:
-            if self._sim_greedy_bs != bs:
-                self.sim_temperatures_buf.zero_()
-                self._sim_greedy_bs = bs
+            self.graph_buffers.stage_fill("sim_temperatures_buf", 0.0)
             return
-        self._sim_greedy_bs = None
-        self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
-        self.sim_seed_buf.fill_(random.getrandbits(31))
+        self.graph_buffers.stage("sim_temperatures_buf", temperatures.view(-1))
+        self.graph_buffers.stage_fill("sim_seed_buf", random.getrandbits(31))
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
@@ -975,25 +1006,19 @@ class DsparkVerifyEpilogue:
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
 
-    def _ensure_out(
-        self, buf: Optional[torch.Tensor], compact: torch.Tensor
-    ) -> torch.Tensor:
-        if (
-            buf is not None
-            and buf.dtype == compact.dtype
-            and buf.shape[1] == compact.shape[1]
-        ):
-            return buf
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "DsparkVerifyEpilogue output buffers must be allocated during "
-            "warmup, not inside graph capture (pool memory is unreadable "
-            "post-replay)."
-        )
-        return torch.empty(
-            (self.max_bs * self.stride, compact.shape[1]),
-            dtype=compact.dtype,
-            device=compact.device,
-        )
+    def _ensure_out(self, name: str, compact: torch.Tensor) -> torch.Tensor:
+        shape = (self.max_bs * self.stride, compact.shape[1])
+        if not self.graph_buffers.has_buffer(name):
+            return self._register_buffer(
+                name, shape, compact.dtype, RefreshMode.IN_GRAPH
+            )
+        spec = self.graph_buffers.get_buffer(name)
+        if spec.shape != shape or spec.dtype != compact.dtype:
+            raise RuntimeError(
+                f"DsparkVerifyEpilogue {name} holds {spec.dtype}{list(spec.shape)}, "
+                f"but the verify graph now produces {compact.dtype}{list(shape)}."
+            )
+        return spec.tensor
 
     def __call__(
         self,
@@ -1005,8 +1030,8 @@ class DsparkVerifyEpilogue:
         req_pool_indices: torch.Tensor,
         bs: int,
     ) -> None:
-        self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
-        self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
+        self._ensure_out("strided_logits", compact_logits)
+        self._ensure_out("strided_hidden", compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
         candidates = torch.zeros(

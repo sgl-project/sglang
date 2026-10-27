@@ -451,6 +451,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            self.model_runner.graph_buffer_registries.append(
+                self._verify_epilogue.graph_buffers
+            )
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported

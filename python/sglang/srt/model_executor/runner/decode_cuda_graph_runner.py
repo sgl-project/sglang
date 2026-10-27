@@ -1318,6 +1318,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and write KV -- through the previous batch's live values. Replay is
         # already covered by the registry's padding policy.
         self.buffers.reset_index_buffers()
+        for registry in self.model_runner.graph_buffer_registries:
+            registry.prepare_capture()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -2057,6 +2059,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
+        for registry in self.model_runner.graph_buffer_registries:
+            registry.check_pointers()
         with self.model_context(), timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
