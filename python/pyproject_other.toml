@@ -41,7 +41,7 @@ runtime_base = [
   "msgspec",
   "ninja",
   "numpy",
-  "openai==2.6.1",
+  "openai==2.8.0",
   "openai-harmony==0.0.4",
   "orjson",
   "packaging",
