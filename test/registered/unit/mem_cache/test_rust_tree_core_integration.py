@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -61,12 +62,13 @@ from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
+    ComponentAction,
     FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     RecoverSWAWithLockedFull,
-    ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
@@ -160,10 +162,16 @@ def _accumulate_step(result, tracker, device_frees, host_frees):
     result.host_frees.clear()
 
 
-def test_match_on_the_empty_tree_returns_no_indices():
-    core = _tree_core()
-    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert result.device_prefix_len == 0
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_on_the_empty_tree_returns_no_indices(backend):
+    core = _tree_core(backend, page_size=2)
+    for key in ([], [1], [1, 2, 3]):
+        result = core.match_prefix(MatchPrefixParams(key=_key(key)))
+        assert result.device_prefix_len == 0
+        assert result.last_visited_node_id is None
+        assert result.full_device_match_len is None
+    assert core.empty_match_result.last_visited_node_id is None
+    assert core.empty_match_result.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["rust", "python"])
@@ -231,14 +239,61 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
     cache.tree_core.sanity_check([], [])
 
 
-def test_insert_then_match_back_returns_the_exact_indices():
-    core = _tree_core()
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_insert_then_match_back_returns_the_exact_indices(backend):
+    core = _tree_core(backend)
     result = _insert(core, [1, 2, 3], [10, 11, 12])
     assert result.prefix_len == 0
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.last_device_node == matched.last_device_node
     assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
+    assert matched.last_visited_node_id == result.last_device_node
+    assert matched.full_device_match_len is None
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_reports_split_prefix_and_zero_match_clears_walk_facts(backend):
+    core = _tree_core(backend)
+    leaf = _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 9])))
+    assert matched.last_visited_node_id == matched.best_match_node
+    assert matched.last_visited_node_id != leaf
+    assert matched.device_prefix_len == 2
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
+    path = core.collect_path_info([leaf])[0]
+    assert path[0].node_id == matched.last_visited_node_id
+    assert path[0].path_end == 2
+
+    cache = SimpleNamespace(
+        supports_prefix_sharing=lambda: True,
+        root_node_handle=core.root_node_handle,
+    )
+    zeroed = zero_match_result(cache, matched._replace(full_device_match_len=2))
+    assert zeroed.last_device_node == core.root_node_handle()
+    assert zeroed.last_visited_node_id is None
+    assert zeroed.full_device_match_len is None
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_match_reports_host_only_node_independent_of_device_acceptance(
+    backend, hicache
+):
+    core = _tree_core(backend)
+    if hicache:
+        core.set_hicache_enabled()
+    host = core.insert_host(
+        core.root_node_handle(), _key([1, 2]), torch.tensor([100, 101]), ["h0", "h1"]
+    ).inserted_host_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    assert matched.last_visited_node_id == host
+    assert matched.last_device_node == core.root_node_handle()
+    assert matched.best_match_node == (host if hicache else core.root_node_handle())
+    assert matched.device_prefix_len == 0
+    assert matched.full_device_match_len is None
+    core.sanity_check([], [])
 
 
 def test_root_node_handle_is_namespace_independent():
@@ -767,7 +822,9 @@ def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
 
 
 def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_core():
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     core = RustUnifiedTreeCoreInspector(
         CacheInitParams(
@@ -781,11 +838,14 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
     stale_root = core.root_node_handle()
     core.reset()
     live_root = core.root_node_handle()
+    visited = _insert(core, [1], [10]).last_device_node
     result = MatchResult(
         device_prefix_len=0,
         last_device_node=live_root,
         last_host_node=live_root,
         best_match_node=live_root,
+        last_visited_node_id=visited,
+        full_device_match_len=0,
     )
     params = MatchPrefixParams(key=_key([]))
 
@@ -809,6 +869,8 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
         best_value_len=0,
     )
     assert finalized.best_match_node == live_root
+    assert finalized.last_visited_node_id == visited
+    assert finalized.full_device_match_len == 0
 
 
 def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
@@ -873,7 +935,7 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
             [live_root, stale_root], live_root, True
         ),
         "evict_excess_path_states": lambda: core.evict_excess_path_states(
-            stale_root, {}, {}
+            stale_root, {}, {}, []
         ),
         "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
         "dec_host_lock_ref": lambda: core.dec_host_lock_ref(
@@ -1052,23 +1114,32 @@ def test_path_order_namespaces_and_detached_snapshots(backend, is_eagle):
     other = insert(tokens, "second")
     before = core.collect_path_info((other, root, leaf, other))
     assert before == (
-        (TreePathNodeInfo(other, root, 0, length, length),),
+        (TreePathNodeInfo(other, root, 0, length, length, 0),),
         (),
-        (TreePathNodeInfo(leaf, root, 0, length, length),),
-        (TreePathNodeInfo(other, root, 0, length, length),),
+        (TreePathNodeInfo(leaf, root, 0, length, length, 0),),
+        (TreePathNodeInfo(other, root, 0, length, length, 0),),
     )
     with pytest.raises(AttributeError):
         before[0][0].path_end = 99
+
+    core.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(array("q", tokens[:3]), extra_key="first", is_bigram=is_eagle)
+        )
+    )
+    chain = core.collect_path_info([leaf])[0]
+    assert [node.num_children for node in chain] == [1, 0]
 
     insert([1, 2, 3, 7, 8, 9], "first")
     path = core.collect_path_info([leaf])[0]
     split = 3 - int(is_eagle)
     assert len(path) == 2
-    assert path[0] == TreePathNodeInfo(path[0].node_id, root, 0, split, split)
+    assert path[0] == TreePathNodeInfo(path[0].node_id, root, 0, split, split, 2)
     assert path[1] == TreePathNodeInfo(
-        leaf, path[0].node_id, split, length, length - split
+        leaf, path[0].node_id, split, length, length - split, 0
     )
-    assert before[2] == (TreePathNodeInfo(leaf, root, 0, length, length),)
+    assert [node.num_children for node in chain] == [1, 0]
+    assert before[2] == (TreePathNodeInfo(leaf, root, 0, length, length, 0),)
     core.reset()
     with pytest.raises(KeyError):
         core.collect_path_info([leaf])
@@ -1089,11 +1160,13 @@ def test_host_only_and_root_adjustments_are_noops(backend, is_eagle):
         root, key, torch.arange(100, 100 + len(key)), ["hash"] * len(key)
     ).inserted_host_node
     assert core.collect_path_info([host]) == (
-        (TreePathNodeInfo(host, root, 0, len(key), None),),
+        (TreePathNodeInfo(host, root, 0, len(key), None, 0),),
     )
     for node in (root, host):
         for delta in (-10, 0, 10):
             core.adjust_component_size(node, ComponentType.FULL, delta)
+        with pytest.raises(ValueError):
+            core.adjust_component_size(node, ComponentType.SWA, 0)
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
     assert core.collect_path_info([host])[0][0].full_value_len is None
 
@@ -1118,6 +1191,7 @@ def test_failed_adjustments_preserve_accounting_and_tree(backend, is_eagle, lock
         (invalid_node, ComponentType.FULL, 0, KeyError),
         (leaf, ComponentType.SWA, 0, ValueError),
         (leaf, 99, 0, ValueError),
+        (leaf, ComponentType.FULL, -len(key) - 1, ValueError),
     ):
         with pytest.raises(error):
             core.adjust_component_size(node, component, delta)
@@ -1143,28 +1217,54 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
     class SideBackingFullComponent(FullComponent):
-        def reclaimable_tokens(self, node):
-            backing = node.component_data[ComponentType.FULL].metadata.get(
-                "side_backing"
-            )
-            return super().reclaimable_tokens(node) + (
-                0 if backing is None else backing.numel()
-            )
+        def reclaimable_value_len(self, node):
+            metadata = node.component_data[ComponentType.FULL].metadata
+            tokens = super().reclaimable_value_len(node)
+            if "raw_backing" in metadata:
+                tokens = metadata["raw_backing"].numel()
+            side_backing = metadata.get("side_backing")
+            return tokens + (0 if side_backing is None else side_backing.numel())
 
     params = CacheInitParams(
         False, None, None, 1, tree_components=(ComponentType.FULL,)
     )
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    core = UnifiedTreeCore(
-        params, {ComponentType.FULL: SideBackingFullComponent(cache, params)}
-    )
+    driver = SideBackingFullComponent(cache, params)
+    core = UnifiedTreeCore(params, {ComponentType.FULL: driver})
     leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
-    metadata = core.node_by_id(leaf).component_data[ComponentType.FULL].metadata
+    node = core.node_by_id(leaf)
+    metadata = node.component_data[ComponentType.FULL].metadata
     metadata["side_backing"] = torch.tensor([100, 101])
     core.adjust_component_size(leaf, ComponentType.FULL, 2)
     assert (core.full_evictable_size(), core.full_protected_size()) == (6, 0)
+    assert driver.value_len(node) == 4
+    assert driver.reclaimable_value_len(node) == 6
+    assert core.collect_path_info([leaf])[0][0].full_value_len == 4
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert matched.device_prefix_len == 4
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
 
     lock = core.inc_lock_ref(leaf)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 6)
+    # A locked split follows logical indices; the tail keeps the side backing.
+    prefix_match = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    prefix = prefix_match.last_device_node
+    prefix_node = core.node_by_id(prefix)
+    assert prefix_match.device_prefix_len == 2
+    assert _path_indices(core, prefix).tolist() == [10, 11]
+    assert core.get_component_device_value(leaf, ComponentType.FULL).tolist() == [
+        12,
+        13,
+    ]
+    assert (driver.value_len(prefix_node), driver.value_len(node)) == (2, 2)
+    assert (
+        driver.reclaimable_value_len(prefix_node),
+        driver.reclaimable_value_len(node),
+    ) == (2, 4)
+    assert [
+        (span.path_start, span.path_end, span.full_value_len)
+        for span in core.collect_path_info([leaf])[0]
+    ] == [(0, 2, 2), (2, 4, 2)]
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 6)
     metadata["side_backing"] = metadata["side_backing"][:1]
     core.adjust_component_size(leaf, ComponentType.FULL, -1)
@@ -1174,9 +1274,27 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
     core.dec_lock_ref(leaf, lock.to_dec_params())
     assert (core.full_evictable_size(), core.full_protected_size()) == (4, 0)
     core.sanity_check([], [])
+
+    for fragment in (prefix_node, node):
+        fragment.component_data[ComponentType.FULL].metadata["raw_backing"] = (
+            torch.empty(0, dtype=torch.int64)
+        )
+        core.adjust_component_size(fragment.id, ComponentType.FULL, -2)
+        assert driver.value_len(fragment) == 2
+        assert driver.reclaimable_value_len(fragment) == 0
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
+    assert [span.full_value_len for span in core.collect_path_info([leaf])[0]] == [2, 2]
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert matched.device_prefix_len == 4
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
+    core.sanity_check([], [])
     tracker = {}
-    _accumulate_step(core.evict_device_leaf(leaf, False), tracker, {}, {})
-    assert tracker[ComponentType.FULL] == 4
+    device_frees = {}
+    _accumulate_step(core.evict_device_leaf(leaf, False), tracker, device_frees, {})
+    assert torch.cat(device_frees[ComponentType.FULL]).tolist() == [12, 13]
+    _accumulate_step(core.evict_device_leaf(prefix, False), tracker, device_frees, {})
+    assert tracker[ComponentType.FULL] == 0
+    assert torch.cat(device_frees[ComponentType.FULL]).tolist() == [12, 13, 10, 11]
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
 
 
@@ -2681,6 +2799,7 @@ def _swa_cache(
     backend="rust",
     ring=False,
     request_window=False,
+    component_registry_override=None,
 ):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -2731,6 +2850,7 @@ def _swa_cache(
                 sliding_window_size=window,
                 swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
+                component_registry_override=component_registry_override,
             )
         )
     return cache, allocator
@@ -2747,7 +2867,9 @@ def _complete_backup(core, node, full_offset=1000, aux_offset=1000):
     return full + full_offset, aux
 
 
-def _swa_mamba_cache(backend, window, enable_session=False):
+def _swa_mamba_cache(
+    backend, window, enable_session=False, component_registry_override=None
+):
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -2768,6 +2890,7 @@ def _swa_mamba_cache(backend, window, enable_session=False):
                 page_size=1,
                 sliding_window_size=window,
                 enable_session_radix_cache=enable_session,
+                component_registry_override=component_registry_override,
                 tree_components=(
                     ComponentType.FULL,
                     ComponentType.SWA,
@@ -2785,11 +2908,17 @@ def _internal_swa_write_back_case(
     with_mamba=False,
     prefix_nodes=1,
     enable_session=False,
+    component_registry_override=None,
 ):
     cache, allocator = (
-        _swa_mamba_cache(backend, window, enable_session)
+        _swa_mamba_cache(backend, window, enable_session, component_registry_override)
         if with_mamba
-        else _swa_cache(window=window, page_size=page_size, backend=backend)
+        else _swa_cache(
+            window=window,
+            page_size=page_size,
+            backend=backend,
+            component_registry_override=component_registry_override,
+        )
     )
     assert cache._tree_core_backend == backend
     segment = 2 * page_size
@@ -3130,6 +3259,121 @@ def _assert_internal_eviction_pending(step, component, node, swa_tokens=0):
 
 
 @pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+@pytest.mark.parametrize("early_release", [False, True], ids=["final", "early-swa"])
+def test_python_component_locks_use_reclaimable_backing(component, early_release):
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+    base = MambaComponent if component == ComponentType.MAMBA else SWAComponent
+
+    class SideBackingComponent(base):
+        def reclaimable_value_len(self, node):
+            backing = node.component_data[self.component_type].metadata.get("backing")
+            if backing is not None:
+                return backing.numel()
+            return super().reclaimable_value_len(node)
+
+    case = _internal_swa_write_back_case(
+        "python",
+        with_mamba=component == ComponentType.MAMBA,
+        component_registry_override={component: SideBackingComponent},
+    )
+    cache, core = case.cache, case.core
+    node_id, leaf = case.nodes
+    node = core.node_by_id(node_id)
+    state = node.component_data[component]
+    logical = state.value.clone()
+    state.metadata["backing"] = torch.arange(len(logical) + 2)
+    core.adjust_component_size(node_id, component, 2)
+
+    def ledgers():
+        return (
+            core.component_evictable_size_[component],
+            core.component_protected_size_[component],
+        )
+
+    before = ledgers()
+    reclaimed = len(logical) + 2
+    lock = core.inc_lock_ref(node_id).to_dec_params()
+    assert state.lock_ref == 1
+    assert ledgers() == (before[0] - reclaimed, before[1] + reclaimed)
+    assert cache.components[component].value_len(node) == len(logical)
+    assert torch.equal(state.value, logical)
+
+    # The final release uses current backing, not the original lock delta.
+    state.metadata["backing"] = state.metadata["backing"][:-1]
+    core.adjust_component_size(node_id, component, -1)
+    if early_release:
+        released = core.dec_swa_lock_only(node_id, lock)
+        assert not released.device_frees and not released.host_frees
+        core.dec_lock_ref(node_id, lock, skip_swa=True)
+    else:
+        core.dec_lock_ref(node_id, lock)
+    assert state.lock_ref == 0
+    assert ledgers() == (before[0] - 1, before[1])
+    assert torch.equal(state.value, logical)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_python_zero_accounted_internal_eviction_continues(component):
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+    base = MambaComponent if component == ComponentType.MAMBA else SWAComponent
+
+    class ReleasedBackingComponent(base):
+        def reclaimable_value_len(self, node):
+            if node.component_data[self.component_type].metadata.get("released"):
+                return 0
+            return super().reclaimable_value_len(node)
+
+    case = _internal_swa_write_back_case(
+        "python",
+        with_mamba=component == ComponentType.MAMBA,
+        prefix_nodes=2,
+        component_registry_override={component: ReleasedBackingComponent},
+    )
+    cache, core = case.cache, case.core
+    first, second, leaf = case.nodes
+    cache.is_write_back = False
+    driver = cache.components[component]
+    expected_values = [
+        core.get_component_device_value(node, component).clone()
+        for node in (first, second)
+    ]
+    first_size = driver.reclaimable_value_len(core.node_by_id(first))
+    expected = driver.reclaimable_value_len(core.node_by_id(second))
+    core.node_by_id(first).component_data[component].metadata["released"] = True
+    core.adjust_component_size(first, component, -first_size)
+    assert driver.value_len(core.node_by_id(first)) == len(expected_values[0]) > 0
+    assert driver.reclaimable_value_len(core.node_by_id(first)) == 0
+    tracker, freed = {}, {}
+    core.evict_device_start(component, expected)
+    try:
+        first_step = core.evict_device_next_node(component, tracker)
+        assert first_step.node_id is None and first_step.made_progress
+        assert not first_step.tracker and first_step.device_frees[component]
+        _accumulate_step(first_step, tracker, freed, {})
+        assert core.get_component_device_value(first, component) is None
+        assert torch.equal(torch.cat(freed[component]), expected_values[0])
+
+        second_step = core.evict_device_next_node(component, tracker)
+        assert second_step.node_id is None and second_step.made_progress
+        _accumulate_step(second_step, tracker, freed, {})
+        assert tracker[component] == expected
+        assert core.get_component_device_value(second, component) is None
+        assert len(freed[component]) == 2
+        assert torch.equal(torch.cat(freed[component]), torch.cat(expected_values))
+        assert not core.evict_device_next_node(component, tracker).made_progress
+    finally:
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
 def test_python_component_returns_immutable_internal_backup_request(component):
     from dataclasses import FrozenInstanceError
 
@@ -3149,14 +3393,20 @@ def test_python_component_returns_immutable_internal_backup_request(component):
         for ct in cache.tree_components
     }
     tracker, device_frees, host_frees = {component: 0}, {}, {}
+    cache_actions = []
     core.evict_device_start(component, num_tokens)
     try:
         request = cache.components[component].evict_device_next_node(
-            tracker, device_frees, host_frees
+            tracker, device_frees, host_frees, cache_actions
         )
         assert isinstance(request, InternalStateBackup)
         assert (request.node_id, request.num_tokens) == (victim, num_tokens)
-        assert not case.events and not device_frees and not host_frees
+        assert (
+            not case.events
+            and not device_frees
+            and not host_frees
+            and not cache_actions
+        )
         assert tracker == {component: 0}
         for ct, value in original.items():
             assert torch.equal(core.get_component_device_value(victim, ct), value)
@@ -3743,6 +3993,17 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+    assert matched.last_visited_node_id != cache.tree_core.root_node_handle()
+    assert matched.last_visited_node_id is not None
+    if not ring:
+        assert matched.last_visited_node_id != matched.last_device_node
+    assert (
+        cache.tree_core.collect_path_info([matched.last_visited_node_id])[0][
+            -1
+        ].path_end
+        == 8
+    )
+    assert matched.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -3799,6 +4060,9 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     )
     leaf = inserted.last_device_node
 
+    action = core.build_backup_kv_action(leaf)
+    assert isinstance(action, BackupKV)
+    assert action.node_ids == [leaf]
     snapshot = core.snapshot_buffer_backup(leaf, pass_prefix_keys=True)
     assert snapshot.node_id == leaf
     assert snapshot.parent_is_root
@@ -3823,6 +4087,8 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     core.reset()
     assert core.snapshot_buffer_backup(leaf, pass_prefix_keys=True) is None
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
+    with pytest.raises(KeyError):
+        core.build_backup_kv_action(leaf)
 
 
 def test_buffer_backup_snapshot_preserves_bigram_keys():
@@ -3971,7 +4237,7 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
     actions = core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
     assert len(actions) == 2
     for action in actions:
-        assert isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        assert isinstance(action, UpdatePendingBackupOnNodeSplit)
         assert action.ack_id == leaf
         assert action.old_node_id == leaf
         assert action.new_child_node_id == leaf
@@ -4409,7 +4675,11 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
         a for a in result.cache_actions if isinstance(a, MambaEvictExcessPathStates)
     ]
     device_frees, host_frees = defaultdict(list), defaultdict(list)
-    core.evict_excess_path_states(action.tail_node_id, device_frees, host_frees)
+    cache_actions = []
+    core.evict_excess_path_states(
+        action.tail_node_id, device_frees, host_frees, cache_actions
+    )
+    assert cache_actions == []
     # The two shallow states free; the tail's survives the soft cap.
     assert sorted(t.item() for t in device_frees[ComponentType.MAMBA]) == [7, 8]
     assert host_frees == {}
@@ -4476,23 +4746,104 @@ def root_child(core):
     return core.match_prefix(MatchPrefixParams(key=_key([1]))).last_host_node
 
 
-def test_split_of_a_write_through_pending_node_crosses_the_replace_action():
-    core = _tree_core()
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("mode", ["pending", "buffer", "both", "ordinary"])
+@pytest.mark.parametrize("split_by", ["insert", "match"])
+def test_split_pending_backup_action(backend, mode, split_by):
+    core = _tree_core(backend)
     core.set_hicache_enabled()
+    has_ack = mode in ("pending", "both")
+    has_buffer = mode in ("buffer", "both")
+    if has_buffer:
+        core.set_host_memory_buffer_only()
     _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4]))).best_match_node
-    core.mark_write_through_pending([leaf], ack_id=leaf)
-    # A divergent prefix splits the pending node; the publish list must follow.
-    result = _insert(core, [1, 2], [10, 11])
-    (replace,) = [
+    if has_ack:
+        core.mark_write_through_pending([leaf], ack_id=leaf)
+    # Both insertion and matching can split the existing node.
+    if split_by == "insert":
+        result = _insert(core, [1, 2], [10, 11])
+    else:
+        result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    split_actions = [
         action
         for action in result.cache_actions
-        if isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        if isinstance(action, UpdatePendingBackupOnNodeSplit)
     ]
-    assert replace.ack_id == leaf
-    assert replace.old_node_id == leaf
-    assert replace.new_child_node_id == leaf
-    assert replace.new_node_id != leaf
+    assert len(split_actions) == int(has_ack or has_buffer)
+    (path,) = core.collect_path_info([leaf])
+    prefix, suffix = [node.node_id for node in path]
+    assert suffix == leaf and prefix != leaf
+    if split_actions:
+        (split_action,) = split_actions
+        assert split_action.ack_id == (leaf if has_ack else None)
+        assert split_action.old_node_id == leaf
+        assert split_action.new_node_id == prefix
+        assert split_action.new_child_node_id == leaf
+        assert isinstance(split_action, ComponentAction)
+        assert split_action.component_type == ComponentType.FULL
+    if backend == "python":
+        assert [
+            core.node_by_id(node_id).write_through_pending_id
+            for node_id in (prefix, leaf)
+        ] == [leaf if has_ack else None] * 2
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("window", [1, 8])
+def test_fresh_swa_leaf_forwards_buffer_split_action(backend, window):
+    core, _ = _swa_transfer_core(backend, window=window)
+    core.set_host_memory_buffer_only()
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([10, 11, 12, 13]),
+            component_evicted_seqlens={ComponentType.SWA: 2},
+        ),
+    )
+    splits = [
+        action
+        for action in result.cache_actions
+        if isinstance(action, UpdatePendingBackupOnNodeSplit)
+    ]
+    assert len(splits) == (2 if window == 1 else 1)
+    for split in splits:
+        assert split.ack_id is None
+        assert split.old_node_id == split.new_child_node_id == result.last_device_node
+    (path,) = core.collect_path_info([result.last_device_node])
+    assert [node.node_id for node in path] == [
+        *[split.new_node_id for split in splits],
+        result.last_device_node,
+    ]
+    assert [(node.path_start, node.path_end) for node in path] == (
+        [(0, 2), (2, 3), (3, 4)] if window == 1 else [(0, 2), (2, 4)]
+    )
+    rebuilds = [a for a in result.cache_actions if isinstance(a, SWARebuild)]
+    assert [rebuild.node_id for rebuild in rebuilds] == [
+        part.node_id for part in path[1:]
+    ]
+    assert torch.cat([rebuild.source_value for rebuild in rebuilds]).tolist() == [
+        12,
+        13,
+    ]
+    assert result.cache_actions.index(splits[-1]) < result.cache_actions.index(
+        rebuilds[0]
+    )
+
+
+def test_python_fresh_swa_leaf_cap_rejects_write_through_ack():
+    core, _ = _swa_transfer_core("python", window=2)
+    core.set_host_memory_buffer_only()
+    leaf = core._add_new_node(
+        core.root_node, _key([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13])
+    )
+    core.mark_write_through_pending([leaf.id], ack_id=leaf.id)
+    swa = core.components_by_type[ComponentType.SWA]
+    with pytest.raises(
+        AssertionError, match="fresh SWA leaf cannot be write-through-pending"
+    ):
+        swa._maybe_split_leaf_for_swa_lock(leaf, [])
 
 
 def test_write_through_threshold_assignment_reaches_the_core():
@@ -5045,9 +5396,10 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
 
 
 def test_stale_inspection_handles_raise_key_error_or_report_absence():
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
-
     from sglang.srt.mem_cache.unified_cache.components import EvictLayer
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     core = RustUnifiedTreeCoreInspector(
         CacheInitParams(
@@ -5259,3 +5611,72 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
+    binding = mem_cache.RustUnifiedTreeCoreBinding(
+        mem_cache.TreeCoreInitParamsBinding(
+            page_size=1, swa_sliding_window_size=8, enable_hicache=True
+        ),
+        [0, 1],
+    )
+    binding.set_has_swa_host_pool()
+    key = array("q", range(5))
+    prefix = binding.insert(
+        mem_cache.InsertParamsBinding(key=key[:2], value=torch.tensor([10, 11]))
+    ).last_device_node
+    binding.set_component_device_value(prefix, 1, torch.tensor([110, 111]))
+    tail = binding.insert(
+        mem_cache.InsertParamsBinding(
+            key=key, value=torch.arange(10, 15), prev_prefix_len=2
+        )
+    ).last_device_node
+    binding.set_component_device_value(tail, 1, torch.tensor([112, 113, 114]))
+    for node, host in (
+        (prefix, torch.arange(310, 312)),
+        (tail, torch.arange(312, 315)),
+    ):
+        _, transfers = binding.build_backup_spec(node)
+        transfer = transfers[1][0]
+        transfers[1][0] = (transfer[0], transfer[2] + 100, *transfer[2:])
+        binding.mark_write_through_pending([node], node)
+        binding.commit_backup(node, host, transfers)
+        binding.finish_write_through([node], node)
+    binding.demote(tail)
+    binding.demote(prefix)
+
+    kv_transfer, transfers = binding.build_load_back_spec(tail)
+    transfer = transfers[1][0]
+    transfers[1][0] = (*transfer[:2], torch.arange(50, 55), *transfer[3:])
+    actions = binding.commit_load_back(
+        tail, torch.arange(40, 45), kv_transfer, transfers
+    )
+    receipt = binding.inc_lock_ref(tail)
+    assert isinstance(actions, list) and len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, tuple) and len(action) == 3
+    assert action[0] == "rebuild_full_to_swa_mapping"
+    assert isinstance(action[1], list) and isinstance(action[2], list)
+    assert [value.tolist() for value in action[1]] == [[40, 41], [42, 43, 44]]
+    assert [value.tolist() for value in action[2]] == [[50, 51], [52, 53, 54]]
+    binding.dec_lock_ref(
+        tail,
+        mem_cache.DecLockRefParamsBinding(
+            node_id=receipt.node_id,
+            skipped_lock_components=receipt.skipped_lock_components,
+            component_lock_uuids=receipt.component_lock_uuids,
+            component_host_lock_uuids=receipt.component_host_lock_uuids,
+        ),
+    )
+    binding.finish_load_back(tail)
+    binding.sanity_check([], [])
+
+    chunk = action[2][1]
+    storage_ref = chunk.untyped_storage()._weak_ref()
+    try:
+        binding.reset()
+        assert chunk.tolist() == [52, 53, 54]
+        del chunk, action, actions
+        assert torch.UntypedStorage._expired(storage_ref)
+    finally:
+        torch.UntypedStorage._free_weak_ref(storage_ref)

@@ -30,7 +30,7 @@ def _cache():
 
 
 def _call(kv, b, s_q, topk, topk_length, *, extra=None, meta=None):
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention import flash_mla_interface
 
     g = torch.Generator(device="cuda").manual_seed(b * 7 + s_q * 13 + topk)
     q = torch.randn(
@@ -48,10 +48,10 @@ def _call(kv, b, s_q, topk, topk_length, *, extra=None, meta=None):
             extra_indices_in_kvcache=extra_indices,
             extra_topk_length=extra_topk_length,
         )
-    sched = flash_mla.FlashMLASchedMeta()
+    sched = flash_mla_interface.FlashMLASchedMeta()
     if meta is not None:
         sched.tile_scheduler_metadata, sched.num_splits = meta
-    out, lse = flash_mla.flash_mla_with_kvcache(
+    out, lse = flash_mla_interface.flash_mla_with_kvcache(
         q,
         kv,
         None,
@@ -180,7 +180,7 @@ def test_schedule_at_shared_memory_boundary(offset):
     expected = []
     for i in range(parts):
         begin, end = min(i * per_part, b), min((i + 1) * per_part, b)
-        expected.append([begin, end - 1, int(begin == b), 2, 0, 0, 0])
+        expected.append([begin, end - 1, 0, 2, 0, 0, 0])
     torch.testing.assert_close(
         meta[:, DEFINED].cpu(), torch.tensor(expected, dtype=torch.int32)
     )

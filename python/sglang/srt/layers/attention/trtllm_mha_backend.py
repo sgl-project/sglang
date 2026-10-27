@@ -18,15 +18,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import canonicalize_stride
-from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -161,8 +161,8 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
-    # Prefix before trailing one-token requests in an extend-shaped batch.
-    mixed_prefill_reqs: int = 0
+    # Prefix before trailing one-token requests; -1 means there is no decode tail.
+    mixed_prefill_reqs: int = -1
     mixed_prefill_tokens: int = 0
     # fmha_v2 prefill: the (row, column) of each page-table entry the batch
     # reads, in copy order, and the block table over that copy.
@@ -1279,7 +1279,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 prefix = len(lengths)
                 while prefix and lengths[prefix - 1] == 1:
                     prefix -= 1
-                if 0 < prefix < len(lengths):
+                if prefix < len(lengths):
                     metadata.mixed_prefill_reqs = prefix
                     metadata.mixed_prefill_tokens = sum(lengths[:prefix])
             if (
@@ -1927,24 +1927,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out = out.view_as(q)
                 prefix_reqs = self.forward_metadata.mixed_prefill_reqs
                 prefix_tokens = self.forward_metadata.mixed_prefill_tokens
+                # FMHA-v2 platforms (SM90/SM120) never get here, so the FP8 tail
+                # runs on trtllm-gen only and never hands an FP8 Q to XQA.
                 if (
-                    prefix_reqs
-                    and self.data_type in (torch.float16, torch.bfloat16)
+                    prefix_reqs >= 0
+                    and self.data_type
+                    in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
                     and q.dtype == self.data_type
                     and layer.attn_type == AttentionType.DECODER
                 ):
-                    out = torch.empty_like(q) if out is None else out
-                    _trtllm_context_attn(
-                        q[:prefix_tokens],
-                        self.forward_metadata.cu_seqlens_q[: prefix_reqs + 1],
-                        self.forward_metadata.cache_seqlens_int32[:prefix_reqs],
-                        self.forward_metadata.max_seq_len_q,
-                        cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
-                            : prefix_reqs + 1
-                        ],
-                        out=out[:prefix_tokens],
-                        page_table_override=page_table[:prefix_reqs],
-                    )
+                    if out is None:
+                        # FP8 Q/KV still produces attention output in model dtype.
+                        out = torch.empty_like(q, dtype=self.q_data_type)
+                    if prefix_reqs:
+                        _trtllm_context_attn(
+                            q[:prefix_tokens],
+                            self.forward_metadata.cu_seqlens_q[: prefix_reqs + 1],
+                            self.forward_metadata.cache_seqlens_int32[:prefix_reqs],
+                            self.forward_metadata.max_seq_len_q,
+                            cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
+                                : prefix_reqs + 1
+                            ],
+                            out=out[:prefix_tokens],
+                            page_table_override=page_table[:prefix_reqs],
+                        )
                     # Eager DP batches can pad Q without adding requests.
                     tail_end = prefix_tokens + (
                         self.forward_metadata.cache_seqlens_int32.shape[0] - prefix_reqs

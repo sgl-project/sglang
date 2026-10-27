@@ -8,20 +8,20 @@ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.kda import (
     chunk_kda,
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 

@@ -3,7 +3,7 @@ gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -216,6 +216,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "speculative_draft_kv_cache_dtype",
+                    "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
                     "watermark_enforce_all",
@@ -1828,6 +1830,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
         self.assertEqual(_deterministic_sampling_backend(view), {})
+
+    def test_deterministic_rocm_rccl_check(self):
+        """Deterministic ROCm TP above 2 must not fall back to RCCL; CUDA (which
+        disables the custom all-reduce itself) and TP2 (one summation order) are allowed."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_rocm_rccl_check,
+        )
+
+        # (is_hip, deterministic, tp_size, disable_custom_all_reduce, raises)
+        for is_hip, det, tp, disable, raises in [
+            (True, True, 4, True, True),
+            (False, True, 8, True, False),
+            (True, True, 2, True, False),
+            (True, False, 8, True, False),
+            (True, True, 8, False, False),
+        ]:
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=det,
+                    tp_size=tp,
+                    disable_custom_all_reduce=disable,
+                )
+            )
+            with (
+                self.subTest(is_hip=is_hip, det=det, tp=tp, disable=disable),
+                override_platform(is_cuda=not is_hip, is_hip=is_hip),
+            ):
+                if raises:
+                    self.assertRaises(ValueError, _deterministic_rocm_rccl_check, view)
+                else:
+                    self.assertEqual(_deterministic_rocm_rccl_check(view), {})
 
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
