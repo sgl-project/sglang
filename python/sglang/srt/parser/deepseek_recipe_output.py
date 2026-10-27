@@ -11,6 +11,8 @@ from typing import Any, Optional
 import msgspec
 
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    THINK_END_TOKEN,
+    THINK_START_TOKEN,
     DeepSeekRecipe,
     load_deepseek_recipe,
 )
@@ -220,3 +222,28 @@ class DeepSeekRecipeOutputParser:
                 )
             )
         return delta
+
+
+def parse_output_text(
+    deepseek_recipe: DeepSeekRecipe,
+    text: str,
+    *,
+    parse_tool_calls: bool,
+    thinking: Optional[bool] = None,
+) -> RecipeOutputDelta:
+    """`text` parsed as a whole output; the markers it spells count as the tokens
+    the model would have sampled. With `thinking` None, text that opens with
+    `<think>` or closes a thinking block is reasoning up to `</think>`."""
+    tokenizer = deepseek_recipe.hf_tokenizer
+    output_ids = tokenizer.encode(text, add_special_tokens=False).ids
+    if thinking is None:
+        thinking = output_ids[:1] == [tokenizer.token_to_id(THINK_START_TOKEN)]
+        if thinking:
+            output_ids = output_ids[1:]
+        thinking = thinking or tokenizer.token_to_id(THINK_END_TOKEN) in output_ids
+    parser = DeepSeekRecipeOutputParser(
+        deepseek_recipe,
+        thinking_stage=deepseek_recipe.parse_start(thinking=thinking),
+        parse_tool_calls=parse_tool_calls,
+    )
+    return parser.finish(output_ids, {"type": "stop"})

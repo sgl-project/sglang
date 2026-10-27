@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
+        Tool,
         ToolCall,
     )
     from sglang.srt.function_call.core_types import ToolCallItem
@@ -104,6 +105,46 @@ class ChatEncodingAdapter(Protocol):
         encoding that collects media itself appends the prompt's images to
         ``image_data`` in placeholder order."""
         ...
+
+
+class NativeTextParser(Protocol):
+    """The native /separate_reasoning and /parse_function_call endpoints, for a
+    parser whose output the served adapter parses."""
+
+    def separate_reasoning_text(self, text: str) -> tuple[str, str]: ...
+
+    def parse_function_call_text(
+        self, text: str, tools: list[Tool]
+    ) -> tuple[str, list[ToolCallItem]]: ...
+
+
+# The reasoning and tool-call parser names whose output the spec's adapter parses.
+ADAPTER_OUTPUT_PARSERS: dict[str, tuple[str, str]] = {
+    "dsv4": ("deepseek-v4", "deepseekv4"),
+    "dsv41": ("deepseek-v41", "deepseekv41"),
+}
+
+
+def native_text_parser(
+    parser_name: Optional[str],
+    *,
+    chat_encoding_spec: Optional[str],
+    adapter: Optional[ChatEncodingAdapter],
+) -> Optional[NativeTextParser]:
+    """The served adapter when it parses `parser_name` output; None for the text
+    parsers. A parser whose adapter is not served raises ValueError: the adapter
+    parses with the served checkpoint's tokenizer."""
+    owners = [
+        spec for spec, names in ADAPTER_OUTPUT_PARSERS.items() if parser_name in names
+    ]
+    if not owners:
+        return None
+    if adapter is None or chat_encoding_spec not in owners:
+        raise ValueError(
+            f"{parser_name!r} output is parsed with its model's tokenizer; this "
+            "server does not serve that model"
+        )
+    return adapter
 
 
 def select_new_output_ids(

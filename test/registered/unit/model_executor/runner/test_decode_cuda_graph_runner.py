@@ -39,7 +39,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
@@ -368,6 +368,73 @@ class TestOriginalTraceExport(CustomTestCase):
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
                 )
+
+
+class TestAttentionVariantSizes(CustomTestCase):
+    """Variants captured only at some batch sizes, such as a megakernel's where its
+    step runs, are captured and replayed by label there and once elsewhere."""
+
+    def test_each_label_is_captured_and_replayed_only_at_its_batch_sizes(self):
+        import contextlib
+
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+
+        variants = SimpleNamespace(
+            capture_labels=("short", "long"),
+            select=lambda fb: (
+                "long" if fb.attention_kv_len_lower_bound >= 8 else "short"
+            ),
+        )
+        both = [("short", "short"), ("long", "long")]
+        for sizes, captures, replays in (
+            # the megakernel runs bs 1 only: one graph at bs 4 and 2, both labels at 1
+            (
+                frozenset({1}),
+                {4: [(None, None)], 2: [(None, None)], 1: both},
+                {1: "long", 2: None},
+            ),
+            # unrestricted (the DSA and candidate variants): every label everywhere
+            (None, {4: both, 2: both, 1: both}, {1: "long", 2: "long"}),
+        ):
+            with self.subTest(sizes=sizes):
+                runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+                runner.capture_bs, runner.compile_bs = [1, 2, 4], []
+                runner.captured_req_width, runner.record_nolora_graph = 7, False
+                runner.model_runner = SimpleNamespace(
+                    model=None, device="cpu", gpu_id=0
+                )
+                runner.attention_graph_variants = variants
+                runner.attention_variant_sizes = sizes
+                captured = {}
+
+                def capture_one_shape(bs, forward, stream_idx, lora, label):
+                    # the label a capture runs under, and what the model reads
+                    seen = (label, get_capture_attention_variant())
+                    captured.setdefault(bs, []).append(seen)
+
+                runner.capture_one_shape = capture_one_shape
+                with (
+                    mock.patch.object(
+                        mod,
+                        "get_parallel",
+                        return_value=SimpleNamespace(tp_rank=1, tp_group=None),
+                    ),
+                    mock.patch.object(mod, "get_available_gpu_memory", return_value=0),
+                    mock.patch.object(
+                        mod.torch_compile_decoration,
+                        "patch_model",
+                        side_effect=lambda *a, **k: contextlib.nullcontext(),
+                    ),
+                ):
+                    runner._capture_one_stream()
+                self.assertEqual(captured, captures)
+                self.assertIsNone(get_capture_attention_variant())
+                long_batch = SimpleNamespace(attention_kv_len_lower_bound=8)
+                for bs, label in replays.items():
+                    replayed = runner._resolve_attention_variant(long_batch, bs)
+                    self.assertEqual(replayed, label, bs)
 
 
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):

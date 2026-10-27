@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -44,6 +45,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -64,6 +66,9 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_parent,
     node_token_ids,
     write_backup,
+)
+from sglang.test.kits.unified_radix_cache.kv_events import (
+    UnifiedRadixCacheKVEventsFixtures,
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.kits.unified_radix_cache.storage import (
@@ -179,6 +184,64 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             )
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
+
+    def test_decode_restore_rematch_covers_bigram_prefix(self):
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            DecodePrefixMatch,
+            HiCacheRestoreResult,
+        )
+        from sglang.srt.mem_cache.common import match_kv_cache
+
+        cache, allocator, pool = build_fixture(self.cfg)
+        UnifiedRadixCacheKVEventsFixtures._init_hicache(self, cache)
+        stored = array("q", range(1, 18))
+        value = allocator.alloc(len(stored) - 1)
+        cache.insert(InsertParams(key=RadixKey(stored), value=value))
+        leaf = cache.match_prefix(MatchPrefixParams(key=RadixKey(stored)))
+        UnifiedRadixCacheKVEventsFixtures._backup_node(
+            self, cache, leaf.last_device_node
+        )
+        cache.evict(EvictParams(num_tokens=len(stored) - 1))
+
+        req = Req(
+            rid="decode-eagle-restore",
+            origin_input_text="",
+            origin_input_ids=stored + array("q", range(100, 104)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([req])
+        first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
+        self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
+        req.lock = cache.lock(first.last_device_node)
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=cache.prefix_device_indices(req),
+                l2_host_hit_length=first.host_hit_length,
+                l3_storage_hit_length=0,
+                last_device_node=first.last_device_node,
+            ),
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+
+        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+            SimpleNamespace(tree_cache=cache), decode_req
+        )
+
+        self.assertTrue(queued)
+        self.assertEqual(
+            decode_req.hicache_restore_status, HiCacheRestoreResult.PENDING
+        )
+        self.assertEqual(len(decode_req.hicache_restored_kv_indices), 16)
+        cache.ready_to_load_host_cache()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
+        cache.loading_check()
+        cache.unlock(decode_req.hicache_restore_lock)
+        cache.unlock(req.lock)
+        cache.sanity_check()
 
     def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
         cache, allocator, _ = self._build_buffer_hicache_fixture(
