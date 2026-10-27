@@ -1,8 +1,9 @@
 """Reuse page_unified L3 objects across independent TP/CP server instances.
 
 Run with four CUDA GPUs. SGLANG_TEST_PAGE_UNIFIED_MODEL can point at a local
-Qwen3-0.6B checkpoint. Each pair keeps its attention-TP size and PP layer ranges
-fixed: the file backend stores one chunk per page and cannot reshape chunks.
+Qwen3-0.6B checkpoint. These smoke cases keep attention-TP and PP layer ranges
+fixed to exercise CP writer election. For TP/PP reshaping accuracy, see
+test_page_unified_qwen3_30b_accuracy.py.
 GLM-5.2's indexer sidecar and DeepSeek-V4's composite pools are not supported by
 the unified storage key scheme yet.
 """

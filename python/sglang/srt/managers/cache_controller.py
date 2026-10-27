@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    UnifiedKVPlan,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
@@ -805,7 +806,18 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
         model_name = storage_model_name(model_name, self.storage_host_pool)
-        unified_suffixes = self._build_unified_suffixes(model_name, attn_cp_size)
+        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
+        unified_chunk_spans = None
+        if unified_plan is not None:
+            # Keys are layer-major/head-minor; the physical page is head-major.
+            # Keep each key paired with its byte span instead of slicing pages
+            # consecutively in key order.
+            layout = self.storage_host_pool.page_unified_layout
+            unified_chunk_spans = [
+                layout.chunk_span(layer_range, head_group)
+                for layer_range in unified_plan.layer_ranges
+                for head_group in range(unified_plan.head_group_num)
+            ]
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -823,16 +835,17 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
-            unified_suffixes=unified_suffixes,
+            unified_suffixes=(unified_plan.suffixes if unified_plan else None),
+            unified_chunk_spans=unified_chunk_spans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
         )
 
-    def _build_unified_suffixes(
+    def _build_unified_plan(
         self, model_name: Optional[str], attn_cp_size: int
-    ) -> Optional[List[str]]:
-        """This rank's topology-free chunk coordinates, or None for rank-suffix keys."""
+    ) -> Optional[UnifiedKVPlan]:
+        """Pair topology-free chunk coordinates with local page ranges."""
         memory = get_memory()
         if memory.hicache_storage_key_scheme != "unified":
             return None
@@ -894,7 +907,7 @@ class HiCacheController:
             namespace_digest(plan.namespace),
             plan.suffixes,
         )
-        return plan.suffixes
+        return plan
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any

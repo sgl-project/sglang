@@ -183,9 +183,9 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=parallel,
             ),
         ):
-            return controller._build_unified_suffixes(
+            return controller._build_unified_plan(
                 "org/model", attn_cp_size=attn_cp_size
-            )
+            ).suffixes
 
     def test_anchor_dtype_and_attention_topology_define_mha_keys(self):
         namespace = derive_namespace(
@@ -343,13 +343,100 @@ class TestControllerUnifiedKeys(CustomTestCase):
             ),
             patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
             patch.object(
-                controller, "_build_unified_suffixes", return_value=["shared"]
+                controller,
+                "_build_unified_plan",
+                return_value=SimpleNamespace(
+                    suffixes=["shared"], layer_ranges=[(0, 4)], head_group_num=1
+                ),
             ),
         ):
             config = controller._generate_storage_config("org/model")
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
         self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (1, 2))
         self.assertTrue(config.is_mla_model)
+
+    def test_config_pairs_grid_keys_with_physical_page_spans(self):
+        # MHA key order alternates head groups, while each group's layers are
+        # contiguous in memory. Include a short final PP layer chunk.
+        cases = (
+            (False, 4, [(0, 16384), (32768, 16384), (16384, 16384), (49152, 16384)]),
+            (False, 3, [(0, 16384), (24576, 16384), (16384, 8192), (40960, 8192)]),
+            (True, 4, [(0, 4096), (4096, 4096)]),
+            (True, 3, [(0, 4096), (4096, 2048)]),
+        )
+        for mla, layer_num, expected_spans in cases:
+            with self.subTest(mla=mla, layer_num=layer_num):
+                controller = self._controller(mla=mla, grouped=False)
+                host_pool = controller.storage_host_pool
+                host_pool.layout = "page_unified"
+                host_pool.storage_format_tag = None
+                host_pool.layer_num = layer_num
+                host_pool.end_layer = 4 + layer_num
+                host_pool.head_group_num = 1 if mla else 2
+                host_pool.page_unified_layout = PageUnifiedLayout(
+                    page_size=16,
+                    layer_num=layer_num,
+                    head_num=1 if mla else 4,
+                    head_group_num=1 if mla else 2,
+                    head_dim=128,
+                    itemsize=1,
+                    is_mla=mla,
+                )
+                controller.enable_storage_metrics = False
+                parallel = SimpleNamespace(
+                    tp_rank=1,
+                    tp_size=2,
+                    attn_tp_rank=1,
+                    attn_tp_size=2,
+                    attn_dcp_size=1,
+                    attn_dcp_rank=0,
+                    pp_rank=1,
+                    pp_size=2,
+                )
+                memory = SimpleNamespace(
+                    hicache_storage_key_scheme="unified",
+                    hicache_storage_head_partition=2,
+                    hicache_storage_layer_partition=2,
+                )
+                with (
+                    patch(
+                        "sglang.srt.managers.cache_controller.get_memory",
+                        return_value=memory,
+                    ),
+                    patch(
+                        "sglang.srt.managers.cache_controller.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch(
+                        "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        controller, "get_attn_cp_rank_and_size", return_value=(0, 1)
+                    ),
+                ):
+                    config = controller._generate_storage_config("org/model")
+
+                namespace = derive_namespace(
+                    model_id="org/model",
+                    dtype="float8_e4m3fn",
+                    page_size=16,
+                    rank_replicated=mla,
+                    total_kv_heads=0 if mla else 8,
+                    head_group=0 if mla else 2,
+                    layer_partition=2,
+                )
+                digest = namespace_digest(namespace)
+                head_suffixes = ("",) if mla else ("_H2", "_H3")
+                self.assertEqual(
+                    config.unified_suffixes,
+                    [
+                        f"{digest}_{layers}{heads}"
+                        for layers in ("L4-6", f"L6-{4 + layer_num}")
+                        for heads in head_suffixes
+                    ],
+                )
+                self.assertEqual(config.unified_chunk_spans, expected_spans)
 
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
@@ -463,10 +550,10 @@ class TestFileBackendUnifiedKeys(CustomTestCase):
         HiCacheFile._init_config_suffix(backend, self._config(None))
         self.assertEqual(backend.config_suffix, "_org-model_1_4")
 
-    def test_multi_chunk_grid_is_refused(self):
-        """One object per page here, so a fan-out would store only one chunk."""
+    def test_multi_chunk_grid_requires_byte_spans(self):
+        """Coordinates alone cannot identify a chunk's position in a page."""
         backend = HiCacheFile.__new__(HiCacheFile)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(ValueError):
             HiCacheFile._init_config_suffix(backend, self._config(["a", "b"]))
 
 
