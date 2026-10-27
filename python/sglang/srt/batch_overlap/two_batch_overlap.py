@@ -728,6 +728,7 @@ class TboForwardBatchPreparer:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
+            "extend_prompt_rest_lens_cpu",
             "lora_ids",
             "rids",
         ]:

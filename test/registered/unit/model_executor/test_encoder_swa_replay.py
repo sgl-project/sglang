@@ -294,6 +294,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             positions=fx.folded_positions(),
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_logprob=False,
+            extend_prompt_rest_lens_cpu=None,
         )
         with (
             patch.object(DSV4AttnMetadata, "init_compression_metadata"),
