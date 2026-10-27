@@ -75,9 +75,6 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      require-label: run-ci-xeon
     secrets: inherit
 
   build-test:

@@ -123,9 +123,6 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      require-label: run-ci-xpu
     secrets: inherit
 
   # Runs the entire per-commit XPU test suite in one job (single install, single queue).

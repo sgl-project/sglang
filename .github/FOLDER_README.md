@@ -12,19 +12,25 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/run-ci` (and base aliases), `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
-| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/run-ci` (and base aliases), `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
+| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
-`/run-<tier>-ci`, `/run-ci <tier>`, and `/run-extra-ci <hardware>` require both label and rerun permissions. `/tag-and-rerun-ci`, the no-argument forms of `/run-ci`, `/run-base-ci`, and `/rerun-base-ci`, and `/run-full-ci` check each step independently: a user who can only retry, including the PR author, may retry existing workflows but cannot add labels.
+`/run-ci`, `/run-base-ci`, and `/rerun-base-ci` with no argument are aliases of
+`/tag-and-rerun-ci`: labeling and retrying each use their existing permission
+checks. With one registered tier argument, they are aliases of `/run-<tier>-ci`
+and require both permissions. For example, `/run-ci extra` equals `/run-extra-ci`.
+Use `/run-ci nv` (or `/run-nv-ci`) for NVIDIA base and shared checks only.
+The `nv` entry has `label: null`, so it adds only `run-ci` and changes only the
+immediate rerun selection. Existing hardware labels are kept; future pushes follow the existing workflow gates.
+Legacy `/tag-and-rerun-ci <tier>` still retries broadly; its arguments add labels.
 
-With no arguments, `/run-ci`, `/run-base-ci`, and `/rerun-base-ci` are aliases of `/tag-and-rerun-ci`: they add `run-ci` when permitted and retry unsuccessful NVIDIA base workflows and shared checks such as lint and router tests. With one registered tier argument, each instead labels and reruns only that tier, including successful runs: `/run-ci amd` equals `/run-amd-ci`. `/run-ci extra` remains an alias of `/run-extra-ci` for NVIDIA extra, and `/run-ci amd-extra` remains an alias of `/run-amd-extra-ci`.
-
-`/run-extra-ci` selects NVIDIA extra with no arguments. With one hardware argument, it selects that hardware's registered extra tier: `/run-extra-ci amd` equals `/run-amd-extra-ci`. `/rerun-extra-ci amd` is equivalent too. For extra coverage, use the structured `/run-extra-ci amd` spelling; existing `/run-amd-extra-ci`, `/run-ci amd-extra`, and base-alias forms remain equivalent. Base commands and `/run-extra-ci` accept at most one argument; fully specified tier commands such as `/run-amd-extra-ci` accept none. An unregistered extra tier, such as `npu-extra`, is rejected without adding labels or rerunning workflows.
-
-`/tag-and-rerun-ci <tiers>` and `/run-full-ci <tiers>` retain their broader unsuccessful-run retry scope: NVIDIA base, shared checks, and all named tiers. `/run-full-ci` always includes NVIDIA extra. Default `/rerun-failed-ci` retries NVIDIA base and extra plus shared checks without adding labels; its tier arguments select NVIDIA base, shared checks, and the named tiers instead.
-
-Opt-in tiers in `scripts/ci/opt_in_ci_tiers.json` are `extra` (NVIDIA extra), `amd` (AMD base), `amd-extra` (AMD extra), `npu`, `xpu`, `musa`, `mlx`, `xeon`, and `arm64`. Their labels are independent; `extra` does not enable extra coverage on other hardware. Existing labels never expand a command's selection. Equivalent tier spellings require a registered tier; MLU and PPU remain outside this registry.
+`/run-extra-ci <hardware>` (also `/rerun-extra-ci <hardware>`) selects the
+`<hardware>-extra` tier only when it is registered. Otherwise, the existing
+ignored-suffix behavior is preserved. The registry contains `extra`, covering
+both NVIDIA and AMD extra workflows, and `nv`, selecting NVIDIA base/shared checks.
+The shared `extra` tier keeps `run-ci-extra`; separate hardware extra tiers are
+left for a follow-up. Other hardware-specific selections are not yet registered.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

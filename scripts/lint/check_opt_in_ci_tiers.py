@@ -5,6 +5,8 @@ The slash command handler labels a PR and re-runs exactly the workflows listed
 for a tier. A workflow that gates on a tier label but is missing from the list
 is never re-run by /run-<tier>-ci; a listed workflow that gates on another
 label, or re-fires on `labeled`, cannot be recovered by a rerun.
+A null label is a selection of existing workflows with no extra opt-in gate;
+those workflows retain their existing event and path conditions.
 """
 
 import glob
@@ -17,7 +19,7 @@ import yaml
 TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
 # Tier names become `/run-<tier>-ci`; these spellings are taken by other commands.
-RESERVED_TIER_NAMES = {"cpu", "failed", "full"}
+RESERVED_TIER_NAMES = {"base", "cpu", "failed", "full"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
@@ -58,7 +60,7 @@ def main() -> int:
         listed = tier["workflows"]
         if not _TIER_NAME.match(name) or name in RESERVED_TIER_NAMES:
             errors.append(f"tier `{name}`: invalid or reserved tier name")
-        if label != f"run-ci-{name}":
+        if label is not None and label != f"run-ci-{name}":
             errors.append(
                 f"tier `{name}`: label must be `run-ci-{name}`, got `{label}`"
             )
@@ -68,6 +70,13 @@ def main() -> int:
         for path in listed:
             if path not in workflows:
                 errors.append(f"tier `{name}`: {path} does not exist")
+                continue
+            if label is None:
+                if gate_labels(workflows[path]):
+                    errors.append(
+                        f"tier `{name}`: {path} requires an opt-in label, "
+                        "but the selection has label: null"
+                    )
                 continue
             if label not in gate_labels(workflows[path]):
                 errors.append(

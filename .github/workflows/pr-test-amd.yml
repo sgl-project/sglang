@@ -152,14 +152,9 @@ concurrency:
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # PRs opt into AMD independently of the default NVIDIA base workflow.
-  # The reusable gate reads live labels; scheduled/manual runs bypass labels.
   call-gate:
     if: github.event_name != 'schedule'
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      require-label: run-ci-amd
     secrets: inherit
   check-changes:
     needs: [call-gate]
@@ -258,7 +253,7 @@ jobs:
   # Chain the label-gated AMD extra tier into the scheduled run, mirroring
   # pr-test.yml's `call-pr-test-extra`. On `schedule` (and run_all_tests
   # dispatch) the extra suite runs on `main` without needing the
-  # `run-ci-amd-extra` label (pr-gate.yml only enforces labels on pull_request
+  # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
   # events). Targeted stage dispatches (target_stage set) are excluded.
   # Not added to `pr-test-amd-finish` so the base AMD gate never depends on
   # the opt-in extra suite.
