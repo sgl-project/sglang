@@ -28,6 +28,7 @@ from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -6080,6 +6081,99 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestInternlmDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_weather",
+                    description="Get the current weather in a given location",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_stock_price",
+                    description="Get current stock price for a symbol",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                        },
+                        "required": ["symbol"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = InternlmDetector()
+
+    def test_detect_and_parse_multiple_tool_calls(self):
+        text = (
+            "I will check both the weather and stock price.<|action_start|> <|plugin|>\n"
+            '{"name": "get_current_weather", "parameters": {"location": "San Francisco, CA"}}<|action_end|>\n'
+            "<|action_start|> <|plugin|>\n"
+            '{"name": "get_stock_price", "parameters": {"symbol": "AAPL"}}<|action_end|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            result.normal_text, "I will check both the weather and stock price."
+        )
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters)["location"], "San Francisco, CA"
+        )
+        self.assertEqual(result.calls[1].name, "get_stock_price")
+        self.assertEqual(json.loads(result.calls[1].parameters)["symbol"], "AAPL")
+
+    def test_streaming_multiple_tool_calls_chunk_by_chunk(self):
+        text = (
+            "Checking data for you.<|action_start|> <|plugin|>\n"
+            '{"name": "get_current_weather", "parameters": {"location": "Tokyo"}}<|action_end|>\n'
+            "<|action_start|> <|plugin|>\n"
+            '{"name": "get_stock_price", "parameters": {"symbol": "NVDA"}}<|action_end|>'
+        )
+        for chunk_size in [1, 2, 4, 7, 16, len(text)]:
+            detector = InternlmDetector()
+            calls = []
+            normal_text = ""
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i : i + chunk_size]
+                res = detector.parse_streaming_increment(chunk, self.tools)
+                if res.normal_text:
+                    normal_text += res.normal_text
+                if res.calls:
+                    calls.extend(res.calls)
+
+            self.assertEqual(normal_text, "Checking data for you.")
+            self.assertEqual(len(calls), 2, f"Failed for chunk_size={chunk_size}")
+            self.assertEqual(calls[0].tool_index, 0)
+            self.assertEqual(calls[0].name, "get_current_weather")
+            self.assertEqual(calls[1].tool_index, 1)
+            self.assertEqual(calls[1].name, "get_stock_price")
+
+    def test_streaming_no_tool_calls(self):
+        detector = InternlmDetector()
+        res = detector.parse_streaming_increment("Just a normal response.", self.tools)
+        self.assertEqual(res.normal_text, "Just a normal response.")
+        self.assertEqual(len(res.calls), 0)
 
 
 class TestToolCallParserNames(unittest.TestCase):
