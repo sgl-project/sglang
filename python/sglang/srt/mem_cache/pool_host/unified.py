@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import heapq
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -234,17 +235,17 @@ class _SharedPageEnvelopeHostBacking:
             return []
         remaining = page_count
         pages = []
-        new_extents = []
-        for start, end in extents:
+        for idx, (start, end) in enumerate(extents):
             capacity = end - start
             take = min(remaining, capacity)
             pages.extend(range(start, start + take))
-            if start + take < end:
-                new_extents.append((start + take, end))
             remaining -= take
-        if remaining == 0:
-            extents[:] = new_extents
-            return pages
+            if remaining == 0:
+                if start + take < end:
+                    extents[: idx + 1] = [(start + take, end)]
+                else:
+                    del extents[: idx + 1]
+                return pages
 
         return None
 
@@ -267,14 +268,20 @@ class _SharedPageEnvelopeHostBacking:
         return request_page_counts, page_counts
 
     @staticmethod
-    def _merge_extents(extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    def _merge_sorted_extents(
+        extents: Iterable[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
         merged = []
-        for start, end in sorted(extents):
+        for start, end in extents:
             if merged and start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], end))
             else:
                 merged.append((start, end))
         return merged
+
+    @classmethod
+    def _merge_extents(cls, extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        return cls._merge_sorted_extents(sorted(extents))
 
     @staticmethod
     def _logical_free_page_count(side: _Side) -> int:
@@ -432,10 +439,19 @@ class _SharedPageEnvelopeHostBacking:
             self._finish_compaction()
 
     def _take_physical_pages(self, side: _Side, page_count: int) -> list[int]:
+        if page_count == 0:
+            return []
         reverse = side.grow_direction == "down"
-        holes = sorted(side.free_physical_pages, reverse=reverse)
-        pages = holes[:page_count]
-        side.free_physical_pages.difference_update(pages)
+        hole_count = len(side.free_physical_pages)
+        if hole_count == 0:
+            pages = []
+        elif page_count >= hole_count:
+            pages = sorted(side.free_physical_pages, reverse=reverse)
+            side.free_physical_pages.clear()
+        else:
+            select = heapq.nlargest if reverse else heapq.nsmallest
+            pages = select(page_count, side.free_physical_pages)
+            side.free_physical_pages.difference_update(pages)
         remaining = page_count - len(pages)
         if remaining == 0:
             return pages
@@ -612,11 +628,9 @@ class _SharedPageEnvelopeHostBacking:
                 physical_page = side.logical_to_physical.pop(logical_page)
                 del side.physical_to_logical[physical_page]
                 side.free_physical_pages.add(physical_page)
-            side.free_logical_extents = self._merge_extents(
-                [
-                    *side.free_logical_extents,
-                    *((page, page + 1) for page in logical_pages),
-                ]
+            freed_extents = ((page, page + 1) for page in sorted(logical_pages))
+            side.free_logical_extents = self._merge_sorted_extents(
+                heapq.merge(side.free_logical_extents, freed_extents)
             )
             self._release_center_holes(side)
             return len(indices)
