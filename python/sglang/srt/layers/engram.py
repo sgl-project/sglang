@@ -51,6 +51,12 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -682,18 +688,20 @@ def _registered_device_ptr(host_ptr: int) -> int:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
+    """Host-memory backing for one engram table: one shard per rank, or with
+    replication per_node one whole table shared by the TP group.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group):
-        self.layout = layout
+    def __init__(self, replication: str, nbytes: int, name: str, group):
+        self.replication = replication
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
+        per_node = replication == EngramReplication.PER_NODE
+        if per_node:
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
                 self.fd,
@@ -712,12 +720,12 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "per_rank":
+        if not per_node:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == "shared":
+        if per_node:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
@@ -769,10 +777,11 @@ class _HostTable:
         if not self.dirty:
             return
         self.dirty = False
-        if self.layout == "shared":
+        per_node = self.replication == EngramReplication.PER_NODE
+        if per_node:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if not per_node and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -780,12 +789,12 @@ class _HostTable:
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
-            f"engram host table {label}: layout={self.layout}, "
+            f"engram host table {label}: replication={self.replication}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+            knob = "shmem_enabled" if per_node else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -999,15 +1008,14 @@ class EngramEmbedding(nn.Module):
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
         # Resolved by server args (_resolve_engram_config); None before that.
-        config = get_exec().offload.engram_config or {}
-        if config.get("lookup") == "peer_read" and self.tp_size > 1:
+        config = get_exec().offload.engram_config or EngramConfig()
+        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
-        elif config.get("placement") == "cpu":
-            layout = "shared" if config["replication"] == "per_node" else "per_rank"
-            self._init_host_table(num_embeddings, dim, layer_id, layout)
+        elif config.placement == EngramPlacement.CPU:
+            self._init_host_table(num_embeddings, dim, layer_id, config.replication)
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -1023,13 +1031,14 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(
-        self, num_embeddings: int, dim: int, layer_id: int, layout: str
+        self, num_embeddings: int, dim: int, layer_id: int, replication: str
     ):
-        n = num_embeddings if layout == "shared" else self.rows
+        per_node = replication == EngramReplication.PER_NODE
+        n = num_embeddings if per_node else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         self.host_table = _HostTable(
-            layout,
+            replication,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
@@ -1045,7 +1054,10 @@ class EngramEmbedding(nn.Module):
 
     @property
     def _shared(self) -> bool:
-        return self.host_table is not None and self.host_table.layout == "shared"
+        return (
+            self.host_table is not None
+            and self.host_table.replication == EngramReplication.PER_NODE
+        )
 
     @property
     def shared_host_table_without_ats(self) -> bool:
