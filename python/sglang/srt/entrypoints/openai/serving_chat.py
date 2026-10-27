@@ -45,7 +45,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -104,6 +104,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
+    check_json_schema,
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
@@ -1168,7 +1169,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                check_json_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:

@@ -2,10 +2,15 @@
 
 import json
 import unittest
+from unittest import mock
 
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.function_call.utils import normalize_json_schema_types
+from sglang.srt.function_call.utils import (
+    _check_json_schema_cached,
+    check_json_schema,
+    normalize_json_schema_types,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -403,6 +408,69 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertIs(schema["additionalProperties"], True)
         self.assertIs(schema["unevaluatedProperties"], False)
         self._assert_accepts(schema)
+
+
+class TestCheckJsonSchemaCached(CustomTestCase):
+    def setUp(self):
+        _check_json_schema_cached.cache_clear()
+        self.addCleanup(_check_json_schema_cached.cache_clear)
+
+    def test_repeated_schema_validates_once(self):
+        with mock.patch.object(
+            Draft202012Validator,
+            "check_schema",
+            wraps=Draft202012Validator.check_schema,
+        ) as check_schema:
+            check_json_schema(
+                {"type": "object", "properties": {"a": {"type": "string"}}}
+            )
+            check_json_schema(
+                {"properties": {"a": {"type": "string"}}, "type": "object"}
+            )
+        self.assertEqual(check_schema.call_count, 1)
+
+    def test_invalid_schema_raises(self):
+        with self.assertRaises(SchemaError):
+            check_json_schema({"type": "not-a-type"})
+
+    def test_unserializable_schema_preserves_validation(self):
+        for schema in (
+            {"minimum": 2**80},
+            {"description": "\ud800"},
+            {"default": {1: "value"}},
+        ):
+            with self.subTest(schema=schema):
+                Draft202012Validator.check_schema(schema)
+                check_json_schema(schema)
+        for schema in ({"type": 2**80}, {"required": {"name"}}):
+            with self.subTest(schema=schema):
+                with self.assertRaises(SchemaError):
+                    check_json_schema(schema)
+
+    def test_lossy_serialization_preserves_validation(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            schema = {"minimum": value}
+            with self.subTest(schema=schema):
+                Draft202012Validator.check_schema(schema)
+                check_json_schema(schema)
+        check_json_schema({"required": ["name"]})
+        with self.assertRaises(SchemaError):
+            check_json_schema({"required": ("name",)})
+
+    def test_large_schema_is_not_retained(self):
+        schema = {"type": "object", "description": "x" * (64 * 1024)}
+        check_json_schema(schema)
+        self.assertEqual(_check_json_schema_cached.cache_info().currsize, 0)
+        schema["type"] = "not-a-type"
+        with self.assertRaises(SchemaError):
+            check_json_schema(schema)
+
+    def test_mutated_schema_is_revalidated(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        check_json_schema(schema)
+        schema["properties"]["a"]["type"] = "not-a-type"
+        with self.assertRaises(SchemaError):
+            check_json_schema(schema)
 
 
 if __name__ == "__main__":
