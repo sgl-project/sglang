@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream.layout import (
     create_layout_reference_images,
     load_layout_bboxes,
@@ -24,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream.prompt_enhance import (
     enhance_prompt,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -35,14 +35,48 @@ CONDITION_IMAGE_SIZE = 384
 NOISE_SCALE = 8.0
 
 PREDEFINED_RESOLUTIONS = [
-    (2048, 2048), (2304, 1728), (1728, 2304), (2560, 1440), (1440, 2560),
-    (2496, 1664), (1664, 2496), (3104, 1312), (1312, 3104), (2304, 1792),
+    (2048, 2048),
+    (2304, 1728),
+    (1728, 2304),
+    (2560, 1440),
+    (1440, 2560),
+    (2496, 1664),
+    (1664, 2496),
+    (3104, 1312),
+    (1312, 3104),
+    (2304, 1792),
     (1792, 2304),
 ]
 
 DEFAULT_TIMESTEPS = [
-    999, 987, 974, 960, 945, 929, 913, 895, 877, 857, 836, 814, 790, 764,
-    737, 707, 675, 640, 602, 560, 515, 464, 409, 347, 278, 199, 110, 8,
+    999,
+    987,
+    974,
+    960,
+    945,
+    929,
+    913,
+    895,
+    877,
+    857,
+    836,
+    814,
+    790,
+    764,
+    737,
+    707,
+    675,
+    640,
+    602,
+    560,
+    515,
+    464,
+    409,
+    347,
+    278,
+    199,
+    110,
+    8,
 ]
 
 
@@ -59,9 +93,12 @@ class FlowMatchScheduler:
         sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
         timesteps = sigmas * 1000
         sigmas_full = np.concatenate([sigmas, [0.0]]).astype(np.float32)
-        self.sigmas = torch.from_numpy(sigmas_full).to(device=device, dtype=torch.float32)
+        self.sigmas = torch.from_numpy(sigmas_full).to(
+            device=device, dtype=torch.float32
+        )
         self.timesteps = torch.from_numpy(timesteps.astype(np.int64)).to(
-            device=device, dtype=torch.long)
+            device=device, dtype=torch.long
+        )
 
     def set_timesteps_list(self, timesteps_list, device: torch.device):
         timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.long)
@@ -70,10 +107,13 @@ class FlowMatchScheduler:
         self.sigmas = torch.tensor(sigmas, device=device, dtype=torch.float32)
         self.timesteps = timesteps
 
-    def step(self, model_output: torch.Tensor, timestep: torch.Tensor,
-             sample: torch.Tensor) -> torch.Tensor:
+    def step(
+        self, model_output: torch.Tensor, timestep: torch.Tensor, sample: torch.Tensor
+    ) -> torch.Tensor:
         """Euler step: z_next = z + dt * model_output."""
-        step_idx = (self.timesteps == timestep.long()).nonzero(as_tuple=True)[0][0].item()
+        step_idx = (
+            (self.timesteps == timestep.long()).nonzero(as_tuple=True)[0][0].item()
+        )
         sigma = self.sigmas[step_idx]
         sigma_next = self.sigmas[step_idx + 1]
         dt = sigma_next - sigma
@@ -86,10 +126,12 @@ class FlashFlowMatchScheduler:
     def __init__(self):
         self.timesteps = None
         self.sigmas = None
+        self._step_index = None
         self.num_inference_steps = None
 
-    def set_timesteps(self, num_inference_steps: int, shift: float,
-                      device: torch.device):
+    def set_timesteps(
+        self, num_inference_steps: int, shift: float, device: torch.device
+    ):
         base_min = 1.0 / 1000
         sigma_min = shift * base_min / (1 + (shift - 1) * base_min)
         sigma_max = 1.0
@@ -99,10 +141,13 @@ class FlashFlowMatchScheduler:
         sigmas_full = np.concatenate([sigmas, [0.0]]).astype(np.float32)
 
         self.sigmas = torch.from_numpy(sigmas_full).to(
-            device=device, dtype=torch.float32)
+            device=device, dtype=torch.float32
+        )
         self.timesteps = torch.from_numpy(timesteps).to(
-            device=device, dtype=torch.float32)
+            device=device, dtype=torch.float32
+        )
         self.num_inference_steps = num_inference_steps
+        self._step_index = None
 
     def set_timesteps_list(self, timesteps_list, device: torch.device):
         timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.long)
@@ -111,27 +156,37 @@ class FlashFlowMatchScheduler:
         self.sigmas = torch.tensor(sigmas, device=device, dtype=torch.float32)
         self.timesteps = timesteps
         self.num_inference_steps = len(timesteps)
+        self._step_index = None
 
-    def step(self, model_output: torch.Tensor, timestep: torch.Tensor,
-             sample: torch.Tensor, s_noise: float = 1.0,
-             noise_clip_std: float = 0.0,
-             generator: torch.Generator | None = None) -> torch.Tensor:
-        step_idx = (self.timesteps == timestep.long()).nonzero(
-            as_tuple=True)[0][0].item()
-        sigma = self.sigmas[step_idx]
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        s_noise: float = 1.0,
+        noise_clip_std: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if self._step_index is None:
+            self._step_index = 0
+        sigma = self.sigmas[self._step_index]
         sample = sample.to(torch.float32)
         denoised = sample - model_output * sigma
-        if step_idx + 1 < len(self.sigmas):
-            sigma_next = self.sigmas[step_idx + 1]
-            noise = torch.randn(model_output.shape,
-                                device=generator.device,
-                                dtype=denoised.dtype, generator=generator)
-            noise = noise.to(model_output.device)
+        if self._step_index < self.num_inference_steps:
+            sigma_next = self.sigmas[self._step_index + 1]
+            if generator is not None and generator.device.type == "cpu":
+                noise = torch.randn(
+                    model_output.shape, generator=generator,
+                    dtype=denoised.dtype).to(model_output.device)
+            else:
+                noise = torch.randn(model_output.shape,
+                                    device=model_output.device,
+                                    dtype=denoised.dtype, generator=generator)
             if noise_clip_std > 0:
                 clip_val = noise_clip_std * noise.std().item()
                 noise = noise.clamp(min=-clip_val, max=clip_val)
-            sample = (sigma_next * noise * s_noise
-                      + (1.0 - sigma_next) * denoised)
+            sample = sigma_next * noise * s_noise + (1.0 - sigma_next) * denoised
+        self._step_index += 1
         return sample
 
 
@@ -167,7 +222,8 @@ class FlowUniPCScheduler:
 
         self.sigmas = torch.from_numpy(sigmas_full)
         self.timesteps = torch.from_numpy(timesteps.astype(np.int64)).to(
-            device=device, dtype=torch.long)
+            device=device, dtype=torch.long
+        )
         self.num_inference_steps = len(timesteps)
 
         self.model_outputs = [None] * self.solver_order
@@ -256,7 +312,9 @@ class FlowUniPCScheduler:
 
         return x_t.to(x.dtype)
 
-    def multistep_uni_c_bh_update(self, this_model_output, last_sample, this_sample, order):
+    def multistep_uni_c_bh_update(
+        self, this_model_output, last_sample, this_sample, order
+    ):
         model_output_list = self.model_outputs
         m0 = model_output_list[-1]
         x = last_sample
@@ -314,10 +372,12 @@ class FlowUniPCScheduler:
             # 2x2 solve of R = [[1, 1], [r1, 1]] (NPU: no torch.linalg.solve)
             r1 = rks[0]
             det = 1 - r1
-            rhos_c = torch.stack([
-                (b[0] - b[1]) / det,
-                (b[1] - r1 * b[0]) / det,
-            ]).to(dtype=x.dtype, device=device)
+            rhos_c = torch.stack(
+                [
+                    (b[0] - b[1]) / det,
+                    (b[1] - r1 * b[0]) / det,
+                ]
+            ).to(dtype=x.dtype, device=device)
 
         x_t_ = sigma_t_a / sigma_s0_a * x - alpha_t * h_phi_1 * m0
         if D1s is not None:
@@ -333,10 +393,7 @@ class FlowUniPCScheduler:
         if self.step_index is None:
             self._init_step_index(timestep)
 
-        use_corrector = (
-            self.step_index > 0 and
-            self.last_sample is not None
-        )
+        use_corrector = self.step_index > 0 and self.last_sample is not None
 
         model_output_convert = self.convert_model_output(model_output, sample)
         if use_corrector:
@@ -354,8 +411,7 @@ class FlowUniPCScheduler:
         self.timestep_list[-1] = timestep
 
         if self.lower_order_final:
-            this_order = min(self.solver_order,
-                             len(self.timesteps) - self.step_index)
+            this_order = min(self.solver_order, len(self.timesteps) - self.step_index)
         else:
             this_order = self.solver_order
         self.this_order = min(this_order, self.lower_order_nums + 1)
@@ -401,24 +457,33 @@ def get_rope_index_fix_point(
         skip_vision_start_token = [1]
 
     if video_grid_thw is not None:
-        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw = torch.repeat_interleave(
+            video_grid_thw, video_grid_thw[:, 0], dim=0
+        )
         video_grid_thw[:, 0] = 1
 
     mrope_position_deltas = []
-    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+    if input_ids is not None and (
+        image_grid_thw is not None or video_grid_thw is not None
+    ):
         total_input_ids = input_ids
         if attention_mask is None:
             attention_mask = torch.ones_like(total_input_ids)
         position_ids = torch.ones(
-            3, input_ids.shape[0], input_ids.shape[1],
-            dtype=input_ids.dtype, device=input_ids.device,
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
         )
         image_index, video_index = 0, 0
         attention_mask = attention_mask.to(total_input_ids.device)
 
         for i, input_ids_i in enumerate(total_input_ids):
             input_ids_i = input_ids_i[attention_mask[i] == 1]
-            vision_start_indices = torch.argwhere(input_ids_i == vision_start_token_id).squeeze(1)
+            vision_start_indices = torch.argwhere(
+                input_ids_i == vision_start_token_id
+            ).squeeze(1)
             vision_tokens = input_ids_i[vision_start_indices + 1]
             image_nums = (vision_tokens == image_token_id).sum()
             video_nums = (vision_tokens == video_token_id).sum()
@@ -428,15 +493,31 @@ def get_rope_index_fix_point(
             remain_images, remain_videos = image_nums, video_nums
 
             for _ in range(image_nums + video_nums):
-                ed_image = input_tokens.index(image_token_id, st) if image_token_id in input_tokens and remain_images > 0 else len(input_tokens) + 1
-                ed_video = input_tokens.index(video_token_id, st) if video_token_id in input_tokens and remain_videos > 0 else len(input_tokens) + 1
+                ed_image = (
+                    input_tokens.index(image_token_id, st)
+                    if image_token_id in input_tokens and remain_images > 0
+                    else len(input_tokens) + 1
+                )
+                ed_video = (
+                    input_tokens.index(video_token_id, st)
+                    if video_token_id in input_tokens and remain_videos > 0
+                    else len(input_tokens) + 1
+                )
                 if ed_image < ed_video:
-                    t, h, w = image_grid_thw[image_index][0], image_grid_thw[image_index][1], image_grid_thw[image_index][2]
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
-                    t, h, w = video_grid_thw[video_index][0], video_grid_thw[video_index][1], video_grid_thw[video_index][2]
+                    t, h, w = (
+                        video_grid_thw[video_index][0],
+                        video_grid_thw[video_index][1],
+                        video_grid_thw[video_index][2],
+                    )
                     video_index += 1
                     remain_videos -= 1
                     ed = ed_video
@@ -448,49 +529,96 @@ def get_rope_index_fix_point(
                 text_len -= skip_vision_start_token[image_index - 1]
                 text_len = max(0, text_len)
 
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                )
+                llm_pos_ids_list.append(
+                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                )
 
-                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                t_index = (
+                    torch.arange(llm_grid_t)
+                    .view(-1, 1)
+                    .expand(-1, llm_grid_h * llm_grid_w)
+                    .flatten()
+                )
+                h_index = (
+                    torch.arange(llm_grid_h)
+                    .view(1, -1, 1)
+                    .expand(llm_grid_t, -1, llm_grid_w)
+                    .flatten()
+                )
+                w_index = (
+                    torch.arange(llm_grid_w)
+                    .view(1, 1, -1)
+                    .expand(llm_grid_t, llm_grid_h, -1)
+                    .flatten()
+                )
 
                 if skip_vision_start_token[image_index - 1]:
                     if fix_point > 0:
                         fix_point = fix_point - st_idx
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + fix_point + st_idx)
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + fix_point + st_idx
+                    )
                     fix_point = 0
                 else:
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + text_len + st_idx
+                    )
                 st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
             if st < len(input_tokens):
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                )
                 text_len = len(input_tokens) - st
-                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                llm_pos_ids_list.append(
+                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                )
 
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
+                position_ids.device
+            )
+            mrope_position_deltas.append(
+                llm_positions.max() + 1 - len(total_input_ids[i])
+            )
 
-        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        mrope_position_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)
         return position_ids, mrope_position_deltas
     else:
         if attention_mask is not None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+            position_ids = (
+                position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+            )
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                -1, keepdim=True
+            )[0]
             mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
         else:
-            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).view(1, 1, -1).expand(3, input_ids.shape[0], -1)
-            mrope_position_deltas = torch.zeros([input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype)
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
+            )
         return position_ids, mrope_position_deltas
 
 
 def build_t2i_text_sample(
-    prompt: str, height: int, width: int,
-    tokenizer: Any, processor: Any, model_config: Any,
+    prompt: str,
+    height: int,
+    width: int,
+    tokenizer: Any,
+    processor: Any,
+    model_config: Any,
 ) -> dict[str, torch.Tensor]:
     """Build text sample for text-to-image generation."""
     image_token_id = model_config.image_token_id
@@ -503,11 +631,15 @@ def build_t2i_text_sample(
 
     messages = [{"role": "user", "content": prompt}]
     template_caption = (
-        processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         + boi_token
         + tms_token * TIMESTEP_TOKEN_NUM
     )
-    input_ids = tokenizer.encode(template_caption, return_tensors="pt", add_special_tokens=False)
+    input_ids = tokenizer.encode(
+        template_caption, return_tensors="pt", add_special_tokens=False
+    )
 
     image_grid_thw = torch.tensor(
         [1, height // PATCH_SIZE, width // PATCH_SIZE], dtype=torch.int64
@@ -518,9 +650,14 @@ def build_t2i_text_sample(
     input_ids_pad = torch.cat([input_ids, vision_tokens], dim=-1)
 
     position_ids, _ = get_rope_index_fix_point(
-        1, image_token_id, video_token_id, vision_start_token_id,
-        input_ids=input_ids_pad, image_grid_thw=image_grid_thw,
-        video_grid_thw=None, attention_mask=None,
+        1,
+        image_token_id,
+        video_token_id,
+        vision_start_token_id,
+        input_ids=input_ids_pad,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        attention_mask=None,
         skip_vision_start_token=[1],
     )
 
@@ -529,10 +666,10 @@ def build_t2i_text_sample(
 
     token_types = torch.zeros((1, all_seq_len), dtype=input_ids.dtype)
     bgn = txt_seq_len - TIMESTEP_TOKEN_NUM
-    token_types[0, bgn: bgn + image_len + TIMESTEP_TOKEN_NUM] = 1
-    token_types[0, txt_seq_len - TIMESTEP_TOKEN_NUM: txt_seq_len] = 3
+    token_types[0, bgn : bgn + image_len + TIMESTEP_TOKEN_NUM] = 1
+    token_types[0, txt_seq_len - TIMESTEP_TOKEN_NUM : txt_seq_len] = 3
 
-    vinput_mask = (token_types == 1)
+    vinput_mask = token_types == 1
     token_types_bin = (token_types > 0).to(token_types.dtype)
 
     return {
@@ -544,26 +681,33 @@ def build_t2i_text_sample(
 
 
 def decode_patches_to_image(
-    z: torch.Tensor, h_patches: int, w_patches: int, patch_size: int = PATCH_SIZE,
+    z: torch.Tensor,
+    h_patches: int,
+    w_patches: int,
+    patch_size: int = PATCH_SIZE,
 ) -> torch.Tensor:
     """Convert patch tensor to image tensor in [0, 1] range."""
     img = (z.float() + 1) / 2
     img = img.reshape(1, h_patches, w_patches, 3, patch_size, patch_size)
     # .contiguous() required on NPU before reshape after permute
-    img = img.permute(0, 3, 1, 4, 2, 5).contiguous().reshape(
-        1, 3, h_patches * patch_size, w_patches * patch_size)
+    img = (
+        img.permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
+        .reshape(1, 3, h_patches * patch_size, w_patches * patch_size)
+    )
     return img
 
 
-def resize_pilimage(pil_image, image_size, patch_size=16,
-                    resampler=None):
+def resize_pilimage(pil_image, image_size, patch_size=16, resampler=None):
     """Aspect-preserving resize + center crop (official utils.py)."""
     from PIL import Image as _Image
+
     if resampler is None:
         resampler = _Image.BICUBIC
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=_Image.BOX)
+            tuple(x // 2 for x in pil_image.size), resample=_Image.BOX
+        )
 
     m = patch_size
     width, height = pil_image.width, pil_image.height
@@ -588,12 +732,14 @@ def resize_pilimage(pil_image, image_size, patch_size=16,
     s2 = height / new_size[1]
     if s1 < s2:
         pil_image = pil_image.resize(
-            [new_size[0], round(height / s1)], resample=resampler)
+            [new_size[0], round(height / s1)], resample=resampler
+        )
         top = (round(height / s1) - new_size[1]) // 2
         pil_image = pil_image.crop((0, top, new_size[0], top + new_size[1]))
     else:
         pil_image = pil_image.resize(
-            [round(width / s2), new_size[1]], resample=resampler)
+            [round(width / s2), new_size[1]], resample=resampler
+        )
         left = (round(width / s2) - new_size[0]) // 2
         pil_image = pil_image.crop((left, 0, left + new_size[0], new_size[1]))
     return pil_image
@@ -613,23 +759,38 @@ def _patchify_image_tensor(x, patch_size):
     c, h, w = x.shape
     h_patches, w_patches = h // patch_size, w // patch_size
     x = x.reshape(c, h_patches, patch_size, w_patches, patch_size)
-    x = x.permute(1, 3, 0, 2, 4).contiguous().reshape(
-        h_patches * w_patches, c * patch_size * patch_size)
+    x = (
+        x.permute(1, 3, 0, 2, 4)
+        .contiguous()
+        .reshape(h_patches * w_patches, c * patch_size * patch_size)
+    )
     return x
 
 
 def _ref_tensor_transform():
     """PIL -> float32 tensor in [-1, 1] (official TENSOR_TRANSFORM)."""
     import torchvision.transforms.v2 as transforms
-    return transforms.Compose([
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize([0.5], [0.5]),
-    ])
+
+    return transforms.Compose(
+        [
+            transforms.ToImage(),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
 
 
-def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width,
-                           ref_image_lens, tokenizer, processor, model_config):
+def build_ti2i_text_sample(
+    prompt,
+    ref_pils_vlm,
+    ref_pils_resized,
+    height,
+    width,
+    ref_image_lens,
+    tokenizer,
+    processor,
+    model_config,
+):
     """Build the TI2I sample (reference-image conditioning, official I2I branch)."""
     image_token_id = model_config.image_token_id
     video_token_id = model_config.video_token_id
@@ -642,14 +803,21 @@ def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
     template_caption = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
-    proc = processor(text=[template_caption], images=ref_pils_vlm,
-                     padding="longest", return_tensors="pt")
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    proc = processor(
+        text=[template_caption],
+        images=ref_pils_vlm,
+        padding="longest",
+        return_tensors="pt",
+    )
     boi_token = getattr(tokenizer, "boi_token", "<|boi_token|>")
     tms_token = getattr(tokenizer, "tms_token", "<|tms_token|>")
     input_ids_2 = tokenizer.encode(
-        boi_token + tms_token * TIMESTEP_TOKEN_NUM, return_tensors="pt",
-        add_special_tokens=False)
+        boi_token + tms_token * TIMESTEP_TOKEN_NUM,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
     input_ids = torch.cat([proc.input_ids, input_ids_2], dim=-1)
 
     igthw_cond = proc.image_grid_thw.clone()
@@ -657,16 +825,16 @@ def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width
         igthw_cond[i, 1] //= spatial_merge_size
         igthw_cond[i, 2] //= spatial_merge_size
     image_grid_thw_tgt = torch.tensor(
-        [[1, height // PATCH_SIZE, width // PATCH_SIZE]], dtype=torch.int64)
+        [[1, height // PATCH_SIZE, width // PATCH_SIZE]], dtype=torch.int64
+    )
     image_grid_thw_ref = torch.tensor(
-        [[1, p.height // PATCH_SIZE, p.width // PATCH_SIZE]
-         for p in ref_pils_resized], dtype=torch.int64)
-    igthw_all = torch.cat([igthw_cond, image_grid_thw_tgt, image_grid_thw_ref],
-                          dim=0)
+        [[1, p.height // PATCH_SIZE, p.width // PATCH_SIZE] for p in ref_pils_resized],
+        dtype=torch.int64,
+    )
+    igthw_all = torch.cat([igthw_cond, image_grid_thw_tgt, image_grid_thw_ref], dim=0)
 
     vision_tokens_list = []
-    vt_tgt = torch.full((1, tgt_image_len), image_token_id,
-                        dtype=input_ids.dtype)
+    vt_tgt = torch.full((1, tgt_image_len), image_token_id, dtype=input_ids.dtype)
     vt_tgt[0, 0] = vision_start_token_id
     vision_tokens_list.append(vt_tgt)
     for rl in ref_image_lens:
@@ -677,9 +845,14 @@ def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width
     input_ids_pad = torch.cat([input_ids, vision_tokens], dim=-1)
 
     position_ids, _ = get_rope_index_fix_point(
-        1, image_token_id, video_token_id, vision_start_token_id,
-        input_ids=input_ids_pad, image_grid_thw=igthw_all,
-        video_grid_thw=None, attention_mask=None,
+        1,
+        image_token_id,
+        video_token_id,
+        vision_start_token_id,
+        input_ids=input_ids_pad,
+        image_grid_thw=igthw_all,
+        video_grid_thw=None,
+        attention_mask=None,
         skip_vision_start_token=[0] * K + [1] + [1] * K,
     )
     txt_seq_len = input_ids.shape[-1]
@@ -690,8 +863,8 @@ def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width
     bgn = txt_seq_len - TIMESTEP_TOKEN_NUM
     end = bgn + tgt_image_len + TIMESTEP_TOKEN_NUM
     token_types_raw[0, bgn:end] = 1
-    token_types_raw[0, end:end + total_ref_len] = 2
-    token_types_raw[0, txt_seq_len - TIMESTEP_TOKEN_NUM: txt_seq_len] = 3
+    token_types_raw[0, end : end + total_ref_len] = 2
+    token_types_raw[0, txt_seq_len - TIMESTEP_TOKEN_NUM : txt_seq_len] = 3
 
     vinput_mask = torch.logical_or(token_types_raw == 1, token_types_raw == 2)
     token_types_bin = (token_types_raw > 0).to(token_types_raw.dtype)
@@ -734,12 +907,14 @@ def _per_prompt_work(batch: Req, prompts: list) -> list[tuple]:
         seeds = [seeds]
     seeds = [s[0] if isinstance(s, list) else int(s) for s in seeds]
 
-    return list(zip(
-        prompts,
-        broadcast(batch.height, "height"),
-        broadcast(batch.width, "width"),
-        broadcast(seeds, "seed"),
-    ))
+    return list(
+        zip(
+            prompts,
+            broadcast(batch.height, "height"),
+            broadcast(batch.width, "width"),
+            broadcast(seeds, "seed"),
+        )
+    )
 
 
 class HiDreamGenerationStage(PipelineStage):
@@ -780,26 +955,35 @@ class HiDreamGenerationStage(PipelineStage):
                     "HiDream DEV generation always uses num_inference_steps=%d "
                     "(the official fixed DEFAULT_TIMESTEPS schedule); ignoring "
                     "the requested %d.",
-                    num_steps, requested_steps,
+                    num_steps,
+                    requested_steps,
                 )
         guidance_scale = batch.guidance_scale
         if guidance_scale is None:
             guidance_scale = 0.0
         guidance_scale = float(guidance_scale)
         scheduler_name = (
-            batch.scheduler_name if batch.scheduler_name is not None else "flash")
+            batch.scheduler_name if batch.scheduler_name is not None else "flash"
+        )
         noise_scale_start = float(
             batch.noise_scale_start
-            if batch.noise_scale_start is not None else NOISE_SCALE)
+            if batch.noise_scale_start is not None
+            else NOISE_SCALE
+        )
         noise_scale_end = float(
-            batch.noise_scale_end
-            if batch.noise_scale_end is not None else NOISE_SCALE)
+            batch.noise_scale_end if batch.noise_scale_end is not None else NOISE_SCALE
+        )
         noise_clip_std = float(
-            batch.noise_clip_std if batch.noise_clip_std is not None else 0.0)
+            batch.noise_clip_std if batch.noise_clip_std is not None else 0.0
+        )
         shift = float(batch.shift) if batch.shift is not None else 1.0
         layout_bboxes = batch.layout_bboxes
 
-        tokenizer = self.processor.tokenizer if hasattr(self.processor, "tokenizer") else self.processor
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
         model_config = self.model.config
         ref_images_batch = getattr(batch, "image_path", None)
 
@@ -813,17 +997,33 @@ class HiDreamGenerationStage(PipelineStage):
                 enhance_prompt(prompt=p, base_url=server_args.pe_server_url)
                 for p in prompts
             ]
+        elif not ref_images_batch:
+            # Short prompts under-condition the model: output may come out
+            # as uncolored line art. Official remedy: the Prompt Agent.
+            for p in prompts:
+                n = len(p.strip())
+                if n < 20:  # arbitrary threshold
+                    logger.warning(
+                        "Short T2I prompt (%d chars): output may be "
+                        "uncolored line art; refine it or enable "
+                        "--pe-server-url.", n)
 
+        # Per-output generators created by InputValidationStage
+        batch_generators = getattr(batch, "generator", None) or []
 
         results = []
-        for prompt, height, width, seed in _per_prompt_work(batch, prompts):
+        for prompt_idx, (prompt, height, width, seed) in enumerate(
+            _per_prompt_work(batch, prompts)
+        ):
             height, width = int(height), int(width)
 
             ref_paths = None
             if ref_images_batch:
-                ref_paths = ([ref_images_batch]
-                             if isinstance(ref_images_batch, str)
-                             else [p for p in ref_images_batch if p])
+                ref_paths = (
+                    [ref_images_batch]
+                    if isinstance(ref_images_batch, str)
+                    else [p for p in ref_images_batch if p]
+                )
                 if not ref_paths:
                     ref_paths = None
 
@@ -832,21 +1032,26 @@ class HiDreamGenerationStage(PipelineStage):
             # (patch-aligned). An explicit width AND height in the request
             # wins (snapped); T2I always snaps the requested size.
             preresized_ref_pil = None
-            explicit_fields = getattr(
-                sampling_params, "_explicit_fields", None) or ()
-            explicit_size = ("width" in explicit_fields
-                             and "height" in explicit_fields)
+            explicit_fields = getattr(sampling_params, "_explicit_fields", None) or ()
+            explicit_size = "width" in explicit_fields and "height" in explicit_fields
             if ref_paths and len(ref_paths) == 1 and not explicit_size:
                 preresized_ref_pil = resize_pilimage(
-                    Image.open(ref_paths[0]).convert("RGB"), 2048, PATCH_SIZE)
+                    Image.open(ref_paths[0]).convert("RGB"), 2048, PATCH_SIZE
+                )
                 width, height = preresized_ref_pil.size
-                logger.info("TI2I: target size %dx%d from reference aspect",
-                            width, height)
+                logger.info(
+                    "TI2I: target size %dx%d from reference aspect", width, height
+                )
             else:
                 best_w, best_h = find_closest_resolution(width, height)
                 if best_w != width or best_h != height:
-                    logger.info("Resolution snapped from %dx%d to %dx%d",
-                                width, height, best_w, best_h)
+                    logger.info(
+                        "Resolution snapped from %dx%d to %dx%d",
+                        width,
+                        height,
+                        best_w,
+                        best_h,
+                    )
                     width, height = best_w, best_h
 
             h_patches = height // PATCH_SIZE
@@ -869,8 +1074,9 @@ class HiDreamGenerationStage(PipelineStage):
                         layout_data = load_layout_bboxes(layout_bboxes)
                         K += 1
                     except Exception as e:
-                        logger.warning("Incorrect layout_bboxes: %s, %s",
-                                       layout_bboxes, e)
+                        logger.warning(
+                            "Incorrect layout_bboxes: %s, %s", layout_bboxes, e
+                        )
 
                 if K == 1:
                     max_size = max(height, width)
@@ -885,8 +1091,13 @@ class HiDreamGenerationStage(PipelineStage):
 
                 if layout_data is not None:
                     ref_pils = create_layout_reference_images(
-                        ref_pils, layout_data, width, height,
-                        ref_max_size=max_size, patch_size=PATCH_SIZE)
+                        ref_pils,
+                        layout_data,
+                        width,
+                        height,
+                        ref_max_size=max_size,
+                        patch_size=PATCH_SIZE,
+                    )
 
                 ref_pils_resized = []
                 ref_images = []
@@ -899,10 +1110,12 @@ class HiDreamGenerationStage(PipelineStage):
                         pil_r = resize_pilimage(pil, max_size, PATCH_SIZE)
                     ref_pils_resized.append(pil_r)
                     ref_images.append(
-                        _patchify_image_tensor(transform(pil_r), PATCH_SIZE))
+                        _patchify_image_tensor(transform(pil_r), PATCH_SIZE)
+                    )
                 ref_image_lens = [x.shape[0] for x in ref_images]
-                ref_patches = torch.cat(ref_images, dim=0).unsqueeze(0).to(
-                    device, dtype)
+                ref_patches = (
+                    torch.cat(ref_images, dim=0).unsqueeze(0).to(device, dtype)
+                )
 
                 if K <= 4:
                     cond_img_size = CONDITION_IMAGE_SIZE
@@ -913,22 +1126,39 @@ class HiDreamGenerationStage(PipelineStage):
                 ref_pils_vlm = []
                 for p in ref_pils_resized:
                     cond_w, cond_h = calculate_dimensions(
-                        cond_img_size, p.width / p.height)
-                    ref_pils_vlm.append(
-                        p.resize((cond_w, cond_h), Image.LANCZOS))
-                logger.info("TI2I: %d reference image(s), %d conditioning patches",
-                            K, sum(ref_image_lens))
+                        cond_img_size, p.width / p.height
+                    )
+                    ref_pils_vlm.append(p.resize((cond_w, cond_h), Image.LANCZOS))
+                logger.info(
+                    "TI2I: %d reference image(s), %d conditioning patches",
+                    K,
+                    sum(ref_image_lens),
+                )
 
             if ref_paths:
                 cond_sample = build_ti2i_text_sample(
-                    prompt, ref_pils_vlm, ref_pils_resized, height, width,
-                    ref_image_lens, tokenizer, self.processor, model_config
+                    prompt,
+                    ref_pils_vlm,
+                    ref_pils_resized,
+                    height,
+                    width,
+                    ref_image_lens,
+                    tokenizer,
+                    self.processor,
+                    model_config,
                 )
                 uncond_sample = None
                 if guidance_scale > 1.0:
                     uncond_sample = build_ti2i_text_sample(
-                        " ", ref_pils_vlm, ref_pils_resized, height, width,
-                        ref_image_lens, tokenizer, self.processor, model_config
+                        " ",
+                        ref_pils_vlm,
+                        ref_pils_resized,
+                        height,
+                        width,
+                        ref_image_lens,
+                        tokenizer,
+                        self.processor,
+                        model_config,
                     )
             else:
                 cond_sample = build_t2i_text_sample(
@@ -941,7 +1171,9 @@ class HiDreamGenerationStage(PipelineStage):
                     )
 
             def to_device(s):
-                return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in s.items()}
+                return {
+                    k: (v.to(device) if torch.is_tensor(v) else v) for k, v in s.items()
+                }
 
             cond_sample = to_device(cond_sample)
             if uncond_sample is not None:
@@ -950,13 +1182,18 @@ class HiDreamGenerationStage(PipelineStage):
             is_editing = ref_paths is not None and len(ref_paths) == 1
             # official --editing_scheduler applies to DEV only ("Ignored for
             # full model"); the FULL model keeps UniPC for every task
-            if (is_editing and model_type != "full"
-                    and "scheduler_name" not in set(
-                        getattr(sampling_params, "_explicit_fields", ()) or ())):
+            if (
+                is_editing
+                and model_type != "full"
+                and "scheduler_name"
+                not in set(getattr(sampling_params, "_explicit_fields", ()) or ())
+            ):
                 if scheduler_name != "flow_match":
                     logger.info(
                         "Editing: scheduler %s -> flow_match (official "
-                        "editing default)", scheduler_name)
+                        "editing default)",
+                        scheduler_name,
+                    )
                 # official --editing_scheduler default is flow_match
                 scheduler_name = "flow_match"
             if model_type == "full":
@@ -971,7 +1208,9 @@ class HiDreamGenerationStage(PipelineStage):
                 if scheduler_name not in ("flash", "flow_match"):
                     logger.warning(
                         "Unsupported scheduler_name=%s for the DEV recipe; "
-                        "using flash.", scheduler_name)
+                        "using flash.",
+                        scheduler_name,
+                    )
                 sched = FlashFlowMatchScheduler()
                 sched.set_timesteps_list(DEFAULT_TIMESTEPS, device)
                 inject_noise = True
@@ -989,24 +1228,39 @@ class HiDreamGenerationStage(PipelineStage):
 
             noise_note = (
                 f" (per-step noise={noise_scale_start}->{noise_scale_end} "
-                f"clip={noise_clip_std})" if inject_noise else ""
+                f"clip={noise_clip_std})"
+                if inject_noise
+                else ""
             )
             logger.info(
                 "HiDream %s/%s: cfg=%s shift=%s steps=%d z_init=%s "
                 "inject=%s%s seed=%s weights=%s",
-                model_type, scheduler_name, guidance_scale, shift, num_steps,
+                model_type,
+                scheduler_name,
+                guidance_scale,
+                shift,
+                num_steps,
                 init_noise_scale,
                 "per-step" if inject_noise else "off",
-                noise_note, batch.seed, w_dtype,
+                noise_note,
+                batch.seed,
+                w_dtype,
             )
 
             tgt_image_len = h_patches * w_patches
 
-            # All noise is drawn through a private CPU generator seeded with
-            # this image's seed (official pipeline.py:315; CPU is the
-            # reference-quality RNG on NPU).
-            generator = torch.Generator("cpu")
-            generator.manual_seed(int(seed))
+            # Reuse the per-output generators from InputValidationStage
+            # (created on CPU); a list shorter than the prompts falls back
+            # to its first generator.
+            if batch_generators:
+                generator = (
+                    batch_generators[prompt_idx]
+                    if prompt_idx < len(batch_generators)
+                    else batch_generators[0]
+                )
+            else:
+                generator = torch.Generator("cpu")
+                generator.manual_seed(int(seed))
             noise = init_noise_scale * torch.randn(
                 (1, 3, height, width),
                 generator=generator,
@@ -1014,8 +1268,11 @@ class HiDreamGenerationStage(PipelineStage):
                 dtype=torch.float32,
             ).to(device, dtype)
             z = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
-            z = z.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(
-                1, h_patches * w_patches, -1)
+            z = (
+                z.permute(0, 2, 4, 1, 3, 5)
+                .contiguous()
+                .reshape(1, h_patches * w_patches, -1)
+            )
 
             precomputed_image_embeds = None
             precomputed_deepstack_image_embeds = None
@@ -1025,31 +1282,42 @@ class HiDreamGenerationStage(PipelineStage):
                 t_pixeldit = 1.0 - step_t.float() / 1000.0
                 sigma = (step_t.float() / 1000.0).clamp_min(T_EPS)
 
-                vinputs = (torch.cat([z, ref_patches], dim=1)
-                           if ref_patches is not None else z.clone())
+                vinputs = (
+                    torch.cat([z, ref_patches], dim=1)
+                    if ref_patches is not None
+                    else z.clone()
+                )
 
                 with torch.autocast(
-                    device_type=device.type, dtype=dtype, cache_enabled=False,
+                    device_type=device.type,
+                    dtype=dtype,
+                    cache_enabled=False,
                 ):
                     x_pred_cond, embeds = self._forward_once(
-                        cond_sample, vinputs, t_pixeldit.to(device),
+                        cond_sample,
+                        vinputs,
+                        t_pixeldit.to(device),
                         precomputed_image_embeds,
                         precomputed_deepstack_image_embeds,
                     )
                 if embeds is not None:
-                    precomputed_image_embeds, \
-                        precomputed_deepstack_image_embeds = embeds
+                    precomputed_image_embeds, precomputed_deepstack_image_embeds = (
+                        embeds
+                    )
                 x_tgt = x_pred_cond[:, :tgt_image_len]
 
                 v_cond = (x_tgt.float() - z.float()) / sigma
 
                 if uncond_sample is not None:
                     with torch.autocast(
-                        device_type=device.type, dtype=dtype,
+                        device_type=device.type,
+                        dtype=dtype,
                         cache_enabled=False,
                     ):
                         x_pred_uncond, _ = self._forward_once(
-                            uncond_sample, vinputs, t_pixeldit.to(device),
+                            uncond_sample,
+                            vinputs,
+                            t_pixeldit.to(device),
                             precomputed_image_embeds,
                             precomputed_deepstack_image_embeds,
                         )
@@ -1062,14 +1330,17 @@ class HiDreamGenerationStage(PipelineStage):
                 model_output = -v_guided
                 if inject_noise:
                     z = sched.step(
-                        model_output.float(), step_t.to(dtype=torch.float32),
-                        z.float(), s_noise=noise_scale_schedule[step_idx],
+                        model_output.float(),
+                        step_t.to(dtype=torch.float32),
+                        z.float(),
+                        s_noise=noise_scale_schedule[step_idx],
                         noise_clip_std=noise_clip_std,
-                        generator=generator).to(dtype)
+                        generator=generator,
+                    ).to(dtype)
                 else:
-                    z = sched.step(model_output.float(),
-                                   step_t.to(dtype=torch.float32),
-                                   z.float()).to(dtype)
+                    z = sched.step(
+                        model_output.float(), step_t.to(dtype=torch.float32), z.float()
+                    ).to(dtype)
 
             img = decode_patches_to_image(z, h_patches, w_patches)
             results.append(img)
@@ -1082,7 +1353,10 @@ class HiDreamGenerationStage(PipelineStage):
         return output
 
     def _forward_once(
-        self, sample: dict, z_in: torch.Tensor, t_pixeldit: torch.Tensor,
+        self,
+        sample: dict,
+        z_in: torch.Tensor,
+        t_pixeldit: torch.Tensor,
         precomputed_image_embeds=None,
         precomputed_deepstack_image_embeds=None,
     ):
@@ -1095,7 +1369,8 @@ class HiDreamGenerationStage(PipelineStage):
             if precomputed_image_embeds is not None:
                 kwargs["precomputed_image_embeds"] = precomputed_image_embeds
                 kwargs["precomputed_deepstack_image_embeds"] = (
-                    precomputed_deepstack_image_embeds)
+                    precomputed_deepstack_image_embeds
+                )
         outputs = self.model(
             input_ids=sample["input_ids"].to(device),
             position_ids=sample["position_ids"].to(device),
@@ -1110,6 +1385,8 @@ class HiDreamGenerationStage(PipelineStage):
         x_masked = x_pred[0, vinput_mask[0]].unsqueeze(0)
         embeds = None
         if "cond_image_embeds" in outputs:
-            embeds = (outputs["cond_image_embeds"],
-                      outputs["cond_deepstack_image_embeds"])
+            embeds = (
+                outputs["cond_image_embeds"],
+                outputs["cond_deepstack_image_embeds"],
+            )
         return x_masked, embeds

@@ -8,14 +8,11 @@ No separate text encoder, VAE, or scheduler modules are needed.
 from __future__ import annotations
 
 import json
-import math
 import os
 from glob import glob
 from typing import Any
 
-import numpy as np
 import torch
-from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
@@ -25,8 +22,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
 )
 from sglang.multimodal_gen.configs.sample.hidream import (
     _VARIANT_DEFAULTS,
-    _resolve_variant,
     HiDreamSamplingParams,
+    _resolve_variant,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -70,9 +67,7 @@ class HiDreamPipeline(ComposedPipelineBase):
         model_path = self.model_path
         logger.info("Loading HiDream model from %s", model_path)
 
-        processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=True
-        )
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
         config_path = os.path.join(model_path, "config.json")
         with open(config_path, "r") as f:
@@ -129,10 +124,16 @@ class HiDreamPipeline(ComposedPipelineBase):
         missing_keys = set(params_dict.keys()) - loaded_keys
         if missing_keys:
             missing_list = sorted(missing_keys)
-            logger.warning("Missing keys when loading HiDream (%d): %s",
-                           len(missing_list), missing_list[:10])
-        logger.info("HiDream model loaded successfully (%d/%d params loaded)",
-                     len(loaded_keys), len(params_dict))
+            logger.warning(
+                "Missing keys when loading HiDream (%d): %s",
+                len(missing_list),
+                missing_list[:10],
+            )
+        logger.info(
+            "HiDream model loaded successfully (%d/%d params loaded)",
+            len(loaded_keys),
+            len(params_dict),
+        )
 
         # Variant dtype policy (deliberate deployment mapping, mirrored in
         # _VARIANT_DEFAULTS)

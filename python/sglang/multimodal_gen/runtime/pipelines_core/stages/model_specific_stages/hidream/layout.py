@@ -81,9 +81,7 @@ def _xxyy_relative_to_absolute_bbox(
     x2 = max(0, min(width - 1, int(round(x2))))
     y2 = max(0, min(height - 1, int(round(y2))))
     if x2 <= x1 or y2 <= y1:
-        raise ValueError(
-            f"Invalid bbox after scaling/clamping: {[x1, y1, x2, y2]!r}"
-        )
+        raise ValueError(f"Invalid bbox after scaling/clamping: {[x1, y1, x2, y2]!r}")
     return [x1, y1, x2, y2]
 
 
@@ -152,9 +150,7 @@ def draw_bbox_layout(
         if 0 <= orig_idx < len(color_list):
             color_list[orig_idx] = color
         line_width = max(max_bbox_line_width - sorted_idx * bbox_line_gap, 5)
-        draw.rectangle(
-            [int(v) for v in item["bbox"]], outline=color, width=line_width
-        )
+        draw.rectangle([int(v) for v in item["bbox"]], outline=color, width=line_width)
 
     if return_color:
         return image, color_list

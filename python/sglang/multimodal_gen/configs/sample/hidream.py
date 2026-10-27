@@ -62,6 +62,7 @@ _VARIANT_DEFAULTS = {
     },
 }
 
+
 @dataclass
 class HiDreamSamplingParams(SamplingParams):
     """Sampling parameters for the HiDream-O1-Image family.
@@ -105,9 +106,7 @@ class HiDreamSamplingParams(SamplingParams):
     )
 
     def _adjust(self, server_args):
-        unset = {
-            name: getattr(self, name) is None for name in self._RECIPE_FIELDS
-        }
+        unset = {name: getattr(self, name) is None for name in self._RECIPE_FIELDS}
         super()._adjust(server_args)
         # serve --num-inference-steps default; explicit request wins.
         if self.num_inference_steps is None:

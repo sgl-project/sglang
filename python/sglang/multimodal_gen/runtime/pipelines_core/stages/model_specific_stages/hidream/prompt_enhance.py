@@ -187,9 +187,7 @@ def enhance_prompt(prompt: str, base_url: str) -> str:
         raw = response.json()["choices"][0]["message"]["content"] or ""
         refined = str(_wrap_result(raw, prompt)["prompt"])
     except Exception as e:
-        logger.warning(
-            "Prompt enhancement failed (%s); using the raw prompt.", e
-        )
+        logger.warning("Prompt enhancement failed (%s); using the raw prompt.", e)
         return prompt
 
     logger.info("Prompt enhanced: %r -> %r", prompt, refined)

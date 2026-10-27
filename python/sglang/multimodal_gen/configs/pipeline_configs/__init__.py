@@ -30,12 +30,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.helios import (
     HeliosMidConfig,
     HeliosT2VConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
+    HiDreamPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
-    HiDreamPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
