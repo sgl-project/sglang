@@ -8,6 +8,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import threading
 import unittest
+from http import HTTPStatus
 from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
@@ -431,6 +432,63 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         abort_obj = FINISH_LENGTH(length=10)
         ctx.abort(ts=2000, abort_info=abort_obj)
         self.assertIsNone(ctx.thread_context)
+
+    def test_aborted_thread_span_is_an_error_only_for_server_faults(self):
+        """A rejected request (4xx) or a caller's abort (no status) is not a
+        failed span; a span is marked as an error only for a 5xx."""
+        for abort_info, status in [
+            (
+                {"reason": "too long", "status_code": HTTPStatus.BAD_REQUEST},
+                otel_trace.StatusCode.UNSET,
+            ),
+            (
+                {"reason": "Aborted", "status_code": None},
+                otel_trace.StatusCode.UNSET,
+            ),
+            (
+                {
+                    "reason": "KV transfer failed",
+                    "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                },
+                otel_trace.StatusCode.ERROR,
+            ),
+        ]:
+            with self.subTest(status_code=abort_info["status_code"]):
+                ctx = TraceReqContext(rid="req-1")
+                ctx.trace_req_start(ts=1000)
+                thread_span = ctx.thread_context.thread_span
+                ctx.abort(ts=2000, abort_info=abort_info)
+                ctx.trace_req_finish(ts=3000)
+
+                self.assertEqual(thread_span.status.status_code, status)
+                self.assertEqual(thread_span.attributes["reason"], abort_info["reason"])
+
+    def test_aborted_request_records_its_status_on_the_root_span(self):
+        """error.type carries the status; as on thread spans, only a 5xx is an error."""
+        ERROR, UNSET = otel_trace.StatusCode.ERROR, otel_trace.StatusCode.UNSET
+        for finish_reason, error_type, status in [
+            ({"type": "abort", "message": "busy", "status_code": 503}, "503", ERROR),
+            (
+                {"type": "abort", "message": "too long", "status_code": 400},
+                "400",
+                UNSET,
+            ),
+            (
+                {"type": "abort", "message": "Aborted", "status_code": None},
+                "abort",
+                UNSET,
+            ),
+            ({"type": "stop", "matched": 2}, None, UNSET),
+        ]:
+            with self.subTest(finish_reason=finish_reason):
+                ctx = TraceReqContext(rid="req-1")
+                ctx.trace_req_start(ts=1000)
+                root_span = ctx.root_span
+                ctx.trace_set_root_error(finish_reason)
+                ctx.trace_req_finish(ts=2000)
+
+                self.assertEqual(root_span.attributes.get("error.type"), error_type)
+                self.assertEqual(root_span.status.status_code, status)
 
     def test_check_fast_return_by_level(self):
         ctx = TraceReqContext(rid="req-1")

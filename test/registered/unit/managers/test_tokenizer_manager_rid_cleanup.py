@@ -51,6 +51,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
+_HANDLER_ERROR = RuntimeError("handler failed")
 
 # ---------------------------------------------------------------------------
 # Per-request field defaults for BatchStrOutput construction.
@@ -524,6 +525,46 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestTraceRecordsAbortStatus(CustomTestCase):
+    """Finishing a request ends its root span, so an abort's status must be
+    recorded on the span before that, on each path that finishes a request."""
+
+    def _traced_state(self, tm, rid):
+        state = _make_req_state(rid)
+        state.time_stats.trace_ctx = MagicMock(tracing_enable=True)
+        tm.rid_to_state[rid] = state
+        return state.time_stats.trace_ctx
+
+    def _assert_recorded_before_finish(self, trace_ctx, finish_reason):
+        trace_ctx.trace_set_root_error.assert_called_once_with(finish_reason)
+        calls = [name for name, _, _ in trace_ctx.method_calls]
+        self.assertLess(
+            calls.index("trace_set_root_error"), calls.index("trace_req_finish")
+        )
+
+    def test_abort_from_scheduler(self):
+        tm = _make_tokenizer_manager(self)
+        trace_ctx = self._traced_state(tm, "abort_rid")
+        abort_req = _make_abort_req("abort_rid")
+
+        tm._handle_abort_req(abort_req)
+
+        self._assert_recorded_before_finish(trace_ctx, abort_req.finished_reason)
+
+    def test_abort_in_batch_output(self):
+        tm = _make_tokenizer_manager(self)
+        trace_ctx = self._traced_state(tm, "batch_abort_rid")
+        reason = {"type": "abort", "message": "busy", "status_code": 503}
+
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_output("batch_abort_rid", finished_reason=reason)
+            )
+        )
+
+        self._assert_recorded_before_finish(trace_ctx, reason)
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
@@ -937,7 +978,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]}, _HANDLER_ERROR)
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_undelivered_batch_removes_all(self):
@@ -945,7 +986,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
-        tm._release_req_states_on_failure(dict(tm.rid_to_state))
+        tm._release_req_states_on_failure(dict(tm.rid_to_state), _HANDLER_ERROR)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
@@ -957,7 +998,8 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
             {
                 "p1": tm.rid_to_state["p1"],
                 "already_gone": _make_req_state("already_gone"),
-            }
+            },
+            _HANDLER_ERROR,
         )
         self.assertNotIn("p1", tm.rid_to_state)
 
@@ -971,8 +1013,8 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         state = _make_req_state(rid)
         state.dispatched = True
         tm.rid_to_state[rid] = state
-        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
-        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]}, _HANDLER_ERROR)
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]}, _HANDLER_ERROR)
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual(
@@ -992,7 +1034,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         live.dispatched = True
         tm.rid_to_state[delivered] = live
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
-        tm._release_req_states_on_failure(dict(tm.rid_to_state))
+        tm._release_req_states_on_failure(dict(tm.rid_to_state), _HANDLER_ERROR)
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual([type(m) for m in sent], [AbortReq])
@@ -1011,11 +1053,34 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
 
         with self.assertLogs(level="ERROR"):
-            tm._release_req_states_on_failure(dict(tm.rid_to_state))
+            tm._release_req_states_on_failure(dict(tm.rid_to_state), _HANDLER_ERROR)
 
         self.assertIn(delivered, tm.rid_to_state)
         self.assertFalse(live.abort_sent)
         self.assertNotIn(undelivered, tm.rid_to_state)
+
+    def test_undelivered_trace_ends_with_the_status_the_client_gets(self):
+        """A request rejected before reaching the scheduler never gets a
+        scheduler response, so its trace must end here; only a 5xx is an error."""
+        for error, status_code in [
+            (HTTPException(status_code=503, detail="no encoder"), 503),
+            (ValueError("prompt too long"), 400),
+            (RuntimeError("unexpected"), 500),
+            (asyncio.CancelledError(), None),
+        ]:
+            with self.subTest(error=type(error).__name__):
+                tm = _make_tokenizer_manager(self)
+                state = _make_req_state("pending")
+                trace_ctx = MagicMock(tracing_enable=True)
+                state.time_stats.trace_ctx = trace_ctx
+                tm.rid_to_state["pending"] = state
+
+                tm._release_req_states_on_failure({"pending": state}, error)
+
+                trace_ctx.trace_set_root_error.assert_called_once_with(
+                    {"type": "abort", "message": str(error), "status_code": status_code}
+                )
+                trace_ctx.trace_req_finish.assert_called_once()
 
     def test_completed_sample_reuse_survives_sibling_cleanup(self):
         """Batch cleanup must preserve a reused sample RID, adapter ref and encoder gate."""
@@ -1044,7 +1109,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
             gate = asyncio.Event()
             tm.encoder_dispatch_ready[rid] = gate
 
-            tm._release_req_states_on_failure(request_states)
+            tm._release_req_states_on_failure(request_states, _HANDLER_ERROR)
             await asyncio.gather(*tm._lora_release_tasks)
             self.assertIs(tm.rid_to_state.get(rid), replacement_state)
             self.assertNotIn(samples[1].rid, tm.rid_to_state)
