@@ -66,7 +66,7 @@ class GDNMISMetadata(msgspec.Struct, frozen=True):
 
 
 def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
-    """Build compact query/item segments from request-local MIS delimiters."""
+    """Build item-only segments, retaining delimiter readouts for empty items."""
     if not forward_batch.is_prefill_only:
         raise ValueError("GDN MIS is only supported for prefill-only requests")
 
@@ -116,11 +116,14 @@ def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
             query_seq_lens_cpu.append(query_len)
             query_request_indices.append(request_idx)
 
-        branch_ends = delimiters[1:] + [seq_len]
-        for branch_start, branch_end in zip(delimiters, branch_ends):
-            branch_len = branch_end - branch_start
+        for branch_start, branch_end in zip(delimiters, delimiters[1:]):
+            item_start = branch_start + 1
+            if item_start == branch_end:
+                # Preserve the existing delimiter readout for an empty item.
+                item_start = branch_start
+            branch_len = branch_end - item_start
             item_token_indices.extend(
-                range(request_start + branch_start, request_start + branch_end)
+                range(request_start + item_start, request_start + branch_end)
             )
             item_seq_lens_cpu.append(branch_len)
             item_request_indices.append(request_idx)

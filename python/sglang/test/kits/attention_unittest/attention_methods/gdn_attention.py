@@ -817,7 +817,7 @@ def _pure_torch_gdn_reference(
     k = k.float()
     v = v.float()
 
-    outputs = torch.empty(
+    outputs = torch.zeros(
         1,
         fixture.case.num_input_tokens,
         fixture.case.num_v_heads,
@@ -836,7 +836,12 @@ def _pure_torch_gdn_reference(
         if fixture.case.mis_delimiter_indices:
             delimiters = fixture.case.mis_delimiter_indices[req_idx]
             segments = [(0, delimiters[0])]
-            segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+            for start_pos, end_pos in zip(delimiters[:-1], delimiters[1:]):
+                segments.append(
+                    (start_pos + 1, end_pos)
+                    if end_pos > start_pos + 1
+                    else (start_pos, end_pos)
+                )
         else:
             segments = [(0, input_len)]
 
@@ -894,7 +899,7 @@ def _pure_torch_mis_conv_reference(fixture: GDNAttentionFixture) -> torch.Tensor
 
     weights = fixture.actual_module.attn.conv_weights.float()
     width = weights.shape[1]
-    result = torch.empty_like(fixture.mixed_qkv)
+    result = torch.zeros_like(fixture.mixed_qkv)
     request_start = 0
     for request_idx, input_len in enumerate(fixture.case.input_lens):
         request_input = fixture.mixed_qkv[
@@ -902,7 +907,12 @@ def _pure_torch_mis_conv_reference(fixture: GDNAttentionFixture) -> torch.Tensor
         ].float()
         delimiters = fixture.case.mis_delimiter_indices[request_idx]
         segments = [(0, delimiters[0])]
-        segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+        for start_pos, end_pos in zip(delimiters[:-1], delimiters[1:]):
+            segments.append(
+                (start_pos + 1, end_pos)
+                if end_pos > start_pos + 1
+                else (start_pos, end_pos)
+            )
 
         query_state = torch.zeros(
             width - 1,
