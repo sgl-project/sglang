@@ -19,7 +19,8 @@ Related docs: [ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
 configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
 [monitoring/README.md](monitoring/README.md) (metrics and
 Grafana), [BENCHMARKS.md](BENCHMARKS.md),
-[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer).
+[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer),
+[EXAMPLES.md](EXAMPLES.md) (GLM-5.3-Flash and DeepSeek-V4.1-Flash, end to end).
 
 ## Architecture
 
@@ -167,6 +168,9 @@ For the full selection rules see ARCHITECTURE.md:
 and [configuration examples](ARCHITECTURE.md#2-configuration-examples).
 
 ## Deployment examples
+
+For complete model deployments (engine flags, router flags, prefer vs balanced
+affinity), see [EXAMPLES.md](EXAMPLES.md).
 
 Static workers, plain engines:
 

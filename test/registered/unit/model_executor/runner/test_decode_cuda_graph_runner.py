@@ -40,7 +40,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
@@ -533,6 +533,212 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                     layout.qo_indptr_device, expected.qo_indptr_device
                 )
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
+class TestSkipPrefilledInputs(CustomTestCase):
+    """SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: a pre-planned verify replay skips
+    re-copying input_ids / positions only when they are the very tensors the plan-time
+    load copied; any other source, even with equal values, is copied."""
+
+    def _runner(self):
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.buffers = SimpleNamespace(
+            input_ids=torch.full((8,), -1, dtype=torch.int64),
+            positions=torch.full((8,), -1, dtype=torch.int64),
+        )
+        r.raw_num_token = 3
+        r._prefilled_inputs = None
+        r.num_prefilled_input_skips = 0
+        return r
+
+    def _batch(self):
+        return SimpleNamespace(
+            input_ids=torch.arange(10, 13), positions=torch.arange(3) + 100
+        )
+
+    def _copied(self, r):
+        return r.buffers.input_ids[:3].tolist(), r.buffers.positions[:3].tolist()
+
+    def test_copies_without_a_plan_time_fill(self):
+        r = self._runner()
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_skips_only_the_plan_time_tensors_and_only_once(self):
+        r, fb = self._runner(), self._batch()
+        r._prefilled_inputs = (fb.input_ids, fb.positions)
+        r._copy_replay_inputs(fb)
+        # Untouched: the plan-time load owns these rows.
+        self.assertEqual(self._copied(r), ([-1] * 3, [-1] * 3))
+        # The record is consumed: the next replay copies again.
+        r._copy_replay_inputs(fb)
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_equal_values_from_other_tensors_are_copied(self):
+        r, other = self._runner(), self._batch()
+        r._prefilled_inputs = (other.input_ids, other.positions)
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+
+class _RecordingGlue(mod.MetadataGlueGraph):
+    """SGLang's glue graph, with each key either captured or not yet."""
+
+    def __init__(self, captured_keys=()):
+        super().__init__("cpu")
+        self.captured_keys = set(captured_keys)
+        self.calls = []
+
+    def is_captured(self, key):
+        return key in self.captured_keys
+
+    def replay(self, key):
+        self.calls.append(("replay", key))
+
+    def reinstall(self, key):
+        self.calls.append(("reinstall", key))
+
+    def run(self, attn_backend, fb_view, key):
+        self.calls.append(("run", fb_view, key))
+
+
+class TestReplayAttnMetadataWiring(CustomTestCase):
+    """Each replay's metadata prep: a staged one only reinstalls; a captured glue key
+    replays without the replay view (SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW); before its
+    capture the glue runs on a view; unrouted replays run the eager prep on a view."""
+
+    KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
+
+    def _replay(
+        self,
+        glue,
+        *,
+        raw_bs=2,
+        bs=2,
+        skip=True,
+        staged=False,
+        beam_trie=False,
+        beam_metadata=None,
+    ):
+        runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
+        runner._metadata_glue = glue
+        runner._skip_glued_replay_view = skip
+        runner.enable_two_batch_overlap = False
+        runner.enable_pdmux = False
+        runner.model_runner = SimpleNamespace(lora_manager=None)
+        runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
+        eager = []
+        runner.attn_backend = SimpleNamespace(
+            init_forward_metadata_out_graph=eager.append
+        )
+        runner.buffers = None
+        runner.seq_len_fill_value = 1
+        runner.is_encoder_decoder = False
+        runner._global_num_tokens_for_graph = lambda num_tokens: None
+        if beam_trie:
+            runner._beam_trie_graph_state = SimpleNamespace(levels=torch.arange(16))
+        views = []
+
+        def build_view(**kwargs):
+            views.append(SimpleNamespace(out_cache_loc=None, **kwargs))
+            return views[-1]
+
+        with mock.patch.object(mod, "build_replay_fb_view", build_view):
+            runner._init_replay_attn_metadata(
+                SimpleNamespace(
+                    forward_mode=mod.ForwardMode.TARGET_VERIFY,
+                    beam_trie_levels=object() if beam_trie else None,
+                ),
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=12,
+                glue_key=self.KEY,
+                early_staged=staged,
+                attention_variant=None,
+                **({"beam_metadata": beam_metadata} if beam_trie else {}),
+            )
+        return views, eager
+
+    def test_replay_routes(self):
+        key = self.KEY
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, staged=True)
+        self.assertEqual((glue.calls, views, eager), ([("reinstall", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, skip=False)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue()
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
+
+    def test_trie_metadata_uses_its_staged_buffers_without_glue(self):
+        for staged in (False, True):
+            for metadata in (None, object()):
+                with self.subTest(staged=staged, shared_metadata=metadata is not None):
+                    glue = _RecordingGlue(captured_keys=[self.KEY])
+                    views, eager = self._replay(
+                        glue,
+                        staged=staged,
+                        beam_trie=True,
+                        beam_metadata=metadata,
+                    )
+                    self.assertEqual(glue.calls, [])
+                    self.assertEqual(eager, views)
+                    self.assertEqual(len(views), 1)
+                    torch.testing.assert_close(
+                        views[0].beam_trie_levels, torch.arange(12)
+                    )
+                    self.assertIs(views[0].beam_attention_metadata, metadata)
+
+
+class TestReplayOutputFields(CustomTestCase):
+    def test_slices_trie_normalizer_and_speculative_hidden_states(self):
+        output = mod.LogitsProcessorOutput(
+            next_token_logits=torch.arange(12).reshape(4, 3),
+            hidden_states=torch.arange(8).reshape(4, 2),
+            last_hidden_states=torch.arange(8).reshape(4, 2) + 100,
+            beam_normalizer=torch.arange(4, dtype=torch.float32),
+        )
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(device_timer=None)
+        runner.model_context = contextlib.nullcontext
+        runner._replay_attn_backend = mock.Mock()
+        runner._resolve_shared_read_ends = mock.Mock(return_value=None)
+        runner.load_batch = mock.Mock()
+        runner.backend = SimpleNamespace(
+            replay_session=contextlib.nullcontext,
+            replay=mock.Mock(return_value=output),
+        )
+        runner._replay_graph_key = object()
+        runner._process_output_after_replay = lambda result, _batch: result
+        runner.raw_num_token = 2
+        runner.is_dllm = False
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_LOG_DECODE_GRAPH_KEY": "0"}),
+            mock.patch.object(
+                mod, "device_timer_ctx", return_value=contextlib.nullcontext()
+            ),
+        ):
+            result = runner.execute(
+                SimpleNamespace(forward_mode=mod.ForwardMode.DECODE)
+            )
+        for name in (
+            "next_token_logits",
+            "hidden_states",
+            "last_hidden_states",
+            "beam_normalizer",
+        ):
+            torch.testing.assert_close(getattr(result, name), getattr(output, name)[:2])
 
 
 if __name__ == "__main__":
