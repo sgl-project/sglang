@@ -24,8 +24,16 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    backend = "flashinfer_sparse_mla" if get_platform().is_sm120 else "trtllm"
+    if get_platform().is_sm120:
+        for name in ("dsa_prefill_backend", "dsa_decode_backend"):
+            if getattr(cfg, name) not in (None, backend):
+                raise ValueError(
+                    "SM120 DSA DCP requires flashinfer_sparse_mla for both "
+                    "prefill and decode (partial output and LSE support)."
+                )
     overrides = {
-        name: "trtllm"
+        name: backend
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
         if getattr(cfg, name) is None
     }

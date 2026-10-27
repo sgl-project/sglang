@@ -38,6 +38,9 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
+from sglang.srt.model_executor.runner_backend_utils.cublas_workspace import (
+    prepare_cublas_for_graph_capture,
+)
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 _is_xpu = is_xpu()
@@ -355,6 +358,8 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
+        if not _is_xpu:
+            prepare_cublas_for_graph_capture(get_device_module())
         graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
