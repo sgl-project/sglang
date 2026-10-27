@@ -47,7 +47,7 @@ def validate_replay_state_indices_cpu(
 
     live_in_range = (live >= 0) & (live < num_state_slots)
     if not bool(torch.all(live_in_range)):
-        bad_rows = torch.nonzero(~live_in_range, as_tuple=False).flatten()
+        bad_rows = torch.where(~live_in_range)[0]
         errors.append(
             "live rows must contain in-range slots in "
             f"[0, {num_state_slots}); bad_rows={bad_rows.tolist()} "
@@ -66,7 +66,7 @@ def validate_replay_state_indices_cpu(
 
     bad_padding = padded != pad_slot_id
     if bool(torch.any(bad_padding)):
-        bad_offsets = torch.nonzero(bad_padding, as_tuple=False).flatten()
+        bad_offsets = torch.where(bad_padding)[0]
         errors.append(
             f"padded rows must equal pad_slot_id={pad_slot_id}; "
             f"bad_rows={(bad_offsets + valid_bs).tolist()} "

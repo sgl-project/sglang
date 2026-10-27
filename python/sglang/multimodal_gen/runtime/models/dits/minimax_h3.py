@@ -2718,25 +2718,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             embeddings.zero_()
 
         if local_embedding_layout is None:
-            text_source_ids = torch.nonzero(
-                (text_pos >= row_start) & (text_pos < row_stop),
-                as_tuple=False,
-            ).view(-1)
+            text_source_ids = torch.where(
+                (text_pos >= row_start) & (text_pos < row_stop)
+            )[0]
             text_row_ids = text_pos.index_select(0, text_source_ids) - row_start
             img_global_ids = img_pos.index_select(
                 0,
-                torch.nonzero(
-                    (img_pos >= row_start) & (img_pos < row_stop),
-                    as_tuple=False,
-                ).view(-1),
+                torch.where((img_pos >= row_start) & (img_pos < row_stop))[0],
             )
             img_row_ids = img_global_ids - row_start
             audio_global_ids = audio_pos.index_select(
                 0,
-                torch.nonzero(
-                    (audio_pos >= row_start) & (audio_pos < row_stop),
-                    as_tuple=False,
-                ).view(-1),
+                torch.where((audio_pos >= row_start) & (audio_pos < row_stop))[0],
             )
             audio_row_ids = audio_global_ids - row_start
         else:
