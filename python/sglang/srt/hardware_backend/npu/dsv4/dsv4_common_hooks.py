@@ -192,14 +192,17 @@ def _write_dsv4_tables(
 
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
     """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
     the per-req sidecar on DSV4NPUReqToTokenPool.
 
-    ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
-    ``token_per_req``); the new compressed tokens go at positions
+    ``req_pool_indices_cpu`` must be the batch's host mirror — reading the
+    device tensor here D2H-syncs with the in-flight forward. ``seq_lens_cpu``
+    is the POST-decode seq len (already incremented by ``token_per_req``);
+    the new compressed tokens go at positions
     ``[(old_seq) // ratio, (new_seq) // ratio)``.
     """
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
@@ -213,7 +216,6 @@ def maybe_write_dsv4_decode(
         return
 
     prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
-    req_pool_indices_cpu = batch.req_pool_indices.cpu()
 
     _write_per_req_slice(
         req_to_token_pool.write_c128,
