@@ -544,6 +544,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = get_observability().enable_trace
         self.allow_auto_truncate = get_serving().allow_auto_truncate
+        self.clamp_max_new_tokens_to_context = (
+            get_serving().clamp_max_new_tokens_to_context
+        )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
@@ -1366,6 +1369,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.sampling_params["max_new_tokens"] = max(
                     0, _max_req_len - input_token_num
                 )
+            elif self.clamp_max_new_tokens_to_context:
+                # The prompt fit the context above, so at least one token remains.
+                obj.sampling_params["max_new_tokens"] = _max_req_len - input_token_num
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
