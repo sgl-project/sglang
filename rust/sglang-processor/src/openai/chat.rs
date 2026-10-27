@@ -1118,7 +1118,7 @@ impl ChatResponder {
             let delta = deepseek
                 .request
                 .parser()
-                .finish(&output_ids(item), deepseek_finish(finish));
+                .finish(output_ids(item), deepseek_finish(finish));
             let calls = delta
                 .whole_tool_calls()
                 .into_iter()
@@ -1330,19 +1330,16 @@ impl ChatResponder {
             .parsers
             .entry(index)
             .or_insert_with(|| deepseek.request.parser());
-        let output_ids = output_ids(content);
         let ids = select_new_output_ids(
-            &output_ids,
+            output_ids(content),
             parser.num_consumed_tokens(),
             meta.completion_tokens as usize,
             finish_type == Some("abort"),
             self.settings.incremental_streaming_output,
         );
-        let delta = match finish_type {
-            None => parser.feed(ids),
-            Some(_) => parser.finish(ids, deepseek_finish(meta.finish_reason.as_ref())),
-        };
-        if !delta.tool_calls.is_empty() {
+        let finish = finish_type.map(|_| deepseek_finish(meta.finish_reason.as_ref()));
+        let delta = parser.step(ids, finish);
+        if parser.has_tool_calls() {
             self.has_tool_calls.insert(index);
         }
         delta
@@ -1534,11 +1531,8 @@ impl ChatResponder {
 }
 
 #[cfg(feature = "render")]
-fn output_ids(item: &GenerateResponse) -> Vec<u32> {
-    let ids = item.output_ids.as_ref().map_or(&[][..], |ids| &ids.ids);
-    ids.iter()
-        .filter_map(|&id| u32::try_from(id).ok())
-        .collect()
+fn output_ids(item: &GenerateResponse) -> &[i64] {
+    item.output_ids.as_ref().map_or(&[], |ids| &ids.ids)
 }
 
 /// The engine's finish reason as recipe's parser takes it; a type other than

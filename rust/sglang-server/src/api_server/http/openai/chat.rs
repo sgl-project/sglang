@@ -574,7 +574,7 @@ pub(super) async fn unary_chat(
         let (reasoning_text, content, tool_calls) = match &deepseek {
             Some(deepseek) => {
                 let delta = deepseek.parser().finish(
-                    &u32_ids(&output.token_ids),
+                    &output.token_ids,
                     deepseek_finish(output.finish_reason.as_ref()),
                 );
                 let calls = delta.whole_tool_calls().into_iter().map(|call| {
@@ -691,11 +691,10 @@ pub(super) fn chat_event_stream(
                 vec![]
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
-        // One recipe parser per choice, and whether it parsed a tool call.
+        // One recipe parser per choice.
         let mut deepseek_parsers: Vec<_> = (0..count)
             .map(|_| deepseek.as_ref().map(DeepSeekRequestOutput::parser))
             .collect();
-        let mut has_tool_calls = vec![false; count];
 
         for (index, call) in submitted {
             streams.push(indexed_decode_stream(index, call));
@@ -747,15 +746,11 @@ pub(super) fn chat_event_stream(
             // reasoning chunk first (logprobs ride it), then the content chunk.
             let mut emitted = Vec::with_capacity(2);
             if let Some(parser) = deepseek_parsers[index].as_mut() {
-                let ids = u32_ids(&output.token_ids);
-                let delta = match finish_reason {
-                    None => parser.feed(&ids),
-                    Some(_) => parser.finish(&ids, deepseek_finish(output.finish_reason.as_ref())),
-                };
-                has_tool_calls[index] |= !delta.tool_calls.is_empty();
+                let finish = finish_reason.map(|_| deepseek_finish(output.finish_reason.as_ref()));
+                let delta = parser.step(&output.token_ids, finish);
                 let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 emitted = deepseek_choices(index, delta, logprobs);
-                if has_tool_calls[index] && finish_reason == Some(OpenAIFinishReason::Stop) {
+                if parser.has_tool_calls() && finish_reason == Some(OpenAIFinishReason::Stop) {
                     finish_reason = Some(OpenAIFinishReason::ToolCalls);
                 }
             } else if reasoning_enabled {
@@ -981,12 +976,6 @@ fn deepseek_finish(reason: Option<&FinishReason>) -> DeepSeekFinish<'_> {
         Some(FinishReason::Known(FinishKind::Length { .. })) => DeepSeekFinish::Length,
         _ => DeepSeekFinish::Abort,
     }
-}
-
-fn u32_ids(ids: &[i64]) -> Vec<u32> {
-    ids.iter()
-        .filter_map(|&id| u32::try_from(id).ok())
-        .collect()
 }
 
 fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {

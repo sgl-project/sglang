@@ -243,13 +243,26 @@ impl DeepSeekOutputParser {
         self.num_consumed_tokens
     }
 
+    /// Whether the parse has named a tool call.
+    pub fn has_tool_calls(&self) -> bool {
+        self.next_tool_call_index > 0
+    }
+
+    /// One engine chunk's new ids, with its finish when it is the last.
+    pub fn step(&mut self, token_ids: &[i64], finish: Option<DeepSeekFinish<'_>>) -> DeepSeekDelta {
+        match finish {
+            None => self.feed(token_ids),
+            Some(finish) => self.finish(token_ids, finish),
+        }
+    }
+
     /// One intermediate engine chunk's new ids.
-    pub fn feed(&mut self, token_ids: &[u32]) -> DeepSeekDelta {
+    pub fn feed(&mut self, token_ids: &[i64]) -> DeepSeekDelta {
         self.num_consumed_tokens += token_ids.len();
         if self.finished {
             return DeepSeekDelta::default();
         }
-        self.pending_ids.extend_from_slice(token_ids);
+        self.pending_ids.extend(vocab_ids(token_ids));
         let ready = self.release_pending_ids();
         if ready.is_empty() {
             return DeepSeekDelta::default();
@@ -273,13 +286,13 @@ impl DeepSeekOutputParser {
     }
 
     /// The last engine chunk: its ids, less the matched stop, and its reason.
-    pub fn finish(&mut self, token_ids: &[u32], finish: DeepSeekFinish<'_>) -> DeepSeekDelta {
+    pub fn finish(&mut self, token_ids: &[i64], finish: DeepSeekFinish<'_>) -> DeepSeekDelta {
         self.num_consumed_tokens += token_ids.len();
         if self.finished {
             return DeepSeekDelta::default();
         }
         let mut ids = std::mem::take(&mut self.pending_ids);
-        ids.extend_from_slice(token_ids);
+        ids.extend(vocab_ids(token_ids));
         match finish {
             DeepSeekFinish::Stop(Some(StopMatch::Text(stop))) => {
                 ids = self.cut_at_stop_string(ids, stop);
@@ -431,16 +444,21 @@ impl DeepSeekOutputParser {
     }
 }
 
+/// The engine's output ids as the tokenizer's vocabulary ids.
+fn vocab_ids(ids: &[i64]) -> impl Iterator<Item = u32> + '_ {
+    ids.iter().filter_map(|&id| u32::try_from(id).ok())
+}
+
 /// `select_new_output_ids`: the ids a `/generate` chunk adds. Intermediate
 /// cumulative chunks share the live output list, so `completion_tokens` bounds
 /// this chunk's snapshot; an incremental abort chunk re-sends streamed ids.
 pub fn select_new_output_ids(
-    output_ids: &[u32],
+    output_ids: &[i64],
     num_consumed_tokens: usize,
     completion_tokens: usize,
     abort: bool,
     incremental: bool,
-) -> &[u32] {
+) -> &[i64] {
     if !incremental {
         let end = completion_tokens.min(output_ids.len());
         return output_ids.get(num_consumed_tokens..end).unwrap_or_default();
