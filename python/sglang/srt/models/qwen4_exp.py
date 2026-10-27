@@ -1594,6 +1594,7 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
+                ffn_combine_mix=self.mlp_hyper_connection.seam_combine_mix,
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
