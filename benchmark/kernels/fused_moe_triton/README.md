@@ -153,6 +153,29 @@ After tuning, configuration files will be generated:
 
 Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_version/` directory to use them in SGLang.
 
+#### AMD Strix Halo / gfx1151 W4A16
+
+For `Qwen3.5-35B-A3B-AWQ-4bit` on a Radeon 8060S, use the Triton path rather than the CDNA-oriented AITER/FlashInfer path:
+
+```bash
+SGLANG_AWQ_MOE_TRITON_ROCM=1 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --no-ray \
+    --model /models/Qwen3.5-35B-A3B-AWQ-4bit \
+    --tp-size 1 \
+    --dtype int4_w4a16 \
+    --batch-sizes 1 2 4 8 16 32 64 128 \
+    --tune
+```
+
+The packed W4A16 `w2` dimension is used for the `N` portion of the runtime filename. The resulting gfx1151 files are:
+
+```text
+E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json
+E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16_down.json
+```
+
+The Strix Halo tuning pass searched 72 representative ROCm configurations and all eight batch sizes above. It produced per-batch maps for the up projection; the down file currently reuses the same validated map without enabling TMA. The local `--no-ray` mode is recommended for a single-GPU Strix Halo. The checked-in map improved direct fused-MoE kernel time by 23.1%–40.9% across the eight tested batch sizes on the validation machine; repeat tuning when the Triton/ROCm version or GPU changes.
+
 ### Supported Models
 
 - **Mixtral**: mistralai/Mixtral-8x7B-Instruct-v0.1, mixtral-8x22b
@@ -170,7 +193,7 @@ Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/trito
 - `--model`: HuggingFace model name or local path
 - `--tp-size`: Tensor parallelism size (default: 2)
 - `--ep-size`: Expert parallelism size (default: 1, can be combined with TP mode, ensure tp_size is divisible by ep_size)
-- `--dtype`: Data type (`auto`, `fp8_w8a8`, `int8_w8a16`, `int8_w8a8`)
+- `--dtype`: Data type (`auto`, `fp8_w8a8`, `int8_w8a16`, `int8_w8a8`, `int4_w4a16`)
 - `--batch-size`: Specific batch size for tuning (optional)
 - `--tune`: Enable tuning mode
 - `--per-channel-quant`: Enable per-channel quantization

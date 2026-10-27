@@ -241,8 +241,7 @@ def benchmark_config(
     return avg
 
 
-@ray.remote(num_gpus=1)
-class BenchmarkWorker:
+class _BenchmarkWorker:
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
@@ -276,11 +275,11 @@ class BenchmarkWorker:
             use_fp8_w8a8=use_fp8_w8a8,
             use_int4_w4a16=use_int4_w4a16,
         )
-        # NOTE(woosuk): The current naming convention uses w2.shape[2], which
-        # is the intermediate size after silu_and_mul.
+        # The config loader names N from the packed w2 shape. W4A16 packs
+        # two int4 values per byte, so use the packed intermediate dimension.
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        N = shard_intermediate_size // 2
+        N = shard_intermediate_size // (4 if use_int4_w4a16 else 2)
         op_config = get_moe_configs(
             num_experts,
             N,
@@ -374,6 +373,11 @@ class BenchmarkWorker:
         return best_config
 
 
+@ray.remote(num_gpus=1)
+class BenchmarkWorker(_BenchmarkWorker):
+    pass
+
+
 def main(args: argparse.Namespace):
     server_args = ServerArgs(
         model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
@@ -403,20 +407,26 @@ def main(args: argparse.Namespace):
     else:
         batch_sizes = get_default_batch_sizes()
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+    if args.no_ray:
+        worker = _BenchmarkWorker(args.seed, server_args)
 
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            return [getattr(worker, method)(*input_args) for input_args in inputs]
+    else:
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
 
     if args.tune:
         if args.search_space_file:
@@ -435,7 +445,7 @@ def main(args: argparse.Namespace):
             search_space = [
                 config
                 for config in search_space
-                if block_k % config["BLOCK_SIZE_K"] == 0
+                if config["BLOCK_SIZE_K"] % block_k == 0
             ]
 
         filename = get_config_filename(
@@ -539,6 +549,11 @@ if __name__ == "__main__":
         help="Tune or benchmark an explicit set of token counts in parallel.",
     )
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--no-ray",
+        action="store_true",
+        help="Run all batch sizes sequentially in the current process instead of using Ray.",
+    )
     parser.add_argument(
         "--search-space-file",
         type=str,

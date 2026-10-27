@@ -318,9 +318,10 @@ def get_config_filename(
         use_int4_w4a16=use_int4_w4a16,
     )
 
-    # NOTE(woosuk): The current naming convention uses w2.shape[2], which
-    # is the intermediate size after silu_and_mul.
-    N = shard_intermediate_size // 2
+    # The config loader names N from the packed w2.shape[2]. For W4A16,
+    # two int4 weights are packed into each byte, so the packed K dimension
+    # is half the non-int4 value used by the benchmark tensors.
+    N = shard_intermediate_size // (4 if use_int4_w4a16 else 2)
 
     filename = get_config_file_name(
         num_experts,
