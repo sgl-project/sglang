@@ -396,7 +396,7 @@ def build_tree_kernel_efficient_func(
         )
     elif _is_xpu:
         xpu_build_tree, xpu_tree_mask = sgl_build_tree_kernel_triton, tree_mask
-        if envs.SGLANG_ENABLE_SPEC_OPTIMIZED.get():
+        if envs.SGLANG_XPU_USE_SYCL.get():
             from sgl_kernel import build_tree_kernel_efficient as xpu_build_tree
 
             # The SYCL op only takes bool; the triton attention backend's
@@ -545,7 +545,7 @@ def verify_tree_greedy_func(
         )
     elif _is_xpu:
         xpu_verify_tree_greedy = verify_tree_greedy_triton
-        if envs.SGLANG_ENABLE_SPEC_OPTIMIZED.get():
+        if envs.SGLANG_XPU_USE_SYCL.get():
             from sgl_kernel import verify_tree_greedy as xpu_verify_tree_greedy
 
         # Positional: the sgl_kernel op spells these args `retrive_*`.

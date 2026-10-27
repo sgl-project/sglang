@@ -1592,7 +1592,7 @@ class Envs:
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
     # XPU only: Enable sycl kernels instead of triton for Speculative execution.
-    SGLANG_ENABLE_SPEC_OPTIMIZED = EnvBool(False)
+    SGLANG_XPU_USE_SYCL = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

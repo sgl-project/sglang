@@ -1,4 +1,4 @@
-"""SGLANG_ENABLE_SPEC_OPTIMIZED routes XPU EAGLE tree building and greedy tree
+"""SGLANG_XPU_USE_SYCL routes XPU EAGLE tree building and greedy tree
 verify to the sgl-kernel-xpu SYCL kernels, which must stay bit-identical to Triton."""
 
 import itertools
@@ -61,7 +61,7 @@ def _draft_tree(bs, topk, steps, num_verify, gen):
 
 def _build(use_sycl, tree, topk, steps, num_verify, mode, tree_mask_buf=None):
     bonus_tokens, parent_list, top_scores_index, draft_tokens, seq_lens = tree
-    with envs.SGLANG_ENABLE_SPEC_OPTIMIZED.override(use_sycl):
+    with envs.SGLANG_XPU_USE_SYCL.override(use_sycl):
         return build_tree_kernel_efficient(
             bonus_tokens=bonus_tokens,
             parent_list=parent_list,
@@ -101,7 +101,7 @@ def _target_predict(candidates, retrieve_next_token, retrieve_next_sibling, gen)
 def _verify(use_sycl, candidates, retrieve, target_predict, depth):
     bs, num_verify = candidates.shape
     retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve
-    with envs.SGLANG_ENABLE_SPEC_OPTIMIZED.override(use_sycl):
+    with envs.SGLANG_XPU_USE_SYCL.override(use_sycl):
         return verify_tree_greedy_func(
             predicts=torch.zeros(bs * num_verify, dtype=torch.int32, device=DEVICE),
             accept_index=torch.full((bs, depth), -1, dtype=torch.int32, device=DEVICE),
@@ -127,7 +127,16 @@ def _verify_inputs(topk, steps, num_verify, bs, gen):
 class TestSpecBuildTreeSycl(CustomTestCase):
     # (topk, spec_steps, num_verify_tokens, bs): chain, small tree, the
     # B60-tuned topk=4 tree, and topk=8 where num_verify < nodes in the tree.
-    CONFIGS = [(1, 3, 4, 3), (2, 3, 6, 3), (4, 5, 8, 8), (8, 5, 16, 4)]
+    # 64 is the largest tree on the SYCL kernels' fast paths; 129 takes both
+    # fallbacks (build_tree scan above 64 nodes, verify SLM above 128).
+    CONFIGS = [
+        (1, 3, 4, 3),
+        (2, 3, 6, 3),
+        (4, 5, 8, 8),
+        (8, 5, 16, 4),
+        (8, 5, 64, 4),
+        (8, 5, 129, 2),
+    ]
     MODES = [TreeMaskMode.FULL_MASK, TreeMaskMode.QLEN_ONLY]
 
     def test_sycl_matches_triton(self):
