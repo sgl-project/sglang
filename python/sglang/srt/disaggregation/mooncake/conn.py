@@ -267,7 +267,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         staging_resource=None,
     ):
         self.staging_resource = staging_resource
-        self._teardown_complete = False
         enable_custom_mem_pool, custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
@@ -446,12 +445,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def teardown(self) -> None:
         """Stop worker threads and release transport resources so this
         KVManager can be discarded during a P<->D role switch.
+        Each manager is torn down once; a role switch creates a new manager.
 
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mooncake-side registrations / sockets are released.
         """
-        if getattr(self, "_teardown_complete", False):
-            return
         resource = getattr(self, "staging_resource", None)
         self._stopped = True
 
@@ -564,7 +562,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             resource.release(self.disaggregation_mode.value)
             self._staging_ctx = None
             self.kv_buffer_tensors = None
-        self._teardown_complete = True
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",

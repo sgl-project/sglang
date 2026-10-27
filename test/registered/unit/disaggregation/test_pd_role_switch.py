@@ -1163,13 +1163,12 @@ class TestMooncakeStagingResource(unittest.TestCase):
         self.assertIsNotNone(r.backing)
         m.deregister_buffer_to_engine.assert_not_called()
 
-    def test_manager_teardown_does_not_release_next_roles_lease(self):
+    def test_manager_teardown_releases_resource_for_next_role(self):
         r = self.resource()
         m = self.manager(r)
         m.teardown()
         r.engine.batch_deregister.assert_not_called()
         r.acquire("decode")
-        m.teardown()  # Must not release the next manager's lease.
         self.assertEqual(r.active_role, "decode")
         r.release("decode")
         r.close()
