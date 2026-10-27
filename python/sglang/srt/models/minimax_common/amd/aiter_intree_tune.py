@@ -4,7 +4,7 @@ for, and where aiter has a row a measured kernel beats, the row carries aiter's 
 ``base_*`` columns and replaces it only while aiter still picks that kernel.
 
 * a8w8 blockscale bpreshuffle: the block-fp8 copy of the MXFP8 projections above
-  ``MXFP8_DENSE_PTPC_DECODE_MAX_M`` rows, up to M = 32768, and the DSpark context-K/V GEMM.
+  ``MXFP8_DENSE_PTPC_DECODE_MAX_M`` rows, up to M = 32768.
 * a8w8 bpreshuffle: their rowwise-fp8 copy at decode sizes, (split-K) FlyDSL where >= 3%
   faster than aiter's minimax_m3 rows with cold weights.
 * bf16: lm_head (50016 x 6144) and the DSpark fc (1536 x 30720) up to M = 1024. Its hipBLASLt
