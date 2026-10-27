@@ -21,6 +21,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.linear.kda_prefill_graph import (
+    KDAPrefillGraphMetadata,
+    KDAPrefillTrackRows,
+    build_track_rows,
+)
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -42,7 +47,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_spec,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
@@ -76,6 +86,7 @@ class MambaAttnBackendBase(AttentionBackend):
     # Most sequences the prefill graph tables hold (larger batches replay no
     # graph); set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
+    prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -124,14 +135,100 @@ class MambaAttnBackendBase(AttentionBackend):
         return False
 
     def prefill_graph_extend_active(self) -> bool:
-        """Whether the extend being captured or replayed runs on those tables."""
-        return False
+        return self.prefill_graph_metadata is not None
 
-    def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
-        raise NotImplementedError()
+    def init_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> KDAPrefillGraphMetadata:
+        cache_indices = self._prefill_graph_cache_indices(forward_batch)
+        meta = KDAPrefillGraphMetadata.allocate(
+            # KDA sees global sequence order, even when CP positions are local.
+            num_tokens=forward_batch.extend_num_tokens,
+            max_seqs_cap=self.prefill_graph_max_seqs,
+            # Any replay of this bucket may carry prefix-cache snapshots (the
+            # extra buffer is only on with the radix cache).
+            track=get_exec().mamba.enable_mamba_extra_buffer,
+            cache_index_dtype=cache_indices.dtype,
+            device=self.device,
+            flashinfer_wrapper_cls=getattr(
+                self.kernel_dispatcher.extend_kernel, "prefill_graph_wrapper_cls", None
+            ),
+        )
+        self._fill_prefill_graph_metadata(
+            meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
+        )
+        return meta
 
-    def refresh_prefill_graph_metadata(self, meta, forward_batch: ForwardBatch):
-        raise NotImplementedError()
+    def refresh_prefill_graph_metadata(
+        self, meta: KDAPrefillGraphMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        self._fill_prefill_graph_metadata(
+            meta=meta,
+            forward_batch=forward_batch,
+            cache_indices=self._prefill_graph_cache_indices(forward_batch),
+        )
+
+    def _prefill_graph_cache_indices(self, forward_batch: ForwardBatch):
+        # Same slot resolution as MambaAttnBackendBase._forward_metadata.
+        cache_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        real_bs = forward_batch._original_batch_size
+        if real_bs is not None and real_bs < cache_indices.shape[0]:
+            cache_indices = cache_indices.clone()
+            cache_indices[real_bs:] = -1
+        return cache_indices
+
+    def _fill_prefill_graph_metadata(
+        self,
+        *,
+        meta: KDAPrefillGraphMetadata,
+        forward_batch: ForwardBatch,
+        cache_indices: torch.Tensor,
+    ) -> None:
+        if forward_batch.mamba_track_indices is not None:
+            # Same one-time in-place translation as the eager metadata path.
+            forward_batch.mamba_track_indices = self._translate_mamba_indices(
+                forward_batch.mamba_track_indices
+            )
+        track_rows = None
+        if forward_batch.mamba_track_mask is not None:
+            assert meta.track, (
+                "prefix-cache track batch replayed on a bucket captured without "
+                "track tables"
+            )
+            track_rows = self._prefill_graph_track_rows(forward_batch)
+        meta.fill(
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            cache_indices=cache_indices,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            track_rows=track_rows,
+        )
+        self.prefill_graph_metadata = meta
+
+    def _prefill_graph_track_rows(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[KDAPrefillTrackRows]:
+        bs = forward_batch.batch_size
+        if self._has_cpu_prefill_track_metadata(forward_batch):
+            track_mask = list(forward_batch.mamba_prefill_track_mask_cpu)
+            track_seq_lens = list(forward_batch.mamba_track_seqlens_cpu)
+            extend_prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
+        else:
+            # The same host copies the eager path takes without CPU metadata.
+            track_mask = forward_batch.mamba_track_mask[:bs].tolist()
+            track_seq_lens = forward_batch.mamba_track_seqlens[:bs].tolist()
+            extend_prefix_lens = forward_batch.extend_prefix_lens[:bs].tolist()
+        return build_track_rows(
+            track_mask=track_mask,
+            track_seq_lens=track_seq_lens,
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            extend_prefix_lens=extend_prefix_lens,
+            state_chunk_size=self.mamba_chunk_size,
+            cache_chunk_size=mamba_cache_chunk_size(),
+            conv_len=self.conv_states_shape[-1],
+            dst=forward_batch.mamba_track_indices,
+        )
 
     @property
     def mamba_chunk_size(self) -> int:

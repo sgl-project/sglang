@@ -12,6 +12,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+    MAX_FUSED_QKV_SPLIT_DIM,
+    gdn_extend_in_graph,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -43,7 +47,6 @@ if is_cuda() or is_hip() or is_xpu():
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
-MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -523,6 +526,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
+        self.prefill_graph_max_seqs = min(
+            self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
+        )
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
@@ -547,6 +553,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         self._use_strided_target_verify_qkv = False
 
+    def supports_prefill_graph_extend(self) -> bool:
+        state = self.req_to_token_pool.mamba_pool.mamba_cache
+        return (
+            is_cuda()
+            and not envs.SGLANG_DISABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and not self.enable_mis
+            and state.temporal.is_contiguous()
+            and state.conv[0].is_contiguous()
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -556,6 +573,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._init_target_verify_qkv_routing(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
@@ -955,6 +973,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        if self.prefill_graph_metadata is not None:
+            state = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            return gdn_extend_in_graph(
+                layer=layer,
+                metadata=self.prefill_graph_metadata,
+                conv_states=state.conv[0],
+                ssm_states=state.temporal,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         seq_len = mixed_qkv.shape[0]
 
         if _is_hip and seq_len == 0:
