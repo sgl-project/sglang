@@ -168,6 +168,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.max_total_num_tokens = 64
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
+        scheduler.tree_cache = SimpleNamespace()
         scheduler.page_size = 64
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
@@ -186,6 +187,21 @@ class TestLocalKvEventSources(CustomTestCase):
                 )
         publisher.describe_local_source.assert_called_once_with(256)
 
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        source = {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://worker-a:29017",
+        }
+        cache_controller = HiCacheController.__new__(HiCacheController)
+        cache_controller.storage_backend = SimpleNamespace(
+            get_kv_hint_source=lambda: source
+        )
+        scheduler.tree_cache.cache_controller = cache_controller
+        with get_context().override_server_args(grpc_port=None):
+            self.assertEqual(scheduler.get_init_info()["kv_hint_sources"], [source])
+
     def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
 
@@ -193,6 +209,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.env_lock = threading.Lock()
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
+        controller.local_kv_hint_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
@@ -204,6 +221,14 @@ class TestLocalKvEventSources(CustomTestCase):
                         "max_total_num_tokens": 64,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
+                        "kv_hint_sources": [
+                            {
+                                "dp_rank": source["dp_rank"],
+                                "capabilities": ["router_hint"],
+                                "source_control_endpoint": source["endpoint"],
+                            }
+                            for source in sources
+                        ],
                     }
                 )
             )
@@ -237,6 +262,9 @@ class TestLocalKvEventSources(CustomTestCase):
             )
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
+        )
+        self.assertEqual(
+            [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
         )
 
 

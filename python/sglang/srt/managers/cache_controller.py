@@ -678,6 +678,13 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
             raise
 
+    def get_kv_hint_sources(self):
+        """Expose backend-owned resolved coordinates without initializing IO."""
+        if self.storage_backend is None:
+            return []
+        source = self.storage_backend.get_kv_hint_source()
+        return [] if source is None else [source]
+
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 

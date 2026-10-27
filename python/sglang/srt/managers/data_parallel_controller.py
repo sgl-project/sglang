@@ -233,6 +233,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.local_kv_event_sources = []
+        self.local_kv_hint_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -809,6 +810,11 @@ class DataParallelController:
                 for info in scheduler_info
                 for source in info.get("kv_event_sources", [])
             )
+            self.local_kv_hint_sources.extend(
+                source
+                for info in scheduler_info
+                for source in info.get("kv_hint_sources", [])
+            )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -962,6 +968,7 @@ def run_data_parallel_controller_process(
             "max_total_num_tokens": controller.max_total_num_tokens,
             "max_req_input_len": controller.max_req_input_len,
             "startup_time": controller.startup_time,
+            "kv_hint_sources": controller.local_kv_hint_sources,
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
         if get_serving().grpc_port is not None and not (

@@ -203,6 +203,15 @@ class HiCacheStorage(ABC):
     # before admission and retain the resulting claim until storage delivery.
     requires_lookup_confirmation = False
 
+    def get_kv_hint_source(self) -> Optional[dict]:
+        """Return resolved control coordinates for this rank, without starting IO.
+
+        This optional discovery contract describes configured addresses, not
+        socket readiness or cache residency. Backends without router hints
+        return None. Only the owner rank of a shared source should report it.
+        """
+        return None
+
     def confirm_lookup(
         self,
         keys: List[str],

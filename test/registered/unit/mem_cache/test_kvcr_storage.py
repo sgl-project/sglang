@@ -8,8 +8,7 @@ import sys
 import types
 import unittest
 from array import array
-from contextlib import ExitStack
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from enum import Enum
 from pathlib import Path
 from queue import Queue
@@ -35,6 +34,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
+from sglang.srt.mem_cache.storage.kvcr.endpoints import control_address
 from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     block_key,
@@ -319,6 +319,50 @@ class TestKVCRStorage(CustomTestCase):
         )
         self.stub.start()
         self.addCleanup(self.stub.stop)
+
+    def test_hint_source_uses_backend_resolved_address_without_starting_io(self):
+        config = copy.copy(self.config)
+        config.dp_rank, config.attn_cp_size = 2, 2
+        config.extra_config = {
+            "control_advertise_host": "2001:db8::1",
+            "control_port": 29017,
+        }
+        backend = KVCRStore(config, self.pool)
+        self.addCleanup(backend.close)
+        source = backend.get_kv_hint_source()
+        self.assertEqual(
+            source,
+            {
+                "dp_rank": 2,
+                "capabilities": ["router_hint"],
+                "source_control_endpoint": "tcp://[2001:db8::1]:29025",
+            },
+        )
+        host, port = control_address(config, backend._extra)
+        self.assertEqual(source["source_control_endpoint"], f"tcp://{host}:{port}")
+        self.assertIsNone(backend._runner)
+        backend._extra["enable_remote_hint"] = False
+        self.assertIsNone(backend.get_kv_hint_source())
+        backend._extra.pop("enable_remote_hint")
+        backend._extra.pop("control_advertise_host")
+        self.assertIsNone(backend.get_kv_hint_source())
+        backend._extra["control_advertise_host"] = "worker-a"
+        backend._offset = 1
+        self.assertIsNone(backend.get_kv_hint_source())
+
+    def test_hint_source_rejects_invalid_advertised_coordinates(self):
+        for extra in (
+            {"control_advertise_host": "0.0.0.0"},
+            {"control_advertise_host": "tcp://worker-a"},
+            {"control_advertise_host": "worker-a", "control_port": True},
+            {"control_advertise_host": "worker-a", "control_port": 65535},
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                config = copy.copy(self.config)
+                config.dp_rank, config.extra_config = 1, extra
+                backend = KVCRStore(config, self.pool)
+                self.addCleanup(backend.close)
+                backend.get_kv_hint_source()
 
     def test_confirmed_mamba_boundary_is_not_shortened_by_host_capacity(self):
         """A full-boundary Mamba claim cannot validate a smaller KV staging cut.
