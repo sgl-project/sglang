@@ -40,7 +40,6 @@
 --enable-session-radix-cache
 --enable-shared-experts-attn-tp
 --enable-tp-lm-head-all-to-all
---enable-unified-cache-external-linker
 --enable-w4a4-mxfp4-megamoe
 --flexkv-config-file
 --fuseep-mode
@@ -86,7 +85,6 @@
 --swa-prefix-tails
 --trust-mm-content-hashes
 --trust-request-chat-template
---unified-cache-external-linker-backend
 --uno-lora-path
 --weight-cache-mode
 --weight-cache-socket

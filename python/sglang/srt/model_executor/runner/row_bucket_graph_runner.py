@@ -20,6 +20,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.forward_batch_info import (
+    compute_local_num_token_non_padded_cpu,
+)
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_attn_backend,
@@ -52,13 +55,27 @@ def _no_scope(batch: ForwardBatch, inputs: List[torch.Tensor]) -> ContextManager
     return nullcontext()
 
 
+def _pack_token_counts(local_rows: int, global_rows: int) -> int:
+    assert 0 <= local_rows <= global_rows < 2**31, (local_rows, global_rows)
+    return (global_rows << 32) | local_rows
+
+
 class _Graph:
-    __slots__ = ("graph", "num_token_non_padded", "outputs", "batch")
+    __slots__ = (
+        "graph",
+        "num_token_non_padded",
+        "global_num_token_non_padded",
+        "packed_token_counts",
+        "outputs",
+        "batch",
+    )
 
     def __init__(self, graph, num_token_non_padded, outputs, batch):
         self.graph = graph
         # MoE top-k masks rows at or past this count; captured by address.
         self.num_token_non_padded = num_token_non_padded
+        self.global_num_token_non_padded = None
+        self.packed_token_counts = None
         self.outputs = outputs
         # Kernels write buffers cached on the capture batch and attention metadata.
         self.batch = batch
@@ -105,23 +122,32 @@ class RowBucketGraphRunner:
         batch_scope: BatchScope = _no_scope,
         bucket_from: Optional[int] = None,
         out_rows: Optional[int] = None,
+        global_num_rows: Optional[int] = None,
     ) -> List[Optional[torch.Tensor]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
         it on first use. ``key`` names what besides row count and input shapes
         changes the recording; ``context`` and ``batch_scope`` wrap capture and
         replay with the breaks' and the body's batch; ``bucket_from`` picks the
         bucket from another row count. Returns views valid until the next replay,
-        cut to ``out_rows`` rows."""
+        cut to ``out_rows`` rows. ``global_num_rows`` opts into a separate GLOBAL
+        device count and localizes the LOCAL count for the bucket's TP shards."""
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
         rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
         assert rows is not None, (num_rows, bucket_from)
+        if global_num_rows is not None:
+            assert 0 <= global_num_rows <= rows, (global_num_rows, rows)
         # Inputs of one shape share their static buffers across keys.
         input_key = tuple((t.dtype, t.shape[1:]) for t in live)
         static = self._static_inputs(input_key, live)
         for buf, t in zip(static, live):
             buf[:num_rows].copy_(t)
-        graph_key = (key, input_key)
+        count_key = (
+            forward_batch.num_token_non_padded is not None,
+            global_num_rows is not None,
+            forward_batch.attn_tp_sequence_sharded,
+        )
+        graph_key = (key, input_key, count_key)
         # The eager breaks read the step's real row count off this view.
         step_batch = copy.copy(forward_batch)
         step_batch.global_num_token_non_padded_cpu = num_rows
@@ -140,12 +166,32 @@ class RowBucketGraphRunner:
                 for r in range(self.max_rows, rows - 1, -self.row_step):
                     if (r, graph_key) not in self._graphs:
                         self._graphs[(r, graph_key)] = self._capture(
-                            r, num_rows, static, forward_batch, body, batch_scope
+                            r,
+                            num_rows,
+                            static,
+                            forward_batch,
+                            body,
+                            batch_scope,
+                            global_num_rows=global_num_rows,
                         )
             graph = self._graphs[(rows, graph_key)]
+            if graph.packed_token_counts is not None:
+                local_rows = compute_local_num_token_non_padded_cpu(
+                    global_num_token_non_padded=global_num_rows,
+                    num_tokens_per_dp=rows,
+                    sharded=step_batch.attn_tp_sequence_sharded,
+                )
+                graph.packed_token_counts.fill_(
+                    _pack_token_counts(local_rows, global_num_rows)
+                )
+                step_batch.global_num_token_non_padded = (
+                    graph.global_num_token_non_padded
+                )
+                step_batch.num_token_non_padded = graph.num_token_non_padded
+            elif graph.num_token_non_padded is not None:
+                graph.num_token_non_padded.fill_(num_rows)
+                step_batch.num_token_non_padded = graph.num_token_non_padded
             with batch_scope(step_batch, [buf[:rows] for buf in static]):
-                if graph.num_token_non_padded is not None:
-                    graph.num_token_non_padded.fill_(num_rows)
                 with graph_pool_replay_scope():
                     graph.graph.replay()
         return [None if t is None else t[:out_rows] for t in graph.outputs]
@@ -166,6 +212,8 @@ class RowBucketGraphRunner:
         forward_batch: ForwardBatch,
         body: Body,
         batch_scope: BatchScope,
+        *,
+        global_num_rows: Optional[int] = None,
     ) -> _Graph:
         start = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
@@ -174,8 +222,43 @@ class RowBucketGraphRunner:
         # Host-side row counts read during capture cover the whole bucket.
         capture_batch = copy.copy(forward_batch)
         capture_batch.global_num_token_non_padded_cpu = rows
+        packed_token_counts = None
+        global_num_token_non_padded = None
         num_token_non_padded = None
-        if forward_batch.num_token_non_padded is not None:
+        if global_num_rows is not None:
+            assert 0 <= global_num_rows <= rows, (global_num_rows, rows)
+            for count in (
+                forward_batch.num_token_non_padded,
+                forward_batch.global_num_token_non_padded,
+            ):
+                assert count is not None and count.dtype == torch.int32
+                assert count.shape in ((), (1,)), count.shape
+            assert (
+                forward_batch.num_token_non_padded.device
+                == forward_batch.global_num_token_non_padded.device
+            )
+            local_rows = compute_local_num_token_non_padded_cpu(
+                global_num_token_non_padded=global_num_rows,
+                num_tokens_per_dp=rows,
+                sharded=capture_batch.attn_tp_sequence_sharded,
+            )
+            packed_token_counts = torch.full(
+                (1,),
+                _pack_token_counts(local_rows, global_num_rows),
+                dtype=torch.int64,
+                device=forward_batch.global_num_token_non_padded.device,
+            )
+            # CUDA is little-endian: LOCAL is the low32 word, GLOBAL the high32.
+            token_counts = packed_token_counts.view(torch.int32)
+            num_token_non_padded = token_counts[0].view_as(
+                forward_batch.num_token_non_padded
+            )
+            global_num_token_non_padded = token_counts[1].view_as(
+                forward_batch.global_num_token_non_padded
+            )
+            capture_batch.global_num_token_non_padded = global_num_token_non_padded
+            capture_batch.num_token_non_padded = num_token_non_padded
+        elif forward_batch.num_token_non_padded is not None:
             num_token_non_padded = torch.full_like(
                 forward_batch.num_token_non_padded, num_rows
             )
@@ -196,6 +279,8 @@ class RowBucketGraphRunner:
                 start,
                 free_before,
             )
+            graph.global_num_token_non_padded = global_num_token_non_padded
+            graph.packed_token_counts = packed_token_counts
             # The graph reads device tensors the scope put on the batch.
             graph.batch += (dict(vars(capture_batch)),)
         return graph

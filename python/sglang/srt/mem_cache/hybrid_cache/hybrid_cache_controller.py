@@ -871,6 +871,11 @@ class HybridCacheController(BaseHiCacheController):
                 or pool_transfer.device_indices is None
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
+            if (
+                pool_transfer.host_indices.numel() == 0
+                and pool_transfer.device_indices.numel() == 0
+            ):
+                continue
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
             transfers.append(
                 L2Transfer(
@@ -1399,6 +1404,9 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.restorable_prefix_pages = (
+            hit_result.restorable_prefix_pages
+        )
         # Each pool's own boundary (the KV pool's where the backend reports
         # it, else the folded cut); the beliefs heal pool by pool. A pool the
         # backend did not report carries no verdict.
@@ -1419,10 +1427,34 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
+        if any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        ):
+            # A trailing state can exist at 512 and 1024 but not at 768. Taking
+            # MIN of each rank's longest hit would choose a missing checkpoint,
+            # so reduce one restorable flag per prefix length instead. Use the
+            # request span (identical on every rank) for the collective shape,
+            # including when one rank skipped its query due to cancellation.
+            hits = [0] * (len(operation.token_ids) // self.page_size + 1)
+            hits[0] = 1
+            if storage_hit_count > 0:
+                pages = operation.pool_storage_result.restorable_prefix_pages
+                if pages is None:
+                    # Backends without sparse-boundary results keep their
+                    # contiguous-prefix contract. File and Mooncake return a set.
+                    pages = range(1, storage_hit_count // self.page_size + 1)
+                # Callers may cap the hit to allocated host space after the
+                # query; a checkpoint past that cap has nowhere to load.
+                for page in pages:
+                    if 0 < page <= storage_hit_count // self.page_size:
+                        hits[page] = 1
+        else:
+            hits = [storage_hit_count]
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
         packed = torch.tensor(
-            [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1433,10 +1465,13 @@ class HybridCacheController(BaseHiCacheController):
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[1:], strict=True)
+            for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        return int(reduced[0])
+        if len(hits) == 1:
+            return int(reduced[0])
+        restorable = reduced[: len(hits)]
+        return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1571,8 +1606,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
-        # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. Rank-sharded sidecars still need every TP rank.
+        # Write primary KV only on its selected shard writer. Rank-sharded
+        # sidecars can still need every TP rank.
         backup_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
