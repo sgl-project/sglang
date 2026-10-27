@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import os
+from contextlib import nullcontext
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -202,6 +203,62 @@ def test_dynamic_batch_split_keeps_each_requests_image_bytes():
     )
 
     assert [output.output_image_bytes for output in outputs] == [[b"a"], [b"b"]]
+
+
+@pytest.mark.parametrize(
+    ("role", "count", "sequential"),
+    [("glm", 1, False), ("glm", 2, False), ("glm", 2, True), ("decoder", 1, False)],
+)
+def test_disaggregated_image_result_keeps_pixels_for_the_head(
+    tmp_path, role, count, sequential
+):
+    req = _image_req(tmp_path, save_output=True, return_image_bytes=True)
+    req.num_outputs_per_prompt = count
+    req.prior_token_id = torch.arange(count * 4).reshape(count, 4)
+    expected = req.prior_token_id.float().reshape(count, 1, 2, 2).expand(-1, 3, -1, -1)
+    worker = object.__new__(GPUWorker)
+    worker.is_output_rank = True
+
+    def forward(requests):
+        (request,) = requests
+        pixels = (
+            request.prior_token_id.float().reshape(-1, 1, 2, 2).expand(-1, 3, -1, -1)
+        )
+        output = OutputBatch(output=pixels)
+        # Exercise real output finalization, not just the request flag.
+        worker._materialize_output_transport(
+            output, request, lambda batch: worker._save_output_paths(request, batch)
+        )
+        return output
+
+    worker.execute_forward = forward
+    worker.execute_forward_sequentially = lambda requests: (
+        forward([r]) for r in requests
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.worker = worker
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: sequential
+        )
+    )
+    scheduler._disagg_trace_dispatch = lambda _: nullcontext()
+    scheduler._disagg_metrics = None
+
+    with zmq.Context() as context:
+        with context.socket(zmq.PUSH) as sender, context.socket(zmq.PULL) as receiver:
+            sender.bind("inproc://image-result")
+            receiver.connect("inproc://image-result")
+            receiver.rcvtimeo = 1000
+            scheduler._pool_result_push = sender
+            if role == "glm":
+                scheduler._execute_glm_distributed_denoiser_request(req, "test")
+            else:
+                scheduler._disagg_decoder_compute(req, "test")
+            tensors, metadata = unpack_tensors(receiver.recv_multipart(), device="cpu")
+    torch.testing.assert_close(tensors["output"], expected, rtol=0, atol=0)
+    assert metadata["request_id"] == "test"
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("sequential", [False, True])

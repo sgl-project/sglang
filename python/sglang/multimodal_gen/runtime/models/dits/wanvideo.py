@@ -80,8 +80,8 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix, is_device_stream_capturing
 
-if current_platform.is_xpu():
-    # CuTe DSL (cutlass) is unavailable on XPU; use the unfused q/k norm path.
+if current_platform.is_xpu() or current_platform.is_hip():
+    # CuTe DSL (cutlass) is unavailable on XPU and ROCm; use the unfused q/k norm path.
     can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
     fused_rmsnorm_interleaved_rope_ = None
     fused_rmsnorm_interleaved_rope_into_blocks = None
@@ -778,35 +778,34 @@ class WanTransformerBlock(nn.Module):
         q2d, k2d = (x.view(-1, x.shape[-1]) for x in (query, key))
         block_cols = rmsnorm_interleaved_rope_block_cols(q2d.shape[-1])
 
-        def fill_all(blocks) -> None:
+        def fill_all(blocks, part: int) -> None:
+            x, norm = ((q2d, self.norm_q), (k2d, self.norm_k))[part]
             tables = self._qk_block_tables(blocks, block_cols, q2d.shape[-1])
             if tables is None:
                 # blocks the kernel cannot address: norm in place, then copy them
-                for x, norm in ((q2d, self.norm_q), (k2d, self.norm_k)):
-                    fused_rmsnorm_interleaved_rope_(
-                        x,
-                        norm.weight,
-                        rope_cos_sin_cache,
-                        norm.variance_epsilon,
-                        self.dim_head,
-                    )
-                for head_start, head_count, q_dst, k_dst in blocks:
-                    cols = slice(
-                        head_start * self.dim_head,
-                        (head_start + head_count) * self.dim_head,
-                    )
-                    q_dst.copy_(q2d[:, cols].view_as(q_dst))
-                    k_dst.copy_(k2d[:, cols].view_as(k_dst))
-                return
-            for x, norm, table in zip((q2d, k2d), (self.norm_q, self.norm_k), tables):
-                fused_rmsnorm_interleaved_rope_into_blocks(
+                fused_rmsnorm_interleaved_rope_(
                     x,
                     norm.weight,
                     rope_cos_sin_cache,
                     norm.variance_epsilon,
                     self.dim_head,
-                    table,
                 )
+                for block in blocks:
+                    head_start, head_count, dst = block[0], block[1], block[2 + part]
+                    cols = slice(
+                        head_start * self.dim_head,
+                        (head_start + head_count) * self.dim_head,
+                    )
+                    dst.copy_(x[:, cols].view_as(dst))
+                return
+            fused_rmsnorm_interleaved_rope_into_blocks(
+                x,
+                norm.weight,
+                rope_cos_sin_cache,
+                norm.variance_epsilon,
+                self.dim_head,
+                tables[part],
+            )
 
         return self.attn1.forward_qk_filled(
             *(
