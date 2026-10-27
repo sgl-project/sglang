@@ -38,6 +38,10 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.striped_host import (
+    StripedLogicalHostPool,
+    collect_striped_plan_layers,
+)
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
@@ -1011,9 +1015,28 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    logical_host_pool = LogicalHostPool(
-        num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
-    )
+    # Striped tier: each rank holds num_host_pages physical pages
+    # of an N-fold logical index.
+    stripe_gather = params.hicache_stripe_gather
+    host_stripe = None if stripe_gather is None else stripe_gather.placement
+    if host_stripe is None:
+        logical_host_pool = LogicalHostPool(
+            num_host_pages * page_size,
+            page_size,
+            layout=get_memory().hicache_mem_layout,
+        )
+    else:
+        if host_stripe.page_size != page_size:
+            raise ValueError(
+                f"Striped host placement page size {host_stripe.page_size} != "
+                f"HiCache page size {page_size}"
+            )
+        logical_host_pool = StripedLogicalHostPool(
+            num_host_pages * page_size,
+            page_size,
+            host_stripe,
+            layout=get_memory().hicache_mem_layout,
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1244,7 +1267,25 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        host_stripe=host_stripe,
     )
+    if stripe_gather is not None:
+        # Fail before serving if the gather cannot pack these pools' page rows.
+        row_bytes = stripe_gather.validate_layers(
+            collect_striped_plan_layers(
+                host_pool_group.entries, transfer_layer_id_max=transfer_layer_id_max
+            )
+        )
+        cache_controller.install_striped_load_drain(stripe_gather)
+        logger.info(
+            "Striped HiCache host tier: %d logical host pages over %d ranks "
+            "(%d physical per rank), %d B per page row, %d pages per gather",
+            logical_host_pool.num_pages,
+            host_stripe.num_ranks,
+            num_host_pages,
+            row_bytes,
+            stripe_gather.chunk_pages(row_bytes),
+        )
     return host_pool_group, cache_controller
 
 
@@ -2537,6 +2578,13 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
         strategy = _select_strategy(kvcache, components)
+        if params.hicache_stripe_gather is not None and not isinstance(
+            strategy, _DeepSeekV4Strategy
+        ):
+            raise ValueError(
+                "--hicache-host-shard stripe supports only the DeepSeek V4 "
+                f"HiCache stack, got {type(strategy).__name__}"
+            )
         result = strategy.build(
             cache=cache,
             kvcache=kvcache,

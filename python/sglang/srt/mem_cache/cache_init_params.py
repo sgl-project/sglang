@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.pool_host.striped_host import StripedGatherExecutor
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.base import (
         TreeComponent,
@@ -72,6 +73,9 @@ class CacheInitParams:
     # Draft KV pools that share the target KV slots but are stored apart from it.
     sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
+    # Striped host tier (--hicache-host-shard stripe): the model runner's
+    # StripedGatherExecutor; None keeps a full host replica per rank.
+    hicache_stripe_gather: Optional[StripedGatherExecutor] = None
 
     @property
     def swa_retain_window(self) -> Optional[int]:

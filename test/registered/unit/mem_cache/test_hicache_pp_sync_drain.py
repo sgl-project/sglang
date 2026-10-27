@@ -33,15 +33,18 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
+            striped_load_drain=None,
             ack_write_queue=[
                 SimpleNamespace(
-                    finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
+                    finish_event=SimpleNamespace(query=MagicMock(return_value=ready)),
+                    gather_plan=None,
                 )
                 for ready in write_ready
             ],
             ack_load_queue=[
                 SimpleNamespace(
-                    finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
+                    finish_event=SimpleNamespace(query=MagicMock(return_value=ready)),
+                    gather_plan=None,
                 )
                 for ready in load_ready
             ],

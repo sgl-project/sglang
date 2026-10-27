@@ -197,6 +197,9 @@ def create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+        load_drain = cache.cache_controller.striped_load_drain
+        if load_drain is not None:
+            ctx.tp_worker.register_hicache_load_drain(load_drain)
     elif get_memory().enable_unified_cache_external_linker:
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
             create_unified_cache_linker,

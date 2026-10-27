@@ -134,31 +134,50 @@ class CacheOperation:
     @staticmethod
     def _merge_pool_transfers(
         ops: List[CacheOperation],
+        merged_host_indices: torch.Tensor,
+        merged_device_indices: torch.Tensor,
     ) -> Optional[List[PoolTransfer]]:
-        grouped: dict[tuple[PoolName, Optional[PoolName]], List[PoolTransfer]] = {}
+        grouped: dict[
+            tuple[PoolName, Optional[PoolName]],
+            List[tuple[CacheOperation, PoolTransfer]],
+        ] = {}
         for op in ops:
             for transfer in op.pool_transfers or []:
                 grouped.setdefault(
                     (transfer.name, transfer.indices_from_pool), []
-                ).append(transfer)
+                ).append((op, transfer))
         if not grouped:
             return None
 
-        def cat_or_none(tensors):
-            parts = [tensor for tensor in tensors if tensor is not None]
+        def merge_indices(pairs, attr, merged):
+            # Transfers riding each op's own indices share the merged op's tensor.
+            if len(pairs) == len(ops) and all(
+                pair_op is op and getattr(t, attr) is getattr(op, attr)
+                for (pair_op, t), op in zip(pairs, ops)
+            ):
+                return merged
+            parts = [getattr(t, attr) for _, t in pairs]
+            parts = [tensor for tensor in parts if tensor is not None]
             return torch.cat(parts) if parts else None
 
-        return [
-            PoolTransfer(
-                name=transfers[0].name,
-                host_indices=cat_or_none(t.host_indices for t in transfers),
-                device_indices=cat_or_none(t.device_indices for t in transfers),
-                keys=[key for t in transfers if t.keys for key in t.keys] or None,
-                hit_policy=transfers[0].hit_policy,
-                indices_from_pool=transfers[0].indices_from_pool,
+        merged_transfers = []
+        for pairs in grouped.values():
+            first = pairs[0][1]
+            merged_transfers.append(
+                PoolTransfer(
+                    name=first.name,
+                    host_indices=merge_indices(
+                        pairs, "host_indices", merged_host_indices
+                    ),
+                    device_indices=merge_indices(
+                        pairs, "device_indices", merged_device_indices
+                    ),
+                    keys=[key for _, t in pairs if t.keys for key in t.keys] or None,
+                    hit_policy=first.hit_policy,
+                    indices_from_pool=first.indices_from_pool,
+                )
             )
-            for transfers in grouped.values()
-        ]
+        return merged_transfers
 
     @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
@@ -176,7 +195,9 @@ class CacheOperation:
             device_indices,
             -1,
             priority,
-            pool_transfers=CacheOperation._merge_pool_transfers(ops),
+            pool_transfers=CacheOperation._merge_pool_transfers(
+                ops, host_indices, device_indices
+            ),
         )
         merged_op.node_ids = node_ids
         return merged_op
@@ -196,6 +217,9 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+    # Striped host tier: the load's StripedLoadPlan. The ack is complete only
+    # once the plan's forward-entry gather is done, not at the owned H2D.
+    gather_plan: Optional[Any] = None
 
 
 @dataclass
@@ -293,6 +317,9 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    # Striped host tier only (HybridCacheController.install_striped_load_drain).
+    striped_load_drain = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -861,6 +888,14 @@ class HiCacheController:
             or self.ack_load_queue
         )
 
+    def backup_admission_is_collective(self) -> bool:
+        """Whether ``write`` agrees host admission across the TP group.
+
+        If so, every rank must reach ``write`` for each backup, even one its
+        own host capacity check would reject.
+        """
+        return False
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -1044,8 +1079,11 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        l2_transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            l2_transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
@@ -1053,6 +1091,9 @@ class HiCacheController:
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
+        )
+        gather_plan = self._enqueue_striped_load(
+            op, l2_transfers, completion.finish_event, producer_id
         )
 
         self.ack_load_queue.append(
@@ -1064,9 +1105,24 @@ class HiCacheController:
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
                 num_bytes=self._transfer_num_bytes(op),
+                gather_plan=gather_plan,
             )
         )
         return producer_id
+
+    def _enqueue_striped_load(
+        self,
+        op: CacheOperation,
+        l2_transfers: list[L2Transfer],
+        h2d_done_event: Any,
+        producer_id: int,
+    ) -> Optional[Any]:
+        """Queue the forward-entry gather of a striped-host load; None if stock."""
+        return None
+
+    def striped_load_gathered(self, consumer_index: int) -> bool:
+        """Whether the load of a layer-done counter slot is gathered (stock: True)."""
+        return True
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

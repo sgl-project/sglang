@@ -98,6 +98,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_nvidia_megakernel",
         "validate_deepep_v2_speculative_draft",
         "validate_deepep_v2_dispatch_token_budget",
+        "validate_hicache_host_shard",
     }
 )
 

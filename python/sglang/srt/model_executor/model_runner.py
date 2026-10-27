@@ -104,6 +104,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.striped_host import create_striped_gather_executor
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -401,6 +402,8 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.mtp_draft_device_pools = ()
         self.mtp_draft_mamba_pools = ()
+        # Striped HiCache host tier: load-gather executor (owns device staging).
+        self.hicache_stripe_gather = None
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
@@ -978,6 +981,7 @@ class ModelRunner:
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
+        self.maybe_init_hicache_stripe_gather()
         self.init_kv_cache_configurator(draft_parallel_layout)
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
@@ -995,6 +999,18 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+
+    def maybe_init_hicache_stripe_gather(self):
+        """Allocate the striped HiCache load-gather staging before KV profiling."""
+        if (
+            self.is_draft_worker
+            or self.hicache_stripe_gather is not None
+            or get_memory().hicache_host_shard != "stripe"
+        ):
+            return
+        self.hicache_stripe_gather = create_striped_gather_executor(
+            tp_group=get_dp_tp_group(), page_size=self.page_size, device=self.device
+        )
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks

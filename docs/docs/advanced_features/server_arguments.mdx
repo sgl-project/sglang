@@ -2157,6 +2157,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-host-shard`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How the TP ranks share the HiCache host tier. `off` keeps a full host replica on every rank. `stripe` stores each host page on one owner rank only, multiplying the logical host capacity by the TP size at the same pinned memory; a load copies the owned pages host-to-device and all-gathers the rest over the TP group. Requires TP > 1, a device KV cache replicated over the TP group (DeepSeek V4 unified KV, attention TP equal to TP or prefill CP with `--enable-cp-decode-attn-tp`), aggregated serving, the write_through policy, no draft model other than DSpark, and no storage backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`off`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>off</code>, <code>stripe</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-write-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The write policy of hierarchical cache.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`write_through`</td>

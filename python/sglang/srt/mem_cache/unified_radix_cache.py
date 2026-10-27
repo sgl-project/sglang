@@ -64,6 +64,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.striped_host import (
+    StripedLoadPlan,
+    plan_gathered,
+    plan_owner_imbalance,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -197,6 +202,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Striped loads every rank agreed are pending, from the last ready-count reduce.
+    _agreed_striped_pending: int = 0
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -1745,7 +1753,11 @@ class UnifiedRadixCache(BasePrefixCache):
             host_avail = self.cache_controller.mem_pool_host.available_size()
             if host_avail < kv_tokens:
                 needed = kv_tokens - host_avail
-                if self.evict_host(needed) < needed:
+                # A striped host tier must reach the admission collective in write().
+                if (
+                    self.evict_host(needed) < needed
+                    and not self.cache_controller.backup_admission_is_collective()
+                ):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -3406,8 +3418,15 @@ class UnifiedRadixCache(BasePrefixCache):
         for ack in ack_queue:
             if not ack.finish_event.query():
                 break
+            # A striped load is complete only after its forward-entry gather.
+            if not plan_gathered(ack.gather_plan):
+                break
             ready_count += 1
         return ready_count
+
+    def _striped_load_drain(self):
+        cc = self.cache_controller
+        return None if cc is None else cc.striped_load_drain
 
     def _sync_hicache_ready_counts(
         self,
@@ -3439,6 +3458,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        # Striped host tier: pending-load consensus and host-index digest ride
+        # this reduce; the consensus also decides the orphan drain.
+        drain = self._striped_load_drain()
+        drain_fields = []
+        if drain is not None:
+            striped_host = cc.mem_pool_host.anchor_entry.host_pool
+            drain_fields = [
+                *drain.consensus_fields(),
+                *striped_host.digest_reduce_fields(),
+            ]
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
@@ -3447,6 +3476,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                *drain_fields,
                 digest,
                 -digest,
             ],
@@ -3462,12 +3492,36 @@ class UnifiedRadixCache(BasePrefixCache):
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        storage_end = 2 + len(storage_queue_sizes)
+        if drain is not None:
+            consensus_end = storage_end + drain.NUM_CONSENSUS_FIELDS
+            # A diverged host index is fatal at the first check after it
+            # diverges, before any load is reaped. A forward in between
+            # may already have gathered from it; the abort does not undo that.
+            striped_host.check_reduced_digest(
+                count_values[consensus_end : storage_end + len(drain_fields)]
+            )
+            self._agreed_striped_pending = drain.check_reduced(
+                count_values[storage_end:consensus_end]
+            )
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            tuple(count_values[2:storage_end]),
             extra_pool_names,
         )
+
+    def _drain_orphan_striped_loads(self) -> None:
+        """Gather loads no forward drained (PD-decode restores); fatal in aggregated
+        serving. Decided by this iteration's ready-count reduce: no extra collective.
+        """
+        drain = self._striped_load_drain()
+        agreed = self._agreed_striped_pending
+        self._agreed_striped_pending = 0
+        if drain is None or agreed == 0:
+            return
+        logger.debug("Draining %d orphan striped loads off the forward entry", agreed)
+        drain.drain_orphans(agreed, stream=self.cache_controller.load_fence_stream)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
@@ -3553,6 +3607,13 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            plan = ack.gather_plan
+            if plan is not None:
+                # MIN-agreed ready count includes this ack only once gathered.
+                assert plan.gather_done_event is not None, (
+                    f"striped load {plan.seq} reaped before its gather"
+                )
+                plan.gather_done_event.synchronize()
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
@@ -3578,7 +3639,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
                     )
+                if plan is not None:
+                    self._log_striped_load_metrics(plan)
             finish_count -= 1
+
+    def _log_striped_load_metrics(self, plan: StripedLoadPlan) -> None:
+        """Record a reaped striped load's gather (its done event has completed)."""
+        gather_ms = plan.gather_start_event.elapsed_time(plan.gather_done_event)
+        self.metrics_collector.observe_striped_load(
+            gathered_bytes=plan.gathered_bytes,
+            gather_seconds=gather_ms / 1000.0,
+            owner_imbalance=plan_owner_imbalance(plan),
+        )
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -3679,6 +3751,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_queue_sizes,
             extra_pool_names,
         ) = self._sync_hicache_ready_counts()
+        self._drain_orphan_striped_loads()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
@@ -3728,7 +3801,9 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        return finish_event.query()
+        return finish_event.query() and self.cache_controller.striped_load_gathered(
+            consumer_index
+        )
 
     def has_free_load_back_slot(self) -> bool:
         """Acks are reaped in lockstep, so every rank agrees on this."""

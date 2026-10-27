@@ -126,6 +126,104 @@ def handle_hicache_ratio_default(server_args: Any):
         declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)
 
 
+def validate_hicache_host_shard(server_args: Any):
+    """Fail closed unless every TP rank holds the same device KV rows and every
+    host-tier reader/writer goes through the owner-only copies and the
+    forward-entry gather. Runs after DP/CP sizes are resolved.
+    """
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_triton,
+    )
+
+    cfg = resolving_view(server_args)
+    if cfg.hicache_host_shard == "off":
+        return
+    refusals = [
+        (
+            not cfg.enable_hierarchical_cache,
+            "requires --enable-hierarchical-cache",
+        ),
+        (
+            cfg.tp_size == 1,
+            "requires --tp-size > 1: a single rank has no peers to stripe "
+            "host pages across",
+        ),
+        (
+            not is_unified_kv_triton(),
+            "requires the DeepSeek V4 unified KV layout "
+            "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton): only its "
+            "page-aligned host pools are striped",
+        ),
+        (
+            cfg.speculative_algorithm not in (None, "DSPARK"),
+            "supports only DSpark speculative decoding: other draft models "
+            "register a sidecar draft host pool, which is never gathered",
+        ),
+        (
+            cfg.hicache_write_policy != "write_through",
+            "requires --hicache-write-policy write_through: the backup "
+            "admission all-reduce must not run inside device eviction",
+        ),
+        (
+            cfg.attn_dp_size > 1 or cfg.enable_dp_attention,
+            "does not support attention data parallelism: each attention-DP "
+            "rank holds different device KV",
+        ),
+        (
+            cfg.attn_cp_size > 1 and not cfg.enable_cp_decode_attn_tp,
+            "with --attention-context-parallel-size > 1 requires "
+            "--enable-cp-decode-attn-tp, which keeps the device KV replicated",
+        ),
+        (
+            cfg.enable_dsa_cache_layer_split,
+            "does not support --enable-dsa-cache-layer-split: the device KV "
+            "layers are split across ranks",
+        ),
+        (cfg.pp_size > 1, "does not support pipeline parallelism"),
+        (
+            cfg.dcp_size > 1,
+            "does not support decode context parallelism: each DCP rank holds "
+            "a different KV shard",
+        ),
+        (
+            cfg.enable_kv_cache_sharding,
+            "does not support --enable-kv-cache-sharding",
+        ),
+        (
+            cfg.hicache_storage_backend is not None,
+            "does not support --hicache-storage-backend: L3 writes whole pages "
+            "from one rank, which holds only its own stripe",
+        ),
+        (
+            cfg.hicache_host_memory_mode != "cache",
+            "requires --hicache-host-memory-mode cache",
+        ),
+        (
+            cfg.enable_unified_cache_external_linker,
+            "does not support --enable-unified-cache-external-linker",
+        ),
+        (
+            cfg.disaggregation_mode != "null",
+            "supports aggregated serving only: PD transfer, decode restore and "
+            "retraction paths read or write the host pool without the stripe "
+            "gather",
+        ),
+        (
+            cfg.enable_pdmux,
+            "does not support --enable-pdmux: split prefill has no "
+            "forward-entry gather",
+        ),
+        (
+            cfg.enable_hisparse,
+            "does not support --enable-hisparse",
+        ),
+        (cfg.enable_lmcache, "does not support --enable-lmcache"),
+    ]
+    for refused, reason in refusals:
+        if refused:
+            raise ValueError(f"--hicache-host-shard stripe {reason}.")
+
+
 def resolve_hicache_dcp_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
