@@ -91,6 +91,13 @@ def create_llada2_cfg_flashinfer_backend(runner):
     )
 
 
+@register_attention_backend("cudnn")
+def create_cudnn_backend(runner):
+    from sglang.srt.layers.attention.cudnn_backend import CuDNAttnBackend
+
+    return CuDNAttnBackend(runner)
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:

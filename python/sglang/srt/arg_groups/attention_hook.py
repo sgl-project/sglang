@@ -162,6 +162,29 @@ def handle_attention_backend_compatibility(server_args: Any):
             "Speculative decoding is currently not supported with Flex Attention backend"
         )
 
+    # cuDNN backend: disable CUDA graph since decode is not yet implemented
+    if attention_backend == "cudnn":
+        logger.warning(
+            "Cuda graph is disabled because cuDNN attention backend does not yet support decode"
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        assert (
+            cfg.speculative_algorithm is None
+        ), "Speculative decoding is currently not supported with cuDNN backend"
+
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
     if (
