@@ -19,7 +19,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill import (
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill import (
     gluon_prefill,
-    gluon_prefill_pair,
+    gluon_prefill_pair_gfx950,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill import (
     index_topk_gfx950 as fused_indexer,
@@ -288,7 +288,9 @@ def test_gluon_prefill_on_fp8_kv_matches_triton(
     monkeypatch, prefix, q_len, kv_scale, pair_min_tokens
 ):
     """Gluon on an fp8 pool must attend like the Triton kernel, scales included."""
-    monkeypatch.setattr(gluon_prefill_pair, "PAIR_MIN_TOKENS_FP8", pair_min_tokens)
+    monkeypatch.setattr(
+        gluon_prefill_pair_gfx950, "PAIR_MIN_TOKENS_FP8", pair_min_tokens
+    )
     seq, b = _extend(prefix, q_len)
     topk = _topk(q_len, seq, b)
     q = torch.randn(q_len, NUM_Q_HEADS, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -322,7 +324,9 @@ def test_gluon_prefill_on_nvfp4_kv_matches_triton(
     monkeypatch, prefix, q_len, pair_min_tokens
 ):
     """Gluon on an NVFP4 pool must attend like the Triton kernel on its bf16 values."""
-    monkeypatch.setattr(gluon_prefill_pair, "PAIR_MIN_TOKENS_BF16", pair_min_tokens)
+    monkeypatch.setattr(
+        gluon_prefill_pair_gfx950, "PAIR_MIN_TOKENS_BF16", pair_min_tokens
+    )
     seq, b, idx_pool = _nvfp4_extend(prefix, q_len)
     rows = idx_pool.payload.shape[0] * BLOCK
     idx_q = torch.randn(q_len, 1, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -369,7 +373,7 @@ def test_gluon_prefill_on_nvfp4_kv_matches_triton(
 )
 def test_pair_prefill_across_requests_matches_triton(monkeypatch):
     """Query pairs that straddle requests must read each query's own request pages."""
-    monkeypatch.setattr(gluon_prefill_pair, "PAIR_MIN_TOKENS_FP8", 1)
+    monkeypatch.setattr(gluon_prefill_pair_gfx950, "PAIR_MIN_TOKENS_FP8", 1)
     torch.manual_seed(0)
     reqs = [(0, 301), (5000, 155), (777, 512)]
     seqs = [p + n for p, n in reqs]
@@ -419,7 +423,7 @@ def test_pair_prefill_fp8_out_equals_o_proj_quant(monkeypatch, kv_scale):
         view_aiter_fused_rms_transposed_fp8_scale,
     )
 
-    monkeypatch.setattr(gluon_prefill_pair, "PAIR_MIN_TOKENS_FP8", 1)
+    monkeypatch.setattr(gluon_prefill_pair_gfx950, "PAIR_MIN_TOKENS_FP8", 1)
     prefix, q_len = 9000, 1501
     seq, b = _extend(prefix, q_len)
     topk = _topk(q_len, seq, b)
