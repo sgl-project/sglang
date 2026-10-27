@@ -838,26 +838,35 @@ class MoriKVManager(CommonKVManager):
         }
         self._staging_acks.expect(worker_index, expected)
         statuses: List[TransferStatus] = []
-        for target in targets:
-            peer = target.peer_info
-            uid = self.engine.allocate_transfer_uid()
-            with self.transfer_lock:
-                if self._stopped or self._should_skip_transfer(room):
-                    raise _MoriTransferSubmissionError(
-                        f"Fabric staging write cancelled for room={room}", statuses
+        try:
+            for target in targets:
+                peer = target.peer_info
+                uid = self.engine.allocate_transfer_uid()
+                with self.transfer_lock:
+                    if self._stopped or self._should_skip_transfer(room):
+                        raise RuntimeError(
+                            f"Fabric staging write cancelled for room={room}"
+                        )
+                    statuses.extend(
+                        self.engine.batch_write(
+                            [slots.desc],
+                            [[slots.offset(worker_index)]],
+                            [peer.dst_staging_desc],
+                            [[worker_index * peer.dst_staging_slot_bytes]],
+                            [[required]],
+                            [uid],
+                        )
                     )
-                submitted = self.engine.batch_write(
-                    [slots.desc],
-                    [[slots.offset(worker_index)]],
-                    [peer.dst_staging_desc],
-                    [[worker_index * peer.dst_staging_slot_bytes]],
-                    [[required]],
-                    [uid],
-                )
-            statuses.extend(submitted)
-            self._record_submitted_statuses(submitted)
+        except Exception as exc:
+            raise _MoriTransferSubmissionError(
+                f"Transfer submission failed: {exc}", statuses
+            ) from exc
 
-        failure_reason = self._wait_transfer_completion(statuses)
+        failure_reason, is_quiescent = self._wait_for_chunk_completion(
+            kv_chunk, statuses
+        )
+        if not is_quiescent:
+            return False
         if failure_reason is not None:
             self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
             return True

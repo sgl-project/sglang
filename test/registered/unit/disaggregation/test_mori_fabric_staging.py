@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.mori.conn import (
     FABRIC_CHUNK_READY,
     MoriKVReceiver,
     MoriKVSender,
-    _MoriTransferSubmissionError,
+    StatusCode,
 )
 from sglang.srt.disaggregation.mori.fabric_staging import (
     FabricSlotAcks,
@@ -86,6 +86,7 @@ def _staging_manager(local=6500, remote=5000):
         state_data_lens=[[3 * 128, 5 * 128], [48 * 8, 16 * 8]],
     )
     manager._fabric_staging = True
+    manager._mori_backend = "fabric"
     manager._staging_slots = _Slots(local)
     manager._staging_acks = FabricSlotAcks(1)
     manager._staging_rx = FabricStagingRx()
@@ -101,6 +102,8 @@ def _staging_manager(local=6500, remote=5000):
             "dummy": ns(is_dummy=True),
             "decode": ns(
                 is_dummy=False,
+                endpoint="10.0.0.2",
+                dst_port=6001,
                 dst_state_indices=[np.arange(128), np.array([5, 6])],
                 dst_staging_epoch=b"epoch",
             ),
@@ -309,8 +312,15 @@ class TestFabricStagingTransfer(CustomTestCase):
                         manager._process_fabric_staging_chunk(chunk, 0)
                 pack.assert_not_called()
 
-    def test_abort_stops_writes_and_quarantines_the_slot(self):
-        for phase in ("pack", "between_targets"):
+    def test_failed_transfer_drains_writes_and_quarantines_the_slot(self):
+        for phase in (
+            "pack",
+            "between_targets",
+            "allocate_uid",
+            "batch_write",
+            "wait_all",
+            "wait_failed",
+        ):
             with self.subTest(phase=phase):
                 manager = _staging_manager()
                 info = manager.transfer_infos[11]["decode"]
@@ -319,9 +329,11 @@ class TestFabricStagingTransfer(CustomTestCase):
                 manager.decode_kv_args_table["second"] = types.SimpleNamespace(
                     **{**vars(peer), "decode_tp_rank": 1}
                 )
-                status = MagicMock()
+                submitted = [MagicMock(), MagicMock()]
+                for status in submitted:
+                    status.InProgress.return_value = True
                 manager.engine = MagicMock()
-                manager.engine.batch_write.return_value = [status]
+                manager.send_kv_status_message = MagicMock()
 
                 def abort():
                     manager._handle_abort_message(_abort_message())
@@ -333,25 +345,61 @@ class TestFabricStagingTransfer(CustomTestCase):
 
                 def allocate_uid():
                     if manager.engine.batch_write.call_count:
-                        abort()
+                        if phase == "between_targets":
+                            abort()
+                        elif phase == "allocate_uid":
+                            raise RuntimeError(phase)
                     return 1
 
+                def batch_write(*args):
+                    index = manager.engine.batch_write.call_count - 1
+                    if phase == "batch_write" and index == 1:
+                        raise RuntimeError(phase)
+                    return [submitted[index]]
+
+                def wait_all(statuses):
+                    if phase == "wait_all":
+                        raise RuntimeError(phase)
+                    return StatusCode.FAILED
+
                 manager.engine.allocate_transfer_uid.side_effect = allocate_uid
+                manager.engine.batch_write.side_effect = batch_write
+                manager.engine.wait_all.side_effect = wait_all
                 chunk = _chunk()
-                manager._mark_transfer_started(chunk)
+                queue = MagicMock()
+                queue.get.side_effect = (chunk, None)
                 with (
                     patch(PACK, side_effect=pack),
-                    self.assertRaisesRegex(
-                        _MoriTransferSubmissionError, "cancelled"
-                    ) as raised,
+                    patch("sglang.srt.disaggregation.mori.conn.logger.exception"),
                 ):
-                    manager._process_fabric_staging_chunk(chunk, 0)
-                submitted = [] if phase == "pack" else [status]
-                self.assertEqual(raised.exception.statuses, submitted)
+                    manager._transfer_worker(queue, 0)
                 self.assertEqual(manager.request_status[11], KVPoll.Failed)
-                self.assertEqual(manager._sent, [])
                 with self.assertRaisesRegex(RuntimeError, "quarantined"):
                     manager._staging_acks.acquire(0)
+                if phase not in ("pack", "between_targets"):
+                    abort()
+                if phase == "pack":
+                    self.assertTrue(manager._drain_queue.empty())
+                else:
+                    self.assertEqual(manager._sent, [])
+                    self.assertEqual(manager._staging_outstanding[11], 1)
+                    queued_chunk, statuses = manager._drain_queue.get_nowait()
+                    self.assertIs(queued_chunk, chunk)
+                    self.assertEqual(
+                        statuses, submitted[: 2 if phase.startswith("wait") else 1]
+                    )
+
+                    for status in statuses:
+
+                        def drain(status=status):
+                            self.assertEqual(manager._sent, [])
+                            status.InProgress.return_value = False
+
+                        status.Wait.side_effect = drain
+                    manager._drain_transfer_statuses(queued_chunk, statuses)
+                    self.assertFalse(any(s.InProgress() for s in statuses))
+                self.assertNotIn(11, manager._staging_outstanding)
+                self.assertEqual(len(manager._sent), 1)
 
     def test_slot_is_reused_only_after_a_terminal_reply(self):
         manager = _staging_manager()
