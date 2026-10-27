@@ -110,6 +110,7 @@ jobs:
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
+              - "test/registered/core/test_basic_sanity.py"
               - "test/registered/radix_cache/test_radix_attention.py"
               - "test/registered/ppu/**"
 

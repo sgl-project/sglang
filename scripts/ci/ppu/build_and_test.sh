@@ -161,4 +161,4 @@ cd "$artifacts"
 python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200 \
     2>&1 | tee "$artifacts/sanity.log"
 # Require every registered PPU model sanity file to pass.
-grep -Fxq 'Test Summary: 4/4 passed' "$artifacts/sanity.log"
+grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/sanity.log"
