@@ -376,6 +376,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
+            or self.attn_backend.get_decode_graph_variants(
+                self.capture_forward_mode, self.captured_req_width
+            )
         )
 
         if (
