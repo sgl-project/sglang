@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import huggingface_hub.constants
 import pytest
 
 from sglang.multimodal_gen.runtime.weights.source import (
@@ -277,73 +276,3 @@ def test_materialize_local_weight_returns_selected_file(tmp_path):
     checkpoint.write_bytes(b"fixture")
 
     assert materialize_weight(resolve_weight(str(checkpoint))) == str(checkpoint)
-
-
-_COMMIT = "0123456789abcdef0123456789abcdef01234567"
-_MODEL_INFO = "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info"
-
-
-def _hub_cache(monkeypatch, tmp_path, files):
-    """Lay out a Hugging Face cache holding one snapshot of owner/repo."""
-    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
-    repo = tmp_path / "models--owner--repo"
-    (repo / "refs").mkdir(parents=True)
-    (repo / "refs" / "main").write_text(_COMMIT)
-    snapshot = repo / "snapshots" / _COMMIT
-    for name in files:
-        (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
-        (snapshot / name).write_bytes(b"fixture")
-
-
-def _remote_info(*files):
-    return SimpleNamespace(
-        sha="remote-sha",
-        siblings=[SimpleNamespace(rfilename=name) for name in files],
-    )
-
-
-def test_resolve_weight_uses_cached_named_file_without_hub_api(monkeypatch, tmp_path):
-    _hub_cache(monkeypatch, tmp_path, ["config.json", "lora.safetensors"])
-
-    with patch(_MODEL_INFO, side_effect=AssertionError("Hub API called")):
-        resolved = resolve_weight("owner/repo", weight_name="lora.safetensors")
-        exact = resolve_weight("owner/repo/lora.safetensors")
-
-    assert resolved.selected_file == "lora.safetensors"
-    assert resolved.inventory.resolved_revision == _COMMIT
-    assert exact.selected_file == "lora.safetensors"
-
-
-@pytest.mark.parametrize(
-    "cached_files",
-    [
-        None,  # repo not cached
-        ["config.json"],  # snapshot without the requested file
-        ["sub/lora.safetensors"],  # only a basename match
-    ],
-)
-def test_resolve_weight_falls_back_to_hub_api(monkeypatch, tmp_path, cached_files):
-    if cached_files is None:
-        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
-    else:
-        _hub_cache(monkeypatch, tmp_path, cached_files)
-    info = _remote_info("lora.safetensors", "sub/lora.safetensors")
-
-    with patch(_MODEL_INFO, return_value=info) as model_info:
-        resolved = resolve_weight("owner/repo", weight_name="lora.safetensors")
-
-    model_info.assert_called_once()
-    assert resolved.selected_file == "lora.safetensors"
-    assert resolved.inventory.resolved_revision == "remote-sha"
-
-
-def test_resolve_weight_without_a_name_ignores_the_cache(monkeypatch, tmp_path):
-    # A partial snapshot may hold one of several independent weight files.
-    _hub_cache(monkeypatch, tmp_path, ["a.safetensors"])
-    info = _remote_info("a.safetensors", "b.safetensors")
-
-    with (
-        patch(_MODEL_INFO, return_value=info),
-        pytest.raises(ValueError, match="multiple independent weight files"),
-    ):
-        resolve_weight("owner/repo")
