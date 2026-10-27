@@ -371,7 +371,9 @@ def pair_sparse_prefill(
     v_scale: float,
     out_quant: str = "",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """``out_quant`` is the o_proj's ``fp8_input_quant_format``: for "fp8" O comes back
+    """Sparse prefill attention, two queries per program, over gluon_prefill's scratch.
+
+    ``out_quant`` is the o_proj's ``fp8_input_quant_format``: for "fp8" O comes back
     as the (fp8 [total_q, H * D], scale [total_q, H] column-major) pair the o_proj's
     separate per 1 x 128 quant would write, else as bf16."""
     total_q, num_heads, head_dim = q.shape

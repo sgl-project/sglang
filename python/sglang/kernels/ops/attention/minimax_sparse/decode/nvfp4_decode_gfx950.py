@@ -175,7 +175,7 @@ def _block_table(
     tab = gl.allocate_shared_memory(
         gl.int32, [TOPK_P, 4], gl.SwizzledSharedLayout(1, 1, 1, [1, 0]), rec
     )
-    # Rank-1 layout so `.index(i)` picks entry i.
+    # Rank-1 layout so .index(i) picks entry i.
     tab = tab._reinterpret(gl.int32, [TOPK_P, 4], gl.SwizzledSharedLayout(1, 1, 1, [0]))
     return tab, c_end
 
