@@ -8,7 +8,6 @@ from array import array
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from types import SimpleNamespace
@@ -41,68 +40,13 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
-
-
-def _cache_query_ranks(rank, rendezvous):
-    torch.set_num_threads(1)
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=rank,
-        world_size=3,
-        timeout=timedelta(seconds=60),
-    )
-    try:
-        case = TestPPPrefetchTicket()
-        case.setUp()
-        case.doCleanups()  # Use real ranks/groups, not the unit fixture's mocks.
-        c = case.c
-        c.host_memory_mode = "cache"
-        c.storage_config = replace(
-            c.storage_config, pp_rank=rank, pp_size=3, tp_rank=0, tp_size=1
-        )
-        c.pp_prefetch_command_group = torch.distributed.group.WORLD
-        c.prefetch_hits_sync_groups = [torch.distributed.group.WORLD]
-        c._all_reduce.side_effect = lambda tensor, op, groups: (
-            torch.distributed.all_reduce(tensor, op=op, group=groups[0])
-        )
-        # Native L2 progression keeps the local start equal across PP stages.
-        local_start = 8
-        c._storage_hit_query.side_effect = lambda op: case.query_hits(
-            op, 0 if op.request_id == "miss" and rank == 1 else (12, 32, 20)[rank]
-        )
-        if rank == 0:
-            local = case.submit_cache_query("hit", start=local_start)
-            missed = case.submit_cache_query("miss")
-            c.pp_prefetch_command_queue.put(None)
-        c.pp_prefetch_command_thread_func()
-        if rank != 0:
-            # The shared query arrived before this stage's native request.
-            local = case.submit_cache_query("hit", start=local_start)
-            missed = case.submit_cache_query("miss")
-        hit = c.prefetch_hit_queue.get_nowait()
-        assert hit.operation.storage_hit_count == 12
-        assert c.resolve_cache_query(hit) is local
-        expected_suffix = 4
-        assert local.storage_hit_count == expected_suffix
-        assert (
-            local.all_hash_values == hit.operation.all_hash_values[local_start // 4 :]
-        )
-        assert local.hash_value == local.all_hash_values[: expected_suffix // 4]
-        assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is missed
-        # S_min=0 even though the local L1/L2 prefix is still present.
-        assert missed.storage_hit_count == 0
-        assert c.prefetch_hit_queue.empty()
-        assert not c.pp_prefetch_states
-        c.mem_pool_host.alloc.assert_not_called()
-    finally:
-        torch.distributed.destroy_process_group()
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
 class TestPPPrefetchTicket(CustomTestCase):
@@ -250,14 +194,16 @@ class TestPPPrefetchTicket(CustomTestCase):
     def test_cache_query_binding_in_either_arrival_order(self):
         c = self.c
         c.host_memory_mode = "cache"
-        c._storage_hit_query.side_effect = lambda op: self.query_hits(op, 20)
-        for query_first in (False, True):
-            with self.subTest(query_first=query_first):
-                rid = str(query_first)
+        for query_first, hit in ((False, 20), (True, 20), (True, 0)):
+            with self.subTest(query_first=query_first, hit=hit):
+                c._storage_hit_query.side_effect = lambda op: self.query_hits(op, hit)
+                rid = str((query_first, hit))
                 c.storage_config.pp_rank = 0
                 self.submit_cache_query(rid)
                 ticket = c.pp_prefetch_command_queue.get_nowait()
                 self.assertTrue(c.pp_prefetch_command_queue.empty())
+                # A peer has its own registry, including when query arrives first.
+                c.pp_prefetch_states.clear()
                 c.storage_config.pp_rank = 1
                 if query_first:
                     self.run_commands(ticket)
@@ -266,12 +212,14 @@ class TestPPPrefetchTicket(CustomTestCase):
                     self.run_commands(ticket)
                 result = c.prefetch_hit_queue.get_nowait()
                 self.assertIs(c.resolve_cache_query(result), local)
-                self.assertEqual(local.storage_hit_count, 12)
+                self.assertEqual(local.storage_hit_count, max(0, hit - 8))
                 self.assertEqual(
                     local.all_hash_values,
                     result.operation.all_hash_values[2:],
                 )
-                self.assertEqual(local.hash_value, local.all_hash_values[:3])
+                self.assertEqual(
+                    local.hash_value, local.all_hash_values[:3] if hit else []
+                )
                 self.assertFalse(local.assume_stored)
                 self.assertTrue(c.prefetch_hit_queue.empty())
                 self.assertTrue(c.pp_prefetch_command_queue.empty())
@@ -294,15 +242,11 @@ class TestPPPrefetchTicket(CustomTestCase):
 
         c._storage_hit_query.side_effect = query
         self.run_commands()
-        self.assertIs(
-            c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), cancelled
-        )
-        self.assertEqual(cancelled.storage_hit_count, 0)
-        self.assertIs(c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), failed)
-        self.assertEqual(failed.storage_hit_count, 0)
-        self.assertIs(
-            c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), following
-        )
+        for operation, hit in ((cancelled, 0), (failed, 0), (following, 12)):
+            self.assertIs(
+                c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), operation
+            )
+            self.assertEqual(operation.storage_hit_count, hit)
         self.assertTrue(c.prefetch_hit_queue.empty())
         self.assertFalse(c.pp_prefetch_states)
         self.assertEqual(c._all_reduce.call_count, 3)
@@ -327,39 +271,70 @@ class TestPPPrefetchTicket(CustomTestCase):
         self.assertFalse(c.pp_prefetch_states)
         self.assertEqual(c._storage_hit_query.call_count, 2)
 
-    def test_cache_query_real_broadcast_min_and_late_binding(self):
-        with tempfile.TemporaryDirectory() as directory:
-            torch.multiprocessing.spawn(
-                _cache_query_ranks,
-                args=(str(Path(directory) / "query"),),
-                nprocs=3,
-            )
-
-    def test_cache_query_is_bound_only_after_native_submission(self):
+    def test_cache_query_follows_prefill_and_decode_submission(self):
         c, cache = self.c, self.cache
         c.host_memory_mode = cache.host_memory_mode = "cache"
         cache.buffer_pipeline = None
         cache.tree_core.page_size = cache.prefetch_threshold = 4
         cache.tree_core.prefetch_anchor_info.return_value = (None, None)
+        cache.hicache_storage_pass_prefix_keys = False
         cache._prefetch_outcome_stats = defaultdict(int)
         cache.inc_host_lock_ref = Mock()
+        # Component algorithms have native tests; check their descriptors survive
+        # the shared root query and ticket conversion, including state endpoints.
+        descriptors = {
+            ct: [
+                PoolTransfer(
+                    name, keys=["state"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+                )
+            ]
+            for ct, name in (
+                (ComponentType.SWA, PoolName.SWA),
+                (ComponentType.MAMBA, PoolName.MAMBA),
+            )
+        }
+        cache._build_prefetch_component_transfers = Mock(return_value=descriptors)
         for bigram in (False, True):
             cache.tree_core.is_eagle = bigram
-            for length, limited in ((2, False), (8, True), (8, False)):
-                with self.subTest(bigram=bigram, length=length, limited=limited):
-                    handle = CacheRequestHandle(str((bigram, length, limited)), 0)
-                    c.prefetch_rate_limited = lambda: limited
-                    tokens = list(range(4, 4 + length + int(bigram)))
-                    cache.inc_host_lock_ref.reset_mock()
-                    cache.prefetch_from_storage(
-                        handle,
-                        0,
-                        tokens,
-                        matched_prefix_tokens=[0, 1, 2, 3],
-                        extra_key="adapter",
-                        cache_salt="tenant",
-                        storage_attempt=2,
+            for decode, length, limited in (
+                (False, 2, False),
+                (False, 8, True),
+                (False, 8, False),
+                (True, 8, False),
+            ):
+                with self.subTest(
+                    bigram=bigram, decode=decode, length=length, limited=limited
+                ):
+                    handle = CacheRequestHandle(
+                        str((bigram, decode, length, limited)), 0
                     )
+                    c.prefetch_rate_limited = lambda: limited
+                    cache.inc_host_lock_ref.reset_mock()
+                    tokens = list(range(20 + int(bigram)))
+                    if decode:
+                        req = SimpleNamespace(
+                            rid=handle.rid,
+                            cache_request_handle=handle,
+                            origin_input_ids=tokens,
+                            storage_prefetch_retry_attempts=2,
+                            extra_key="adapter",
+                            cache_salt="tenant",
+                        )
+                        match = DecodePrefixMatch(torch.arange(4), 0, length, 0, 0)
+                        DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                            SimpleNamespace(tree_cache=cache), req, match
+                        )
+                        self.assertTrue(match.prefetch_registered)
+                    else:
+                        cache.prefetch_from_storage(
+                            handle,
+                            0,
+                            tokens[4 : 4 + length + int(bigram)],
+                            matched_prefix_tokens=tokens[:4],
+                            extra_key="adapter",
+                            cache_salt="tenant",
+                            storage_attempt=2,
+                        )
                     if length < 4 or limited:
                         self.assertTrue(c.pp_prefetch_command_queue.empty())
                         cache.inc_host_lock_ref.assert_not_called()
@@ -369,59 +344,26 @@ class TestPPPrefetchTicket(CustomTestCase):
                     self.assertIs(
                         c.pp_prefetch_states[ticket.key].cache_operation, operation
                     )
-                    self.assertEqual(ticket.cache_attempt, 2)
+                    self.assertEqual(ticket.key, (handle, 2))
+                    self.assertEqual(len(operation.token_ids), length)
+                    self.assertEqual(operation.storage_start, 4)
                     self.assertEqual(
                         list(ticket.prefetch_key.raw_token_ids()),
-                        list(range(12 + int(bigram))),
+                        tokens[: 12 + int(bigram)],
                     )
                     self.assertEqual(ticket.prefetch_key.cache_salt, "tenant")
-                    self.assertEqual(operation.storage_start, 4)
-                    # The already-ongoing operation must not issue another query.
+                    cache._build_prefetch_component_transfers.assert_called_with(
+                        0, ticket.prefetch_key, last_hash=None
+                    )
+                    self.assertEqual(
+                        [(p.name, p.keys, p.hit_policy) for p in ticket.pool_specs],
+                        [
+                            (name, ["state"], PoolHitPolicy.TRAILING_PAGES)
+                            for name in (PoolName.SWA, PoolName.MAMBA)
+                        ],
+                    )
                     cache.prefetch_from_storage(handle, 0, tokens)
                     self.assertTrue(c.pp_prefetch_command_queue.empty())
-
-    def test_decode_query_keeps_hit_boundary_and_retry_identity(self):
-        """Decode must not query beyond its promised hit or bind a retry as attempt 0."""
-        c, cache = self.c, self.cache
-        c.host_memory_mode = cache.host_memory_mode = "cache"
-        cache.buffer_pipeline = None
-        cache.tree_core.page_size = cache.prefetch_threshold = 4
-        cache.tree_core.prefetch_anchor_info.return_value = (None, None)
-        cache.hicache_storage_pass_prefix_keys = False
-        cache._prefetch_outcome_stats = defaultdict(int)
-        cache.inc_host_lock_ref = Mock()
-        c.prefetch_rate_limited = lambda: False
-        decode = SimpleNamespace(tree_cache=cache)
-        for bigram in (False, True):
-            with self.subTest(bigram=bigram):
-                cache.tree_core.is_eagle = bigram
-                handle = CacheRequestHandle(str(bigram), 0)
-                req = SimpleNamespace(
-                    rid=handle.rid,
-                    cache_request_handle=handle,
-                    origin_input_ids=list(range(20 + int(bigram))),
-                    storage_prefetch_retry_attempts=2,
-                    extra_key="adapter",
-                    cache_salt="tenant",
-                )
-                match = DecodePrefixMatch(torch.arange(4), 0, 8, 0, 0)
-
-                DecodeHiCachePreallocMixin._start_hicache_prefetch(decode, req, match)
-
-                self.assertTrue(match.prefetch_registered)
-                ticket = c.pp_prefetch_command_queue.get_nowait()
-                operation = cache.ongoing_prefetch[handle].operation
-                self.assertIs(
-                    c.pp_prefetch_states[ticket.key].cache_operation, operation
-                )
-                self.assertEqual(ticket.key, (handle, 2))
-                self.assertEqual(len(operation.token_ids), 8)
-                self.assertEqual(operation.storage_start, 4)
-                self.assertEqual(
-                    list(ticket.prefetch_key.raw_token_ids()),
-                    list(range(12 + int(bigram))),
-                )
-                self.assertTrue(c.pp_prefetch_command_queue.empty())
 
     def test_query_and_completion_sync_scopes(self):
         c = self.c

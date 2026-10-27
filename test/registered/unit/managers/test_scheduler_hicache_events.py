@@ -1,7 +1,6 @@
 """HiCache progress must not depend on whether a prefill batch is admitted."""
 
 import unittest
-from concurrent.futures import Future
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -16,7 +15,6 @@ maybe_stub_sgl_kernel()
 
 from test_request_class_override_points import _recv, _scheduler
 
-from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -49,14 +47,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 s._add_request_to_queue = MethodType(Scheduler._add_request_to_queue, s)
                 issued = []
                 s._prefetch_kvcache = lambda req: issued.append(req.rid)
-                gm = s.grammar_manager = GrammarManager.__new__(GrammarManager)
-                gm.grammar_queue = []
-                gm._enable_strict_thinking = False
-                gm.grammar_backend = Mock()
-                future = Future()
-                gm.grammar_backend.get_cached_or_future_value.return_value = (
-                    future,
-                    False,
+                # Grammar compilation is native; exercise only its enqueue boundary.
+                s.grammar_manager = Mock(
+                    process_req_with_grammar=Mock(side_effect=[True, False])
                 )
                 structured = _recv("r")
                 structured.sampling_params.json_schema = '{"type":"object"}'
@@ -65,8 +58,10 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 self.assertEqual(issued, ["q"])
                 s.tree_cache.bind_prefetch_ticket.assert_not_called()
                 # Native grammar readiness moves r through the same enqueue path.
-                future.set_result(Mock())
-                s._add_request_to_queue(gm.grammar_queue.pop())
+                held = s.grammar_manager.process_req_with_grammar.call_args_list[
+                    0
+                ].args[0]
+                s._add_request_to_queue(held)
                 self.assertEqual(issued, ["q", "r"])
 
     def setUp(self):

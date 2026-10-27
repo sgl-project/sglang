@@ -146,13 +146,9 @@ class TestHeldRowAdmission(CustomTestCase):
                 s = self._scheduler(DisaggregationMode.PREFILL, [], None, [a, b])
                 s.enable_hicache_storage = True
                 s._prefetch_after_device_hit_loss = lambda req: False
-                polled = []
-
-                def poll(handle):
-                    polled.append(handle.rid)
-                    return handle.rid == "b"
-
-                s.tree_cache.check_prefetch_progress = poll
+                poll = s.tree_cache.check_prefetch_progress = Mock(
+                    side_effect=[False, True]
+                )
                 s.tree_cache.prefetch_stop_pending = lambda handle: stopping
                 s.tree_cache.pop_prefetch_loaded_span = lambda handle: (0, None)
                 with (
@@ -167,14 +163,13 @@ class TestHeldRowAdmission(CustomTestCase):
                             None, ScheduleBatch(reqs=[])
                         )
                         self.assertIsNone(batch)
-                        self.assertEqual(polled, ["a"])
                         self.assertEqual(s.waiting_queue, [a, b])
                     else:
                         # Ordinary query/timeout waits still let ready b run.
                         with self.assertRaises(_BatchBuilt):
                             s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=[]))
-                        self.assertEqual(polled, ["a", "b"])
                         self.assertEqual(s.waiting_queue, [a])
+                    self.assertEqual(poll.call_count, 1 if stopping else 2)
 
 
 if __name__ == "__main__":

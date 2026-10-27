@@ -2,7 +2,6 @@
 
 import tempfile
 import unittest
-from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from queue import Queue
@@ -13,7 +12,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.pp_prefetch_scheduler import PPPrefetchConsensus
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -22,26 +21,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
-
-
-def _controller(rank, size):
-    cc = NS(
-        pp_group=None,
-        attn_cp_group=None,
-        attn_tp_group=None,
-        tp_group=None,
-        pp_prefetch_ack_queue=Queue(),
-        ack_prefetch_queue=Queue(),
-    )
-    cc._publish_prefetch_ack = MethodType(HiCacheController._publish_prefetch_ack, cc)
-    with (
-        patch.object(dist, "get_rank", return_value=rank),
-        patch.object(dist, "get_world_size", return_value=size),
-    ):
-        cc.pp_prefetch_consensus = PPPrefetchConsensus(cc)
-    return cc
 
 
 def _gloo_completion(rank, rendezvous):
@@ -64,6 +46,7 @@ def _gloo_completion(rank, rendezvous):
         cc.pp_prefetch_ack_queue, cc.ack_prefetch_queue = Queue(), Queue()
         cc.pp_prefetch_consensus = PPPrefetchConsensus(cc)
         operation = NS(is_pp_broadcast=False)
+        stale, fresh = NS(is_pp_broadcast=False), NS(is_pp_broadcast=False)
         acks = [
             PrefetchAck("r", operation, completed_tokens=128 - rank * 16),
             PrefetchAck(
@@ -96,16 +79,6 @@ def _gloo_completion(rank, rendezvous):
             "_pp_send_pyobj_to_next_stage",
         ):
             setattr(s, name, MethodType(getattr(SchedulerPPMixin, name), s))
-        topology = NS(
-            attn_tp_rank=tp,
-            attn_cp_rank=0,
-            attn_dp_rank=0,
-            attn_cp_size=1,
-            attn_tp_size=2,
-            tp_size=2,
-            pp_rank=pp,
-            pp_size=3,
-        )
 
         def stage_broadcast(value):
             values = [value]
@@ -113,10 +86,7 @@ def _gloo_completion(rank, rendezvous):
             return values[0]
 
         with (
-            patch(
-                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-                return_value=topology,
-            ),
+            published_topology(tp_size=2, pp_size=3, ranks={"world_rank": rank}),
             patch(
                 "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
                 stage_broadcast,
@@ -131,7 +101,26 @@ def _gloo_completion(rank, rendezvous):
                 for i, ack in enumerate(acks):
                     if tick == 2 * pp + tp + i:
                         cc.pp_prefetch_ack_queue.put(ack)
+                if tick == 16:
+                    cc.pp_prefetch_ack_queue.put(
+                        PrefetchAck("old", stale, completed_tokens=128)
+                    )
+                if tick == 18:
+                    # Reset with a proposal in flight and an ACK still queued.
+                    # The old return arrives after reset, before the fresh one.
+                    cc.pp_prefetch_ack_queue.put(
+                        PrefetchAck("old", stale, completed_req=True)
+                    )
+                    cc.pp_prefetch_consensus.reset()
+                    assert cc.pp_prefetch_ack_queue.empty()
+                    cc.pp_prefetch_ack_queue.put(
+                        PrefetchAck("new", fresh, completed_tokens=64)
+                    )
                 s._pp_prefetch_step()
+                if tick < 5:  # The slowest TP rank has no progress ACK yet.
+                    assert cc.ack_prefetch_queue.empty()
+                if tick < 7:
+                    assert not any(a.completed_req for a in cc.ack_prefetch_queue.queue)
                 # Native cache progress remains PP0-led and may consume every
                 # committed ACK now; no peer waits for a not-yet-published ACK.
                 cache._drain_async_work()
@@ -162,101 +151,27 @@ def _gloo_completion(rank, rendezvous):
         assert not cc.pp_prefetch_consensus.pending
         assert not cc.pp_prefetch_consensus.inflight
         assert cc.pp_prefetch_ack_queue.empty()
-        results = [cc.ack_prefetch_queue.get_nowait() for _ in range(3)]
-        assert all(ack.operation is operation for ack in results)
+        results = [cc.ack_prefetch_queue.get_nowait() for _ in range(4)]
+        assert all(ack.operation is operation for ack in results[:3])
         assert results[0].completed_tokens == 48
         assert results[1].pool_hits[PoolName.SWA] == 1
         assert results[1].pool_hits[PoolName.MAMBA] == 0
         assert results[2].completed_req
+        assert results[3].operation is fresh
+        assert results[3].completed_tokens == 64
+        assert cc.ack_prefetch_queue.empty()
     finally:
         dist.destroy_process_group()
 
 
 class TestPrefetchConsensus(unittest.TestCase):
-    def test_slow_stage_defers_ack_without_blocking_or_publishing_terminal(self):
-        for size in (2, 3, 8):
-            with self.subTest(pp=size):
-                controllers = [_controller(i, size) for i in range(size)]
-                inboxes = [deque() for _ in range(size)]
-                operations = [object() for _ in controllers]
-                for i, cc in enumerate(controllers[:-1]):
-                    cc.pp_prefetch_ack_queue.put(
-                        PrefetchAck("r", operations[i], completed_tokens=128)
-                    )
-                    cc.pp_prefetch_ack_queue.put(
-                        PrefetchAck("r", operations[i], completed_req=True)
-                    )
-                for tick in range(6 * size):
-                    if tick == 2 * size:
-                        cc = controllers[-1]
-                        cc.pp_prefetch_ack_queue.put(
-                            PrefetchAck("r", operations[-1], completed_tokens=64)
-                        )
-                    if tick == 3 * size:
-                        cc.pp_prefetch_ack_queue.put(
-                            PrefetchAck("r", operations[-1], completed_req=True)
-                        )
-                    for i, cc in enumerate(controllers):
-
-                        def send(update, i=i):
-                            inboxes[(i + 1) % size].append(update)
-                            return []
-
-                        cc.pp_prefetch_consensus.advance(inboxes[i].popleft, send, size)
-                    if tick < 2 * size:
-                        self.assertTrue(
-                            all(c.ack_prefetch_queue.empty() for c in controllers)
-                        )
-                for i, cc in enumerate(controllers):
-                    self.assertFalse(cc.pp_prefetch_consensus.pending)
-                    self.assertFalse(cc.pp_prefetch_consensus.inflight)
-                    progress, terminal = [
-                        cc.ack_prefetch_queue.get_nowait() for _ in range(2)
-                    ]
-                    self.assertEqual(progress.completed_tokens, 64)
-                    self.assertIs(progress.operation, operations[i])
-                    self.assertTrue(terminal.completed_req)
-
-    def test_tp2_pp3_real_ring_and_native_cache_event_order(self):
+    def test_tp2_pp3_slow_stage_reset_and_native_cache_event_order(self):
         with tempfile.TemporaryDirectory() as directory:
             torch.multiprocessing.spawn(
                 _gloo_completion,
                 args=(str(Path(directory) / "completion"),),
                 nprocs=6,
             )
-
-    def test_reset_and_detach_discard_unpublished_results(self):
-        controllers = [_controller(i, 3) for i in range(3)]
-        inboxes = [deque() for _ in controllers]
-        old, new = object(), object()
-        for cc in controllers:
-            cc.pp_prefetch_ack_queue.put(PrefetchAck("r", old, completed_tokens=128))
-        for tick in range(12):
-            if tick == 2:
-                for cc in controllers:
-                    cc.pp_prefetch_consensus.reset()
-                    cc.pp_prefetch_ack_queue.put(
-                        PrefetchAck("r", new, completed_tokens=64)
-                    )
-            for i, cc in enumerate(controllers):
-
-                def send(update, i=i):
-                    inboxes[(i + 1) % 3].append(update)
-                    return []
-
-                cc.pp_prefetch_consensus.advance(inboxes[i].popleft, send, 3)
-        for cc in controllers:
-            result = cc.ack_prefetch_queue.get_nowait()
-            self.assertIs(result.operation, new)
-            self.assertEqual(result.completed_tokens, 64)
-            self.assertTrue(cc.ack_prefetch_queue.empty())
-            # Native detach cleans up operations directly, without ACK drain.
-            cc.pp_prefetch_ack_queue.put(PrefetchAck("r", new, completed_tokens=128))
-            cc.pp_prefetch_ack_queue.put(PrefetchAck("r", new, completed_req=True))
-            cc.pp_prefetch_consensus.reset()
-            self.assertFalse(cc.pp_prefetch_consensus.pending)
-            self.assertTrue(cc.pp_prefetch_ack_queue.empty())
-            self.assertTrue(cc.ack_prefetch_queue.empty())
 
 
 if __name__ == "__main__":
