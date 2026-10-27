@@ -39,46 +39,27 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
     A5 reads a quantized KV cache, which is a different kernel rather than a
     flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            return (
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv_metadata_host,
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
-        torch.ops.custom.npu_sparse_attn_sharedkv,
-    )
-
-
-def _dspark_a5_sparse_attn_ops():
-    """Operators provided by the Ascend 950 sgl-kernel-npu wheel."""
-    try:
-        import sgl_kernel_npu  # noqa: F401 - registers torch.ops.npu operators
-    except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "DSpArk on Ascend 950 requires an sgl-kernel-npu wheel containing "
-            "kv_quant_sparse_attn_sharedkv and its host metadata operator"
-        ) from exc
-
-    names = (
-        "kv_quant_sparse_attn_sharedkv_metadata_host",
-        "kv_quant_sparse_attn_sharedkv",
-    )
-    missing = [name for name in names if not hasattr(torch.ops.npu, name)]
-    if missing:
-        raise RuntimeError(
-            f"The installed sgl-kernel-npu wheel is missing torch.ops.npu {missing}; "
-            "rebuild and install its Ascend 950 kernels wheel"
-        )
-    return (
-        getattr(torch.ops.npu, names[0]),
-        getattr(torch.ops.npu, names[1]),
+        torch.ops.custom.npu_sparse_attn_sharedkv
+        if not is_dspark
+        else torch.ops.npu.sparse_attn_sharedkv,
     )
 
 
@@ -1003,8 +984,6 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
-        if self._is_dspark_draft_worker and is_npu_arch35():
-            _dspark_a5_sparse_attn_ops()
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
@@ -2049,11 +2028,10 @@ class DeepseekV4AscendAttnBackend(
                 "cu_seqlens_q": cu_q_cpu.to(dtype=torch.int32).contiguous(),
             }
             c1a_kwargs = c1a_kwargs | host_inputs
-            metadata_op = (
-                _dspark_a5_sparse_attn_ops()[0]
-                if is_npu_arch35()
-                else torch.ops.npu.sparse_attn_sharedkv_metadata_host
-            )
+            if is_npu_arch35():
+                metadata_op, _ = _sparse_attn_ops(is_dspark=True)
+            else:
+                metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
         else:
             c1a_kwargs = c1a_kwargs | {
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -2164,14 +2142,9 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        _, attn_op = _sparse_attn_ops()
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         if self._is_dspark_draft_worker:
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
-            attn_op = (
-                _dspark_a5_sparse_attn_ops()[1]
-                if is_npu_arch35()
-                else torch.ops.npu.sparse_attn_sharedkv
-            )
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices

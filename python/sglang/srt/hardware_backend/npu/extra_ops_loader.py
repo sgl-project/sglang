@@ -134,3 +134,25 @@ class TorchOpLoader:
         self._loaded_library = library_path
         logger.info("Registered %s operators from %s", self._spec.name, library_path)
         return library_path
+
+
+def initialize_dspark_a5_sparse_attn_ops() -> None:
+    """Import the sgl-kernel-npu wheel and check the A5 DSpArk operators."""
+    try:
+        import sgl_kernel_npu  # noqa: F401 - loads libsgl_kernel_npu.so
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "DSpArk A5 requires an sgl-kernel-npu wheel containing the "
+            "quantized sparse-attention and host metadata operators."
+        ) from exc
+
+    required_ops = (
+        "kv_quant_sparse_attn_sharedkv_metadata_host",
+        "kv_quant_sparse_attn_sharedkv",
+    )
+    missing = [name for name in required_ops if not hasattr(torch.ops.npu, name)]
+    if missing:
+        raise RuntimeError(
+            f"The installed sgl-kernel-npu wheel is missing torch.ops.npu {missing}. "
+            "Rebuild and reinstall its Ascend 950 kernels wheel."
+        )
