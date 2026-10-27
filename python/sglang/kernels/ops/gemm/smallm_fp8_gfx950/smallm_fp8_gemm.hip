@@ -156,12 +156,6 @@ SMALLM_FP8_GEMM(1, 1, 8, 8, 0)   // TP2 K = 4096, N = 4096, M <= 8
 SMALLM_FP8_GEMM(1, 1, 8, 8, 1)   // TP2 K = 4096, N = 4096, M <= 16
 SMALLM_FP8_GEMM(2, 1, 4, 16, 0)  // TP2 K = 4096, N = 4096, 17 <= M <= 40
 SMALLM_FP8_GEMM(3, 1, 4, 16, 0)
-SMALLM_FP8_GEMM(1, 1, 12, 8, 1)  // M3.1 K = 6144, N = 2560 / 2304 / 1536 / 1280, M <= 8
-SMALLM_FP8_GEMM(1, 1, 8, 12, 1)  // M3.1 K = 6144, N = 2560 / 2304 / 1536 / 1280, M <= 16
-SMALLM_FP8_GEMM(1, 2, 6, 16, 1)  // M3.1 K = 6144, N = 6144, M <= 16
-SMALLM_FP8_GEMM(1, 2, 4, 12, 0)  // M3.1 K = 3072, M <= 8
-SMALLM_FP8_GEMM(1, 2, 8, 6, 0)   // M3.1 K = 3072, M <= 16
-SMALLM_FP8_GEMM(1, 2, 4, 8, 0)   // M3.1 K = 2048, M <= 8
-SMALLM_FP8_GEMM(1, 2, 8, 4, 1)   // M3.1 K = 2048, M <= 16
-SMALLM_FP8_GEMM(1, 2, 2, 6, 0)   // M3.1 K = 768, M <= 16
+SMALLM_FP8_GEMM(1, 1, 12, 8, 1)  // M3.1 K = 6144, N = 1536, M <= 8
+SMALLM_FP8_GEMM(1, 1, 8, 12, 1)  // M3.1 K = 6144, N = 1536, M <= 16
 #endif
