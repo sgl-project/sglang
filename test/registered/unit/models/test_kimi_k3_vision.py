@@ -12,6 +12,7 @@ from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
     MoonViT3dEncoder,
+    MoonViTEncoderLayer,
     _resolve_mm_attention_backend,
     interpolate_pos_emb,
     sdpa_varlen_attention,
@@ -25,6 +26,56 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class _RecordingVisionAttention(torch.nn.Module):
+    def __init__(self, **_kwargs):
+        super().__init__()
+        self.call_count = 0
+
+    def forward(self, q, _k, _v, **_kwargs):
+        self.call_count += 1
+        return q
+
+
+def _make_kimi_k3_encoder_layer(attention_backend):
+    return MoonViTEncoderLayer(
+        num_heads=1,
+        hidden_dim=8,
+        qkv_hidden_size=8,
+        mlp_dim=16,
+        norm_type="rmsnorm",
+        activation=F.gelu,
+        attn_bias=False,
+        linear_bias=False,
+        attention_backend=attention_backend,
+    )
+
+
+def test_kimi_k3_vision_backend_label_can_overlap_module_name(monkeypatch):
+    """Backend labels may overlap with nn.Module APIs without blocking startup."""
+    backend = "cuda"
+    monkeypatch.setitem(
+        kimi_k3_vl.QKV_BACKEND_IMPL,
+        backend,
+        _RecordingVisionAttention,
+    )
+
+    layer = _make_kimi_k3_encoder_layer(backend)
+    implementation = layer.attention_backend_impls[backend]
+
+    output = layer._attention(
+        torch.randn(2, 8),
+        torch.tensor([0, 2], dtype=torch.int32),
+        ((0, 2),),
+        torch.ones(2, 4, dtype=torch.complex64),
+        SimpleNamespace(),
+        use_fused_rope=False,
+        selected_attention_backend=backend,
+    )
+
+    assert output.shape == (2, 8)
+    assert implementation.call_count == 1
 
 
 @pytest.mark.parametrize(
