@@ -37,6 +37,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_memory,
@@ -163,6 +164,15 @@ class RequestIntake:
         ):
             return tuple(recv_req)
         return ()
+
+    def reconstruct_positional_embed_overrides(self, recv_req) -> None:
+        """Rebuild each request's override embeds from their CUDA IPC handles,
+        which releases the sender's pool slot."""
+        for tokenized_req in self._tokenized_requests(recv_req):
+            if tokenized_req.positional_embed_overrides is not None:
+                tokenized_req.positional_embed_overrides.reconstruct(
+                    get_device().gpu_id
+                )
 
     def _gather_vmm_materialization_errors(
         self, local_error: Optional[str]
