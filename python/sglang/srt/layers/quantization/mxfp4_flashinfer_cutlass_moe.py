@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.utils import RoutingMethodType
 
 # MXFP4 group/block size (E8M0 scale per 32 fp4 weights).
 _GROUP_SIZE = 32
@@ -126,6 +127,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
     def get_moe_runner_backend(self, layer):
         return self.runner.runner_backend
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling.

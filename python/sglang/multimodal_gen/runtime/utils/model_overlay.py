@@ -26,6 +26,11 @@ logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "tencent/Hy-Nomas": {
+        "overlay_repo_id": "Niehen6174/Hy-Nomas-overlay",
+        "overlay_revision": "14088cc131c66fb7265cefbf99276428ccd5a957",
+        "source_revision": "dea948068220d1037f1d1c10b95b6793d92bee28",
+    },
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
@@ -162,8 +167,8 @@ def resolve_model_overlay_target(
     if os.path.exists(model_name_or_path):
         # Local source dirs do not have a repo id, so match them by basename.
         base_name = os.path.basename(os.path.normpath(model_name_or_path))
-        normalized_path = (
-            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/")
+        path_parts = (
+            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/").split("/")
         )
         for source_model_id, spec in registry.items():
             if base_name == source_model_id.rsplit("/", 1)[-1]:
@@ -171,7 +176,7 @@ def resolve_model_overlay_target(
             cache_repo_fragment = (
                 f"models--{source_model_id.lower().replace('/', '--')}"
             )
-            if cache_repo_fragment in normalized_path:
+            if cache_repo_fragment in path_parts:
                 return source_model_id, spec
 
     return None
@@ -363,6 +368,7 @@ def resolve_direct_overlay_repo(
     model_name_or_path: str,
     *,
     hf_hub_download_fn: Callable[..., str],
+    snapshot_download_fn: Callable[..., str] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
     if os.path.exists(model_name_or_path):
         manifest = load_overlay_manifest_if_present(model_name_or_path)
@@ -395,6 +401,22 @@ def resolve_direct_overlay_repo(
         return None
     except Exception:
         return None
+
+    if snapshot_download_fn is not None:
+        # The manifest alone leaves model_index.json and configs out of the snapshot.
+        try:
+            overlay_dir = download_overlay_metadata(
+                model_name_or_path,
+                {"overlay_repo_id": model_name_or_path},
+                snapshot_download_fn=snapshot_download_fn,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to download overlay metadata for %s",
+                model_name_or_path,
+                exc_info=True,
+            )
+            return None
 
     manifest = load_overlay_manifest_if_present(overlay_dir)
     if manifest is None:
@@ -673,7 +695,9 @@ def maybe_load_overlay_model_index(
         return load_model_index_from_dir(overlay_dir)
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None
@@ -751,7 +775,9 @@ def maybe_resolve_overlay_model_path(
         )
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None
