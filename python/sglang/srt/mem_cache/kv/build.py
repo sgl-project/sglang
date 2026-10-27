@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.kv.decl import (
     WindowLifetime,
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
@@ -40,7 +40,6 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaPool,
-    UnifiedMLATokenToKVPool,
     _wire_mamba_slot_allocator,
 )
 
@@ -160,7 +159,7 @@ def _build_token_view(
     """A token sub-pool's view in its layout."""
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
-        return UnifiedMLATokenToKVPool(
+        return MLAView(
             arena=arena,
             spec=sub_pool.spec,
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,

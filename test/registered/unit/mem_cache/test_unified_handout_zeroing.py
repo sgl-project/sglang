@@ -16,9 +16,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMLATokenToKVPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -57,7 +56,7 @@ def _build(device, page_size=1):
         enable_memory_saver=False,
         page_size=page_size,
     )
-    kvcache = UnifiedMLATokenToKVPool(
+    kvcache = MLAView(
         arena=buf,
         spec=buf.spec("full"),
         kv_cache_dtype=torch.bfloat16,
@@ -258,7 +257,7 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         self.assertTrue((env[pages2] == 0).all().item())
 
     def test_zeroing_keys_on_pool_type(self):
-        # UnifiedMLATokenToKVPool has NaN-unsafe partial-page reads whatever
+        # The MLA view has NaN-unsafe partial-page reads whatever
         # its geometry; zeroing must key on the pool type, not on any
         # id-space scale.
         buf, kvcache, allocator = self.build("cuda")

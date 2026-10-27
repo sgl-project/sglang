@@ -2,7 +2,7 @@
 
 PD disaggregation transfers the unified memory pool as whole envelopes with
 ``addr = raw_ptr + physical_index * item_len`` (see
-``UnifiedMLATokenToKVPool.get_contiguous_buf_infos`` /
+``MLAView.get_contiguous_buf_infos`` /
 ``UnifiedMambaPool.get_contiguous_buf_infos`` and mooncake's
 ``_send_kvcache_generic`` / ``_send_mamba_state``). That contract only holds if
 the page-major view builders keep (a) one page's data for ALL layers inside one

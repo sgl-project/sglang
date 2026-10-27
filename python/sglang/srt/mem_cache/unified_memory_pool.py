@@ -29,88 +29,13 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
-from sglang.srt.mem_cache.memory_pool import MambaPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
-
-
-class UnifiedMLATokenToKVPool(MLATokenToKVPool):
-    """MLA KV pool whose per-layer `kv_buffer` entries are token-major views
-    into a `KVArena` band: `(num_pages * ps, 1, kv_cache_dim)` with the whole
-    entry as slot stride, indexed by the physical token id (`translate_kv_loc`
-    of the virtual id), so the stock `MLATokenToKVPool` read/write methods work
-    on them unmodified. The arena moves and zeroes its units.
-    """
-
-    requires_physical_write_loc = True
-
-    def __init__(
-        self,
-        *,
-        arena: KVArena,
-        spec: MLASubPoolSpec,
-        kv_cache_dtype: torch.dtype,
-        page_size: int = 1,
-    ):
-        store_dtype = _store_dtype_for(kv_cache_dtype)
-        assert spec.store_dtype == store_dtype, (
-            f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
-            f"match kv cache dtype {kv_cache_dtype} (store {store_dtype})"
-        )
-
-        self._arena = arena
-        self._sub_pool_name = spec.name
-        self._kv_views = spec.views(arena)
-        max_slots = arena.extent_entries(spec.name)
-        self.num_pages = max_slots // page_size
-        self.page_bytes = page_size * spec.entry_bytes()
-        self._view_rows = self.num_pages * page_size
-
-        super().__init__(
-            # OOB checks bound locs by `size + page_size`; physical ids run to
-            # `_view_rows` (page 0 is the reserved padding sink).
-            size=self._view_rows - page_size,
-            page_size=page_size,
-            dtype=kv_cache_dtype,
-            kv_lora_rank=spec.kv_lora_rank,
-            qk_rope_head_dim=spec.qk_rope_head_dim,
-            layer_num=spec.layer_num,
-            device=arena.device,
-            enable_memory_saver=False,  # the arena owns the bytes
-        )
-
-    def _create_buffers(self):
-        self.kv_buffer = self._kv_views
-
-    def _clear_buffers(self):
-        # The arena owns the bytes; do not delete the views.
-        pass
-
-    # The plan's write translation (`translate_write_loc`) already collapsed
-    # the widened id and sent the rows this rank does not own to the padding
-    # sink.
-    write_loc_is_dcp_resolved = True
-
-    def get_kv_size_bytes(self):
-        return 0  # the arena logs the total; per-sub-pool would double-count
-
-    def get_contiguous_buf_infos(self):
-        """PD-transfer registration: ONE entry, the raw buffer, addressed as
-        ``raw_ptr + physical_page_id * page_envelope_bytes``.
-
-        The transfer item is the whole page envelope (all layers of one page)
-        rather than a per-layer region: the layers interleave inside each
-        slot's entry. Both sides must therefore build the pool with identical
-        specs.
-        """
-        raw = self._arena.raw
-        return [raw.data_ptr()], [raw.numel()], [self.page_bytes]
 
 
 class UnifiedMambaPool(MambaPool):
