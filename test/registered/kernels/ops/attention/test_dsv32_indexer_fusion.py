@@ -21,8 +21,8 @@ from sglang.kernels.ops.attention.dsa.indexer_k import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
-from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
-from sglang.kernels.ops.attention.fused_store_index_cache import (
+from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
@@ -31,7 +31,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _is_hip = is_hip()
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 HEAD_DIM = 128

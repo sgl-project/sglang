@@ -182,9 +182,16 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
-_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+    try:
+        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+    except ImportError:
+        # sgl-kernel-npu wheels built before the target-specific Gemma provider
+        # landed expose only the torch_npu operator, which is exactly what that
+        # provider binds to on A2/A3 — so those deployments keep working
+        # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
+        # forward fails loudly, same as before this indirection existed.
+        npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
 
 
 @lru_cache(maxsize=1)
@@ -1113,8 +1120,12 @@ class GemmaRMSNorm(BaseFusedOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        self.refresh_gemma_weight()
+
+    def refresh_gemma_weight(self) -> None:
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
-        torch.add(param.data, 1.0, out=self.gemma_weight)
+        # CPU offload may move the parameter to host while the buffer stays on device.
+        self.gemma_weight.copy_(self.weight.data).add_(1.0)
 
     def _forward_impl(
         self,
@@ -1237,18 +1248,12 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                gamma = self.gemma_weight.to(x.dtype)
-                norm_out, _, residual = torch_npu.npu_add_rms_norm(
-                    residual, x, gamma, self.variance_epsilon
-                )
-            else:
-                norm_out, residual = add_gemma_rms_norm(
-                    x, self.weight, residual, self.variance_epsilon
-                )
+            norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                residual, x, self.gemma_weight.to(x.dtype), self.variance_epsilon
+            )
             return norm_out, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        x, _ = npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 
     def forward_xpu(
@@ -1352,9 +1357,13 @@ class Gemma3RMSNorm(BaseFusedOp):
             # output and residual becomes x + residual for the next layer.
             gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
             return x, residual
-        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
-        # can all go through it directly without a Python-side reshape.
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs go
+        # through directly without a Python-side reshape. It handles
+        # non-contiguous batch/row strides but requires a contiguous last dim,
+        # which a permuted hidden state may not have.
         elif residual is None and x.dim() in (2, 3, 4):
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x, residual)
 
@@ -1372,7 +1381,7 @@ class Gemma3RMSNorm(BaseFusedOp):
             return self.forward_native(x, residual)
         if residual is not None:
             return self.forward_native(x, residual)
-        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
+        output, _ = npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
     def extra_repr(self):
