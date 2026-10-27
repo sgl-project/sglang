@@ -147,6 +147,11 @@ def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
         reasons.append("--enable-unified-memory is set")
     if get_parallel().attn_dcp_size > 1:
         reasons.append("DCP widens the draft id space")
+    if get_exec().kernel.monokernel_backend is not None:
+        # The monokernel draft kernels write out_cache_loc and read req_to_token
+        # (full-pool ids) straight into the draft cache, without the full->SWA
+        # translation; past the SWA-sized pool they fault.
+        reasons.append("a monokernel backend indexes the draft cache by full ids")
     if reasons:
         logger.warning(
             "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
