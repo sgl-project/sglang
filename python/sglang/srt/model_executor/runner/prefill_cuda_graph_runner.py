@@ -1298,8 +1298,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
         elif not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            build_snapshot = True
+            # An idle DP rank retains the padded graph shape for collective
+            # participation, but has no real sparse queries or KV writes.
+            if not (
+                attn_backend.skips_prefill_metadata_on_idle_dp_rank
+                and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0
+            ):
+                attn_backend.init_forward_metadata(forward_batch)
+                build_snapshot = True
         else:
             assert self.attn_metadata_buffers is not None
             metadata = self.attn_metadata_buffers[shape_key]
@@ -2294,6 +2300,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None
+                else None
+            ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_tokens]
+                if output.last_hidden_states is not None
                 else None
             ),
             input_token_logprobs=output.input_token_logprobs,
