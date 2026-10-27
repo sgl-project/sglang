@@ -7,7 +7,7 @@ instead of once per row. Each row keeps its own causal and local-block masks, so
 its scores and top-k match the per-row decode indexer.
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -139,7 +139,7 @@ def _verify_score_kernel(
 
 def _use_fused_verify_topk(
     q: torch.Tensor,
-    k_cache: torch.Tensor | Nvfp4Cache,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
     *,
     num_draft: int,
     topk: int,
@@ -162,7 +162,9 @@ def _use_fused_verify_topk(
 def verify_topk_idx(
     *,
     q: torch.Tensor,  # [rows, num_heads, head_dim], rows = num_reqs * num_draft
-    k_cache: torch.Tensor | Nvfp4Cache,  # [max_slots, num_kv_heads, head_dim] or NVFP4
+    k_cache: Union[
+        torch.Tensor, Nvfp4Cache
+    ],  # [max_slots, num_kv_heads, head_dim] or NVFP4
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     seq_lens: torch.Tensor,  # [rows]
     max_seqlen: int,

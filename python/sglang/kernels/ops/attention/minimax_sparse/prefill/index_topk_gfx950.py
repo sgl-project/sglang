@@ -476,16 +476,16 @@ def _num_splits(q_tiles: int, max_seqlen_k: int, block_size_k: int) -> int:
 
 
 def _merge_partial_topk(
-    part_s,
-    part_i,
-    cu_seqlens,
-    prefix_lens,
-    total_q,
-    topk,
-    init_blocks,
-    local_blocks,
-    block_size_k,
-):
+    part_s: torch.Tensor,
+    part_i: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    total_q: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    block_size_k: int,
+) -> torch.Tensor:
     n_rows, nc = part_s.shape
     kt = triton.next_power_of_2(topk)
     if nc > 2 * _MERGE_GROUP:
