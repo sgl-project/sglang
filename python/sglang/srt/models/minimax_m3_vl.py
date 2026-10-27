@@ -29,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.deepseek_common.utils import quant_blocks_shared_experts_fusion
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
@@ -177,6 +178,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             return (
                 "Shared and routed experts may use different quantization formats "
                 "in mixed-precision checkpoints."
+            )
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
             )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
