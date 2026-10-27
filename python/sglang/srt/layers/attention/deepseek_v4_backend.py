@@ -120,6 +120,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -3491,6 +3492,11 @@ class DeepseekV4AttnBackend(
                         candidates = self.prefill_candidates
                         rows = x.shape[0]
                         table = candidates.prefill_graph_table(layer.layer_id, rows)
+                        # A capture records the table it is given; the warmup
+                        # before it allocates one.
+                        assert (
+                            table is not None or _current_capture_var.get() is None
+                        ), "candidate table not allocated before capture"
                         _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
                         if table is None:  # first run: the break allocated the buffers
                             table = candidates.prefill_graph_table(layer.layer_id, rows)
