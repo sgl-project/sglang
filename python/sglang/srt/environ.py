@@ -1413,6 +1413,11 @@ class Envs:
     # is a hit on the second run, and a cache hit has nothing to report, so pair
     # this with SGLANG_JIT_FORCE_RECOMPILE to see the report every time.
     SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    # Drop --use_fast_math from every JIT build, the way the HIP path already
+    # does: a switch for ruling fast math in or out when chasing a numerical
+    # difference. Changes the build flags, so it compiles into its own cache
+    # entry and leaves the default build untouched.
+    SGLANG_JIT_DISABLE_FAST_MATH = EnvBool(False)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
