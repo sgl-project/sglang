@@ -1,10 +1,14 @@
 import json
 import multiprocessing as mp
+import pickle
 import queue
 import tempfile
 import time
+import traceback
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import zmq
 from prometheus_client import CollectorRegistry, Histogram
@@ -25,6 +29,107 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiDetokenizerRouter
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
+
+
+def _run_child(errors, target, args):
+    try:
+        target(*args)
+    except BaseException:
+        errors.put(traceback.format_exc())
+        raise
+
+
+def _child_diagnostics(errors, processes):
+    details = []
+    while True:
+        try:
+            details.append(errors.get(timeout=0.1))
+        except queue.Empty:
+            break
+    details.extend(
+        f"{process.name}: pid={process.pid}, exitcode={process.exitcode}"
+        for process in processes
+    )
+    return "\n".join(details)
+
+
+@contextmanager
+def _socket_pair():
+    with zmq.Context() as context:
+        with context.socket(zmq.PAIR) as sender, context.socket(zmq.PAIR) as receiver:
+            for socket in (sender, receiver):
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.RCVTIMEO, 1000)
+                socket.setsockopt(zmq.SNDTIMEO, 1000)
+            sender.bind("inproc://timestamp-framing")
+            receiver.connect("inproc://timestamp-framing")
+            yield sender, receiver
+
+
+class TestTimestampFraming(CustomTestCase):
+    def setUp(self):
+        self.original_codec = io_struct._USE_PICKLE_IPC
+        self.addCleanup(setattr, io_struct, "_USE_PICKLE_IPC", self.original_codec)
+
+    def test_legacy_and_exact_timestamp_round_trip(self):
+        message = AbortReq(rid="framing")
+        timestamp = 1234567890123456
+        for pickle_ipc in (False, True):
+            with (
+                self.subTest(pickle_ipc=pickle_ipc),
+                _socket_pair() as (sender, receiver),
+            ):
+                io_struct._USE_PICKLE_IPC = pickle_ipc
+                io_struct.sock_send(sender, message)
+                self.assertEqual(
+                    io_struct.sock_recv_with_timestamp(receiver), (None, message)
+                )
+                with patch.object(
+                    io_struct.time, "monotonic_ns", return_value=timestamp
+                ):
+                    io_struct.sock_send_with_timestamp(sender, message)
+                self.assertEqual(
+                    io_struct.sock_recv_with_timestamp(receiver), (timestamp, message)
+                )
+                self.assertFalse(receiver.getsockopt(zmq.RCVMORE))
+
+    def test_rejects_malformed_timestamp_frames(self):
+        message = AbortReq(rid="malformed")
+        for pickle_ipc in (False, True):
+            io_struct._USE_PICKLE_IPC = pickle_ipc
+            payload = (
+                pickle.dumps(message)
+                if pickle_ipc
+                else io_struct.msgpack_encode(message)
+            )
+            cases = [
+                ([bytes(size)], "Invalid timestamp frame length") for size in (0, 7, 9)
+            ]
+            cases.append(([bytes(8), b"extra"], "Expected at most two frames"))
+            for frames, error in cases:
+                with (
+                    self.subTest(pickle_ipc=pickle_ipc, lengths=list(map(len, frames))),
+                    _socket_pair() as (sender, receiver),
+                ):
+                    sender.send_multipart([payload, *frames])
+                    with self.assertRaisesRegex(ValueError, error):
+                        io_struct.sock_recv_with_timestamp(receiver)
+
+    def test_encoding_failure_sends_no_partial_message(self):
+        for pickle_ipc in (False, True):
+            io_struct._USE_PICKLE_IPC = pickle_ipc
+            encoder = "pickle.dumps" if pickle_ipc else "msgpack_encode"
+            socket = MagicMock()
+            with (
+                self.subTest(pickle_ipc=pickle_ipc),
+                patch(
+                    f"sglang.srt.managers.io_struct.{encoder}",
+                    side_effect=ValueError("encoding failed"),
+                ),
+                self.assertRaisesRegex(ValueError, "encoding failed"),
+            ):
+                io_struct.sock_send_with_timestamp(socket, AbortReq(rid="encoding"))
+            self.assertEqual(socket.mock_calls, [])
 
 
 class _RecordingHistogram:
@@ -126,21 +231,29 @@ def _delivery_case(pickle_ipc):
         ]
         result_queue = ctx.Queue()
         observations = ctx.Queue()
+        errors = ctx.Queue()
         worker_ready = [ctx.Event(), ctx.Event()]
         workers = [
-            ctx.Process(target=_worker, args=(endpoint, ready, result_queue))
+            ctx.Process(
+                target=_run_child,
+                args=(errors, _worker, (endpoint, ready, result_queue)),
+            )
             for endpoint, ready in zip(worker_endpoints, worker_ready)
         ]
         router_ready = ctx.Event()
         router_start = ctx.Event()
         router_process = ctx.Process(
-            target=_router,
+            target=_run_child,
             args=(
-                router_endpoint,
-                worker_endpoints,
-                router_ready,
-                router_start,
-                observations,
+                errors,
+                _router,
+                (
+                    router_endpoint,
+                    worker_endpoints,
+                    router_ready,
+                    router_start,
+                    observations,
+                ),
             ),
         )
         context = zmq.Context()
@@ -188,14 +301,22 @@ def _delivery_case(pickle_ipc):
             else:
                 raise AssertionError("legacy single-frame message was observed")
             return {"samples": samples, "worker_results": worker_results}
+        except Exception as exc:
+            raise AssertionError(
+                f"Delivery subprocess failure: {exc}\n"
+                + _child_diagnostics(errors, [*workers, router_process])
+            ) from exc
         finally:
             if push is not None:
                 push.close(0)
             context.term()
             if router_process.is_alive():
                 router_process.terminate()
-            router_process.join(timeout=5)
+            if router_process.pid is not None:
+                router_process.join(timeout=5)
             for worker in workers:
+                if worker.pid is None:
+                    continue
                 worker.join(timeout=5)
                 if worker.is_alive():
                     worker.terminate()
@@ -208,37 +329,49 @@ def _overhead_case(timestamped):
         endpoint = f"ipc://{tmp}/sink.sock"
         count = 128
         result_queue = ctx.Queue()
+        errors = ctx.Queue()
         ready = ctx.Event()
         sink = ctx.Process(
-            target=_frame_sink, args=(endpoint, count, ready, result_queue)
+            target=_run_child,
+            args=(errors, _frame_sink, (endpoint, count, ready, result_queue)),
         )
-        sink.start()
-        assert ready.wait(5), "sink did not bind"
-        context = zmq.Context()
-        push = context.socket(zmq.PUSH)
-        push.connect(endpoint)
-        time.sleep(0.05)
-        sender = SenderWrapper(push, timestamped=timestamped)
-        messages = [AbortReq(rid=f"overhead-{i}") for i in range(count)]
+        context = None
+        push = None
         original_monotonic_ns = io_struct.time.monotonic_ns
-        if not timestamped:
-
-            def fail_if_clock_read():
-                raise AssertionError("metrics-off path read the timestamp clock")
-
-            io_struct.time.monotonic_ns = fail_if_clock_read
         samples_us = []
         try:
+            sink.start()
+            assert ready.wait(5), "sink did not bind"
+            context = zmq.Context()
+            push = context.socket(zmq.PUSH)
+            push.connect(endpoint)
+            time.sleep(0.05)
+            sender = SenderWrapper(push, timestamped=timestamped)
+            messages = [AbortReq(rid=f"overhead-{i}") for i in range(count)]
+            if not timestamped:
+
+                def fail_if_clock_read():
+                    raise AssertionError("metrics-off path read the timestamp clock")
+
+                io_struct.time.monotonic_ns = fail_if_clock_read
             for message in messages:
                 start = time.perf_counter_ns()
                 sender.send_output(message)
                 samples_us.append((time.perf_counter_ns() - start) / 1e3)
             frame_counts = result_queue.get(timeout=8)
+        except Exception as exc:
+            raise AssertionError(
+                f"Frame sink subprocess failure: {exc}\n"
+                + _child_diagnostics(errors, [sink])
+            ) from exc
         finally:
             io_struct.time.monotonic_ns = original_monotonic_ns
-            push.close(0)
-            context.term()
-            sink.join(timeout=5)
+            if push is not None:
+                push.close(0)
+            if context is not None:
+                context.term()
+            if sink.pid is not None:
+                sink.join(timeout=5)
             if sink.is_alive():
                 sink.terminate()
                 sink.join()
@@ -250,6 +383,28 @@ def _overhead_case(timestamped):
 
 
 class TestRouterDeliveryIntegration(CustomTestCase):
+    def test_worker_startup_failure_preserves_traceback(self):
+        with patch(
+            f"{__name__}._worker", side_effect=RuntimeError("worker startup failed")
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "RuntimeError: worker startup failed"
+            ) as error:
+                _delivery_case(io_struct._USE_PICKLE_IPC)
+        self.assertIn("Traceback", str(error.exception))
+        self.assertIn("exitcode=1", str(error.exception))
+
+    def test_sink_startup_failure_preserves_traceback(self):
+        with patch(
+            f"{__name__}._frame_sink", side_effect=RuntimeError("sink startup failed")
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "RuntimeError: sink startup failed"
+            ) as error:
+                _overhead_case(False)
+        self.assertIn("Traceback", str(error.exception))
+        self.assertIn("exitcode=1", str(error.exception))
+
     def test_real_zmq_delivery_backlog_and_both_codecs(self):
         original_codec = io_struct._USE_PICKLE_IPC
         try:
