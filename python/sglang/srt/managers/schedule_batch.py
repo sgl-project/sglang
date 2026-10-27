@@ -1107,6 +1107,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        pooling_may_read_prefix: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -1141,6 +1142,10 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
         self.decision_layout = decision_layout
+        # Pooling reads hidden states at positions a prefix-cache hit would
+        # not recompute (set from the model's EmbeddingModelSpec): force a
+        # full recompute instead of reusing a cached prefix.
+        self.pooling_may_read_prefix = pooling_may_read_prefix
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -1787,6 +1792,15 @@ class Req(ReqDllmMixin):
             )
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
+        if (
+            self.pooling_may_read_prefix
+            or self.token_indices_to_pool is not None
+            or self.multi_item_delimiter_indices is not None
+        ):
+            # The pooler reads hidden states at positions inside the matched
+            # prefix, which a cache hit does not recompute (only the suffix
+            # is, at most the last token).  Recompute the full sequence.
+            return 0
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if (
