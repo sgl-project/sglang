@@ -335,9 +335,24 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        # The speculative intermediate scratch (intermediate_ssm /
+        # intermediate_conv_window) is indexed positionally by running-batch
+        # slot, never by req_pool_idx: build_verify_intermediate_state_indices
+        # uses req_to_token_pool.size (== `size`), and in-transfer requests
+        # occupying the pre_alloc_size extra slots never enter target_verify.
+        # So it only needs `size` rows, matching the non-PD path
+        # (mamba_spec_state_size = max_running_requests). The extra
+        # pre_alloc_size rows were pure waste -- with MTP on GLM-5.3-Flash the
+        # [num_layers, spec_state_size+1, draft_tokens, ...] cache reaches
+        # ~20GB/GPU and leaves too little for decode CUDA graphs + NCCL.
+        # Exception: GDN's ReplaySSM-spec ring/cursors are keyed by req_pool_idx
+        # (spanning size + pre_alloc_size), so keep the padded size there.
+        mamba_spec_state_size = size
+        if enable_linear_replayssm_spec:
+            mamba_spec_state_size = size + pre_alloc_size
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
