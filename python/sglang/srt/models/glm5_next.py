@@ -26,6 +26,12 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.moe_fp8_transport import (
+    cp_moe_fp8_layer_eligible,
+    cp_moe_fp8_transport,
+    cp_moe_fp8_transport_enabled,
+    register_cp_moe_fp8_layer,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -807,6 +813,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
+        if isinstance(self.mlp, Glm5NextMoE) and cp_moe_fp8_transport_enabled():
+            register_cp_moe_fp8_layer(self.mlp)
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
@@ -849,6 +857,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
+                gathers_attn_cp_input=(
+                    cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
+                    and not is_nextn
+                    and cp_moe_fp8_transport_enabled()
+                ),
             ),
         )
 
@@ -984,10 +997,23 @@ class Glm5NextDecoderLayer(nn.Module):
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
+        from sglang.srt.layers.cp.interleave import (
+            attn_cp_interleave_gather,
+            is_interleave_extend,
+        )
+
+        deferred_cp_moe = (
+            isinstance(self.mlp, Glm5NextMoE)
+            and not self.is_nextn
+            and cp_moe_fp8_transport_enabled()
+            and is_interleave_extend(forward_batch)
+        )
         if (
             isinstance(self.mlp, Glm5NextMoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            # Local residual rows must not back the full-row MoE output.
+            and not deferred_cp_moe
             and hidden_states_orig.shape[0] == hidden_states.shape[0]
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
@@ -997,11 +1023,30 @@ class Glm5NextDecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         with _mlp_ctx:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                gemm_output_zero_allocator,
-            )
+            if deferred_cp_moe:
+                if (
+                    cp_moe_fp8_layer_eligible(self.mlp)
+                    and hidden_states.is_cuda
+                    and hidden_states.dtype == torch.bfloat16
+                    and hidden_states.is_contiguous()
+                    and hidden_states.shape[0] >= 4
+                    and hidden_states.shape[0] % 4 == 0
+                ):
+                    hidden_states = cp_moe_fp8_transport(
+                        hidden_states, self.mlp.layer_id, get_parallel().attn_cp_size
+                    )
+                else:
+                    hidden_states = self.mlp(
+                        attn_cp_interleave_gather(hidden_states),
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    gemm_output_zero_allocator,
+                )
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return (hidden_states, topk_indices)

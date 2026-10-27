@@ -1778,7 +1778,13 @@ class DeepseekV2MoE(nn.Module):
                 )
         return self._moe_quant_once
 
-    def _compute_moe_quant_once_enabled(self) -> Tuple[bool, str]:
+    def _compute_moe_quant_once_enabled(
+        self,
+        *,
+        ignore_env: bool = False,
+        allow_deep_gemm: bool = False,
+        allow_fused_shared: bool = False,
+    ) -> Tuple[bool, str]:
         """Returns (eligible, reason); reason names the first failing check."""
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
@@ -1787,7 +1793,7 @@ class DeepseekV2MoE(nn.Module):
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
-        if not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
+        if not ignore_env and not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
             return False, "env off"
         if not _is_cuda:
             return False, "not CUDA"
@@ -1796,17 +1802,22 @@ class DeepseekV2MoE(nn.Module):
         # Shared-expert side: fp8 block-128 weights served by a w8a8 linear
         # backend taught to accept a pre-quantized (q, scale) tuple: cutlass
         # or deepgemm (fp32 scales only, i.e. not UE8M0/Blackwell).
-        if self.num_fused_shared_experts != 0 or self.shared_experts is None:
+        fused_shared = allow_fused_shared and self.num_fused_shared_experts == 1
+        if not fused_shared and (
+            self.num_fused_shared_experts != 0 or self.shared_experts is None
+        ):
             return False, "no separate shared experts"
-        if not self.shared_experts_is_fp8:
+        if not fused_shared and not self.shared_experts_is_fp8:
             return False, "shared experts not fp8"
-        if self.shared_experts_weight_block_size != [128, 128]:
+        if not fused_shared and self.shared_experts_weight_block_size != [128, 128]:
             return False, "shared weight block size != [128, 128]"
-        gate_up = self.shared_experts.gate_up_proj
-        if not isinstance(gate_up.quant_method, Fp8LinearMethod):
+        gate_up = None if fused_shared else self.shared_experts.gate_up_proj
+        if not fused_shared and not isinstance(gate_up.quant_method, Fp8LinearMethod):
             return False, "shared gate_up quant method not Fp8LinearMethod"
-        linear_fn = gate_up.quant_method.w8a8_block_fp8_linear
-        if linear_fn is cutlass_w8a8_block_fp8_linear_with_fallback:
+        linear_fn = None if fused_shared else gate_up.quant_method.w8a8_block_fp8_linear
+        if fused_shared:
+            pass  # The shared expert uses the routed runner audited below.
+        elif linear_fn is cutlass_w8a8_block_fp8_linear_with_fallback:
             if gate_up.weight.shape[0] % 128 != 0 or gate_up.weight.shape[1] % 128 != 0:
                 return False, "gate_up weight shape unsupported by cutlass"
         elif linear_fn is deepgemm_w8a8_block_fp8_linear_with_fallback:
@@ -1833,10 +1844,26 @@ class DeepseekV2MoE(nn.Module):
             return False, "experts weight block size != [128, 128]"
         # Fp8MoEMethod only sets .runner for runner backends it drives itself.
         runner = getattr(quant_method, "runner", None)
-        if runner is None or not runner.runner_backend.is_triton():
+        if runner is None:
             return False, "MoE runner backend not triton"
-        if runner.fused_func is None or runner.lora_enabled:
+        is_triton = runner.runner_backend.is_triton()
+        is_deep_gemm = allow_deep_gemm and runner.runner_backend.is_deep_gemm()
+        if not (is_triton or is_deep_gemm):
+            return False, "MoE runner backend not triton or eligible deep_gemm"
+        if (is_triton and runner.fused_func is None) or runner.lora_enabled:
             return False, "triton fused func unavailable (or LoRA enabled)"
+        if is_deep_gemm:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
+
+            if (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or not deep_gemm_sm120.use_swizzle()
+            ):
+                return (
+                    False,
+                    "DeepGEMM pre-quantized input requires FP32 scales and SM90",
+                )
         if not isinstance(experts.dispatcher, StandardDispatcher):
             return False, "dispatcher not StandardDispatcher"
         if experts.moe_runner_config.apply_router_weight_on_input:
