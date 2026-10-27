@@ -123,6 +123,7 @@ class TestSwaBackupAfterCompaction(unittest.TestCase):
         )
         component = SimpleNamespace(
             component_type=ComponentType.SWA,
+            pool_name=PoolName.SWA,
             tree_core=SimpleNamespace(has_swa_host_pool=True),
             _collect_unbacked_swa_nodes=lambda n: [n],
             _unified_allocator=lambda: object(),

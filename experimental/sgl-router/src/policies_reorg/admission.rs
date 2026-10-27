@@ -5,13 +5,14 @@
 //! current measurements. Request size is a bucket concern, not an admission one.
 
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
-use super::PickError;
+use super::{PickError, Rejection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -58,6 +59,27 @@ impl EngineMetrics {
 /// rejection; admission never selects replacements or reserves capacity.
 pub trait EngineAdmission: Send + Sync + Debug {
     fn check(&self, engine: &Worker, metrics: &EngineMetrics) -> Result<Decision, PickError>;
+}
+
+/// Splits `engines` into those `admission` admits under `load`, in order, and
+/// the rejections, so a load-based pick never lands on an engine at a cap.
+pub fn partition_admitted(
+    admission: &dyn EngineAdmission,
+    engines: &[Arc<Worker>],
+    load: &EngineReportedLoadSnapshot,
+) -> Result<(Vec<Arc<Worker>>, Vec<Rejection>), PickError> {
+    let mut admitted = Vec::with_capacity(engines.len());
+    let mut rejections = Vec::new();
+    for engine in engines {
+        match admission.check(engine, &EngineMetrics::observe(engine, load))? {
+            Decision::Allow => admitted.push(Arc::clone(engine)),
+            Decision::Reject(reason) => rejections.push(Rejection {
+                engine: engine.id.clone(),
+                reason,
+            }),
+        }
+    }
+    Ok((admitted, rejections))
 }
 
 /// Per-engine caps; an unset limit is not checked and unknown metrics fail open.

@@ -615,6 +615,14 @@ def test_hopper_indexer_backends_replay(ratio):
     req_table[:, : width * ratio : ratio] = (slots[::6] * ratio).int()
     positions = (lens * ratio - 1).clamp_min(0)
     pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    # A unit page keeps the per-row table valid under the shuffled slots below.
+    page_table = torch.empty((batch, capacity), device=q.device, dtype=torch.int32)
+    page_table.copy_(req_table[req.long(), ::ratio] // ratio)
+    metadata = SimpleNamespace(
+        max_compressed_seq_len=capacity,
+        page_table=page_table,
+        compressed_page_size=1,
+    )
     indexer = SimpleNamespace(
         queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
     )
@@ -626,7 +634,7 @@ def test_hopper_indexer_backends_replay(ratio):
         x=weights,
         positions=positions,
         req_rows=req,
-        paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
+        paged_metadata=metadata,
         is_verify=True,
     )
     kwargs = dict(
@@ -636,14 +644,14 @@ def test_hopper_indexer_backends_replay(ratio):
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
+    # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
+    # runtime; the candidate paths also clear padded rows and columns.
     outputs = [
         SimpleNamespace(
-            page_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            ),
+            page_indices=torch.empty(shape, device=q.device, dtype=torch.int32),
             raw_indices=None,
         )
-        for _ in range(3)
+        for shape in ((batch, topk), (batch + 1, topk + 8), (batch + 1, topk + 8))
     ]
     decode_inputs = [
         DecodeInputs(
@@ -686,6 +694,7 @@ def test_hopper_indexer_backends_replay(ratio):
         positions.copy_(lens * ratio - 1)
         req.copy_(req.roll(1))
         req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
+        page_table.copy_(req_table[req.long(), ::ratio] // ratio)
         q.neg_()
         for scores in captured_scores:
             scores.fill_(torch.inf)
@@ -741,7 +750,7 @@ def test_hopper_indexer_backends_replay(ratio):
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()
                     torch.testing.assert_close(out.raw_indices[row], expected_raw)
-        for out in outputs:
+        for out in outputs[1:]:
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()

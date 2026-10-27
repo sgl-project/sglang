@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -64,11 +65,17 @@ def _has_bool_tensor(index) -> bool:
 
 
 class TestHiSparseDecodeRemap(CustomTestCase):
+    def test_spec_scratch_is_charged_only_before_request_slot_allocation(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+
+        allocator.configure_spec_scratch(1024)
+
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=False), 1024)
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=True), 0)
+
     def _page_size_one_coordinator(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            HiSparseTokenToKVPoolAllocator,
-        )
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
         pool = MiniMaxSparseKVPool(

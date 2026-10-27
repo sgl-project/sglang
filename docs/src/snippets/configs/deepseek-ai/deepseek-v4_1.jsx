@@ -8,8 +8,9 @@
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
-// DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
-// enabled on this model. EP is set equal to TP on every shape except MI355X.
+// DP-Attention, DeepEP and MegaMoE are absent by design. DeepEP and MegaMoE have
+// never been enabled on this model; DP-Attention runs in the MI355X agentic recipe
+// (cookbook §3.6). EP is set equal to TP on every shape except MI355X.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
@@ -55,7 +56,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012",
   },
 
   github: {
@@ -355,6 +356,7 @@ export const config = {
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -391,6 +393,7 @@ export const config = {
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
       ],
       flags: [
         "--trust-remote-code",

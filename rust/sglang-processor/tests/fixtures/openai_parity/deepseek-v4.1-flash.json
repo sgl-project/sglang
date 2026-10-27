@@ -43,7 +43,7 @@
         "body": {
           "id": "c6dcc2f5b69b420a87cc3e8fad90e5e2",
           "object": "text_completion",
-          "created": 1791415091,
+          "created": 1791964219,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -100,12 +100,12 @@
       },
       "openai": {
         "events": [
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " Paris", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ".\n", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "The capital", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " of France is Paris", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ".\nThe capital of France is", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791415091, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " Paris.\n", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " Paris", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ".\n", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "The capital", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " of France is Paris", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ".\nThe capital of France is", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "5095f8a9eaf042d982ce5726818fabbd", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " Paris.\n", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": null},
           "[DONE]"
         ]
       }
@@ -141,11 +141,11 @@
       },
       "openai": {
         "events": [
-          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " ", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "1", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ". 2.", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " 3. 4.", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": null},
-          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 4, "total_tokens": 16, "completion_tokens": 12, "reasoning_tokens": 0}},
+          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " ", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "1", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": ". 2.", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": " 3. 4.", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": null},
+          {"id": "1065b36962644355822df94ac3e210a9", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 4, "total_tokens": 16, "completion_tokens": 12, "reasoning_tokens": 0}},
           "[DONE]"
         ]
       }
@@ -191,7 +191,7 @@
         "body": {
           "id": "4dd4915786774a359b9d0ce2874f5210",
           "object": "text_completion",
-          "created": 1791415092,
+          "created": 1791964219,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -248,11 +248,11 @@
       },
       "openai": {
         "events": [
-          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "", "logprobs": {"text_offset": [-1], "token_logprobs": [-1.1889069080352783], "tokens": ["�"], "top_logprobs": [{"�": -1.1889069080352783, "\n": -2.1889069080352783}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎂", "logprobs": {"text_offset": [-1], "token_logprobs": [-0.6908118724822998], "tokens": ["�"], "top_logprobs": [{"�": -1.3158118724822998}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎈", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.4868738055229187, -0.13829706609249115], "tokens": ["�", "�"], "top_logprobs": [{"�": -1.6118738651275635}, {"�": -2.5132970809936523}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎁", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.9616221189498901, -0.08908755332231522], "tokens": ["�", "�"], "top_logprobs": [{"�": -0.9616221189498901, "\n\n": -1.9616221189498901}, {"�": -2.46408748626709}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791415092, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎊", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.5141168832778931, -2.706014311115723e-05], "tokens": ["�", "�"], "top_logprobs": [{"�": -0.5141168832778931, "\n": -2.3891167640686035}, {"�": -11.00002670288086}]}, "finish_reason": "length", "matched_stop": null}], "usage": null},
+          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "", "logprobs": {"text_offset": [-1], "token_logprobs": [-1.1889069080352783], "tokens": ["�"], "top_logprobs": [{"�": -1.1889069080352783, "\n": -2.1889069080352783}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎂", "logprobs": {"text_offset": [-1], "token_logprobs": [-0.6908118724822998], "tokens": ["�"], "top_logprobs": [{"�": -1.3158118724822998}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎈", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.4868738055229187, -0.13829706609249115], "tokens": ["�", "�"], "top_logprobs": [{"�": -1.6118738651275635}, {"�": -2.5132970809936523}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎁", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.9616221189498901, -0.08908755332231522], "tokens": ["�", "�"], "top_logprobs": [{"�": -0.9616221189498901, "\n\n": -1.9616221189498901}, {"�": -2.46408748626709}]}, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "127614240ecd423983df26c65c629656", "object": "text_completion", "created": 1791964219, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "text": "🎊", "logprobs": {"text_offset": [-1, -1], "token_logprobs": [-0.5141168832778931, -2.706014311115723e-05], "tokens": ["�", "�"], "top_logprobs": [{"�": -0.5141168832778931, "\n": -2.3891167640686035}, {"�": -11.00002670288086}]}, "finish_reason": "length", "matched_stop": null}], "usage": null},
           "[DONE]"
         ]
       }
@@ -299,12 +299,12 @@
         "body": {
           "id": "2756d2d8d84a49fda277dd299dc3a5f4",
           "object": "chat.completion",
-          "created": 1791415093,
+          "created": 1791964221,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {"role": "assistant", "content": "391", "reasoning_content": null, "tool_calls": null},
+              "message": {"role": "assistant", "content": "391", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 1
@@ -354,9 +354,9 @@
       },
       "openai": {
         "events": [
-          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791964221, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791964221, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "c088ead1c4e442d7a58f0c08472e8e9f", "object": "chat.completion.chunk", "created": 1791964221, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -412,7 +412,7 @@
         "body": {
           "id": "c7387dcb565d4a93999f8d66737c3722",
           "object": "chat.completion",
-          "created": 1791415093,
+          "created": 1791964221,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -420,8 +420,7 @@
               "message": {
                 "role": "assistant",
                 "content": "391",
-                "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
-                "tool_calls": null
+                "reasoning_content": "We need answer briefly. 17*23=391. Need final."
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -482,15 +481,15 @@
       },
       "openai": {
         "events": [
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
-          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 41, "total_tokens": 59, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 16}},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "8eb1429855cc4ed58576582e47a480ce", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 41, "total_tokens": 59, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 16}},
           "[DONE]"
         ]
       }
@@ -534,14 +533,14 @@
       },
       "openai": {
         "events": [
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "8299b81b4beb48a390909c703cc0253f", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -597,7 +596,7 @@
         "body": {
           "id": "27de6a3b2313452897d3915fb5421ee6",
           "object": "chat.completion",
-          "created": 1791415093,
+          "created": 1791964222,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -605,8 +604,7 @@
               "message": {
                 "role": "assistant",
                 "content": "391",
-                "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
-                "tool_calls": null
+                "reasoning_content": "We need answer briefly. 17*23=391. Need final."
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -665,12 +663,12 @@
       },
       "openai": {
         "events": [
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791415093, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "fc8e8713b5c244279d75e8de7d7cbc72", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
           "[DONE]"
         ]
       }
@@ -771,7 +769,7 @@
         "body": {
           "id": "8e5a8040a34d490fb70d9d0fdf0ead41",
           "object": "chat.completion",
-          "created": 1791415094,
+          "created": 1791964222,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -779,8 +777,7 @@
               "message": {
                 "role": "assistant",
                 "content": "391",
-                "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
-                "tool_calls": null
+                "reasoning_content": "We need answer briefly. 17*23=391. Need final."
               },
               "logprobs": {
                 "content": [
@@ -1061,14 +1058,14 @@
       },
       "openai": {
         "events": [
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": {"content": [{"token": "We", "bytes": [87, 101], "logprob": -0.0008636558777652681, "top_logprobs": [{"token": "We", "bytes": [87, 101], "logprob": -0.0008636558777652681}, {"token": "391", "bytes": [51, 57, 49], "logprob": -7.375863552093506}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": {"content": [{"token": " need", "bytes": [32, 110, 101, 101, 100], "logprob": -6.6756979322235566e-06, "top_logprobs": [{"token": " need", "bytes": [32, 110, 101, 101, 100], "logprob": -6.6756979322235566e-06}, {"token": " just", "bytes": [32, 106, 117, 115, 116], "logprob": -12.000006675720215}]}, {"token": " answer", "bytes": [32, 97, 110, 115, 119, 101, 114], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": " answer", "bytes": [32, 97, 110, 115, 119, 101, 114], "logprob": -1.1920928244535389e-07}, {"token": " to", "bytes": [32, 116, 111], "logprob": -16.875}]}, {"token": " briefly", "bytes": [32, 98, 114, 105, 101, 102, 108, 121], "logprob": -0.4880966246128082, "top_logprobs": [{"token": " briefly", "bytes": [32, 98, 114, 105, 101, 102, 108, 121], "logprob": -0.4880966246128082}, {"token": " ", "bytes": [32], "logprob": -1.2380965948104858}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": {"content": [{"token": ".", "bytes": [46], "logprob": -0.002515249652788043, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -0.002515249652788043}, {"token": " ", "bytes": [32], "logprob": -6.0025153160095215}]}, {"token": " ", "bytes": [32], "logprob": -0.01080920360982418, "top_logprobs": [{"token": " ", "bytes": [32], "logprob": -0.01080920360982418}, {"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -4.760809421539307}]}, {"token": "17", "bytes": [49, 55], "logprob": -2.50339189733495e-06, "top_logprobs": [{"token": "17", "bytes": [49, 55], "logprob": -2.50339189733495e-06}, {"token": "391", "bytes": [51, 57, 49], "logprob": -12.87500286102295}]}, {"token": "*", "bytes": [42], "logprob": 0.0, "top_logprobs": [{"token": "*", "bytes": [42], "logprob": 0.0}, {"token": "+", "bytes": [43], "logprob": -24.875}]}, {"token": "23", "bytes": [50, 51], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "23", "bytes": [50, 51], "logprob": -1.1920928244535389e-07}, {"token": "20", "bytes": [50, 48], "logprob": -15.75}]}, {"token": "=", "bytes": [61], "logprob": -0.38696637749671936, "top_logprobs": [{"token": "=", "bytes": [61], "logprob": -0.38696637749671936}, {"token": " =", "bytes": [32, 61], "logprob": -1.136966347694397}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": {"content": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0, "top_logprobs": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0}, {"token": "17", "bytes": [49, 55], "logprob": -18.375}]}, {"token": ".", "bytes": [46], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -2.3841855067985307e-07}, {"token": "?", "bytes": [63], "logprob": -15.5}]}, {"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -0.0734870582818985, "top_logprobs": [{"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -0.0734870582818985}, {"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -3.3234870433807373}]}, {"token": " final", "bytes": [32, 102, 105, 110, 97, 108], "logprob": -0.2000287026166916, "top_logprobs": [{"token": " final", "bytes": [32, 102, 105, 110, 97, 108], "logprob": -0.2000287026166916}, {"token": " maybe", "bytes": [32, 109, 97, 121, 98, 101], "logprob": -2.700028657913208}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": {"content": [{"token": ".", "bytes": [46], "logprob": -0.11973340809345245, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -0.11973340809345245}, {"token": " only", "bytes": [32, 111, 110, 108, 121], "logprob": -2.3697333335876465}]}, {"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -0.012617756612598896, "top_logprobs": [{"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -0.012617756612598896}, {"token": " \n", "bytes": [32, 10], "logprob": -4.387617588043213}]}, {"token": "391", "bytes": [51, 57, 49], "logprob": 0.0, "top_logprobs": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0}, {"token": "17", "bytes": [49, 55], "logprob": -17.25}]}, {"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0, "top_logprobs": [{"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0}, {"token": "\n", "bytes": [10], "logprob": -20.25}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": {"content": [{"token": "We", "bytes": [87, 101], "logprob": -0.0008636558777652681, "top_logprobs": [{"token": "We", "bytes": [87, 101], "logprob": -0.0008636558777652681}, {"token": "391", "bytes": [51, 57, 49], "logprob": -7.375863552093506}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": {"content": [{"token": " need", "bytes": [32, 110, 101, 101, 100], "logprob": -6.6756979322235566e-06, "top_logprobs": [{"token": " need", "bytes": [32, 110, 101, 101, 100], "logprob": -6.6756979322235566e-06}, {"token": " just", "bytes": [32, 106, 117, 115, 116], "logprob": -12.000006675720215}]}, {"token": " answer", "bytes": [32, 97, 110, 115, 119, 101, 114], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": " answer", "bytes": [32, 97, 110, 115, 119, 101, 114], "logprob": -1.1920928244535389e-07}, {"token": " to", "bytes": [32, 116, 111], "logprob": -16.875}]}, {"token": " briefly", "bytes": [32, 98, 114, 105, 101, 102, 108, 121], "logprob": -0.4880966246128082, "top_logprobs": [{"token": " briefly", "bytes": [32, 98, 114, 105, 101, 102, 108, 121], "logprob": -0.4880966246128082}, {"token": " ", "bytes": [32], "logprob": -1.2380965948104858}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": {"content": [{"token": ".", "bytes": [46], "logprob": -0.002515249652788043, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -0.002515249652788043}, {"token": " ", "bytes": [32], "logprob": -6.0025153160095215}]}, {"token": " ", "bytes": [32], "logprob": -0.01080920360982418, "top_logprobs": [{"token": " ", "bytes": [32], "logprob": -0.01080920360982418}, {"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -4.760809421539307}]}, {"token": "17", "bytes": [49, 55], "logprob": -2.50339189733495e-06, "top_logprobs": [{"token": "17", "bytes": [49, 55], "logprob": -2.50339189733495e-06}, {"token": "391", "bytes": [51, 57, 49], "logprob": -12.87500286102295}]}, {"token": "*", "bytes": [42], "logprob": 0.0, "top_logprobs": [{"token": "*", "bytes": [42], "logprob": 0.0}, {"token": "+", "bytes": [43], "logprob": -24.875}]}, {"token": "23", "bytes": [50, 51], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "23", "bytes": [50, 51], "logprob": -1.1920928244535389e-07}, {"token": "20", "bytes": [50, 48], "logprob": -15.75}]}, {"token": "=", "bytes": [61], "logprob": -0.38696637749671936, "top_logprobs": [{"token": "=", "bytes": [61], "logprob": -0.38696637749671936}, {"token": " =", "bytes": [32, 61], "logprob": -1.136966347694397}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final"}, "logprobs": {"content": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0, "top_logprobs": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0}, {"token": "17", "bytes": [49, 55], "logprob": -18.375}]}, {"token": ".", "bytes": [46], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -2.3841855067985307e-07}, {"token": "?", "bytes": [63], "logprob": -15.5}]}, {"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -0.0734870582818985, "top_logprobs": [{"token": " Need", "bytes": [32, 78, 101, 101, 100], "logprob": -0.0734870582818985}, {"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -3.3234870433807373}]}, {"token": " final", "bytes": [32, 102, 105, 110, 97, 108], "logprob": -0.2000287026166916, "top_logprobs": [{"token": " final", "bytes": [32, 102, 105, 110, 97, 108], "logprob": -0.2000287026166916}, {"token": " maybe", "bytes": [32, 109, 97, 121, 98, 101], "logprob": -2.700028657913208}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": {"content": [{"token": ".", "bytes": [46], "logprob": -0.11973340809345245, "top_logprobs": [{"token": ".", "bytes": [46], "logprob": -0.11973340809345245}, {"token": " only", "bytes": [32, 111, 110, 108, 121], "logprob": -2.3697333335876465}]}, {"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -0.012617756612598896, "top_logprobs": [{"token": "</think>", "bytes": [60, 47, 116, 104, 105, 110, 107, 62], "logprob": -0.012617756612598896}, {"token": " \n", "bytes": [32, 10], "logprob": -4.387617588043213}]}, {"token": "391", "bytes": [51, 57, 49], "logprob": 0.0, "top_logprobs": [{"token": "391", "bytes": [51, 57, 49], "logprob": 0.0}, {"token": "17", "bytes": [49, 55], "logprob": -17.25}]}, {"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0, "top_logprobs": [{"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0}, {"token": "\n", "bytes": [10], "logprob": -20.25}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9e4a8a98ba5a42c8b93a00b193dcdf04", "object": "chat.completion.chunk", "created": 1791964222, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -1107,13 +1104,13 @@
       },
       "openai": {
         "events": [
-          {"id": "f362f47a2265417c91a85ecf0d24f301", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "f362f47a2265417c91a85ecf0d24f301", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
-          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
-          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 19, "completion_tokens": 4, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "f362f47a2265417c91a85ecf0d24f301", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "f362f47a2265417c91a85ecf0d24f301", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "ee5d4a95cb574d54844cb72ce03c2f9d", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 19, "completion_tokens": 4, "prompt_tokens_details": null, "reasoning_tokens": 0}},
           "[DONE]"
         ]
       }
@@ -1161,17 +1158,12 @@
         "body": {
           "id": "042617057c0d4b1c9277fecd73bc8a06",
           "object": "chat.completion",
-          "created": 1791415094,
+          "created": 1791964223,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "1 2 3 4",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
+              "message": {"role": "assistant", "content": "1 2 3 4", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": " 5"
@@ -1240,17 +1232,12 @@
         "body": {
           "id": "aec29e238ac54d478a93c447b901a605",
           "object": "chat.completion",
-          "created": 1791415094,
+          "created": 1791964223,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": " 391.",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
+              "message": {"role": "assistant", "content": " 391.", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 1
@@ -1315,15 +1302,15 @@
       },
       "openai": {
         "events": [
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " "}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "17 *"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " 23 = 17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "*20 + 17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "*3 = 340 +"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " 51 = 391."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791415094, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " "}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "17 *"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " 23 = 17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "*20 + 17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "*3 = 340 +"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " 51 = 391."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "edbfded1541743a087422bd525235e38", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -1371,7 +1358,7 @@
         "body": {
           "id": "7e6f9aa5970142eeb04a1b0b22844188",
           "object": "chat.completion",
-          "created": 1791415094,
+          "created": 1791964223,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -1379,8 +1366,7 @@
               "message": {
                 "role": "assistant",
                 "content": "{\n  \"a\": null,\n  \"b\": null\n}",
-                "reasoning_content": null,
-                "tool_calls": null
+                "reasoning_content": null
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -1453,7 +1439,7 @@
         "body": {
           "id": "773678f760264686b70b6511af673c1f",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964223,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -1461,8 +1447,7 @@
               "message": {
                 "role": "assistant",
                 "content": "We need answer briefly. 17*23=391. Need final.</think>391",
-                "reasoning_content": null,
-                "tool_calls": null
+                "reasoning_content": null
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -1523,10 +1508,10 @@
       },
       "openai": {
         "events": [
-          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We need answer briefly. 17*23=391. Need final."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We need answer briefly. 17*23=391. Need final."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "9b4af9b5c842465388211e05ab42870e", "object": "chat.completion.chunk", "created": 1791964223, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -1588,7 +1573,7 @@
         "body": {
           "id": "1521e4518efe4be988a47549dc61340a",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964224,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -1596,8 +1581,7 @@
               "message": {
                 "role": "assistant",
                 "content": "4",
-                "reasoning_content": "We need answer simple. User asks \"What is 2+2?\" Need terse. Answer 4.",
-                "tool_calls": null
+                "reasoning_content": "We need answer simple. User asks \"What is 2+2?\" Need terse. Answer 4."
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -1673,12 +1657,12 @@
         "body": {
           "id": "7bea756578d9456f972806f37236a0c0",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964224,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {"role": "assistant", "content": "391", "reasoning_content": null, "tool_calls": null},
+              "message": {"role": "assistant", "content": "391", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 1
@@ -1741,12 +1725,12 @@
         "body": {
           "id": "0ff44e4d322d4a56b6535ee26ae9a866",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964224,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {"role": "assistant", "content": "教育", "reasoning_content": null, "tool_calls": null},
+              "message": {"role": "assistant", "content": "教育", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 1
@@ -1878,7 +1862,7 @@
         "body": {
           "id": "82ee48dc6f7c472eba023581cded5c41",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964224,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -1889,7 +1873,7 @@
                 "reasoning_content": null,
                 "tool_calls": [
                   {
-                    "id": "call_0a880f982c9b4ecd9bda917b",
+                    "id": "call_619981ae1958412b977ad26b",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -2008,14 +1992,14 @@
       },
       "openai": {
         "events": [
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_aaca72501df04cb7b0335f64", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
-          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 353, "total_tokens": 402, "completion_tokens": 49, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_81045c2dd21f4771a297a641", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "dc6419e71ec54b5fa23616abecede55c", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 353, "total_tokens": 402, "completion_tokens": 49, "prompt_tokens_details": null, "reasoning_tokens": 0}},
           "[DONE]"
         ]
       }
@@ -2118,15 +2102,15 @@
       },
       "openai": {
         "events": [
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " user wants"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " weather in Paris. Simple"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " single tool"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " call."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_b8c04beb73764e408abf9ffe", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791415095, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " user wants"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " weather in Paris. Simple"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " single tool"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " call."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_79ff6f380d4b4c74b28ef2b4", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "3fa146aae144437bb7460ffe1f15a0fe", "object": "chat.completion.chunk", "created": 1791964224, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -2240,7 +2224,7 @@
         "body": {
           "id": "bb9bc0a3c251448aaad43b7dee590f78",
           "object": "chat.completion",
-          "created": 1791415095,
+          "created": 1791964224,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -2251,13 +2235,13 @@
                 "reasoning_content": null,
                 "tool_calls": [
                   {
-                    "id": "call_167a9d93dcd5496cb4cbee8b",
+                    "id": "call_966ff3c0cc1545a5b3b97910",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
                   },
                   {
-                    "id": "call_b5e106f718c245b8af4bf34c",
+                    "id": "call_e6fed1b8ba88453c9fd56839",
                     "index": 1,
                     "type": "function",
                     "function": {"name": "get_time", "arguments": "{\"timezone\": \"Asia/Tokyo\"}"}
@@ -2390,32 +2374,32 @@
       },
       "openai": {
         "events": [
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "I", "bytes": [73], "logprob": -0.011228466406464577, "top_logprobs": [{"token": "I", "bytes": [73], "logprob": -0.011228466406464577}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll get", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "'ll", "bytes": [39, 108, 108], "logprob": -0.0002892790944315493, "top_logprobs": [{"token": "'ll", "bytes": [39, 108, 108], "logprob": -0.0002892790944315493}]}, {"token": " get", "bytes": [32, 103, 101, 116], "logprob": -1.0491138696670532, "top_logprobs": [{"token": " get", "bytes": [32, 103, 101, 116], "logprob": -1.0491138696670532}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " both pieces", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " both", "bytes": [32, 98, 111, 116, 104], "logprob": -0.0014555584639310837, "top_logprobs": [{"token": " both", "bytes": [32, 98, 111, 116, 104], "logprob": -0.0014555584639310837}]}, {"token": " pieces", "bytes": [32, 112, 105, 101, 99, 101, 115], "logprob": -0.11524038016796112, "top_logprobs": [{"token": " pieces", "bytes": [32, 112, 105, 101, 99, 101, 115], "logprob": -0.11524038016796112}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " of information for you at", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " of", "bytes": [32, 111, 102], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": " of", "bytes": [32, 111, 102], "logprob": -2.3841855067985307e-07}]}, {"token": " information", "bytes": [32, 105, 110, 102, 111, 114, 109, 97, 116, 105, 111, 110], "logprob": -0.00012396997772157192, "top_logprobs": [{"token": " information", "bytes": [32, 105, 110, 102, 111, 114, 109, 97, 116, 105, 111, 110], "logprob": -0.00012396997772157192}]}, {"token": " for", "bytes": [32, 102, 111, 114], "logprob": -0.04319322109222412, "top_logprobs": [{"token": " for", "bytes": [32, 102, 111, 114], "logprob": -0.04319322109222412}]}, {"token": " you", "bytes": [32, 121, 111, 117], "logprob": -5.960462772236497e-07, "top_logprobs": [{"token": " you", "bytes": [32, 121, 111, 117], "logprob": -5.960462772236497e-07}]}, {"token": " at", "bytes": [32, 97, 116], "logprob": -0.2680835425853729, "top_logprobs": [{"token": " at", "bytes": [32, 97, 116], "logprob": -0.2680835425853729}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " the", "bytes": [32, 116, 104, 101], "logprob": -0.2014143019914627, "top_logprobs": [{"token": " the", "bytes": [32, 116, 104, 101], "logprob": -0.2014143019914627}]}, {"token": " same", "bytes": [32, 115, 97, 109, 101], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": " same", "bytes": [32, 115, 97, 109, 101], "logprob": -1.1920928244535389e-07}]}, {"token": " time", "bytes": [32, 116, 105, 109, 101], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": " time", "bytes": [32, 116, 105, 109, 101], "logprob": -2.3841855067985307e-07}]}, {"token": ".\n\n", "bytes": [46, 10, 10], "logprob": -2.5748875486897305e-05, "top_logprobs": [{"token": ".\n\n", "bytes": [46, 10, 10], "logprob": -2.5748875486897305e-05}]}, {"token": "<", "bytes": [60], "logprob": -4.768370445162873e-07, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": -4.768370445162873e-07}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0, "top_logprobs": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "get", "bytes": [103, 101, 116], "logprob": -8.344646857949556e-07, "top_logprobs": [{"token": "get", "bytes": [103, 101, 116], "logprob": -8.344646857949556e-07}]}, {"token": "_", "bytes": [95], "logprob": -6.437280717364047e-06, "top_logprobs": [{"token": "_", "bytes": [95], "logprob": -6.437280717364047e-06}]}, {"token": "weather", "bytes": [119, 101, 97, 116, 104, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": "weather", "bytes": [119, 101, 97, 116, 104, 101, 114], "logprob": 0.0}]}, {"token": "\">\n", "bytes": [34, 62, 10], "logprob": -5.960462772236497e-07, "top_logprobs": [{"token": "\">\n", "bytes": [34, 62, 10], "logprob": -5.960462772236497e-07}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "city", "bytes": [99, 105, 116, 121], "logprob": -9.536738616588991e-07, "top_logprobs": [{"token": "city", "bytes": [99, 105, 116, 121], "logprob": -9.536738616588991e-07}]}, {"token": "\"", "bytes": [34], "logprob": 0.0, "top_logprobs": [{"token": "\"", "bytes": [34], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0, "top_logprobs": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0, "top_logprobs": [{"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0}]}, {"token": "\">", "bytes": [34, 62], "logprob": 0.0, "top_logprobs": [{"token": "\">", "bytes": [34, 62], "logprob": 0.0}]}, {"token": "Paris", "bytes": [80, 97, 114, 105, 115], "logprob": -3.4570634852570947e-06, "top_logprobs": [{"token": "Paris", "bytes": [80, 97, 114, 105, 115], "logprob": -3.4570634852570947e-06}]}, {"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": -0.0699400082230568, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -0.0699400082230568}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " the same time.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_d40134b580294e0fa415bf7d", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": -3.3378546504536644e-06, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": -3.3378546504536644e-06}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "get", "bytes": [103, 101, 116], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "get", "bytes": [103, 101, 116], "logprob": -1.1920928244535389e-07}]}, {"token": "_time", "bytes": [95, 116, 105, 109, 101], "logprob": -3.576278118089249e-07, "top_logprobs": [{"token": "_time", "bytes": [95, 116, 105, 109, 101], "logprob": -3.576278118089249e-07}]}, {"token": "\">\n", "bytes": [34, 62, 10], "logprob": 0.0, "top_logprobs": [{"token": "\">\n", "bytes": [34, 62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "time", "bytes": [116, 105, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": "time", "bytes": [116, 105, 109, 101], "logprob": 0.0}]}, {"token": "zone", "bytes": [122, 111, 110, 101], "logprob": 0.0, "top_logprobs": [{"token": "zone", "bytes": [122, 111, 110, 101], "logprob": 0.0}]}, {"token": "\"", "bytes": [34], "logprob": 0.0, "top_logprobs": [{"token": "\"", "bytes": [34], "logprob": 0.0}]}, {"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0, "top_logprobs": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0, "top_logprobs": [{"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0}]}, {"token": "\">", "bytes": [34, 62], "logprob": 0.0, "top_logprobs": [{"token": "\">", "bytes": [34, 62], "logprob": 0.0}]}, {"token": "Asia", "bytes": [65, 115, 105, 97], "logprob": -0.0001264730526600033, "top_logprobs": [{"token": "Asia", "bytes": [65, 115, 105, 97], "logprob": -0.0001264730526600033}]}, {"token": "/T", "bytes": [47, 84], "logprob": 0.0, "top_logprobs": [{"token": "/T", "bytes": [47, 84], "logprob": 0.0}]}, {"token": "ok", "bytes": [111, 107], "logprob": -1.311301275563892e-06, "top_logprobs": [{"token": "ok", "bytes": [111, 107], "logprob": -1.311301275563892e-06}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "yo", "bytes": [121, 111], "logprob": -3.576278118089249e-07, "top_logprobs": [{"token": "yo", "bytes": [121, 111], "logprob": -3.576278118089249e-07}]}, {"token": "</", "bytes": [60, 47], "logprob": 0.0, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": 0.0, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_9fd16a7fec2546649c25f3f6", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{\"timezone\": \"Asia/Tokyo\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0, "top_logprobs": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": ">", "bytes": [62], "logprob": 0.0, "top_logprobs": [{"token": ">", "bytes": [62], "logprob": 0.0}]}, {"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0, "top_logprobs": [{"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
-          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "I", "bytes": [73], "logprob": -0.011228466406464577, "top_logprobs": [{"token": "I", "bytes": [73], "logprob": -0.011228466406464577}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll get", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "'ll", "bytes": [39, 108, 108], "logprob": -0.0002892790944315493, "top_logprobs": [{"token": "'ll", "bytes": [39, 108, 108], "logprob": -0.0002892790944315493}]}, {"token": " get", "bytes": [32, 103, 101, 116], "logprob": -1.0491138696670532, "top_logprobs": [{"token": " get", "bytes": [32, 103, 101, 116], "logprob": -1.0491138696670532}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " both pieces", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " both", "bytes": [32, 98, 111, 116, 104], "logprob": -0.0014555584639310837, "top_logprobs": [{"token": " both", "bytes": [32, 98, 111, 116, 104], "logprob": -0.0014555584639310837}]}, {"token": " pieces", "bytes": [32, 112, 105, 101, 99, 101, 115], "logprob": -0.11524038016796112, "top_logprobs": [{"token": " pieces", "bytes": [32, 112, 105, 101, 99, 101, 115], "logprob": -0.11524038016796112}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " of information for you at", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " of", "bytes": [32, 111, 102], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": " of", "bytes": [32, 111, 102], "logprob": -2.3841855067985307e-07}]}, {"token": " information", "bytes": [32, 105, 110, 102, 111, 114, 109, 97, 116, 105, 111, 110], "logprob": -0.00012396997772157192, "top_logprobs": [{"token": " information", "bytes": [32, 105, 110, 102, 111, 114, 109, 97, 116, 105, 111, 110], "logprob": -0.00012396997772157192}]}, {"token": " for", "bytes": [32, 102, 111, 114], "logprob": -0.04319322109222412, "top_logprobs": [{"token": " for", "bytes": [32, 102, 111, 114], "logprob": -0.04319322109222412}]}, {"token": " you", "bytes": [32, 121, 111, 117], "logprob": -5.960462772236497e-07, "top_logprobs": [{"token": " you", "bytes": [32, 121, 111, 117], "logprob": -5.960462772236497e-07}]}, {"token": " at", "bytes": [32, 97, 116], "logprob": -0.2680835425853729, "top_logprobs": [{"token": " at", "bytes": [32, 97, 116], "logprob": -0.2680835425853729}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " the", "bytes": [32, 116, 104, 101], "logprob": -0.2014143019914627, "top_logprobs": [{"token": " the", "bytes": [32, 116, 104, 101], "logprob": -0.2014143019914627}]}, {"token": " same", "bytes": [32, 115, 97, 109, 101], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": " same", "bytes": [32, 115, 97, 109, 101], "logprob": -1.1920928244535389e-07}]}, {"token": " time", "bytes": [32, 116, 105, 109, 101], "logprob": -2.3841855067985307e-07, "top_logprobs": [{"token": " time", "bytes": [32, 116, 105, 109, 101], "logprob": -2.3841855067985307e-07}]}, {"token": ".\n\n", "bytes": [46, 10, 10], "logprob": -2.5748875486897305e-05, "top_logprobs": [{"token": ".\n\n", "bytes": [46, 10, 10], "logprob": -2.5748875486897305e-05}]}, {"token": "<", "bytes": [60], "logprob": -4.768370445162873e-07, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": -4.768370445162873e-07}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0, "top_logprobs": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "get", "bytes": [103, 101, 116], "logprob": -8.344646857949556e-07, "top_logprobs": [{"token": "get", "bytes": [103, 101, 116], "logprob": -8.344646857949556e-07}]}, {"token": "_", "bytes": [95], "logprob": -6.437280717364047e-06, "top_logprobs": [{"token": "_", "bytes": [95], "logprob": -6.437280717364047e-06}]}, {"token": "weather", "bytes": [119, 101, 97, 116, 104, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": "weather", "bytes": [119, 101, 97, 116, 104, 101, 114], "logprob": 0.0}]}, {"token": "\">\n", "bytes": [34, 62, 10], "logprob": -5.960462772236497e-07, "top_logprobs": [{"token": "\">\n", "bytes": [34, 62, 10], "logprob": -5.960462772236497e-07}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "city", "bytes": [99, 105, 116, 121], "logprob": -9.536738616588991e-07, "top_logprobs": [{"token": "city", "bytes": [99, 105, 116, 121], "logprob": -9.536738616588991e-07}]}, {"token": "\"", "bytes": [34], "logprob": 0.0, "top_logprobs": [{"token": "\"", "bytes": [34], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0, "top_logprobs": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0, "top_logprobs": [{"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0}]}, {"token": "\">", "bytes": [34, 62], "logprob": 0.0, "top_logprobs": [{"token": "\">", "bytes": [34, 62], "logprob": 0.0}]}, {"token": "Paris", "bytes": [80, 97, 114, 105, 115], "logprob": -3.4570634852570947e-06, "top_logprobs": [{"token": "Paris", "bytes": [80, 97, 114, 105, 115], "logprob": -3.4570634852570947e-06}]}, {"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": -0.0699400082230568, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -0.0699400082230568}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " the same time.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_0356ba9bfb8b4e0e951fbb76", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": -3.3378546504536644e-06, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": -3.3378546504536644e-06}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "get", "bytes": [103, 101, 116], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "get", "bytes": [103, 101, 116], "logprob": -1.1920928244535389e-07}]}, {"token": "_time", "bytes": [95, 116, 105, 109, 101], "logprob": -3.576278118089249e-07, "top_logprobs": [{"token": "_time", "bytes": [95, 116, 105, 109, 101], "logprob": -3.576278118089249e-07}]}, {"token": "\">\n", "bytes": [34, 62, 10], "logprob": 0.0, "top_logprobs": [{"token": "\">\n", "bytes": [34, 62, 10], "logprob": 0.0}]}, {"token": "<", "bytes": [60], "logprob": 0.0, "top_logprobs": [{"token": "<", "bytes": [60], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": " name", "bytes": [32, 110, 97, 109, 101], "logprob": 0.0}]}, {"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "time", "bytes": [116, 105, 109, 101], "logprob": 0.0, "top_logprobs": [{"token": "time", "bytes": [116, 105, 109, 101], "logprob": 0.0}]}, {"token": "zone", "bytes": [122, 111, 110, 101], "logprob": 0.0, "top_logprobs": [{"token": "zone", "bytes": [122, 111, 110, 101], "logprob": 0.0}]}, {"token": "\"", "bytes": [34], "logprob": 0.0, "top_logprobs": [{"token": "\"", "bytes": [34], "logprob": 0.0}]}, {"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0, "top_logprobs": [{"token": " string", "bytes": [32, 115, 116, 114, 105, 110, 103], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0, "top_logprobs": [{"token": "=\"", "bytes": [61, 34], "logprob": 0.0}]}, {"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0, "top_logprobs": [{"token": "true", "bytes": [116, 114, 117, 101], "logprob": 0.0}]}, {"token": "\">", "bytes": [34, 62], "logprob": 0.0, "top_logprobs": [{"token": "\">", "bytes": [34, 62], "logprob": 0.0}]}, {"token": "Asia", "bytes": [65, 115, 105, 97], "logprob": -0.0001264730526600033, "top_logprobs": [{"token": "Asia", "bytes": [65, 115, 105, 97], "logprob": -0.0001264730526600033}]}, {"token": "/T", "bytes": [47, 84], "logprob": 0.0, "top_logprobs": [{"token": "/T", "bytes": [47, 84], "logprob": 0.0}]}, {"token": "ok", "bytes": [111, 107], "logprob": -1.311301275563892e-06, "top_logprobs": [{"token": "ok", "bytes": [111, 107], "logprob": -1.311301275563892e-06}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "yo", "bytes": [121, 111], "logprob": -3.576278118089249e-07, "top_logprobs": [{"token": "yo", "bytes": [121, 111], "logprob": -3.576278118089249e-07}]}, {"token": "</", "bytes": [60, 47], "logprob": 0.0, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": 0.0}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0, "top_logprobs": [{"token": " parameter", "bytes": [32, 112, 97, 114, 97, 109, 101, 116, 101, 114], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": 0.0, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_6a57f818db0b47a08979e506", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{\"timezone\": \"Asia/Tokyo\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0, "top_logprobs": [{"token": " invoke", "bytes": [32, 105, 110, 118, 111, 107, 101], "logprob": 0.0}]}, {"token": ">\n", "bytes": [62, 10], "logprob": 0.0, "top_logprobs": [{"token": ">\n", "bytes": [62, 10], "logprob": 0.0}]}, {"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07, "top_logprobs": [{"token": "</", "bytes": [60, 47], "logprob": -1.1920928244535389e-07}]}, {"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0, "top_logprobs": [{"token": "｜DSML｜", "bytes": [239, 189, 156, 68, 83, 77, 76, 239, 189, 156], "logprob": 0.0}]}, {"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0, "top_logprobs": [{"token": " calls", "bytes": [32, 99, 97, 108, 108, 115], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": {"content": [{"token": ">", "bytes": [62], "logprob": 0.0, "top_logprobs": [{"token": ">", "bytes": [62], "logprob": 0.0}]}, {"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0, "top_logprobs": [{"token": "<｜end▁of▁sentence｜>", "bytes": [60, 239, 189, 156, 101, 110, 100, 226, 150, 129, 111, 102, 226, 150, 129, 115, 101, 110, 116, 101, 110, 99, 101, 239, 189, 156, 62], "logprob": 0.0}]}]}, "finish_reason": null, "matched_stop": null}]},
+          {"id": "75dd3932158d44b48e549862b46b7f7d", "object": "chat.completion.chunk", "created": 1791964225, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -2483,32 +2467,7 @@
         }
       },
       "generate": {
-        "input_ids": [
-          0, 128799, 271, 372, 27193, 271, 3476, 611, 3278, 304, 260, 1341, 294, 6704, 304, 1694,
-          3287, 270, 3967, 734, 3417, 16, 2042, 588, 34756, 6704, 513, 4985, 260, 38322, 128825,
-          10699, 48902, 5603, 1277, 270, 2502, 979, 30, 128825, 10699, 1018, 30, 128825, 34756,
-          2329, 84476, 6792, 5896, 35044, 3816, 30, 128825, 10767, 2329, 84476, 46630, 4130, 61729,
-          35044, 4, 3418, 1281, 11476, 94, 19836, 3320, 6, 46630, 4130, 61729, 56909, 1718, 128825,
-          10767, 1018, 7835, 1718, 128825, 34756, 1018, 30, 128825, 34756, 2329, 84476, 6792, 5896,
-          35044, 20, 3816, 7835, 1718, 128825, 34756, 1018, 1718, 128825, 10699, 4697, 3524, 8252,
-          1531, 366, 12038, 412, 344, 305, 1341, 3608, 4463, 1281, 11476, 4, 37419, 1884, 710, 915,
-          4815, 343, 62896, 14, 2631, 2065, 634, 14, 31939, 14, 8435, 754, 2281, 270, 1990, 295,
-          26639, 8786, 305, 1341, 3608, 4463, 1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104,
-          343, 89944, 284, 513, 223, 128821, 754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223,
-          128821, 1613, 128822, 119907, 1117, 4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14,
-          5238, 6578, 1561, 223, 128822, 418, 4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249,
-          13178, 8380, 271, 24313, 2852, 3362, 582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582,
-          6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582,
-          10325, 1760, 582, 68838, 3362, 28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760,
-          582, 20855, 3362, 582, 31060, 2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463,
-          1760, 582, 47002, 3362, 20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486,
-          3362, 20584, 37399, 13747, 30316, 24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855,
-          3362, 582, 6287, 270, 3277, 1014, 295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612,
-          4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611,
-          3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 33236, 3476,
-          74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305, 10767, 5815, 8380, 304, 34756, 4105,
-          10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111, 1748, 1928, 33, 128804, 128822
-        ],
+        "input_ids": [0, 128803, 3085, 734, 270, 9670, 295, 11111, 1748, 1928, 33, 128804, 128822],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 48},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -2522,7 +2481,7 @@
         "body": {
           "id": "6890a7dd471c40fc803b28b7b4935353",
           "object": "chat.completion",
-          "created": 1791415096,
+          "created": 1791964226,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -2530,8 +2489,7 @@
               "message": {
                 "role": "assistant",
                 "content": "I'll check the current weather in Paris for you.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
-                "reasoning_content": null,
-                "tool_calls": null
+                "reasoning_content": null
               },
               "logprobs": null,
               "finish_reason": "length",
@@ -2670,21 +2628,21 @@
       },
       "openai": {
         "events": [
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "Right", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " now in", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " Paris it", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'s **18°C (", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "about", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " 64°F)** and", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " **cloudy**. Let", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " me know if you'd like", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " the forecast", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " or the", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " temperature", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " in a", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " different unit.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791415096, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "Right", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " now in", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " Paris it", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'s **18°C (", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "about", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " 64°F)** and", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " **cloudy**. Let", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " me know if you'd like", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " the forecast", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " or the", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " temperature", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " in a", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " different unit.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "1c73183a0f544d70ad9d236e533858be", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -2793,21 +2751,21 @@
       },
       "openai": {
         "events": [
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 354, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": "I", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 354, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 358, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 358, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 362, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 362, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_3d8b0591d544487eae38fccb", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": " you.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_a26a834487134e26995f6eba", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
-          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 353, "total_tokens": 451, "completion_tokens": 98, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 354, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 354, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 358, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": "'ll check the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 358, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 362, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": " weather in Paris for", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 362, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "64f7d825330043e195fdc42064f2da81", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_01a611e73a394e758a729517", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": " you.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_ffa07ea755914496ab872034", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 353, "total_tokens": 398, "completion_tokens": 45, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "92535597b39e4115a1646fe00509816f", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [], "usage": {"prompt_tokens": 353, "total_tokens": 451, "completion_tokens": 98, "prompt_tokens_details": null, "reasoning_tokens": 0}},
           "[DONE]"
         ]
       }
@@ -2908,17 +2866,12 @@
         "body": {
           "id": "9b84e25fb753470cb43417f3964bda0c",
           "object": "chat.completion",
-          "created": 1791415097,
+          "created": 1791964226,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
               "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Bonjour !",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
+              "message": {"role": "assistant", "content": "Bonjour !", "reasoning_content": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 1
@@ -3067,13 +3020,13 @@
       },
       "openai": {
         "events": [
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need answer briefly"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": ". 17*23="}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "391. Need final."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "966fbcb0720242758a09d34ae7f20639", "object": "chat.completion.chunk", "created": 1791964226, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -3129,7 +3082,7 @@
         "body": {
           "id": "fe56ef7cd94f4cc698d2c4ea3fff0ecb",
           "object": "chat.completion",
-          "created": 1791415097,
+          "created": 1791964226,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -3137,8 +3090,7 @@
               "message": {
                 "role": "assistant",
                 "content": "391",
-                "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
-                "tool_calls": null
+                "reasoning_content": "We need answer briefly. 17*23=391. Need final."
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -3210,7 +3162,7 @@
         "body": {
           "id": "6a2f87f8916a49079e8070eb4f70c229",
           "object": "chat.completion",
-          "created": 1791415097,
+          "created": 1791964226,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -3218,8 +3170,7 @@
               "message": {
                 "role": "assistant",
                 "content": "391",
-                "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
-                "tool_calls": null
+                "reasoning_content": "We need answer briefly. 17*23=391. Need final."
               },
               "logprobs": null,
               "finish_reason": "stop",
@@ -3354,23 +3305,23 @@
       },
       "openai": {
         "events": [
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " user wants weather in"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " Paris and Rome. Two"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " independent calls,"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " so make"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " both"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " in the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " same block."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I'll", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " check", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " both", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " cities for", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null, "tool_calls": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_d624aec3151f4bcd95bb8326", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_e2ec41b9419a4b3fbd753b53", "index": 1, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791415097, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": "The"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " user wants weather in"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " Paris and Rome. Two"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " independent calls,"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " so make"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " both"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " in the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": " same block."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": "I'll", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " check", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " both", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " cities for", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_b418adbfb29746dab7ecbff1", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_06d4e94d745b45d48fa3729c", "index": 1, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "ae8b71f43782430fab0ec51fc983dc41", "object": "chat.completion.chunk", "created": 1791964227, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
           "[DONE]"
         ]
       }
@@ -3482,7 +3433,7 @@
         "body": {
           "id": "683ba109c2d049e2be9607306f4d0cbc",
           "object": "chat.completion",
-          "created": 1791415097,
+          "created": 1791964227,
           "model": "deepseek-ai/DeepSeek-V4.1-Flash",
           "choices": [
             {
@@ -3493,7 +3444,7 @@
                 "reasoning_content": null,
                 "tool_calls": [
                   {
-                    "id": "call_34830ec57b964443b5ae13dc",
+                    "id": "call_7d4794e5dc9e414c9956c0e6",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \" New York \"}"}
@@ -3520,7 +3471,7 @@
       }
     }
   ],
-  "chat_model": {"context_length": 1048576, "generation_config": {}},
+  "chat_model": {"context_length": 1048576, "generation_config": {}, "chat_encoding_spec": "dsv41"},
   "generate_defaults": {
     "rid": null,
     "session_id": null,
@@ -3535,6 +3486,7 @@
     "use_audio_in_video": false,
     "video_config": null,
     "sampling_params": null,
+    "watermark": null,
     "return_logprob": null,
     "logprob_start_len": null,
     "top_logprobs_num": null,
@@ -3543,6 +3495,7 @@
     "sampling_logprobs_mode": null,
     "return_text_in_logprobs": false,
     "return_flat_raw_top_logprobs": false,
+    "return_flat_raw_output_top_logprobs": false,
     "return_flat_raw_top_logprobs_b64": false,
     "stream": false,
     "log_metrics": true,
@@ -3614,7 +3567,8 @@
       "skip_special_tokens": true,
       "logit_bias": null,
       "custom_params": null,
-      "sampling_seed": null
+      "sampling_seed": null,
+      "watermark": null
     },
     "chat": {
       "temperature": 1.0,
@@ -3638,7 +3592,8 @@
       "logit_bias": null,
       "custom_params": null,
       "sampling_seed": null,
-      "spaces_between_special_tokens": true
+      "spaces_between_special_tokens": true,
+      "watermark": null
     }
   }
 }

@@ -251,11 +251,6 @@ class Glm5NextTextConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if self.is_kda_layer(i)]
 
     @property
-    def nextn_layer_ids(self):
-        num_nextn_layers = self.num_nextn_predict_layers or 0
-        return [self.num_hidden_layers + i for i in range(num_nextn_layers)]
-
-    @property
     def full_attention_layer_ids(self):
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
 

@@ -1085,6 +1085,25 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # Routed banks live outside `model.layers.`, so the gate below drops
+            # them before the FusedMoE branch can reject them.
+            if (
+                module_name.startswith("model.meta_mlp.")
+                and isinstance(module, (FusedMoE, InklingBatchDenseMLP))
+                and all(x in self.target_modules for x in ["gate_up_proj", "down_proj"])
+                and get_layer_id(module_name) is None
+            ):
+                raise ValueError(
+                    "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
+                    "is not supported by the baseline; remove routed-expert "
+                    "targets or use a future bank-aware LoRA implementation."
+                )
+
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer
             # can apply separate B projections for each.
@@ -1123,12 +1142,6 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
-                    if module_name.startswith("model.meta_mlp."):
-                        raise ValueError(
-                            "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
-                            "is not supported by the baseline; remove routed-expert "
-                            "targets or use a future bank-aware LoRA implementation."
-                        )
                     # FusedMoE submodules outside the decoder layer hierarchy
                     # (e.g. nested helpers under non-".layers." prefixes) have
                     # no resolvable layer id; skip them so we don't index

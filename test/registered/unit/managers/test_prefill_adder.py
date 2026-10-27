@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -100,6 +101,7 @@ class TestPrefillAdder(CustomTestCase):
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
         allocator.swa_req_ring = False
+        allocator.request_slot_reserve.return_value = 0
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             PrefillBudget(allocator, tree_cache, **kwargs)
         )
@@ -119,6 +121,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.kv = SimpleNamespace(req_pool_idx=None)
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -135,6 +138,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.auxiliary_swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
@@ -287,6 +291,56 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.NO_TOKEN,
         )
         self.assertEqual(adder.can_run_list, [])
+
+    def test_hisparse_short_prompts_reserve_full_buffers_and_scratch(self):
+        """Short prompts and chunks must fit persistent buffers plus one scratch."""
+        for available, chunk, prefix, ignore_eos, admitted in (
+            (10496, None, 0, False, 2),
+            (10496, None, 0, True, 2),
+            (5248, 64, 0, False, 1),
+            (4096, 64, 64, False, 0),
+            (4160, 64, 64, False, 1),
+        ):
+            with self.subTest(available=available, chunk=chunk, prefix=prefix):
+                self.mock_tree_cache.supports_mamba.return_value = False
+                self.mock_tree_cache.disable = ignore_eos
+                allocator = HiSparseTokenToKVPoolAllocator(
+                    size=available,
+                    page_size=64,
+                    dtype=torch.float32,
+                    device="cpu",
+                    kvcache=SimpleNamespace(register_mapping=lambda mapping: None),
+                    need_sort=False,
+                )
+                allocator.configure_spec_scratch(1024, device_buffer_size=4160)
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=64,
+                    rem_chunk_tokens=chunk,
+                    token_to_kv_pool_allocator=allocator,
+                )
+                reqs = []
+                for i in range(3):
+                    req = self.create_shared_req(f"hisparse-{i}", max_new_tokens=0)
+                    req.sampling_params.ignore_eos = ignore_eos
+                    req.full_untruncated_fill_ids = list(range(100))
+                    req.origin_input_ids = req.full_untruncated_fill_ids
+                    req.prefix_len = prefix
+                    req.kv = SimpleNamespace(req_pool_idx=i if prefix else None)
+                    reqs.append(req)
+                    if prefix:
+                        adder.add_chunked_req(req)
+                    else:
+                        adder.add_one_req(
+                            req, has_chunked_req=False, truncation_align_size=None
+                        )
+                self.assertEqual(adder.can_run_list, reqs[:admitted])
+                if admitted:
+                    self.assertEqual(adder.cur_rem_tokens, 0)
+                    self.assertEqual(
+                        reqs[0].extend_len,
+                        64 if chunk and not prefix else 100 - prefix,
+                    )
 
     def test_continuation_without_limit_keeps_normal_chunk_size(self):
         adder = self.create_shortest_prefill_adder()

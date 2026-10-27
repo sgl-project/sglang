@@ -603,6 +603,7 @@ def _post_fusion(
         and next.norm_fusable
         and next.hc is not None
         and _can_use_mega_mhc(cfg)
+        and y.shape[0] > 0
     ):
         next_hc = next.hc
         updated, normalized, stats = mhc_mega_boundary(

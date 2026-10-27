@@ -71,7 +71,7 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Namespaces the tree and storage; omitted from KV events.
+        # Namespaces the tree and storage; KV events see only its LoRA name.
         self.extra_key = extra_key
         # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
@@ -497,7 +497,7 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         inserted_len=len(prompt_key),
-                        priority=priority + 1,
+                        priority=min(priority + 1, torch.iinfo(torch.int64).max),
                     )
                 )
 

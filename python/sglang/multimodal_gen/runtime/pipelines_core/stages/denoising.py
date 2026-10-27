@@ -1191,6 +1191,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",

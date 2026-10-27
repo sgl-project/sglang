@@ -2,7 +2,6 @@ import json as json_lib
 import logging
 import math
 import os
-import re
 from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
@@ -447,11 +446,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
-    lora_pattern = re.compile(
-        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def __init__(
         self,
         config: Llama4Config,
@@ -585,7 +579,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def should_apply_lora(self, module_name: str) -> bool:
         """Skip vision model and multi_modal_projector for LoRA."""
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.model.layers.")
 
     def forward(
         self,

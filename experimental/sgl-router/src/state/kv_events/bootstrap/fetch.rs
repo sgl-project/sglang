@@ -6,7 +6,7 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use tracing::debug;
 
-use super::{PeerSnapshot, CURSORS_ONLY_PARAM, MAX_AGE_PARAM, SNAPSHOT_PATH};
+use super::{PeerSnapshot, CURSORS_ONLY_PARAM, LORA_MAPPINGS_PARAM, MAX_AGE_PARAM, SNAPSHOT_PATH};
 
 /// Ceiling on a peer snapshot body, both as buffered off the wire and as
 /// inflated, as a resource guard rather than a format bound.
@@ -69,7 +69,10 @@ pub async fn fetch_snapshot(
     peer_base_url: &str,
     max_age: Option<Duration>,
 ) -> Result<FetchAnswer, anyhow::Error> {
-    fetch_body(http, &snapshot_url(peer_base_url, max_age), peer_base_url).await
+    let mut url = snapshot_url(peer_base_url, max_age);
+    let separator = if max_age.is_some() { '&' } else { '?' };
+    url.push_str(&format!("{separator}{LORA_MAPPINGS_PARAM}=true"));
+    fetch_body(http, &url, peer_base_url).await
 }
 
 /// Fetch one peer's cursor table (`?cursors_only=true`). A producer that

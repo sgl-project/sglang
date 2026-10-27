@@ -234,29 +234,45 @@ def test_compact_eager_keeps_masked_layout_for_cuda_graph(monkeypatch):
         )
 
 
-def test_standard_layout_auto_memory_policy(monkeypatch):
+@pytest.mark.parametrize("packed_scales", [False, True])
+@pytest.mark.parametrize(
+    "experts,hidden,intermediate,budget_gib,choices",
+    [
+        (512, 4096, 256, 42.5, ((4096, True), (8192, False), (16384, False))),
+        # Qwen3-30B on H200: M=4608 OOMs when captured input storage is omitted.
+        (128, 2048, 768, 3.15, ((3072, True), (4608, False))),
+        # Qwen3.5-122B TP2 reaches the same failure at M=3072.
+        (256, 3072, 512, 5.37, ((1792, True), (2304, False), (3072, False))),
+    ],
+)
+def test_standard_layout_auto_memory_policy(
+    monkeypatch, experts, hidden, intermediate, budget_gib, choices, packed_scales
+):
+    monkeypatch.setattr(
+        deep_gemm_runner.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", packed_scales
+    )
     config = MoeRunnerConfig(
-        num_experts=512,
-        num_local_experts=512,
-        hidden_size=4096,
-        intermediate_size_per_partition=256,
+        num_experts=experts,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
         top_k=8,
     )
     quant_info = DeepGemmMoeQuantInfo(
-        w13_weight=torch.empty((1, 512, 1), dtype=torch.float8_e4m3fn),
-        w2_weight=torch.empty((1, 4096, 1), dtype=torch.float8_e4m3fn),
+        w13_weight=torch.empty((1, 2 * intermediate, 1), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((1, hidden, 1), dtype=torch.float8_e4m3fn),
         use_fp8=True,
         block_shape=[128, 128],
     )
     monkeypatch.setattr(
         deep_gemm_runner,
         "_masked_standard_layout_memory_budget_bytes",
-        int(42.5 * (1 << 30)),
+        int(budget_gib * (1 << 30)),
     )
 
     with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
-        for num_tokens, expected in ((8192, True), (16384, False)):
-            hidden_states = torch.empty((num_tokens, 4096), device="meta")
+        for num_tokens, expected in choices:
+            hidden_states = torch.empty((num_tokens, hidden), device="meta")
             assert (
                 deep_gemm_runner._should_use_masked_standard_layout(
                     config, quant_info, hidden_states

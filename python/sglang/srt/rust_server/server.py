@@ -75,16 +75,20 @@ class RustServer:
 
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
-    def _start_multimodal(
-        self, *, server_args: ServerArgs, model_config: ModelConfig, processor
-    ) -> None:
-        """Start the model's Rust workers and retain their scheduler-side state."""
-        mm_host = RustMmProcessor(
+    @classmethod
+    def _resolve_multimodal(
+        cls, *, server_args: ServerArgs, model_config: ModelConfig, processor
+    ) -> Optional[RustMmSpec]:
+        """Resolve the built-in Rust MM pipeline for a multimodal model, and
+        refuse a model it cannot serve. ``launch`` calls this before the
+        listener binds, so a refused model never accepts a connection. A
+        model package whose ``_start_multimodal`` starts its own pipeline
+        overrides this to return ``None``."""
+        mm_spec = RustMmProcessor(
             server_args=server_args,
             model_config=model_config,
             processor=processor,
-        )
-        mm_spec = mm_host.resolve_spec()
+        ).resolve_spec()
         if mm_spec is None:
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
@@ -95,8 +99,17 @@ class RustServer:
                 f"(supported: {', '.join(supported)}; "
                 "images only). Unset SGLANG_RUST_SERVER to serve this model."
             )
-        self.server.start_mm_workers(self._build_mm_spec(mm_spec), mm_host.mm_workers)
-        self.mm_spec = mm_spec
+        return mm_spec
+
+    def _start_multimodal(
+        self, *, server_args: ServerArgs, model_config: ModelConfig, processor
+    ) -> None:
+        """Start the Rust workers for the pipeline ``launch`` resolved."""
+        assert self.mm_spec is not None
+        self.server.start_mm_workers(
+            self._build_mm_spec(self.mm_spec),
+            get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
+        )
 
     @staticmethod
     def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
@@ -125,7 +138,8 @@ class RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
-        creates.
+        creates. A model the server cannot serve is refused before the port
+        is bound.
         """
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -155,6 +169,17 @@ class RustServer:
             )
         )
 
+        # Multimodal models must have a Rust pipeline — there is no Python
+        # fallback. The listener answers as soon as the server is constructed,
+        # so refuse a model without one first.
+        mm_spec = (
+            cls._resolve_multimodal(
+                server_args=server_args, model_config=model_config, processor=processor
+            )
+            if model_config.is_multimodal
+            else None
+        )
+
         extension = cls._load_extension()
         server = extension.Server(
             _build_server_args(
@@ -170,14 +195,13 @@ class RustServer:
         )
         instance = cls(server, http_port=listen_port)
 
-        # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback.
         if model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread still holds the full mask. Narrow it first so every MM thread
-            # created below (the processor's executors, the Rust MM workers) stays
-            # off the scheduler's reserved cores, where MM preprocessing would
-            # preempt the scheduler loop and inflate inter-token latency.
+            # created below (the Rust MM workers, and any a model package's
+            # `_start_multimodal` starts) stays off the scheduler's reserved
+            # cores, where MM preprocessing would preempt the scheduler loop and
+            # inflate inter-token latency.
             if server_cores is not None:
                 try:
                     os.sched_setaffinity(0, set(server_cores))
@@ -185,6 +209,7 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
+            instance.mm_spec = mm_spec
             instance._start_multimodal(
                 server_args=server_args, model_config=model_config, processor=processor
             )

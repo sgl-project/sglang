@@ -260,6 +260,7 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::Kv => "kv",
         PoolName::Mamba => "mamba",
         PoolName::Swa => "swa",
+        PoolName::AuxiliarySwa => "auxiliary_swa",
         PoolName::Indexer => "indexer",
         PoolName::DeepseekV4C4 => "deepseek_v4_c4",
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
@@ -288,6 +289,7 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "kv" => Ok(PoolName::Kv),
         "mamba" => Ok(PoolName::Mamba),
         "swa" => Ok(PoolName::Swa),
+        "auxiliary_swa" => Ok(PoolName::AuxiliarySwa),
         "indexer" => Ok(PoolName::Indexer),
         "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
@@ -2202,9 +2204,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 KvCacheEvent::BlockRemoved {
                     block_hashes,
                     medium,
+                    extra_key,
                 } => {
-                    let item: Py<PyAny> =
-                        ("block_removed", block_hashes, medium.as_str()).into_py_any(py)?;
+                    let item: Py<PyAny> = (
+                        "block_removed",
+                        block_hashes,
+                        medium.as_str(),
+                        extra_key.map(|extra_key| extra_key.to_string()),
+                    )
+                        .into_py_any(py)?;
                     list.append(item)?;
                 }
                 KvCacheEvent::AllBlocksCleared => {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
     format_json_schema, lora_path, one, usage_flags, yes,
@@ -16,6 +17,7 @@ use super::wire::{
     stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use crate::py::python_json;
 use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
 
@@ -26,7 +28,50 @@ pub struct ChatModel {
     pub context_length: Option<u64>,
     /// `model_config.get_default_sampling_params()` under `--sampling-defaults model`.
     pub generation_config: Map<String, Value>,
+    /// The chat template always reasons: `template_detection` resolves its
+    /// reasoning config to `special_case="always"`.
+    #[serde(default)]
+    pub always_thinks: bool,
+    /// The kwarg that turns the chat template's reasoning on and off, with its
+    /// default: `template_detection`'s `toggle_param` and `default_enabled`.
+    #[serde(default)]
+    pub reasoning_toggle: Option<ReasoningToggle>,
+    /// `chat_encoding_spec`, the encoder SGLang renders the model with; the
+    /// OpenAI layer special-cases `"kimi_k3"`.
+    #[serde(default)]
+    pub chat_encoding_spec: Option<String>,
 }
+
+impl ChatModel {
+    fn is_kimi_k3(&self) -> bool {
+        self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+}
+
+/// A chat template's reasoning toggle (`ReasoningToggleConfig`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReasoningToggle {
+    pub toggle_param: String,
+    pub default_enabled: bool,
+}
+
+impl ReasoningToggle {
+    /// `_get_reasoning_from_request` for this config.
+    fn enabled(&self, kwargs: &Map<String, Value>) -> bool {
+        let value = kwargs.get(&self.toggle_param);
+        match self.default_enabled {
+            true => value != Some(&Value::Bool(false)),
+            false => value == Some(&Value::Bool(true)),
+        }
+    }
+}
+
+/// `KimiK3Detector.eot_token`, which K3 requests with tools also stop on.
+const KIMI_K3_TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
+
+/// `_KIMI_K3_GENERATION_STUB_TOKENS`: K3's assistant generation stub is model
+/// input, but not reported as prompt tokens.
+const KIMI_K3_GENERATION_STUB_TOKENS: u64 = 3;
 
 /// `ChatCompletionRequest` with Pydantic's defaults, for the fields that reach
 /// `GenerateReqInput` or the response. A body this rejects goes to the engine.
@@ -83,6 +128,7 @@ struct ChatRequest {
     chat_template_kwargs: Option<Map<String, Value>>,
     custom_logit_processor: Option<OneOrList<Option<String>>>,
     custom_params: Option<Map<String, Value>>,
+    watermark: Option<Map<String, Value>>,
     images_config: Option<Map<String, Value>>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
@@ -109,6 +155,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "return_input_ids_in_sglext",
     "return_output_ids_in_sglext",
     "return_sampling_mask",
+    "return_flat_raw_output_top_logprobs",
     "sampling_logprobs_mode",
     "video_config",
     "max_dynamic_patch",
@@ -171,11 +218,28 @@ pub fn lower_chat(
         Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
         None => None,
     };
+    // `_process_messages`: glm47 constrains a request with tools, `"none"`
+    // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
+    // does not accept.
+    if settings.tool_call_parser.as_deref() == Some("glm47")
+        && raw
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(Unsupported("tool_grammar"));
+    }
     let tools = request_tools(&raw)?;
-    let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
-        (Some(parser), Some(names)) => {
-            tool_detector(parser, names.clone()).ok_or(Unsupported("tool_parser"))?;
-            Some((parser.to_owned(), names.clone()))
+    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
+    let tool_parsing = match (
+        settings.tool_call_parser.as_deref(),
+        &tools,
+        &tool_definitions,
+    ) {
+        (Some(parser), Some(_), Some(definitions)) => {
+            tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
+            Some((parser.to_owned(), definitions.clone()))
         }
         _ => None,
     };
@@ -213,11 +277,35 @@ pub fn lower_chat(
     for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let thinking = parser.is_some() && kwargs.get("thinking") == Some(&Value::Bool(true));
+    let thinking = match parser.and_then(|config| config.default_thinking(&kwargs)) {
+        Some(thinking) => thinking,
+        None => {
+            parser.is_some()
+                && match &model.reasoning_toggle {
+                    Some(toggle) => toggle.enabled(&kwargs),
+                    None => {
+                        model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
+                    }
+                }
+        }
+    };
+    // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
+    let kimi_k3 = model.is_kimi_k3();
+    if kimi_k3 || settings.reasoning_parser.as_deref() == Some("kimi_k3") {
+        request.skip_special_tokens = false;
+    }
     // `_process_messages`: tool output keeps the parser's special tokens.
     if tools.is_some() {
         request.skip_special_tokens = false;
     }
+    // K3 also stops on its tool parser's `eot_token`.
+    let tool_call_stop = match &tool_parsing {
+        Some((parser, _)) if kimi_k3 => match parser.as_str() {
+            "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
+            _ => return Err(Unsupported("tool_parser")),
+        },
+        _ => None,
+    };
     let previous_content = match request.messages.last() {
         Some(last)
             // Roles are compared lowercased, as Pydantic normalizes them.
@@ -235,9 +323,40 @@ pub fn lower_chat(
         _ => None,
     };
 
-    let lowered = generate_body(
+    let mut lowered = generate_body(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     );
+    // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
+    // its structural tag, unless the request is already constrained; Python
+    // tests the constraints by truthiness, so empty strings are unset.
+    let sampling = &mut lowered["sampling_params"];
+    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && tool_parser == "kimi_k3"
+        && ["regex", "ebnf", "json_schema"]
+            .iter()
+            .all(|key| sampling[*key].as_str().is_none_or(str::is_empty))
+    {
+        // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
+        let strip = parser
+            .map(|config| config.think_tokens())
+            .unwrap_or_default();
+        let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
+        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
+            sampling["structural_tag"] = python_json(&tag, true).into();
+        }
+    }
+    if let Some(stop) = tool_call_stop {
+        let sampling = &mut lowered["sampling_params"];
+        let mut stops = match sampling["stop"].take() {
+            Value::Array(stops) => stops,
+            Value::Null => Vec::new(),
+            single => vec![single],
+        };
+        if !stops.iter().any(|s| s == stop) {
+            stops.push(stop.into());
+        }
+        sampling["stop"] = stops.into();
+    }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let reasoning = parser
@@ -252,16 +371,34 @@ pub fn lower_chat(
                     == Some(&Value::Bool(true)),
             },
         });
+    let history_tool_calls = request
+        .messages
+        .iter()
+        .filter(|m| {
+            m["role"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
+        })
+        .filter_map(|m| m["tool_calls"].as_array())
+        .map(|calls| calls.len() as i64)
+        .sum();
     let responder = ChatResponder {
         model: request.model,
+        unreported_prompt_tokens: if kimi_k3 {
+            KIMI_K3_GENERATION_STUB_TOKENS
+        } else {
+            0
+        },
+        history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
         reasoning,
-        tools: tool_names,
+        tools: tool_parsing,
         include_usage,
         continuous_usage_stats,
         settings: settings.clone(),
         tokenizer,
+        created: now(),
         stream: StreamState::default(),
         roles_sent: HashSet::new(),
         detectors: HashMap::new(),
@@ -487,7 +624,7 @@ fn validate(
             return invalid;
         }
     }
-    format_json_schema(request.response_format.as_ref())?;
+    format_json_schema(request.response_format.as_ref(), false)?;
     Ok(())
 }
 
@@ -498,14 +635,15 @@ fn valid_message(message: &Value) -> bool {
     let Some(message) = message.as_object() else {
         return false;
     };
+    let role = message.get("role").and_then(Value::as_str);
+    // Thinking parts are valid only in assistant messages.
+    let assistant = role.is_some_and(|r| r.eq_ignore_ascii_case("assistant"));
     let text_content = |content: &Value| match content {
         Value::String(_) => true,
-        Value::Array(parts) => parts
-            .iter()
-            .all(|part| part["type"] == "text" && part["text"].is_string()),
+        Value::Array(parts) => parts.iter().all(|part| text_part(part, assistant)),
         _ => false,
     };
-    match message.get("role").and_then(Value::as_str) {
+    match role {
         // `ChatCompletionMessageUserParam`: the role is case-sensitive and content is required.
         Some("user") => message.get("content").is_some_and(text_content),
         Some(role) if GENERIC_ROLES.contains(&role.to_lowercase().as_str()) => {
@@ -525,6 +663,21 @@ fn valid_message(message: &Value) -> bool {
                 && optional(message, "tools", |tools| {
                     tools.as_array().is_some_and(Vec::is_empty)
                 })
+        }
+        _ => false,
+    }
+}
+
+/// A text, `tool_reference` or (in assistant messages) thinking content part.
+fn text_part(part: &Value, assistant: bool) -> bool {
+    match part["type"].as_str() {
+        Some("text") => part["text"].is_string(),
+        Some("tool_reference") => part["name"].is_string(),
+        // `ChatCompletionMessageContentThinkingPart`: exactly one of `thinking` and `text`.
+        Some("thinking" | "reasoning") if assistant => {
+            let set = |key: &str| !part[key].is_null();
+            let string = |key: &str| part[key].is_null() || part[key].is_string();
+            set("thinking") != set("text") && string("thinking") && string("text")
         }
         _ => false,
     }
@@ -600,8 +753,11 @@ fn generate_body(
         "custom_params": request.custom_params,
         "sampling_seed": request.seed,
         "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
+        "watermark": request.watermark,
     });
-    if let Ok(Some(schema)) = format_json_schema(request.response_format.as_ref()) {
+    if let Ok(Some(schema)) =
+        format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
+    {
         sampling["json_schema"] = schema.into();
     }
     json!({
@@ -654,15 +810,21 @@ struct ReasoningConfig {
 /// Builds the OpenAI chat response from the engine's `/generate` output.
 pub struct ChatResponder {
     model: String,
+    /// Prompt tokens `_reported_prompt_tokens` leaves out of usage.
+    unreported_prompt_tokens: u64,
+    /// `_get_history_tool_calls_cnt`, which numbers K3 tool-call ids.
+    history_tool_calls: i64,
     n: usize,
     logprobs: bool,
     reasoning: Option<ReasoningConfig>,
-    /// The tool parser and tool names when the output is parsed for tool calls.
-    tools: Option<(String, Vec<String>)>,
+    /// The tool parser and request tools when the output is parsed for tool calls.
+    tools: Option<(String, Vec<Value>)>,
     include_usage: bool,
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The stream's `created`, which every chunk repeats.
+    created: u64,
     stream: StreamState,
     roles_sent: HashSet<u64>,
     detectors: HashMap<u64, ThinkDetector>,
@@ -674,10 +836,13 @@ pub struct ChatResponder {
 impl ChatResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
     pub fn unary(self, body: &[u8]) -> Option<Reply> {
-        let ret = match serde_json::from_slice(body).ok()? {
+        let mut ret = match serde_json::from_slice(body).ok()? {
             Value::Array(items) => items,
             item => vec![item],
         };
+        for item in &mut ret {
+            self.report_prompt_tokens(&mut item["meta_info"]);
+        }
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
             let meta = &item["meta_info"];
@@ -695,8 +860,8 @@ impl ChatResponder {
             // `_process_tool_calls`.
             let mut finish_reason = meta["finish_reason"].clone();
             let mut tool_calls = Value::Null;
-            if let Some((parser, names)) = &self.tools
-                && let Some(detector) = tool_detector(parser, names.clone())
+            if let Some((parser, tools)) = &self.tools
+                && let Some(detector) = tool_detector(parser, tools)
                 && detector.has_tool_call(&text)
             {
                 let (normal, calls) = detector.parse_non_stream(&text);
@@ -705,7 +870,7 @@ impl ChatResponder {
                     let calls = calls
                         .iter()
                         .enumerate()
-                        .map(|(i, call)| tool_call(i as i64, call));
+                        .map(|(i, call)| self.tool_call(i as i64, call));
                     tool_calls = calls.collect();
                     if finish_reason["type"] == "stop" {
                         finish_reason["type"] = "tool_calls".into();
@@ -714,14 +879,18 @@ impl ChatResponder {
                 }
             }
             let finish_reason = &finish_reason;
+            let mut message = json!({
+                "role": "assistant",
+                "content": text,
+                "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
+            });
+            // `ChatMessage._serialize` omits absent tool calls.
+            if !tool_calls.is_null() {
+                message["tool_calls"] = tool_calls;
+            }
             choices.push(json!({
                 "index": index,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                    "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
-                    "tool_calls": tool_calls,
-                },
+                "message": message,
                 "logprobs": logprobs,
                 "finish_reason": finish_reason.get("type"),
                 "matched_stop": finish_reason.get("matched"),
@@ -759,7 +928,9 @@ impl ChatResponder {
     fn stream_frame(&mut self, content: &Value) -> Vec<String> {
         let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
         let meta = &content["meta_info"];
-        self.stream.record(index, meta);
+        let mut reported = meta.clone();
+        self.report_prompt_tokens(&mut reported);
+        self.stream.record(index, &reported);
         let finish_reason = meta["finish_reason"].clone();
         let finish_type = finish_reason["type"].as_str().map(str::to_owned);
 
@@ -853,27 +1024,34 @@ impl ChatResponder {
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
             let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
-                tool_detector(&tools.0, tools.1.clone()).expect("checked when lowering")
+                tool_detector(&tools.0, &tools.1).expect("checked when lowering")
             });
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);
-            let delta = |content: Value, tool_calls: Value| json!({"role": null, "content": content, "reasoning_content": null, "tool_calls": tool_calls});
+            // `ChatCompletionResponseStreamChoice._serialize` omits absent tool calls.
+            let delta = |content: Value, tool_calls: Option<Value>| {
+                let mut delta =
+                    json!({"role": null, "content": content, "reasoning_content": null});
+                if let Some(tool_calls) = tool_calls {
+                    delta["tool_calls"] = tool_calls;
+                }
+                delta
+            };
             if !normal.is_empty() {
-                let mut chunk =
-                    self.chunk_json(index, delta(normal.into(), Value::Null), None, None);
+                let mut chunk = self.chunk_json(index, delta(normal.into(), None), None, None);
                 chunk["usage"] = usage.clone();
                 events.push(format!("data: {chunk}\n\n"));
             }
             for call in calls {
                 self.has_tool_calls.insert(index);
-                let mut tool_call = tool_call(call.tool_index, &call);
+                let mut tool_call = self.tool_call(call.tool_index, &call);
                 // Python streams an id and name only for a non-empty name.
                 if call.name.is_empty() {
                     tool_call["id"] = Value::Null;
                     tool_call["function"]["name"] = Value::Null;
                 }
                 let calls = json!([tool_call]);
-                let mut chunk = self.chunk_json(index, delta(Value::Null, calls), None, None);
+                let mut chunk = self.chunk_json(index, delta(Value::Null, Some(calls)), None, None);
                 chunk["usage"] = usage.clone();
                 events.push(format!("data: {chunk}\n\n"));
             }
@@ -920,7 +1098,7 @@ impl ChatResponder {
                 let chunk = json!({
                     "id": self.stream.last_id,
                     "object": "chat.completion.chunk",
-                    "created": now(),
+                    "created": self.created,
                     "model": self.model,
                     "choices": [],
                     "usage": self.stream.total_usage(self.n, self.settings.enable_cache_report),
@@ -930,6 +1108,32 @@ impl ChatResponder {
         }
         events.push("data: [DONE]\n\n".into());
         events
+    }
+
+    /// `_reported_prompt_tokens`.
+    fn report_prompt_tokens(&self, meta: &mut Value) {
+        if self.unreported_prompt_tokens > 0 && meta.is_object() {
+            let prompt = meta_u64(meta, "prompt_tokens");
+            meta["prompt_tokens"] = prompt.saturating_sub(self.unreported_prompt_tokens).into();
+        }
+    }
+
+    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
+    fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
+        let id = match self.tools.as_ref().map(|(parser, _)| parser.as_str()) {
+            Some("kimi_k3") => format!(
+                "{}:{}",
+                call.name,
+                self.history_tool_calls + call.tool_index
+            ),
+            _ => tool_call_id(),
+        };
+        json!({
+            "id": id,
+            "index": index,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.parameters},
+        })
     }
 
     /// `build_sse_content`: msgspec drops a null `usage`, never a null choice field.
@@ -956,7 +1160,7 @@ impl ChatResponder {
         let mut chunk = json!({
             "id": self.stream.last_id,
             "object": "chat.completion.chunk",
-            "created": now(),
+            "created": self.created,
             "model": self.model,
             "choices": [{
                 "index": index,
@@ -1012,16 +1216,6 @@ impl ChatResponder {
     }
 }
 
-/// A `ToolCall` as Pydantic dumps it; `call_<24 hex>` ids as SGLang mints them.
-fn tool_call(index: i64, call: &ToolCallItem) -> Value {
-    json!({
-        "id": tool_call_id(),
-        "index": index,
-        "type": "function",
-        "function": {"name": call.name, "arguments": call.parameters},
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,6 +1246,10 @@ mod tests {
             json!([{"role": "USER", "content": "hi"}]),
             json!([{"role": "bot", "content": "hi"}]),
             json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]),
+            json!([{"role": "user", "content": [{"type": "thinking", "thinking": "t"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "text": "x"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking"}]}]),
+            json!([{"role": "user", "content": [{"type": "tool_reference"}]}]),
             json!([{"role": "user", "content": [{"type": "text"}]}]),
             json!([{"role": "user", "content": 1}]),
             json!(["hi"]),
@@ -1074,12 +1272,53 @@ mod tests {
     fn text_messages_are_lowered() {
         let messages = json!([
             {"role": "System", "content": "be brief", "tools": []},
-            {"role": "user", "content": [{"type": "text", "text": "hi"}], "name": 1},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "tool_reference", "name": "f"}], "name": 1},
+            {"role": "Assistant", "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "a"}]},
             {"role": "assistant", "content": null, "phase": null, "tool_calls": [
                 {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
             ]},
             {"role": "tool", "content": "42", "tool_call_id": "c"},
         ]);
         assert_eq!(unsupported(messages), None);
+    }
+
+    #[test]
+    fn stream_chunks_repeat_the_stream_created() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let settings = OpenAiSettings::default();
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        // A `created` far in the past stands in for the clock ticking mid-stream:
+        // a chunk that re-reads the clock would report a different second.
+        responder.created = 1;
+        let meta = |finish: Value| json!({"id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1});
+        let mut events = Vec::new();
+        for frame in [
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(Value::Null)}).to_string(),
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(json!({"type": "stop"}))})
+                .to_string(),
+            "[DONE]".into(),
+        ] {
+            events.extend(responder.stream_data(frame.as_bytes()).unwrap());
+        }
+        let created: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .map(|chunk| chunk["created"].clone())
+            .collect();
+        assert!(created.len() > 1, "{events:?}");
+        assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
     }
 }

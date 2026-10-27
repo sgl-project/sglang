@@ -290,6 +290,8 @@ def _bind_stage(
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()
+            # CP-TP group sharing is the MoE-CP gather MHC has been run with.
+            and not get_parallel().enable_cp_tp_group_sharing
         ):
             raise NotImplementedError(
                 "an update applied at the stage's exit with a gather over attention CP"

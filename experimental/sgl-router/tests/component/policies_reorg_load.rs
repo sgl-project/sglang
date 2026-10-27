@@ -46,11 +46,13 @@ struct ObserveAdmission {
 
 impl EngineAdmission for ObserveAdmission {
     fn check(&self, engine: &Worker, metrics: &EngineMetrics) -> Result<Decision, PickError> {
-        assert_eq!(engine.url, URL);
-        // A new report arriving after selection must not change the observation
-        // supplied to admission. The next pick should read the new report.
+        // A new report arriving while a pick checks its candidates must not
+        // change the observation supplied to admission. The next pick should
+        // read the new report.
         report(&self.table, 0, 99, Instant::now());
-        self.observations.lock().unwrap().push(*metrics);
+        if engine.url == URL {
+            self.observations.lock().unwrap().push(*metrics);
+        }
         Ok(Decision::Allow)
     }
 }

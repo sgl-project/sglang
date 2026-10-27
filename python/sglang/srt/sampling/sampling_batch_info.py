@@ -31,6 +31,7 @@ from sglang.srt.sampling.penalties import (
     apply_scaling_penalties,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -110,6 +111,12 @@ class SamplingBatchInfo:
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
+
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
 
     # Device
     device: str = "cuda"
@@ -215,6 +222,29 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        features = get_exec().features
+        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
+            watermark_config = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+            watermark_keys = watermark_config.keys
+            watermark_context_windows = watermark_config.context_windows
+            watermark_enabled = watermark_config.enabled
+            watermark_candidates_host = watermark_config.candidates_host
+            has_watermark_candidates = watermark_config.has_candidates
+        else:
+            watermark_keys = None
+            watermark_context_windows = None
+            watermark_enabled = None
+            watermark_candidates_host = None
+            has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -284,6 +314,11 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark_keys=watermark_keys,
+            watermark_context_windows=watermark_context_windows,
+            watermark_enabled=watermark_enabled,
+            watermark_candidates_host=watermark_candidates_host,
+            has_watermark_candidates=has_watermark_candidates,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),

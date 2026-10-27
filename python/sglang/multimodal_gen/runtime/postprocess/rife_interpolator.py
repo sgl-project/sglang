@@ -19,6 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    validate_frame_interpolation_exp,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -314,10 +317,11 @@ class Model:
         """Interpolate a single intermediate frame between img0 and img1."""
         n, c, h, w = img0.shape
 
-        # Pad to multiples of 32 so that RIFE's downsample/upsample round-trips
-        # preserve spatial dimensions exactly.
-        ph = ((h - 1) // 32 + 1) * 32
-        pw = ((w - 1) // 32 + 1) * 32
+        # At scale < 1 the deepest IFBlock divides spatial dims by 32/scale,
+        # so the pad unit must grow accordingly; upstream RIFE uses max(32, 32/scale).
+        _pad_unit = max(32, int(32 / scale))
+        ph = ((h - 1) // _pad_unit + 1) * _pad_unit
+        pw = ((w - 1) // _pad_unit + 1) * _pad_unit
         pad = (0, pw - w, 0, ph - h)
         img0 = F.pad(img0, pad)
         img1 = F.pad(img1, pad)
@@ -463,6 +467,7 @@ class FrameInterpolator:
         Returns:
             (interpolated_frames, multiplier) where multiplier = 2**exp.
         """
+        validate_frame_interpolation_exp(exp)
         if len(frames) < 2:
             logger.warning(
                 "Frame interpolation requires at least 2 frames; returning input unchanged."

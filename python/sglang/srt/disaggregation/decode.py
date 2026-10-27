@@ -98,7 +98,7 @@ from sglang.srt.mem_cache.common import (
     RetractionBackup,
     checkpoint_kv_cache,
     discard_kv_cache_backup,
-    dsv41_dspark_needs_rebootstrap,
+    dsv4_needs_rebootstrap,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
@@ -877,9 +877,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.request_retirer.retire_unadmitted_request(req)
             return
-        if is_retracted and dsv41_dspark_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
-        ):
+        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             if req.output_ids:
                 req.disagg.rebootstrap_forced_output_id = req.output_ids.pop()
             req.disagg.rebootstrap_in_progress = True
@@ -1155,9 +1153,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Deferred allocation cannot precede the recompute that makes its
             # source ready. Keep the existing leader election and error path.
             if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
-                )
+                self._submit_prefill_recompute(decode_req)
+
+    def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
+        # A fake transfer has no prefill; its receiver completes once metadata is sent.
+        if _is_fake_transfer(decode_req.req):
+            return
+        self.kv_manager.submit_prefill_recompute(
+            decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+        )
 
     def _update_handshake_waiters(
         self,
@@ -1445,17 +1449,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
-        # Each admitted req needs padded_buffer_size from hisparse device pool.
+        # Each admitted req needs a padded buffer plus its speculative scratch.
         # ready reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
         if self.enable_hisparse:
+            coordinator = self.hisparse_coordinator
+            per_req_device_tokens = (
+                coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
+            )
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
             hisparse_req_budget = max(
                 0,
-                hisparse_avail // self.hisparse_coordinator.padded_buffer_size
+                hisparse_avail // per_req_device_tokens
                 - len(self.transfer_queue.queue),
             )
 
@@ -1772,13 +1780,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             device_page_indices = None
             if (
                 self.enable_hisparse
-                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and (
+                    isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    or self.draft_token_to_kv_pool is not None
+                )
                 and not _is_fake_transfer(decode_req.req)
             ):
                 # alloc_logical_only() already allocated the shared logical pages
-                # used by C4 indexer and C128 KV. These device buffers do not use
-                # the C4 sparse physical-slot mapping; carry their logical page IDs
-                # alongside the independently allocated C4 host page IDs.
+                # used by the indexer and draft KV. These device buffers do not
+                # use target sparse physical slots; carry logical page IDs beside
+                # the independently allocated target host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx,
                     prefix_len:origin_input_len,
@@ -1789,8 +1800,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ).astype(np.int32)
                 if self.transfer_backend != TransferBackend.MOONCAKE:
                     raise NotImplementedError(
-                        "DSV4 HiSparse direct PD transfer currently requires "
-                        "the Mooncake backend"
+                        "HiSparse device-only PD transfer currently requires the "
+                        "Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
@@ -1853,10 +1864,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
         ):
-            self.kv_manager.submit_prefill_recompute(
-                decode_req.kv_receiver,
-                decode_req.req.build_rebootstrap_payload(),
-            )
+            self._submit_prefill_recompute(decode_req)
         self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
@@ -2683,6 +2691,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_image_tokens = cached_tokens[4].item()
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        decode_req.req.mm_token_counts_ready = True
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

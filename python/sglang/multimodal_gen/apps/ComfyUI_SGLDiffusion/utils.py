@@ -2,11 +2,13 @@ import base64
 import io
 import os
 import shutil
+import subprocess
 import time
 import uuid
 
 import folder_paths
 import numpy as np
+import requests
 import torch
 from comfy_api.input import VideoInput
 from PIL import Image
@@ -156,14 +158,78 @@ class SGLDVideoInput(VideoInput):
         """
         Abstract method to save the video input to a file.
         """
+        if not os.path.exists(self.video_path):
+            raise FileNotFoundError(
+                f"Video not found at '{self.video_path}'. This file must be "
+                "readable from the ComfyUI process; a path on a remote "
+                "SGLang Diffusion server is not."
+            )
         save_path = path
-        # Copy video file from video_path to save_path
-        if os.path.exists(self.video_path):
-            # Ensure destination directory exists
-            save_dir = os.path.dirname(save_path)
-            if save_dir:
-                os.makedirs(save_dir, exist_ok=True)
-            shutil.copy2(self.video_path, save_path)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        shutil.copy2(self.video_path, save_path)
+
+    def as_trimmed(
+        self,
+        start_time: float | None = None,
+        duration: float | None = None,
+        strict_duration: bool = False,
+    ):
+        """
+        Required by VideoInput since ComfyUI #12107.
+
+        Trims via ffmpeg stream-copy (fast, no re-encode); `strict_duration`
+        is accepted for interface compatibility but not enforced to frame
+        accuracy, since this node never needs sub-frame precision.
+        """
+        start_time = start_time or 0.0
+        if duration is not None and duration < 0:
+            return None
+
+        temp_dir = folder_paths.get_temp_directory()
+        _ensure_dir(temp_dir)
+        ext = os.path.splitext(self.video_path)[1] or ".mp4"
+        dest = os.path.join(temp_dir, f"sgl_video_trim_{uuid.uuid4().hex[:8]}{ext}")
+
+        cmd = ["ffmpeg", "-y", "-ss", str(start_time), "-i", self.video_path]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += ["-c", "copy", dest]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        return SGLDVideoInput(dest, self.height, self.width)
+
+
+def resolve_video_path(file_path: str | None, url: str | None) -> str:
+    """
+    Resolve the generated video to a path this process can use.
+
+    The server sets `file_path` to None once a cloud upload succeeds (the
+    local file is removed); fetch `url` into the ComfyUI temp directory in
+    that case. Otherwise `file_path` is returned as-is; a server on another
+    host without cloud storage returns a path this process can't read, and
+    `SGLDVideoInput.save_to` raises clearly when that path turns out to be
+    unreadable.
+    """
+    if file_path:
+        return file_path
+    if not url:
+        raise RuntimeError(
+            "Generated video has no local file_path and no url to fetch it from."
+        )
+
+    temp_dir = folder_paths.get_temp_directory()
+    _ensure_dir(temp_dir)
+    ext = os.path.splitext(url.split("?", 1)[0])[1] or ".mp4"
+    dest = os.path.join(temp_dir, f"sgl_video_{uuid.uuid4().hex[:8]}{ext}")
+
+    with requests.get(url, timeout=120, stream=True) as response:
+        response.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return dest
 
 
 def convert_video_to_comfy_video(

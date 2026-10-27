@@ -49,7 +49,7 @@ pub struct KvEventBatch {
 pub enum KvCacheEvent {
     /// `{"type": "BlockStored", "block_hashes", "parent_block_hash",
     /// "token_ids", "block_size", "lora_id", "medium"?, ...}`. Keys the
-    /// gateway does not route on (`cache_salt`, `session_id`) are ignored.
+    /// gateway does not route on (`session_id`) are ignored.
     BlockStored(BlockStored),
     /// `{"type": "BlockRemoved", "block_hashes", "medium"?}`.
     BlockRemoved(BlockRemoved),
@@ -70,6 +70,9 @@ pub struct BlockStored {
     pub block_size: u32,
     /// LoRA adapter ID this block is associated with, if any.
     pub lora_id: Option<i64>,
+    pub lora_name: Option<String>,
+    pub cache_salt: Option<String>,
+    pub is_bigram: bool,
     /// Storage tier (`"GPU"`, `"CPU_PINNED"`, `"DISK"`, `"EXTERNAL"`).
     /// Optional in the Python schema (`= None` default), so it may be
     /// omitted entirely under `omit_defaults`.
@@ -212,9 +215,8 @@ impl<'de> Deserialize<'de> for BoundedI64Vec {
 /// One element of a `token_ids` array. SGLang emits a flat `u32` per token for
 /// unigram pages, but a 2-element `[t_i, t_{i+1}]` array per token for *bigram*
 /// pages (`mem_cache/events.py`, `is_bigram` branch — DeepSeek-V4-class models).
-/// `token_ids` is purely informational for the gateway (routing keys off the
-/// engine-provided `block_hashes`), so we accept either shape and flatten the
-/// ints rather than model the bigram pairing.
+/// LoRA ingestion hashes these atoms independently of the worker's block IDs;
+/// preserve whether the flattened atoms came from bigram pairs.
 enum TokenCell {
     One(u32),
     Many(Vec<u32>),
@@ -268,7 +270,7 @@ impl<'de> Deserialize<'de> for TokenCell {
 /// (unigram) token ids and bigram `[t_i, t_{i+1}]` pairs via [`TokenCell`],
 /// flattening the latter.
 #[derive(Debug, Clone, PartialEq)]
-struct BoundedU32Vec(Vec<u32>);
+struct BoundedU32Vec(Vec<u32>, bool);
 
 impl<'de> Deserialize<'de> for BoundedU32Vec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -277,11 +279,11 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
     {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = Vec<u32>;
+            type Value = BoundedU32Vec;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a msgpack array of u32 values")
             }
-            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u32>, A::Error>
+            fn visit_seq<A>(self, mut seq: A) -> Result<BoundedU32Vec, A::Error>
             where
                 A: SeqAccess<'de>,
             {
@@ -298,6 +300,7 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                 };
                 // Each element is either a scalar token id (unigram) or a
                 // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`.
+                let mut is_bigram = false;
                 while let Some(cell) = seq.next_element::<TokenCell>()? {
                     let push = |t: u32, out: &mut Vec<u32>| -> Result<(), A::Error> {
                         if out.len() >= MAX_TOKENS_PER_EVENT {
@@ -312,17 +315,17 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                     match cell {
                         TokenCell::One(t) => push(t, &mut out)?,
                         TokenCell::Many(ts) => {
+                            is_bigram = true;
                             for t in ts {
                                 push(t, &mut out)?;
                             }
                         }
                     }
                 }
-                Ok(out)
+                Ok(BoundedU32Vec(out, is_bigram))
             }
         }
-        let v = deserializer.deserialize_seq(V)?;
-        Ok(BoundedU32Vec(v))
+        deserializer.deserialize_seq(V)
     }
 }
 
@@ -379,7 +382,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
         D: Deserializer<'de>,
     {
         /// Map keys of a `KVCacheEvent` the gateway reads. Every other key
-        /// (`cache_salt`, `session_id`, future additions) is skipped.
+        /// (`session_id`, future additions) is skipped.
         enum EventField {
             Type,
             BlockHashes,
@@ -387,6 +390,8 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
             TokenIds,
             BlockSize,
             LoraId,
+            LoraName,
+            CacheSalt,
             Medium,
             Other,
         }
@@ -410,6 +415,8 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             "token_ids" => EventField::TokenIds,
                             "block_size" => EventField::BlockSize,
                             "lora_id" => EventField::LoraId,
+                            "lora_name" => EventField::LoraName,
+                            "cache_salt" => EventField::CacheSalt,
                             "medium" => EventField::Medium,
                             _ => EventField::Other,
                         })
@@ -438,6 +445,8 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 let mut token_ids: Option<BoundedU32Vec> = None;
                 let mut block_size: Option<u32> = None;
                 let mut lora_id: Option<i64> = None;
+                let mut lora_name: Option<String> = None;
+                let mut cache_salt: Option<String> = None;
                 let mut medium: Option<String> = None;
                 while let Some(field) = map.next_key::<EventField>()? {
                     match field {
@@ -448,6 +457,8 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         EventField::TokenIds => token_ids = Some(map.next_value()?),
                         EventField::BlockSize => block_size = Some(map.next_value()?),
                         EventField::LoraId => lora_id = map.next_value()?,
+                        EventField::LoraName => lora_name = map.next_value()?,
+                        EventField::CacheSalt => cache_salt = map.next_value()?,
                         EventField::Medium => medium = map.next_value()?,
                         EventField::Other => {
                             map.next_value::<IgnoredAny>()?;
@@ -455,6 +466,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                     }
                 }
                 let tag = tag.ok_or_else(|| de::Error::missing_field("type"))?;
+                let is_bigram = token_ids.as_ref().is_some_and(|tokens| tokens.1);
                 match tag.as_str() {
                     "BlockStored" => Ok(KvCacheEvent::BlockStored(BlockStored {
                         block_hashes: block_hashes
@@ -467,6 +479,9 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         block_size: block_size
                             .ok_or_else(|| de::Error::missing_field("block_size"))?,
                         lora_id,
+                        lora_name,
+                        cache_salt,
+                        is_bigram,
                         medium,
                     })),
                     "BlockRemoved" => Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
@@ -786,8 +801,7 @@ mod tests {
         }
     }
 
-    /// Attribution keys (`cache_salt`, `session_id`) and any future key the
-    /// gateway does not route on are skipped, not rejected.
+    /// Namespace and attribution metadata do not change legacy event hashes.
     #[test]
     fn unknown_keys_are_ignored() {
         let event = build_block_stored_bytes_with_extra(

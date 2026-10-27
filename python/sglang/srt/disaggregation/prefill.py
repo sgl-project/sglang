@@ -501,6 +501,18 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def can_prefill_before_bootstrap(self, req: Req) -> bool:
+        """Check eligibility; pause and metadata admission stay in the shared queue."""
+        return (
+            req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+            or get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ) and not (
+            _uses_write_through_cache(self.scheduler.tree_cache)
+            and req.swa_branching_seqlen is not None
+            and req.swa_branching_seqlen > req.kv.cache_protected_len
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def pop_bootstrapped(self) -> List[Req]:
         """Pop the reqs which have finished bootstrapping."""
@@ -533,20 +545,7 @@ class PrefillBootstrapQueue:
                 self.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
             elif poll == KVPoll.Bootstrapping:
-                if (
-                    (
-                        req.disagg.prefill_attempt_count
-                        < get_disagg().optimistic_prefill_attempts
-                        or get_disagg().disaggregation_decode_allocation_policy
-                        == "prefill_complete"
-                    )
-                    and not req.is_retracted  # engine paused
-                    and not (
-                        _uses_write_through_cache(self.tree_cache)
-                        and req.swa_branching_seqlen is not None
-                        and req.swa_branching_seqlen > req.kv.cache_protected_len
-                    )
-                ):
+                if not req.is_retracted and self.can_prefill_before_bootstrap(req):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.disagg.prefill_attempt_count += 1
@@ -1025,6 +1024,8 @@ class DisaggPrefill:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if req.return_routed_experts:
+                    self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree

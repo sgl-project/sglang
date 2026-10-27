@@ -67,18 +67,21 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     DSA = 1
     TRTLLM_MHA = 2
+    DSV4 = 3
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "fa4", "flashinfer"):
             return cls.FLASH_ATTENTION
-        if value in ("dsa"):
+        if value == "dsa":
             return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
+        if value == "dsv4":
+            return cls.DSV4
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha', 'dsv4'}"
         )
 
 

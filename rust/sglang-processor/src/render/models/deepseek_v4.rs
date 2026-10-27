@@ -6,6 +6,7 @@ use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
 use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
+use super::schema_types::normalize_json_schema_types;
 use crate::model_files::resolve_model_file;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -49,12 +50,15 @@ pub(crate) fn render(
     if messages.first().is_none_or(|m| m["role"] != "system") {
         messages.insert(0, json!({"role": "system", "content": ""}));
     }
-    // Unlike the Jinja path, SGLang passes every request tool, whatever the tool_choice.
+    // Unlike the Jinja path, SGLang passes every request tool once `tool_choice` allows any.
     if let Some(tools) = request["tools"]
         .as_array()
         .filter(|tools| !tools.is_empty())
     {
-        messages[0]["tools"] = normalize_tools(tools)?.into();
+        let normalized = normalize_tools(tools)?;
+        if renders_tools(request, tools) {
+            messages[0]["tools"] = normalized.into();
+        }
     }
     let mode = if thinking(request, defaults) {
         ThinkingMode::Thinking
@@ -176,7 +180,23 @@ pub(super) fn engine_message(message: Value) -> Value {
     message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
     message.insert("role".into(), role.into());
     message.entry("content").or_insert_with(|| "".into());
+    if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
+        calls
+            .iter_mut()
+            .for_each(|call| *call = tool_call_dump(call));
+    }
     message.into()
+}
+
+/// `ToolCall.model_dump()`: its declared fields only, unset ones null.
+fn tool_call_dump(call: &Value) -> Value {
+    let function = &call["function"];
+    json!({
+        "id": call["id"],
+        "index": call["index"],
+        "type": "function",
+        "function": {"name": function["name"], "arguments": function["arguments"]},
+    })
 }
 
 /// `process_content_for_template_format`: text parts joined with spaces.
@@ -237,7 +257,7 @@ pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Each assistant tool call's `function.arguments`, absent ones as `null`.
-fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
     message
         .get_mut("tool_calls")
@@ -249,9 +269,21 @@ fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
         .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
-/// `protocol.py::Function.model_dump()`, in declared field order; the encoder
-/// serializes it verbatim.
-fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
+/// Whether `serving_chat` hands the encoder the request tools: `tool_choice`
+/// `"none"` withholds them, and a named choice needs a request tool of that name.
+pub(super) fn renders_tools(request: &Value, tools: &[Value]) -> bool {
+    match &request["tool_choice"] {
+        Value::Null => true,
+        Value::String(choice) => choice != "none",
+        named => tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == named["function"]["name"]),
+    }
+}
+
+/// `protocol.py::Function.model_dump()`, in declared field order, after
+/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
+pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
         .map(|tool| {
@@ -260,7 +292,9 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
             let mut function = Map::new();
             function.insert("description".into(), f["description"].clone());
             function.insert("name".into(), name.into());
-            function.insert("parameters".into(), f["parameters"].clone());
+            let mut parameters = f["parameters"].clone();
+            normalize_json_schema_types(&mut parameters);
+            function.insert("parameters".into(), parameters);
             let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
             function.insert("strict".into(), strict.into());
             if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]

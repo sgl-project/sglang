@@ -193,9 +193,10 @@ class DsparkInfoDumper:
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = None
+        self._device_module = torch.get_device_module(device)
+        self._d2h_stream = None
         if self.enabled and InfoComponent.REQS in self._components:
-            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = self._device_module.Stream(device=device)
 
         self._current_segments: dict[
             InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
@@ -303,7 +304,7 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        start = self._device_module.Event(enable_timing=True)
         start.record()
         self._open_segments[segment] = start
 
@@ -311,7 +312,7 @@ class DsparkInfoDumper:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = self._device_module.Event(enable_timing=True)
         end.record()
         self._current_segments[segment] = (start, end)
 

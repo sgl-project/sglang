@@ -895,7 +895,7 @@ class ReqLogprob:
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
     # Flat replacements for the rows above (see
-    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
     # emptied and the arrays ship instead.
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
@@ -1259,6 +1259,7 @@ class Req:
         self.mm_image_tokens: int = 0
         self.mm_audio_tokens: int = 0
         self.mm_video_tokens: int = 0
+        self.mm_token_counts_ready: bool = False
 
         # Prefix info
         # Tokens [0, prefix_len) are already in the row, or, before allocation,
@@ -1426,7 +1427,11 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         # PD per-request bookkeeping, attached by the PD queue that takes the request.
         self.disagg: Optional[DisaggReqState] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
@@ -1454,6 +1459,26 @@ class Req:
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
+
+    def get_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Return per-modality prompt counts, scanning media at most once."""
+        if not self.mm_token_counts_ready and self.multimodal_inputs is not None:
+            (
+                self.mm_image_tokens,
+                self.mm_audio_tokens,
+                self.mm_video_tokens,
+            ) = self.multimodal_inputs.compute_mm_token_counts()
+            self.mm_token_counts_ready = True
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
+    def inherit_mm_token_counts(self, other: Req) -> None:
+        """Reuse counts from the request whose media history is shared."""
+        (
+            self.mm_image_tokens,
+            self.mm_audio_tokens,
+            self.mm_video_tokens,
+        ) = other.get_mm_token_counts()
+        self.mm_token_counts_ready = True
 
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
@@ -1487,12 +1512,20 @@ class Req:
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    @property
+    def auxiliary_swa_host_hit_length(self) -> int:
+        plan = self.staged_prefetch_plan
+        return (
+            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+        )
+
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
             self.host_hit_length > 0
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
+            or self.auxiliary_swa_host_hit_length > 0
         )
 
     def materialized_host_hit_len(self) -> int:
@@ -1531,6 +1564,13 @@ class Req:
         )
 
     def extend_image_inputs(self, image_inputs):
+        if self.mm_token_counts_ready:
+            image_tokens, audio_tokens, video_tokens = (
+                image_inputs.compute_mm_token_counts()
+            )
+            self.mm_image_tokens += image_tokens
+            self.mm_audio_tokens += audio_tokens
+            self.mm_video_tokens += video_tokens
         if self.session is not None:
             self._extend_session_image_inputs(image_inputs)
         elif self.multimodal_inputs is None:
@@ -3118,8 +3158,10 @@ class ScheduleBatch:
                 )
 
         if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered
             extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
             )
             # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
             # so they stay within the vocab boundary before being sent to GPU.

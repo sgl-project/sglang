@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree};
+use super::{BlockSizeOracle, CacheNamespace, HashTree};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,8 +30,12 @@ impl RadixTreePrefixProvider {
         }
     }
 
-    pub fn match_request_tokens(&self, tokens: &[u32]) -> Option<PrefixLookupResult> {
-        let hashes = self.block_hashes(tokens)?;
+    pub fn match_request_tokens(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+    ) -> Option<PrefixLookupResult> {
+        let hashes = self.block_hashes(tokens, namespace)?;
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
         for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
@@ -77,8 +81,13 @@ impl RadixTreePrefixProvider {
     }
 
     /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
-    pub fn rank_depths(&self, tokens: &[u32], worker_url: &str) -> Vec<(u32, usize)> {
-        let Some(hashes) = self.block_hashes(tokens) else {
+    pub fn rank_depths(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+        worker_url: &str,
+    ) -> Vec<(u32, usize)> {
+        let Some(hashes) = self.block_hashes(tokens, namespace) else {
             return Vec::new();
         };
         self.tree
@@ -89,13 +98,8 @@ impl RadixTreePrefixProvider {
             .collect()
     }
 
-    fn block_hashes(&self, tokens: &[u32]) -> Option<Vec<i64>> {
-        let block_size = self.block_size_oracle.get()?;
-        let hashes = if self.block_size_oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
-        };
+    fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+        let hashes = self.block_size_oracle.block_hashes(tokens, namespace)?;
         (!hashes.is_empty()).then_some(hashes)
     }
 }

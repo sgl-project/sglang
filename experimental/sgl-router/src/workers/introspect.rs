@@ -172,11 +172,11 @@ impl WorkerIntrospector {
         }
 
         // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
-        // token bigrams; the router must mirror that on the selection side.
+        // token bigrams, except on hybrid (Mamba/linear-attention) models.
         let is_bigram = crate::state::kv_events::classify_bigram(
             parsed.speculative_algorithm.as_deref(),
             worker_url,
-        );
+        ) && !parsed.uses_mamba_radix_cache;
         let event_config = parsed
             .kv_events
             .map(|block| resolve_event_config(block, worker_url, is_bigram));
@@ -386,6 +386,10 @@ struct ServerInfoBody {
     /// token bigrams. Absent on workers without speculative decoding.
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Hybrid (Mamba/linear-attention) models keep unigram KV keys even
+    /// under EAGLE.
+    #[serde(default)]
+    uses_mamba_radix_cache: bool,
     /// Carries the value of `ServerArgs.disaggregation_mode`
     /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
     /// versions that predate the field.
@@ -545,6 +549,28 @@ mod tests {
             cfg.is_bigram,
             "EAGLE worker via the introspector must set is_bigram"
         );
+    }
+
+    /// A hybrid (Mamba/KDA) EAGLE worker keeps unigram KV keys, so it must
+    /// NOT be bigram.
+    #[tokio::test]
+    async fn fetch_no_bigram_for_hybrid_eagle_worker() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "speculative_algorithm": "EAGLE",
+            "uses_mamba_radix_cache": true,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector().fetch(&url).await.event_config.unwrap();
+        assert!(!cfg.is_bigram);
     }
 
     /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.

@@ -76,6 +76,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
+
+        ``prefill_tokens`` includes the cached prefix and selected extension.
+        """
+        return 0
+
     def max_new_tokens_for_memory(
         self,
         input_tokens: int,

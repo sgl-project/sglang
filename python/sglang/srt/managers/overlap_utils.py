@@ -745,12 +745,16 @@ class FutureMap:
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )
-        if self.need_topk:
+
+        # Staging transitions refresh only the bonus token. Preserve top-k and
+        # hidden state already published by the preceding target forward.
+        if self.need_topk and payload.topk_p is not None:
+            assert payload.topk_index is not None
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
             self.topk_index_buf[indices] = payload.topk_index.to(
                 self.topk_index_buf.dtype
             )
-        if self.need_hidden_states:
+        if self.need_hidden_states and payload.hidden_states is not None:
             self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )

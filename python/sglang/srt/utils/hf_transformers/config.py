@@ -384,6 +384,14 @@ def get_config(
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
+            elif (
+                key in ("rope_scaling", "rope_parameters")
+                and isinstance(value, dict)
+                and isinstance(current, dict)
+            ):
+                # v5's rope_scaling setter replaces rope_parameters wholesale;
+                # merge so partial overrides keep rope_theta (#41227).
+                setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
 

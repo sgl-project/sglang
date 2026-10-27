@@ -8,12 +8,7 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _to_raw
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import gpu as mlir_gpu
-from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects import vector
-from flydsl._mlir.dialects import vector as mlir_vector
+from aiter.ops.flydsl.kernels.tensor_shim import GTensor
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
@@ -111,16 +106,12 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         state_idx = fx.Int32(state_indices[batch])
         valid = state_idx > fx.Int32(0)
 
-        valid_if = scf.IfOp(_to_raw(valid), results_=[], has_else=True)
-        with ir.InsertionPoint(valid_if.then_block):
+        # Branch bodies are closures: a bare `if` would make the AST rewriter
+        # carry the GTensors whose methods the body calls out as scf.if results.
+        def _valid_then():
             # A workgroup exclusively owns all three convolution channels for
             # its (batch, head), so every cache entry is shifted exactly once.
-            conv_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
-            )
-            with ir.InsertionPoint(conv_if.then_block):
+            def _conv_then():
                 channel_local = tid
                 q_channel = head * fx.Int32(_DIM) + channel_local
                 k_channel = (
@@ -173,7 +164,9 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 fx.ptr_store(q_conv, q_lds + tid)
                 fx.ptr_store(k_conv, k_lds + tid)
                 fx.ptr_store(v_conv, v_lds + tid)
-                scf.YieldOp([])
+
+            if tid < fx.Int32(_DIM):
+                _conv_then()
 
             fx.gpu.barrier()
 
@@ -214,22 +207,8 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 k_vecs.append(k_f32)
                 sum_q_vec = q_f32 * q_f32
                 sum_k_vec = k_f32 * k_f32
-                sum_q_partial = (
-                    sum_q_partial
-                    + mlir_vector.ReductionOp(
-                        T.f32,
-                        vector.CombiningKind.ADD,
-                        sum_q_vec,
-                    ).dest
-                )
-                sum_k_partial = (
-                    sum_k_partial
-                    + mlir_vector.ReductionOp(
-                        T.f32,
-                        vector.CombiningKind.ADD,
-                        sum_k_vec,
-                    ).dest
-                )
+                sum_q_partial = sum_q_partial + fx.Vector(sum_q_vec).reduce("add")
+                sum_k_partial = sum_k_partial + fx.Vector(sum_k_vec).reduce("add")
 
                 gate_bf16 = raw_g.vec_load(
                     (batch * stride_g_token + head * fx.Int32(_DIM) + k_base,),
@@ -248,40 +227,18 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
             width = fx.Int32(_WARP_SIZE)
             for offset in (1, 2, 4):
-                sum_q_partial = (
-                    sum_q_partial
-                    + mlir_gpu.ShuffleOp(
-                        _to_raw(sum_q_partial),
-                        _to_raw(fx.Int32(offset)),
-                        _to_raw(width),
-                        mode="xor",
-                    ).shuffleResult
+                sum_q_partial = sum_q_partial + fx.gpu.shuffle_xor(
+                    sum_q_partial, fx.Int32(offset), width
                 )
-                sum_k_partial = (
-                    sum_k_partial
-                    + mlir_gpu.ShuffleOp(
-                        _to_raw(sum_k_partial),
-                        _to_raw(fx.Int32(offset)),
-                        _to_raw(width),
-                        mode="xor",
-                    ).shuffleResult
+                sum_k_partial = sum_k_partial + fx.gpu.shuffle_xor(
+                    sum_k_partial, fx.Int32(offset), width
                 )
 
             subgroup_leader = (lane // fx.Int32(_WARP_THREADS_K)) * fx.Int32(
                 _WARP_THREADS_K
             )
-            norm_q = mlir_gpu.ShuffleOp(
-                _to_raw(sum_q_partial),
-                _to_raw(subgroup_leader),
-                _to_raw(width),
-                mode="idx",
-            ).shuffleResult
-            norm_k = mlir_gpu.ShuffleOp(
-                _to_raw(sum_k_partial),
-                _to_raw(subgroup_leader),
-                _to_raw(width),
-                mode="idx",
-            ).shuffleResult
+            norm_q = fx.gpu.shuffle_idx(sum_q_partial, subgroup_leader, width)
+            norm_k = fx.gpu.shuffle_idx(sum_k_partial, subgroup_leader, width)
             inv_q = fx.math.rsqrt(fx.Float32(norm_q) + fx.Float32(1e-6))
             inv_k = fx.math.rsqrt(fx.Float32(norm_k) + fx.Float32(1e-6))
 
@@ -291,26 +248,10 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
             dot_kq_vec = zero_vec
             for ki in range_constexpr(_K_ITERS):
-                dot_kq_vec = mlir_vector.FMAOp(
-                    k_vecs[ki],
-                    q_vecs[ki],
-                    dot_kq_vec,
-                ).result
-            dot_kq = mlir_vector.ReductionOp(
-                T.f32,
-                vector.CombiningKind.ADD,
-                dot_kq_vec,
-            ).dest
+                dot_kq_vec = fx.fma(k_vecs[ki], q_vecs[ki], dot_kq_vec)
+            dot_kq = fx.Vector(dot_kq_vec).reduce("add")
             for offset in (1, 2, 4):
-                dot_kq = (
-                    dot_kq
-                    + mlir_gpu.ShuffleOp(
-                        _to_raw(dot_kq),
-                        _to_raw(fx.Int32(offset)),
-                        _to_raw(width),
-                        mode="xor",
-                    ).shuffleResult
-                )
+                dot_kq = dot_kq + fx.gpu.shuffle_xor(dot_kq, fx.Int32(offset), width)
 
             beta_value = fx.Float32(raw_beta[batch * stride_beta_token + head])
             beta = fx.Float32(1.0) / (
@@ -341,70 +282,30 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                     state_pos = vi * _K_ITERS + ki
                     decayed = state_vecs[state_pos] * decay_vecs[ki]
                     state_vecs[state_pos] = decayed
-                    sum_hk_vec = mlir_vector.FMAOp(
-                        decayed,
-                        k_vecs[ki],
-                        sum_hk_vec,
-                    ).result
-                    sum_hq_vec = mlir_vector.FMAOp(
-                        decayed,
-                        q_vecs[ki],
-                        sum_hq_vec,
-                    ).result
+                    sum_hk_vec = fx.fma(decayed, k_vecs[ki], sum_hk_vec)
+                    sum_hq_vec = fx.fma(decayed, q_vecs[ki], sum_hq_vec)
 
-                sum_hk = mlir_vector.ReductionOp(
-                    T.f32,
-                    vector.CombiningKind.ADD,
-                    sum_hk_vec,
-                ).dest
-                sum_hq = mlir_vector.ReductionOp(
-                    T.f32,
-                    vector.CombiningKind.ADD,
-                    sum_hq_vec,
-                ).dest
+                sum_hk = fx.Vector(sum_hk_vec).reduce("add")
+                sum_hq = fx.Vector(sum_hq_vec).reduce("add")
                 for offset in (1, 2, 4):
-                    sum_hk = (
-                        sum_hk
-                        + mlir_gpu.ShuffleOp(
-                            _to_raw(sum_hk),
-                            _to_raw(fx.Int32(offset)),
-                            _to_raw(width),
-                            mode="xor",
-                        ).shuffleResult
+                    sum_hk = sum_hk + fx.gpu.shuffle_xor(
+                        sum_hk, fx.Int32(offset), width
                     )
-                    sum_hq = (
-                        sum_hq
-                        + mlir_gpu.ShuffleOp(
-                            _to_raw(sum_hq),
-                            _to_raw(fx.Int32(offset)),
-                            _to_raw(width),
-                            mode="xor",
-                        ).shuffleResult
+                    sum_hq = sum_hq + fx.gpu.shuffle_xor(
+                        sum_hq, fx.Int32(offset), width
                     )
 
                 conv_v = fx.Float32(fx.ptr_load(v_lds + global_v))
                 v_new = (conv_v - fx.Float32(sum_hk)) * beta
-                v_new = mlir_gpu.ShuffleOp(
-                    _to_raw(v_new),
-                    _to_raw(subgroup_leader),
-                    _to_raw(width),
-                    mode="idx",
-                ).shuffleResult
+                v_new = fx.gpu.shuffle_idx(v_new, subgroup_leader, width)
                 recurrent_value = fx.Float32(sum_hq) + fx.Float32(v_new) * fx.Float32(
                     dot_kq
                 )
-                v_new_vec = mlir_vector.BroadcastOp(
-                    vec_f32,
-                    _to_raw(v_new),
-                ).vector
+                v_new_vec = fx.full(_VALUES_PER_THREAD_K, v_new, fx.Float32)
 
                 for ki in range_constexpr(_K_ITERS):
                     state_pos = vi * _K_ITERS + ki
-                    updated = mlir_vector.FMAOp(
-                        k_vecs[ki],
-                        v_new_vec,
-                        state_vecs[state_pos],
-                    ).result
+                    updated = fx.fma(k_vecs[ki], v_new_vec, state_vecs[state_pos])
                     k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
                     state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
                     state.vec_store(
@@ -422,37 +323,23 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             fx.gpu.barrier()
 
             # Preserve the model's BF16 boundary before RMSNorm and gating.
-            output_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
-            )
-            with ir.InsertionPoint(output_if.then_block):
+            def _norm_then():
                 recurrent_bf16 = fx.ptr_load(out_lds + tid)
                 recurrent_f32 = fx.Float32(recurrent_bf16)
                 square = recurrent_f32 * recurrent_f32
                 for offset in (32, 16, 8, 4, 2, 1):
-                    square = (
-                        square
-                        + mlir_gpu.ShuffleOp(
-                            _to_raw(square),
-                            _to_raw(fx.Int32(offset)),
-                            _to_raw(width),
-                            mode="xor",
-                        ).shuffleResult
+                    square = square + fx.gpu.shuffle_xor(
+                        square, fx.Int32(offset), width
                     )
                 if lane == fx.Int32(0):
                     fx.ptr_store(square, norm_lds + warp)
-                scf.YieldOp([])
+
+            if tid < fx.Int32(_DIM):
+                _norm_then()
 
             fx.gpu.barrier()
 
-            output_store_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
-            )
-            with ir.InsertionPoint(output_store_if.then_block):
+            def _output_then():
                 norm_sum = fx.Float32(fx.ptr_load(norm_lds))
                 norm_sum = norm_sum + fx.Float32(fx.ptr_load(norm_lds + fx.Int32(1)))
                 inv_rms = fx.math.rsqrt(
@@ -473,21 +360,20 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                     batch * stride_out_token + head * stride_out_head + tid,
                     result.to(fx.BFloat16),
                 )
-                scf.YieldOp([])
-            scf.YieldOp([])
-        with ir.InsertionPoint(valid_if.else_block):
-            zero_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
+
+            if tid < fx.Int32(_DIM):
+                _output_then()
+
+        def _zero_then():
+            out.store(
+                batch * stride_out_token + head * stride_out_head + tid,
+                fx.BFloat16(0.0),
             )
-            with ir.InsertionPoint(zero_if.then_block):
-                out.store(
-                    batch * stride_out_token + head * stride_out_head + tid,
-                    fx.BFloat16(0.0),
-                )
-                scf.YieldOp([])
-            scf.YieldOp([])
+
+        if valid:
+            _valid_then()
+        elif tid < fx.Int32(_DIM):
+            _zero_then()
 
     @flyc.jit
     def launch(

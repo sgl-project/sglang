@@ -175,7 +175,44 @@ impl std::error::Error for RestoreError {}
 /// cost of one uncontended re-acquire per chunk.
 const SNAPSHOT_LOCK_CHUNK: usize = 4096;
 
+type LoraAliases = Vec<(u32, Vec<sgl_kv_indexer::lora::LoraBlock>)>;
+
 impl HashTree {
+    /// Hold the LoRA map across the tree walk so aliases and their carriers
+    /// describe the same LoRA state. Base-model writers retain the old path.
+    pub(crate) fn export_with_lora(&self) -> (Vec<KvWorkerId>, Vec<SnapshotNode>, LoraAliases) {
+        let maps = self.lora.lock();
+        let (workers, nodes) = self.export_snapshot();
+        if !maps
+            .values()
+            .any(sgl_kv_indexer::lora::LoraIndex::has_blocks)
+        {
+            return (workers, nodes, Vec::new());
+        }
+        let mut carrier_tiers = HashMap::<(u32, i64), u8>::new();
+        for node in &nodes {
+            for (k, &worker) in node.workers.iter().enumerate() {
+                *carrier_tiers.entry((worker, node.block_hash)).or_default() |=
+                    node.carrier_tiers(k).bits();
+            }
+        }
+        let aliases = workers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, worker)| {
+                let mut blocks = maps.get(worker)?.snapshot();
+                for block in &mut blocks {
+                    block.tiers &= carrier_tiers
+                        .get(&(i as u32, block.lookup))
+                        .copied()
+                        .unwrap_or(0);
+                }
+                (!blocks.is_empty()).then_some((i as u32, blocks))
+            })
+            .collect();
+        (workers, nodes, aliases)
+    }
+
     /// Export every node as a flat, parent-linked list that
     /// [`HashTree::restore_snapshot`] can rebuild an identical tree from.
     ///
@@ -419,6 +456,102 @@ mod tests {
     // -----------------------------------------------------------------------
     // Snapshot export / restore
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn lora_snapshot_splice_preserves_aliases_removals_and_rank_isolation() {
+        use crate::state::kv_events::bootstrap::{
+            PeerSnapshot, VettedSnapshot, WireWorker, LORA_SNAPSHOT_FORMAT,
+        };
+        use crate::state::kv_events::{BlockStored, CacheNamespace};
+        let tree = HashTree::new();
+        let worker = KvWorkerId::new("http://worker".into(), 0);
+        let other_rank = KvWorkerId::new("http://worker".into(), 1);
+        let event = BlockStored {
+            block_hashes: vec![100, 101],
+            parent_block_hash: None,
+            token_ids: vec![1, 2, 3, 4],
+            block_size: 2,
+            lora_id: None,
+            lora_name: Some("adapter-a".into()),
+            cache_salt: Some("tenant-a".into()),
+            is_bigram: false,
+            medium: Some("GPU".into()),
+        };
+        tree.store_event(&worker, &event);
+        tree.store_event(&other_rank, &event);
+        let ns = CacheNamespace {
+            lora_name: event.lora_name.clone(),
+            cache_salt: event.cache_salt.clone(),
+            ambiguous: false,
+        };
+        let keys = ns.block_hashes(&event.token_ids, 2, false);
+        let (workers, nodes, aliases) = tree.export_with_lora();
+        let snapshot = PeerSnapshot {
+            format: LORA_SNAPSHOT_FORMAT,
+            block_size: 2,
+            is_bigram: false,
+            producer_ready: true,
+            workers: workers.iter().map(WireWorker::from).collect(),
+            cursors: workers
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (i as u32, 5))
+                .collect(),
+            nodes,
+            lora_blocks: aliases,
+            empty_ranks: Vec::new(),
+        };
+        let snapshot: PeerSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let live = workers.iter().cloned().collect();
+        let mut invalid = snapshot.clone();
+        invalid.lora_blocks[0].1[0].lookup ^= 1;
+        assert!(matches!(
+            VettedSnapshot::from_wire(invalid, &live, Some(2)),
+            Err(crate::state::kv_events::bootstrap::VetError::InvalidLoraMapping)
+        ));
+        let mut invalid = snapshot.clone();
+        invalid.lora_blocks.clear();
+        assert!(matches!(
+            VettedSnapshot::from_wire(invalid, &live, Some(2)),
+            Err(crate::state::kv_events::bootstrap::VetError::InvalidLoraMapping)
+        ));
+        let mut vetted = VettedSnapshot::from_wire(snapshot, &live, Some(2)).unwrap();
+        // A bootstrap for rank 0 must not import rank 1's map or carriers.
+        vetted.retain_workers(&std::iter::once(worker.clone()).collect());
+        let restored = HashTree::new();
+        vetted.graft_into(&restored).unwrap();
+        assert_eq!(
+            restored.prefix_depths(None, &keys),
+            HashMap::from([(worker.clone(), 2)])
+        );
+        let mut continuation = event.clone();
+        continuation.block_hashes = vec![102];
+        continuation.parent_block_hash = Some(101);
+        continuation.token_ids = vec![5, 6];
+        restored.store_event(&worker, &continuation);
+        let extended = ns.block_hashes(&[1, 2, 3, 4, 5, 6], 2, false);
+        assert_eq!(
+            restored.prefix_depths(None, &extended),
+            HashMap::from([(worker.clone(), 3)])
+        );
+        // An idempotent replay must not keep credit after its removal.
+        restored.store_event(&worker, &event);
+        restored.remove_event(&worker, &[100, 101, 102], Tiers::ALL);
+        assert!(restored.prefix_depths(None, &extended).is_empty());
+        assert!(restored
+            .lora
+            .lock()
+            .get(&worker)
+            .unwrap()
+            .snapshot()
+            .is_empty());
+        tree.clear_worker(&worker);
+        assert_eq!(
+            tree.prefix_depths(None, &keys),
+            HashMap::from([(other_rank, 2)])
+        );
+    }
 
     fn rec(
         parent: Option<u32>,

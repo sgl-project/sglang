@@ -558,11 +558,13 @@ impl ConfigValidator {
         Self::validate_mtls(config)?;
 
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+        // With dp_aware, each URL expands into dp_size workers discovered at runtime
+        let check_p2c_worker_count = !config.dp_aware;
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
-                if worker_count < 2 {
+                if check_p2c_worker_count && worker_count < 2 {
                     return Err(ConfigError::IncompatibleConfig {
                         reason: "Power-of-two policy requires at least 2 workers".to_string(),
                     });
@@ -577,7 +579,7 @@ impl ConfigValidator {
             } = &config.mode
             {
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
-                    if prefill_urls.len() < 2 {
+                    if check_p2c_worker_count && prefill_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
                         });
@@ -585,7 +587,7 @@ impl ConfigValidator {
                 }
 
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
-                    if decode_urls.len() < 2 {
+                    if check_p2c_worker_count && decode_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason:
                                 "Power-of-two policy for decode requires at least 2 decode workers"

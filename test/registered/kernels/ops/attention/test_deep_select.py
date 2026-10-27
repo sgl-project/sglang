@@ -148,6 +148,7 @@ def _random_page_table(rows: int, width: int, page_size: int):
 @pytest.mark.parametrize(
     "k,rows,width,with_end",
     [
+        (512, 4, 64, True),
         (2048, 150, 33000, True),
         (1024, 2, 600_000, False),
     ],
@@ -161,7 +162,7 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
         end = torch.randint(
             1, width + 1, (rows,), dtype=torch.int32, device="cuda", generator=g
         )
-        end[0] = k // 2
+        end[0] = min(k // 2, width)
     table, inverse = _random_page_table(rows, width, page_size)
 
     slots = topk_page_transform(

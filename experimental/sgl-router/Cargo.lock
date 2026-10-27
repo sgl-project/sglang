@@ -918,9 +918,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "7.0.1"
+version = "7.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbca1e2025c60cbecc4c3e919d689d99e552787a7b63821b7a811d257349e820"
+checksum = "b8a2960657bf5e8ddcf24aedfe97cb6d9b1541ad658e07d8a2f5df0e699ee977"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3268,6 +3268,8 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rmpv",
+ "serde",
+ "sha2",
  "tokio",
  "tonic",
  "tonic-prost",

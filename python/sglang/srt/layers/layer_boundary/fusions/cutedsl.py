@@ -83,7 +83,7 @@ class MoeDeferredFinalize(DeferredFinalize, frozen=True):
     routed_output: torch.Tensor
     expert_weights: torch.Tensor
     permuted_indices: torch.Tensor
-    gated_shared_output: torch.Tensor
+    gated_shared_output: torch.Tensor | None
     m: int
     finish: Callable[[], torch.Tensor]
 
@@ -95,7 +95,7 @@ class MoeDeferredFinalize(DeferredFinalize, frozen=True):
         cls,
         deferred_output,
         *,
-        gated_shared_output: torch.Tensor,
+        gated_shared_output: torch.Tensor | None,
         m: int,
         reduce: Callable[[torch.Tensor], torch.Tensor],
     ) -> MoeDeferredFinalize:
@@ -130,7 +130,9 @@ class CuteDSLWorkspace:
         hidden_size: int,
         top_k: int,
         rms_epsilon: float,
+        include_shared_expert: bool = True,
     ) -> None:
+        self.include_shared_expert = include_shared_expert
         self.hidden_size = int(hidden_size)
         self.top_k = int(top_k)
         self.rms_epsilon = float(rms_epsilon)
@@ -157,6 +159,7 @@ class CuteDSLWorkspace:
             rms_epsilon=self.rms_epsilon,
             # _fused_norm_gamma() already returns the multiplier as applied.
             weight_bias=0.0,
+            include_shared_expert=self.include_shared_expert,
         )
         self._workspace = workspace
         self.max_m = workspace.max_m
@@ -368,6 +371,7 @@ def install_cutedsl_fusion(
     can_defer_finalize: _LayerPredicate,
     label: str,
     terminal_finalize: bool = False,
+    include_shared_expert: bool = True,
 ) -> CuteDSLWorkspace | None:
     """One shared workspace handle per fusion-enabled layer, or None.
 
@@ -403,6 +407,7 @@ def install_cutedsl_fusion(
         hidden_size=hidden_size,
         top_k=top_k,
         rms_epsilon=rms_epsilon,
+        include_shared_expert=include_shared_expert,
     )
     hands_off = 0
     for layer in layers:

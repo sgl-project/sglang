@@ -1,10 +1,12 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
-//! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
-//! `runtime::start`, and the Rust MM pipeline handoff ([`MmSpec`]).
+//! ([`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`]), the
+//! [`RuntimeConfig`] pairing them for `runtime::start`, and the Rust MM
+//! pipeline handoff ([`MmSpec`]).
 //!
-//! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
-//! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
+//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
+//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
 //! `Server`. There is one schema — this file — and
@@ -36,6 +38,10 @@ pub struct RustServerServerArgs {
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
+    /// This listener serves the node's `/metrics` (when metrics are on). Only
+    /// the base port does: every listener would render the same node-wide
+    /// files, so a scraper of each DP rank's port would count them N times.
+    pub metrics_listener: bool,
 }
 
 impl Default for RustServerServerArgs {
@@ -48,6 +54,7 @@ impl Default for RustServerServerArgs {
             from_scheduler_cap: 8192,
             stage_channel_cap: 8192,
             cores: None,
+            metrics_listener: true,
         }
     }
 }
@@ -157,6 +164,8 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
+    pub metrics: Option<MetricsConfig>,
 }
 
 #[pyo3::pymethods]
@@ -192,6 +201,7 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        metrics,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -225,6 +235,7 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        metrics: Option<MetricsConfig>,
     ) -> Self {
         Self {
             model_path,
@@ -256,6 +267,7 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            metrics,
         }
     }
 }
@@ -295,7 +307,26 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            metrics: None,
         }
+    }
+}
+
+/// Prometheus metrics, as Python serves them with `--enable-metrics`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct MetricsConfig {
+    /// `PROMETHEUS_MULTIPROC_DIR`: every process's prometheus_client files,
+    /// which `/metrics` merges on each scrape.
+    pub multiproc_dir: String,
+}
+
+#[pyo3::pymethods]
+impl MetricsConfig {
+    #[new]
+    #[pyo3(signature = (*, multiproc_dir))]
+    fn py_new(multiproc_dir: String) -> Self {
+        Self { multiproc_dir }
     }
 }
 

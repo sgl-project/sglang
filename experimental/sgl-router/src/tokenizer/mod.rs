@@ -10,7 +10,7 @@ use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
-use sglang_processor::openai::{ChatModel, OpenAiTokenizer, TokenPieces};
+use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -152,6 +152,10 @@ impl TokenizerRegistry {
                 .flatten()
                 .and_then(|config| config.as_object().cloned())
                 .unwrap_or_default(),
+            // Read from the chat formatter below.
+            always_thinks: false,
+            reasoning_toggle: None,
+            chat_encoding_spec: None,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -165,6 +169,17 @@ impl TokenizerRegistry {
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                me.chat_model.always_thinks = formatter.always_thinks();
+                me.chat_model.reasoning_toggle =
+                    formatter
+                        .reasoning_toggle()
+                        .map(|(toggle_param, default_enabled)| ReasoningToggle {
+                            toggle_param: toggle_param.into(),
+                            default_enabled,
+                        });
+                if formatter.is_kimi_k3() {
+                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
+                }
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
@@ -186,7 +201,7 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4 and V4.1, so this model forwards only guarded request shapes (plain text \
+                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8, so this model forwards only guarded shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \

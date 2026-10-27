@@ -85,12 +85,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "mori",
             "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, mori, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
@@ -106,13 +107,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
-                )
-
             if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "

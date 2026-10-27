@@ -21,6 +21,7 @@ use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
+use crate::state::kv_events::CacheNamespace;
 pub(crate) use crate::state::kv_events::PrefixLookupResult;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -166,6 +167,7 @@ pub struct SelectionContext<'a> {
     candidate_range_id: &'a str,
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
+    cache_namespace: &'a CacheNamespace,
     external_prefix: Option<&'a PrefixLookupResult>,
     load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
@@ -183,6 +185,7 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
+            cache_namespace: CacheNamespace::NONE,
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
@@ -204,6 +207,7 @@ impl<'a> SelectionContext<'a> {
             candidate_range_id: "global",
             input_tokens: None,
             request_tokens: None,
+            cache_namespace: CacheNamespace::NONE,
             external_prefix: None,
             load_snapshot: None,
             prefill_cache_bucket: None,
@@ -215,6 +219,12 @@ impl<'a> SelectionContext<'a> {
     /// Attaches ingress-computed routing tokens.
     pub fn with_request_tokens(mut self, request_tokens: Option<&'a [u32]>) -> Self {
         self.request_tokens = request_tokens;
+        self
+    }
+
+    /// Attaches the KV namespace the request tokens are cached under.
+    pub fn with_cache_namespace(mut self, cache_namespace: &'a CacheNamespace) -> Self {
+        self.cache_namespace = cache_namespace;
         self
     }
 
@@ -297,6 +307,10 @@ impl<'a> SelectionContext<'a> {
     /// Returns ingress-computed routing tokens.
     pub fn request_tokens(&self) -> Option<&[u32]> {
         self.request_tokens
+    }
+
+    pub fn cache_namespace(&self) -> &CacheNamespace {
+        self.cache_namespace
     }
 
     pub fn external_prefix(&self) -> Option<&PrefixLookupResult> {
