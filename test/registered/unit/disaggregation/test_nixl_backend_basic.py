@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1139,6 +1140,43 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             0,
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
+
+
+class TestNixlEagerConnect(CustomTestCase):
+    def _add_peer(self, agent):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = agent
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.decode_kv_args_table = {}
+        mgr.requires_dcp_relayout = MagicMock(return_value=False)
+        mgr.check_peer_aux_buffer_count = MagicMock()
+        mgr._prepare_payload_xfer = MagicMock()
+        mgr._prepare_state_xfer = MagicMock()
+        mgr._add_remote_peer(
+            SimpleNamespace(
+                agent_name="decode-0",
+                agent_metadata=b"md",
+                dst_dcp_size=1,
+                dst_dcp_rank=0,
+                dst_aux_ptrs=[],
+            )
+        )
+        return mgr
+
+    def test_disabled_by_default(self):
+        agent = MagicMock()
+        self._add_peer(agent)
+        agent.make_connection.assert_not_called()
+
+    def test_connect_failure_keeps_peer_registered(self):
+        """A failed eager connect must not raise out of the bootstrap thread."""
+        agent = MagicMock()
+        agent.make_connection.side_effect = RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+        with envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_EAGER_CONNECT.override(True):
+            mgr = self._add_peer(agent)
+        agent.make_connection.assert_called_once_with("decode-0")
+        self.assertIn("decode-0", mgr.decode_kv_args_table)
+        mgr._prepare_payload_xfer.assert_called_once()
 
 
 if __name__ == "__main__":

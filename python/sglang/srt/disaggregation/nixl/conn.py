@@ -2045,6 +2045,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
+            if envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_EAGER_CONNECT.get():
+                self._eager_connect(agent_name)
+
+    def _eager_connect(self, agent_name: str) -> None:
+        start = time.monotonic()
+        try:
+            self.agent.make_connection(agent_name)
+        except Exception as e:
+            logger.warning(
+                "NIXL eager connect to %s failed, falling back to lazy connect: %s",
+                agent_name,
+                e,
+            )
+            return
+        logger.debug(
+            "NIXL eager connect to %s took %.3fs",
+            agent_name,
+            time.monotonic() - start,
+        )
 
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
         # NIXL drops a peer's metadata after a remote-disconnect error and never
