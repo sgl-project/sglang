@@ -102,6 +102,7 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
+    get_disagg,
     get_exec,
     get_flags,
     get_model,
@@ -4094,6 +4095,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
         elif not get_parallel().enable_dp_lm_head:
             return True
         elif moe_a2a_backend.is_none():
+            return True
+        elif (
+            get_disagg().afd_role == "attn"
+            and get_disagg().afd_ffn_moe_backend != "deepep"
+        ):
             return True
         elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
             # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank

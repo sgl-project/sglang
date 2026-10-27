@@ -664,8 +664,8 @@ def handle_deterministic_inference(server_args: Any):
                 f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
             )
 
-        # Check TP size
-        if cfg.tp_size > 1:
+        # AFD ranks share a communicator even when the local TP size is one.
+        if cfg.tp_size > 1 or cfg.afd_role is not None:
             if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
@@ -697,5 +697,5 @@ def handle_deterministic_inference(server_args: Any):
                 os.environ["NCCL_MIN_NCHANNELS"] = nchannels
                 os.environ["NCCL_MAX_NCHANNELS"] = nchannels
                 logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
+                    "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference with TP or AFD communication."
                 )

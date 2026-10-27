@@ -5,6 +5,7 @@ from functools import partial
 import msgspec
 import torch
 
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, ReadoutFusion
 from sglang.srt.layers.layer_boundary.factories import declare_attn, declare_ffn
@@ -376,7 +377,10 @@ def materialize(hidden_states, batch, *, consume=True, next=None):
 def stages(config, layer_id, *, layer=None):
     from sglang.srt.layers.layer_boundary.layout import token_axis_sizes
 
-    ep = not get_moe_a2a_backend().is_none()
+    backend = get_moe_a2a_backend()
+    ep = not (
+        backend.is_none() or (backend.is_afd_attn() and not is_afd_attn_moe_scattered())
+    )
     table_attn, table_ffn, overlapped_ffn = {}, {}, {}
     for variant in (BatchVariant.ORDINARY, BatchVariant.CONTEXT_PARALLEL):
         cp = variant is BatchVariant.CONTEXT_PARALLEL
@@ -501,7 +505,12 @@ class MoeTransport(MoeRowTransport):
     def __init__(self, layer, hidden_states, forward_batch, call, rows):
         self.source_rows = hidden_states.shape[0]
         self.rows = rows
-        if (rows.group is None) != (not get_moe_a2a_backend().is_none()):
+        backend = get_moe_a2a_backend()
+        ep = not (
+            backend.is_none()
+            or (backend.is_afd_attn() and not is_afd_attn_moe_scattered())
+        )
+        if (rows.group is None) != ep:
             raise ValueError("MoE backend does not match its transport output contract")
         cp = TokenAxis.ATTN_CP in rows.source.sharded
         super().__init__(

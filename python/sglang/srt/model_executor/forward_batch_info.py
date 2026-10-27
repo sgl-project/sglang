@@ -38,6 +38,7 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
@@ -2276,6 +2277,7 @@ def enable_num_token_non_padded():
     if (
         get_parallel().moe_ep_size > 1
         or world_dp_gather_enabled()
+        or is_afd_attn_moe_scattered()
         or get_moe_a2a_backend().is_customized()
     ):
         return True

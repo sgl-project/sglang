@@ -283,6 +283,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # backend, memory budget, and shard topology have all resolved.
     run_hook(handle_kv_cache_sharding, server_args)
 
+    from sglang.srt.afd.afd_config import (
+        check_afd_server_args,
+        prepare_afd_ffn_moe_backend,
+    )
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
@@ -292,12 +296,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_moe_kernel_config, server_args)
+    run_hook(prepare_afd_ffn_moe_backend, server_args)
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)
     run_hook(validate_experimental_sgl_marlin, server_args)
+    run_hook(check_afd_server_args, server_args)
 
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
 

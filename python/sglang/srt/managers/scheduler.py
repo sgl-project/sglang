@@ -567,6 +567,12 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        if get_disagg().afd_role == "ffn":
+            from sglang.srt.afd.ffn.scheduler import finish_ffn_scheduler_init
+
+            finish_ffn_scheduler_init(self)
+            return
+
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
@@ -1121,6 +1127,7 @@ class Scheduler(
     @torch.no_grad()
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        self.maybe_init_afd()
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
@@ -1128,6 +1135,11 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
+        if get_disagg().afd_role == "ffn":
+            from sglang.srt.afd.ffn.scheduler import init_ffn_model_worker_state
+
+            init_ffn_model_worker_state(self)
+            return
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
@@ -1947,10 +1959,13 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
-        result_dict["hicache_object_layout"] = self._hicache_l3_layout()
+        if get_disagg().afd_role != "ffn":
+            result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        if (
+            get_disagg().afd_role != "ffn"
+            and get_serving().grpc_port is not None
+            and not (get_serving().smg_grpc_mode or get_serving().grpc_mode)
         ):
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
@@ -1959,7 +1974,28 @@ class Scheduler(
             )
         return result_dict
 
+    def maybe_init_afd(self):
+        self._afd_sync_sender = None
+        self.afd_handshake = None
+        if get_disagg().afd_role != "attn":
+            return
+
+        from sglang.srt.afd.afd_scheduler import init_afd_attn
+
+        self.device_module = torch.get_device_module(self.tp_worker.device)
+        self.afd_handshake, self._afd_sync_sender = init_afd_attn(self)
+
+    def _afd_pre_run_batch(self, batch: ScheduleBatch) -> None:
+        if get_disagg().afd_role != "attn":
+            return
+
+        from sglang.srt.afd.afd_scheduler import prepare_afd_attn_batch
+
+        prepare_afd_attn_batch(self, batch)
+
     def release_host_resources(self) -> None:
+        if get_disagg().afd_role == "ffn":
+            return
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
@@ -4645,6 +4681,8 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        self._afd_pre_run_batch(batch)
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
@@ -6204,6 +6242,11 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if get_disagg().afd_role == "ffn":
+        from sglang.srt.afd.ffn.scheduler import event_loop_afd_ffn
+
+        event_loop_afd_ffn(scheduler)
+        return
     if scheduler.server_args.enable_pd_role_switch:
         return role_switch.run_event_loop_supervisor(
             scheduler,

@@ -47,6 +47,7 @@ class MoeA2ABackend(Enum):
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
+    AFD_ATTN = "afd"
 
     @classmethod
     def _missing_(cls, value):
@@ -98,6 +99,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_afd_attn(self):
+        return self == MoeA2ABackend.AFD_ATTN
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -720,6 +724,10 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
 
 def is_moe_input_scattered_across_dp_ranks() -> bool:
     """Whether sparse MoE routing runs on a DP-local token shard."""
+    if get_moe_a2a_backend().is_afd_attn():
+        from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+
+        return is_afd_attn_moe_scattered()
     return (
         not get_moe_a2a_backend().is_none()
         or should_use_flashinfer_cutlass_moe_fp4_allgather()
@@ -766,6 +774,10 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     This is a property of the MoE configuration. Whether the MoE block or a later
     step runs a sum that is still owed is decided separately.
     """
+    if get_moe_a2a_backend().is_afd_attn():
+        from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+
+        return is_afd_attn_moe_scattered()
     if get_parallel().dwdp_size > 1:
         return True
     if should_use_flashinfer_cutlass_moe_fp4_allgather():

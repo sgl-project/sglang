@@ -11,6 +11,7 @@ from sglang.srt.eplb.lplb_solver import (
     clear_global_lplb_solvers,
     set_global_lplb_solver,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -138,6 +139,9 @@ def check_quantized_moe_compatibility(
     moe_ep_size: int,
     moe_dp_size: int,
 ) -> None:
+    # Attention workers neither shard nor execute the routed expert weights.
+    if get_moe_a2a_backend().is_afd_attn():
+        return
     if (
         quantization_config := getattr(
             model_config.hf_config, "quantization_config", None
