@@ -39,6 +39,10 @@
 # At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.17-rocm720-mi35x -f rocm.Dockerfile .
 
+# Usage (to build SGLang ROCm + uTLX docker image, for sglang's TLX kernels):
+# Rebuilds Triton with plugin support and adds the uTLX plugin; gfx950-rocm1000 only, skipped elsewhere.
+#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1000 --build-arg ENABLE_UTLX=1 -t v0.5.17-rocm10-mi35x -f rocm.Dockerfile .
+
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
@@ -1206,6 +1210,60 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 
 # torch 2.11 still Requires-Dist: triton-rocm after the swap above.
 RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+
+# -----------------------
+# uTLX (standalone TLX) for sglang's TLX kernels, in two steps: rebuild Triton with
+# plugin support, then build the uTLX plugin against it. Opt in with ENABLE_UTLX=1;
+# gfx950-rocm1000 only, skipped on every other flavor. Must stay after the Triton
+# step above.
+ARG ENABLE_UTLX=0
+ARG UTLX_TRITON_REPO="https://github.com/ROCm/triton.git"
+# The commit the SDK's Triton (3.8.0+git4cff872c.rocm10.0.0) is built from.
+ARG UTLX_TRITON_COMMIT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
+ARG UTLX_REPO="https://github.com/triton-lang/triton-ext.git"
+# triton-ext main at #179, the source of triton-utlx-rocm 3.8.0.post1. Includes #177,
+# which keeps Gluon kernels (e.g. aiter's) compiling with uTLX loaded.
+ARG UTLX_COMMIT="9592ce6d40d5d6b1b80cb9304b4fcff632456a8c"
+# Both steps share one RUN: step 2 needs the LLVM that step 1 downloads into
+# /root/.triton (2.4 GB), and a separate RUN would leave it in the image.
+RUN set -eux; \
+    [ "${ENABLE_UTLX}" = "1" ] && [ "${GPU_ARCH}" = "gfx950-rocm1000" ] \
+        || { echo "[uTLX] skip (ENABLE_UTLX=${ENABLE_UTLX}, GPU_ARCH=${GPU_ARCH})"; exit 0; }; \
+    \
+    # Step 1: Triton with TRITON_EXT_ENABLED=ON.
+    # The SDK's Triton is built without it and skips every plugin. Rebuild the same
+    # commit, so the version stays the one torch pins.
+    # cherry pick ROCm/triton#978 to keep libtriton's LLVM apart from the SDK's libLLVM
+    # that torch preloads, may be removed once the ROCm SDK's Triton includes it
+    # The wheel does not ship Triton's C++ headers, which uTLX compiles against, so
+    # they are installed from the build tree.
+    triton_version="$(pip show triton | sed -n 's/^Version: //p')"; \
+    git init -q /tmp/triton && cd /tmp/triton; \
+    git fetch -q --depth 1 "${UTLX_TRITON_REPO}" "${UTLX_TRITON_COMMIT}" && git checkout -q FETCH_HEAD; \
+    git fetch -q --depth 2 "${UTLX_TRITON_REPO}" ea2482df04a608156c5778db4adfd0942c66df1e \
+        && git cherry-pick --no-commit FETCH_HEAD; \
+    env -u CPATH -u LIBRARY_PATH TRITON_EXT_ENABLED=ON MAX_JOBS=64 \
+        TRITON_WHEEL_VERSION_SUFFIX=".rocm${triton_version##*.rocm}" \
+        pip install --no-build-isolation --no-deps --force-reinstall .; \
+    triton_dir="$(python3 -c 'import triton, os; print(os.path.dirname(triton.__file__))')"; \
+    build=$(echo /tmp/triton/build/cmake.*); \
+    cmake --install "${build}" --component headers --prefix "${triton_dir}"; \
+    for dst in "${triton_dir}/include" "${triton_dir}/include/amd/include"; do \
+        mkdir -p "${dst}" && cp -r third_party/amd/include/. "${build}/third_party/amd/include/." "${dst}/"; \
+    done; \
+    \
+    # Step 2: the uTLX plugin, against the Triton headers and the LLVM from step 1.
+    # UTLX_TRITON_ROCM selects uTLX's code paths for Triton release/3.8. Its examples
+    # and tests are kept in /sgl-workspace/utlx.
+    git init -q /tmp/triton-ext && cd /tmp/triton-ext; \
+    git fetch -q --depth 1 "${UTLX_REPO}" "${UTLX_COMMIT}" && git checkout -q FETCH_HEAD; \
+    env -u CPATH -u LIBRARY_PATH TRITON_WHEEL_DIR="${triton_dir}" \
+        LLVM_INSTALL_DIR="$(readlink -f /root/.triton/llvm/llvm-ubuntu-x64)" \
+        pip install --no-build-isolation --no-deps \
+            --config-settings=cmake.define.UTLX_TRITON_ROCM=ON ./extensions/utlx; \
+    mkdir -p /sgl-workspace/utlx && cp -r extensions/utlx/examples extensions/utlx/test /sgl-workspace/utlx/; \
+    \
+    cd / && rm -rf /tmp/triton /tmp/triton-ext /root/.triton /root/.cache/pip
 
 # -----------------------
 # Performance environment variable.
