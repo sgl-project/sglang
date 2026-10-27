@@ -2794,6 +2794,55 @@ class ServingChatTestCase(CustomTestCase):
                 prompt = self.tm.tokenizer.encode.call_args.args[0]
                 self.assertEqual("calculator" in prompt, expects_tools)
 
+    def _mm_request(self):
+        self.template_manager.jinja_template_content_format = "openai"
+        return ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe"},
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                    ],
+                }
+            ],
+        )
+
+    def test_mm_skip_prompt_reencode_sends_the_rendered_template(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.tm.tokenizer.apply_chat_template.return_value = "<rendered>"
+        render_and_encode = Mock(return_value=([1, 2], "<decoded>"))
+        self.chat._render_and_encode_chat_template = render_and_encode
+
+        with patch.dict("os.environ", {"SGLANG_CHAT_MM_SKIP_PROMPT_REENCODE": "1"}):
+            result = self.chat._apply_jinja_template(
+                self._mm_request(), None, is_multimodal=True
+            )
+
+        render_and_encode.assert_not_called()
+        self.assertFalse(
+            self.tm.tokenizer.apply_chat_template.call_args.kwargs["tokenize"]
+        )
+        self.assertEqual(result.prompt, "<rendered>")
+        self.assertEqual(result.prompt_ids, [])
+
+    def test_mm_skip_prompt_reencode_is_off_by_default(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat._prompt_text_round_trip_is_lossy = False
+        render_and_encode = Mock(return_value=([1, 2], "<decoded>"))
+        self.chat._render_and_encode_chat_template = render_and_encode
+
+        with patch.dict("os.environ", {"SGLANG_CHAT_MM_SKIP_PROMPT_REENCODE": "0"}):
+            result = self.chat._apply_jinja_template(
+                self._mm_request(), None, is_multimodal=True
+            )
+
+        render_and_encode.assert_called_once()
+        self.assertEqual(result.prompt, "<decoded>")
+        self.assertEqual(result.prompt_ids, [1, 2])
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
