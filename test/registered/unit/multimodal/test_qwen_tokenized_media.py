@@ -18,7 +18,8 @@ One row per test: what it pins, then the test.
             -> test_worker_threads_encode_timestamps_with_their_own_tokenizer
             per-source preprocess_kwargs and serving views
             -> test_video_preprocess_kwargs_apply_per_item_and_keep_serving_views
-            per-source frame and pixel options stay within the configured limits
+            per-source frame and pixel options stay within the configured limits,
+            and the configured fps or nframes wins over the item's other one
             -> test_video_preprocess_kwargs_cannot_raise_configured_limits
     audio   feature mask and CNN chunk lengths
             -> test_omni_audio_mask_and_cnn_chunk_lengths
@@ -71,6 +72,7 @@ from sglang.srt.multimodal.processors.qwen_vl import (
 from sglang.srt.multimodal.qwen_vl_media_processing import (
     FPS_MAX_FRAMES,
     VIDEO_MAX_PIXELS,
+    VIDEO_MIN_PIXELS,
     VIDEO_TOTAL_PIXELS,
 )
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
@@ -934,6 +936,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
         client_options = {
             "fps": 60,
             "max_frames": 10**6,
+            "min_pixels": 10**9,
             "max_pixels": 10**12,
             "total_pixels": 10**15,
             "do_normalize": False,
@@ -943,13 +946,24 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 {},
                 {
                     "max_frames": FPS_MAX_FRAMES,
+                    "min_pixels": VIDEO_MIN_PIXELS,
                     "max_pixels": VIDEO_MAX_PIXELS,
                     "total_pixels": VIDEO_TOTAL_PIXELS,
                 },
             ),
             (
-                {"max_frames": 64, "max_pixels": 1024, "total_pixels": 4096},
-                {"max_frames": 64, "max_pixels": 1024, "total_pixels": 4096},
+                {
+                    "max_frames": 64,
+                    "min_pixels": 512,
+                    "max_pixels": 1024,
+                    "total_pixels": 4096,
+                },
+                {
+                    "max_frames": 64,
+                    "min_pixels": 512,
+                    "max_pixels": 1024,
+                    "total_pixels": 4096,
+                },
             ),
         ):
             with self.subTest(video_config=video_config):
@@ -962,6 +976,17 @@ class TestQwenTokenizedMedia(CustomTestCase):
             strategy._bound_item_video_options({"nframes": 8, "max_frames": 16}),
             {"nframes": 8, "max_frames": 16},
         )
+        # smart_nframes takes fps or nframes, not both: the configured way of
+        # sampling wins, so a configured nframes drops the item's fps and back.
+        for video_config, item_options, expected in (
+            ({"nframes": 4}, {"fps": 2, "max_frames": 8}, {"max_frames": 8}),
+            ({"fps": 2}, {"nframes": 8}, {}),
+        ):
+            with self.subTest(video_config=video_config):
+                with patch.object(strategy, "video_config", video_config):
+                    self.assertEqual(
+                        strategy._bound_item_video_options(item_options), expected
+                    )
         with self.assertRaisesRegex(ValueError, "resized_height"):
             strategy._bound_item_video_options(
                 {"resized_height": 10**4, "resized_width": 10**4}
