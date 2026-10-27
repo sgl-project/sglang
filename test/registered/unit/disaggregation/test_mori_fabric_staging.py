@@ -5,6 +5,7 @@ import time
 import types
 import unittest
 from collections import defaultdict
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -34,6 +35,8 @@ from sglang.srt.disaggregation.mori.fabric_staging import (
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -137,6 +140,44 @@ def _ready(manager, storage_bytes=6500):
     msg = [FABRIC_CHUNK_READY, b"11", b"0", b"2", b"0", b"512", b"0"]
     msg += [b"10.0.0.1", b"6000", b"0", b"0", b"1", room.epoch]
     return msg, replies, storage
+
+
+class TestFabricMemoryPool(CustomTestCase):
+    def test_ple_state_uses_fabric_pool_only_without_staging(self):
+        """Direct Fabric transfers require exportable PLE state allocations."""
+        fabric_pool = object()
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="mori"
+            ),
+            envs.SGLANG_MORI_BACKEND.override("fabric"),
+            envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override(None),
+            patch(
+                "sglang.srt.disaggregation.mori.custom_mem_pool.get_mori_fabric_mem_pool",
+                return_value=fabric_pool,
+            ),
+            patch("torch.cuda.use_mem_pool", side_effect=lambda _: nullcontext()),
+        ):
+            for staging in (False, True):
+                with (
+                    self.subTest(staging=staging),
+                    envs.SGLANG_MORI_FABRIC_STAGING.override(staging),
+                ):
+                    pools = (
+                        ShortConvPool(
+                            size=2,
+                            state_shape=(2, 3),
+                            layer_ids=[0],
+                            dtype=torch.float32,
+                            device="cpu",
+                        ),
+                        NGramPool(size=2, context_len=3, eos_token_id=0, device="cpu"),
+                    )
+                    for pool in pools:
+                        self.assertEqual(pool.enable_custom_mem_pool, not staging)
+                        self.assertIs(
+                            pool.custom_mem_pool, None if staging else fabric_pool
+                        )
 
 
 class TestFabricStagingSizing(CustomTestCase):

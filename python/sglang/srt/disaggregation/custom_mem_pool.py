@@ -16,7 +16,7 @@
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_disagg
 
 PoolResult = Tuple[bool, Optional[Any], Optional[str]]
 
@@ -39,23 +39,14 @@ def _mooncake_pool(device: str) -> PoolResult:
 _PD_BACKEND_POOLS: Dict[str, Callable[[str], PoolResult]] = {"mori": _mori_pool}
 
 
-def _get_server_args_or_none():
-    # Standalone pool tests may run before ModelRunner publishes ServerArgs.
-    try:
-        return get_server_args()
-    except ValueError:
-        return None
-
-
 def maybe_init_custom_mem_pool(device: str) -> PoolResult:
     """Initialize the custom memory pool required by the active transport."""
-    server_args = _get_server_args_or_none()
-    if server_args is not None and getattr(
-        server_args, "disaggregation_mode", "null"
-    ) in ("prefill", "decode"):
-        resolve = _PD_BACKEND_POOLS.get(
-            getattr(server_args, "disaggregation_transfer_backend", None)
-        )
+    try:
+        config = get_disagg()
+    except ValueError:
+        config = None
+    if config is not None and config.disaggregation_mode in ("prefill", "decode"):
+        resolve = _PD_BACKEND_POOLS.get(config.disaggregation_transfer_backend)
         if resolve is not None:
             return resolve(device)
 
