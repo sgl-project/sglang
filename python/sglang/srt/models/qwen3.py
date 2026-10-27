@@ -51,7 +51,9 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.kernels.ops.attention.fused_qknorm_rope import fused_qk_norm_mrope
+    from sglang.kernels.ops.attention.fused_qknorm_rope import (
+        fused_qk_norm_rope_with_cache,
+    )
 
 _has_fused_qk_norm_mrope = False
 _has_fused_qk_norm_rope = False
@@ -234,14 +236,19 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-        self.use_fused_qk_norm_mrope_cuda = (
+        self.use_fused_qk_norm_rope_cuda = (
             _is_cuda
             and get_platform().is_sm100
             and self.head_dim == 128
-            and isinstance(self.rotary_emb, MRotaryEmbedding)
+            and (
+                type(self.rotary_emb) is RotaryEmbedding
+                or (
+                    type(self.rotary_emb) is MRotaryEmbedding
+                    and bool(self.rotary_emb.mrope_section)
+                )
+            )
             and self.rotary_emb.rotary_dim == 128
             and self.rotary_emb.is_neox_style
-            and self.rotary_emb.axis_map is not None
             and not self.rotary_emb._force_native
             and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
@@ -269,27 +276,31 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        rope_positions = positions
+        if positions.ndim == 2 and forward_batch.forward_mode.is_decode():
+            # Decode MRoPE positions repeat one row on all three axes.
+            rope_positions = positions[0]
         if (
-            self.use_fused_qk_norm_mrope_cuda
+            self.use_fused_qk_norm_rope_cuda
             and q.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == q.dtype
             and self.k_norm.weight.dtype == q.dtype
             and 0 < q.shape[0] <= 128
-            and positions.ndim == 2
-            and positions.dtype == torch.int64
+            and rope_positions.ndim == 1
+            and rope_positions.dtype == torch.int64
         ):
-            self.rotary_emb._match_cos_sin_cache_dtype(q)
-            fused_qk_norm_mrope(
+            if positions.ndim == 2:
+                self.rotary_emb._match_cos_sin_cache_dtype(q)
+            fused_qk_norm_rope_with_cache(
                 q,
                 k,
                 self.q_norm.weight,
                 self.k_norm.weight,
                 self.rotary_emb.cos_sin_cache,
-                positions,
-                self.rotary_emb.axis_map,
+                rope_positions,
                 self.q_norm.variance_epsilon,
             )
             return q, k, v
@@ -380,6 +391,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(

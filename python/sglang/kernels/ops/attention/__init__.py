@@ -560,9 +560,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="attention.fused_qk_norm_mrope",
+        op="attention.fused_qk_norm_rope_with_cache",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.attention.fused_qknorm_rope:fused_qk_norm_mrope",
+        target="sglang.kernels.ops.attention.fused_qknorm_rope:fused_qk_norm_rope_with_cache",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
     )
 )

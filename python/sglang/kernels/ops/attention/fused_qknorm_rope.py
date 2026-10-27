@@ -196,33 +196,31 @@ def fused_qk_norm_rope(
 
 
 @cache_once
-def _mrope_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _rope_with_cache_module(cache_dtype: torch.dtype):
+    args = make_cpp_args(is_arch_support_pdl(), cache_dtype)
     return load_jit(
-        "fused_qk_norm_mrope",
-        args,
+        "fused_qk_norm_rope_with_cache",
+        *args,
         cuda_files=["elementwise/fused_qknorm_rope.cuh"],
         extra_cuda_cflags=["-DJIT_HEAD_DIM=128", "-DJIT_INTERLEAVE=0", "-DJIT_YARN=0"],
-        cuda_wrappers=[("run", f"FusedQKNormMRoPE<{args}>::run")],
+        cuda_wrappers=[("run", f"FusedQKNormRoPEWithCache<{args}>::run")],
     )
 
 
-def fused_qk_norm_mrope(
+def fused_qk_norm_rope_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
-    axis_map: torch.Tensor,
     eps: float,
 ) -> None:
-    """Normalize and rotate Q/K in place; BF16, head size 128, NeoX layout.
+    """Normalize and rotate Q/K in place; BF16, head size 128, full NeoX RoPE.
 
-    ``axis_map`` maps each of the 64 rotary pairs to one of three position
-    rows, supporting both contiguous and interleaved multimodal sections.
-    The normalization rounds to BF16 before the BF16 rotary operations.
+    ``positions`` is 1D int64. A BF16 ``cos_sin_cache`` reproduces the Triton
+    MRoPE rotation, an FP32 one reproduces ``apply_rope_with_cos_sin_cache_inplace``.
     """
-    _mrope_module().run(
-        q, k, q_weight, k_weight, cos_sin_cache, positions, axis_map, eps
+    _rope_with_cache_module(cos_sin_cache.dtype).run(
+        q, k, q_weight, k_weight, cos_sin_cache, positions, eps
     )
