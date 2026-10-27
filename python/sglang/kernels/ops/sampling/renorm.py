@@ -3,7 +3,7 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 from sglang.utils import LazyImport
 
 if is_cuda():
@@ -11,7 +11,7 @@ if is_cuda():
     # this module.
     top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
     top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
-elif is_hip():
+elif is_hip() or is_xpu():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )

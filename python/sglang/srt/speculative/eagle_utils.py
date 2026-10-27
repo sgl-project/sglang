@@ -492,6 +492,7 @@ def _verify_uses_greedy(
     is_hip: bool,
     is_xpu: bool,
     use_rejection_sampling: bool,
+    tree_topk: int,
 ) -> bool:
     """Whether EAGLE verify must commit argmax instead of taking the sampling path.
 
@@ -500,7 +501,13 @@ def _verify_uses_greedy(
     sampler instead, so only a HIP run without that still has to go greedy. Every
     other platform reduces to the original predicate.
     """
-    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+    return (
+        is_all_greedy
+        or is_cpu
+        or (is_hip and not use_rejection_sampling)
+        # XPU's target-only sampler only verifies top-1 chains.
+        or (is_xpu and tree_topk != 1 and not use_rejection_sampling)
+    )
 
 
 def _can_use_sparse_uno_tree_target_sampling(
@@ -672,6 +679,7 @@ def eagle_sample(
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
+        tree_topk=verify_input.tree_topk,
     ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)

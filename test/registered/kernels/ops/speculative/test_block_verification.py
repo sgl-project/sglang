@@ -7,17 +7,24 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_target_only_triton,
     chain_speculative_sampling_triton,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
-DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+if os.environ.get("TRITON_INTERPRET") == "1":
+    DEVICE = "cpu"
+elif torch.xpu.is_available():
+    DEVICE = "xpu"
+else:
+    DEVICE = "cuda"
 
 
 def _verify(target, draft, candidates, coins, final_coins, *, block=True):
@@ -380,6 +387,63 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (bonus[sampled] == 4).all()
     token_correct_len, _, _ = accept(False)
     assert (token_correct_len[sampled] == 0).any()
+
+
+@pytest.mark.parametrize("steps,vocab", [(1, 7), (3, 17), (3, 131073)])
+def test_target_only_matches_one_hot_draft(steps, vocab):
+    """Target-only chain sampling equals classic sampling with a one-hot draft.
+
+    A top-1 draft proposes each token with probability 1; the target-only mode
+    must accept, reject and resample exactly as the classic kernel does when
+    handed that one-hot proposal explicitly.
+    """
+    torch.manual_seed(7)
+    batch = 64
+    # Half of every row's mass sits on one token, so a draft of it is often accepted.
+    peak = torch.randint(0, vocab, (batch, steps + 1))
+    target = torch.rand(batch, steps + 1, vocab).softmax(-1)
+    target = (target + torch.nn.functional.one_hot(peak, vocab)) / 2
+    candidates = torch.zeros(batch, steps + 1, dtype=torch.long)
+    # Half the drafts are the peak, so both accept and reject paths run.
+    candidates[:, 1:] = torch.where(
+        torch.rand(batch, steps) < 0.5,
+        peak[:, :steps],
+        torch.randint(0, vocab, (batch, steps)),
+    )
+    one_hot = torch.nn.functional.one_hot(candidates[:, 1:], vocab).float()
+    coins = torch.rand(batch, steps + 1)
+    final_coins = torch.rand(batch)
+    target, one_hot, candidates, coins, final_coins = (
+        x.to(DEVICE) for x in (target, one_hot, candidates, coins, final_coins)
+    )
+    expected_lengths, expected = _verify(
+        target, one_hot, candidates, coins, final_coins, block=False
+    )
+
+    slots = steps + 1
+    indices = torch.arange(batch * slots, device=DEVICE).flip(0).view(batch, slots)
+    predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device=DEVICE)
+    accepted = torch.full((batch, slots), -1, dtype=torch.int32, device=DEVICE)
+    lengths = torch.empty(batch, dtype=torch.int32, device=DEVICE)
+    chain_speculative_sampling_target_only_triton(
+        predicts,
+        accepted,
+        lengths,
+        candidates,
+        indices,
+        None,
+        None,
+        coins,
+        final_coins,
+        target,
+        None,
+        1.0,
+        1.0,
+        True,
+    )
+    assert 0 < expected_lengths.sum() < batch * steps
+    torch.testing.assert_close(lengths, expected_lengths)
+    torch.testing.assert_close(predicts[indices], expected)
 
 
 if __name__ == "__main__":

@@ -6,13 +6,20 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import is_hip, is_xpu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
-if is_hip():
+DEVICE = "xpu:0" if is_xpu() else "cuda:0"
+
+if is_hip() or is_xpu():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )
@@ -37,7 +44,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=DEVICE)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
@@ -71,11 +78,11 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     4. Renormalizes the remaining probabilities to sum to 1
     """
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=DEVICE)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=DEVICE)
     mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
     renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
