@@ -2059,6 +2059,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # first is applied, so list order is a hard contract.
         def make_cache():
             cache = mock.MagicMock()
+            cache.queued_backups = {}
             cache.ongoing_write_through = {7: _OngoingWriteThrough(10, None, [5, 10])}
             cache._replace_pending_write_through_node = lambda *args: (
                 UnifiedRadixCache._replace_pending_write_through_node(cache, *args)

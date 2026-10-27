@@ -116,6 +116,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
         cache.ongoing_write_through = {1: None, 2: None}
         cache._finish_write_through_ack = cache.ongoing_write_through.pop
         cache.metrics_collector = None
+        cache.queued_backups = {}
         # Warm up temporary allocations so cudaMalloc cannot hide a missing fence.
         operations = list(controller.write_queue)
         cache.writing_check(write_back=True)

@@ -67,10 +67,11 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig()
 
-    def test_walk_backup_can_host_evict_on_path_h_leaf(self):
-        """A crossing node's backup runs at its walk step, so its host eviction
-        can still take an H-leaf deeper on the inserted path."""
+    def _build_host_full_on_path_h_leaf(self, batched):
+        """A device-evicted H-leaf under an unbacked `top`, with the host pool too
+        full to back `top` up without evicting another host entry."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache._batched_backup = batched
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         (top,) = node_children(cache, cache.root_node_handle())
@@ -102,6 +103,14 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
             cache.evict(EvictParams(num_tokens=count))
             self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
         cache.dec_lock_ref(top, top_lock.to_dec_params())
+        return cache, allocator, req_to_token_pool, top, h_leaf
+
+    def test_walk_backup_can_host_evict_on_path_h_leaf(self):
+        """A crossing node's backup runs at its walk step, so its host eviction
+        can still take an H-leaf deeper on the inserted path."""
+        cache, allocator, req_to_token_pool, top, h_leaf = (
+            self._build_host_full_on_path_h_leaf(batched=False)
+        )
 
         # The crossing backup evicts exactly the on-path H-leaf, then the
         # remaining suffix is recreated as a fresh leaf.
@@ -116,6 +125,26 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
             node_key_length(cache, child) for child in node_children(cache, top)
         }
         self.assertEqual(child_key_len, 8)
+        cache.sanity_check()
+
+    def test_batched_backup_reuses_the_on_path_h_leaf(self):
+        """A crossing node's backup runs at flush, after the walk re-attached the
+        on-path H-leaf, so its host eviction takes another node and the leaf stays."""
+        cache, allocator, req_to_token_pool, top, h_leaf = (
+            self._build_host_full_on_path_h_leaf(batched=True)
+        )
+
+        # The walk re-attaches the on-path H-leaf and hangs the suffix below it.
+        cache.write_through_threshold = cache.tree_core.get_node_hit_count(top) + 1
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 13)))
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(cache.tree_core.is_backuped(top))
+        self.assertEqual(node_children(cache, top), [h_leaf])
+        self.assertFalse(cache.tree_core.is_full_device_evicted(h_leaf))
+        self.assertTrue(cache.tree_core.is_backuped(h_leaf))
+        (suffix,) = node_children(cache, h_leaf)
+        self.assertEqual(node_key_length(cache, suffix), 4)
         cache.sanity_check()
 
     def test_insert_aborts_continuation_when_action_apply_fails(self):

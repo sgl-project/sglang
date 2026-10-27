@@ -31,6 +31,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
+        cache.queued_backups = {}
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
             ack_write_queue=[

@@ -31,11 +31,6 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     def contains_node(self, node_id: NodeId) -> bool: ...
 
     @abstractmethod
-    def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
-        """The parent node id, or None for the root."""
-        ...
-
-    @abstractmethod
     def get_child_node_ids(self, node_id: NodeId) -> list[NodeId]: ...
 
     @abstractmethod
