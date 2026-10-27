@@ -98,12 +98,31 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return "string"
         return str(inferred_type).strip().lower()
 
+    def _is_string_type(self, param_name: str, param_config: dict) -> bool:
+        """Whether a parameter's inferred schema type is string-like.
+
+        Unknown parameters (missing from the schema) default to string so the
+        parser stays lossless for them.
+        """
+        return self._get_param_type(
+            param_config[param_name] if param_name in param_config else {}
+        ) in ("string", "str", "text", "varchar", "char", "enum")
+
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
         """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
+        # The XML tool-call format has no null literal, so models spell "not
+        # provided" as "null" text, or (on non-string parameters) the Python
+        # literal "None"/"none"; empty tags are handled by the callers.
+        # Normalize those text nulls to None instead of leaking them through as
+        # strings. For string parameters a literal "none" can be a legitimate
+        # value, so it is left as-is.
+        if param_value.strip().lower() == "null":
+            return None
+        if param_value.strip().lower() == "none" and not self._is_string_type(
+            param_name, param_config
+        ):
             return None
 
         if param_name not in param_config:
@@ -217,6 +236,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             p_val = p_val[1:]
                         if p_val.endswith("\n"):
                             p_val = p_val[:-1]
+
+                        # An empty/whitespace-only value on a NON-STRING
+                        # parameter means "not provided" (the XML tool-call
+                        # format cannot express null): drop it so the tool's
+                        # default applies instead of leaking "" into strict
+                        # schemas (e.g. openai-agents pydantic). For string
+                        # parameters "" is a legal value, so keep it lossless.
+                        if not p_val.strip() and not self._is_string_type(
+                            p_name, param_config
+                        ):
+                            continue
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
@@ -346,6 +376,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         if raw_value.endswith("\n"):
                             raw_value = raw_value[:-1]
 
+                        # An empty/whitespace-only value on a NON-STRING
+                        # parameter means "not provided" (the XML tool-call
+                        # format cannot express null). Skip the whole tag (just
+                        # advance the cursor, emit nothing) so the tool's
+                        # default is used instead of leaking "" into strict
+                        # schemas. For string parameters "" is a legal value.
+                        param_config = self._get_arguments_config(
+                            self.current_func_name, tools
+                        )
+                        if not raw_value.strip() and not self._is_string_type(
+                            param_name, param_config
+                        ):
+                            total_len = (name_end + 1) + end_pos + end_token_len
+                            self.parsed_pos += total_len
+                            continue
+
                         # JSON Construction
                         if not self.json_started:
                             calls.append(
@@ -355,9 +401,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             )
                             self.json_started = True
 
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
