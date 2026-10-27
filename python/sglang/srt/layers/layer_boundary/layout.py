@@ -99,7 +99,13 @@ def batches_are_unpadded() -> bool:
 def _prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()
-    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+    return (
+        parallel.attn_cp_size > 1
+        and parallel.enable_prefill_cp
+        # Full-sequence CP models (hybrid linear attention) keep whole token
+        # rows at every boundary; only their MLA layers slice inside forward().
+        and not getattr(parallel, "enable_linear_attn_cp", False)
+    )
 
 
 def input_scattered_configured() -> bool:
@@ -208,6 +214,10 @@ def _batch_shards_over_cp(forward_batch: ForwardBatch) -> bool:
     parallel extend is, so other batches, decode graph capture among them,
     never read the CP predicates."""
     if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
+    if get_parallel().enable_linear_attn_cp:
+        # Full-sequence CP models keep whole rows at every boundary; only
+        # their MLA layers slice inside forward().
         return False
     if _cp_gathers_over_attn_cp():
         return dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)

@@ -482,8 +482,19 @@ def linear_attn_parallel_group() -> str:
 
 
 def linear_attn_tp_size() -> int:
-    """The width of ``linear_attn_parallel_group()``."""
-    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+    """Linear-attention head width, including CP when prefill CP is enabled."""
+    parallel = get_parallel()
+    if getattr(parallel, "enable_linear_attn_cp", False):
+        return parallel.attn_tp_size * parallel.attn_cp_size
+    return getattr(parallel, f"{linear_attn_parallel_group()}_size")
+
+
+def linear_attn_tp_rank() -> int:
+    """Head-shard rank in CP-major, attention-TP-minor weight-loader order."""
+    parallel = get_parallel()
+    if getattr(parallel, "enable_linear_attn_cp", False):
+        return parallel.attn_cp_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+    return getattr(parallel, f"{linear_attn_parallel_group()}_rank")
 
 
 def draft_attn_parallel_group() -> str:
