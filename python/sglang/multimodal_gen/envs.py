@@ -223,6 +223,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
+    # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
+    # scales, dequantized one block at a time into the attention buffer.
+    "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV", "false"
+    ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config

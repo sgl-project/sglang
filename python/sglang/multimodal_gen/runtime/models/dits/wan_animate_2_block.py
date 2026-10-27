@@ -88,6 +88,36 @@ def _reference_video_key_mask(
     return key_mask
 
 
+def _pad_reference_video_kv(x: torch.Tensor, layout: _InContextLayout) -> torch.Tensor:
+    """``[B, S_reference_video, H, D]`` -> the zero-padded per-frame-slot layout
+    ``[B, padded_reference_video_len, H, D]`` that _in_context_attention consumes, so the
+    static reference half of the flex K/V is copied as one contiguous block per call."""
+    batch_size, _, num_heads, head_dim = x.shape
+    f = layout.reference_video_f
+    tokens_per_frame = layout.reference_video_tokens_per_frame
+    slot = layout.max_tokens_per_frame
+    out = x.new_zeros(batch_size, layout.padded_reference_video_len, num_heads, head_dim)
+    out[:, : f * slot].view(batch_size, f, slot, num_heads, head_dim)[
+        :, :, :tokens_per_frame
+    ] = x[:, : f * tokens_per_frame].view(
+        batch_size, f, tokens_per_frame, num_heads, head_dim
+    )
+    return out
+
+
+def _quantize_fp8_per_token_head(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 e4m3 with one fp32 scale per (batch, token, head): ``x ~= q * scale``, ``scale``
+    is ``[B, S, H, 1]``. All-zero rows (slot / SP padding) get scale 1 and stay exactly zero."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    x = x.float()
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
+    q = (x / scale).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return q, scale
+
+
 class WanAnimate2TransformerBlock(WanTransformerBlock):
     """Wan block with the Wan-Animate-2 in-context self-attention.
 
@@ -248,6 +278,9 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         index: int,
         k_cache: dict[int, torch.Tensor],
         v_cache: dict[int, torch.Tensor],
+        # Per-(token, head) fp32 scales when the reference K/V cache is stored in FP8.
+        k_scale_cache: dict[int, torch.Tensor] | None = None,
+        v_scale_cache: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One generation block with in-context masked self-attention over
         [gen tokens, then cached reference-video]."""
@@ -289,6 +322,8 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             reference_video_v,
             block_mask,
             layout,
+            k_scale_cache[index] if k_scale_cache is not None else None,
+            v_scale_cache[index] if v_scale_cache is not None else None,
         )
         if sp_size > 1:
             # scatter the sequence back / gather heads.
@@ -311,10 +346,14 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         q: torch.Tensor,  # [B, seq_len, H, D] (gen-RoPE'd)
         k: torch.Tensor,  # [B, seq_len, H, D] (gen-RoPE'd)
         v: torch.Tensor,  # [B, seq_len, H, D]
-        reference_video_k: torch.Tensor,  # [B, reference_video_seq_len, H, D] (reference-video RoPE'd)
-        reference_video_v: torch.Tensor,  # [B, reference_video_seq_len, H, D]
+        # [B, padded_reference_video_len, H, D] (reference-video RoPE'd), in the zero-padded
+        # slot layout of _pad_reference_video_kv; FP8 when the scales are given.
+        reference_video_k: torch.Tensor,
+        reference_video_v: torch.Tensor,
         block_mask: BlockMask,
         layout: _InContextLayout,
+        reference_video_k_scale: torch.Tensor | None = None,  # [B, padded_reference_video_len, H, 1] fp32
+        reference_video_v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build the padded [gen | reference-video] layout and run compiled flex_attention.
 
@@ -336,12 +375,15 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             device=device,
             dtype=dtype,
         )
-        k_padded = torch.zeros(
+        # The reference half is overwritten whole below; only the generation half needs zeros.
+        k_padded = torch.empty(
             batch_size, padded_kv_len, num_heads, head_dim, device=device, dtype=dtype
         )
-        v_padded = torch.zeros(
+        v_padded = torch.empty(
             batch_size, padded_kv_len, num_heads, head_dim, device=device, dtype=dtype
         )
+        k_padded[:, :padded_generation_video_len].zero_()
+        v_padded[:, :padded_generation_video_len].zero_()
 
         num_latent_frames = layout.generation_video_f
         latent_hw = layout.generation_video_tokens_per_frame
@@ -365,42 +407,14 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             batch_size, num_latent_frames, max_tokens_per_frame, num_heads, head_dim
         )[:, :, :latent_hw] = v_valid
 
-        reference_video_f, reference_video_tokens_per_frame = (
-            layout.reference_video_f,
-            layout.reference_video_tokens_per_frame,
-        )
-        reference_video_k_valid = reference_video_k[
-            :, : layout.reference_video_num_tokens
-        ].view(
-            batch_size,
-            reference_video_f,
-            reference_video_tokens_per_frame,
-            num_heads,
-            head_dim,
-        )
-        reference_video_v_valid = reference_video_v[
-            :, : layout.reference_video_num_tokens
-        ].view(
-            batch_size,
-            reference_video_f,
-            reference_video_tokens_per_frame,
-            num_heads,
-            head_dim,
-        )
-        k_padded[
-            :,
-            padded_generation_video_len : padded_generation_video_len
-            + reference_video_f * max_tokens_per_frame,
-        ].view(
-            batch_size, reference_video_f, max_tokens_per_frame, num_heads, head_dim
-        )[:, :, :reference_video_tokens_per_frame] = reference_video_k_valid
-        v_padded[
-            :,
-            padded_generation_video_len : padded_generation_video_len
-            + reference_video_f * max_tokens_per_frame,
-        ].view(
-            batch_size, reference_video_f, max_tokens_per_frame, num_heads, head_dim
-        )[:, :, :reference_video_tokens_per_frame] = reference_video_v_valid
+        for padded, cached, cached_scale in (
+            (k_padded, reference_video_k, reference_video_k_scale),
+            (v_padded, reference_video_v, reference_video_v_scale),
+        ):
+            reference_half = padded[:, padded_generation_video_len:]
+            reference_half.copy_(cached)
+            if cached_scale is not None:
+                reference_half.mul_(cached_scale)
 
         # At 0.0 the bias is an exact identity, so the kernel is not asked to apply it;
         # otherwise the cached partial keeps the identity compiled flex guards on (_make_score_mod).
