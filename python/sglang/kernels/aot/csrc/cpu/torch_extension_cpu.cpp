@@ -536,9 +536,6 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
-std::tuple<at::Tensor, at::Tensor>
-_quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt = c10::nullopt);
-
 // rope
 void rotary_embedding_cpu(
     at::Tensor& positions,

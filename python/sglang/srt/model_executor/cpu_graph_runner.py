@@ -445,7 +445,7 @@ def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
     tp_group: GroupCoordinator,
-    dynamic: bool = False,
+    dynamic: Optional[bool] = None,
     model_forward: Optional[Callable] = None,
 ):
     """Patch the model to make it compatible with torch.compile"""
@@ -524,6 +524,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
 _CPU_COMPILE_FAKE_OPS: set[str] = set()
 _CPU_COMPILE_FAKE_OPS_REGISTERED = False
+_CPU_COMPILE_FAKE_TP_SIZE: int = 1
 
 
 def register_cpu_compile_fake(op_name: str):
@@ -549,7 +550,8 @@ def register_fake_ops(tp_size: int):
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
     """
-    global _CPU_COMPILE_FAKE_OPS_REGISTERED
+    global _CPU_COMPILE_FAKE_OPS_REGISTERED, _CPU_COMPILE_FAKE_TP_SIZE
+    _CPU_COMPILE_FAKE_TP_SIZE = tp_size
     if _CPU_COMPILE_FAKE_OPS_REGISTERED:
         return
 
@@ -628,7 +630,7 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
-        return torch.cat([data] * tp_size, dim=dim)
+        return torch.cat([data] * _CPU_COMPILE_FAKE_TP_SIZE, dim=dim)
 
     @register_cpu_compile_fake("fused_experts_cpu")
     def _(
@@ -1341,6 +1343,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 tp_group=get_parallel().tp_group,
+                dynamic=False,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
                     bs, forward, skip_cross_attention=True
@@ -1589,6 +1592,12 @@ class CPUGraphRunner:
         for name, value in vars(forward_batch).items():
             if isinstance(value, torch.Tensor):
                 setattr(dynamic_forward_batch, name, value)
+            elif (
+                value is None
+                and getattr(dynamic_forward_batch, name, None) is not None
+                and isinstance(getattr(dynamic_forward_batch, name), torch.Tensor)
+            ):
+                setattr(dynamic_forward_batch, name, None)
         dynamic_forward_batch.forward_mode = self.capture_forward_mode
         dynamic_forward_batch.global_forward_mode = self.capture_forward_mode
         dynamic_forward_batch.batch_size = forward_batch.batch_size
@@ -1953,11 +1962,8 @@ class CPUGraphRunner:
         # multimodal preprocessing, and output handling. Compile the resolved
         # language-model body that the outer forward invokes.
         model = self.model_runner.model
-        if (
-            self.is_generation
-            and getattr(model, "pp_group", None) is not None
-            and model.pp_group.is_last_rank
-        ):
+        pp_group = getattr(model, "pp_group", None)
+        if self.is_generation and (pp_group is None or pp_group.is_last_rank):
             try:
                 layer_model = resolve_language_model(model)
             except AttributeError:
@@ -2046,7 +2052,7 @@ class CPUGraphRunner:
             self._prefill_graph_model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=self.enable_dynamic_graph,
+            dynamic=True if self.enable_dynamic_graph else None,
             model_forward=(
                 self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
@@ -2098,6 +2104,12 @@ class CPUGraphRunner:
         for name, value in vars(forward_batch).items():
             if isinstance(value, torch.Tensor):
                 setattr(dynamic_forward_batch, name, value)
+            elif (
+                value is None
+                and getattr(dynamic_forward_batch, name, None) is not None
+                and isinstance(getattr(dynamic_forward_batch, name), torch.Tensor)
+            ):
+                setattr(dynamic_forward_batch, name, None)
         dynamic_forward_batch.forward_mode = ForwardMode.EXTEND
         dynamic_forward_batch.global_forward_mode = ForwardMode.EXTEND
         dynamic_forward_batch.batch_size = forward_batch.batch_size
