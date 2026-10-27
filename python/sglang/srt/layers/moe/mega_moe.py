@@ -592,10 +592,10 @@ def run_mega_routed_experts(
 
 
 def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
-    if get_is_capture_mode() or is_dsa_enable_prefill_cp():
-        return None
     counts = get_dp_global_num_tokens()
     if not counts or len(counts) != buf.group.size():
+        return None
+    if get_is_capture_mode() or is_dsa_enable_prefill_cp():
         return None
     return min(int(sum(counts)), buf.group.size() * buf.num_max_tokens_per_rank)
 
