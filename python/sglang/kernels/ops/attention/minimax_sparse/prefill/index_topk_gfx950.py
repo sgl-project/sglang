@@ -39,6 +39,8 @@ _MAX_SPLITS = 32
 _WAVE_PROGRAMS = 512
 # Candidates one merge program reduces per query; larger lists go through a first pass.
 _MERGE_GROUP = 128
+# Candidates a merge program holds across its query rows.
+_MERGE_PROGRAM_CANDIDATES = 2048
 
 
 @gluon.jit
@@ -496,7 +498,7 @@ def _merge_partial_topk(
         red_i = torch.empty(
             (n_rows, groups * kt), dtype=torch.int32, device=part_s.device
         )
-        bq = 2048 // _MERGE_GROUP
+        bq = _MERGE_PROGRAM_CANDIDATES // _MERGE_GROUP
         _reduce_lists_kernel[(triton.cdiv(n_rows, bq), groups)](
             part_s,
             part_i,
@@ -514,7 +516,7 @@ def _merge_partial_topk(
         part_s, part_i, nc = red_s, red_i, groups * kt
     topk_idx = torch.empty((n_rows, topk), dtype=torch.int32, device=part_s.device)
     nc_pow2 = triton.next_power_of_2(nc)
-    bq = max(1, min(64, 2048 // nc_pow2))
+    bq = max(1, min(64, _MERGE_PROGRAM_CANDIDATES // nc_pow2))
     _index_topk_merge_kernel[(triton.cdiv(n_rows, bq),)](
         part_s,
         part_i,
