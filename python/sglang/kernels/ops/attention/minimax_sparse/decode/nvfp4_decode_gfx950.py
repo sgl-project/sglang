@@ -612,7 +612,7 @@ def can_use_nvfp4_decode_gfx950(
 
 
 def _o_proj_input(
-    batch_size: int, num_q_heads: int, head_dim: int, mode: int, device
+    batch_size: int, num_q_heads: int, head_dim: int, mode: int, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """FP8 O and its scale for OUT_QUANT ``mode``, with the scale's (head, row) strides."""
     q8 = torch.empty(
