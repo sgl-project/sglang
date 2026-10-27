@@ -39,7 +39,14 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 Qwen3Config = None
 
@@ -47,6 +54,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
@@ -66,6 +74,9 @@ if _use_aiter:
         logger.info("aiter fused_qk_norm_rope kernel available")
     except ImportError:
         pass
+
+if _is_xpu:
+    from sgl_kernel import fused_inplace_qknorm_rope
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -245,6 +256,15 @@ class Qwen3Attention(nn.Module):
             and self.head_dim in (64, 128, 256, 512)
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
+        # One sgl-kernel-xpu launch replaces the q RMSNorm, k RMSNorm and RoPE launches.
+        self.use_fused_qk_norm_rope_xpu = (
+            _is_xpu
+            and get_exec().kernel.enable_fused_qk_norm_rope
+            and get_exec().deterministic.rl_on_policy_target is None
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.head_dim in (64, 128, 256)
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
         if self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope:
             # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
             # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
@@ -256,6 +276,21 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_fused_qk_norm_rope_xpu and qkv.dtype == torch.bfloat16:
+            # Normalizes and rotates q and k in place, through their strided views of qkv.
+            fused_inplace_qknorm_rope(
+                q=q.view(-1, self.num_heads, self.head_dim),
+                k=k.view(-1, self.num_kv_heads, self.head_dim),
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions.view(-1),
+                is_neox=self.rotary_emb.is_neox_style,
+                eps=self.q_norm.variance_epsilon,
+                head_dim=self.head_dim,
+                rope_dim=self.rotary_emb.rotary_dim,
+            )
+            return q, k, v
         q, k = apply_qk_norm(
             q=q,
             k=k,
