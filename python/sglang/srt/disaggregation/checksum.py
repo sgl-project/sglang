@@ -7,7 +7,11 @@ import torch
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HybridLinearKVPool,
+    MiniMaxSparseKVPool,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 NestedInts = Sequence[int] | Sequence[Sequence[int]]
@@ -74,7 +78,7 @@ def state_indices_for_request(
             )
         )
         return _to_page_indices_gpu(window_swa, page_size)
-    if isinstance(pool, DSATokenToKVPool):
+    if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
         device_page_size = pool.page_size
         kv_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, start_idx:seq_len

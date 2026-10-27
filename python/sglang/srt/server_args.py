@@ -597,8 +597,8 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
     GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
     sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
-    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
-    bf16 q) without having to move off trtllm_mha.
+    it forces bf16 q with the widening sparse/indexer path without having to
+    move off trtllm_mha.
     """
     from sglang.srt.environ import envs
 
