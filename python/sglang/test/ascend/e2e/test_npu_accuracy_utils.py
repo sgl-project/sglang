@@ -161,9 +161,9 @@ def run_evalscope(
 
     logger.info(f"Generated evalscope script: {script_path}")
 
-    install_cmd = (
-        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
-    )
+    # Resolve the install script relative to this file so it works from any
+    # deployment path (e.g. /sgl-workspace/sglang in CI images).
+    install_cmd = f"/bin/bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_evalscope.sh')}"
     subprocess.run(install_cmd, shell=True, check=True)
 
     python_bin = "test_env_evalscope/bin/python"
@@ -314,6 +314,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     accuracy = 0.1
+    # Per-case evalscope accuracy retry count. None uses the dataset default
+    # (get_max_retries); set to 1 to fail fast on first measurement.
+    max_retries = None
     test_type = "accuracy"
 
     @classmethod
@@ -478,7 +481,11 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model)
-            max_retries = get_max_retries(self.datasets)
+            max_retries = (
+                self.max_retries
+                if self.max_retries is not None
+                else get_max_retries(self.datasets)
+            )
             best_metrics = None
             for attempt in range(max_retries):
                 metrics = run_evalscope(

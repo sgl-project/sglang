@@ -63,13 +63,40 @@ def get_capture_lora_variant() -> Optional[str]:
     return _capture_lora_variant
 
 
-def _set_capture_lora_variant(variant: Optional[str]) -> None:
+@contextmanager
+def capture_lora_variant(variant: Optional[str]):
+    """Scope the "lora"/"nolora" label so later captures cannot inherit it.
+
+    None denotes a single graph serving both variants.
+    """
     global _capture_lora_variant
+    previous = _capture_lora_variant
     _capture_lora_variant = variant
+    try:
+        yield
+    finally:
+        _capture_lora_variant = previous
 
 
 def get_capture_attention_variant() -> Optional[str]:
     return _capture_attention_variant
+
+
+def skip_low_ratio_indexer(compress_ratio: int) -> bool:
+    """Whether the captured candidate variant selects every position for this ratio."""
+    return _capture_attention_variant == "candidate_all" or (
+        _capture_attention_variant == "candidate_c2_all" and compress_ratio == 2
+    )
+
+
+def skip_candidate_filtering() -> bool:
+    """Whether the captured variant stays inside the candidate window, where every
+    block is a candidate."""
+    return _capture_attention_variant in (
+        "candidate_all",
+        "candidate_c2_all",
+        "candidate_unfiltered",
+    )
 
 
 def _set_capture_attention_variant(variant: Optional[str]) -> None:

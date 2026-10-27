@@ -2,7 +2,7 @@ import json as json_lib
 import logging
 import math
 import os
-import re
+from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -24,8 +24,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -446,11 +446,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
-    lora_pattern = re.compile(
-        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def __init__(
         self,
         config: Llama4Config,
@@ -507,7 +502,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
-        self.padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def _has_vision_weights(self, config) -> bool:
         """Check if the model has vision components by examining the checkpoint."""
@@ -559,8 +553,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         except (OSError, json_lib.JSONDecodeError, KeyError):
             return False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(
         self,
@@ -584,7 +578,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def should_apply_lora(self, module_name: str) -> bool:
         """Skip vision model and multi_modal_projector for LoRA."""
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.model.layers.")
 
     def forward(
         self,

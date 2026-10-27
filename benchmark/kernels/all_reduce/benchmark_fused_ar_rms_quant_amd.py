@@ -47,6 +47,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
+from sglang.test.test_utils import publish_build_topology
 
 Shape = Tuple[int, int]
 FP8_DTYPE = torch.float8_e4m3fnuz
@@ -400,7 +401,8 @@ def main() -> None:
         distributed_init_method="env://",
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(world_rank=rank, tp_size=world_size)
+    initialize_model_parallel()
 
     if rank == 0:
         print(

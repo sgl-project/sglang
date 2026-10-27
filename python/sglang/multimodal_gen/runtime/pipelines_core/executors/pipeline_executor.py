@@ -12,7 +12,15 @@ from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    ConditioningCache,
+    conditioning_cache_group,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -54,6 +62,11 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
+        self.conditioning_cache = ConditioningCache(
+            int(server_args.conditioning_cache_max_size_mb * 1024**2)
+            if not server_args.disable_conditioning_cache
+            else 0
+        )
 
     def begin_component_residency_request(
         self,
@@ -85,9 +98,24 @@ class PipelineExecutor(ABC):
         payload: Any,
         server_args: ServerArgs,
     ):
+        requests = payload if isinstance(payload, list) else [payload]
+        if get_progress_reporter() is not None and any(
+            req.report_progress and not req.is_warmup for req in requests
+        ):
+            # partition denoising progress across all passes, including refinement
+            denoisers = [s for s in stages if s.role_affinity == RoleType.DENOISER]
+            for index, stage in enumerate(denoisers):
+                stage._progress_range = (
+                    index / len(denoisers),
+                    (index + 1) / len(denoisers),
+                )
         self.begin_component_residency_request(stages, payload, server_args)
         try:
-            yield
+            with self.conditioning_cache.scope(
+                cross_request=not server_args.use_fsdp_inference,
+                refresh=self._is_warmup_payload(payload),
+            ):
+                yield
         finally:
             self.finish_component_residency_request()
 
@@ -117,9 +145,13 @@ class PipelineExecutor(ABC):
         self.before_stage(stage, stage_index, payload, server_args)
         with maybe_record_function(f"STAGE {stage_name}"):
             with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-                payload = self.run_stage_with_context(
-                    stage, payload, server_args, run_stage
-                )
+                with conditioning_cache_group(
+                    enabled=(isinstance(payload, list) and len(payload) > 1)
+                    or (isinstance(payload, Req) and payload.batch_size > 1)
+                ):
+                    payload = self.run_stage_with_context(
+                        stage, payload, server_args, run_stage
+                    )
         return payload
 
     @staticmethod

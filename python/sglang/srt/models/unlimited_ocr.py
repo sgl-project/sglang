@@ -1,6 +1,7 @@
 """Standalone UNLIMITED-OCR model (SAM + CLIP vision encoders, Deepseek backbone)."""
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Set, Tuple, TypeAlias, Union
 
 import torch
@@ -9,8 +10,8 @@ from torch import Tensor, nn
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -311,10 +312,9 @@ class UnlimitedOCRForCausalLM(nn.Module):
             )
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input token IDs with multimodal placeholder tokens."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract vision features from multimodal data items."""
