@@ -33,7 +33,7 @@ class TestEplbMapRecord(CustomTestCase):
             [[-1, 0, 3, 4], [3, 9, 0, 3]], dtype=torch.int64, device="cuda"
         )
         load = torch.ones(4, dtype=torch.int32, device="cuda")
-        self.assertTrue(record_physical_counts(topk_ids, load))
+        record_physical_counts(topk_ids, load)
         torch.cuda.synchronize()
         self.assertTrue(
             torch.equal(load.cpu(), torch.tensor([3, 1, 1, 4], dtype=torch.int32))

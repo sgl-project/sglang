@@ -38,6 +38,7 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -53,11 +54,7 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var, is_cuda
-
-_is_cuda = is_cuda()
-if _is_cuda:
-    from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
+from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -173,7 +170,7 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def get_current_pass_count_buffer(self, layer_idx: int):
+    def get_current_pass_count_buffer(self):
         return None
 
     def on_deepep_dispatch_normal(
@@ -289,13 +286,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
-    def get_current_pass_count_buffer(self, layer_idx: int):
-        if not self._hook_enabled() or self._current_layer_idx.value != layer_idx:
+    def get_current_pass_count_buffer(self):
+        if not self._hook_enabled():
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
             return None
-        return gatherer._data[layer_idx]
+        return gatherer._data[self._current_layer_idx.value]
 
     def on_deepep_dispatch_normal(
         self,
@@ -623,13 +620,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        if (
-            _is_cuda
-            and layer_idx is not None
-            and record_physical_counts(
-                topk_ids=topk_ids, load_buffer=self._data[layer_idx]
-            )
-        ):
+        if topk_ids.is_cuda:
+            record_physical_counts(topk_ids, self._data[layer_idx])
             return
         topk_ids = topk_ids.flatten()
         mask = (topk_ids >= 0) & (

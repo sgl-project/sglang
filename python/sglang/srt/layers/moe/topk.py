@@ -2629,16 +2629,15 @@ def _post_process_topk_ids(
             recorder_topk_ids = routed_cols
         else:
             fused_topk_ids = None
-            if layer_id is not None:
-                recorder = get_global_expert_distribution_recorder()
-                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
-                if load_buffer is not None:
-                    fused_topk_ids = topk_ids_logical_to_physical_and_record(
-                        topk_ids,
-                        expert_location_dispatch_info,
-                        load_buffer,
-                        num_token_non_padded,
-                    )
+            recorder = get_global_expert_distribution_recorder()
+            load_buffer = recorder.get_current_pass_count_buffer()
+            if load_buffer is not None:
+                fused_topk_ids = topk_ids_logical_to_physical_and_record(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    load_buffer,
+                    num_token_non_padded,
+                )
             if fused_topk_ids is not None:
                 topk_ids = fused_topk_ids
                 _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -2680,11 +2679,10 @@ def _post_process_topk_ids(
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-            and layer_id is not None
         ):
             if get_moe_a2a_backend().is_megamoe():
                 recorder = get_global_expert_distribution_recorder()
-                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                load_buffer = recorder.get_current_pass_count_buffer()
                 if load_buffer is not None:
                     fused_topk_ids = topk_ids_logical_to_physical_and_record(
                         topk_ids,
