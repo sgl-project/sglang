@@ -254,6 +254,32 @@ def _split_hicache_size(
     )
 
 
+def _mla_host_kv_fraction(config: HostPoolGroupConfig) -> float:
+    """KV's share of a group budget, including indexer and packed draft rows."""
+    if len(config.pools) == 1:
+        return 1.0
+    root = config.pools[0]
+    pool = root.decl.device_pool
+    kv_layers = pool.layer_num
+    if pool.layer_shard_enabled:
+        kv_layers = (kv_layers + pool.layer_shard_size - 1) // pool.layer_shard_size
+    kv_layers += len(root.packed_draft_device_pools)
+    kv_row_bytes = pool.kv_cache_dim * pool.store_dtype.itemsize * kv_layers
+    sidecar_row_bytes = 0
+    for entry in config.pools[1:]:
+        device_pool = entry.decl.device_pool
+        start, end = (
+            device_pool._owned_local_layer_range()
+            if device_pool.layer_shard_enabled
+            else (0, device_pool.layer_num)
+        )
+        owned = entry.decl.owned_device_layers
+        layers = sum(owned is None or layer in owned for layer in range(start, end))
+        layers += len(entry.packed_draft_device_pools)
+        sidecar_row_bytes += entry.decl.storage_info.bytes_per_token_per_layer * layers
+    return kv_row_bytes / (kv_row_bytes + sidecar_row_bytes)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1320,6 +1346,10 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+        if use_mla:
+            # The split includes DSA index bytes, but the MLA host allocates
+            # only KV. Reserve the declared sidecars before choosing KV slots.
+            kv_host_size *= _mla_host_kv_fraction(config)
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         index_bytes = sum(
