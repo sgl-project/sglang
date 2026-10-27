@@ -270,15 +270,20 @@ register_kernel(
 )
 
 # EPLB logical->physical expert id remap fused with the per-expert count.
-for _fn in ("eplb_map_and_record", "record_physical_counts"):
-    register_kernel(
-        KernelSpec(
-            op=f"moe.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.moe.eplb_map_record:{_fn}",
-        )
+register_kernel(
+    KernelSpec(
+        op="moe.eplb_map_and_record",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:eplb_map_and_record",
     )
-del _fn
+)
+register_kernel(
+    KernelSpec(
+        op="moe.record_physical_counts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:record_physical_counts",
+    )
+)
 
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.

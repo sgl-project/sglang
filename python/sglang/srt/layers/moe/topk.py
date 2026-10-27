@@ -91,7 +91,6 @@ except ImportError:
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
-from sglang.kernels.ops.moe.eplb_map_record import eplb_map_and_record
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -101,6 +100,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+    topk_ids_logical_to_physical_and_record,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -2546,24 +2546,6 @@ def capture_routed_experts_if_allowed(
         )
 
 
-def _eplb_map_and_record_fused(
-    topk_ids: torch.Tensor,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
-    load_buffer: torch.Tensor,
-    num_token_non_padded: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    dispatch = None
-    if expert_location_dispatch_info is not None:
-        if expert_location_dispatch_info.ep_dispatch_algorithm != "static":
-            return None
-        dispatch = (
-            expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
-        )
-        if dispatch is None:
-            return None
-    return eplb_map_and_record(topk_ids, dispatch, load_buffer, num_token_non_padded)
-
-
 def _eplb_map_and_record_fused_if_recording(
     topk_ids: torch.Tensor,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
@@ -2584,7 +2566,7 @@ def _eplb_map_and_record_fused_if_recording(
     )
     if load_buffer is None:
         return None
-    return _eplb_map_and_record_fused(
+    return topk_ids_logical_to_physical_and_record(
         topk_ids, expert_location_dispatch_info, load_buffer, num_token_non_padded
     )
 
@@ -2724,7 +2706,7 @@ def _post_process_topk_ids(
                 recorder = get_global_expert_distribution_recorder()
                 load_buffer = recorder.get_current_pass_count_buffer(layer_id)
                 if load_buffer is not None:
-                    fused_topk_ids = _eplb_map_and_record_fused(
+                    fused_topk_ids = topk_ids_logical_to_physical_and_record(
                         topk_ids,
                         expert_location_dispatch_info,
                         load_buffer,
