@@ -31,6 +31,11 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_prefill_kv_dequant import (
+    FP8_DTYPES,
+    FlashInferPrefillKVDequant,
+    PrefillKVDequantPlan,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -162,6 +167,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    kv_dequant_plan: Optional[PrefillKVDequantPlan] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -552,6 +558,31 @@ class FlashInferAttnBackend(AttentionBackend):
                     backend=self.decode_backend,
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
+            )
+
+        # A separate BF16 plan shares only the float workspace. The original
+        # plan stays available for batches/layers that cannot take this path.
+        self.fp8_prefill_kv_dequant = None
+        if (
+            envs.SGLANG_PREFILL_KV_DEQUANT.get()
+            and self.__class__ is FlashInferAttnBackend
+            and not skip_prefill
+            and self.num_wrappers == 1
+            and self.prefill_backend == "fa2"
+            and self.flashinfer_kv_cache_dtype in FP8_DTYPES
+            and model_runner.dtype == torch.bfloat16
+            and not self.prefill_uses_dequant_workspace
+            and not self.enable_deterministic
+            and not self.is_dllm_model
+            and not self.enable_mis
+        ):
+            self.fp8_prefill_kv_dequant = FlashInferPrefillKVDequant(
+                lambda: BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer, "NHD", backend="fa2"
+                ),
+                min_tokens=envs.SGLANG_PREFILL_KV_DEQUANT_MIN_TOKENS.get(),
+                min_kv_tokens=envs.SGLANG_PREFILL_KV_DEQUANT_MIN_KV_TOKENS.get(),
+                max_kv_tokens=envs.SGLANG_PREFILL_KV_DEQUANT_MAX_KV_TOKENS.get(),
             )
 
         # Create indices updater
@@ -1095,6 +1126,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                kv_dequant_plan=self.indices_updater_prefill.kv_dequant_plan,
             )
 
     def init_cuda_graph_state(
@@ -1413,6 +1445,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            if self.forward_metadata.kv_dequant_plan is not None:
+                plan = self.forward_metadata.kv_dequant_plan
+                dequant_kv = plan.gather(kv_cache)
+                if dequant_kv is not None:
+                    prefill_wrapper_paged = plan.wrapper
+                    kv_cache = dequant_kv
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
@@ -1901,6 +1939,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.kv_dequant_plan = None
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1981,6 +2020,14 @@ class FlashInferIndicesUpdaterPrefill:
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
+            kv_dequant_num_tokens=(
+                seq_lens_sum - sum(extend_prefix_lens_cpu)
+                if spec_info is None
+                and extend_prefix_lens_cpu is not None
+                and cross_attention_custom_mask is None
+                and custom_kv_indices is None
+                else None
+            ),
             plan=plan,
         )
 
@@ -2218,6 +2265,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        kv_dequant_num_tokens: Optional[int] = None,
         *,
         plan: KVLocPlan,
     ):
@@ -2392,15 +2440,15 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
+        prefill_plan_kwargs = dict(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=kv_indices,
+            paged_kv_last_page_len=self.kv_last_page_len[:bs],
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
@@ -2412,6 +2460,18 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+        wrapper_paged.begin_forward(**prefill_plan_kwargs)
+        self.kv_dequant_plan = None
+        helper = getattr(self.attn_backend, "fp8_prefill_kv_dequant", None)
+        if helper is not None:
+            self.kv_dequant_plan = helper.prepare(
+                num_new_tokens=kv_dequant_num_tokens,
+                num_pages=paged_kernel_lens_sum,
+                use_ragged=use_ragged,
+                spec_info=spec_info,
+                original_wrapper=wrapper_paged,
+                plan_kwargs=prefill_plan_kwargs,
+            )
 
 
 def _build_draft_indptr_host(
