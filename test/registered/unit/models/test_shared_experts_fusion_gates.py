@@ -249,6 +249,22 @@ class TestDeepseekV2Gate(_FusionGateCase):
             )
 
 
+class TestDeepseekV2SharedExpertTP1(_FusionGateCase):
+    def test_dwdp_replicates_the_shared_expert(self):
+        """DWDP skips the post-experts all-reduce, so a TP-sharded shared expert
+        would add only its partial output on each rank."""
+        from sglang.srt.models.deepseek_v2 import shared_experts_use_tp1
+
+        with get_parallel().override(dwdp_size=8):
+            self.assertTrue(shared_experts_use_tp1())
+
+    def test_plain_tp_keeps_the_shared_expert_sharded(self):
+        from sglang.srt.models.deepseek_v2 import shared_experts_use_tp1
+
+        with get_parallel().override(dwdp_size=1):
+            self.assertFalse(shared_experts_use_tp1())
+
+
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):
         base = dict(architectures=["Glm4MoeLiteForCausalLM"], n_shared_experts=1)

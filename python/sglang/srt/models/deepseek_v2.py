@@ -624,6 +624,28 @@ class MoEOutput(NamedTuple):
         )
 
 
+def shared_experts_use_tp1() -> bool:
+    # Disable TP for shared experts for A2A/FP4 allgather paths, or when
+    # explicitly requested for DSV4 checkpoints whose shared scales are
+    # not divisible by the global TP size, or under DWDP, where each rank
+    # holds a full replica and a sharded weight would never be all-reduced.
+    return (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_pplx()
+        or get_moe_a2a_backend().is_mooncake()
+        or get_moe_a2a_backend().is_nixl()
+        or get_moe_a2a_backend().is_mori()
+        or get_moe_a2a_backend().is_ascend_fuseep()
+        or get_moe_a2a_backend().is_flashinfer()
+        or get_moe_a2a_backend().is_megamoe()
+        or get_moe_a2a_backend().is_flashinfer_megamoe()
+        or get_moe_a2a_backend().is_deepep_v2()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
+        or envs.SGLANG_SHARED_EXPERT_TP1.get()
+    )
+
+
 class MergedMoEOutput(MoEOutput):
     """Merged routed rows with a replicated shared output still separate."""
 
@@ -868,23 +890,7 @@ class DeepseekV2MoE(nn.Module):
             and not _uses_per_rank_shared_slots
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # Disable TP for shared experts for A2A/FP4 allgather paths, or when
-            # explicitly requested for DSV4 checkpoints whose shared scales are
-            # not divisible by the global TP size.
-            _shared_expert_use_tp1 = (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_pplx()
-                or get_moe_a2a_backend().is_mooncake()
-                or get_moe_a2a_backend().is_nixl()
-                or get_moe_a2a_backend().is_mori()
-                or get_moe_a2a_backend().is_ascend_fuseep()
-                or get_moe_a2a_backend().is_flashinfer()
-                or get_moe_a2a_backend().is_megamoe()
-                or get_moe_a2a_backend().is_flashinfer_megamoe()
-                or get_moe_a2a_backend().is_deepep_v2()
-                or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                or envs.SGLANG_SHARED_EXPERT_TP1.get()
-            )
+            _shared_expert_use_tp1 = shared_experts_use_tp1()
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,

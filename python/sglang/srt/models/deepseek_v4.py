@@ -4435,7 +4435,11 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if (
+            get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+            and get_parallel().dwdp_size <= 1
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -4449,6 +4453,8 @@ class DeepseekV4Model(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
+            # DWDP / non-dp-attn: tokens stay on-rank, so the global ids are just
+            # the local ones (no DP buffer to gather from under SKIP_ALL_GATHER).
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None

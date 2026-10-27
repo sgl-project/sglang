@@ -513,7 +513,8 @@ class MoeTransport(MoeRowTransport):
             cp_return_contiguous=layer.config.model_type == "deepseek_v41",
             use_cp=cp,
             moe_gather=not cp
-            and TokenAxis.ATTN_DP in rows.source.sharded - rows.compute.sharded,
+            and TokenAxis.ATTN_DP in rows.source.sharded - rows.compute.sharded
+            and get_parallel().dwdp_size <= 1,
             attn_scatter=not cp
             and TokenAxis.ATTN_TP in rows.compute.sharded - rows.source.sharded,
         )

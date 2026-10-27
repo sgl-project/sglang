@@ -118,6 +118,7 @@ class MoeRowTransport(ComputeTransport):
                 not _use_cp
                 and get_parallel().attn_dp_size > 1
                 and get_moe_a2a_backend().is_none()
+                and get_parallel().dwdp_size <= 1
             )
         )
         _use_tp_attn_a2a_scatter = (
