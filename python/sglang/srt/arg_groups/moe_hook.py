@@ -280,6 +280,50 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+def validate_ascend_ops_config(view: Any) -> dict:
+    """Validate and report the configuration for the Ascend Ops backend."""
+    a2a_backend = view.moe_a2a_backend
+    draft_a2a_backend = view.speculative_moe_a2a_backend
+    main_uses_ascend_ops = a2a_backend == "ascend_ops"
+    draft_uses_ascend_ops = draft_a2a_backend == "ascend_ops"
+    ascend_ops_selected = main_uses_ascend_ops or draft_uses_ascend_ops
+    moe_ascend_ops_config = view.moe_ascend_ops_config
+
+    if moe_ascend_ops_config is not None and not ascend_ops_selected:
+        raise ValueError(
+            "--moe-ascend-ops-config requires the main or speculative MoE backend "
+            f"to be ascend_ops; got main={a2a_backend!r}, "
+            f"draft={draft_a2a_backend!r}."
+        )
+    if not ascend_ops_selected:
+        return {}
+
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--moe-a2a-backend ascend_ops is only supported on NPU "
+            "for both the main and speculative draft model."
+        )
+    try:
+        parsed_moe_ascend_ops_config = AscendOpsConfig.from_json_str(
+            moe_ascend_ops_config
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
+        ) from exc
+    logger.info(
+        "ascend_ops MoE backend enabled for main=%s, draft=%s with "
+        "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",
+        main_uses_ascend_ops,
+        draft_uses_ascend_ops,
+        parsed_moe_ascend_ops_config.prefill,
+        parsed_moe_ascend_ops_config.decode,
+        parsed_moe_ascend_ops_config.ll_dispatch_alg,
+        parsed_moe_ascend_ops_config.ll_combine_alg,
+    )
+    return {}
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -303,44 +347,10 @@ def handle_a2a_moe(server_args: Any):
     # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
     # invoked here at the legacy write slots.
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
+    run_post_process_pass(server_args, validate_ascend_ops_config)
 
     resolved = resolved_view(server_args)
     a2a_backend = resolved.moe_a2a_backend
-    draft_a2a_backend = resolved.speculative_moe_a2a_backend
-    main_uses_ascend_ops = a2a_backend == "ascend_ops"
-    draft_uses_ascend_ops = draft_a2a_backend == "ascend_ops"
-    ascend_ops_selected = main_uses_ascend_ops or draft_uses_ascend_ops
-    moe_ascend_ops_config = cfg.moe_ascend_ops_config
-    if moe_ascend_ops_config is not None and not ascend_ops_selected:
-        raise ValueError(
-            "--moe-ascend-ops-config requires the main or speculative MoE backend "
-            f"to be ascend_ops; got main={a2a_backend!r}, "
-            f"draft={draft_a2a_backend!r}."
-        )
-    if ascend_ops_selected:
-        if not get_platform().is_npu:
-            raise ValueError(
-                "--moe-a2a-backend ascend_ops is only supported on NPU "
-                "for both the main and speculative draft model."
-            )
-        try:
-            parsed_moe_ascend_ops_config = AscendOpsConfig.from_json_str(
-                moe_ascend_ops_config
-            )
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
-            ) from exc
-        logger.info(
-            "ascend_ops MoE backend enabled for main=%s, draft=%s with "
-            "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",
-            a2a_backend == "ascend_ops",
-            draft_a2a_backend == "ascend_ops",
-            parsed_moe_ascend_ops_config.prefill,
-            parsed_moe_ascend_ops_config.decode,
-            parsed_moe_ascend_ops_config.ll_dispatch_alg,
-            parsed_moe_ascend_ops_config.ll_combine_alg,
-        )
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
@@ -674,29 +684,21 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         )
 
 
-def validate_ascend_ops_speculative_draft(server_args: Any) -> None:
-    """Validate Ascend Ops and keep target/draft backend selection consistent."""
-    view = resolved_view(server_args)
-    main_backend = view.moe_a2a_backend
-    draft_backend = view.speculative_moe_a2a_backend
-    if draft_backend is None and view.speculative_algorithm:
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+def resolve_ascend_ops_speculative_draft(view: Any) -> dict:
+    """Keep the Ascend Ops target and speculative backends consistent."""
+    if view.moe_a2a_backend == "ascend_ops":
+        if view.speculative_moe_a2a_backend != "ascend_ops":
+            logger.info(
+                "The main MoE backend is ascend_ops; setting the speculative "
+                "draft MoE backend to ascend_ops."
+            )
+        return {"speculative_moe_a2a_backend": "ascend_ops"}
 
-        algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
-        if not algorithm.is_ngram():
-            draft_backend = main_backend
-    if draft_backend == "ascend_ops" and not get_platform().is_npu:
-        raise ValueError(
-            "--speculative-moe-a2a-backend ascend_ops is only supported on NPU."
-        )
-    if draft_backend is not None and (
-        (main_backend == "ascend_ops") != (draft_backend == "ascend_ops")
-    ):
-        raise ValueError(
-            "The main and speculative draft MoE backends must both use "
-            "ascend_ops or both use another backend; got "
-            f"main={main_backend!r}, draft={draft_backend!r}."
-        )
+    assert view.speculative_moe_a2a_backend != "ascend_ops", (
+        "The speculative draft MoE backend cannot be ascend_ops when the main "
+        f"MoE backend is {view.moe_a2a_backend!r}."
+    )
+    return {}
 
 
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:

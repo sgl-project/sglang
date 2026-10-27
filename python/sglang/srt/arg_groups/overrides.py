@@ -1612,11 +1612,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
     backend = view.moe_a2a_backend
-    if backend not in _A2A_EP_SPANNING_BACKENDS:
-        # A speculative draft can select Ascend Ops independently of the
-        # target model, but it still uses the TP communication group.
-        if view.speculative_moe_a2a_backend == "ascend_ops":
-            backend = "ascend_ops"
     if backend in _A2A_EP_SPANNING_BACKENDS:
         if view.ep_size != view.tp_size:
             logger.info(

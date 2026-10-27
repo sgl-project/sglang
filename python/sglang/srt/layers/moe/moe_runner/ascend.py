@@ -62,6 +62,20 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     return kernel.use_fused_gmm1
 
 
+def _reshape_received_scale(received_scale: torch.Tensor) -> torch.Tensor:
+    """Normalize communicated MX scales, including zero-row receives."""
+    if received_scale.ndim == 3 and received_scale.shape[-1] == 2:
+        return received_scale
+    if received_scale.ndim != 2 or received_scale.shape[1] % 2 != 0:
+        raise RuntimeError(
+            "invalid communicated MoE scale shape: "
+            f"{tuple(received_scale.shape)}"
+        )
+    return received_scale.reshape(
+        received_scale.shape[0], received_scale.shape[1] // 2, 2
+    )
+
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -435,7 +449,7 @@ def _pre_permute_alltoallv(
     local_ids = torch.repeat_interleave(local_ids, local_counts).view(-1, 1)
 
     if quant_mode not in (-1, INT8_QUANT_MODE) and received_scale is not None:
-        received_scale = received_scale.reshape(received_scale.shape[0], -1, 2)
+        received_scale = _reshape_received_scale(received_scale)
 
     if num_local_experts > 1 and received.shape[0] > 0:
         routed = npu_moe_init_routing(
