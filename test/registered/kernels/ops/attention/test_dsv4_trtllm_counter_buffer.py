@@ -294,6 +294,88 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
             with self.subTest(ratio=ratio, dspark=dspark):
                 self.assertTrue(torch.equal(out, ref))
 
+    def test_decode_low_ratio_tail_written_in_place(self):
+        """A V4.1 index source's top-k kernel writes the shared table's tail in place,
+        with no pack_sparse_tail: its picks are a top-k of the row and touch no other
+        table cell, attention equals FlashInfer on [SWA | picks] with the ratio's
+        own lens, and attention still launches without PDL after the write."""
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_sparse
+        from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
+
+        seq_lens = torch.randint(1, 2 * SWA, (ROWS,), dtype=torch.int32, device="cuda")
+        table, lens = _tile(SWA + TAIL, fill=-1), _tile(fill=SWA)
+        table[:ROWS, :SWA] = _idx(ROWS, SWA)
+        table[ROWS:] = 7  # pad rows: nothing may write them
+        before = table.clone()
+        tail = table[:ROWS, SWA:]
+        # Scores over 4096 candidates; some rows have fewer than the top-k.
+        width = 4096
+        cands = torch.randint(1, width + 1, (ROWS,), dtype=torch.int32, device="cuda")
+        cands[:2] = torch.tensor([TAIL - 1, 3])
+        picks = cands.clamp(max=TAIL)
+        lens[:ROWS] = SWA + picks  # init_trtllm_sparse_buffers, once per step
+        core = SimpleNamespace(
+            seq_lens_casual=seq_lens,
+            swa_page_indices=table[:ROWS, :SWA],
+            trtllm_c4_indices=table[:ROWS],
+            trtllm_c1_lens=lens[:ROWS],
+            sparse_topk_lengths=lambda compress_ratio: picks,
+        )
+        scores = torch.randn(ROWS, width, device="cuda").to(torch.bfloat16)
+        # Identity tables: slot == candidate position, a valid compressed KV slot.
+        pages = torch.arange(width // 64, dtype=torch.int32, device="cuda")
+        blocks = torch.arange(width // 8, dtype=torch.int32, device="cuda")
+        writers = {
+            # c2 sources and the c1 candidate source (DeepSelect)
+            "paged_bf16": lambda: topk_transform_paged_bf16(
+                scores, cands, pages.expand(ROWS, -1), tail, 64
+            ),
+            # c1 candidate consumers
+            "sparse_bf16_small": lambda: topk_transform_sparse(
+                scores, cands, blocks.expand(ROWS, -1), tail
+            ),
+        }
+        q = _fp8(ROWS, HEADS, 512)
+
+        def run():
+            return self.backend._forward_trtllm_decode(
+                q=q,
+                layer=self.layer,
+                compress_ratio=1,
+                core_attn_metadata=core,
+                attn_sink=self.sink,
+                extra_indices=tail,
+            )
+
+        for name, write in writers.items():
+            with self.subTest(writer=name):
+                tail.fill_(-2)
+                write()
+                for r in range(ROWS):
+                    k, row = int(picks[r]), tail[r].sort().values
+                    self.assertEqual(row[: TAIL - k].tolist(), [-1] * (TAIL - k))
+                    chosen = row[TAIL - k :].long()
+                    self.assertEqual(chosen.unique().numel(), k)
+                    self.assertLess(int(chosen.max()), int(cands[r]))
+                    kth = scores[r, : cands[r]].float().topk(k).values[-1]
+                    self.assertTrue(torch.all(scores[r, chosen].float() >= kth))
+                self.assertTrue(torch.equal(table[:, :SWA], before[:, :SWA]))
+                self.assertTrue(torch.equal(table[ROWS:], before[ROWS:]))
+                ref_table = torch.cat([table[:ROWS, :SWA], tail.clone()], dim=1)
+                self._check(run, q, ref_table, picks + SWA, seq_lens)
+
+                def write_then_run():
+                    write()
+                    run()
+
+                # The write is this layer's tail refresh: attention waits for it.
+                self.backend._tail_refresh_layers = None
+                self.assertEqual(_pdl_into_attention(write_then_run), [False])
+                # Control: a layer that reuses the tail keeps PDL.
+                self.backend._tail_refresh_layers = frozenset()
+                self.assertEqual(_pdl_into_attention(write_then_run), [True])
+                self.backend._tail_refresh_layers = None
+
     def test_prefill(self):
         # A new 3-token request (inside the SWA window) and 9 tokens after an 8K
         # prefix, one dense row per token; q is padded to 16 rows.

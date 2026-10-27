@@ -892,6 +892,7 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         present_ratios=(4,),
         swa_width: int = 128,
         seq_lens=None,
+        writes_table=None,
     ):
         from dataclasses import MISSING, fields
 
@@ -922,8 +923,9 @@ class TestTrtllmSparseTablePool(CustomTestCase):
                 core, f"c{r}_sparse_page_indices", torch.full((n, 512), 7, **self.kw)
             )
         core.c128_page_indices = None
-        # Mirrors the backend gate: low-ratio layers rewrite the shared lens per layer.
-        core.trtllm_topk_writes_table = not core.low_ratios
+        core.trtllm_topk_writes_table = (
+            not core.low_ratios if writes_table is None else writes_table
+        )
         core.c4_sparse_raw_indices = torch.empty(1, **self.kw) if raw_indices else None
         core.c4_sparse_page_indices = (
             torch.full((n, 1024), -1, **self.kw) if raw_indices else None
@@ -946,35 +948,106 @@ class TestTrtllmSparseTablePool(CustomTestCase):
             other.trtllm_c4_indices[:, SWA_WINDOW:].data_ptr(),
         )
 
-    def test_low_ratio_layers_share_the_indexed_table(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
-        seq_lens = torch.full((64,), 500, **self.kw)
-        seq_lens[0] = 1  # empty ratio-2 history
-        core = self._core(present_ratios=(0, 1, 2), seq_lens=seq_lens)
-        self.assertEqual(tuple(core.trtllm_c4_indices.shape), (64, SWA_WINDOW + 512))
-        self.assertIsNone(core.c4_sparse_page_indices)  # no in-place top-k writer
-        # trtllm needs the true zero length for an empty compressed history.
-        self.assertEqual(core.c2_sparse_topk_lengths[:2].tolist(), [0, 250])
-        self.assertEqual(core.c1_sparse_topk_lengths[:2].tolist(), [1, 500])
+    def test_low_ratio_layers_read_the_last_source_of_their_ratio(self):
+        """One DeepSeek-V4.1 decode step through the backend's table code: every
+        indexed layer's attention gets [SWA | top-k of the last index source of its
+        ratio] and SWA_WINDOW + that ratio's compressed length, whether the indexer
+        writes the shared tail in place or pack_sparse_tail copies it, and under the
+        capture variants whose skipped indexers fill all positions once per step."""
         if self.dev != "cuda":
             return  # pack_sparse_tail is a Triton kernel
-        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
-            _refresh_indexed_tail,
-        )
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+        from sglang.srt.model_executor.runner_utils import capture_mode
 
-        for ratio in (1, 2):
-            core.sparse_page_indices(ratio).fill_(ratio)
-            _refresh_indexed_tail(
-                core,
-                ratio,
-                core.sparse_page_indices(ratio),
-                core.trtllm_c4_indices,
-                core.trtllm_c4_lens,
-            )
-            self.assertTrue(torch.all(core.trtllm_c4_indices[:, SWA_WINDOW:] == ratio))
-            expected = core.sparse_topk_lengths(ratio) + SWA_WINDOW
-            self.assertTrue(torch.equal(core.trtllm_c4_lens, expected))
+        ratios = [0, 0] + [2] * 18 + [1] * 20
+        sources = [2, 8, 14, 20, 24, 28, 32, 36]
+        seq_lens = torch.full((64,), 2000, **self.kw)
+        seq_lens[:3] = torch.tensor([1, 2, 500])
+        # Hand-derived: ratio 1 keeps seq, ratio 2 seq // 2 (0 when empty, which
+        # trtllm needs), both capped at the 512 top-k.
+        want_lens = {1: [1, 2, 500, 512], 2: [0, 1, 250, 512]}
+        skipped_by = {None: (), "candidate_c2_all": (2,), "candidate_all": (1, 2)}
+
+        def pattern(tag):  # distinct per writer, row and column
+            return torch.arange(64 * 512, **self.kw).view(64, 512) + tag * 10**6
+
+        b = object.__new__(trtllm.DeepseekV4TrtllmAttnBackend)
+        b._tail_refresh_layers = trtllm._tail_refresh_layers(ratios, sources)
+        b.softmax_scale = 1.0
+        b.trtllm_workspace_buffer = b.trtllm_counter_buffer = torch.empty(0)
+        b._trtllm_kv_cache_views = lambda layer_id, compress_ratio: (None, None)
+        seen = []
+
+        def kernel(*, query, sparse_indices, sparse_topk_lens, **_):
+            seen.append((sparse_indices[:4].clone(), sparse_topk_lens[:4].clone()))
+            return query.new_zeros(query.shape, dtype=torch.bfloat16)
+
+        q = torch.zeros(64, 1, 512, device=self.dev)
+        for variant, writes in ((v, w) for v in skipped_by for w in (False, True)):
+            skipped = skipped_by[variant]
+            with self.subTest(variant=variant, writes_table=writes):
+                capture_mode._set_capture_attention_variant(variant)
+                try:
+                    core = self._core(
+                        present_ratios=(0, 1, 2), seq_lens=seq_lens, writes_table=writes
+                    )
+                finally:
+                    capture_mode._set_capture_attention_variant(None)
+                swa = core.swa_page_indices[:4].clone()
+                tail_ptr = core.trtllm_c4_indices[:, SWA_WINDOW:].data_ptr()
+                for r in (1, 2):  # in place unless the ratio's indexer is skipped
+                    in_place = core.sparse_page_indices(r).data_ptr() == tail_ptr
+                    self.assertEqual(in_place, writes and r not in skipped)
+                for r in skipped:  # init_forward_metadata_in_graph's per-step fill
+                    core.sparse_page_indices(r).copy_(pattern(-r))
+                for layer_id, r in enumerate(ratios):
+                    if r == 0:
+                        continue
+                    if layer_id in sources and r not in skipped:  # the indexer
+                        core.sparse_page_indices(r).copy_(pattern(layer_id))
+                    with mock.patch.object(
+                        trtllm,
+                        "trtllm_batch_decode_sparse_mla_dsv4",
+                        kernel,
+                        create=True,
+                    ):
+                        b._forward_trtllm_decode(
+                            q=q,
+                            layer=SimpleNamespace(
+                                layer_id=layer_id, k_scale_float=None
+                            ),
+                            compress_ratio=r,
+                            core_attn_metadata=core,
+                            attn_sink=torch.zeros(1, device=self.dev),
+                            extra_indices=core.sparse_page_indices(r),
+                        )
+                    table, lens = seen[-1]
+                    last = max(s for s in sources if s <= layer_id and ratios[s] == r)
+                    tag = -r if r in skipped else last
+                    self.assertTrue(torch.equal(table[:, :SWA_WINDOW], swa))
+                    self.assertTrue(
+                        torch.equal(table[:, SWA_WINDOW:], pattern(tag)[:4]),
+                        f"layer {layer_id} does not read the top-k of {tag}",
+                    )
+                    self.assertEqual(
+                        lens.tolist(), [SWA_WINDOW + n for n in want_lens[r]]
+                    )
+
+    def test_v41_prefill_tables_keep_the_pack_while_decode_writes_in_place(self):
+        # V4.1 (ratios 1 and 2, no c4): the backend's in-place flag is for the decode
+        # writers; the prefill tables must not take the c4 in-place path (no c4 lens).
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        core = self._core(present_ratios=(0, 1, 2), writes_table=True)
+        core.swa_page_indices = torch.arange(64 * 128, **self.kw).view(64, 128)
+        core.init_trtllm_prefill_sparse_buffers(64)
+        table = core.trtllm_prefill_c4_indices
+        self.assertTrue(torch.equal(table[:, :SWA_WINDOW], core.swa_page_indices))
+        self.assertEqual(core.trtllm_prefill_swa_lens.tolist(), [SWA_WINDOW] * 64)
+        for r in (1, 2):  # still packed per source layer: no alias into the tail
+            tail_ptr = table[:, SWA_WINDOW:].data_ptr()
+            self.assertNotEqual(core.sparse_page_indices(r).data_ptr(), tail_ptr)
 
     def test_dspark_wide_swa_lens_cover_the_draft_block(self):
         core = self._core(present_ratios=(0,), swa_width=192)

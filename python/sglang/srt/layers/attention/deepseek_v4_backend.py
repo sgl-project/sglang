@@ -422,10 +422,12 @@ class DSV4AttnMetadata:
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
-    # Combined decode tables; trtllm_c4_* is shared by ratios 1, 2 and 4.
+    # Combined decode tables; ratios 1, 2 and 4 share trtllm_c4_indices, not the lens.
     trtllm_swa_lens: Optional[torch.Tensor] = None
     trtllm_c4_indices: Optional[torch.Tensor] = None
     trtllm_c4_lens: Optional[torch.Tensor] = None
+    trtllm_c1_lens: Optional[torch.Tensor] = None
+    trtllm_c2_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
     # trtllm prefill tables, built once per chunk before the indexer runs.
@@ -437,7 +439,7 @@ class DSV4AttnMetadata:
     trtllm_prefill_c128: Optional[tuple] = None
     # Backend-owned TrtllmSparseTablePool (duck-typed: import cycle); shared, never copied.
     trtllm_table_pool: Optional[object] = None
-    # trtllm topk_v2 path: c4_sparse_page_indices aliases the combined table's tail.
+    # The top-k kernels take a row stride: c{1,2,4}_sparse_page_indices alias the tail.
     trtllm_topk_writes_table: bool = False
     # Late-layer tail: the first indexed layer packs the table even if not an index source.
     trtllm_tail_needs_pack: bool = False
@@ -556,8 +558,23 @@ class DSV4AttnMetadata:
 
     def _c4_topk_writes_table(self) -> bool:
         # topk_v2 aliases the table tail unless a raw-indices channel exists;
-        # that reroutes the indexer to the stride-unaware v1 kernel.
-        return self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None
+        # that reroutes the indexer to the stride-unaware v1 kernel. Without c4
+        # (V4.1) the flag covers only the ratio-1/2 decode writers.
+        return (
+            self.has_c4
+            and self.trtllm_topk_writes_table
+            and self.c4_sparse_raw_indices is None
+        )
+
+    def _topk_writes_table(self, ratio: int) -> bool:
+        if ratio == 4:
+            return self._c4_topk_writes_table()
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        # A skipped indexer's all-position indices differ per ratio: own buffer, packed.
+        return self.trtllm_topk_writes_table and not skip_low_ratio_indexer(ratio)
 
     def _has_trtllm_indexed_table(self) -> bool:
         # Ratios 1, 2 and 4 all select index_topk entries into one shared table.
@@ -604,8 +621,8 @@ class DSV4AttnMetadata:
         self._zero_empty_low_ratio_lengths()
         if self._has_trtllm_indexed_table():
             assert swa_width == SWA_WINDOW
-            # The tail and lens are refreshed per layer;
-            # when topk_v2 writes the c4 tail itself, the lens are set once per step.
+            # Each index source refreshes the tail and its ratio's lens; when the
+            # indexer writes the tail itself, the lens are set once per step.
             self.trtllm_c4_indices = pool.view(
                 "d_c4",
                 num_tokens,
@@ -614,14 +631,18 @@ class DSV4AttnMetadata:
                 constant=True,
             )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = pool.view(
-                "d_c4_lens", num_tokens, fill=SWA_WINDOW, constant=True
-            )
-            if self._c4_topk_writes_table():
-                torch.add(
-                    self.c4_sparse_topk_lengths, SWA_WINDOW, out=self.trtllm_c4_lens
+            for ratio in self.low_ratios + ((4,) if self.has_c4 else ()):
+                lens = pool.view(
+                    f"d_c{ratio}_lens", num_tokens, fill=SWA_WINDOW, constant=True
                 )
-                self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
+                setattr(self, f"trtllm_c{ratio}_lens", lens)
+                topk_lengths = self.sparse_topk_lengths(ratio)
+                if topk_lengths is not None and self._topk_writes_table(ratio):
+                    torch.add(topk_lengths, SWA_WINDOW, out=lens)
+                    # Sources of every ratio share the tail; _tail_refresh_layers
+                    # ensures a layer reads the last source of its own ratio.
+                    tail = self.trtllm_c4_indices[:, SWA_WINDOW:]
+                    setattr(self, f"c{ratio}_sparse_page_indices", tail)
 
         if self.c128_page_indices is not None:
             assert swa_width == SWA_WINDOW
@@ -748,6 +769,8 @@ class DSV4AttnMetadata:
                 "trtllm_swa_lens",
                 "trtllm_c4_indices",
                 "trtllm_c4_lens",
+                "trtllm_c1_lens",
+                "trtllm_c2_lens",
                 "trtllm_c128_indices",
                 "trtllm_c128_lens",
             ],
@@ -803,6 +826,8 @@ class DSV4AttnMetadata:
             "trtllm_swa_lens",
             "trtllm_c4_indices",
             "trtllm_c4_lens",
+            "trtllm_c1_lens",
+            "trtllm_c2_lens",
             "trtllm_c128_indices",
             "trtllm_c128_lens",
         ]

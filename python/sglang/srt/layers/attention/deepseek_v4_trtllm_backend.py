@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.index_logits import index_logits_dtype
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -152,9 +153,13 @@ def _refresh_indexed_tail(
     extra_indices = extra_indices[:rows]
     width = extra_indices.shape[-1]
     assert table.shape == (rows, SWA_WINDOW + width), f"{table.shape=} {width=}"
+    tail = table[:, SWA_WINDOW:]
+    # Lens were set per step; the indexer wrote the tail in place.
     if compress_ratio == 4 and core._c4_topk_writes_table():
-        # Lens were set per step; the indexer wrote the tail in place.
-        copy_unless_aliased(table[:, SWA_WINDOW:], extra_indices)
+        copy_unless_aliased(tail, extra_indices)
+        return
+    if extra_indices.data_ptr() == tail.data_ptr():
+        assert extra_indices.stride() == tail.stride()
         return
     pack_sparse_tail(
         extra_indices,
@@ -272,11 +277,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self._tail_refresh_layers = _tail_refresh_layers(
             cfg.compress_ratios, cfg.index_source_layer_ids
         )
-        # topk_v2 writes the c4 tail in place only when no ratio-1/2 layer shares the table.
+        # The indexer writes its top-k into the table tail when every top-k kernel it
+        # may run takes a row stride: c4 topk_v2; on V4.1 bf16 logits, DeepSelect,
+        # topk_bf16_small or torch.
+        if self.low_ratios:
+            writes = not self.has_c4 and index_logits_dtype() == torch.bfloat16
+        else:
+            writes = self.dsa_topk_backend.should_use_topk_v2()
         self.trtllm_topk_writes_table = (
-            self.dsa_topk_backend.should_use_topk_v2()
-            and not get_exec().features.enable_return_indexer_topk
-            and not self.low_ratios
+            writes and not get_exec().features.enable_return_indexer_topk
         )
 
         # Preallocate every role at its maximum so nothing is allocated while serving.
@@ -301,7 +310,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         pool.preallocate("p_swa_lens", max_prefill_rows, fill=SWA_WINDOW)
         if self.has_c4 or self.low_ratios:
             pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
-            pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
+            for ratio in self.low_ratios + ((4,) if self.has_c4 else ()):
+                pool.preallocate(f"d_c{ratio}_lens", max_decode_rows, fill=SWA_WINDOW)
             pool.preallocate("p_c4", max_prefill_rows, fill=-1, width=SWA_WINDOW + w4)
             pool.preallocate("p_c4_lens", max_prefill_rows, fill=SWA_WINDOW)
         if self.has_c128:
@@ -499,9 +509,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices = core_attn_metadata.trtllm_c128_indices
             sparse_topk_lens = core_attn_metadata.trtllm_c128_lens
         else:
-            # Ratios 1, 2 and 4 share one indexed table.
+            # Ratios 1, 2 and 4 share one indexed table, each with its own lens.
             sparse_indices = core_attn_metadata.trtllm_c4_indices
-            sparse_topk_lens = core_attn_metadata.trtllm_c4_lens
+            sparse_topk_lens = getattr(
+                core_attn_metadata, f"trtllm_c{compress_ratio}_lens"
+            )
         assert sparse_indices is not None and sparse_topk_lens is not None, (
             "trtllm decode requires metadata built with "
             "init_trtllm_sparse_buffers (decode-mode DSV4AttnMetadata)"
@@ -559,8 +571,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sinks=attn_sink,
             kv_layout="HND",
             backend=self.trtllm_fi_backend,
-            # The kernel loads sparse_topk_lens before griddepcontrol.wait, so
-            # it must not overlap the tail refresh that just wrote them.
+            # The kernel loads sparse_topk_lens before griddepcontrol.wait, so it
+            # must not overlap this layer's tail write (pack or in-place top-k).
             enable_pdl=False if refreshed else None,
         )
         if out_pad_tail is not None:
