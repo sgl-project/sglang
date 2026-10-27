@@ -250,6 +250,7 @@ def qwen3_vl_video_pixel_limits(image_factor: int) -> dict[str, float]:
     if "VIDEO_MAX_PIXELS" in os.environ:
         total_pixels = min(total_pixels, VIDEO_TOTAL_PIXELS)
     return {
+        "min_pixels": _QWEN3_VL_VIDEO_MIN_TOKENS * factor_area,
         "max_pixels": _QWEN3_VL_VIDEO_MAX_TOKENS * factor_area,
         "total_pixels": total_pixels,
     }
@@ -275,9 +276,7 @@ def preprocess_qwen3_vl_video_sync(
     nframes, _, height, width = video.shape
     factor_area = image_factor * image_factor
     limits = qwen3_vl_video_pixel_limits(image_factor)
-    min_pixels = video_config.get(
-        "min_pixels", _QWEN3_VL_VIDEO_MIN_TOKENS * factor_area
-    )
+    min_pixels = video_config.get("min_pixels", limits["min_pixels"])
     total_pixels = video_config.get("total_pixels", limits["total_pixels"])
     max_pixels = max(
         min(limits["max_pixels"], total_pixels / nframes * FRAME_FACTOR),
