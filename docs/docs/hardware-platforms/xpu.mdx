@@ -329,7 +329,7 @@ below is the `v0.0.10b2` release, pinned so the build is reproducible.
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-TMS_PLATFORM=xpu pip install --no-build-isolation \
+TMS_PLATFORM=xpu uv pip install --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@a5c99f11b18ebb8e9fda71a68812e476ae49e417
 ```
 
@@ -369,7 +369,7 @@ SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](http
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Used in integration tests; verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
 | [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
 
-**Prerequisites:** `pip install nixl sglang-router`
+**Prerequisites:** `uv pip install nixl sglang-router`
 
 **Start the prefill server (GPU 0):**
 
