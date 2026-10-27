@@ -1,6 +1,7 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
 import unittest
+from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -11,6 +12,7 @@ from sglang.srt.managers.cache_controller import CacheOperation, HiCacheControll
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -30,10 +32,11 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"
@@ -63,7 +66,7 @@ def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
 
 
 def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespace:
-    class FakeHostPool:
+    class FakeHostPool(MHATokenToKVPoolHost):
         size_per_token = 2
 
         def backup_from_device_all_layer(
@@ -74,7 +77,7 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
     entries = [
         PoolEntry(
             name=name,
-            host_pool=FakeHostPool(),
+            host_pool=FakeHostPool.__new__(FakeHostPool),
             device_pool=None,
             layer_mapper=lambda layer_id: layer_id,
             is_primary_index_anchor=name == PoolName.KV,
@@ -84,6 +87,7 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
     return SimpleNamespace(
         layout="page_first",
         can_use_write_back_jit=can_use_write_back_jit,
+        supports_per_pool_backup_indices=False,
         anchor_entry=entries[0],
         entry_map={entry.name: entry for entry in entries},
     )
@@ -223,6 +227,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             op.pool_transfers,
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
+        controller.mem_pool_device_allocator = mock.Mock()
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
         )
@@ -237,7 +242,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             start_event=object(), finish_event=object(), timing_enabled=False
         )
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
-        controller.layer_num = 2
+        controller.transfer_layer_id_max = 2
         controller.ack_load_queue = []
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
@@ -264,15 +269,118 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
 
-    def test_short_staged_swa_tail_resolves_device_covered_head(self):
+    def _hybrid_load_controller(self):
+        entries = {}
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT):
+            host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+            host_pool.load_to_device_per_layer = mock.Mock()
+            entries[name] = PoolEntry(
+                name=name,
+                host_pool=host_pool,
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=entries[PoolName.KV], entry_map=entries
+        )
+        controller.mem_pool_device_allocator = object()
+        controller.load_queue = []
+        return controller
+
+    def test_swa_restore_skips_only_empty_draft(self):
+        for full_tokens in (0, 64):
+            with self.subTest(full_tokens=full_tokens):
+                controller = self._hybrid_load_controller()
+                full_host = _indices(0, full_tokens)
+                full_device = _indices(256, 256 + full_tokens)
+                swa_host, swa_device = _indices(0, 64), _indices(128, 192)
+                controller.load(
+                    full_host,
+                    device_indices=full_device,
+                    extra_pools=[
+                        PoolTransfer(
+                            PoolName.SWA,
+                            host_indices=swa_host,
+                            device_indices=swa_device,
+                        ),
+                        PoolTransfer(PoolName.DRAFT, indices_from_pool=PoolName.KV),
+                    ],
+                )
+                op = controller.load_queue[0]
+                transfers = controller._l2_load_transfers(
+                    op.host_indices, op.device_indices, op.pool_transfers
+                )
+                expected = {PoolName.SWA: (swa_host, swa_device)}
+                if full_tokens:
+                    expected.update(
+                        {
+                            PoolName.KV: (full_host, full_device),
+                            PoolName.DRAFT: (full_host, full_device),
+                        }
+                    )
+                self.assertEqual(len(transfers), len(expected))
+                completed = mock.Mock()
+                with mock.patch.object(
+                    transfer_module, "device_module", _FakeDeviceModule
+                ):
+                    L2TransferEngine("kernel").submit_host_to_device(
+                        transfers, transfer_layer_id_max=2, on_layer_done=completed
+                    )
+                self.assertEqual(completed.call_args_list, [mock.call(0), mock.call(1)])
+                for name, entry in controller.mem_pool_host.entry_map.items():
+                    copies = entry.host_pool.load_to_device_per_layer.call_args_list
+                    if name not in expected:
+                        self.assertEqual(copies, [])
+                        continue
+                    self.assertEqual([copy.args[3] for copy in copies], [0, 1])
+                    for copy in copies:
+                        self.assertIs(copy.args[1], expected[name][0])
+                        self.assertIs(copy.args[2], expected[name][1])
+
+    def test_mismatched_auxiliary_transfer_is_not_silently_dropped(self):
+        controller = self._hybrid_load_controller()
+        empty = _indices(0, 0)
+        for host_tokens, device_tokens in ((0, 1), (1, 0)):
+            with self.subTest(host_tokens=host_tokens, device_tokens=device_tokens):
+                transfer = PoolTransfer(
+                    PoolName.DRAFT,
+                    host_indices=_indices(0, host_tokens),
+                    device_indices=_indices(0, device_tokens),
+                )
+                self.assertEqual(
+                    len(controller._l2_transfers(empty, empty, [transfer])), 1
+                )
+
+    def test_unresolved_auxiliary_transfer_still_fails(self):
+        controller = self._hybrid_load_controller()
+        empty = _indices(0, 0)
+        with self.assertRaisesRegex(ValueError, "Unresolved L2 transfer"):
+            controller._l2_transfers(empty, empty, [PoolTransfer(PoolName.DRAFT)])
+
+    def _short_swa_tail_pipeline(self, swa_page_size: int) -> BufferModePipeline:
+        """Pipeline holding one staged span [2, 8) whose 4-slot trailing SWA
+        window outruns the splice left by a device prefix of 6."""
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.components = {}
+        pipeline._swa_component = SimpleNamespace(
+            pool_name=PoolName.SWA,
+            component_type=ComponentType.SWA,
+            full_window_pages=1,
+        )
+        pipeline._auxiliary_swa_component = None
+        pipeline._cache.cache_controller.mem_pool_host.entry_map = {
+            PoolName.SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(page_size=swa_page_size)
+            )
+        }
         pipeline.release_staged_hold = mock.Mock(return_value=True)
         pipeline.staged_prefetches = {
             handle: SimpleNamespace(
                 request=handle,
-                key_tokens=list(range(8)),
+                key_tokens=array("q", range(8)),
                 extra_key=None,
                 cache_salt=None,
                 matched_len=2,
@@ -289,17 +397,40 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 operation_id=1,
             )
         }
+        return pipeline
 
-        self.assertEqual(
-            pipeline.plan_staged_splice(handle, device_prefix_len=6), (0, 0)
-        )
-        pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with(
-            handle, 4
-        )
-        pipeline.release_staged_hold.assert_called_once_with(handle, reason="shrunk")
+    def test_short_staged_swa_tail_keeps_complete_window(self):
+        """Logical SWA coverage survives pruning resident rows from H2D."""
+        handle = CacheRequestHandle("r", 0)
+        for page_size in (2, 4):
+            for resident_prefix in (False, True):
+                with self.subTest(page_size=page_size, resident_prefix=resident_prefix):
+                    pipeline = self._short_swa_tail_pipeline(swa_page_size=page_size)
+                    tree = pipeline._cache.tree_core
+                    tree.is_eagle = False
+                    tree.match_full_device_prefix.return_value = (6, 1, 6)
+                    tree.collect_full_device_indices.return_value = _indices(0, 6)
+                    tree.swa_tombstone_ranges.return_value = (
+                        [] if resident_prefix else [(4, 6)]
+                    )
+                    req = SimpleNamespace(
+                        rid="r",
+                        cache_request_handle=handle,
+                        prefix_len=0,
+                        kv=SimpleNamespace(cache_protected_len=0),
+                    )
+                    self.assertTrue(pipeline.prepare_staged_prefetch(req))
+                    self.assertEqual(req.host_hit_length, 2)
+                    self.assertEqual(
+                        req.swa_host_hit_length, 2 if resident_prefix else 4
+                    )
+                    window = req.staged_prefetch_plan.windows[ComponentType.SWA]
+                    self.assertEqual((window.start, window.end), (4, 8))
+                    pipeline.release_staged_hold.assert_not_called()
 
     def test_l2_transfer_maps_global_layers(self):
-        host_pool = mock.Mock()
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
         transfer = L2Transfer(
             host_pool=host_pool,
             device_pool=mock.sentinel.device_pool,
@@ -308,7 +439,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             layer_mapper={1: 0, 3: 1}.get,
         )
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device([transfer], layer_num=4)
+            L2TransferEngine("kernel").submit_host_to_device(
+                [transfer], transfer_layer_id_max=4
+            )
 
         self.assertEqual(
             [
@@ -319,7 +452,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
-        host_pool = mock.Mock()
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
         entry = PoolEntry(
             name=PoolName.KV,
@@ -333,7 +467,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             anchor_entry=entry,
             entry_map={entry.name: entry},
         )
-        controller.layer_num = 2
+        controller.transfer_layer_id_max = 2
 
         self.assertEqual(
             len(controller._l2_transfers(_indices(0, 2), _indices(2, 4))), 1
@@ -344,7 +478,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertFalse(transfers[0].is_draft)
         self.assertTrue(transfers[1].is_draft)
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
-            L2TransferEngine("kernel").submit_host_to_device(transfers, layer_num=2)
+            L2TransferEngine("kernel").submit_host_to_device(
+                transfers, transfer_layer_id_max=2
+            )
         self.assertEqual(
             [
                 call.args[3]
@@ -472,6 +608,11 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.target_layer_num = layer_num
+        host.device_k_buffers = tuple(k_layers)
+        host.device_v_buffers = tuple(v_layers)
+        host.device_k_data_ptrs = device_pool.k_data_ptrs
+        host.device_v_data_ptrs = device_pool.v_data_ptrs
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
@@ -549,6 +690,83 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
 
+    def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
+        """FIA views and packed drafts must restore without querying their owners."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+
+        with mock.patch.dict("os.environ", {"ASCEND_USE_FIA": "True"}):
+            pools = tuple(
+                NPUMHATokenToKVPool(
+                    size=32,
+                    page_size=16,
+                    dtype=torch.float16,
+                    head_num=2,
+                    head_dim=4,
+                    layer_num=layers,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_alt_stream=False,
+                )
+                for layers in (2, 1)
+            )
+        infos = tuple(pool.get_device_pool_infos()[0].buffer_info for pool in pools)
+        for pool in pools:
+            pool.get_hicache_transfer_buffers = mock.Mock(
+                side_effect=AssertionError("runtime owner query")
+            )
+        host = MHATokenToKVPoolHost(
+            infos[0],
+            2,
+            0,
+            16,
+            "page_first_direct",
+            pin_memory=False,
+            device_capacity_tokens=32,
+            start_layer=0,
+            end_layer=2,
+            draft_buffer_infos=infos[1:],
+        )
+        self.addCleanup(host.destroy)
+        expected = []
+        for i, info in enumerate(infos):
+            for tensor in info.transfer_buffers():
+                tensor.copy_(
+                    torch.arange(tensor.numel()).reshape(tensor.shape) + i * 100
+                )
+                expected.append(tensor[:, 1].clone())
+
+        def transfer(*, device_k, device_v, host_k, host_v, direction, **kwargs):
+            for device_buffer, host_buffer in ((device_k, host_k), (device_v, host_v)):
+                if direction == "D2H":
+                    host_buffer[0].copy_(device_buffer[:, 1])
+                else:
+                    device_buffer[:, 1].copy_(host_buffer[0])
+
+        with (
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                create=True,
+            ),
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                side_effect=transfer,
+                create=True,
+            ),
+        ):
+            host.backup_from_device_all_layer(
+                object(), _indices(0, 16), _indices(16, 32), "kernel_ascend"
+            )
+            for info in infos:
+                for buffer in info.transfer_buffers():
+                    buffer.zero_()
+            host.load_to_device_per_layer(
+                object(), _indices(0, 16), _indices(16, 32), 0, "kernel_ascend"
+            )
+        actual = [tensor[:, 1] for info in infos for tensor in info.transfer_buffers()]
+        for before, after in zip(expected, actual, strict=True):
+            self.assertTrue(torch.equal(before, after))
+
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         kv_cache_dim = 5
@@ -570,7 +788,14 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
         host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host._is_dummy = False
+        host._layer_shard_enabled = False
+        host._target_layer_indices = tuple(range(layer_num))
+        host._host_layer_by_controller = {i: i for i in range(layer_num)}
+        host._buffer_index_by_layer = {i: i for i in range(layer_num)}
         host.device_pool = device_pool
+        host.device_kv_buffers = tuple(device_layers)
+        host.device_data_ptrs = device_pool.data_ptrs
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
@@ -647,6 +872,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
 
         host = MambaPoolHost.__new__(MambaPoolHost)
+        host.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
         host.layout = "page_first"
         host.num_mamba_layers = num_layers
         host.device_pool = SimpleNamespace(device="cpu")
@@ -711,6 +940,83 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+
+    def test_mamba_kernel_npu_backup_then_load_roundtrip(self):
+        num_layers = 2
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 5], dtype=torch.int64)
+        temporal = torch.arange(num_layers * 8 * 3, dtype=torch.float32).reshape(
+            num_layers, 8, 3
+        )
+        conv = (
+            torch.arange(num_layers * 8 * 2, dtype=torch.float32).reshape(
+                num_layers, 8, 2
+            )
+            / 8
+        ).to(torch.bfloat16)
+        device_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal.clone(), conv=[conv.clone()])
+        )
+        expected_temporal = device_pool.mamba_cache.temporal[:, device_indices].clone()
+        expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
+
+        host = MambaPoolHost.__new__(MambaPoolHost)
+        host.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
+        host.layout = "page_first_direct"
+        host.num_mamba_layers = num_layers
+        host.temporal_state_elem_size = 3
+        host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.float32)
+        host.conv_state_shapes = [(2,)]
+        host.conv_buffer = [torch.zeros(8, num_layers, 1, 2, dtype=torch.bfloat16)]
+        host.temporal_staging_buffer = None
+        host.conv_staging_buffers = [None]
+        host._temporal_can_use_jit = False
+        host._conv_can_use_jit = [False]
+        host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
+        host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
+
+        host.backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend="kernel_ascend",
+        )
+        device_pool.mamba_cache.temporal.zero_()
+        device_pool.mamba_cache.conv[0].zero_()
+        for layer_id in range(num_layers):
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.temporal[:, device_indices], expected_temporal
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.temporal_buffer[host_indices].squeeze(2).transpose(0, 1),
+                expected_temporal,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.conv_buffer[0][host_indices].squeeze(2).transpose(0, 1),
+                expected_conv,
             )
         )
 
@@ -864,6 +1170,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
+        host._live_target_layers = list(range(layer_num))
+        host._device_to_host_layer = {layer: layer for layer in range(layer_num)}
         host.indexer_page_stride_size = indexer_page_stride_size
         host.indexer_layout_dim = host.layer_num * host.indexer_page_stride_size
         host.index_k_device_ptrs = torch.tensor(
@@ -970,7 +1278,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=True
         )
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1004,7 +1314,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=False
         )
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
         )
@@ -1014,10 +1326,126 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.move_hybrid_indices.assert_called_once()
         self.assertEqual([indices.device.type for indices in captured], ["cpu", "cpu"])
 
+    def _chain_write_controller(self, captured):
+        """A hybrid controller over a real HostPoolGroup whose KV pool records
+        every backup it receives."""
+
+        class ChainHostPool:
+            def prepare_transfer_indices(self, host, device, backend):
+                return host, device
+
+            def backup_from_device_all_layer_physical(self, *args):
+                self.backup_from_device_all_layer(*args)
+
+            layout = "page_first"
+            page_size = 4
+            device = "cpu"
+            size = 64
+            logical_size = 64
+            size_per_token = 2
+            can_use_write_back_jit = True
+
+            def __init__(self):
+                self.next_free = 0
+
+            def alloc(self, need_size):
+                start = self.next_free
+                self.next_free += need_size
+                return _indices(start, start + need_size)
+
+            def backup_from_device_all_layer(
+                self, device_pool, host_indices, device_indices, io_backend
+            ):
+                captured.append((host_indices, device_indices))
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = []
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=ChainHostPool(),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.ack_write_queue = []
+        controller.write_fence_stream = None
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        return controller
+
+    def test_hybrid_write_without_flush_merges_chain_into_one_submit(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            first = controller.write(_indices(4, 8), node_id=1, flush=False)
+            second = controller.write(_indices(12, 16), node_id=2, flush=False)
+            self.assertEqual(len(controller.write_queue), 2)
+            self.assertEqual(captured, [])
+            self.assertEqual(controller.ack_write_queue, [])
+
+            controller.start_writing()
+            # Flushing a drained queue must not submit another copy or ack.
+            controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        host_indices, device_indices = captured[0]
+        self.assertEqual(host_indices.tolist(), torch.cat([first, second]).tolist())
+        self.assertEqual(
+            device_indices.tolist(), list(range(4, 8)) + list(range(12, 16))
+        )
+        self.assertEqual(len(controller.ack_write_queue), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1, 2])
+        self.assertEqual(controller.ack_write_queue[0].num_tokens, 8)
+
+    def test_write_copy_waits_for_queued_forwards(self):
+        # Under overlap scheduling a finished request is cached while the next
+        # forward still writes its last token's KV; the D2H copy must start
+        # after that forward, or the host keeps a half-written token.
+        events = []
+
+        class RecordingStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, other):
+                events.append(f"{self.name} waits {other.name}")
+
+        controller = self._chain_write_controller(events)
+        controller.l2_transfer_engine.device_to_host_stream = RecordingStream("d2h")
+        controller.write_fence_stream = RecordingStream("forward")
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0], "d2h waits forward")
+        # Then the write's one copy, of the node's device slots.
+        self.assertEqual(events[1][1].tolist(), [4, 5, 6, 7])
+
+    def test_hybrid_write_flushes_by_default(self):
+        captured = []
+        controller = self._chain_write_controller(captured)
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(controller.write_queue, [])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [1])
+
     def test_write_back_jit_cache_controller_keeps_host_indices_on_cpu(self):
         captured = {}
 
-        class FakeHostPool:
+        class FakeHostPool(MHATokenToKVPoolHost):
             layout = "page_first"
             can_use_write_back_jit = True
             size_per_token = 2
@@ -1036,10 +1464,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
         ]
         controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1054,7 +1484,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def test_cache_controller_moves_indices_without_write_back_jit(self):
         captured = {}
 
-        class FakeHostPool:
+        class FakeHostPool(MHATokenToKVPoolHost):
             layout = "page_first"
             can_use_write_back_jit = False
             size_per_token = 2
@@ -1072,10 +1502,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller = HiCacheController.__new__(HiCacheController)
         controller.write_queue = [op]
         controller.io_backend = "kernel"
-        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )
@@ -1084,6 +1516,68 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+
+class _IndexTensorStub:
+    """Stands in for an index tensor resident on ``device_type``; CPU CI has no xpu."""
+
+    def __init__(self, device_type: str):
+        self.device = torch.device(device_type)
+        self.is_cuda = device_type == "cuda"
+        self.recorded = []
+
+    def record_stream(self, stream):
+        self.recorded.append(stream)
+
+
+def _record_stream_transfer(host_indices, device_indices) -> L2Transfer:
+    return L2Transfer(
+        host_pool=None,
+        device_pool=None,
+        host_indices=host_indices,
+        device_indices=device_indices,
+    )
+
+
+class TestL2TransferRecordStream(CustomTestCase):
+    """XPU index tensors must be kept alive across an L2 copy, like CUDA ones."""
+
+    def test_xpu_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("xpu")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(
+            device.recorded,
+            [stream],
+            "xpu index tensor was not pinned to the transfer stream; it can be "
+            "freed and reused while the copy is in flight",
+        )
+        self.assertEqual(
+            host.recorded, [], "record_stream is meaningless for a host tensor"
+        )
+
+    def test_cuda_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("cuda")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(device.recorded, [stream])
+        self.assertEqual(host.recorded, [])
+
+    def test_other_accelerators_are_unchanged(self):
+        # "npu" needs torch_npu to parse; mps stands in for any other accelerator.
+        device = _IndexTensorStub("mps")
+
+        L2TransferEngine._record_stream(
+            [_record_stream_transfer(_IndexTensorStub("cpu"), device)], object()
+        )
+
+        self.assertEqual(device.recorded, [])
 
 
 if __name__ == "__main__":

@@ -112,7 +112,9 @@ class ComfyUIPassThroughScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         Returns:
             The input sample unchanged (prev_sample = sample)
         """
-        # Increment step index for tracking
+        # DenoisingStage resets _step_index to None before each request.
+        if self._step_index is None:
+            self._step_index = 0
         self._step_index += 1
 
         # Simply return the input sample unchanged

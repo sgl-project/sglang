@@ -98,6 +98,8 @@ class SchedulerMlxOverlapMixin:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
         self.profiler_manager._profile_batch_predicate(batch)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
@@ -111,6 +113,11 @@ class SchedulerMlxOverlapMixin:
             pending.schedule_batch.input_ids = result.next_token_ids
         self.last_batch = pending.schedule_batch
         self.process_batch_result(pending.batch_copy, result)
+
+    def _drain_mlx_pending_jobs(self: Scheduler):
+        """Finalize and process every launched job, oldest first."""
+        while self.result_queue:
+            self._finalize_mlx_pending_job(self.result_queue.popleft())
 
     @DynamicGradMode()
     def event_loop_overlap_mlx(self: Scheduler):
@@ -152,8 +159,6 @@ class SchedulerMlxOverlapMixin:
         are the source of truth and are never merged into a shared
         batched buffer.
         """
-        pending_curr: Optional[MlxPendingJob] = None
-        pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             self._prepare_mlx_launch(batch)
@@ -169,10 +174,9 @@ class SchedulerMlxOverlapMixin:
             extend_logprob_start_len_per_req = None
             if batch.return_logprob:
                 # Mirror Scheduler.run_batch's launch-time copy.
-                extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                extend_input_len_per_req = (
+                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+                )
                 extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
             return MlxPendingJob(
                 launch=launch,
@@ -215,6 +219,12 @@ class SchedulerMlxOverlapMixin:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
+            # In-flight jobs live in self.result_queue across iterations, so
+            # a retract-mode pause_generation can drain them.  At most one is
+            # left here.
+            pending_curr = self.result_queue[0] if self.result_queue else None
+            pending_next = None
+
             # 1. If pending_curr is a pure decode AND no new prefill is waiting,
             #    build pending_next on top of it NOW — before we block on curr.
             can_chain = (
@@ -224,7 +234,7 @@ class SchedulerMlxOverlapMixin:
                 and pending_curr.chain_safe
                 and not self.waiting_queue
             )
-            if can_chain and pending_next is None:
+            if can_chain:
                 # Build + launch the chained step BEFORE we block on
                 # pending_curr — this is the "no idle gap" trick.
                 # GPU now has 2 steps queued.
@@ -236,10 +246,9 @@ class SchedulerMlxOverlapMixin:
             if pending_curr is not None:
                 self._finalize_mlx_pending_job(pending_curr)
                 self.result_queue.popleft()
-                pending_curr = None
 
             # 3. Decide whether pending_next is still valid (if no reqs finished)
-            #    and promote it.
+            #    and promote it: it stays queued as the next pending_curr.
             finished_any = any(
                 req.finished() for req in (pending_next.reqs if pending_next else [])
             )
@@ -249,10 +258,8 @@ class SchedulerMlxOverlapMixin:
                 and not finished_any
                 and not new_prefill_waiting
             ):
-                pending_curr = pending_next
-                pending_next = None
-                self.cur_batch_for_debug = pending_curr.schedule_batch
-                self.last_batch = pending_curr.schedule_batch
+                self.cur_batch_for_debug = pending_next.schedule_batch
+                self.last_batch = pending_next.schedule_batch
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
                 continue
@@ -262,7 +269,6 @@ class SchedulerMlxOverlapMixin:
             if pending_next is not None:
                 self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
-                pending_next = None
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
@@ -270,9 +276,9 @@ class SchedulerMlxOverlapMixin:
             next_batch = plan.batch_to_run
             self.cur_batch_for_debug = next_batch
             if next_batch:
-                pending_curr = _launch_fresh(next_batch)
-                self.result_queue.append(pending_curr)
+                self.result_queue.append(_launch_fresh(next_batch))
             else:
+                self._sched_idled = True
                 self.on_idle()
 
             self.last_batch = next_batch

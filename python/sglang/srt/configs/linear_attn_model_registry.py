@@ -71,6 +71,15 @@ def get_linear_attn_spec_by_arch(arch_name: str) -> Optional[LinearAttnModelSpec
     return None
 
 
+def get_linear_attn_spec(hf_config: Any) -> Optional[LinearAttnModelSpec]:
+    """Spec for ``hf_config``: by architecture name, else by config class and predicate."""
+    spec = get_linear_attn_spec_by_arch(hf_config.architectures[0])
+    if spec is not None:
+        return spec
+    result = get_linear_attn_config(hf_config)
+    return result[0] if result is not None else None
+
+
 def import_backend_class(dotted_name: str) -> type:
     module_path, class_name = dotted_name.rsplit(".", 1)
     module = importlib.import_module(module_path)

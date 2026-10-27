@@ -6,6 +6,8 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/gemm/dot_product.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <array>
@@ -17,7 +19,7 @@ namespace sglang {
 
 constexpr uint32_t kMaxBlockThreads = 1024;
 
-template <uint32_t N_, uint32_t K_, uint32_t N_SPLIT_, uint32_t kBytes_>
+template <uint32_t N_, uint32_t K_, uint32_t N_SPLIT_, uint32_t kBytes_, typename Weight = bf16_t>
 struct GEMMTraitN {
   static constexpr uint32_t N = N_;
   static constexpr uint32_t K = K_;
@@ -30,9 +32,9 @@ struct GEMMTraitN {
   static constexpr uint32_t kNumBlocks = N / N_SPLIT;
   static constexpr uint32_t kBlockSize = (K * sizeof(bf16_t)) / kBytes;
   // always use the largest possible vector
-  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(bf16_t);
+  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(Weight);
   // may reduce block size for less thread usage
-  static constexpr uint32_t kUnroll = kBytes / device::kMaxVecBytes;
+  static constexpr uint32_t kUnroll = kBytes / (kVecSize * sizeof(bf16_t));
   static_assert(kBlockSize % device::kWarpThreads == 0, "block size must be divisible by warp size");
   static_assert(kBlockSize <= kMaxBlockThreads, "block size exceeds the maximum block size");
 };
@@ -62,28 +64,11 @@ struct GEMMTraitK {
 struct TinyGEMMParams {
   void* __restrict__ out;
   const bf16_t* __restrict__ x;
-  const bf16_t* __restrict__ w;
+  const void* __restrict__ w;
   int64_t stride_x;
 };
 
-template <std::size_t N>
-SGL_DEVICE void dot_product(device::AlignedVector<bf16x2_t, N> a, device::AlignedVector<bf16x2_t, N> b, float& acc) {
-  using namespace device;
-#pragma unroll
-  for (uint32_t i = 0; i < N; ++i) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-    acc = device::math::fma_f32_bf16(a[i].x, b[i].x, acc);
-    acc = device::math::fma_f32_bf16(a[i].y, b[i].y, acc);
-#else
-    const auto [a0, a1] = cast<fp32x2_t>(a[i]);
-    const auto [b0, b1] = cast<fp32x2_t>(b[i]);
-    acc += a0 * b0;
-    acc += a1 * b1;
-#endif
-  }
-}
-
-template <typename Trait, uint32_t M, typename Out, bool kUsePDL>
+template <typename Trait, uint32_t M, typename Out, bool kUsePDL, typename Weight>
 TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
   using namespace device;
   constexpr uint32_t N = Trait::N;
@@ -97,10 +82,11 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  const bf16_t* w_tile = params.w + bx * (N_SPLIT * K);
+  const Weight* w_tile = static_cast<const Weight*>(params.w) + bx * (N_SPLIT * K);
 
   // prefetch weight before PDL
-  vec_t wv[N_SPLIT][kUnroll];
+  using weight_vec_t = AlignedVector<packed_t<Weight>, kVecSize / 2>;
+  weight_vec_t wv[N_SPLIT][kUnroll];
 #pragma unroll
   for (uint32_t n = 0; n < N_SPLIT; ++n) {
 #pragma unroll
@@ -130,7 +116,7 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
       float acc = 0.0f;
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) {
-        dot_product(xv[m][u], wv[n][u], acc);
+        dot_product_vec(xv[m][u], wv[n][u], acc);
       }
       s_acc[warp_id][m * N_SPLIT + n] = warp::reduce_sum(acc);
     }
@@ -170,7 +156,7 @@ TINY_GEMM_KERNEL void tiny_k_gemm_kernel(const TinyGEMMParams params) {
   const uint32_t tx = threadIdx.x;
   const uint32_t n_idx = bx * N_SPLIT + tx / kNumKLanes;
   const uint32_t work_id = tx % kNumKLanes;
-  const bf16_t* w_tile = params.w + n_idx * K;
+  const bf16_t* w_tile = static_cast<const bf16_t*>(params.w) + n_idx * K;
 
   // Weight prefetch: address is input-independent, load before the PDL wait.
   vec_t wv;
@@ -185,7 +171,7 @@ TINY_GEMM_KERNEL void tiny_k_gemm_kernel(const TinyGEMMParams params) {
 #pragma unroll
   for (uint32_t m = 0; m < M; ++m) {
     float acc = 0.0f;
-    dot_product(xv[m], wv, acc);
+    dot_product_vec(xv[m], wv, acc);
     // Broadcast store: every lane of the group holds the reduced sum.
     const auto sum = warp::reduce_sum<kNumKLanes>(acc);
     static_cast<Out*>(params.out)[m * N + n_idx] = cast<Out>(sum);
@@ -193,14 +179,21 @@ TINY_GEMM_KERNEL void tiny_k_gemm_kernel(const TinyGEMMParams params) {
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <uint32_t N, uint32_t K, uint32_t kMaxM, uint32_t N_SPLIT, typename OutT, bool kUsePDL>
+template <
+    uint32_t N,
+    uint32_t K,
+    uint32_t kMaxM,
+    uint32_t N_SPLIT,
+    typename OutT,
+    bool kUsePDL,
+    typename Weight = bf16_t>
 struct TinyNGemmKernel {
-  using Trait = GEMMTraitN<N, K, N_SPLIT, 32>;
+  using Trait = GEMMTraitN<N, K, N_SPLIT, 32, Weight>;
   using KernelFn = void (*)(TinyGEMMParams);
 
   template <std::size_t... I>
   static constexpr auto make_table(std::index_sequence<I...>) {
-    return std::array<KernelFn, kMaxM + 1>{nullptr, tiny_n_gemm_kernel<Trait, I + 1, OutT, kUsePDL>...};
+    return std::array<KernelFn, kMaxM + 1>{nullptr, tiny_n_gemm_kernel<Trait, I + 1, OutT, kUsePDL, Weight>...};
   }
 
   static constexpr auto kTable = make_table(std::make_index_sequence<kMaxM>{});
@@ -211,8 +204,17 @@ struct TinyNGemmKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({M, K}).with_strides({-1, 1}).with_dtype<bf16_t>().with_device(device).verify(x);
-    TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(w);
+    TensorMatcher({M, K})
+        .with_strides({-1, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(Trait::kVecSize * sizeof(bf16_t))
+        .verify(x);
+    TensorMatcher({N, K})
+        .with_dtype<Weight>()
+        .with_device(device)
+        .ensure_alignment(Trait::kVecSize * sizeof(Weight))
+        .verify(w);
     TensorMatcher({M, N}).with_dtype<OutT>().with_device(device).verify(out);
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     if (num_tokens == 0) return;
@@ -224,7 +226,7 @@ struct TinyNGemmKernel {
     const auto params = TinyGEMMParams{
         .out = out.data_ptr(),
         .x = static_cast<const bf16_t*>(x.data_ptr()),
-        .w = static_cast<const bf16_t*>(w.data_ptr()),
+        .w = w.data_ptr(),
         .stride_x = static_cast<int64_t>(x.stride(0)),
     };
     LaunchKernel(Trait::kNumBlocks, Trait::kBlockSize, device.unwrap())  //
@@ -263,7 +265,7 @@ struct TinyKGemmKernel {
     const auto params = TinyGEMMParams{
         .out = out.data_ptr(),
         .x = static_cast<const bf16_t*>(x.data_ptr()),
-        .w = static_cast<const bf16_t*>(w.data_ptr()),
+        .w = w.data_ptr(),
         .stride_x = static_cast<int64_t>(x.stride(0)),
     };
     LaunchKernel(Trait::kNumBlocks, Trait::kBlockSize, device.unwrap())  //

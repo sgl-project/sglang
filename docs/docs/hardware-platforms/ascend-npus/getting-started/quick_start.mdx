@@ -14,10 +14,9 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ### Supported Devices
 
-- Atlas 800I A2 inference series (Atlas 800I A2)
-- Atlas 800I A3 inference series (Atlas 800I A3)
+- Ascend A3 Series Products
 
-To identify your device, run `npu-smi info -l`: A3 reports `Chip Count: 2` per NPU, while A2 reports `Chip Count: 1` per NPU.
+To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ### Docker
@@ -40,49 +39,30 @@ at least **30GB** of free space. If you need to download model weights, check th
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `cann9.0.0-a3-v0.5.16`)
-if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version,
+or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes. CANN 9.1.0 has no stable
+image yet, so use the daily build tag for now.
+
+{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
 </Tip>
 
 If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```shell Command
-# Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16              # Stable release
-# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3               # Daily build
+# TODO: CANN 9.1.0 has no stable image yet, so only the daily build tag is
+# available for now. Once the stable image is published, restore the stable
+# release option here.
+export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
     --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager \
-    --device=/dev/hisi_hdc \
-    --volume /usr/local/sbin:/usr/local/sbin \
-    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule \
-    --volume ~/.cache/:/root/.cache/ \
-    --entrypoint=bash \
-    $IMAGE
-```
-
-  </Tab>
-  <Tab title="Atlas 800I A2">
-
-```shell Command
-# Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16             # Stable release
-# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b               # Daily build
-
-docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci_manager \
     --device=/dev/hisi_hdc \
     --volume /usr/local/sbin:/usr/local/sbin \

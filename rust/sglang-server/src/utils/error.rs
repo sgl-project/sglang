@@ -36,15 +36,17 @@ pub enum Error {
 }
 
 impl Error {
-    /// HTTP status to surface for the non-streaming error path. Mirrors the
-    /// codes used in the Python `_create_error_response`.
-    pub fn http_status(&self) -> u16 {
-        match self {
-            Error::Validation(_) => 400,
-            Error::Disconnected => 499, // nginx-style client closed request
-            Error::QueueFull => 503,
-            _ => 500,
-        }
+    /// Whether this failure represents a server defect rather than an expected
+    /// request, capacity, or cancellation outcome.
+    pub fn is_server_fault(&self) -> bool {
+        matches!(
+            self,
+            Error::Tokenize(_)
+                | Error::Encode(_)
+                | Error::Detokenize(_)
+                | Error::Codec(_)
+                | Error::Internal(_)
+        )
     }
 }
 

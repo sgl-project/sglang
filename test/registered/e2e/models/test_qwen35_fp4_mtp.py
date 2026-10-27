@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=720, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=670, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
@@ -68,7 +68,7 @@ def _run_mtp_gsm8k(test_case):
         top_p=0.95,
         top_k=20,
         base_url=test_case.base_url,
-        host="http://127.0.0.1",
+        host="127.0.0.1",
         port=int(test_case.base_url.split(":")[-1]),
     )
     metrics = run_eval(args)

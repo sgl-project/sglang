@@ -22,7 +22,6 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import tqdm
 
@@ -43,11 +42,13 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_lora,
+    get_model,
     get_parallel,
     get_spec,
 )
 from sglang.srt.utils import (
     empty_context,
+    get_free_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -208,6 +209,10 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_dual_residual_rmsnorm_cpu")
+    def _(x, residual, w1, w2, eps):
+        return torch.empty_like(x), torch.empty_like(x)
 
     @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
     def _(q, k, q_weight, k_weight, eps, head_dim):
@@ -412,6 +417,21 @@ def register_fake_ops(tp_size: int):
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
+    @register_cpu_compile_fake("fused_moe_router_cpu")
+    def _(
+        moe_softcapping,
+        hidden_states,
+        gating_output,
+        topk,
+        renormalize,
+        correction_bias=None,
+    ):
+        shape = (hidden_states.shape[0], topk)
+        return (
+            torch.empty(shape, device=hidden_states.device, dtype=torch.float32),
+            torch.empty(shape, device=hidden_states.device, dtype=torch.int32),
+        )
+
     @register_cpu_compile_fake("topk_softmax_cpu")
     def _(
         hidden_states,
@@ -460,6 +480,19 @@ def register_fake_ops(tp_size: int):
         mat2,
         scales2,
         block_size,
+        bias,
+        out_dtype,
+        is_vnni,
+    ):
+        M = mat1.shape[0]
+        N = mat2.shape[0]
+        return mat1.new_empty(M, N, dtype=out_dtype)
+
+    @register_cpu_compile_fake("fp8_per_tensor_scaled_mm_cpu")
+    def _(
+        mat1,
+        mat2,
+        scale2,
         bias,
         out_dtype,
         is_vnni,
@@ -606,7 +639,7 @@ class CPUGraphRunner:
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -631,7 +664,7 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
+        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture
@@ -721,6 +754,12 @@ class CPUGraphRunner:
         return is_bs_supported
 
     def capture(self) -> None:
+        with get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        ):
+            self._capture()
+
+    def _capture(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_parallel().tp_rank == 0
@@ -728,7 +767,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
+                avail_mem = get_free_cpu_memory() / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
@@ -737,7 +776,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.captured_req_width,
-                tp_group=self.model_runner.tp_group,
+                tp_group=get_parallel().tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
                     bs, forward, skip_cross_attention=True
@@ -815,9 +854,12 @@ class CPUGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
+            num_token_non_padded=(
+                self.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=self.capture_forward_mode,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -828,19 +870,21 @@ class CPUGraphRunner:
         )
         with skip_ctx:
             with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ):
                 self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
                     bs,
                     num_tokens,
                     req_pool_indices,
                     seq_lens,
+                    out_cache_loc,
                     None,
                     forward_batch.forward_mode,
                     forward_batch.spec_info,
                 )
                 with torch.no_grad():
-                    self.model_runner.tp_group.barrier()
+                    get_parallel().tp_group.barrier()
                     self.model_runner.model.forward(
                         forward_batch.input_ids,
                         forward_batch.positions,
@@ -862,7 +906,7 @@ class CPUGraphRunner:
 
                 with torch.no_grad():
                     for _ in range(2):
-                        self.model_runner.tp_group.barrier()
+                        get_parallel().tp_group.barrier()
                         out = run_once()
                     # Save the captured forward_batch in the appropriate dict
                     if skip_cross_attention:
@@ -969,11 +1013,15 @@ class CPUGraphRunner:
         with replay_context():
             with skip_ctx:
                 prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                output = graphs[prepared_forward_batch.batch_size](
-                    prepared_forward_batch.input_ids,
-                    prepared_forward_batch.positions,
-                    prepared_forward_batch,
-                )
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend),
+                    forward_batch=prepared_forward_batch,
+                ):
+                    output = graphs[prepared_forward_batch.batch_size](
+                        prepared_forward_batch.input_ids,
+                        prepared_forward_batch.positions,
+                        prepared_forward_batch,
+                    )
         if forward_batch.batch_size in graphs:
             return output
 
@@ -983,6 +1031,11 @@ class CPUGraphRunner:
             hidden_states=(
                 output.hidden_states[: self.raw_num_token]
                 if output.hidden_states is not None
+                else None
+            ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_token]
+                if output.last_hidden_states is not None
                 else None
             ),
         )
