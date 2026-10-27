@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
     DraftStateRegion,
     FusedDraftPlacement,
+    LatentDraftRegion,
     draft_state_layer_ids,
     draft_swa_layer_ids,
 )
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
+    MLATokenToKVPool,
     unwrap_write_loc,
     write_loc_is_physical,
 )
@@ -32,6 +34,23 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+
+def _contiguous_lanes(layer_lanes: Mapping[int, int], lane_num: int) -> List[int]:
+    """The region lanes of ``layer_lanes``' layers in layer order. The layer ids
+    must be contiguous (the pool indexes them from its start layer) and the
+    lanes distinct and inside the region."""
+    layer_ids = sorted(layer_lanes)
+    assert layer_ids, "a fused draft pool binds at least one layer"
+    start_layer = layer_ids[0]
+    assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
+        f"fused draft layer ids must be contiguous; got {layer_ids}"
+    )
+    lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
+    assert len(set(lanes)) == len(lanes) and all(0 <= s < lane_num for s in lanes), (
+        f"draft lanes {lanes} must be distinct and within range({lane_num})"
+    )
+    return lanes
 
 
 class UnifiedDraftKVPool(MHATokenToKVPool):
@@ -57,16 +76,9 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         page_size: int = 1,
     ):
         region = unified_buffer.require_draft_host_spec(host_sub_pool_name).draft_region
+        lanes = _contiguous_lanes(layer_lanes, region.lane_num)
         layer_ids = sorted(layer_lanes)
-        assert layer_ids, "UnifiedDraftKVPool binds at least one layer"
         start_layer = layer_ids[0]
-        assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
-            f"fused draft layer ids must be contiguous; got {layer_ids}"
-        )
-        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
-        assert len(set(lanes)) == len(lanes) and all(
-            0 <= s < region.lane_num for s in lanes
-        ), f"draft lanes {lanes} must be distinct and within range({region.lane_num})"
         k_views, v_views = unified_buffer.build_dense_draft_views(host_sub_pool_name)
         max_slots = unified_buffer.max_slots(host_sub_pool_name)
 
@@ -123,6 +135,90 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+
+class UnifiedDraftMLAKVPool(MLATokenToKVPool):
+    """MLA draft KV over the latent draft part of an MLA host sub-pool's
+    entries: per-layer `kv_buffer` views of the draft lanes inside every slot,
+    indexed by the target's PHYSICAL token ids (translated through
+    `host_allocator`), so the stock `MLATokenToKVPool` read/write methods work
+    on them unmodified. Compaction moves whole page envelopes on the HOST pool,
+    draft bytes included."""
+
+    requires_physical_write_loc = True
+    # Fusion declines under DCP, so a write loc is never widened here.
+    write_loc_is_dcp_resolved = True
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        host_sub_pool_name: str,
+        host_allocator,
+        layer_lanes: Mapping[int, int],
+        page_size: int = 1,
+    ):
+        region = unified_buffer.require_draft_host_spec(host_sub_pool_name).draft_region
+        assert isinstance(region, LatentDraftRegion), (
+            f"sub-pool {host_sub_pool_name!r} carries no latent draft region"
+        )
+        lanes = _contiguous_lanes(layer_lanes, region.lane_num)
+        layer_ids = sorted(layer_lanes)
+        start_layer = layer_ids[0]
+        views = unified_buffer.build_latent_draft_views(host_sub_pool_name)
+        max_slots = unified_buffer.max_slots(host_sub_pool_name)
+
+        self._unified_buffer = unified_buffer
+        self._host_sub_pool_name = host_sub_pool_name
+        self.host_allocator = host_allocator
+        self.layer_lanes: Dict[int, int] = dict(layer_lanes)
+        self._kv_views: List[torch.Tensor] = [views[s] for s in lanes]
+        num_pages = max_slots // page_size
+
+        super().__init__(
+            size=num_pages * page_size - page_size,
+            page_size=page_size,
+            dtype=region.resolved_kv_dtype(),
+            kv_lora_rank=region.kv_lora_rank,
+            qk_rope_head_dim=region.qk_rope_head_dim,
+            layer_num=len(layer_ids),
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            start_layer=start_layer,
+            end_layer=start_layer + len(layer_ids) - 1,
+        )
+
+    def _create_buffers(self):
+        self.kv_buffer = self._kv_views
+
+    def _clear_buffers(self):
+        pass  # lifetime owned by UnifiedKVPool
+
+    def get_kv_size_bytes(self):
+        return 0  # fused into the host entries; UnifiedKVPool logs the total
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "fused draft KV relocates with the HOST pool's whole-page move; a "
+            "draft-side per-slot move would corrupt the fused layout"
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft KV has no per-layer contiguous regions; KV transfer / "
+            "disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+    def get_v_head_dim(self):
+        # The triton backend asks a hybrid-linear host's draft pool for this at
+        # startup; a latent row's value is its kv_lora_rank part.
+        return self.kv_lora_rank
 
 
 class UnifiedDraftSWAKVPool(SWAKVPool):
@@ -432,7 +528,10 @@ class UnifiedDraftMambaPool(MambaPool):
 def fused_draft_host_allocator(token_to_kv_pool: Any) -> Optional[Any]:
     """The host allocator a fused draft pool translates through, or None for
     any other pool."""
-    if isinstance(token_to_kv_pool, (UnifiedDraftKVPool, UnifiedDraftSWAKVPool)):
+    if isinstance(
+        token_to_kv_pool,
+        (UnifiedDraftKVPool, UnifiedDraftMLAKVPool, UnifiedDraftSWAKVPool),
+    ):
         return token_to_kv_pool.host_allocator
     return None
 
@@ -573,6 +672,12 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         f"draft runner {ctx.runner}: layers full={full_ids} swa={swa_ids} vs placed "
         f"lanes full={list(full_lanes)} swa={list(swa_lanes)}"
     )
+    full_region = ctx.placement.region("full")
+    if isinstance(full_region, LatentDraftRegion):
+        assert not swa_ids, "an MLA draft's latent rows ride in the full sub-pool alone"
+        return msgspec.structs.replace(
+            binding, token_to_kv_pool=_latent_draft_pool(ctx, full_region, full_ids)
+        )
     if not swa_ids:
         pool = UnifiedDraftKVPool(
             unified_buffer=ctx.unified_buffer,
@@ -590,6 +695,28 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
             swa_layer_lanes=dict(zip(swa_ids, swa_lanes)),
         )
     return msgspec.structs.replace(binding, token_to_kv_pool=pool)
+
+
+def _latent_draft_pool(
+    ctx: BindContext, region: LatentDraftRegion, layer_ids: List[int]
+) -> UnifiedDraftMLAKVPool:
+    """The MLA draft's pool over its latent lanes. The region was sized from the
+    draft config at target boot; the built draft must write rows that wide."""
+    mc = ctx.model_config
+    width = int(mc.kv_lora_rank) + int(mc.qk_rope_head_dim)
+    if width != region.kv_cache_dim:
+        raise ValueError(
+            f"Fused draft KV: the draft writes {width}-wide latent rows, but its "
+            f"region inside the target's pages holds {region.kv_cache_dim}-wide ones."
+        )
+    lanes = ctx.placement.lanes_for(ctx.runner, "full")
+    return UnifiedDraftMLAKVPool(
+        unified_buffer=ctx.unified_buffer,
+        host_sub_pool_name="full",
+        host_allocator=ctx.host_allocator,
+        layer_lanes=dict(zip(layer_ids, lanes)),
+        page_size=ctx.page_size,
+    )
 
 
 register_draft_binder("dense", _bind_dense)

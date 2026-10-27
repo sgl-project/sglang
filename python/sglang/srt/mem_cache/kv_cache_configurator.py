@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import TRANSLATED_MHA_RAILS
+from sglang.srt.arg_groups.kv_cache_hook import (
+    TRANSLATED_MHA_RAILS,
+    unified_memory_attention_backends,
+)
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
@@ -1088,6 +1091,7 @@ class KVCacheConfigurator:
             FusedDraftDecision,
             PlacementContext,
             draft_kv_profile,
+            draft_swa_layer_ids,
             place_fused_draft,
         )
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
@@ -1107,11 +1111,23 @@ class KVCacheConfigurator:
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
-        if aux.draft_model_config.attention_arch != AttentionArch.MHA:
+        draft_arch = aux.draft_model_config.attention_arch
+        if draft_arch == AttentionArch.MHA:
+            draft_mla = False
+        elif draft_arch == AttentionArch.MLA and self.use_mla_backend:
+            # The draft's latent rows join the host's own MLA rows; a window
+            # layer would need an MLA sliding-window sub-pool, which none builds.
+            if draft_swa_layer_ids(aux.draft_model_config):
+                return FusedDraftDecision(
+                    declined="the MLA draft has sliding-window layers"
+                )
+            draft_mla = True
+        else:
+            host_arch = "MLA" if self.use_mla_backend else "MHA"
             return FusedDraftDecision(
                 declined=(
-                    f"the draft's attention is {aux.draft_model_config.attention_arch.name}; "
-                    "the fused region holds dense MHA K/V rows"
+                    f"the draft's attention is {draft_arch.name}, which an "
+                    f"{host_arch} host's entries do not hold"
                 )
             )
         # The draft runner's backend, resolved as its worker will: an EAGLE
@@ -1130,12 +1146,23 @@ class KVCacheConfigurator:
         )
         # A fused draft reads its rows through the KV-index translator, which
         # other backends miss on some draft path.
-        if not draft_backends <= TRANSLATED_MHA_RAILS:
+        if not draft_mla and not draft_backends <= TRANSLATED_MHA_RAILS:
             return FusedDraftDecision(
                 declined=(
                     f"the draft runs on {', '.join(sorted(draft_backends))}, "
                     "off the translated MHA rails "
                     f"({', '.join(sorted(TRANSLATED_MHA_RAILS))})"
+                )
+            )
+        # An MLA draft's latent rows are read like the host's own, on any
+        # backend the unified pool supports for MLA attention.
+        mla_backends = unified_memory_attention_backends(mla=True)
+        if draft_mla and not draft_backends <= mla_backends:
+            return FusedDraftDecision(
+                declined=(
+                    f"the draft runs on {', '.join(sorted(draft_backends))}, which "
+                    "the unified pool does not support for MLA attention "
+                    f"({', '.join(sorted(mla_backends))})"
                 )
             )
         # Under DCP each rank's host rows hold only its share of the widened
