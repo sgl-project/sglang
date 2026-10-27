@@ -66,9 +66,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
-    dcp_gathered_page_table,
     dcp_trtllm_sparse_attention,
-    dcp_use_gathered_prefill,
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
@@ -99,7 +97,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.layers.dcp import is_dsa_dcp_gathered_prefill
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -1402,68 +1399,6 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
-        # Re-plan only over this backend's own plan: another planner's metadata
-        # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
-        existing = forward_batch.attn_dcp_metadata
-        if (
-            _is_hip
-            and self.dcp_size > 1
-            and (existing is None or is_dsa_dcp_gathered_prefill(existing))
-        ):
-            forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
-                forward_batch, page_table.shape[1]
-            )
-
-    def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
-        return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
-
-    def _plan_dcp_gathered_prefill(
-        self, forward_batch: ForwardBatch, page_table_width: int
-    ):
-        """Gathered-prefix DCP prefill plan, or None to attend owned slots."""
-        if not (
-            _is_hip
-            and self.dsa_prefill_impl == "triton"
-            and not self.use_mha
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and not self._is_in_tc_piecewise_cuda_graph()
-            and not self._is_in_breakable_cuda_graph()
-            and forward_batch.extend_prefix_lens is not None
-            and dcp_use_gathered_prefill(
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_num_tokens,
-                self.num_dcp_q_heads,
-            )
-        ):
-            return None
-        from sglang.srt.layers.dcp.planner import (
-            prepare_decode_context_parallel_metadata,
-        )
-        from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-            create_chunked_prefix_cache_kv_indices,
-        )
-
-        dcp_meta = prepare_decode_context_parallel_metadata(
-            seq_lens=forward_batch.seq_lens,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens=forward_batch.extend_seq_lens,
-            req_pool_indices=forward_batch.req_pool_indices,
-            req_to_token=self.req_to_token,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            kv_buffer_shape=self.token_to_kv_pool.get_kv_buffer_shape()[0],
-            kv_cache_dtype=self.token_to_kv_pool.dtype,
-            kv_cache_device=forward_batch.seq_lens.device,
-            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
-        )
-        dcp_meta.dsa_page_table_1 = dcp_gathered_page_table(
-            dcp_meta.dcp_kv_indptr,
-            dcp_meta.dcp_kv_indices,
-            forward_batch.seq_lens,
-            page_table_width,
-        )
-        dcp_meta.dsa_gathered_prefill = True
-        return dcp_meta
 
     def _cal_indexer_k_start_end(
         self,
@@ -2299,12 +2234,6 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        prefill_page_table_1 = metadata.page_table_1
-        dcp_gathered = self._dcp_gathered_prefill(forward_batch)
-        if dcp_gathered:
-            # The caller all-gathered the prefix and appended this extend's KV.
-            kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
-            prefill_page_table_1 = forward_batch.attn_dcp_metadata.dsa_page_table_1
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2337,7 +2266,7 @@ class DeepseekSparseAttnBackend(
                 "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
             )
 
-        if self.use_fused_topk and not dcp_gathered:
+        if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2360,7 +2289,7 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=prefill_page_table_1,
+                    page_table=metadata.page_table_1,
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
@@ -2407,7 +2336,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if _is_hip and self.dcp_size > 1 and not dcp_gathered:
+            if _is_hip and self.dcp_size > 1:
                 assert topk_transform_method == TopkTransformMethod.PAGED
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
@@ -4214,17 +4143,12 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = (
-            not self.use_fused_topk
-            or (
-                self.hisparse_coordinator is not None
-                and (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    or forward_batch.forward_mode.is_target_verify()
-                )
+        force_unfused = not self.use_fused_topk or (
+            self.hisparse_coordinator is not None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
             )
-            # The gathered prefix is addressed by position, not by slot.
-            or self._dcp_gathered_prefill(forward_batch)
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
