@@ -1821,7 +1821,9 @@ class LowRatioCompressAscendBackendMixin:
                 )
             if int(idx.max()) >= int(lens.max()):
                 problems.append(
-                    f"{prefix}: index {int(idx.max())} >= len {int(lens.max())}"
+                    f"{prefix}: index {int(idx.max())} >= len {int(lens.max())} "
+                    f"(bt={tuple(bt.shape)} pages={kv.shape[0]} "
+                    f"page_of_index={int(idx.max()) // max(1, int(kv.shape[1]))})"
                 )
             if int(lens.max()) > idx.shape[-1]:
                 problems.append(
@@ -1830,6 +1832,18 @@ class LowRatioCompressAscendBackendMixin:
             if int(idx.min()) < -1:
                 problems.append(f"{prefix}: index min {int(idx.min())} < -1")
         key = (layer.layer_id, phase)
+        sample = ("sample", layer.layer_id, phase)
+        if problems and sample not in self._dsv41_debugged:
+            # Are the window indices absolute positions or window slots? That
+            # decides whether the block table needs absolute width. Row 0 only.
+            self._dsv41_debugged.add(sample)
+            idx = kw["ori_sparse_indices"]
+            print(
+                f"[dsv41] SAMPLE layer={layer.layer_id} pos0={int(forward_batch.positions[0])} "
+                f"len0={int(kw['ori_topk_length'][0])} "
+                f"head={idx[0, :8].tolist()} tail={idx[0, -8:].tolist()}",
+                flush=True,
+            )
         if problems:
             print(
                 f"[dsv41] AUDIT FAIL layer={layer.layer_id} ratio={ratio} "
