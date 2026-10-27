@@ -1,10 +1,23 @@
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
+
+import torch
 
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
+from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
+    PrefillStagingContext,
+    handle_watermark_msg,
+    is_watermark_ready,
+    prefetch_staging_reqs,
+)
+from sglang.srt.disaggregation.common.utils import FastQueue
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.mooncake.staging_resource import MooncakeStagingResource
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
@@ -306,6 +319,109 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation.assert_not_called()
         s._sync_disaggregation_mode_to_subcomponents.assert_not_called()
 
+    def _shared_scheduler(self, mode=DisaggregationMode.PREFILL):
+        s = self._scheduler(mode)
+        rc.get_context().override(
+            "test.shared", disaggregation_transfer_backend="mooncake"
+        )
+        resource = SimpleNamespace(unsafe_reason=None, poison=MagicMock())
+        manager = SimpleNamespace(
+            supports_role_switch=True,
+            enable_staging=True,
+            staging_resource=resource,
+            check_staging_role_switch_ready=MagicMock(return_value=None),
+        )
+        s._pd_staging_resource = resource
+        name = (
+            "disagg_prefill_bootstrap_queue"
+            if mode == DisaggregationMode.PREFILL
+            else "disagg_decode_prealloc_queue"
+        )
+        setattr(s, name, SimpleNamespace(kv_manager=manager))
+        return s, manager
+
+    def test_shared_staging_flips_in_both_directions(self):
+        for old, new in (
+            (DisaggregationMode.PREFILL, "decode"),
+            (DisaggregationMode.DECODE, "prefill"),
+        ):
+            for failure in (None, "teardown", "rebuild"):
+                with self.subTest(old=old, failure=failure):
+                    s, manager = self._shared_scheduler(old)
+                    parallel = SimpleNamespace(
+                        pp_size=1,
+                        attn_tp_size=2,
+                        attn_tp_group=SimpleNamespace(cpu_group=object()),
+                    )
+                    with (
+                        patch.object(
+                            role_switch, "get_parallel", return_value=parallel
+                        ),
+                        patch("torch.distributed.all_gather_object") as gather,
+                    ):
+                        ready = Scheduler.handle_pd_role_switch(
+                            s, PdRoleSwitchReqInput(new_role=new, prepare_only=True)
+                        )
+                        self.assertTrue(ready.success, ready.message)
+                        s.teardown_disaggregation.assert_not_called()
+                        s.init_disaggregation.assert_not_called()
+                        if failure == "teardown":
+                            s.teardown_disaggregation.side_effect = RuntimeError("boom")
+                        elif failure == "rebuild":
+                            s.init_disaggregation.side_effect = RuntimeError("boom")
+                        out = Scheduler.handle_pd_role_switch(
+                            s, PdRoleSwitchReqInput(new_role=new)
+                        )
+                        gather.assert_not_called()
+                    self.assertEqual(out.success, failure is None, out.message)
+                    self.assertEqual(
+                        manager.check_staging_role_switch_ready.call_count, 2
+                    )
+                    self.assertEqual(s._pd_role_switch_unhealthy, failure is not None)
+                    self.assertFalse(s._pd_role_switch_in_progress)
+                    self.assertEqual(s._event_loop_should_restart, failure is None)
+                    s.teardown_disaggregation.assert_called_once()
+                    self.assertEqual(
+                        s.init_disaggregation.call_count, int(failure != "teardown")
+                    )
+                    if failure is not None:
+                        self.assertFalse(out.safe_to_restore)
+                        s._pd_staging_resource.poison.assert_called_once()
+
+    def test_shared_staging_busy_rejected_before_teardown(self):
+        s, manager = self._shared_scheduler()
+        manager.check_staging_role_switch_ready.return_value = (
+            "staging allocations are still active"
+        )
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
+        s.teardown_disaggregation.assert_not_called()
+
+    def test_shared_staging_uncertain_drain_requires_restart(self):
+        s, manager = self._shared_scheduler()
+        s._pd_staging_resource.unsafe_reason = "missing ACK"
+        manager.check_staging_role_switch_ready.return_value = (
+            "restart required: missing ACK"
+        )
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+        self.assertFalse(out.success)
+        self.assertFalse(out.safe_to_restore)
+        s.teardown_disaggregation.assert_not_called()
+
+    def test_other_backend_staging_remains_rejected(self):
+        s, _ = self._shared_scheduler()
+        rc.get_context().override("test.other", disaggregation_transfer_backend="nixl")
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+        self.assertFalse(out.success)
+        self.assertIn("staging", out.message)
+
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
     """Guard the wire contract of the /pd_role_switch req/resp structs.
@@ -411,10 +527,26 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     def test_data_parallel_role_switch_accepted(self):
         self._run(self._sa(dp_size=2))
 
-    def test_reject_decode_context_parallelism(self):
+    def test_reject_context_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
             self._run(self._sa(dcp_size=2))
         self.assertIn("decode context parallelism", str(ctx.exception))
+
+        for mode in ("prefill", "decode"):
+            for staging in ("0", "1"):
+                with (
+                    self.subTest(mode=mode, staging=staging),
+                    patch.dict("os.environ", {"SGLANG_DISAGG_STAGING_BUFFER": staging}),
+                    self.assertRaisesRegex(ValueError, "attention context parallelism"),
+                ):
+                    self._run(
+                        self._sa(
+                            disaggregation_mode=mode,
+                            disaggregation_transfer_backend="mooncake",
+                            tp_size=2,
+                            attn_cp_size=2,
+                        )
+                    )
 
     def test_reject_speculative_decoding(self):
         with self.assertRaises(ValueError) as ctx:
@@ -424,6 +556,22 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     def test_no_role_switch_is_unaffected(self):
         # The same unsupported feature is fine when role switch is off.
         self._run(self._sa(enable_pd_role_switch=False, moe_a2a_backend="mori"))
+
+        for mode in ("prefill", "decode"):
+            for staging in ("0", "1"):
+                with (
+                    self.subTest(mode=mode, staging=staging),
+                    patch.dict("os.environ", {"SGLANG_DISAGG_STAGING_BUFFER": staging}),
+                ):
+                    self._run(
+                        self._sa(
+                            disaggregation_mode=mode,
+                            disaggregation_transfer_backend="mooncake",
+                            enable_pd_role_switch=False,
+                            tp_size=2,
+                            attn_cp_size=2,
+                        )
+                    )
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
@@ -797,6 +945,417 @@ class TestStartupDecodeGraphReuse(unittest.TestCase):
                         runner.init_decode_cuda_graph.assert_called_once_with()
                 finally:
                     rc.reset_context()
+
+
+def cpu_buffer_init(buf, size_bytes, device, gpu_id, custom_mem_pool=None):
+    buf.buffer = torch.empty(size_bytes, dtype=torch.uint8)
+    buf.size_bytes = size_bytes
+    buf.device = torch.device("cpu")
+    buf.device_module = torch.get_device_module(buf.device)
+    buf.gpu_id = gpu_id
+    buf.data_ptr = buf.buffer.data_ptr()
+    buf._gather_stream = None
+
+
+class TestMooncakeStagingResource(unittest.TestCase):
+    def setUp(self):
+        self.pool = object()
+        p = patch(
+            "sglang.srt.disaggregation.mooncake.staging_resource._get_custom_mem_pool",
+            return_value=(self.pool, "test"),
+        )
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(
+            StagingBuffer, "__init__", autospec=True, side_effect=cpu_buffer_init
+        )
+        self.alloc = p.start()
+        self.addCleanup(p.stop)
+
+    def resource(self, decode_bytes=4096, device_type="cuda"):
+        engine = SimpleNamespace(
+            batch_register=Mock(return_value=0), batch_deregister=Mock(return_value=0)
+        )
+        args = SimpleNamespace(gpu_id=0, page_size=1, kv_item_lens=[128, 128])
+        r = MooncakeStagingResource(
+            engine, args, 4, 2, decode_bytes, device_type=device_type
+        )
+        r.initialize()
+        return r
+
+    def test_views_capacity_and_registration_are_shared(self):
+        for decode_bytes in (1024, 4096):
+            with self.subTest(decode_bytes=decode_bytes):
+                r = self.resource(decode_bytes)
+                base = r.backing.get_ptr()
+                self.assertEqual(r.capacity, max(2048, decode_bytes))
+                self.assertEqual(r.decode_allocator.get_total_size(), decode_bytes)
+                self.assertEqual(r.decode_allocator.get_base_ptr(), base)
+                for i, view in enumerate(r.prefill_buffers):
+                    self.assertEqual(view.get_ptr(), base + i * 1024)
+                    self.assertEqual(view.get_size(), 1024)
+                    self.assertEqual(view.device, view.buffer.device)
+                    self.assertIs(
+                        view.device_module, torch.get_device_module(view.buffer.device)
+                    )
+                r.prefill_buffers[0].buffer.fill_(7)
+                self.assertTrue(torch.all(r.decode_allocator.buffer.buffer[:1024] == 7))
+                self.assertIs(self.alloc.call_args.args[-1], self.pool)
+                for role in ("prefill", "decode") * 10:
+                    r.acquire(role)
+                    r.release(role)
+                r.engine.batch_register.assert_called_once_with([base], [r.capacity])
+                r.engine.batch_deregister.assert_not_called()
+                r.close()
+                r.close()
+                r.engine.batch_deregister.assert_called_once_with([base])
+
+    def test_allocator_survives_flip_and_old_watermark_cannot_unlock_wrap(self):
+        r = self.resource()
+        r.acquire("decode")
+        a = r.decode_allocator
+        for _ in range(5):
+            alloc_id, _, _ = a.assign(128)
+            a.free(alloc_id)
+        old_wm = a.get_watermark()
+        next_id = a.next_alloc_id
+        peer = PrefillStagingContext(remote_watermarks={"session": old_wm})
+        r.release("decode")
+        r.acquire("prefill")
+        r.prefill_buffers[0].buffer.fill_(42)
+        r.release("prefill")
+        r.acquire("decode")
+        self.assertIs(r.decode_allocator, a)
+        self.assertEqual(a.get_watermark(), old_wm)
+        self.assertEqual(a.next_alloc_id, next_id)
+        first, _, _ = a.assign(a.total_size)
+        second, _, second_round = a.assign(a.total_size)
+        self.assertFalse(
+            is_watermark_ready(peer, "session", second_round, a.total_size)
+        )
+        a.free(first)
+        wm = a.get_watermark()
+        handle_watermark_msg(
+            peer, [b"WATERMARK", str(wm[0]).encode(), str(wm[1]).encode(), b"session"]
+        )
+        handle_watermark_msg(
+            peer,
+            [
+                b"WATERMARK",
+                str(old_wm[0]).encode(),
+                str(old_wm[1]).encode(),
+                b"session",
+            ],
+        )
+        self.assertTrue(is_watermark_ready(peer, "session", second_round, a.total_size))
+        self.assertEqual(peer.remote_watermarks["session"], wm)
+        a.free(second)
+        r.release("decode")
+        r.close()
+
+    def test_busy_or_poisoned_storage_cannot_change_owner(self):
+        r = self.resource()
+        r.acquire("decode")
+        with self.assertRaises(RuntimeError):
+            r.acquire("prefill")
+        alloc_id, _, _ = r.decode_allocator.assign(128)
+        with self.assertRaisesRegex(RuntimeError, "allocations"):
+            r.release("decode")
+        r.decode_allocator.free(alloc_id)
+        r.poison("missing drain ACK")
+        with self.assertRaisesRegex(RuntimeError, "restart required"):
+            r.release("decode")
+        with self.assertRaises(RuntimeError):
+            r.close()
+        self.assertIsNotNone(r.backing)
+        r.engine.batch_deregister.assert_not_called()
+
+    def test_deregistration_errors_keep_storage_owned(self):
+        r = self.resource()
+        r.engine.batch_deregister.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "deregistration failed"):
+            r.close()
+        self.assertIsNotNone(r.backing)
+        r.engine.batch_deregister.return_value = 0
+        r.close()
+
+    def test_layout_cannot_change_between_roles(self):
+        args = SimpleNamespace(gpu_id=0, page_size=1, kv_item_lens=[128, 128])
+        for device_type in ("cuda", "cuda:7", "xpu", "xpu:7"):
+            with self.subTest(device_type=device_type):
+                r = self.resource(device_type=device_type)
+                bare_type = torch.device(device_type).type
+                self.assertEqual(r.device, f"{bare_type}:0")
+                self.assertEqual(self.alloc.call_args.args[2], r.device)
+                r.validate_layout(args, 4, 2, 4096, device_type=bare_type)
+                for chunk, size, device in (
+                    (8, 4096, bare_type),
+                    (4, 8192, bare_type),
+                    (4, 4096, "cpu"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "layout changed"):
+                        r.validate_layout(args, chunk, 2, size, device_type=device)
+                r.close()
+
+    def test_registration_errors_keep_storage_owned(self):
+        r = MooncakeStagingResource(
+            SimpleNamespace(
+                batch_register=Mock(return_value=-1),
+                batch_deregister=Mock(return_value=0),
+            ),
+            SimpleNamespace(gpu_id=0, page_size=1, kv_item_lens=[128]),
+            4,
+            2,
+            1024,
+            device_type="cuda",
+        )
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            r.initialize()
+        self.assertIsNotNone(r.backing)
+        with self.assertRaises(RuntimeError):
+            r.acquire("decode")
+        r.close()
+
+    def test_stream_finishes_before_role_is_released(self):
+        r = self.resource()
+        observed_roles = []
+        r.prefill_buffers[0]._gather_stream = SimpleNamespace(
+            synchronize=lambda: observed_roles.append(r.active_role)
+        )
+        r.acquire("prefill")
+        r.release("prefill")
+        self.assertEqual(observed_roles, ["prefill"])
+        r.acquire("decode")
+        r.release("decode")
+        r.close()
+        self.assertEqual(observed_roles, ["prefill", "decode", None])
+
+    def manager(self, r):
+        m = MooncakeKVManager.__new__(MooncakeKVManager)
+        m.staging_resource = r
+        m.disaggregation_mode = DisaggregationMode.PREFILL
+        m._stopped = False
+        m._staging_outstanding = {}
+        m._staging_ctx = PrefillStagingContext(buffers=r.prefill_buffers)
+        m._worker_threads = []
+        m.transfer_queues = []
+        m.executors = []
+        m._socket_lock = threading.Lock()
+        m._socket_cache = {}
+        m._monitor_cache = {}
+        m.server_socket = Mock()
+        m._zmq_ctx = Mock()
+        m.deregister_buffer_to_engine = Mock()
+        r.acquire("prefill")
+        return m
+
+    def test_executor_shutdown_failure_keeps_resource_borrowed(self):
+        r = self.resource()
+        m = self.manager(r)
+        executor = Mock()
+        executor.shutdown.side_effect = RuntimeError("executor failed")
+        m.executors = [executor]
+        with self.assertRaisesRegex(RuntimeError, "executor failed"):
+            m.teardown()
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        self.assertEqual(r.active_role, "prefill")
+        self.assertIn("executor shutdown failed", r.unsafe_reason)
+        self.assertIsNotNone(r.backing)
+        m.deregister_buffer_to_engine.assert_not_called()
+
+    def test_manager_teardown_does_not_release_next_roles_lease(self):
+        r = self.resource()
+        m = self.manager(r)
+        m.teardown()
+        r.engine.batch_deregister.assert_not_called()
+        r.acquire("decode")
+        m.teardown()  # Must not release the next manager's lease.
+        self.assertEqual(r.active_role, "decode")
+        r.release("decode")
+        r.close()
+
+    def test_unstopped_worker_keeps_resource_borrowed(self):
+        r = self.resource()
+        m = self.manager(r)
+        m._worker_threads = [Mock(is_alive=Mock(return_value=True))]
+        with self.assertRaisesRegex(RuntimeError, "did not stop"):
+            m.teardown()
+        self.assertEqual(r.active_role, "prefill")
+        m.deregister_buffer_to_engine.assert_not_called()
+
+    def test_pending_queue_is_not_idle(self):
+        r = self.resource()
+        m = self.manager(r)
+        q = FastQueue()
+        q.put(object())
+        m.transfer_queues = [q]
+        self.assertIn("queues", m.check_staging_role_switch_ready())
+        q.get()
+        m.transfer_queues = []
+        m.teardown()
+        r.close()
+
+    def test_prefetch_socket_and_its_private_context_are_closed(self):
+        r = self.resource()
+        m = self.manager(r)
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.PUSH)
+        sock.bind("inproc://shared-staging-prefetch")
+        m._staging_ctx.prefetch_sockets["peer"] = sock
+        endpoints = m._staging_ctx.prefetch_endpoints
+        endpoints["peer"] = "inproc://shared-staging-prefetch"
+        m.teardown()
+        self.assertEqual(endpoints, {})
+        self.assertTrue(sock.closed)
+        self.assertTrue(ctx.closed)
+        self.assertIsNone(r.active_role)
+        r.close()
+
+    def test_decode_endpoint_change_replaces_prefetch_socket(self):
+        ctx = zmq.Context()
+        listeners = [ctx.socket(zmq.PULL), ctx.socket(zmq.PULL)]
+        ports = [s.bind_to_random_port("tcp://127.0.0.1") for s in listeners]
+        sockets, requested, endpoints = {}, set(), {}
+        try:
+            for room, listener_index in enumerate((0, 0, 1)):
+                port = ports[listener_index]
+                info = SimpleNamespace(
+                    is_dummy=False,
+                    dst_kv_indices=[0],
+                    endpoint="localhost",
+                    dst_port=port,
+                )
+                old = sockets.get("same-session")
+                old_ctx = old.context if old is not None else None
+                with patch.object(
+                    zmq.Socket,
+                    "getsockopt_string",
+                    side_effect=AssertionError("must not query LAST_ENDPOINT"),
+                ):
+                    prefetch_staging_reqs(
+                        room,
+                        {room: {"same-session": info}},
+                        {"page_size": 1},
+                        1,
+                        requested,
+                        sockets,
+                        session_endpoints=endpoints,
+                    )
+                self.assertTrue(listeners[listener_index].poll(2000))
+                self.assertEqual(
+                    listeners[listener_index].recv_multipart()[0], b"STAGING_REQ"
+                )
+                self.assertEqual(len(sockets), 1)
+                self.assertEqual(endpoints["same-session"], f"tcp://localhost:{port}")
+                if room == 1:
+                    self.assertIs(sockets["same-session"], old)
+                    self.assertFalse(old.closed)
+                elif room == 2:
+                    self.assertTrue(old.closed)
+                    self.assertTrue(old_ctx.closed)
+        finally:
+            for sock in sockets.values():
+                owner = sock.context
+                sock.close(linger=0)
+                owner.term()
+            for sock in listeners:
+                sock.close(linger=0)
+            ctx.term()
+
+    def test_handler_close_detaches_without_resetting_allocator(self):
+        r = self.resource()
+        handler = DecodeStagingHandler.__new__(DecodeStagingHandler)
+        handler._room_to_decode_req = {7: object()}
+        handler._room_to_receiver = {7: object()}
+        handler._writer_counts = {7: {0: [(0, 1, "writer")]}}
+        self.assertIn("rooms", handler.check_idle())
+        handler._room_to_decode_req.clear()
+        self.assertIn("rooms", handler.check_idle())
+        handler._room_to_receiver.clear()
+        # An arrival after unregister can recreate a nonempty orphan entry.
+        self.assertIsNone(handler.check_idle())
+        handler._writer_counts[7].clear()
+        self.assertIsNone(handler.check_idle())
+        handler._writer_counts[7][0] = [(0, 1, "writer")]
+        handler._wm_subscribers = {"peer": object()}
+        handler.staging_allocator = r.decode_allocator
+        handler.kv_manager = handler.scheduler = handler.kv_buffer_info = object()
+        handler.close()
+        self.assertIsNone(handler.kv_manager)
+        self.assertIsNone(handler.scheduler)
+        self.assertIsNone(handler.staging_allocator)
+        self.assertEqual(handler._wm_subscribers, {})
+        self.assertIsNotNone(r.decode_allocator)
+        r.close()
+
+    def test_deferred_release_requires_confirmed_drain_for_future_switches(self):
+        for drained in (False, True):
+            with self.subTest(drained=drained):
+                r = self.resource()
+                receiver = SimpleNamespace(
+                    kv_mgr=SimpleNamespace(
+                        staging_resource=r,
+                        is_abort_release_safe=Mock(return_value=drained),
+                    )
+                )
+                req = SimpleNamespace(
+                    req=SimpleNamespace(bootstrap_room=7), kv_receiver=receiver
+                )
+                q = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                q._deferred_releases = [(req, 0, 0, 0, 1)]
+                q.enable_host_receive = False
+                q.deferred_kv_release_timeout = 1
+                q._do_release = Mock()
+                q._observe_deferred_kv_release = Mock()
+                q.gloo_group = object()
+                with patch("torch.distributed.get_world_size", return_value=1):
+                    q.resolve_deferred_releases()
+                q._do_release.assert_called_once_with(req, 0)
+                self.assertEqual(r.unsafe_reason is None, drained)
+                if drained:
+                    r.acquire("prefill")
+                    r.release("prefill")
+                    r.close()
+
+    def test_deferred_release_resource_lookup_failure_is_isolated(self):
+        resource = SimpleNamespace(poison=Mock())
+        manager = SimpleNamespace(
+            staging_resource=resource, is_abort_release_safe=lambda *args: True
+        )
+        receiver = Mock()
+        type(receiver).kv_mgr = PropertyMock(
+            side_effect=[manager, RuntimeError("lookup failed")]
+        )
+        good = SimpleNamespace(
+            kv_receiver=SimpleNamespace(kv_mgr=manager),
+            req=SimpleNamespace(bootstrap_room=1),
+        )
+        bad = SimpleNamespace(
+            kv_receiver=receiver, req=SimpleNamespace(bootstrap_room=2)
+        )
+        q = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        q._deferred_releases = [
+            (good, 0, 0, 0, 1),
+            (bad, 0, 0, 1, 1),
+            (good, 0, 0, 2, 1),
+        ]
+        q.enable_host_receive = False
+        q._do_release = Mock()
+        q._observe_deferred_kv_release = Mock()
+        q.gloo_group = object()
+        with patch("torch.distributed.get_world_size", return_value=1):
+            q.resolve_deferred_releases()
+        self.assertEqual(q._do_release.call_count, 2)
+        self.assertEqual([c.args[1] for c in q._do_release.call_args_list], [0, 2])
+        self.assertEqual(
+            [
+                c.kwargs["outcome"]
+                for c in q._observe_deferred_kv_release.call_args_list
+            ],
+            ["drained", "error", "drained"],
+        )
+        resource.poison.assert_not_called()
+        self.assertEqual(q._deferred_releases, [])
 
 
 if __name__ == "__main__":

@@ -592,6 +592,7 @@ class TestMooncakeStagingDeviceType(unittest.TestCase):
     def _manager():
         return SimpleNamespace(
             kv_args=SimpleNamespace(gpu_id=3),
+            staging_resource=None,
             _staging_ctx=SimpleNamespace(buffers=None, allocator=None),
             kv_buffer_tensors=MagicMock(),
             _register_staging_memory=MagicMock(),

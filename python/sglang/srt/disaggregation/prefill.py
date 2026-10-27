@@ -361,6 +361,14 @@ class PrefillBootstrapQueue:
             if self.transfer_backend == TransferBackend.ASCEND
             else {}
         )
+        if (
+            self.transfer_backend == TransferBackend.MOONCAKE
+            and get_disagg().enable_pd_role_switch
+            and envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        ):
+            kv_manager_kwargs["staging_resource"] = (
+                self.scheduler.get_or_create_pd_staging_resource(kv_args)
+            )
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
