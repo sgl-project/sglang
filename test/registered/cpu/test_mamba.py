@@ -1,4 +1,6 @@
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import sgl_kernel  # noqa: F401
@@ -189,8 +191,9 @@ def _chunk_factors(q, k, gate, beta, scale):
     return torch.tril(aqk), inverse
 
 
-def _torch_chunk_kda(query, key, value, gate, beta, state):
-    dtype, scale = query.dtype, query.shape[-1] ** -0.5
+def _torch_chunk_kda(query, key, value, gate, beta, state, scale=None):
+    dtype = query.dtype
+    scale = query.shape[-1] ** -0.5 if scale is None else scale
     group = value.shape[1] // query.shape[1]
     q, k = [
         l2norm(x.float()).to(dtype).transpose(0, 1).float().repeat_interleave(group, 0)

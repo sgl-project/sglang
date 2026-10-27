@@ -37,8 +37,9 @@ from sglang.srt.utils.log_utils import rank0_log
 if is_npu():
     from sgl_kernel_npu.operators.mamba import causal_conv1d_update
 elif is_cpu():
-    from sgl_kernel.mamba import causal_conv1d_update_cpu
+    from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
+    causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
@@ -986,7 +987,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     )
 
         qkv = causal_conv1d_update(
-            mixed_qkv,
+            mixed_qkv.contiguous() if is_cpu() else mixed_qkv,
             conv_states.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
@@ -1062,6 +1063,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
+        if is_cpu():
+            # Canonicalize the row stride even for a one-token projection slice.
+            mixed_qkv = mixed_qkv.contiguous().view_as(mixed_qkv)
         split_size = (
             layer.q_dim
             if self.kernel_dispatcher.prefill_backend.is_flashinfer()
