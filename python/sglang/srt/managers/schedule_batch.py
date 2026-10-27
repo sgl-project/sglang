@@ -1467,6 +1467,14 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+        # Skip-join MLFQ state (managers/skip_join_mlfq.py); a None level means not
+        # placed yet. It survives retraction, so a returning request keeps its level.
+        self.mlfq_level: Optional[int] = None
+        self.mlfq_runs: int = 0  # forward passes charged; 0 means never run
+        self.mlfq_service_s: float = 0.0
+        self.mlfq_level_entry_time: float = 0.0
+        self.mlfq_last_service_time: float = 0.0
+
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""
         if not self.mm_token_counts_ready and self.multimodal_inputs is not None:

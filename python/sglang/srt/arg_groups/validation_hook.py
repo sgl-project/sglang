@@ -278,12 +278,22 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    if cfg.schedule_policy == "sj-mlfq":
+        # The MLFQ level is the request priority, higher values first.
+        assert (
+            cfg.enable_priority_scheduling
+            and not cfg.schedule_low_priority_values_first
+        ), (
+            "--schedule-policy sj-mlfq requires --enable-priority-scheduling "
+            "with the default higher-values-first order."
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
             "lof",
+            "sj-mlfq",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof' or 'sj-mlfq'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.default_priority_value is None:
             logger.warning(

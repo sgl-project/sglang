@@ -7,7 +7,7 @@ from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -225,6 +225,54 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestSkipJoinMlfq(CustomTestCase):
+    def _policy(self, enable_priority_scheduling=True):
+        return SchedulePolicy(
+            policy="sj-mlfq",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=enable_priority_scheduling,
+            schedule_low_priority_values_first=False,
+        )
+
+    def make_req(self, rid, uncached, *, cached=0):
+        req = _make_req(rid, "", list(range(uncached + cached)))
+        req.full_untruncated_fill_ids = req.origin_input_ids[:]
+        req.num_matched_prefix_tokens = cached
+        req.prefix_len = cached
+        return req
+
+    def test_requires_priority_scheduling(self):
+        # The level is the request priority; without priority scheduling it is ignored.
+        with self.assertRaises(ValueError):
+            self._policy(enable_priority_scheduling=False)
+
+    def test_orders_by_predicted_prefill_time_and_gates_on_running_levels(self):
+        with published_topology(
+            schedule_policy="sj-mlfq", enable_priority_scheduling=True
+        ):
+            policy = self._policy()
+        # Seed cost: 256 uncached tokens is 18 ms (level 1); a returning turn of
+        # 500 uncached on 4,500 cached is 45 ms (level 3); 8,000 fresh is 0.58 s
+        # (level 6). Only the uncached work and the cached prefix set the level.
+        long, short, turn = (
+            self.make_req("long", 8000),
+            self.make_req("short", 256),
+            self.make_req("turn", 500, cached=4500),
+        )
+        queue = [long, short, turn]
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            policy.calc_priority(queue)
+        self.assertEqual([r.rid for r in queue], ["short", "turn", "long"])
+        self.assertEqual([r.priority for r in queue], [-1, -3, -6])
+        # Nothing running: the gate is open. A level-3 request running: level 6 waits.
+        self.assertIsNone(policy.prefill_gate_level([]))
+        self.assertFalse(policy.gate_blocks(long, policy.prefill_gate_level([])))
+        self.assertEqual(policy.prefill_gate_level([turn]), 3)
+        self.assertTrue(policy.gate_blocks(long, 3))
+        self.assertFalse(policy.gate_blocks(short, 3))
 
 
 if __name__ == "__main__":
