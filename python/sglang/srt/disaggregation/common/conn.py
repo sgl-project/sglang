@@ -1332,6 +1332,17 @@ class CommonKVManager(BaseKVManager):
             )
 
         if (
+            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            and info.attn_tp_size != self.attn_tp_size
+        ):
+            # MiniMax main KV pages are head-major page rows and its index state
+            # is replicated per rank; neither can be resliced by attention head.
+            raise RuntimeError(
+                "MiniMax sparse PD requires matching attention TP sizes: "
+                f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
+            )
+
+        if (
             info.kv_layout is not None
             and self.kv_layout is not None
             and info.kv_layout != self.kv_layout
