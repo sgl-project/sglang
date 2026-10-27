@@ -54,7 +54,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self.is_draft_worker = cuda_graph_runner.model_runner.is_draft_worker
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
-        self._eplb_capture_states: Dict[ShapeKey, tuple[str, ...]] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -99,21 +98,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
-        from sglang.srt.hardware_backend.npu.eplb_statistics import (
-            get_graph_capture_state,
-            on_graph_capture_forward_start,
-        )
-
-        def run_once():
-            on_graph_capture_forward_start()
-            return forward_fn()
-
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            run_once()
+            forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -145,11 +135,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 auto_dispatch_capture=True,
             ),
         ):
-            out = run_once()
+            out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-        self._eplb_capture_states[shape_key] = get_graph_capture_state()
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -164,19 +153,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._prepare_eplb_replay(shape_key)
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
-
-    def _prepare_eplb_replay(self, shape_key: ShapeKey) -> None:
-        state = self._eplb_capture_states[shape_key]
-        if not state:
-            return
-        from sglang.srt.hardware_backend.npu.eplb_statistics import (
-            on_graph_replay_forward_start,
-        )
-
-        on_graph_replay_forward_start(state)
 
     def replay_with_input_update(
         self,
@@ -210,7 +188,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
-        self._prepare_eplb_replay(shape_key)
         graph.replay()
         update_future.result()
 
@@ -223,5 +200,4 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
-        self._eplb_capture_states.clear()
         self._pool = None

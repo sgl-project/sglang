@@ -40,7 +40,6 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         shape_key = ShapeKey(size=2)
         backend._graphs[shape_key] = graph
         backend._outputs[shape_key] = "output"
-        backend._eplb_capture_states[shape_key] = ()
 
         output = backend.replay_with_input_update(
             shape_key,
