@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import MOE
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -21,7 +23,7 @@ from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 TOKENS_PER_TUBELET = 4
 HIDDEN_SIZE = 8
@@ -97,15 +99,20 @@ class TestNemotronHOmniVideo(CustomTestCase):
     def test_evs_keeps_image_pad_values_for_redistribution(self):
         """EVS placeholder redistribution must not restore raw image tokens next to a video."""
         start, end, image_token = 1, 2, 18
-        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[], hash=11)
+        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[(2, 2)], hash=11)
         video = _video_item([2], pre_chunked_input_ids=[])
+        video.offsets = [(5, 5)]
         video.hash = 22
         for item in (image, video):
             item.set_pad_value()
         input_ids = array("q", [7, start, image_token, end, start, image_token, end])
         video.pre_chunked_input_ids = input_ids.tolist()
         mm_inputs = MultimodalInputs(
-            mm_items=[image, video], im_start_id=start, im_end_id=end
+            mm_items=[image, video],
+            im_start_id=start,
+            im_end_id=end,
+            im_token_id=image_token,
+            video_token_id=image_token,
         )
 
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
@@ -137,6 +144,36 @@ class TestNemotronHOmniModel(CustomTestCase):
 
         self.assertIs(model_class, NemotronH_Omni_Reasoning_V3)
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
+
+    def test_lora_scope_excludes_the_vision_tower(self):
+        """RADIO qkv_proj under a layers.<i>. path is outside the LoRA scope."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+
+        self.assertTrue(
+            model.should_apply_lora("language_model.model.layers.7.mixer.qkv_proj")
+        )
+        self.assertFalse(
+            model.should_apply_lora(
+                "vision_model.radio_model.model.encoder.layers.7.attn.attn.qkv_proj"
+            )
+        )
+
+    def test_lora_shape_hooks_reach_the_language_model(self):
+        """The LoRA shape hooks forward to the inner language model."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        model.language_model = SimpleNamespace(
+            get_hidden_dim=lambda module_name, layer_idx: (module_name, layer_idx),
+            get_stacked_multiply=lambda module_name: (module_name, "mult"),
+        )
+
+        self.assertEqual(model.get_hidden_dim("out_proj", 5), ("out_proj", 5))
+        self.assertEqual(
+            model.get_stacked_multiply("gate_up_proj_moe"),
+            ("gate_up_proj_moe", "mult"),
+        )
+        self.assertIn("in_proj", NemotronH_Omni_Reasoning_V3.supported_lora_modules)
 
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
@@ -250,6 +287,24 @@ class TestNemotronHOmniModel(CustomTestCase):
             [name for name, _ in loaded_sound_weights],
             ["sound_encoder.projection.weight"],
         )
+
+    def test_expert_location_config_spans_full_hybrid_stack(self):
+        """The VL wrapper exposes the full-stack expert-location config for EPLB."""
+        pattern = "ME*E-E"
+        llm_config = NemotronHConfig(
+            hybrid_override_pattern=pattern, n_routed_experts=8, n_group=1
+        )
+
+        expert_config = (
+            NemotronH_Omni_Reasoning_V3.get_model_config_for_expert_location(
+                SimpleNamespace(llm_config=llm_config)
+            )
+        )
+
+        self.assertEqual(expert_config.num_layers, len(pattern))
+        moe_layer_ids = [i for i, c in enumerate(pattern) if c == MOE]
+        self.assertLess(max(moe_layer_ids), expert_config.num_layers)
+        self.assertEqual(expert_config.num_logical_experts, 8)
 
 
 if __name__ == "__main__":

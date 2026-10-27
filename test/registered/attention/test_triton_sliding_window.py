@@ -15,8 +15,8 @@ from sglang.test.test_utils import (
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=80, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=91, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=200, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):
