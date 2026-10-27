@@ -210,6 +210,8 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
+                    get_eager_max_batch_size=lambda bs: bs,
+                    max_speculative_num_draft_tokens=lambda: width,
                     max_prefill_buffer_tokens=lambda: 4096,
                     get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
                 ),
