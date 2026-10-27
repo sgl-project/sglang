@@ -63,6 +63,30 @@ class TestCpuParamOffloader(unittest.TestCase):
 
                 self.assertFalse(getattr(output, "is_shuffled", False))
 
+    def test_forward_observes_tag_and_restores_host_parameter(self):
+        module, param_offloader = self._make_offloader(is_shuffled=True)
+        host_parameter = module.w13_weight
+        module.forward = lambda: (
+            module.w13_weight.sum(),
+            getattr(module.w13_weight, "is_shuffled", False),
+        )
+        on_forward_end = mock.Mock()
+        offloader._hook_module_forward_raw(
+            module,
+            on_forward_end=on_forward_end,
+            get_parameter_and_buffer_dicts=lambda: {
+                "w13_weight": self._create_device_tensor(param_offloader)
+            },
+        )
+
+        for _ in range(2):
+            value, is_shuffled = module()
+
+            self.assertTrue(is_shuffled)
+            torch.testing.assert_close(value, host_parameter.sum())
+            self.assertIs(module.w13_weight, host_parameter)
+        self.assertEqual(on_forward_end.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
