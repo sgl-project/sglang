@@ -218,6 +218,23 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 [{"role": "user", "content": "hi"}, {"role": "user", "content": "Hel"}]
             ),
         )
+        # A null content is "", and the trailing turn's tool calls are discarded.
+        calling = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "a", "type": "function", "function": {"name": "f"}}],
+        }
+        for fields in ({}, {"continue_final_message": True}):
+            self.assertEqual(
+                prompt([{"role": "user", "content": "hi"}, calling], **fields),
+                prompt(
+                    [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": ""},
+                    ],
+                    **fields,
+                ),
+            )
         # A task renders its own tail; the continued prefix follows it.
         self.assertEqual(
             prompt(
@@ -228,6 +245,27 @@ class TestHandlerRequestSemantics(CustomTestCase):
             prompt([{"role": "user", "content": "hi"}], task="title")
             + self.tokenizer.encode("Hel", add_special_tokens=False),
         )
+
+    def test_null_tool_result_is_empty(self):
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        chat = _serving(self, self.tokenizer)
+
+        def prompt(result):
+            call = {
+                "id": "a",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }
+            messages = [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "a", "content": result},
+            ]
+            request = ChatCompletionRequest(messages=messages)
+            return chat._process_messages(request, False).prompt_ids
+
+        self.assertEqual(prompt(None), prompt(""))
 
     def test_tool_result_images_follow_prompt_order(self):
         """Out-of-order tool results render in call order; their images must follow."""
@@ -280,18 +318,20 @@ class TestHandlerRequestSemantics(CustomTestCase):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
         chat = _serving(self, self.tokenizer)
-        request = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "hi"}],
-            temperature=0.0,
-            chat_template_kwargs={"thinking": True, "reasoning_effort": 30},
-        )
-        adapted, _ = chat._convert_to_internal_request(request)
+        # A numeric string budget is the number it spells.
+        for effort in (30, "30", "0.3"):
+            request = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.0,
+                chat_template_kwargs={"thinking": True, "reasoning_effort": effort},
+            )
+            adapted, _ = chat._convert_to_internal_request(request)
+            self.assertIn(
+                "Reasoning Effort: 30 (range 1-100",
+                self.tokenizer.decode(adapted.input_ids),
+            )
         self.assertEqual(adapted.sampling_params["temperature"], 0.0)
         self.assertIsNone(adapted.sampling_params["max_new_tokens"])
-        self.assertIn(
-            "Reasoning Effort: 30 (range 1-100",
-            self.tokenizer.decode(adapted.input_ids),
-        )
         titled = self._prompt(chat, task="title").prompt_ids
         self.assertEqual(titled[-1], self._token("<｜title｜>"))
 
