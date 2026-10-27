@@ -585,20 +585,8 @@ class DSV4AttnMetadata:
         pool = self.trtllm_table_pool
         assert pool is not None, "trtllm metadata requires the table pool"
 
-        # Not pool-backed: both are read outside this step (eager prefill per-layer reads).
-        n_pad = ceil_align(num_tokens, 64)
-        if n_pad != num_tokens:
-
-            def _tile_padded_step(fill, src, width=None):
-                shape = (n_pad,) if width is None else (n_pad, width)
-                buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-                buf[:num_tokens].copy_(src)
-                return buf[:num_tokens]
-
-            self.seq_lens_casual = _tile_padded_step(1, self.seq_lens_casual)
-            self.swa_page_indices = _tile_padded_step(
-                -1, self.swa_page_indices, width=swa_width
-            )
+        # seq_lens_casual and swa_page_indices need no tile pad: the dense per-token
+        # call reads rows [:num_tokens] only.
         wide_swa = swa_width > SWA_WINDOW
         self.trtllm_swa_lens = pool.view(
             "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=wide_swa

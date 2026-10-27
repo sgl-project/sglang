@@ -227,6 +227,73 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
         self.backend._tail_refresh_layers = frozenset()
         self.assertEqual(_pdl_into_attention(pack_then_run), [True])
 
+    def test_decode_reads_no_metadata_row_past_the_batch(self):
+        """seq_lens_casual and swa_page_indices come without a tile pad, so rows
+        past the batch hold whatever the allocator left there (poisoned here, as
+        are the pool tables' pad rows); outputs must match exact-size tables."""
+        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+
+        bad = 1 << 30  # out-of-range seq lens / slots: a read would show
+
+        def live_then_poison(live):
+            buf = torch.full(
+                (64, *live.shape[1:]), bad, dtype=live.dtype, device="cuda"
+            )
+            buf[:ROWS].copy_(live)
+            return buf[:ROWS]
+
+        seq_lens = torch.randint(1, 2 * SWA, (ROWS,), dtype=torch.int32, device="cuda")
+        tail_lens = torch.randint(
+            1, TAIL + 1, (ROWS,), dtype=torch.int32, device="cuda"
+        )
+        swa, extra, q = _idx(ROWS, SWA), _idx(ROWS, TAIL), _fp8(ROWS, HEADS, 512)
+        window = torch.full((ROWS,), SWA, dtype=torch.int32, device="cuda")
+        # DSpark draft rows: window + 64-slot block, bounded by the block's lengths.
+        wide = torch.cat([swa, _idx(ROWS, 64)], dim=1)
+        block_lens = torch.randint(
+            SWA, SWA + 65, (ROWS,), dtype=torch.int32, device="cuda"
+        )
+        for ratio, swa_table in ((0, swa), (4, swa), (0, wide)):
+            dspark = swa_table.shape[1] > SWA
+            core = SimpleNamespace(
+                seq_lens_casual=live_then_poison(seq_lens),
+                swa_page_indices=live_then_poison(swa_table),
+                swa_topk_lengths=live_then_poison(block_lens),
+                trtllm_swa_lens=live_then_poison(block_lens if dspark else window),
+                trtllm_c4_indices=live_then_poison(
+                    torch.cat([swa, torch.full_like(extra, -1)], 1)
+                ),
+                trtllm_c4_lens=live_then_poison(window),
+                _c4_topk_writes_table=lambda: False,
+                sparse_topk_lengths=lambda compress_ratio: tail_lens,
+            )
+            out = self.backend._forward_trtllm_decode(
+                q=q,
+                layer=self.layer,
+                compress_ratio=ratio,
+                core_attn_metadata=core,
+                attn_sink=self.sink,
+                extra_indices=extra if ratio else None,
+            )
+            ref = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q.view(ROWS, 1, HEADS, 512),
+                swa_kv_cache=self.kv[0],
+                workspace_buffer=self.ref_workspace,
+                sparse_indices=torch.cat([swa, extra], 1)
+                if ratio
+                else swa_table.clone(),
+                compressed_kv_cache=self.kv[0] if dspark else self.kv[1],
+                sparse_topk_lens=tail_lens + SWA
+                if ratio
+                else (block_lens if dspark else window).clone(),
+                seq_lens=(block_lens if dspark else seq_lens).clone(),
+                bmm1_scale=SCALE,
+                sinks=self.sink,
+                backend="trtllm-gen",
+            ).view(ROWS, HEADS, 512)
+            with self.subTest(ratio=ratio, dspark=dspark):
+                self.assertTrue(torch.equal(out, ref))
+
     def test_prefill(self):
         # A new 3-token request (inside the SWA window) and 9 tokens after an 8K
         # prefix, one dense row per token; q is padded to 16 rows.
