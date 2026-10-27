@@ -30,10 +30,12 @@ Decision model (precision vs full)
 ----------------------------------
 Precision mode has the highest priority: when --precision-mode is not 'true',
 every suite runs in full, no matter what was recommended. Otherwise a full run
-is triggered by only two signals:
+is triggered by only three signals:
 
   - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
   - a missing changed-file list (test_selector.py failed),
+  - no suite enumerating a single registered file (the enumeration itself is
+    broken: unreadable test tree or list_tests/run_suite drift),
 
 plus the multimodal baseline safety gate described below.
 
@@ -634,6 +636,19 @@ def main():
             f"Suite {suite}: {len(suite_files)} files, {len(intersection)} recommended"
         )
 
+    # One 0-file suite is a real registry state (that suite registers no PR
+    # test). EVERY suite enumerating 0 files is not: it means test/registered
+    # was unreadable or list_tests.py drifted from run_suite.py, so the
+    # enumeration cannot be trusted and no suite may be skipped.
+    enumeration_empty = bool(suites) and not any(
+        suite_pool_sizes[suite] for suite in suites
+    )
+    if enumeration_empty:
+        print(
+            "::warning::No suite enumerated any registered test file; the "
+            "enumeration cannot be trusted, so every suite runs in full"
+        )
+
     if diffusion_suites:
         map_keys = (
             load_multimodal_map_keys(Path(args.case_map)) if args.case_map else None
@@ -699,6 +714,9 @@ def main():
         # means it failed, so there is no evidence to narrow anything down.
         decision = "full"
         decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+    elif enumeration_empty:
+        decision = "full"
+        decision_reason = "no suite enumerated any registered test file"
     elif full_run_paths:
         decision = "full"
         decision_reason = "pipeline configuration changed: " + ", ".join(full_run_paths)
