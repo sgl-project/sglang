@@ -650,6 +650,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_bole_spec: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -880,11 +881,19 @@ class MambaPool:
                 if enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
+                    # Bole keeps per-step low-rank factors in its own workspace
+                    # and rebuilds the accepted state on commit, so the
+                    # per-draft snapshot axis is empty (the tensor stays
+                    # non-None for code that reads its layout).
                     intermediate_ssm_state_cache = torch.zeros(
                         size=(
                             num_mamba_layers,
                             spec_state_size + 1,
-                            speculative_num_draft_tokens,
+                            (
+                                0
+                                if enable_linear_bole_spec
+                                else speculative_num_draft_tokens
+                            ),
                             temporal_state_shape[0],
                             temporal_state_shape[1],
                             temporal_state_shape[2],
@@ -975,6 +984,13 @@ class MambaPool:
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
                 )
+                self.bole_verifier = None
+                if enable_linear_bole_spec:
+                    from sglang.srt.layers.attention.linear.bole_spec import (
+                        BoleSpecVerifier,
+                    )
+
+                    self.bole_verifier = BoleSpecVerifier(temporal_state)
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
                     if intermediate_ssm_state_cache is not None
@@ -1378,6 +1394,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_bole_spec: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1417,6 +1434,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_linear_bole_spec=enable_linear_bole_spec,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1437,6 +1455,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_bole_spec: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1455,6 +1474,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_linear_bole_spec=enable_linear_bole_spec,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

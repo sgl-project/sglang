@@ -522,6 +522,46 @@ def handle_linear_attn_backend(server_args: Any):
                 cfg.mamba_ssm_dtype,
             )
 
+    # Bole spec-verify: the factor kernels solve one causal draft chain per
+    # request with the triton verify path, and replace the recurrent verify's
+    # per-draft snapshots (so ReplaySSM spec-verify cannot be stacked on top).
+    if cfg.enable_linear_bole_spec:
+        if cfg.speculative_eagle_topk not in (None, 1):
+            raise ValueError(
+                "--enable-linear-bole-spec requires a linear draft chain "
+                "(--speculative-eagle-topk in {None, 1}); got "
+                f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+            )
+        verify = cfg.linear_attn_verify_backend or (
+            "flashinfer" if decode == "flashinfer" else "triton"
+        )
+        if verify != "triton":
+            raise ValueError(
+                "--enable-linear-bole-spec requires the triton linear-attn "
+                f"verify backend, got {verify!r} (set "
+                "--linear-attn-verify-backend triton)."
+            )
+        if cfg.enable_linear_replayssm_spec:
+            raise ValueError(
+                "--enable-linear-bole-spec and --enable-linear-replayssm-spec "
+                "are mutually exclusive: both replace the per-draft snapshots."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-linear-bole-spec is not supported under PD "
+                f"disaggregation, got --disaggregation-mode={cfg.disaggregation_mode!r}."
+            )
+        if cfg.mamba_ssm_dtype not in (None, "float32", "bfloat16"):
+            raise ValueError(
+                "--enable-linear-bole-spec supports --mamba-ssm-dtype float32 "
+                f"or bfloat16, got {cfg.mamba_ssm_dtype!r}."
+            )
+        if cfg.linear_bole_workspace_mb < 0:
+            raise ValueError(
+                "--linear-bole-workspace-mb must be >= 0, got "
+                f"{cfg.linear_bole_workspace_mb}."
+            )
+
 
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.
