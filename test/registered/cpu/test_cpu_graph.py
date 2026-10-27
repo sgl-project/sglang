@@ -78,6 +78,10 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
             3, num_tokens
         ),
         mm_inputs=None,
+        return_logprob=False,
+        input_embeds=None,
+        replace_embeds=None,
+        contains_mm_inputs=lambda: False,
     )
 
 

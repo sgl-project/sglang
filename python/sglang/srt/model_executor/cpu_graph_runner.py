@@ -2059,7 +2059,7 @@ class CPUGraphRunner:
             self._prefill_graph_model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=True if self.enable_dynamic_graph else None,
+            dynamic=None,
             model_forward=(
                 self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
@@ -2158,31 +2158,6 @@ class CPUGraphRunner:
                 )
         return forward
 
-    def _compile_prefill_dynamic_batch_one(self) -> Callable:
-        with patch_model(
-            self._prefill_graph_model,
-            self.enable_torch_compile,
-            tp_group=get_parallel().tp_group,
-            dynamic=True,
-            model_forward=(
-                self._prefill_original_forward
-                if self._prefill_uses_eager_logits_tail
-                else None
-            ),
-        ) as forward:
-            for num_tokens in sorted(
-                {self.prefill_max_num_tokens, max(self.prefill_max_num_tokens // 2, 1)}
-            ):
-                self._warmup_prefill_callable(
-                    forward,
-                    num_tokens,
-                    mark_token_axis_dynamic=True,
-                    warmup_bs_values=[1],
-                    mark_request_axis_dynamic=False,
-                    save_dynamic_template=False,
-                )
-        return forward
-
     def _rewarm_decode_dynamic_graphs(self) -> None:
         """Re-establish decode variants after prefill warmup.
 
@@ -2241,10 +2216,11 @@ class CPUGraphRunner:
                 num_tokens
             )
 
-        if self.enable_dynamic_graph:
-            log_info_on_rank0(logger, "Compiling CPU prefill dynamic fallback graph")
+        if self.enable_dynamic_graph and self.prefill_max_bs >= 2:
+            log_info_on_rank0(
+                logger, "Compiling CPU prefill dynamic fallback graph (bs >= 2)"
+            )
             self.prefill_dynamic_graph = self._compile_prefill_dynamic_fallback()
-            self.prefill_dynamic_graph_bs1 = self._compile_prefill_dynamic_batch_one()
 
         self._compile_decode_dynamic_graphs()
         # Prefill warmups run after the decode capture reset and mutate the
@@ -2272,6 +2248,11 @@ class CPUGraphRunner:
             # Vision preprocessing depends on Python-side multimodal objects;
             # keep that path eager until it has a tensor-only graph contract.
             return False
+        if forward_batch.batch_size == 1:
+            if raw_num_tokens in self.prefill_graphs_bs1:
+                return True
+            return self._get_prefill_padding_bucket(raw_num_tokens) is not None
+
         if raw_num_tokens > self.prefill_max_num_tokens:
             return self.prefill_dynamic_graph is not None
         if raw_num_tokens in self.prefill_graphs:
@@ -2341,13 +2322,15 @@ class CPUGraphRunner:
                         forward_batch.out_cache_loc, (0, pad_len), value=0
                     )
                 forward_batch = padded_fb
-            elif self.prefill_dynamic_graph is not None:
+            elif not use_batch_one_graph and self.prefill_dynamic_graph is not None:
                 using_dynamic_fallback = True
-                if use_batch_one_graph and self.prefill_dynamic_graph_bs1 is not None:
-                    compiled_fn = self.prefill_dynamic_graph_bs1
-                else:
-                    compiled_fn = self.prefill_dynamic_graph
-                    forward_batch = self._prepare_dynamic_prefill_batch(forward_batch)
+                compiled_fn = self.prefill_dynamic_graph
+                forward_batch = self._prepare_dynamic_prefill_batch(forward_batch)
+
+        assert compiled_fn is not None, (
+            f"No suitable prefill graph found for batch_size={forward_batch.batch_size}, "
+            f"num_tokens={raw_num_tokens}."
+        )
 
         if self.enable_torch_compile and not use_batch_one_graph:
             self._mark_dynamic_request_axis(forward_batch)
