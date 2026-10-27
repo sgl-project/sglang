@@ -1,7 +1,7 @@
 """Eligibility tests for the Path B fused swiglu kernel.
 
 The fused kernel recomputes the gate matmul and has no slot for the per-expert
-learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse`` must
+learned bias QuantizedSwitchLinear adds after the matmul, so ``can_patch`` must
 exclude a gate carrying one, and the patch must leave such a layer unfused.
 Runs only on Apple Silicon with MLX, via stage-a-unit-test-mlx.
 """
