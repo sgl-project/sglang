@@ -995,8 +995,9 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 
 
 class MqaAttentionBase(nn.Module):
-    # Class-level default for subclasses that read it without running __init__.
+    # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
+    wo_a_fp8_block128: bool = False
 
     def __init__(
         self,

@@ -320,9 +320,10 @@ def wo_a_weight_scale_to_e8m0(
 
     DeepSeek-V4 checkpoints that carry fp4 experts already store their linear
     block scales as powers of two, so the conversion is exact and the weight
-    passes through untouched. Otherwise the weight is dequantized and requantized
-    against power-of-two scales, because rounding the exponent up on its own
-    would rescale every value in the block.
+    passes through untouched. Otherwise a 128x128-block weight is dequantized and
+    requantized against power-of-two scales, because rounding the exponent up on
+    its own would rescale every value in the block; the ue8m0 requantizer is
+    128x128-only, so a 32x32-block weight must already carry power-of-two scales.
     """
     G, R = num_groups, o_lora_rank
     D = weight.shape[-1]
@@ -339,6 +340,12 @@ def wo_a_weight_scale_to_e8m0(
 
     scale = weight_scale_inv.detach().float()
     if not _is_power_of_two(scale):
+        if block != WO_A_MXFP8_GROUP_SIZE:
+            raise ValueError(
+                f"DSV4 wo_a {block}x{block} block scales are not power-of-two; the "
+                "aiter mxscale GEMM needs ue8m0 scales for this block. Rerun with "
+                "SGLANG_OPT_FP8_WO_A_GEMM=0."
+            )
         from sglang.srt.layers.quantization.fp8_utils import (
             block_quant_dequant,
             quant_weight_ue8m0,

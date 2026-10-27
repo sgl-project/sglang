@@ -78,7 +78,7 @@ def wo_a_fp8_block32_enabled() -> bool:
     batch-invariant inference keep the bf16 GEMM's one reduction order."""
     return (
         is_wo_a_fp8_block32_supported()
-        and get_exec().kernel.monokernel_backend is None
+        and not get_exec().kernel.enable_amd_monokernel
         and wo_a_split_k_allowed()
     )
 
