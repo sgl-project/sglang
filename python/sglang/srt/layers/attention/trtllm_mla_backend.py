@@ -128,6 +128,25 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
     return torch.zeros(required_bytes, dtype=torch.uint8, device=device)
 
 
+def _use_fused_set_kv_concat_q_fp8(
+    *, data_type, kv_lora_rank: int, qk_rope_head_dim: int, kv_index_translator
+) -> bool:
+    """Whether the fp8 decode path fuses quantize + KV write + q concat.
+
+    The kernel takes a WIDENED loc and skips only non-owned DCP rows; under the
+    unified pool with DCP the loc arrives already resolved (non-owned rows on
+    sink 0), so that combination takes the pool's sink-aware writer instead.
+    """
+    return (
+        data_type == torch.float8_e4m3fn
+        and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and not (get_parallel().dcp_enabled and kv_index_translator.is_translating)
+        and can_use_set_mla_kv_concat_q_fp8()
+    )
+
+
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
 
@@ -325,12 +344,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # fp8 sibling: quantize + KV scatter + q concat in one launch
         # (replaces mla_quantize_without_rope_for_fp8's concat + three aten
         # casts plus the KV-row write on the fp8 decode path).
-        self._fused_set_kv_concat_q_fp8 = (
-            self.data_type == torch.float8_e4m3fn
-            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
-            and self.kv_lora_rank == 512
-            and self.qk_rope_head_dim == 64
-            and can_use_set_mla_kv_concat_q_fp8()
+        self._fused_set_kv_concat_q_fp8 = _use_fused_set_kv_concat_q_fp8(
+            data_type=self.data_type,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_index_translator=self.kv_index_translator,
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
