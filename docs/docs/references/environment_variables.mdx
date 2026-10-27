@@ -1736,6 +1736,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KDA_FIXED_AUTOTUNE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run three KDA prefill kernels (gate cumsum, chunk-local cumsum, chunk output) on one fixed config instead of the one Triton autotunes in each process, so their results do not change between restarts or pipeline ranks. Implied by deterministic inference; set it to get this without the flag, e.g. with an attention backend that deterministic inference refuses. Other autotuned kernels are unchanged.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_1STAGE_ALLREDUCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order). If unset, it is auto-enabled when deterministic inference is on.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
