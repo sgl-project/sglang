@@ -117,8 +117,8 @@ class GraniteMoeMoE(nn.Module):
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -135,6 +135,7 @@ class GraniteMoeMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
 
@@ -145,10 +146,11 @@ class GraniteMoeMoE(nn.Module):
             intermediate_size=intermediate_size,
             layer_id=layer_id,
             params_dtype=params_dtype,
-            reduce_results=True,
+            reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -166,6 +168,7 @@ class GraniteMoeSharedMLP(nn.Module):
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
 
@@ -183,6 +186,7 @@ class GraniteMoeSharedMLP(nn.Module):
             self.input_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("output_linear", prefix),
         )
         if config.hidden_act != "silu":

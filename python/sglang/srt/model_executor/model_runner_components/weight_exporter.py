@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,20 @@ class WeightExporter:
     get_model: Callable[[], Any]
     _weights_send_group: dict = field(default_factory=dict)
 
+    def _weight_export_unsupported_reason(self) -> Optional[str]:
+        for module in self.get_model().modules():
+            reason = getattr(module, "_weight_export_error", None)
+            if reason is not None:
+                return reason
+        return None
+
+    def _check_weight_export_supported(self):
+        # Save paths run under handle_rpc_request, which reports the raise as a
+        # failed RpcReqOutput; direct control requests return their failure.
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            raise RuntimeError(reason)
+
     def init_weights_send_group_for_remote_instance(
         self,
         master_address,
@@ -32,6 +47,10 @@ class WeightExporter:
         group_name,
         backend="nccl",
     ):
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return False, reason
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -43,6 +62,8 @@ class WeightExporter:
         )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+        backend = "hccl" if backend == "nccl" and is_npu() else backend
+        device_type = "cuda" if not is_npu() else "npu"
 
         logger.info(
             f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
@@ -60,7 +81,7 @@ class WeightExporter:
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
+                device_id=torch.device(device_type, self.gpu_id),
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
@@ -78,6 +99,10 @@ class WeightExporter:
         ports,
         group_name,
     ):
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return False, reason
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -121,6 +146,7 @@ class WeightExporter:
         return success, message
 
     def save_remote_model(self: WeightExporter, url: str):
+        self._check_weight_export_supported()
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
@@ -132,6 +158,7 @@ class WeightExporter:
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ):
+        self._check_weight_export_supported()
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
         logger.info(
@@ -147,6 +174,10 @@ class WeightExporter:
         Only used for unit test with an unoptimized performance.
         For optimized performance, please use torch.save and torch.load.
         """
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return None
         # TODO: (chenyang) Add support for Qwen models.
         try:
             return self.get_model().get_weights_by_name(

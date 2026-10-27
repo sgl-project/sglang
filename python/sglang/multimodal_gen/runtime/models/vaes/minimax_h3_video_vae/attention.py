@@ -10,13 +10,14 @@ import torch.nn.functional as F
 from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
 
-from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
+from .vit_utils import apply_rotary_pos_emb_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
@@ -36,7 +37,7 @@ def _sdpa_attention(query, key, value):
 
 
 def _vit_norm_input(module, hidden_states):
-    if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
+    if envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
         return hidden_states.float()
     weight = module.weight
     return hidden_states.to(weight.dtype if weight is not None else hidden_states.dtype)
@@ -44,7 +45,7 @@ def _vit_norm_input(module, hidden_states):
 
 def _apply_qk_norm(module, hidden_states):
     if (
-        _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
+        envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
         and module.weight is None
         and (not isinstance(module, nn.LayerNorm) or module.bias is None)
@@ -142,7 +143,6 @@ class Attention(nn.Module):
             query = _apply_qk_norm(self.norm_q, query)
         if self.norm_k is not None:
             key = _apply_qk_norm(self.norm_k, key)
-
         if rotary_pos_emb is not None:
             query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 

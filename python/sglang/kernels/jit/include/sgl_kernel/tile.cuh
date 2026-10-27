@@ -34,7 +34,11 @@ struct Memory {
     return Memory{0, 1};
   }
   /// \brief Create a Memory accessor distributed across warp threads.
-  SGL_DEVICE static Memory warp(int warp_threads = kWarpThreads) {
+  SGL_DEVICE static Memory warp() {
+    return Memory{get_lane_id(), kWarpThreads};
+  }
+  /// \brief Create a Memory accessor over a narrower warp sub-group.
+  SGL_DEVICE static Memory warp(int warp_threads) {
     return Memory{static_cast<uint32_t>(threadIdx.x % warp_threads), static_cast<uint32_t>(warp_threads)};
   }
   /// \brief Create a Memory accessor distributed across all CTA threads.

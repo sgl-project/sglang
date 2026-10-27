@@ -15,14 +15,17 @@
 
 import logging
 from collections.abc import Iterable
-from typing import List
+from typing import List, Optional
 
 import regex as re
 import torch
+from transformers import LlavaConfig
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.models.llava import LlavaForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -88,22 +91,18 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
             yield name, loaded_weight
 
 
-class Mistral3ForConditionalGeneration:
+class Mistral3ForConditionalGeneration(LlavaForConditionalGeneration):
     MULTIMODAL_PROJECTOR_TYPE = Mistral3MultiModalProjector
 
-    def __init__(self, **kwargs):
-        # lazy load inner class
-        # to bypass circular import
-        from sglang.srt.models.llava import LlavaForConditionalGeneration
-
-        # override config: mistral's projector adds patchmerger that doesn't require padding
-        kwargs["config"].vision_config.pad_image_border = False
-
-        self.inner = LlavaForConditionalGeneration(**kwargs)
-        self.inner.multi_modal_projector = self.MULTIMODAL_PROJECTOR_TYPE(
-            kwargs["config"]
-        )
-        self.inner.get_image_feature = self.get_image_feature
+    def __init__(
+        self,
+        config: LlavaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        # mistral's projector adds a patch merger that doesn't require padding
+        config.vision_config.pad_image_border = False
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract features from image inputs.
@@ -115,16 +114,22 @@ class Mistral3ForConditionalGeneration:
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        # Requesting hidden states materialises one tensor per layer (~1.8 GiB per
+        # 1540px image); the plain forward returns the same tensor as the last entry.
+        last_layer_only = self.vision_feature_layer == -1
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = item.feature, item.image_sizes
-            image_outputs = self.vision_tower(
-                pixel_values, image_sizes, output_hidden_states=True
-            )
-            selected_image_feature = image_outputs.hidden_states[
-                self.vision_feature_layer
-            ]
+            if last_layer_only:
+                selected_image_feature = self.vision_tower(pixel_values, image_sizes)
+            else:
+                image_outputs = self.vision_tower(
+                    pixel_values, image_sizes, output_hidden_states=True
+                )
+                selected_image_feature = image_outputs.hidden_states[
+                    self.vision_feature_layer
+                ]
 
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
@@ -141,15 +146,6 @@ class Mistral3ForConditionalGeneration:
             )
         ret = torch.cat(features, dim=0)
         return ret
-
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
-
-    def __hasattr__(self, name):
-        return hasattr(self.inner, name)
-
-    def __call__(self, *args, **kwargs):
-        return self.inner(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Normalize transformers v5 Mistral3 weight names for
@@ -189,7 +185,7 @@ class Mistral3ForConditionalGeneration:
                     name = "language_model." + name
                 yield name, w
 
-        return self.inner.load_weights(normalize(weights))
+        return super().load_weights(normalize(weights))
 
 
 EntryClass = [MistralForCausalLM, Mistral3ForConditionalGeneration]

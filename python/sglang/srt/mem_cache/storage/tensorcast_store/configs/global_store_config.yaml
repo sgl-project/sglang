@@ -1,0 +1,93 @@
+# Config metadata for auditing and cluster safety.
+meta:
+  schema_version: "v1"
+  description: "Example config file for TensorCast Global Store"
+  cluster_token: ""
+
+database:
+  db_file: null
+
+server:
+  listen:
+    host: 0.0.0.0
+    port: 50051
+  advertise:
+    host: ""
+    port: 0
+  max_workers: 10
+  grpc:
+    max_concurrent_streams: 0
+    keepalive_time: 120s
+    keepalive_timeout: 0s
+    max_connection_idle: 0s
+    max_connection_age: 0s
+    tcp_nodelay: false
+    so_reuseport: false
+    tls:
+      enabled: false
+      cert_file: ""
+      key_file: ""
+      client_ca_file: ""
+  metrics_port: 18000
+
+worker_policy:
+  heartbeat_timeout: 30s
+  cleanup_interval: 60s
+  default_heartbeat_interval: 5s
+  memory_tiers:
+    snapshot_retention: 600s
+    snapshot_max_rows: 200
+    publish_interval: 5s
+  key_mapping:
+    alias_cache_ttl: 1s
+  transport_scheduler:
+    mode: TRANSPORT_SCHEDULER_MODE_GROUP_DISPATCH
+    source_balance_weights:
+      replica_load_weight: 1.0
+      worker_load_weight: 1.0
+      recent_assignment_penalty_weight: 1.0
+      diffusion_bonus_weight: 1.0
+    group_dispatch:
+      fairness_floor_ratio: 0.25
+      completion_bias_weight: 1.0
+      starvation_aging_threshold: 5s
+      queue_scan_limit: 128
+      dispatch_batch_limit: 16
+
+limits:
+  digest_writes:
+    max_leaf_writes_per_request: 16384
+    max_proof_digests_per_request: 16384
+    max_total_digests_per_request: 32768
+    max_digest_bytes_per_request: 2097152
+  operation_leases:
+    default_ttl: 30s
+    max_ttl: 300s
+  operation_writes:
+    min_status_update_interval: 1s
+  retention:
+    operations_ttl: 86400s
+    assembly_proof_commitments_ttl: 86400s
+    piece_proof_digests_ttl: 86400s
+
+observability:
+  logging:
+    level: INFO
+    file: ""
+    otel_context_enabled: false
+    sink_file: ""
+    vlog_level: 0
+  otel:
+    enabled: false
+    exporter_otlp_endpoint: http://127.0.0.1:4317
+    exporter_protocol: grpc
+    service_name: tensorcast-global-store
+    sampler: parentbased_traceidratio
+    sampler_arg: "1.0"
+  otel_cxx:
+    sdk_disabled: false
+    exporter_insecure: false
+    exporter_headers: {}
+    console_exporter: false
+  tracing:
+    chrome_trace_dir: ""

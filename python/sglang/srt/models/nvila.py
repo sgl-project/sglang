@@ -1,5 +1,6 @@
 import itertools
 import math
+from array import array
 from collections.abc import Iterable
 from typing import Any
 
@@ -18,7 +19,7 @@ import sglang.srt.model_loader.weight_utils as weight_utils
 import sglang.srt.utils as utils
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -218,11 +219,8 @@ class NVILAForConditionalGeneration(nn.Module):
                 )
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
 
 def merge_chessboard(x, num_split_h, num_split_w):

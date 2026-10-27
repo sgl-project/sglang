@@ -1,7 +1,7 @@
 # docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.1.2-devel-ubuntu24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,14 +13,17 @@ ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
+# Branch, tag or commit SHA; only used when SG_LANG_KERNEL_SOURCE=source.
 ARG SG_LANG_KERNEL_BRANCH=main
+# wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml; source: build SG_LANG_KERNEL_BRANCH.
+ARG SG_LANG_KERNEL_SOURCE=wheel
 
 USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
-ARG IGC_VERSION=2.34.4+21428
+ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
+ARG IGC_VERSION=2.38.2+22051
 ARG GMM_VERSION=22.10.0
 
 RUN apt-get update && apt-get install -y software-properties-common curl && \
@@ -73,13 +76,21 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /sgl-workspace
 
-RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
+# SG_LANG_KERNEL_SOURCE=source points the sglang-kernel-xpu dependency at the kernel repo.
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
     git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
+    if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
+        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO}" && \
+        sed -i -E "s|\"sglang-kernel-xpu @ [^\"]*\"|\"sglang-kernel-xpu @ git+${SG_LANG_KERNEL_REPO}@${SG_LANG_KERNEL_BRANCH}\"|" pyproject_xpu.toml && \
+        grep -q "sglang-kernel-xpu @ git+" pyproject_xpu.toml; \
+    elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
+        echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
+    fi && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33

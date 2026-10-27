@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+    />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Rollout Simulator and Explorer</title>
+    <style>
+      __CSS__
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Rollout Simulator and Explorer</h1>
+          <p id="subtitle"></p>
+        </div>
+        <span class="badge">Recorded run · simulated tool calls</span>
+      </header>
+      <nav role="tablist" aria-label="Rollout views">
+        <button
+          role="tab"
+          id="timeline-tab"
+          aria-controls="timeline-panel"
+          aria-selected="true"
+        >
+          Timeline</button
+        ><button
+          role="tab"
+          id="metrics-tab"
+          aria-controls="metrics-panel"
+          aria-selected="false"
+        >
+          Engine Metrics
+        </button>
+      </nav>
+      <div class="controls">
+        <label
+          >Window
+          <select id="window">
+            <option value="all">Entire run</option>
+            <option value="5">5 seconds</option>
+            <option value="1">1 second</option>
+          </select></label
+        ><label class="position"
+          >Position
+          <input
+            id="position"
+            aria-label="Time window start"
+            type="range"
+            min="0"
+            max="0"
+            value="0"
+            step="0.01" /></label
+        ><button id="reset">Reset view</button
+        ><span id="range" class="time"></span>
+      </div>
+      <section
+        id="timeline-panel"
+        role="tabpanel"
+        aria-labelledby="timeline-tab"
+      >
+        <div class="legend">
+          <span
+            ><i class="swatch" style="background: var(--sampling)"></i
+            >Sampling</span
+          ><span
+            ><i class="swatch" style="background: var(--tool)"></i>Tool
+            call</span
+          ><span
+            ><i class="swatch" style="background: var(--wait)"></i>Wait</span
+          >
+        </div>
+        <p class="note">
+          Click a phase for turn details. Drag to zoom. Wait = client
+          concurrency queue; sampling includes TTFT. Tiny waits become visible
+          when zoomed.
+        </p>
+        <div class="timeline">
+          <svg
+            id="timeline"
+            role="img"
+            aria-label="Measured conversation timeline"
+          ></svg>
+          <div id="tooltip" class="tip" hidden></div>
+        </div>
+        <p id="availability" class="note"></p>
+        <label
+          >Request
+          <select id="request"></select
+        ></label>
+        <div class="detail" aria-live="polite">
+          <strong id="selected-title"></strong>
+          <div id="details" class="detail-grid"></div>
+        </div>
+      </section>
+      <section
+        id="metrics-panel"
+        role="tabpanel"
+        aria-labelledby="metrics-tab"
+        hidden
+      >
+        <label
+          >Metrics endpoint
+          <select id="exporter"></select
+        ></label>
+        <p class="note">
+          Sources are shown below each chart: client timing distributions use
+          2-second windows; server gauges and counter rates use 1-second
+          scrapes. Gaps mean unavailable, not zero.
+        </p>
+        <div id="metric-grid" class="grid"></div>
+      </section>
+      <footer>
+        Self-contained recording. Tool calls are simulated. Stream timing
+        includes network and scheduling. Missing measurements stay unavailable.
+      </footer>
+    </main>
+    <script>
+      __JS__;
+    </script>
+  </body>
+</html>

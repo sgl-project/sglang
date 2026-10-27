@@ -1,7 +1,7 @@
 """CPU-only unit tests for the mamba pool ratio vs the prefill->decode peak.
 
 Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
-at the first cache_unfinished_req, a request still holds its admission-locked
+at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
@@ -11,7 +11,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -160,6 +161,46 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             r(extra_buffer=True, lazy=False, disable_overlap=False), 4
         )  # overlap
 
+    def test_lazy_donation_releases_only_its_prefix_state(self):
+        from sglang.srt import runtime_context as rc
+
+        for slots_per_req in (3, 4):
+            with self.subTest(slots_per_req=slots_per_req):
+                component, cache, _ = _build_peak(slots_per_req * N, lock_prefixes=True)
+                cache.allocator.alloc((slots_per_req - 2) * N)
+                nodes = {node.id: node for node in cache.prefix_nodes}
+                full = _RecordingComp(ComponentType.FULL, 2)
+                cache.components = (full, component)
+                cache.node_by_id = nodes.__getitem__
+                cache._assert_receipt_anchor = UnifiedTreeCore._assert_receipt_anchor
+                cache._update_evictable_leaf_sets = lambda _: None
+                cache._release_components = MethodType(
+                    UnifiedTreeCore._release_components, cache
+                )
+                cache.dec_lock_ref = MethodType(UnifiedTreeCore.dec_lock_ref, cache)
+                with rc.get_context().override_server_args(
+                    disable_radix_cache=False,
+                    mamba_radix_cache_strategy="extra_buffer_lazy",
+                ):
+                    for node in nodes.values():
+                        req = SimpleNamespace(
+                            lock=TreeLock(node.id, DecLockRefParams(node_id=node.id))
+                        )
+                        released = len(full.released)
+                        self.assertEqual(cache.allocator.free_ids, [])
+                        self.assertIsNotNone(component._alloc_mamba_slot(req))
+                        self.assertEqual(
+                            node.component_data[ComponentType.MAMBA].lock_ref, 0
+                        )
+                        self.assertEqual(
+                            req.lock.receipt.skipped_lock_components,
+                            (ComponentType.MAMBA,),
+                        )
+                        self.assertEqual(len(full.released), released)
+                        cache.dec_lock_ref(req.lock.node, req.lock.receipt)
+                        self.assertEqual(len(full.released), released + 1)
+                    self.assertEqual(len(full.released), N)
+
 
 class _RecordingComp:
     """Fake tree component: records the dec params it is asked to release with."""
@@ -172,11 +213,11 @@ class _RecordingComp:
     def eviction_priority(self, is_leaf):
         return self._priority
 
-    def release_component_lock(self, node, params):
+    def release_component_lock(self, node, params, lock_host=False):
         self.released.append(params)
 
     def release_window_lock(  # SWA only
-        self, node, swa_uuid_for_lock, device_frees, host_frees
+        self, node, swa_uuid_for_lock, device_frees, host_frees, cache_actions
     ):
         pass
 
@@ -195,6 +236,7 @@ class TestDecSwaLockSkip(unittest.TestCase):
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
         tree_core = SimpleNamespace(
+            root_node=object(),
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
@@ -203,7 +245,11 @@ class TestDecSwaLockSkip(unittest.TestCase):
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            DecLockRefParams(skipped_lock_components=skipped_lock_components),
+            DecLockRefParams(
+                node_id=node.id,
+                skipped_lock_components=skipped_lock_components,
+                component_lock_uuids={ComponentType.SWA: None},
+            ),
         )
         return full, mamba
 
@@ -263,16 +309,12 @@ class TestPPMambaPoolSizing(unittest.TestCase):
     BUDGET_GB = 8.0
 
     @classmethod
-    def _pool_size(cls, pp_rank, pp_size):
-        from sglang.srt import runtime_context as rc
+    def _cache_params(cls):
         from sglang.srt.configs.mamba_utils import (
             Mamba2CacheParams,
             Mamba2StateDType,
             Mamba2StateShape,
         )
-        from sglang.srt.distributed.utils import get_pp_indices
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-        from sglang.srt.runtime_context import get_schedule
 
         shape = Mamba2StateShape(
             conv=[(4096, 3)],
@@ -286,18 +328,38 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             conv_kernel=0,
             num_k_heads_per_tp=8,
         )
-        params = Mamba2CacheParams(
+        return Mamba2CacheParams(
             shape=shape,
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
             layers=list(cls.MAMBA_LAYERS),
         )
+
+    @classmethod
+    def _mamba_budget_bytes(cls):
+        """The byte budget the solve hands the state pool: the mamba share of
+        the rest-memory, at the fixture's mamba_full_memory_ratio of 0.5."""
+        return cls.BUDGET_GB * (0.5 / 1.5) * (1 << 30)
+
+    @classmethod
+    def _pool_size(cls, pp_rank, pp_size, fused_state_entry=None):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.distributed.utils import get_pp_indices
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        params = cls._cache_params()
         start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+            extra_mamba_cache_bytes_per_req=0,
+            fused_entry_bytes=lambda name: (
+                fused_state_entry if name == "mamba" else None
+            ),
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
-            ps=SimpleNamespace(attn_dp_size=1, pp_size=pp_size),
+            attn_dp_size=1,
+            pp_size=pp_size,
             hybrid_gdn_config=None,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
@@ -313,6 +375,27 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
 
+    def test_a_fused_state_entry_is_priced_per_slot(self):
+        """With a draft state block fused into every state slot, the unified
+        factory carves out K x the FUSED entry; the solve must size K from
+        that entry, or the buffer over-commits by K x (fused - host) bytes.
+
+        The fused entry is the host's block plus the draft's, so it is always
+        WIDER than the per-request cost the unfused solve prices -- hence
+        fewer slots, never more. Deriving it from `mamba_cache_per_req` keeps
+        that ordering true; a hard-coded constant silently inverted it.
+        """
+        host_per_req = self._cache_params().mamba_cache_per_req
+        fused_entry = host_per_req + host_per_req // 4  # host + a draft block
+        budget_bytes = self._mamba_budget_bytes()
+
+        unfused = self._pool_size(0, 1)
+        fused = self._pool_size(0, 1, fused_state_entry=fused_entry)
+
+        self.assertEqual(unfused, int((budget_bytes - host_per_req) // host_per_req))
+        self.assertEqual(fused, int((budget_bytes - fused_entry) // fused_entry))
+        self.assertLess(fused, unfused)
+
     def test_stage_is_not_charged_for_the_whole_model(self):
         solo = self._pool_size(0, 1)
         staged = self._pool_size(0, 8)
@@ -326,6 +409,104 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         self.assertEqual(
             len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
         )
+
+
+class TestExtraMambaCacheSizing(unittest.TestCase):
+    @staticmethod
+    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
+                )
+            ),
+            extra_mamba_cache_bytes_per_req=extra_bytes,
+            fused_entry_bytes=lambda name: None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
+            attn_dp_size=dp_size,
+            pp_size=pp_size,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+            _calculate_mamba_ratio=lambda: 2,
+        )
+        args = dict(
+            disable_radix_cache=False,
+            max_mamba_cache_size=None,
+            max_running_requests=256 if draft_tokens is not None else None,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+            speculative_num_draft_tokens=draft_tokens,
+        )
+        args.update(schedule)
+        with rc.get_context().override_server_args(**args):
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+            return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
+
+    def test_auto_capacity_reserves_backend_state(self):
+        self.assertEqual(self._size(0), (9, 80 << 20))
+        self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+
+    def test_fixed_capacity_charges_padding_and_partitioned_state(self):
+        for pp_size in (1, 2):
+            for dp_size in (1, 2):
+                for schedule in (
+                    dict(max_mamba_cache_size=8),
+                    dict(disable_radix_cache=True, max_running_requests=8),
+                ):
+                    with self.subTest(pp=pp_size, dp=dp_size, **schedule):
+                        slots, remaining = self._size(
+                            8 << 20, pp_size=pp_size, dp_size=dp_size, **schedule
+                        )
+                        self.assertEqual(slots, 8 // dp_size)
+                        self.assertEqual(
+                            remaining,
+                            (120 << 20) - (slots + 1) * (12 << 20) // pp_size,
+                        )
+
+    def test_speculative_auto_capacity_keeps_scratch_separate(self):
+        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
+        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_pd_prefill_does_not_reserve_speculative_scratch(self):
+        """A PD prefill server's hybrid req pool never allocates the per-draft-token
+        verify snapshots, so none of the three capacity branches may charge them."""
+        prefill = dict(disaggregation_mode="prefill")
+        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * 2 * 4 MiB
+        # scratch is only charged outside PD prefill.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 44 << 20)
+        )
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8, **prefill),
+            (8, 84 << 20),
+        )
+        # Capacity from max_running_requests with the radix cache disabled.
+        fixed = dict(disable_radix_cache=True, max_running_requests=8)
+        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, 12 << 20))
+        self.assertEqual(
+            self._size(0, draft_tokens=2, **fixed, **prefill), (8, 84 << 20)
+        )
+        # Auto capacity sizes like a non-speculative server.
+        self.assertEqual(self._size(0, draft_tokens=2, **prefill), self._size(0))
+        # Prefill pools that still allocate the snapshots keep the reserve.
+        for allocates in (
+            dict(enable_pd_role_switch=True),
+            dict(enable_unified_memory=True),
+        ):
+            with self.subTest(**allocates):
+                self.assertEqual(
+                    self._size(
+                        0,
+                        draft_tokens=2,
+                        max_mamba_cache_size=8,
+                        **prefill,
+                        **allocates,
+                    ),
+                    (8, 44 << 20),
+                )
 
 
 if __name__ == "__main__":

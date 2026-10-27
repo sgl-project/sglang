@@ -29,7 +29,6 @@ from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -52,8 +51,9 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionMLP,
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
+    glm4v_vision_reduces_over_attn_tp,
 )
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -99,6 +99,9 @@ class GlmOcrVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = GlmOcrVisionMLP(
             dim,
@@ -285,7 +288,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         super().__init__(config, quant_config, prefix)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(

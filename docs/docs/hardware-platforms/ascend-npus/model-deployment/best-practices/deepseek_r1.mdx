@@ -7,25 +7,25 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for DeepSeek-R1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [DeepSeek-R1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -33,7 +33,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 16
 
@@ -125,8 +125,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 8 \
-        --enable-dp-attention \
+        --attn-dp-size 8 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --reasoning-parser deepseek-r1 \
@@ -151,7 +150,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -161,12 +159,11 @@ do
         --port 8001 \
         --nnodes 1 \
         --tp-size 16 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.9 \
         --max-running-requests 416 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 \
@@ -233,7 +230,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -279,7 +276,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
@@ -304,8 +300,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 3000 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -341,7 +336,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -432,8 +427,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -458,7 +452,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -471,12 +464,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -544,7 +536,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -639,8 +631,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 4 \
-        --enable-dp-attention \
+        --attn-dp-size 4 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -665,7 +656,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_LM_HEAD_TP=8
         export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
@@ -679,12 +669,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
         --quantization modelslim \
         --moe-a2a-backend ascend_fuseep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \
         --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 \
@@ -751,7 +740,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -842,8 +831,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -868,7 +856,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -881,12 +868,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -954,7 +940,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -1045,8 +1031,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1071,7 +1056,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1084,12 +1068,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -1157,7 +1140,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 32
 
@@ -1247,8 +1230,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1273,7 +1255,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1286,12 +1267,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 8 \
+        --attn-dp-size 8 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \

@@ -132,7 +132,7 @@ struct AttnPrologueParams {
   int64_t inter_stride_b;
   int64_t inter_stride_t;
   int64_t inter_stride_w;
-  int64_t kv_buf_stride;  // elems per KV slot row (= Hkv * head_dim)
+  int64_t kv_buf_stride;  // elems between consecutive KV slots (>= Hkv * head_dim)
   uint32_t T;
   uint32_t q;  // draft_token_num
   uint32_t dq;
