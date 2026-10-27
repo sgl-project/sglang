@@ -120,7 +120,10 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    apply_session_id_header,
+)
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
@@ -944,6 +947,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    apply_session_id_header(obj, request.headers)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

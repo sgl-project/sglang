@@ -6,6 +6,8 @@ This mechanism allows upstream callers to leave the body opaque
 
 from fastapi import HTTPException
 
+from sglang.srt.environ import envs
+
 # request header -> (target attribute, value type)
 _HEADER_OVERRIDES = {
     "x-override-rid": ("rid", str),
@@ -17,6 +19,25 @@ _HEADER_OVERRIDES = {
     "x-override-disagg-prefill-dp-rank": ("disagg_prefill_dp_rank", int),
     "x-override-priority": ("priority", int),
 }
+
+
+def apply_session_id_header(obj, headers) -> None:
+    """Fall back to the ``SGLANG_SESSION_ID_HEADER`` header (``X-Session-ID`` by
+    default) when the body carries no session identity.
+
+    The body always wins: this only fills a missing ``session_id``, so a caller
+    that sets the field explicitly is unaffected. ``session_params`` describes a
+    scheduler-managed session and is mutually exclusive with ``session_id``, so
+    the header is ignored when ``session_params`` is present.
+    """
+    if getattr(obj, "session_id", None) is not None:
+        return
+    if getattr(obj, "session_params", None) is not None:
+        return
+    header = envs.SGLANG_SESSION_ID_HEADER.get()
+    value = headers.get(header) if header else None
+    if value:
+        obj.session_id = value
 
 
 def apply_header_overrides(obj, headers) -> None:
