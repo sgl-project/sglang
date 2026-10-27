@@ -3990,6 +3990,9 @@ dependencies = [
 [[package]]
 name = "sglang-disagg"
 version = "0.1.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "sglang-grpc"

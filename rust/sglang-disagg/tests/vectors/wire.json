@@ -1511,5 +1511,550 @@
     }
    }
   ]
- }
+ },
+ "peers": [
+  {
+   "name": "add_prefill",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {}
+  },
+  {
+   "name": "add_duplicate",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "add",
+     "d0",
+     "meta0"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {}
+  },
+  {
+   "name": "add_decode",
+   "is_prefill": false,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": false
+   },
+   "final_reload_times": {}
+  },
+  {
+   "name": "reload_healthy",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     100000,
+     "ok"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {}
+  },
+  {
+   "name": "reload_invalid",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     100000,
+     "invalid"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {
+    "d0": 100000
+   }
+  },
+  {
+   "name": "reload_rate_limited",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     100000,
+     "invalid"
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     100500,
+     "invalid"
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     101100,
+     "invalid"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {
+    "d0": 101100
+   }
+  },
+  {
+   "name": "reload_prepare_fails_then_retries",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "reload_fail_prepare",
+     [
+      "d0"
+     ],
+     100000
+    ],
+    [
+     "reload",
+     [
+      "d0"
+     ],
+     101500,
+     "invalid"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "remove_remote_agent",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {
+    "d0": 101500
+   }
+  },
+  {
+   "name": "reload_skips_unknown",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "reload",
+     [
+      "ghost"
+     ],
+     100000,
+     "invalid"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ]
+   ],
+   "final_peers": [
+    "d0"
+   ],
+   "final_prepared": {
+    "d0": true
+   },
+   "final_reload_times": {}
+  },
+  {
+   "name": "reload_check_raises",
+   "is_prefill": true,
+   "ops": [
+    [
+     "add",
+     "d0",
+     "meta0"
+    ],
+    [
+     "add",
+     "d1",
+     "meta1"
+    ],
+    [
+     "reload",
+     [
+      "d0",
+      "d1"
+     ],
+     100000,
+     "raise"
+    ]
+   ],
+   "agent_trace": [
+    [
+     "add_remote_agent",
+     "meta0"
+    ],
+    [
+     "aux_check",
+     "d0",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d0"
+    ],
+    [
+     "prepare_state",
+     "d0"
+    ],
+    [
+     "add_remote_agent",
+     "meta1"
+    ],
+    [
+     "aux_check",
+     "d1",
+     2
+    ],
+    [
+     "prepare_payload",
+     "d1"
+    ],
+    [
+     "prepare_state",
+     "d1"
+    ],
+    [
+     "check_remote_metadata",
+     "d0"
+    ],
+    [
+     "check_remote_metadata",
+     "d1"
+    ]
+   ],
+   "final_peers": [
+    "d0",
+    "d1"
+   ],
+   "final_prepared": {
+    "d0": true,
+    "d1": true
+   },
+   "final_reload_times": {}
+  }
+ ]
 }

@@ -6,3 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[build-dependencies]
+cc = "1"
+
+[features]
+# Compiles csrc/nixl_shim.cc against the NIXL C++ headers (Linux/CUDA hosts
+# only; NIXL_INCLUDE_DIR overrides the default /usr/local/include search).
+# Feature-off builds — including macOS dev machines — never touch csrc.
+nixl = []

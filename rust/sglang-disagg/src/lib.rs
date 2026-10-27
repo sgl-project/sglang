@@ -28,6 +28,7 @@ pub mod error;
 pub mod json;
 pub mod nixl;
 pub mod pack;
+pub mod peers;
 pub mod room;
 pub mod status;
 pub mod topology;

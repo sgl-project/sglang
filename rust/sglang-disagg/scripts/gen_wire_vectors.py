@@ -887,6 +887,186 @@ for sc in [
 ]:
     V["room"]["prefill"].append(sc)
 
+# --------------------------------------------------------------------------- //
+# Peer bookkeeping (nixl/conn.py:2030-2088, real methods, stub agent)
+# --------------------------------------------------------------------------- //
+
+import time  # noqa: E402
+
+NM = nixl_conn.NixlKVManager
+
+
+class StubAgent:
+    """Records every agent call; check_remote_metadata behavior per op."""
+
+    def __init__(self):
+        self.trace = []
+        self.check_mode = "ok"
+
+    def add_remote_agent(self, metadata):
+        self.trace.append(["add_remote_agent", metadata.decode()])
+
+    def check_remote_metadata(self, name):
+        self.trace.append(["check_remote_metadata", name])
+        if self.check_mode == "raise":
+            raise RuntimeError("check blew up")
+        return self.check_mode == "ok"
+
+    def remove_remote_agent(self, name):
+        self.trace.append(["remove_remote_agent", name])
+
+
+def make_peer_ns(is_prefill, agent):
+    ns = SimpleNamespace(
+        decode_kv_args_table={},
+        prep_handles={},
+        prep_handles_slice_dst={},
+        _prepared_state_plans={},
+        _peer_reload_times={},
+        _peer_reload_lock=threading.Lock(),
+        agent=agent,
+        disaggregation_mode=(
+            _DisaggregationMode.PREFILL if is_prefill else _DisaggregationMode.DECODE
+        ),
+    )
+    ns.requires_dcp_relayout = lambda *a: False
+
+    def prep_payload(peer_info):
+        agent.trace.append(["prepare_payload", peer_info.agent_name])
+        ns.prep_handles[peer_info.agent_name] = "H"
+
+    def prep_state(peer_info):
+        agent.trace.append(["prepare_state", peer_info.agent_name])
+        ns._prepared_state_plans[peer_info.agent_name] = "P"
+
+    ns._prepare_payload_xfer = prep_payload
+    ns._prepare_state_xfer = prep_state
+    ns.check_peer_aux_buffer_count = lambda name, n: agent.trace.append(
+        ["aux_check", name, n]
+    )
+    return ns
+
+
+def peer_info(name, meta):
+    return SimpleNamespace(
+        agent_name=name,
+        agent_metadata=meta.encode(),
+        dst_dcp_size=1,
+        dst_dcp_rank=0,
+        dst_aux_ptrs=[1, 2],
+        requires_dcp_relayout=False,
+        kv_xfer_segments="SEG",
+    )
+
+
+def peer_scenario(name, is_prefill, ops):
+    agent = StubAgent()
+    ns = make_peer_ns(is_prefill, agent)
+    real_monotonic = time.monotonic
+    for op in ops:
+        k = op[0]
+        if k == "add":
+            _, peer_name, meta = op
+            NM._add_remote_peer(ns, peer_info(peer_name, meta))
+        elif k == "reload":
+            _, agents, now, check_mode = op
+            agent.check_mode = check_mode
+            nixl_conn.time.monotonic = lambda: now
+            try:
+                NM._reload_invalidated_peers(ns, {a: True for a in agents})
+            finally:
+                nixl_conn.time.monotonic = real_monotonic
+            agent.check_mode = "ok"
+        elif k == "reload_fail_prepare":
+            _, agents, now = op
+            agent.check_mode = "invalid"
+            ns2_prepare = ns._prepare_payload_xfer
+
+            def failing(peer_info, _orig=ns2_prepare):
+                raise RuntimeError("prepare blew up")
+
+            ns._prepare_payload_xfer = failing
+            nixl_conn.time.monotonic = lambda: now
+            try:
+                NM._reload_invalidated_peers(ns, {a: True for a in agents})
+            finally:
+                nixl_conn.time.monotonic = real_monotonic
+                ns._prepare_payload_xfer = ns2_prepare
+            agent.check_mode = "ok"
+        else:
+            raise AssertionError(k)
+    # Times are integer milliseconds — the Rust side parses the vector file
+    # with an int-only JSON reader (floats are banned on the wire).
+    ser_ops = []
+    for o in ops:
+        o = list(o)
+        if o[0] in ("reload", "reload_fail_prepare"):
+            o[2] = int(round(o[2] * 1000))
+        ser_ops.append(o)
+    return {
+        "name": name,
+        "is_prefill": is_prefill,
+        "ops": ser_ops,
+        "agent_trace": agent.trace,
+        "final_peers": sorted(ns.decode_kv_args_table),
+        "final_prepared": {k: (k in ns.prep_handles) for k in ns.decode_kv_args_table},
+        "final_reload_times": {
+            k: int(round(t * 1000)) for k, t in ns._peer_reload_times.items()
+        },
+    }
+
+
+V["peers"] = [
+    peer_scenario("add_prefill", True, [("add", "d0", "meta0")]),
+    peer_scenario(
+        "add_duplicate", True, [("add", "d0", "meta0"), ("add", "d0", "meta0")]
+    ),
+    peer_scenario("add_decode", False, [("add", "d0", "meta0")]),
+    peer_scenario(
+        "reload_healthy",
+        True,
+        [("add", "d0", "meta0"), ("reload", ["d0"], 100.0, "ok")],
+    ),
+    peer_scenario(
+        "reload_invalid",
+        True,
+        [("add", "d0", "meta0"), ("reload", ["d0"], 100.0, "invalid")],
+    ),
+    peer_scenario(
+        "reload_rate_limited",
+        True,
+        [
+            ("add", "d0", "meta0"),
+            ("reload", ["d0"], 100.0, "invalid"),
+            ("reload", ["d0"], 100.5, "invalid"),
+            ("reload", ["d0"], 101.1, "invalid"),
+        ],
+    ),
+    peer_scenario(
+        "reload_prepare_fails_then_retries",
+        True,
+        [
+            ("add", "d0", "meta0"),
+            ("reload_fail_prepare", ["d0"], 100.0),
+            ("reload", ["d0"], 101.5, "invalid"),
+        ],
+    ),
+    peer_scenario(
+        "reload_skips_unknown",
+        True,
+        [("add", "d0", "meta0"), ("reload", ["ghost"], 100.0, "invalid")],
+    ),
+    peer_scenario(
+        "reload_check_raises",
+        True,
+        [
+            ("add", "d0", "meta0"),
+            ("add", "d1", "meta1"),
+            ("reload", ["d0", "d1"], 100.0, "raise"),
+        ],
+    ),
+]
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(
     json.dumps(
@@ -905,5 +1085,5 @@ print(
     f"room: {len(V['room']['update_status'])} update_status, "
     f"{len(V['room']['decode'])} decode, "
     f"{len(V['room']['deferred_abort'])} deferred_abort ops, "
-    f"{len(V['room']['prefill'])} prefill)"
+    f"{len(V['room']['prefill'])} prefill, {len(V['peers'])} peers)"
 )
