@@ -8,11 +8,15 @@ Two test classes:
 """
 
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
 from sglang.srt.model_executor.runner_utils.forward_batch import (
     set_forward_batch,
 )
@@ -288,6 +292,77 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.testing.assert_close(observed["out_cache_loc"], expected)
         self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
+
+    def test_pool_outputs_replay_without_retaining_intermediates(self):
+        for pass_output in (False, True):
+            with self.subTest(pass_output=pass_output):
+                allocations, references, direct_writes = [], [], []
+
+                def allocate(src):
+                    self.assertTrue(torch.cuda.is_current_stream_capturing())
+                    allocations.append(1)
+                    return torch.empty_like(src), None
+
+                def compute(src, out=None):
+                    self.assertFalse(torch.cuda.is_current_stream_capturing())
+                    result = src * 2 if out is None else torch.mul(src, 2, out=out[0])
+                    return result, None
+
+                def copy_output(dst, src):
+                    if isinstance(dst, tuple):
+                        direct_writes.append(dst[0] is src[0])
+                    return original_copy(dst, src)
+
+                operation = self.eager_on_graph(
+                    compute, output_factory=allocate, pass_output=pass_output
+                )
+                x = torch.zeros(1024, device=self.device)
+                y = torch.empty_like(x)
+                self.assertTrue(torch.equal(operation(x)[0], x))
+                self.assertEqual(allocations, [])
+                graph = self.BreakableCUDAGraph()
+                original_copy = bcg._copy_into_output
+                with patch.object(bcg, "_copy_into_output", side_effect=copy_output):
+                    with self.BreakableCUDAGraphCapture(
+                        graph, stream=torch.cuda.Stream()
+                    ):
+                        value = x + 1
+                        for _ in range(4):
+                            result, absent = operation(value)
+                            self.assertIsNone(absent)
+                            references.append(weakref.ref(result))
+                            value = result + 1
+                            del result
+                        y.copy_(value)
+                    self.assertTrue(all(ref() is None for ref in references))
+                    for n in (2, 5):
+                        x.fill_(n)
+                        graph.replay()
+                        torch.testing.assert_close(y, torch.full_like(y, 16 * n + 31))
+                self.assertEqual(len(allocations), 4)
+                self.assertEqual(direct_writes, [pass_output] * 12)
+
+    def test_output_factory_is_bypassed_by_explicit_eager_call(self):
+        class Operation:
+            @bcg.eager_on_graph(output_factory=lambda self, x: torch.empty_like(x))
+            def run(self, x):
+                return x
+
+        operation = Operation()
+        x = torch.ones(4, device=self.device)
+        with patch.object(bcg, "_current_capture_var") as capture:
+            self.assertIs(operation.run.run_eager(x), x)
+            capture.get.assert_not_called()
+        self.assertIs(operation.run(x), x)
+
+    def test_pool_output_layout_mismatch_is_rejected(self):
+        target = torch.empty(2, 4, device=self.device)
+        for result in (target[:1], target.double(), (target,), None):
+            with self.subTest(result_type=type(result)):
+                with self.assertRaisesRegex(AssertionError, "BCG output layout"):
+                    bcg._copy_into_output(target, result)
+        with self.assertRaisesRegex(AssertionError, "BCG output structure"):
+            bcg._copy_into_output((target, None), (target,))
 
 
 class TestCopyOutput(CustomTestCase):

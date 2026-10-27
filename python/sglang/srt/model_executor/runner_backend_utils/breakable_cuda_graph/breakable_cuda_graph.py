@@ -244,11 +244,35 @@ class _EagerOnGraphCallable:
         return bound
 
 
+def _copy_into_output(dst, src):
+    """Validate the fixed output layout before writing graph-owned storage."""
+    if dst is None and src is None:
+        return
+    if isinstance(dst, (tuple, list)):
+        assert type(dst) is type(src) and len(dst) == len(src), (
+            "BCG output structure changed"
+        )
+        for target, value in zip(dst, src):
+            _copy_into_output(target, value)
+        return
+    assert (
+        torch.is_tensor(dst)
+        and torch.is_tensor(src)
+        and dst.shape == src.shape
+        and dst.dtype == src.dtype
+        and dst.device == src.device
+    ), "BCG output layout changed"
+    if dst is not src:
+        dst.copy_(src)
+
+
 def eager_on_graph(
     fn: Optional[Callable] = None,
     capture_stub: Optional[Callable] = None,
     *,
     enable: Optional[bool] = None,
+    output_factory: Optional[Callable] = None,
+    pass_output: bool = False,
 ):
     """Record an eager call between captured segments.
 
@@ -259,6 +283,13 @@ def eager_on_graph(
     Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
     This explicit entry bypasses graph segmentation and capture stubs; methods
     bind their instance automatically.
+
+    ``output_factory(*args, **kwargs)`` optionally allocates fixed-layout tensor
+    outputs (or tuples/lists with None leaves) before ending the graph segment.
+    Their storage can then be reused by the graph pool after their consumers.
+    With ``pass_output=True``, the inner function also receives these buffers
+    as ``out`` and can return them directly to avoid a copy. Outside capture,
+    neither the factory nor the extra argument nor the output copies are used.
     """
 
     # Transitional support while model callers migrate to the bare decorator.
@@ -273,6 +304,13 @@ def eager_on_graph(
             capture = _current_capture_var.get()
             if capture is None:
                 return inner(*args, **kwargs)
+
+            # allocate while still capturing so output storage belongs to the pool
+            output = (
+                output_factory(*args, **kwargs) if output_factory is not None else None
+            )
+            if pass_output:
+                kwargs = dict(kwargs, out=output)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
@@ -289,9 +327,14 @@ def eager_on_graph(
             # capture (contents are never consumed; warmup and replay run
             # the real inner), letting rank-coupled bodies skip the work.
             if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
+                result = capture_stub(*args, **kwargs)
             else:
-                output = inner(*args, **kwargs)
+                result = inner(*args, **kwargs)
+            if output_factory is None:
+                output = result
+            else:
+                _copy_into_output(output, result)
+            del result
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -299,14 +342,20 @@ def eager_on_graph(
             captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            # The eager break output is different: it is allocated between graph
-            # captures and is the static input address consumed by the next
-            # captured segment. Keep a strong reference so replay can safely
-            # copy fresh eager output into that bridge buffer.
-            captured_output = output
+            # pool-owned outputs need only weak refs; eager-allocated outputs
+            # still need a strong owner to keep their replay addresses alive
+            captured_output = (
+                _weak_ref_if_tensor(output) if output_factory is not None else output
+            )
+            if pass_output:
+                # preserve identity so directly written leaves never copy themselves
+                captured_kwargs["out"] = captured_output
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)
+                if output_factory is not None:
+                    _copy_into_output(captured_output, new_out)
+                    return
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
