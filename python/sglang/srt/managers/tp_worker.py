@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
+    from sglang.srt.model_executor.encoder_swa_replay import FoldedExtend
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -667,6 +668,24 @@ class TpModelWorker(BaseTpWorker):
     ) -> Tuple[Optional[ScheduleBatch], ForwardBatch]:
         """The forward batch of a step (and the step as the forward reads it),
         or the forward batch given."""
+        batch, forward_batch, _ = self._init_forward_batch(
+            batch,
+            forward_batch,
+            skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
+        )
+        return batch, forward_batch
+
+    def _init_forward_batch(
+        self,
+        batch: Optional[ScheduleBatch],
+        forward_batch: Optional[ForwardBatch],
+        skip_attn_backend_init: Optional[bool],
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode],
+    ) -> Tuple[Optional[ScheduleBatch], ForwardBatch, Optional[FoldedExtend]]:
+        """`init_forward_batch`, plus the encoder-SWA replay rows folded into
+        the forward, which the forward drops from its logits."""
         # Get forward batch from schedule batch
         folded = None
         if batch is not None:
@@ -712,7 +731,7 @@ class TpModelWorker(BaseTpWorker):
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
-        return batch, forward_batch
+        return batch, forward_batch, folded
 
     def prepare_decode_step(self, step: ScheduleBatch) -> None:
         """A speculative server's stage before the last under pipeline
@@ -738,7 +757,7 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_kv_loc_plan: bool = False,
     ) -> GenerationBatchResult:
-        batch, forward_batch = self.init_forward_batch(
+        batch, forward_batch, folded = self._init_forward_batch(
             batch,
             forward_batch,
             skip_attn_backend_init,
