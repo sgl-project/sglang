@@ -175,6 +175,7 @@ jobs:
           - { stage: extra-b, runner_config: 4-gpu-h100, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 4-gpu-b200, timeout_per_file: '1800' }
           - { stage: extra-b, runner_config: 8-gpu-h200, timeout_per_file: '' }
+          - { stage: extra-b, runner_config: 8-gpu-h20, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -186,6 +187,16 @@ jobs:
       run_timeout_minutes: '60'
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
+  xeon-extra:
+    needs: [check-changes, call-gate]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ inputs.git_ref || github.ref }}
+      run_all_tests: ${{ inputs.run_all_tests == true }}
+      extra_only: true
     secrets: inherit
 
   # =============================================== aggregator ====================================================
@@ -202,6 +213,7 @@ jobs:
         simulator-test-cpu,
         simulator-test-gpu,
         extra-test,
+        xeon-extra,
       ]
     if: always()
     runs-on: ubuntu-latest
