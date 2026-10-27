@@ -28,6 +28,7 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
     should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
@@ -1613,7 +1614,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # When auto declines spatial-shard (gfx1250), decode is single-rank and
+        # DecodingStage runs it on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            not is_auto_parallel_decode_mode(config.parallel_decode_mode)
+            or should_use_spatial_shard_parallel_decode(config)
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(
