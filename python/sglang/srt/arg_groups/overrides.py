@@ -1614,7 +1614,7 @@ def _a2a_ep_size(view: Any) -> dict:
     if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
         if view.ep_size != view.tp_size:
             logger.info(
-                f"{backend} MoE is enabled. The expert parallel size "
+                f"{view.moe_a2a_backend} MoE is enabled. The expert parallel size "
                 f"is adjusted from {view.ep_size} to the tensor parallel size "
                 f"[{view.tp_size}]."
             )
