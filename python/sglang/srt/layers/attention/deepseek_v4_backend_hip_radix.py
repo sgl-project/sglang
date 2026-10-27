@@ -95,7 +95,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
 )
-from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
@@ -326,10 +325,8 @@ class UnifiedKvMetadata:
 
     # DeepSeek-V4.1 ratio-1/2 decode streams: SWA-ring prefix built once per step,
     # compressed tail filled per layer at that layer's compressed-row base.
-    c1_indices: Optional[torch.Tensor] = None
     c1_indptr: Optional[torch.Tensor] = None
     c1_len: Optional[torch.Tensor] = None
-    c2_indices: Optional[torch.Tensor] = None
     c2_indptr: Optional[torch.Tensor] = None
     c2_len: Optional[torch.Tensor] = None
 
@@ -344,10 +341,8 @@ class UnifiedKvMetadata:
 
     _LOW_RATIO_FIELDS = (
         "swa_loc_i64",
-        "c1_indices",
         "c1_indptr",
         "c1_len",
-        "c2_indices",
         "c2_indptr",
         "c2_len",
     )
@@ -1741,6 +1736,8 @@ class DeepseekV4HipRadixBackend(
         if isinstance(metadata, DSV4Metadata):
             # the bucket object outlives the step; a warmup's length-fold cache must not be replayed
             metadata.core_attn_metadata._aiter_sparse_masked_indices = None
+            if metadata.core_attn_metadata.unified is not None:
+                metadata.core_attn_metadata.unified.low_ratio_streams = {}
 
         window = self.token_to_kv_pool.request_window
         if window is not None and isinstance(metadata, DSV4Metadata):
@@ -2662,7 +2659,6 @@ class DeepseekV4HipRadixBackend(
             self._attach_grouped_verify_streams(core, state_slot, num_draft)
             u.low_ratio_streams = {}
             for ratio in core.low_ratios:
-                setattr(u, f"c{ratio}_indices", None)
                 setattr(u, f"c{ratio}_indptr", meta[f"c{ratio}_indptr"])
                 setattr(u, f"c{ratio}_len", meta[f"c{ratio}_len"])
             u.swa_loc, u.swa_loc_i64 = meta["swa_loc"], meta["swa_loc_i64"]
@@ -2745,7 +2741,6 @@ class DeepseekV4HipRadixBackend(
             low_len = torch.clamp(
                 core.seq_lens_casual[:N].to(torch.int32) // ratio, max=core.index_topk
             )
-            setattr(core.unified, f"c{ratio}_indices", None)
             setattr(
                 core.unified,
                 f"c{ratio}_indptr",
@@ -3211,6 +3206,10 @@ class DeepseekV4HipRadixBackend(
             # Already CP-reindexed; padding rows carry the inert expansion position.
             positions = core_attn_metadata.positions_casual.to(torch.int64)
             assert positions.shape[0] == T
+            if tail is not None:
+                assert tail.pos_global is not None, (
+                    "unified_kv: the late-layer tail under CP needs its CP layout"
+                )
             positions_full = (
                 tail.pos_global
                 if tail is not None
@@ -3821,6 +3820,10 @@ class DeepseekV4HipRadixBackend(
         """swa_replay_start floors every row's window at that absolute position."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         raw_positions = seq_lens_casual - 1
+
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
 
         request_layout = None
         window = self.token_to_kv_pool.request_window

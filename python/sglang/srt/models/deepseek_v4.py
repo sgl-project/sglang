@@ -2309,14 +2309,13 @@ class MQALayer(MqaAttentionBase):
 
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
-        # DeepSeek-V4.1 has no query head norm: its query is computed exactly as
-        # on the paged path (RoPE'd bf16) and the fp8 store only packs it.
+        # DeepSeek-V4.1 has no query head norm: the fp8 packer applies the query RoPE.
         unified_no_q_norm = unified and fp8_2buff and not self.q_head_norm
         if do_fused_qk_norm_rope:
             if unified_no_q_norm:
                 # the indexer reads q_for_wqb, as _hip.compute_q_b hands it back;
                 # the RoPE happens in the fp8 packer
-                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                _, q_for_wqb = self._normalize_q_lora(q_lora)
                 q_lora = q_for_wqb
                 q = _hip.wq_b_unroped(self, q_for_wqb)
             elif _is_gfx95_supported or _is_gfx1250_supported:

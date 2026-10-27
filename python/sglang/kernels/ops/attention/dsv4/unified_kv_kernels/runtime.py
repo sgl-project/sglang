@@ -403,10 +403,9 @@ def build_grouped_verify_streams(
     )
 
 
-# DeepSeek-V4.1 low-ratio streams (128 SWA rows + up to 512 top-k rows): the
-# occupancy heuristic over-splits them and the stage-2 merge dominates. MI355X,
-# 16 heads, 640 rows: auto 16.1 us (merge 9.2) vs 8 splits 14.1 at T=1, best at
-# T=8 / 16 too (work/tests/bench_unified_decode.py).
+# DeepSeek-V4.1 low-ratio streams (128 SWA + up to 512 top-k rows): the occupancy
+# heuristic over-splits them. Measured on MI355X, 16 heads, 640 rows: auto 16.1 us
+# vs 8 splits 14.1 us at T=1, and 8 is also best at T=8 / 16.
 _DECODE_LOW_RATIO_SPLITS = 8
 
 
@@ -489,7 +488,8 @@ def _merge_splits_inv_rope_kernel(
     tl.store(out_ptr + seq * stride_obs + head * stride_oh + d, out)
 
 
-_MERGE_NUM_WARPS = 2  # bench_merge.py: 3.4 us at T=1..16, 8 splits (1 warp 3.8, 4 warps 5.3; stage2 5.2)
+# Measured on MI355X, 8 splits, T=1..16: 3.4 us (1 warp 3.8, 4 warps 5.3; stage2 5.2).
+_MERGE_NUM_WARPS = 2
 
 
 def _decode_fp8_2buff_inv_rope(

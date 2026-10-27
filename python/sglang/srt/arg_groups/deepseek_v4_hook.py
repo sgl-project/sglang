@@ -342,10 +342,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
         ("HiSparse", cfg.enable_hisparse),
-        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups), incl. PD
-        # transfer, the external cache linker and DSpark (its draft keeps a bf16
-        # ring of its own); the bf16 rows, encoder replay and HiCache are not
-        # wired / validated for them.
+        # Ratios 1 / 2 are wired for the fp8 two-pool layout only (incl. PD, the
+        # external linker, DSpark), not for bf16 rows, encoder replay or HiCache.
         (
             "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
             is_unified_kv_triton() and not is_unified_kv_fp8(),
