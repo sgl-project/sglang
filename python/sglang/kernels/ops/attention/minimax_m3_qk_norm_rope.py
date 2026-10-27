@@ -32,7 +32,7 @@ def _cache_inv_scale(
     # casts, and None means unit (no division at all).
     if scale is None or x.dtype == cache.dtype:
         return None
-    # torch's `x / scale` multiplies by the fp32 reciprocal of the fp32 scale.
+    # torch's x / scale multiplies by the fp32 reciprocal of the fp32 scale.
     return float(np.float32(1.0) / np.float32(scale))
 
 
