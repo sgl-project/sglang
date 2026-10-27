@@ -1207,9 +1207,7 @@ class PrefillAdder:
     def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
         # Running work and admitted prefills (including continuing chunks) can
         # release capacity. Only idle budget failures should force recomputation.
-        if self.can_run_list or (
-            self.running_batch is not None and self.running_batch.reqs
-        ):
+        if self.can_run_list or self.running_reqs:
             return
         if self.tree_cache.buffer_pipeline is not None:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
