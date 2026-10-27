@@ -26,8 +26,10 @@
 4. The loop folds a batch of available ACKs along PP0 → … → PP-last → PP0.
    A stage with fewer ACKs shortens the batch; it never waits for local I/O.
    PP0 forwards the agreed results before the native cache-event drain.
-5. The native ACK publisher, cache insertion / buffer ticket handoff, stop-policy
-   evaluation, scheduler selection and H2D consume those results unchanged.
+5. Native stop-policy evaluation requests I/O termination. Cache-mode PP keeps
+   the request pending until the ordered query drain (no I/O launched) or the
+   final agreed ACK retires the operation. The native finalizer then inserts the
+   usable prefix; scheduler selection and H2D consume it through the usual path.
 
 The ring reuses the native P2P helpers and WORLD group with a distinct message
 tag. Returns and send-buffer retirement are delayed by `pp_loop_size`, so the
@@ -82,7 +84,20 @@ grammar-pending request) and passes on all three simulated PP stages after the
 fix. Query/ACK transport still has real Gloo coverage; grammar ingress uses CPU
 doubles. These checks are not GPU end-to-end qualification.
 
-GPU model accuracy, deployment and performance have not been run for this
-replacement. Earlier opt-in Gate benchmark results are not acceptance evidence
-for this version; in particular, completion visibility now follows the loop
-rather than the old background PP collective.
+2026-10-27 stop/finalize correction: the 4cd986a GPU diagnostic reproduced
+best_effort consuming stale completed_tokens while valid ACKs were still in
+the PP ring. All replay queries returned their full storage spans. Stop now
+preserves native operation ownership until query/terminal-ACK retirement;
+it adds no collective, fixed wait, request queue or policy-specific protocol.
+The non-PP immediate-finalization path and buffer ticket path are unchanged.
+The shared lifecycle fixture covers best_effort and expired timeout with
+unfinished queries, partial/full ACKs, and abort-before-terminal cleanup.
+All eight cases fail before the fix and pass after it; the four related
+CPU/Gloo suites pass 52 tests and 75 subtests. GPU performance recovery for
+this fix remains to be measured. A pre-query best_effort cancellation can
+still produce zero storage hits; this change does not turn it into wait_complete.
+
+The 4cd986a replacement completed one N4000 best_effort run in Singapore and
+one N4000 timeout run in Beijing, both without HTTP failures. They are not
+same-machine policy ablations, nor model-accuracy acceptance. Earlier opt-in
+Gate benchmark results likewise do not qualify this different completion path.

@@ -2402,6 +2402,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
+        if self.cache_controller.pp_prefetch_consensus is not None:
+            # Stop permission does not make in-flight PP completion ACKs visible.
+            # Keep ownership until the native query drain (no IO) or terminal
+            # ACK finalizes the agreed prefix and releases its unused tail.
+            return False
         if operation.host_indices is None:
             if operation.deadline_expired:
                 self._finish_storage_prefetch(request, 0, reason="deadline")
@@ -3225,8 +3230,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.pool_transfers_done = True
                 if ack.completed_req:
                     if is_current:
-                        # check_prefetch_progress() is not called for this rid yet.
-                        # Let us insert the prefetch result into the radix tree.
+                        # Natural completion or a PP stop awaiting its final ACK.
                         self._handle_prefetch_result(operation)
                     if operation.ack_releases_incomplete_host_indices:
                         cc.append_host_mem_release(
