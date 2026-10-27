@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -285,8 +286,6 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     elif quant_method.is_fp4_expert:
         # FP4 (1x32 UE8M0) experts run DeepGEMM's FP8 x FP4 grouped GEMM on
         # 1x128 FP8 activations, which needs the UE8M0 (Blackwell) scale layout.
-        from sglang.srt.layers import deep_gemm_wrapper
-
         if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             reason = "selected FP4 experts without DeepGEMM UE8M0 scales"
         elif config.activation_scheme != "dynamic":

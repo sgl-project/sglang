@@ -1,5 +1,8 @@
 """CPU-only tests for the DeepEP v2 ElasticBuffer ownership facade."""
 
+import importlib
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import deepep_v2
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
 from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -120,9 +124,6 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
 
     def test_deepep_2_5_epbuffer_is_preferred(self):
         """deep_ep_v25 (sgl-deep-ep-v25) wins, then deep_ep's EPBuffer, then 2.1's ElasticBuffer."""
-        import importlib
-        import sys
-        import types
 
         def _module(name, **names):
             module = types.ModuleType(name)
@@ -177,8 +178,6 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         impl.hidden_size = 128
         impl.activation_scale_block_size = 128
         impl.router_topk = 2
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
         out = StandardTopKOutput(
             topk_weights=torch.ones(9, 2),
             topk_ids=torch.zeros(9, 2, dtype=torch.int32),

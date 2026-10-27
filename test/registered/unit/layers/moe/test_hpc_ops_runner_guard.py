@@ -2,10 +2,16 @@
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    _validate_deepep_v2_quant_method,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.runtime_context import get_flags
@@ -80,10 +86,6 @@ def _fp8_method(**overrides):
 def test_deepep_v2_quant_contract_accepts_blockwise_fp8(
     _moe_flags, use_mxfp8, block_size
 ):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import (
-        _validate_deepep_v2_quant_method,
-    )
-
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
     _validate_deepep_v2_quant_method(
         _fp8_method(weight_block_size=block_size, use_mxfp8=use_mxfp8)
@@ -101,10 +103,6 @@ def test_deepep_v2_quant_contract_accepts_blockwise_fp8(
 def test_deepep_v2_quant_contract_rejects_incompatible_fp8(
     _moe_flags, overrides, expected
 ):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import (
-        _validate_deepep_v2_quant_method,
-    )
-
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
     with pytest.raises(ValueError, match=expected):
         _validate_deepep_v2_quant_method(_fp8_method(**overrides))
@@ -122,11 +120,6 @@ def test_deepep_v2_quant_contract_fp4_experts(
     _moe_flags, monkeypatch, scale_ue8m0, activation_scheme, expected
 ):
     """FP4 experts feed DeepGEMM's FP8 x FP4 GEMM only with UE8M0 scales."""
-    from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.moe.fused_moe_triton.layer import (
-        _validate_deepep_v2_quant_method,
-    )
-
     monkeypatch.setattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", scale_ue8m0)
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
     # FP4-expert checkpoints carry the 128x128 block size of their dense layers.
@@ -217,11 +210,6 @@ def test_deepep_v2_registration_uses_primary_architecture_and_rejects_conflicts(
 @pytest.mark.parametrize("block_size,width", [(32, 16), (128, 4)])
 def test_mxfp8_recipes_keep_activation_and_weight_groups_separate(block_size, width):
     # The packed format is a layout contract, independent of the host GPU.
-    from unittest.mock import patch
-
-    from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-
     with patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True):
         quant = DeepGemmMoeQuantInfo(
             None, None, True, block_shape=[1, 32], use_mxfp8=True
@@ -258,11 +246,6 @@ def test_activation_group_matches_recipe_a(
     The masked path once used the checkpoint block size (32 for V4.1-Flash), so its
     down-projection scales disagreed with recipe_a=(1, 128) and DeepGEMM rejected them.
     """
-    from unittest.mock import patch
-
-    from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-
     with patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True):
         quant = DeepGemmMoeQuantInfo(
             None,
