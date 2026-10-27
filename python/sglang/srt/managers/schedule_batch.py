@@ -970,6 +970,11 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
