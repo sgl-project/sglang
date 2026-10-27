@@ -26,9 +26,11 @@ logger = init_logger(__name__)
 try:
     from sglang.kernels.ops.diffusion import (
         BitExactFusionGate,
+        can_use_conv_bias_epilogue,
         can_use_nearest_upsample_nhwc,
         can_use_wan_norm_silu_post,
         can_use_wan_rmsnorm_silu,
+        conv_bias_epilogue,
         nearest_upsample_nhwc,
         wan_norm_silu_post,
         wan_rmsnorm_silu,
@@ -58,11 +60,25 @@ class FusedWanRMSNormSiLU(nn.Module):
             "Wan norm+SiLU post-ops", per_signature=True
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, conv_bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``conv_bias`` is a preceding conv's deferred bias (see
+        ``WanCausalConv3d._conv_with_epilogue``): folded into the fused kernel
+        when the gate is on, otherwise applied first with aten's arithmetic."""
         if self._sgl_gate.enabled and not torch.compiler.is_compiling():
             bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-            if can_use_wan_rmsnorm_silu(x, self.gamma, bias):
-                return wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
+            if can_use_wan_rmsnorm_silu(x, self.gamma, bias, conv_bias):
+                return wan_rmsnorm_silu(
+                    x, self.gamma, bias, rms_scale=self.scale, conv_bias=conv_bias
+                )
+        if conv_bias is not None:
+            if not torch.compiler.is_compiling() and can_use_conv_bias_epilogue(
+                x, conv_bias
+            ):
+                x = conv_bias_epilogue(x, conv_bias)  # bit-exact, vectorised
+            else:
+                x = x + conv_bias.to(x.dtype).view(1, -1, 1, 1, 1)
         if (
             not torch.compiler.is_compiling()
             and not self._post_gate.disabled
@@ -200,7 +216,7 @@ def _install_norm_silu(
     decoder: nn.Module,
     gate: VaeFastPathGate,
     *,
-    residual_block_cls: type,
+    residual_block_cls: tuple[type, ...],
     rms_norm_cls: type,
     label: str,
 ) -> int | None:
@@ -214,7 +230,7 @@ def _install_norm_silu(
     eligible = [
         m
         for m in res_blocks
-        if type(m) is residual_block_cls
+        if type(m) in residual_block_cls
         and _is_plain_silu(m.nonlinearity)
         and _norm_fusable(m.norm1, rms_norm_cls)
         and _norm_fusable(m.norm2, rms_norm_cls)
@@ -269,6 +285,9 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
         AutoencoderKLWan,
         WanAttentionBlock,
         WanDecoder3d,
+        WanDistAttentionBlock,
+        WanDistResample,
+        WanDistResidualBlock,
         WanResample,
         WanResidualBlock,
         WanRMS_norm,
@@ -277,13 +296,19 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLWan):
         return vae
+    # the spatial-parallel decoder's blocks only swap in halo-exchanging convs
     return _maybe_optimize_wan_family_vae(
         vae,
         decoder_cls=WanDecoder3d,
-        residual_block_cls=WanResidualBlock,
+        residual_block_cls=(WanResidualBlock, WanDistResidualBlock),
         rms_norm_cls=WanRMS_norm,
         upsample_cls=WanUpsample,
-        gated_module_classes=(WanResample, WanAttentionBlock),
+        gated_module_classes=(
+            WanResample,
+            WanDistResample,
+            WanAttentionBlock,
+            WanDistAttentionBlock,
+        ),
         label="Wan VAE",
     )
 
@@ -309,7 +334,7 @@ def maybe_optimize_qwen_image_vae(vae: nn.Module) -> nn.Module:
     return _maybe_optimize_wan_family_vae(
         vae,
         decoder_cls=QwenImageDecoder3d,
-        residual_block_cls=QwenImageResidualBlock,
+        residual_block_cls=(QwenImageResidualBlock,),
         rms_norm_cls=QwenImageRMS_norm,
         upsample_cls=QwenImageUpsample,
         gated_module_classes=(QwenImageAttentionBlock,),
@@ -321,7 +346,7 @@ def _maybe_optimize_wan_family_vae(
     vae: nn.Module,
     *,
     decoder_cls: type,
-    residual_block_cls: type,
+    residual_block_cls: tuple[type, ...],
     rms_norm_cls: type,
     label: str,
     upsample_cls: type | None = None,
@@ -329,9 +354,6 @@ def _maybe_optimize_wan_family_vae(
 ) -> nn.Module:
     decoder = getattr(vae, "decoder", None)
     if type(decoder) is not decoder_cls:
-        return vae
-    if decoder.use_parallel_decode and decoder.world_size > 1:
-        logger.info("%s: spatial-parallel decode; skipping fast path.", label)
         return vae
     if not _HAS_TRITON:
         logger.warning("%s: Triton unavailable; skipping fast path.", label)

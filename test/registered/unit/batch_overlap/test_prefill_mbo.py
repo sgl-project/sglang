@@ -2,8 +2,9 @@
 microbatch inputs and per-microbatch mHC coefficients."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -201,6 +202,25 @@ class TestLayerOperations(CustomTestCase):
     def tearDown(self):
         prefill_mbo.end_forward()
 
+    def test_deepseek_v4_subclasses_keep_the_main_dispatch(self):
+        from sglang.srt.batch_overlap import operations_strategy
+        from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
+
+        class DerivedV4Layer(DeepseekV4DecoderLayerBase):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+
+        expected = OperationsStrategy(operations=[], tbo_delta_stages=0)
+        with patch.object(
+            operations_strategy,
+            "_compute_moe_deepseek_v4_layer_operations_strategy_tbo",
+            return_value=expected,
+        ) as compute:
+            layer = DerivedV4Layer()
+            actual = OperationsStrategy.init_new_tbo([layer], ForwardMode.EXTEND)
+        compute.assert_called_once_with(layer, ForwardMode.EXTEND)
+        self.assertEqual(actual, expected)
+
     def test_glm5_next_runs_only_split_prefills(self):
         layers = [Glm5NextDecoderLayer("l0"), Glm5NextDecoderLayer("l1")]
         with self.assertRaises(NotImplementedError):
@@ -280,6 +300,62 @@ class TestMicrobatchInputs(CustomTestCase):
             tbo_subbatch_index=0,
         )
         self.assertTrue(torch.equal(out["positions"], positions[:4]))
+
+
+class TestEagerSharedReadIntegration(CustomTestCase):
+    def test_split_preserves_resolved_shared_read_event(self):
+        from sglang.srt.model_executor.runner import eager_runner
+
+        calls = []
+        shared_read_ends = object()
+        output = object()
+        batch = SimpleNamespace(
+            needs_forward_metadata_init=lambda: True,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=torch.zeros(8192, dtype=torch.int64),
+            positions=torch.arange(8192),
+        )
+        backend = SimpleNamespace(
+            init_forward_metadata=lambda batch: calls.append("metadata"),
+            resolve_prefill_shared_read_ends=lambda *a, **kw: (
+                calls.append("resolve") or shared_read_ends
+            ),
+        )
+        model_runner = SimpleNamespace(
+            _extend_forward_kwargs=lambda *a: {},
+            model=SimpleNamespace(
+                forward=lambda *a, **kw: calls.append("forward") or output
+            ),
+            attn_backend=backend,
+            device="cpu",
+            device_timer=None,
+        )
+        runner = SimpleNamespace(model_runner=model_runner, enable_pdmux=True)
+        publish = Mock(side_effect=lambda *a: calls.append("publish"))
+        with (
+            patch.object(eager_runner, "is_cp_active", return_value=False),
+            patch.object(
+                eager_runner,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1),
+            ),
+            patch.object(prefill_mbo, "enabled", return_value=True),
+            patch.object(
+                prefill_mbo,
+                "maybe_split",
+                side_effect=lambda batch: calls.append("split"),
+            ),
+            patch.object(
+                eager_runner, "maybe_publish_prefill_shared_read_done", publish
+            ),
+            patch.object(eager_runner, "device_timer_ctx", return_value=nullcontext()),
+            patch.object(eager_runner, "get_forward_context", return_value=None),
+            patch.object(eager_runner, "forward_context", return_value=nullcontext()),
+        ):
+            actual = eager_runner.EagerRunner._execute_extend(runner, batch)
+        self.assertIs(actual, output)
+        self.assertEqual(calls, ["metadata", "split", "resolve", "publish", "forward"])
+        self.assertIs(publish.call_args.args[1], shared_read_ends)
 
 
 class TestMhcCoefficientsPerMicrobatch(CustomTestCase):

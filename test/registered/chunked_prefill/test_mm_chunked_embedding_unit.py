@@ -25,7 +25,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -50,9 +50,7 @@ HIDDEN = 16
 
 @pytest.fixture(autouse=True)
 def single_process_runtime_context():
-    # These mm_utils unit tests exercise cache-hit paths that acknowledge
-    # deferred CUDA IPC through runtime_context. They do not start an engine, so
-    # pin the runtime topology to a single-process CPU setup.
+    # Exercise the embedding path without starting an engine.
     server_args_override = get_context().override_server_args(tp_size=1)
     server_args_override.install()
     try:
@@ -72,14 +70,6 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
-
-
-@pytest.fixture(autouse=True)
-def _skip_cuda_ipc_acknowledgement(monkeypatch):
-    """Keep CPU embedding tests independent of tensor-parallel runtime state."""
-    monkeypatch.setattr(
-        mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits", lambda _items: None
-    )
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:
@@ -490,6 +480,34 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
         == embeddings.untyped_storage().data_ptr()
     )
     concat.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "n_ids,n_placeholders,ids_dtype",
+    [
+        (1, 1, torch.int64),
+        (64, 3, torch.int64),
+        (4096, 800, torch.int64),
+        (16384, 800, torch.int32),
+    ],
+)
+def test_multimodal_mask_matches_broadcast_compare(n_ids, n_placeholders, ids_dtype):
+    gen = torch.Generator().manual_seed(n_ids)
+    pad_values = torch.randperm(4 * n_placeholders + 8, generator=gen)[
+        :n_placeholders
+    ].tolist()
+    # Host-sorted placeholders with a repeat, as embed_mm_inputs builds them; ids
+    # below, between and above them.
+    placeholders = torch.tensor(sorted(pad_values + pad_values[:1]))
+    input_ids = torch.randint(-2, 4 * n_placeholders + 10, (n_ids,), generator=gen).to(
+        ids_dtype
+    )
+
+    mask = mm_schedule._get_multimodal_mask(input_ids, placeholders)
+
+    broadcast = (input_ids.unsqueeze(-1) == placeholders).any(-1).unsqueeze(-1)
+    assert torch.equal(mask, broadcast)
+    assert torch.equal(mask, torch.isin(input_ids, placeholders).unsqueeze(-1))
 
 
 if __name__ == "__main__":

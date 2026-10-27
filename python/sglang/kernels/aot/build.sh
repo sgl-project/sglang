@@ -6,7 +6,7 @@ if [ $# -lt 2 ]; then
   exit 1
 fi
 
-PYTHON_VERSION="$1"          # e.g. 3.10
+PYTHON_VERSION="$1"          # e.g. 3.11
 CUDA_VERSION="$2"            # e.g. 12.9
 ARCH="${3:-$(uname -i)}"     # optional override
 
