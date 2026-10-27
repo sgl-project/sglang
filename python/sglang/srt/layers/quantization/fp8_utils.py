@@ -13,6 +13,10 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.kernels.ops.gemm.fp8_w8a16_xpu import (
+    has_xpu_w8a16_gemm,
+    xpu_w8a16_block_fp8_linear,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     dequant_group_fp8_to_bf16,
     fp8_dtype,
@@ -750,6 +754,34 @@ def dispatch_w8a8_block_fp8_linear(
     return linear
 
 
+def xpu_w8a16_block_fp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Keep activations in bf16 on XPU: decode is weight-bandwidth bound and Xe2 GEMMs
+    gain nothing from fp8 activations."""
+    if (
+        input_scale is not None
+        or input.dtype != torch.bfloat16
+        or list(block_size) != [128, 128]
+    ):
+        return torch_w8a8_block_fp8_linear(
+            input=input,
+            weight=weight,
+            block_size=block_size,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+        )
+    return xpu_w8a16_block_fp8_linear(
+        input=input, weight=weight, weight_scale=weight_scale, bias=bias
+    )
+
+
 def torch_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1199,6 +1231,8 @@ def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
 
         return npu_w8a8_mxfp8_linear
     elif _is_xpu:
+        if has_xpu_w8a16_gemm():
+            return xpu_w8a16_block_fp8_linear_with_fallback
         return torch_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
