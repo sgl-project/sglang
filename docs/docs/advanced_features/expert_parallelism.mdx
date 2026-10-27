@@ -146,6 +146,57 @@ Launch with DeepEP and DeepGEMM for DeepSeek-V3:
 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --moe-a2a-backend deepep --moe-runner-backend deep_gemm --tp 8 --ep 8
 ```
 
+## Orchestrator-safe Elastic EP growth
+
+On Linux with NVIDIA CUDA and an enabled Elastic EP backend, you can correlate
+growth requests and safely retry a lost acknowledgment. Requests still use
+`POST /scale_elastic_ep`; acceptance does not wait for the joining allocation to
+finish the collective. A scheduler acknowledgment is bounded by 30 seconds or
+the configured scale-operation timeout, whichever is shorter.
+
+First read `GET /is_scaling_elastic_ep` on the primary. Keep its `instance_id`
+and opaque `topology_token`, then submit an absolute physical EP target:
+
+```json
+{
+  "new_ep_size": 8,
+  "operation_id": "grow-4-8",
+  "expected_instance_id": "<instance_id from status>",
+  "expected_topology_token": "<topology_token from status>",
+  "expected_joining_allocation_ids": ["<joining allocation ID>"]
+}
+```
+
+The identity and fence fields are optional for existing callers. For external
+orchestration, retain the complete body and replay it unchanged after a timeout
+or lost response. The same operation returns its pending or retained terminal
+result; `submission_unknown` can safely re-fan out the same scheduler request.
+Changing its target, original token or joining allocation is a conflict (HTTP
+409), as is sending a new request from a stale instance or topology token.
+Each new acceptance advances the token even if that operation later fails.
+Committing membership advances it again; duplicate completion updates and
+identical retries leave it unchanged. A delayed old request cannot become a new
+resize after a successor replaces the retained result, even at the same size or
+with a reused operation ID. Only the latest operation is retained, for the
+tokenizer instance's lifetime until a successor is accepted; runtime restart
+changes `instance_id`.
+
+Poll status for `operation_id`, `operation_succeeded`, `pending_ep_size` and
+`effective_ep_size`. Read `runtime_health` and `runtime_error` independently:
+a successful historical operation is not current serving-health evidence.
+`ready_rank_count` describes cohort admission, not inference readiness.
+
+For one immutable launch template, use `--elastic-ep-join-mode auto`, a stable
+`--elastic-ep-allocation-index` and an optional opaque
+`--elastic-ep-allocation-id`. The initial EP size counts physical ranks, not
+allocations. With visible width `W`, initial indices below `initial_ep_size / W`
+form one world; later indices append one complete allocation per grow. Automatic
+mode derives TP/DP/EP and node geometry, requires attention TP1/CP1 and DP
+attention, and refuses previously occupied append slots rather than selecting
+recovery implicitly. Explicit growth keeps its fixed attention-topology mapping.
+Shrink, replacement and failure recovery are outside this interface's growth
+contract.
+
 ## Extensible EP Framework
 
 SGLang's EP framework provides modular abstractions for easy integration of custom kernels, backends, and optimizations. It decouples the MoE forward pass into stages (dispatch → pre-permute → core runner → post-permute → combine), enabling seamless extensions without refactoring core logic.

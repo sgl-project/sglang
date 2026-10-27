@@ -50,6 +50,8 @@ def _manager(*, replica_size: int = 1) -> TokenizerManager:
     manager.elastic_max_committed_ep_size = 4
     manager.elastic_operation_id = None
     manager.elastic_operation_target = None
+    manager.elastic_operation_base_token = None
+    manager.elastic_topology_revision = 0
     manager.elastic_operation_succeeded = None
     manager.elastic_expected_joining_allocation_ids = []
     manager.elastic_pending_ep_size = None
@@ -82,6 +84,192 @@ def _manager(*, replica_size: int = 1) -> TokenizerManager:
 
 
 class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_commit_fences_pending_token_without_invalidating_replay(self):
+        manager = _manager()
+        request = ScaleElasticEPReqInput(
+            new_ep_size=8,
+            operation_id="grow",
+            expected_topology_token=manager.elastic_topology_token,
+        )
+        await manager.scale_elastic_ep(request)
+        pending_token = manager.elastic_topology_token
+        committed = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=8,
+            operation_id="grow",
+            scale_phase="serving_expanded",
+        )
+        manager.forward_elastic_scale_update(committed)
+        committed_token = manager.elastic_topology_token
+        self.assertNotEqual(committed_token, pending_token)
+
+        manager.forward_elastic_scale_update(committed)
+        self.assertEqual(manager.elastic_topology_token, committed_token)
+        self.assertTrue((await manager.scale_elastic_ep(request)).terminal)
+        self.assertEqual(manager.elastic_topology_token, committed_token)
+        stale = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(
+                new_ep_size=12,
+                operation_id="next",
+                expected_topology_token=pending_token,
+            )
+        )
+        self.assertTrue(stale.conflict)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 1)
+
+    async def test_reconciled_commit_advances_fence_only_once(self):
+        manager = _manager()
+        manager.scale_elastic_ep_communicator.side_effect = [
+            TimeoutError("response lost"),
+            [
+                ScaleElasticEPReqOutput(
+                    success=True,
+                    message="completed",
+                    terminal=True,
+                    effective_ep_size=8,
+                    new_ep_size=8,
+                )
+            ],
+        ]
+        request = ScaleElasticEPReqInput(
+            new_ep_size=8,
+            operation_id="grow",
+            expected_topology_token=manager.elastic_topology_token,
+        )
+        with self.assertRaises(TimeoutError):
+            await manager.scale_elastic_ep(request)
+        pending_token = manager.elastic_topology_token
+        self.assertTrue((await manager.scale_elastic_ep(request)).terminal)
+        committed_token = manager.elastic_topology_token
+        self.assertNotEqual(committed_token, pending_token)
+
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=8,
+                operation_id="grow",
+                scale_phase="serving_expanded",
+            )
+        )
+        self.assertTrue((await manager.scale_elastic_ep(request)).terminal)
+        self.assertEqual(manager.elastic_topology_token, committed_token)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 2)
+
+    async def test_reused_operation_id_cannot_recreate_an_older_fence(self):
+        manager = _manager()
+        await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(new_ep_size=8, operation_id="resize")
+        )
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=8,
+                operation_id="resize",
+                scale_phase="serving_expanded",
+            )
+        )
+        original_token = manager.elastic_topology_token
+        manager.scale_elastic_ep_communicator.return_value = [
+            ScaleElasticEPReqOutput(
+                success=True,
+                message="accepted",
+                new_ep_size=12,
+                pending_ep_size=12,
+            )
+        ]
+        for operation_id in ("successor", "resize"):
+            accepted = await manager.scale_elastic_ep(
+                ScaleElasticEPReqInput(
+                    new_ep_size=12,
+                    operation_id=operation_id,
+                    expected_topology_token=manager.elastic_topology_token,
+                )
+            )
+            self.assertTrue(accepted.success)
+            manager.forward_elastic_scale_update(
+                ElasticScaleUpdateReq(
+                    success=False,
+                    effective_ep_size=8,
+                    operation_id=operation_id,
+                    scale_phase="failed",
+                    error="failed before topology change",
+                )
+            )
+        self.assertNotEqual(manager.elastic_topology_token, original_token)
+        stale = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(
+                new_ep_size=12,
+                operation_id="delayed",
+                expected_topology_token=original_token,
+            )
+        )
+        self.assertTrue(stale.conflict)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 3)
+
+    async def test_base_token_fences_delayed_requests_but_not_identical_replay(self):
+        manager = _manager()
+        token = manager.get_elastic_ep_state()["topology_token"]
+        request = ScaleElasticEPReqInput(
+            new_ep_size=8,
+            operation_id="grow",
+            expected_instance_id="runtime-1",
+            expected_topology_token=token,
+        )
+        accepted = await manager.scale_elastic_ep(request)
+        self.assertTrue(accepted.success)
+        self.assertNotEqual(token, manager.get_elastic_ep_state()["topology_token"])
+        self.assertTrue((await manager.scale_elastic_ep(request)).success)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 1)
+
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=8,
+                operation_id="grow",
+                scale_phase="serving_expanded",
+            )
+        )
+        # A later accepted request replaces the retained result. Even if that
+        # request fails back at its base, the original request cannot start anew.
+        successor = ScaleElasticEPReqInput(
+            new_ep_size=12,
+            operation_id="grow-next",
+            expected_topology_token=manager.elastic_topology_token,
+        )
+        manager.scale_elastic_ep_communicator.return_value = [
+            ScaleElasticEPReqOutput(
+                success=True, message="accepted", pending_ep_size=12
+            )
+        ]
+        self.assertTrue((await manager.scale_elastic_ep(successor)).success)
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=False,
+                effective_ep_size=8,
+                operation_id="grow-next",
+                scale_phase="failed",
+                error="rejected before mutation",
+            )
+        )
+        self.assertTrue((await manager.scale_elastic_ep(request)).conflict)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 2)
+
+    async def test_replay_cannot_change_the_original_base_token(self):
+        manager = _manager()
+        original_token = manager.elastic_topology_token
+        request = ScaleElasticEPReqInput(
+            new_ep_size=8, operation_id="grow", expected_topology_token=original_token
+        )
+        self.assertTrue((await manager.scale_elastic_ep(request)).success)
+        changed = ScaleElasticEPReqInput(
+            new_ep_size=8,
+            operation_id="grow",
+            expected_topology_token=manager.elastic_topology_token,
+        )
+        self.assertTrue((await manager.scale_elastic_ep(changed)).conflict)
+        self.assertEqual(manager.elastic_operation_base_token, original_token)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 1)
+
     async def test_completed_submission_retry_preserves_ep_and_dp_units(self):
         manager = _manager(replica_size=2)
         control = FanOutCommunicator(send=MagicMock(), fan_out=2)

@@ -64,6 +64,16 @@ async def scale_elastic_ep(raw_request: Request):
         )
 
     expected_joining_allocation_ids = body.get("expected_joining_allocation_ids")
+    expected_topology_token = body.get("expected_topology_token")
+    if expected_topology_token is not None and (
+        not isinstance(expected_topology_token, str)
+        or not expected_topology_token.strip()
+        or len(expected_topology_token) > 256
+    ):
+        return ORJSONResponse(
+            {"error": "expected_topology_token must contain 1–256 characters"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
     if expected_joining_allocation_ids is not None and (
         not isinstance(expected_joining_allocation_ids, list)
         or len(expected_joining_allocation_ids) != 1
@@ -100,6 +110,7 @@ async def scale_elastic_ep(raw_request: Request):
             new_ep_size=new_ep_size,
             operation_id=operation_id,
             expected_instance_id=expected_instance_id,
+            expected_topology_token=expected_topology_token,
             expected_joining_allocation_ids=expected_joining_allocation_ids,
         )
     )

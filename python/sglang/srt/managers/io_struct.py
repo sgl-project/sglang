@@ -2333,6 +2333,7 @@ class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     new_ep_size: int
     operation_id: Optional[str] = None
     expected_instance_id: Optional[str] = None
+    expected_topology_token: Optional[str] = None
     expected_joining_allocation_ids: Optional[List[str]] = None
     # Filled by TokenizerManager before scheduler fan-out. It is not accepted
     # from the public API as the runtime is authoritative for its own identity.

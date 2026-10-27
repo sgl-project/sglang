@@ -547,6 +547,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_max_committed_ep_size = self.elastic_effective_ep_size
         self.elastic_operation_id = None
         self.elastic_operation_target = None
+        self.elastic_operation_base_token = None
+        self.elastic_topology_revision = 0
         self.elastic_operation_succeeded = None
         self.elastic_expected_joining_allocation_ids = []
         self.elastic_pending_ep_size = None
@@ -3722,21 +3724,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
         self._dispatch_to_scheduler(msg)
+        self._record_elastic_topology_commit(msg.effective_ep_size)
+        self.elastic_last_error = None
+
+    def _record_elastic_topology_commit(self, ep_size: int) -> None:
         self.elastic_worker_count = physical_ep_size_to_dp_size(
-            msg.effective_ep_size, self.attn_replica_size
+            ep_size, self.attn_replica_size
         )
         self.elastic_max_committed_ep_size = max(
             self.elastic_max_committed_ep_size,
-            msg.effective_ep_size,
+            ep_size,
         )
+        if self.elastic_operation_succeeded is not True:
+            self.elastic_topology_revision += 1
         self.elastic_pending_ep_size = None
         self.elastic_operation_succeeded = True
-        self.elastic_last_error = None
         self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def get_elastic_ep_state(self):
         return {
             "instance_id": self.elastic_instance_id,
+            "topology_token": self.elastic_topology_token,
             "operation_id": self.elastic_operation_id,
             "target_ep_size": self.elastic_operation_target,
             "operation_succeeded": self.elastic_operation_succeeded,
@@ -3755,6 +3763,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "ready_rank_count": self.elastic_ready_rank_count,
             "joining_allocation_ids": list(self.elastic_joining_allocation_ids),
         }
+
+    @property
+    def elastic_topology_token(self) -> str:
+        # Advance on new acceptance and first commit, never on identical replay.
+        return uuid.uuid5(
+            uuid.NAMESPACE_OID,
+            json.dumps([self.elastic_instance_id, self.elastic_topology_revision]),
+        ).hex
 
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
@@ -3809,13 +3825,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         if retry_unknown_submission:
-            if obj.new_ep_size != self.elastic_operation_target:
+            if (
+                obj.new_ep_size != self.elastic_operation_target
+                or obj.expected_topology_token != self.elastic_operation_base_token
+            ):
                 return ScaleElasticEPReqOutput(
                     success=False,
                     conflict=True,
                     message=(
                         f"Operation {operation_id} already targets EP size "
-                        f"{self.elastic_operation_target}, not {obj.new_ep_size}."
+                        f"{self.elastic_operation_target} from its original topology token."
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
@@ -3849,6 +3868,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_scale_phase = "reconciling_submission"
             self.elastic_last_error = None
         else:
+            if (
+                obj.expected_topology_token is not None
+                and obj.expected_topology_token != self.elastic_topology_token
+            ):
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message="Resize base topology token is stale.",
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=self.elastic_effective_ep_size,
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                )
             if self.elastic_pending_ep_size is not None:
                 return ScaleElasticEPReqOutput(
                     success=False,
@@ -3868,6 +3902,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             self.elastic_operation_id = operation_id
             self.elastic_operation_target = obj.new_ep_size
+            self.elastic_operation_base_token = obj.expected_topology_token
+            self.elastic_topology_revision += 1
             self.elastic_operation_succeeded = None
             self.elastic_expected_joining_allocation_ids = list(
                 obj.expected_joining_allocation_ids or []
@@ -3940,17 +3976,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             None,
         )
         if pending_response is None:
-            self.elastic_worker_count = physical_ep_size_to_dp_size(
-                obj.new_ep_size, self.attn_replica_size
-            )
-            self.elastic_max_committed_ep_size = max(
-                self.elastic_max_committed_ep_size,
-                obj.new_ep_size,
-            )
-            self.elastic_pending_ep_size = None
+            self._record_elastic_topology_commit(obj.new_ep_size)
             self.elastic_scale_phase = "serving_expanded"
-            self.elastic_operation_succeeded = True
-            self.update_control_communicator_fan_out(self.elastic_worker_count)
         else:
             self.elastic_pending_ep_size = pending_response.pending_ep_size
             self.elastic_scale_phase = pending_response.scale_phase
