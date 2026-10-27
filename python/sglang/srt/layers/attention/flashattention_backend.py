@@ -48,8 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
@@ -227,13 +226,18 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
-            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
-                phase="target_verify",
-                spec_algorithm=SpeculativeAlgorithm.from_string(
-                    get_spec().speculative_algorithm
-                ),
-                is_draft_worker=True,
+            # The draft worker's own forward width, NOT the target-verify
+            # width; NOTE: overwrites the config-named attr in place.
+            # For DSpark checkpoints with sample_from_anchor=False the draft
+            # forwards gamma + 1 rows per request (anchor + gamma draft
+            # positions), while the target-verify helper returns
+            # num_draft_tokens - 1, which under-sizes cu_seqlens_q whenever
+            # batch size > 1. ModelRunner.decode_num_tokens_per_req() is
+            # the shared source of truth for this width (the Triton backend
+            # already uses it for its target_verify_num_tokens_per_req),
+            # and it falls back to the target-verify width for every other
+            # algorithm/worker, so those are unaffected.
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req(
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id
