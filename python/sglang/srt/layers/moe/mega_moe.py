@@ -488,6 +488,7 @@ def run_mega_routed_experts(
         assert not routing_in_buffer
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
+    global_num_tokens = _mega_moe_global_tokens_hint(buf)
     mega_kwargs = {"recipe": (1, 1, 32)}
     if mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
@@ -531,9 +532,6 @@ def run_mega_routed_experts(
             mma_type=mma_type,
         )
     else:
-        global_num_tokens = _mega_moe_global_tokens_hint(buf)
-        if global_num_tokens is not None:
-            mega_kwargs["global_num_tokens"] = global_num_tokens
         shared_block_m = 0
         if shared_l1_weights is not None:
             shared_block_m = deep_gemm.get_block_m_for_mega_moe(
@@ -566,6 +564,9 @@ def run_mega_routed_experts(
                 shared_block_m=shared_block_m,
                 copy_topk=not routing_in_buffer,
             )
+
+    if global_num_tokens is not None:
+        mega_kwargs["global_num_tokens"] = global_num_tokens
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
