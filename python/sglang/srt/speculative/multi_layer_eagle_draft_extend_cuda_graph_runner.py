@@ -599,6 +599,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         allocated/captured (e.g. to allocate shared sconv buffers)."""
 
     def _cuda_graph_disabled(self) -> bool:
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+                NPUCudaGraphBackend,
+            )
+
+            # This guard runs before per-step backend instances are created.
+            return NPUCudaGraphBackend.cuda_graph_disabled()
         return check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
 
     def _init_and_capture(self):
