@@ -141,9 +141,10 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp4",
             "modelopt_mixed",
             "nvfp4_online",
+            "minimax_m3_nvfp4",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'minimax_m3_nvfp4', or bfloat16 (None)."
         )
 
     # The runner-driven shared-experts fusion disables moved to the
@@ -237,6 +238,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     model_config = model_config_of(server_args)
     architectures = model_config.hf_config.architectures or []
     validated_architectures = (
+        "BeamForCausalLM",
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",

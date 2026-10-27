@@ -110,5 +110,30 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
         self.assertEqual(len(captured.output), 2, captured.output)
 
 
+class TestLateConfiguredLogLevel(unittest.TestCase):
+    def test_debug_root_level_set_after_logger_creation_logs_on_all_ranks(self):
+        """A DEBUG level set after logger creation must still log on every rank."""
+        import os
+        from unittest.mock import patch
+
+        root = logging.getLogger()
+        previous_level = root.level
+        root.setLevel(logging.WARNING)
+        logger = init_logger("sgl_diffusion_late_level_test")
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            root.setLevel(logging.DEBUG)
+            with patch.dict(os.environ, {"RANK": "1", "LOCAL_RANK": "1"}):
+                logger.info("from a non-main rank")
+        finally:
+            logger.removeHandler(handler)
+            root.setLevel(previous_level)
+
+        self.assertEqual(len(records), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
