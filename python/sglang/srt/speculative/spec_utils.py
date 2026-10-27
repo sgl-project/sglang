@@ -25,6 +25,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -34,13 +35,13 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
-    draft_attn_parallel_group,
     get_exec,
     get_parallel,
     get_spec,
@@ -70,6 +71,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+
+if _is_cuda:
+    from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
 logger = logging.getLogger(__name__)
@@ -485,6 +490,7 @@ def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
+    generator: Optional[torch.Generator] = None,
 ) -> int:
     """Sample a simulated acceptance length in [1, max_len]."""
     if simulate_acc_method == "multinomial":
@@ -492,6 +498,7 @@ def sample_simulated_acc_len(
             mean=simulate_acc_len,
             std=1.0,
             size=(1,),
+            generator=generator,
             device="cpu",
         )
         # clamp simulated values to be between 1 and max_len
@@ -512,7 +519,7 @@ def sample_simulated_acc_len(
             weight_upper = simulate_acc_len - lower
             weight_lower = 1.0 - weight_upper
             probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1)
+            sampled_index = torch.multinomial(probs, num_samples=1, generator=generator)
             simulate_acc_len = lower if sampled_index == 0 else upper
     else:
         raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
@@ -530,13 +537,26 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+    generator: Optional[torch.Generator] = None,
 ):
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
     simulate_acc_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, spec_steps + 1
+        simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
+
+    if _is_cuda and accept_index.is_cuda:
+        return simulated_accept(
+            accept_indices=accept_index,
+            predict_tokens=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidate_tokens=candidates,
+            target_tokens=target_predict,
+            width=spec_steps + 1,
+            num_accept_tokens=simulate_acc_len,
+            real_tokens=use_real_draft_tokens,
+        )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
@@ -560,6 +580,47 @@ def generate_simulated_accept_index(
     bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
     predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
         dtype=predict.dtype
+    )
+    return sim_accept_index
+
+
+def generate_simulated_accept_index_device(
+    accept_index: torch.Tensor,
+    predict: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bs: int,
+    spec_steps: int,
+    simulate_acc_len: torch.Tensor,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+) -> torch.Tensor:
+    """generate_simulated_accept_index with the drawn length already on the device
+    (int64 [1]); static shapes, so a CUDA graph can replay it. Writes the same values
+    as the host-length version for the same length."""
+    width = spec_steps + 1
+    steps = torch.arange(width, device=accept_index.device, dtype=accept_index.dtype)
+    accepted = steps.view(1, width) < simulate_acc_len
+    sim_accept_index = torch.where(
+        accepted,
+        accept_index[:, :1] + steps.view(1, width),
+        torch.full_like(steps, -1).view(1, width),
+    )
+    num_correct_drafts.copy_((simulate_acc_len - 1).expand(bs))
+    if simulate_acc_token_mode != "real-draft-token":
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+    # Chain drafts (topk=1): node b*width + j sits at row b, column j of predict.
+    rows = predict.view(bs, width)
+    drafted = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1).to(rows.dtype)
+    rows.copy_(
+        torch.where(
+            steps < simulate_acc_len - 1,
+            drafted,
+            torch.where(
+                steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows
+            ),
+        )
     )
     return sim_accept_index
 
@@ -810,17 +871,26 @@ def draft_pp_context():
         yield
 
 
-def draft_tp_context(owns_attention: bool):
-    """Enter the TP placement that draft work runs under.
-
-    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) uses ``draft_attn_parallel_group()``. Other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope.
-    """
-    if not owns_attention:
+def draft_tp_context(layout: DraftParallelLayout):
+    """Enter an already-resolved draft placement from outside any draft scope."""
+    if layout.tp_group is None:
         return contextlib.nullcontext()
-    group = getattr(get_parallel(), f"{draft_attn_parallel_group()}_group")
-    return patch_tensor_parallel_group(group, owns_attention=True)
+    tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+    if layout.disable_cp:
+        return _draft_without_cp(tp_context)
+    return tp_context
+
+
+@contextmanager
+def _draft_without_cp(tp_context):
+    with (
+        tp_context,
+        get_parallel().override(
+            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+        ),
+        disable_cp_strategy(),
+    ):
+        yield
 
 
 def spec_stage_span(name: str):
@@ -884,6 +954,57 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+class VerifyTrackIndices:
+    """The last verify's mamba track indices, for prepare_mamba_track_for_verify to
+    reuse while everything they are built from is unchanged."""
+
+    def __init__(self):
+        # the tensors themselves: a freed tensor's id can go to a new one
+        self._req_pool_indices = self._mapping = self._indices = None
+        self._positions = self._versions = None
+
+    def set_from_reqs(self, batch: ScheduleBatch) -> None:
+        """set_mamba_track_indices_from_reqs, without its gathers and host-to-device
+        copy when the request slots and the ping-pong mapping are the same tensors at
+        the same versions, no track position moved and the last indices are unwritten.
+        """
+        req_pool_indices = batch.req_pool_indices
+        mapping = (
+            batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+        )
+        positions = tuple(req.kv.mamba_next_track_idx for req in batch.reqs)
+        if (
+            req_pool_indices is self._req_pool_indices
+            and mapping is self._mapping
+            and positions == self._positions
+            and self._versions is not None
+            and _versions(req_pool_indices, mapping, self._indices) == self._versions
+        ):
+            batch.mamba_track_buffer_indices = [
+                0 if p is None else p for p in positions
+            ]
+            batch.mamba_track_indices = self._indices
+            return
+        set_mamba_track_indices_from_reqs(batch)
+        self._req_pool_indices, self._mapping = req_pool_indices, mapping
+        self._indices, self._positions = batch.mamba_track_indices, positions
+        self._versions = _versions(req_pool_indices, mapping, self._indices)
+
+
+def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
+    # PyTorch bumps a tensor's version on every in-place write it makes; inference
+    # tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) have none, so they never match
+    if any(t.is_inference() for t in tensors):
+        return None
+    return tuple(t._version for t in tensors)
+
+
+# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+_VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
+    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+)
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -907,7 +1028,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+    if track_positions is None and _VERIFY_TRACK_INDICES is not None:
+        _VERIFY_TRACK_INDICES.set_from_reqs(batch)
+    else:
+        set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None

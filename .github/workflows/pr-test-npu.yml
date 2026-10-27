@@ -4,10 +4,10 @@ on:
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
-   branches:
-     - main
-     - 'npu/**'
-     - 'npu-*'
+    branches:
+      - main
+      - 'npu/**'
+      - 'npu-*'
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -704,10 +704,14 @@ jobs:
   # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
-    needs: pr-gate
+    needs: [check-changes, pr-gate]
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !failure() && !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      github.event_name == 'pull_request' &&
+      inputs.coverage_mode != true &&
+      needs.check-changes.outputs.changes_exist == 'true' }}
     outputs:
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
@@ -809,8 +813,8 @@ jobs:
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
-      # empty bucket/recommendation) and only_tests_<suite> (non-empty only in
-      # precision mode, gated inside the script). On failure outputs stay
+      # empty bucket in precision mode) and only_tests_<suite> (non-empty only
+      # in precision mode, gated inside the script). On failure outputs stay
       # empty -> callers run full suites.
       - name: Bucket recommended tests per suite
         id: bucket-tests
