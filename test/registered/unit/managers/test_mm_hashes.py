@@ -31,9 +31,10 @@ from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
     MultimodalDataItem,
+    _compute_pad_values,
 )
-from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -271,7 +272,10 @@ class TestCallerMmHashesGating(CustomTestCase):
         preserving the external-KV-router use case."""
         items = self._run(self._manager(trust=True), ["deadbeef00000001"])
         self.assertEqual(items[0].hash, 0xDEADBEEF00000001)
-        self.assertEqual(items[0].pad_value, _compute_pad_value(0xDEADBEEF00000001))
+        self.assertEqual(
+            items[0].pad_value,
+            _compute_pad_values((0xDEADBEEF00000001).to_bytes(8, byteorder="big"))[0],
+        )
 
     def test_length_mismatch_ignored_with_flag(self):
         items = self._run(self._manager(trust=True), ["aa", "bb"], num_items=1)
