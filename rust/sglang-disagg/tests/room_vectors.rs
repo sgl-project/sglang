@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sglang_disagg::json::{JVal, loads};
-use sglang_disagg::room::{
+use disagg_wire::json::{JVal, loads};
+use disagg_wire::room::{
     ApplyOutcome, DecodeRooms, DeferredAbortTracker, PrefillRooms, StatusTable, TransferInfoEntry,
 };
-use sglang_disagg::{KVPoll, Room};
+use disagg_wire::{KVPoll, Room};
 
 fn vectors() -> JVal {
     let path = format!("{}/tests/vectors/wire.json", env!("CARGO_MANIFEST_DIR"));

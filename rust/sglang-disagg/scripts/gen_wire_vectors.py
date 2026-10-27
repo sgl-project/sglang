@@ -87,6 +87,12 @@ for pkg in [
 ]:
     stub(pkg)
 
+# The vectors are the Python-owned wire truth, so the generator always runs
+# the pure-Python codecs: stubbing the rust_wire registry with rust=None
+# pins the dispatch in common/conn.py and nixl/conn.py to the python path
+# even when SGLANG_DISAGG_WIRE_BACKEND=rust leaks into the environment.
+stub("sglang.srt.disaggregation.rust_wire", rust=None)
+
 
 class _EnvVal:
     value = 1024

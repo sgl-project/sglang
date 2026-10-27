@@ -29,6 +29,8 @@ pub mod json;
 pub mod nixl;
 pub mod pack;
 pub mod peers;
+#[cfg(feature = "python-extension")]
+pub mod py;
 pub mod room;
 pub mod status;
 pub mod topology;

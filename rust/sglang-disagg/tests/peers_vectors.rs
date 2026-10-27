@@ -3,9 +3,9 @@
 //! `_reload_invalidated_peers` against a recording stub agent. The Rust
 //! `PeerTable` must produce the identical agent-call trace and final state.
 
-use sglang_disagg::json::{JVal, loads};
-use sglang_disagg::peers::{AddOutcome, PeerOps, PeerTable};
-use sglang_disagg::{Error, Result};
+use disagg_wire::json::{JVal, loads};
+use disagg_wire::peers::{AddOutcome, PeerOps, PeerTable};
+use disagg_wire::{Error, Result};
 
 fn vectors() -> JVal {
     let path = format!("{}/tests/vectors/wire.json", env!("CARGO_MANIFEST_DIR"));

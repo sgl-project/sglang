@@ -3,12 +3,12 @@
 //! loads the actual `python/sglang/srt/disaggregation/` modules). The Rust
 //! codecs must produce byte-identical frames and round-trip every parse.
 
-use sglang_disagg::KVPoll;
-use sglang_disagg::json::{JVal, dumps_default, loads};
-use sglang_disagg::nixl::{self, MemKind, MetadataParams, RegistrationParams};
-use sglang_disagg::pack;
-use sglang_disagg::status::{self, AbortAck, AbortNotification};
-use sglang_disagg::topology::{self, PrefillRankInfo, PrefillServerInfo, RegisterParams};
+use disagg_wire::KVPoll;
+use disagg_wire::json::{JVal, dumps_default, loads};
+use disagg_wire::nixl::{self, MemKind, MetadataParams, RegistrationParams};
+use disagg_wire::pack;
+use disagg_wire::status::{self, AbortAck, AbortNotification};
+use disagg_wire::topology::{self, PrefillRankInfo, PrefillServerInfo, RegisterParams};
 
 fn vectors() -> JVal {
     let path = format!("{}/tests/vectors/wire.json", env!("CARGO_MANIFEST_DIR"));

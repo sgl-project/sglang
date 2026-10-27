@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.rust_wire import rust as rust_wire_codecs
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
@@ -301,6 +302,20 @@ class TransferInfo:
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if rust_wire_codecs is not None:
+            d = rust_wire_codecs.parse_metadata(msg)
+            return cls(
+                room=d["room"],
+                endpoint=d["endpoint"],
+                dst_port=d["dst_port"],
+                agent_name=d["agent_name"],
+                dst_kv_indices=np.asarray(d["dst_kv_indices"], dtype=np.int32),
+                dst_aux_index=d["dst_aux_index"],
+                required_dst_info_num=d["required_dst_info_num"],
+                dst_state_indices=d["dst_state_indices"],
+                decode_prefix_len=d["decode_prefix_len"],
+                is_dummy=d["is_dummy"],
+            )
         dst_state_indices = (
             unpack_int_lists(msg[7], "i") if len(msg) > 7 and msg[7] != b"" else []
         )
@@ -374,6 +389,8 @@ class KVArgsRegisterInfo:
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if rust_wire_codecs is not None:
+            return cls(**rust_wire_codecs.parse_registration(msg))
         dst_kv_ptrs = list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5]))
         dst_kv_mem_kinds = (
             _unpack_kv_mem_kinds(msg[17], len(dst_kv_ptrs))
@@ -3426,6 +3443,35 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         threading.Thread(target=bootstrap_thread_guarded).start()
 
     def build_receiver_registration_message(self) -> List[bytes]:
+        if rust_wire_codecs is not None:
+            kv = self.kv_args
+            staging = None
+            if self.enable_staging and self._staging_ctx.allocator is not None:
+                _alloc = self._staging_ctx.allocator
+                staging = (_alloc.get_base_ptr(), _alloc.get_total_size())
+            return rust_wire_codecs.build_registration(
+                self.local_ip,
+                self.rank_port,
+                self.agent.name,
+                self.agent.get_agent_metadata(),
+                kv.kv_data_ptrs,
+                kv.kv_data_lens,
+                kv.kv_data_mem_kinds,
+                kv.kv_item_lens,
+                kv.kv_layer_ids,
+                kv.aux_data_ptrs,
+                kv.state_data_ptrs or [],
+                kv.state_item_lens or [],
+                kv.state_data_lens or [],
+                getattr(kv, "state_dim_per_tensor", []) or [],
+                kv.state_layer_ids,
+                kv.gpu_id,
+                self.attn_tp_size,
+                kv.engine_rank,
+                self.dcp_size,
+                self.dcp_rank,
+                staging,
+            )
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
         )
@@ -3504,6 +3550,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> List[bytes]:
+        if rust_wire_codecs is not None:
+            return rust_wire_codecs.build_metadata(
+                bootstrap_room,
+                self.local_ip,
+                self.rank_port,
+                self.agent.name,
+                kv_indices.tolist(),
+                aux_index,
+                required_dst_info_num,
+                state_indices,
+                decode_prefix_len,
+                is_dummy,
+            )
         packed_state_indices = (
             pack_int_lists(
                 [(idx if idx is not None else []) for idx in state_indices], "i"

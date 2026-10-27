@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     DeferredBootstrap,
 )
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
+from sglang.srt.disaggregation.rust_wire import rust as rust_wire_codecs
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -740,6 +741,15 @@ class CommonKVManager(BaseKVManager):
         status: KVPoll,
         failure_reason: Optional[str],
     ) -> List[bytes]:
+        if rust_wire_codecs is not None:
+            return rust_wire_codecs.encode_kv_status(
+                bootstrap_room,
+                int(status),
+                self._prefill_unique_rank(),
+                failure_reason,
+                self.kv_status_msg_tag,
+                self.kv_status_msg_carries_reason,
+            )
         parts = [
             str(bootstrap_room).encode("ascii"),
             str(int(status)).encode("ascii"),
@@ -755,6 +765,17 @@ class CommonKVManager(BaseKVManager):
         self, msg: List[bytes]
     ) -> Optional[Tuple[int, int, int, Optional[str]]]:
         """Decode a prefill status message, or None when it is not one."""
+        if rust_wire_codecs is not None:
+            parsed = rust_wire_codecs.parse_kv_status(msg, self.kv_status_msg_tag)
+            if parsed is None:
+                # Tag mismatch is a silent miss; a tag match with a malformed
+                # body warns, mirroring the python path's logging split.
+                if self.kv_status_msg_tag is None or (
+                    msg and msg[0] == self.kv_status_msg_tag
+                ):
+                    logger.warning("Dropping malformed prefill status message")
+                return None
+            return parsed
         if self.kv_status_msg_tag is not None:
             if not msg or msg[0] != self.kv_status_msg_tag:
                 return None
@@ -816,15 +837,25 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         """Notify decode that a staging chunk RDMA is complete (every chunk;
         scatter is arrival-driven)."""
-        parts = [
-            b"CHUNK_READY",
-            str(room).encode("ascii"),
-            str(chunk_idx).encode("ascii"),
-            str(page_start).encode("ascii"),
-            str(num_pages).encode("ascii"),
-            writer_id.encode("ascii"),
-            str(self._prefill_unique_rank()).encode("ascii"),
-        ]
+        if rust_wire_codecs is not None:
+            parts = rust_wire_codecs.build_chunk_ready(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                writer_id,
+                self._prefill_unique_rank(),
+            )
+        else:
+            parts = [
+                b"CHUNK_READY",
+                str(room).encode("ascii"),
+                str(chunk_idx).encode("ascii"),
+                str(page_start).encode("ascii"),
+                str(num_pages).encode("ascii"),
+                writer_id.encode("ascii"),
+                str(self._prefill_unique_rank()).encode("ascii"),
+            ]
         for endpoint, port in targets:
             na = NetworkAddress(endpoint, port)
             self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
@@ -832,14 +863,21 @@ class CommonKVManager(BaseKVManager):
     def handle_chunk_ready(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != b"CHUNK_READY":
             return False
-        try:
-            room, chunk_idx, page_start, num_pages = (
-                int(part.decode("ascii")) for part in msg[1:5]
-            )
-            writer_id = msg[5].decode("ascii")
-        except (IndexError, ValueError, UnicodeDecodeError):
-            logger.warning("Dropping malformed CHUNK_READY message")
-            return True
+        if rust_wire_codecs is not None:
+            parsed = rust_wire_codecs.parse_chunk_ready(msg)
+            if parsed is None:
+                logger.warning("Dropping malformed CHUNK_READY message")
+                return True
+            room, chunk_idx, page_start, num_pages, writer_id = parsed
+        else:
+            try:
+                room, chunk_idx, page_start, num_pages = (
+                    int(part.decode("ascii")) for part in msg[1:5]
+                )
+                writer_id = msg[5].decode("ascii")
+            except (IndexError, ValueError, UnicodeDecodeError):
+                logger.warning("Dropping malformed CHUNK_READY message")
+                return True
         if room not in self.request_status:
             return True
         handler = self._staging_handler
