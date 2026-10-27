@@ -1,7 +1,7 @@
 """AITER attention paths that read an fp8 KV cache with calibrated KV scales.
 
 Each case stores ``K / k_scale`` and ``V / v_scale`` in an fp8 cache, runs one
-``AiterAttnBackend`` path with the real aiter kernel, and compares the output with
+``AiterAttnBackend`` path with its real kernel, and compares the output with
 fp32 attention over the dequantized cache. With unit scales, mixing up q's scale
 with ``k_scale`` or skipping the cache dequantization does not change the result, so
 the scales are kept far from 1. The unified-attention decode is covered by
@@ -24,6 +24,7 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
+    from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
     from sglang.kernels.ops.quantization.fp8_kernel import (
         fp8_dtype,
         scaled_fp8_quant,
@@ -48,19 +49,28 @@ class _FakeKVPool:
     def get_kv_buffer(self, _layer_id):
         return self.k_cache, self.v_cache
 
+    def get_key_buffer(self, _layer_id):
+        return self.k_cache
+
+    def get_value_buffer(self, _layer_id):
+        return self.v_cache
+
 
 def _offsets(lens):
     return [0, *itertools.accumulate(lens)]
 
 
 def _reference_attention(q, k, v, causal):
-    """fp32 attention for one request; q is [Lq, Hq, D], k / v are [Lk, Hkv, D]."""
+    """fp32 attention for one request; q is [Lq, Hq, D], k / v are [Lk, Hkv, D].
+    With ``causal``, q holds the last Lq of the Lk positions."""
     group = q.shape[1] // k.shape[1]
     k = k.repeat_interleave(group, dim=1)
     v = v.repeat_interleave(group, dim=1)
     scores = torch.einsum("qhd,khd->hqk", q.float(), k) / math.sqrt(q.shape[-1])
     if causal:
-        mask = torch.ones(scores.shape[1:], dtype=torch.bool, device=q.device).tril()
+        mask = torch.ones(scores.shape[1:], dtype=torch.bool, device=q.device).tril(
+            k.shape[0] - q.shape[0]
+        )
         scores = scores.masked_fill(~mask, float("-inf"))
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
@@ -105,6 +115,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
         backend.k_scale = torch.ones(1, dtype=torch.float32, device=_DEVICE)
         backend.v_scale = torch.ones(1, dtype=torch.float32, device=_DEVICE)
         backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
+        backend.extend_attention_fwd = extend_attention_fwd
         return backend
 
     def _make_layer(self, k_scale, v_scale):
@@ -118,6 +129,8 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             head_dim=_HEAD_DIM,
             k_scale=k_scale,
             v_scale=v_scale,
+            k_scale_float=k_scale.item(),
+            v_scale_float=v_scale.item(),
             sliding_window_size=-1,
             scaling=_HEAD_DIM**-0.5,
             logit_cap=0.0,
@@ -227,6 +240,71 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             [
                 _reference_attention(q[s:e], k_deq[s:e], v_deq[s:e], True)
                 for s, e in zip(offsets, offsets[1:])
+            ]
+        )
+        self._assert_close(out, expected)
+
+    def test_extend_attention_target_verify(self):
+        prefix_lens = [300, 77, 512]
+        num_draft = 4
+        batch = len(prefix_lens)
+        offsets = _offsets(p + num_draft for p in prefix_lens)
+        q, ((k_fp8, k_deq, k_scale), (v_fp8, v_deq, v_scale)) = self._make_inputs(
+            batch * num_draft, offsets[-1]
+        )
+        # Target verify reads the committed prefix from the cache and the draft
+        # tokens from k / v.
+        prefix_loc = torch.cat(
+            [
+                torch.arange(s, s + p, dtype=torch.int32, device=_DEVICE)
+                for s, p in zip(offsets, prefix_lens)
+            ]
+        )
+        draft_loc = torch.cat(
+            [torch.arange(e - num_draft, e, device=_DEVICE) for e in offsets[1:]]
+        )
+
+        backend = self._make_backend(k_fp8, v_fp8)
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=torch.arange(
+                0,
+                (batch + 1) * num_draft,
+                num_draft,
+                dtype=torch.int32,
+                device=_DEVICE,
+            ),
+            kv_indptr=torch.tensor(
+                _offsets(prefix_lens), dtype=torch.int32, device=_DEVICE
+            ),
+            kv_indices=prefix_loc,
+            custom_mask=None,
+            mask_indptr=torch.zeros(batch + 1, dtype=torch.int64, device=_DEVICE),
+            max_extend_len=num_draft,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            attn_attend_prefix_cache=False,
+            out_cache_loc=None,
+        )
+
+        out = backend.forward_extend(
+            q,
+            k_deq[draft_loc].bfloat16(),
+            v_deq[draft_loc].bfloat16(),
+            self._make_layer(k_scale, v_scale),
+            forward_batch,
+            save_kv_cache=False,
+        )
+
+        expected = torch.cat(
+            [
+                _reference_attention(
+                    q[b * num_draft : (b + 1) * num_draft],
+                    k_deq[s:e],
+                    v_deq[s:e],
+                    True,
+                )
+                for b, (s, e) in enumerate(zip(offsets, offsets[1:]))
             ]
         )
         self._assert_close(out, expected)

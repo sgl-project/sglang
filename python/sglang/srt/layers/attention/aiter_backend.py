@@ -4250,6 +4250,11 @@ class AiterAttnBackend(AttentionBackend):
 
                 self._reject_target_verify_cross_layer_kv(k, v)
 
+                # extend_attention_fwd takes the KV scales as host floats.
+                k_scale = v_scale = 1.0
+                if self.kv_cache_dtype == fp8_dtype and layer.k_scale is not None:
+                    k_scale, v_scale = layer.k_scale_float, layer.v_scale_float
+
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),
@@ -4264,8 +4269,8 @@ class AiterAttnBackend(AttentionBackend):
                     True,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
+                    k_scale,
+                    v_scale,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )
