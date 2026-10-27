@@ -513,19 +513,25 @@ class HunYuanSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states):
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # Must run before the experts: the CUDA FusedMoE kernel runs in place
+        # and overwrites hidden_states with the expert output.
+        shared_out = None
+        if self.shared_mlp is not None:
+            shared_out = self.shared_mlp(hidden_states)
+
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.shared_mlp is not None:
-            _shared_out = self.shared_mlp(hidden_states)
-            final_hidden_states = final_hidden_states + _shared_out
+        if shared_out is not None:
+            final_hidden_states = final_hidden_states + shared_out
 
         # NPU: AscendTPDispatcher all-gathers the FusedMoE output internally;
         # the shared MLP's down_proj all-reduces its own output.

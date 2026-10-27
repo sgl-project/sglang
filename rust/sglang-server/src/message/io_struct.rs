@@ -40,12 +40,11 @@ wire_struct! {
         return_indexer_topk: bool,
         session_id: (),
         session_params: (),
-        lora_id: (),
+        lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block. Everything after `cache_salt` (the last
-        /// field emitted) has a msgspec default in Python and is omitted
-        /// (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. Everything after `kv_hints` (the last
+        /// field emitted) has a msgspec default in Python and is omitted.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,16 +52,10 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
-        /// The scheduler decodes this header by position (Python's
-        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so
-        /// `routing_key` is sent at its default for the fields after it to land
-        /// in their slots.
-        routing_key: (),
+        routing_key: Option<&'a str>,
         require_reasoning: bool,
         priority: Option<i64>,
         extra_key: Option<&'a str>,
-        /// Defaults, so `cache_salt`, the prefix cache's second key, lands in
-        /// its slot.
         no_logs: bool,
         return_bytes: bool,
         return_entropy: bool,
@@ -73,6 +66,7 @@ wire_struct! {
         token_indices_to_pool: (),
         time_stats: (),
         cache_salt: Option<&'a str>,
+        kv_hints: Option<&'a super::request::KvHintsEnvelope>,
     }
 }
 
@@ -92,6 +86,12 @@ control_messages! {
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
 
+    /// `/flush_cache`'s control request: the scheduler flushes its caches in
+    /// its own loop, waiting up to `timeout_s` for running requests to drain.
+    FlushCacheReqInput {
+        timeout_s: Option<f64>,
+    }
+
     /// `/weights_checker`'s control request: every scheduler rank runs the
     /// weight checker's `action` on the runners `selector` names.
     CheckWeightsReqInput {
@@ -99,6 +99,20 @@ control_messages! {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+    }
+
+    /// Clear the HiCache storage backend.
+    ClearHiCacheReqInput {}
+
+    /// Detach the HiCache storage backend.
+    DetachHiCacheStorageReqInput {}
+
+    /// Attach a HiCache storage backend with optional configuration and policies.
+    AttachHiCacheStorageReqInput {
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
     }
 }
 
@@ -133,7 +147,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_indexer_topk: false,
             session_id: (),
             session_params: (),
-            lora_id: (),
+            lora_id: req.lora_id.as_deref(),
             custom_logit_processor: (),
             positional_embed_overrides: (),
             bootstrap_host: req.bootstrap_host.as_deref(),
@@ -143,7 +157,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
-            routing_key: (),
+            routing_key: req.routing_key.as_deref(),
             require_reasoning: req.require_reasoning,
             priority: req.priority,
             extra_key: req.extra_key.as_deref(),
@@ -157,6 +171,37 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             token_indices_to_pool: (),
             time_stats: (),
             cache_salt: req.cache_salt.as_deref(),
+            kv_hints: req.kv_hints.as_ref(),
+        }
+    }
+}
+
+impl ClearHiCacheReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl DetachHiCacheStorageReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl AttachHiCacheStorageReqInput {
+    pub fn new(
+        rid: String,
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    ) -> Self {
+        Self {
+            rid,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config_json,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
         }
     }
 }
@@ -164,6 +209,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl FlushCacheReqInput {
+    pub fn new(rid: String, timeout_s: Option<f64>) -> Self {
+        Self { rid, timeout_s }
     }
 }
 
@@ -219,6 +270,24 @@ mod tests {
     }
 
     #[test]
+    fn flush_cache_req_msgpack_shape() {
+        let b = FlushCacheReqInput::new("7".into(), Some(30.0))
+            .encode()
+            .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            4,
+            "FlushCacheReqInput = [tag, rid, http_ipc, timeout_s]"
+        );
+        assert_eq!(arr[0].as_str(), Some("FlushCacheReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_f64(), Some(30.0));
+    }
+
+    #[test]
     fn check_weights_req_msgpack_shape() {
         let b = CheckWeightsReqInput::new(
             "7".into(),
@@ -269,9 +338,8 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 46 (through
-        // `cache_salt`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 46, "header ends at cache_salt");
+        // The orchestrator controls extend the array through `kv_hints`.
+        assert_eq!(arr.len(), 47, "header ends at kv_hints");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -299,6 +367,49 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+    }
+
+    /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec
+    /// structs, so a positional array at the kv_hints slot fails to decode.
+    #[test]
+    fn header_kv_hints_are_map_encoded() {
+        use sglang_api_types::api::v1 as api;
+        let kv_hints = crate::message::request::KvHintsEnvelope::try_from(api::KvHintsEnvelope {
+            protocol_version: "1".into(),
+            message_id: "m".into(),
+            actions: vec![api::KvHintAction {
+                action_id: "a".into(),
+                action_type: "pin".into(),
+                action_version: "1".into(),
+                payload: Some(r#"{"blocks":[1,2]}"#.into()),
+            }],
+        })
+        .unwrap();
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            input_ids: Some(vec![1]),
+            kv_hints: Some(kv_hints),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let envelope = val.as_array().expect("array")[46]
+            .as_map()
+            .expect("kv_hints must be a map");
+        let get = |map: &[(rmpv::Value, rmpv::Value)], key: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing key {key}"))
+        };
+        assert_eq!(get(envelope, "protocol_version").as_str(), Some("1"));
+        assert_eq!(get(envelope, "message_id").as_str(), Some("m"));
+        let actions = get(envelope, "actions");
+        let action = actions.as_array().unwrap()[0]
+            .as_map()
+            .expect("kv_hints action must be a map");
+        assert_eq!(get(action, "action_type").as_str(), Some("pin"));
+        assert!(get(action, "payload").is_map());
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler

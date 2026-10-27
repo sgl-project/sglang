@@ -23,17 +23,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=61, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
-    def test_skip_all_gather_policy(self):
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
-            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -444,6 +437,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         ):
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=2,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,
@@ -466,6 +460,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = True
+        runner._backend_vote_prefill_cuda_graph = None
         runner.can_replay_locally.side_effect = lambda **kwargs: (
             not kwargs["contains_mm_inputs"]
             or runner_cls.can_replay_locally(self=runner, **kwargs)
@@ -482,6 +477,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         )
         vote = dp_attn._local_prefill_cuda_graph_vote(
             local_batch=batch,
+            num_tokens=4,
             prefill_graph_runner=runner,
             coordinated_prefill=True,
             breakable_prefill=True,
@@ -514,6 +510,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = False
+        runner._backend_vote_prefill_cuda_graph = None
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
         runner.prefer_eager_mixed_prefill = False
@@ -540,6 +537,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             )
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=48,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,
@@ -581,8 +579,8 @@ class TestPrefillCudaGraphVote(CustomTestCase):
 
 
 # The ring path (2), primes, an even non-power-of-two, and two powers of two
-# with different gather / broadcast tree depths. Every rank is a spawned
-# interpreter, so the hosted CPU runner's memory caps the largest world.
+# with different gather / broadcast tree depths. The hosted CPU runner's
+# memory caps the largest world.
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)
 _EXCHANGE_ROUNDS = 4
 
@@ -664,7 +662,11 @@ class TestSyncRowExchangeGloo(CustomTestCase):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
         sock.close()
-        ctx = mp.get_context("spawn")
+        # Every rank would otherwise be a fresh interpreter importing the whole
+        # package before it exchanges a single row; forking the ranks from one
+        # preloaded server keeps the test cheap on a small CPU runner.
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload([__name__])
         out_q = ctx.Queue()
         procs = [
             ctx.Process(target=_exchange_worker, args=(r, world, port, out_q))

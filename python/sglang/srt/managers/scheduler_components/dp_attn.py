@@ -32,6 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
+from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -383,6 +384,7 @@ def _local_decode_cuda_graph_vote(
 def _local_prefill_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
+    num_tokens: int,
     prefill_graph_runner,
     coordinated_prefill: bool,
     breakable_prefill: bool,
@@ -392,7 +394,9 @@ def _local_prefill_cuda_graph_vote(
     """This rank's vote for the prefill graph (min-reduced across dp
     ranks). Extend and mixed batches share the runner's rank-local replay
     policy. A decode batch eligible for the decode->extend conversion votes as
-    its 1-token-extend view, so the vote and post-sync conversion agree."""
+    its 1-token-extend view, so the vote and post-sync conversion agree.
+    num_tokens is the rows this rank gathers, encoder replay rows folded in,
+    which an extend replay runs."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
@@ -400,7 +404,6 @@ def _local_prefill_cuda_graph_vote(
 
     mode = local_batch.forward_mode
     if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
-        num_tokens = local_batch.extend_num_tokens
         input_embeds = local_batch.input_embeds
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
@@ -442,6 +445,13 @@ def _local_prefill_cuda_graph_vote(
     if prefill_graph_runner is None:
         return True
     if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
+        return False
+    backend_vote = prefill_graph_runner._backend_vote_prefill_cuda_graph
+    if (
+        mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and backend_vote is not None
+        and not backend_vote(local_batch)
+    ):
         return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
@@ -534,6 +544,11 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
+        if (
+            local_batch.encoder_swa_reset is not None
+            and model_runner.attn_backend.folds_encoder_swa_replay
+        ):
+            num_tokens += folded_replay_rows(local_batch)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -566,6 +581,7 @@ def prepare_mlp_sync_batch_raw(
     )
     can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
         local_batch=local_batch,
+        num_tokens=num_tokens,
         prefill_graph_runner=prefill_graph_runner,
         coordinated_prefill=coordinated_prefill,
         breakable_prefill=breakable_prefill,
