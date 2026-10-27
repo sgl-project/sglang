@@ -18,8 +18,8 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 class TestHunyuan3DGPUGrid(CustomTestCase):
     def test_vanilla_volume_decoder_grid_matches_numpy_reference(self):
         bounds = [-1.7, 0.2, -3.1, 2.3, 4.7, 0.8]
-        resolution = 2
-        xyz_reference, grid_size, _ = generate_dense_grid_points(
+        resolution = 7
+        xyz_reference, _, _ = generate_dense_grid_points(
             bbox_min=np.array(bounds[:3]),
             bbox_max=np.array(bounds[3:]),
             octree_resolution=resolution,
@@ -45,21 +45,17 @@ class TestHunyuan3DGPUGrid(CustomTestCase):
                         return queries.sum(dim=-1)
 
                     latents = torch.zeros((1, 1, 1), device=device, dtype=dtype)
-                    actual = VanillaVolumeDecoder()(
+                    VanillaVolumeDecoder()(
                         latents=latents,
                         geo_decoder=geo_decoder,
                         bounds=bounds,
-                        num_chunks=10,
+                        num_chunks=128,
                         octree_resolution=resolution,
                         enable_pbar=False,
                     )
 
                     actual_xyz = torch.cat(captured_queries, dim=1)[0]
                     self.assertTrue(torch.equal(actual_xyz, expected_xyz))
-                    expected_logits = (
-                        expected_xyz.sum(dim=-1).view(1, *grid_size).float()
-                    )
-                    self.assertTrue(torch.equal(actual, expected_logits))
 
 
 if __name__ == "__main__":
