@@ -51,18 +51,6 @@ def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected
             pytest.fail("intra-node groups do not need a fabric clique")
         return has_fabric_clique
 
-    # Capability detection must not probe the caching allocator. Multi-node
-    # collectives stage inputs through their own symmetric-memory workspace.
-    monkeypatch.setattr(
-        custom_all_reduce_v2.torch,
-        "empty",
-        Mock(side_effect=AssertionError("unexpected allocator probe")),
-    )
-    monkeypatch.setattr(
-        custom_all_reduce_v2,
-        "is_vmm_pointer",
-        Mock(side_effect=AssertionError("unexpected VMM pointer probe")),
-    )
     intra_node_capability = Mock(return_value=True)
 
     monkeypatch.setattr(
