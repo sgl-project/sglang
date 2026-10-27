@@ -370,6 +370,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             flashinfer_moe_autotune_context(
                 decode_num_tokens=decode_num_tokens * gather_width,
                 prefill_num_tokens=prefill_num_tokens * gather_width,
+                skip_ops=skip_ops,
             ),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),

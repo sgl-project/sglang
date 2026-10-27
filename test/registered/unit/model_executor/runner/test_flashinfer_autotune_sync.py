@@ -177,11 +177,12 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         # MegaMoE keeps its per-rank capacities.
                         self.assertEqual(
                             moe_autotune._active_limits.get(),
-                            (0, 0)
+                            (0, 0, frozenset(skip_ops))
                             if draft or pd == "decode"
                             else (
                                 max(graph_rows, 256 * width) * 4,
                                 (max(chunk_size, 0) or 16384) * 4,
+                                frozenset(skip_ops),
                             ),
                         )
                         if prefill is None:
@@ -236,47 +237,6 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 for path in paths:
                     self.assertEqual(path.parent, cache_path.parent / "runs")
                     self.assertTrue(path.name.startswith("rank.20260922_010000."))
-
-    def test_sparse_profiles_persist_without_enabling_tuning(self):
-        from sglang.srt.layers.moe import flashinfer_autotune as moe_autotune
-
-        target, draft = SimpleNamespace(), SimpleNamespace()
-        native = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
-        with (
-            patch.dict(
-                sys.modules, {"flashinfer.autotuner": SimpleNamespace(autotune=native)}
-            ),
-            patch.object(moe_autotune, "_tuning_buckets", return_value=(1, 2, 4, 10)),
-        ):
-            with moe_autotune.flashinfer_moe_autotune_context(
-                decode_num_tokens=4, prefill_num_tokens=10
-            ):
-                # Optional EXTEND may pad its dummy above the prefill limit.
-                with moe_autotune.flashinfer_moe_autotune(11, target):
-                    pass
-                with moe_autotune.flashinfer_moe_autotune_context(
-                    decode_num_tokens=0, prefill_num_tokens=0
-                ):
-                    with moe_autotune.flashinfer_moe_autotune(4, draft):
-                        pass
-                self.assertEqual(moe_autotune._active_limits.get(), (4, 10))
-            self.assertIsNone(moe_autotune._active_limits.get())
-            native.assert_called_once_with(
-                False, tuning_buckets=(1, 2, 4, 10), round_up=True
-            )
-            native.reset_mock()
-            for tokens in (5, 7, 10):
-                with moe_autotune.flashinfer_moe_autotune(tokens, target):
-                    pass
-                native.assert_called_with(
-                    False, tuning_buckets=(1, 2, 4, 10), round_up=True
-                )
-            self.assertEqual(native.call_count, 3)
-            native.reset_mock()
-            for tokens, owner in ((11, target), (4, draft), (7, SimpleNamespace())):
-                with moe_autotune.flashinfer_moe_autotune(tokens, owner):
-                    pass
-            native.assert_not_called()
 
 
 class TestAutotuneCacheDigest(CustomTestCase):

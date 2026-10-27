@@ -8,8 +8,15 @@ _active_limits = ContextVar("flashinfer_moe_autotune_limits", default=None)
 
 
 @contextmanager
-def flashinfer_moe_autotune_context(*, decode_num_tokens: int, prefill_num_tokens: int):
-    token = _active_limits.set((decode_num_tokens, prefill_num_tokens))
+def flashinfer_moe_autotune_context(
+    *,
+    decode_num_tokens: int,
+    prefill_num_tokens: int,
+    skip_ops: set[str] | frozenset[str] = frozenset(),
+):
+    token = _active_limits.set(
+        (decode_num_tokens, prefill_num_tokens, frozenset(skip_ops))
+    )
     try:
         yield
     finally:
@@ -36,23 +43,29 @@ def flashinfer_moe_autotune(num_tokens: int, owner):
     """
     limits = _active_limits.get()
     if limits is not None:
-        owner._flashinfer_moe_tuning_buckets = (
-            _tuning_buckets(*limits) if all(limits) else None
+        decode_num_tokens, prefill_num_tokens, skip_ops = limits
+        owner._flashinfer_moe_tuning_policy = (
+            (_tuning_buckets(decode_num_tokens, prefill_num_tokens), skip_ops)
+            if decode_num_tokens and prefill_num_tokens
+            else None
         )
-    buckets = getattr(owner, "_flashinfer_moe_tuning_buckets", None)
-    if not buckets:
-        return nullcontext()
-    if num_tokens > buckets[-1] and limits is None:
-        # Do not clamp an oversized serving input to an undersized profile.
+    policy = getattr(owner, "_flashinfer_moe_tuning_policy", None)
+    if policy is None:
         return nullcontext()
 
     from flashinfer.autotuner import autotune
+
+    buckets, skip_ops = policy
+    if num_tokens > buckets[-1] and limits is None:
+        # Do not clamp an oversized serving input to an undersized profile.
+        return autotune(False, skip_ops=skip_ops) if skip_ops else nullcontext()
 
     # False inherits the enclosing startup autotune(True), but never enables
     # profiling in serving. Both phases must use the same sparse ceil mapping:
     # every token count above decode and through prefill selects the one prefill.
     # An opt-in EXTEND dummy can be padded above prefill; still tune only this set.
-    return autotune(False, tuning_buckets=buckets, round_up=True)
+    # Keep skipped ops on their heuristic path before any mapped cache lookup.
+    return autotune(False, tuning_buckets=buckets, round_up=True, skip_ops=skip_ops)
 
 
 def flashinfer_moe_autotune_fused_func(func):
