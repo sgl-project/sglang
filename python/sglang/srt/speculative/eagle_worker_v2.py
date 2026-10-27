@@ -11,10 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -460,12 +456,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if get_model().model_impl == "mindspore":
             return
 
-        Device2DraftCudaGraphRunner = {
-            "xpu": EAGLEDraftCudaGraphRunner,
-            "npu": EAGLEDraftNpuGraphRunner,
-            "cuda": EAGLEDraftCudaGraphRunner,
-            "musa": EAGLEDraftCudaGraphRunner,
-        }
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
@@ -478,9 +468,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -1742,9 +1730,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-                TargetGraphRunnerCls = (
-                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
-                )
+                TargetGraphRunnerCls = DecodeCudaGraphRunner
                 target_graph_before_mem = get_available_gpu_memory(
                     self.device, self.gpu_id
                 )

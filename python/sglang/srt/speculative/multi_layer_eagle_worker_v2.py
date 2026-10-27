@@ -22,9 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
-    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
-)
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
@@ -445,8 +442,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
                 )
         else:
+            # NPU length updates live in the backend. Keep one graph per step;
+            # combined multi-step NPU capture is not enabled here.
             self.cuda_graph_runner_for_draft_extend = (
-                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
             )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_extend"] = (

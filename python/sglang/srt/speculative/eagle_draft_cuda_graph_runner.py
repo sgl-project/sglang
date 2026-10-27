@@ -169,6 +169,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        # Select device capabilities before allocating static inputs.
+        self.backend = resolve_decode_backend(self)
+
         # Static buffers
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -278,8 +281,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        self.backend = resolve_decode_backend(self)
-
         # Capture
         try:
             with model_capture_mode():
@@ -307,7 +308,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # Helpers
     # -----------------------------------------------------------------
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
@@ -364,7 +365,33 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 and forward_batch.can_run_dp_draft_cuda_graph
             )
 
-        return is_bs_supported
+        if (
+            not self.eagle_worker.seed_dsa_topk_from_draft_extend
+            or self.attn_dp_size <= 1
+        ):
+            return is_bs_supported
+
+        # A PD-disagg IndexShare seed is transferred asynchronously, so seed
+        # availability is request-local: a real rank can miss it while idle
+        # ranks have no request at all. The draft forward contains TP/EP
+        # collectives, so all ranks must still choose the same graph/eager
+        # path or the mismatched collectives hang. Reduce the final decision
+        # across the model TP group, which contains all attention-DP ranks
+        # for this pipeline stage.
+        seed_ready = forward_batch.forward_mode.is_idle() or (
+            spec_info is not None and spec_info.dsa_topk_indices is not None
+        )
+        decision = torch.tensor(
+            int(is_bs_supported and seed_ready),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        torch.distributed.all_reduce(
+            decision,
+            op=torch.distributed.ReduceOp.MIN,
+            group=get_parallel().tp_group.cpu_group,
+        )
+        return bool(decision.item())
 
     # -----------------------------------------------------------------
     # Capture (per-shape)

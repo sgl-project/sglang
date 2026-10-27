@@ -26,8 +26,9 @@ if TYPE_CHECKING:
 
 
 class BaseCudaGraphBackend(ABC):
-    """Pure ABC: no state, no defaults. Each implementation owns its
-    per-backend state and binds the handles it needs from the
+    """Device lifecycle and optional hooks with portable defaults.
+
+    Each implementation owns its per-backend state and binds handles from the
     cuda_graph_runner passed to its __init__.
 
     Methods:
@@ -54,11 +55,40 @@ class BaseCudaGraphBackend(ABC):
     """
 
     @property
+    def supports_shared_read_events(self) -> bool:
+        """Whether the runner publishes shared-buffer read completion events."""
+        return True
+
+    @property
     def cache_loc_dtype(self) -> torch.dtype:
         return torch.int64
 
     def bind_decode_runner(self, runner) -> None:
         pass
+
+    def prepare_replay(self, forward_batch: ForwardBatch) -> bool:
+        """Whether device-specific replay input preparation is complete."""
+        return False
+
+    def prepare_capture_forward(self, model, enable_compile, **kwargs):
+        """Yield the capture forward callable; restore temporary state on exit."""
+        from sglang.srt.compilation import torch_compile_decoration
+
+        return torch_compile_decoration.patch_model(model, enable_compile, **kwargs)
+
+    def capture_profile_context(self, options):
+        from sglang.srt.model_executor.runner_backend.capture_profile import (
+            create_cuda_capture_profile,
+        )
+
+        return create_cuda_capture_profile(options)
+
+    def finish_capture_profile(self, options, profile_context) -> None:
+        from sglang.srt.model_executor.runner_backend.capture_profile import (
+            finish_cuda_capture_profile,
+        )
+
+        finish_cuda_capture_profile(options, profile_context)
 
     @abstractmethod
     def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
