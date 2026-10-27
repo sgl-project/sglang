@@ -656,58 +656,76 @@ class TestStageEncoderPools(CustomTestCase):
                     "server_args": {
                         "model_path": "black-forest-labs/FLUX.2-klein-4B",
                         "num_gpus": 1,
+                        "disable_conditioning_cache": True,
                     },
                 },
             },
             "outputs": ["prompt_embeds", "image_latent"],
         }
-        reference = BytesIO()
-        Image.new("RGB", (256, 256), "teal").save(reference, format="PNG")
-        request = {
-            "prompt": "A red teapot",
-            "width": 256,
-            "height": 256,
-            "seed": 42,
-            "image_path": [
-                "data:image/png;base64,"
-                + base64.b64encode(reference.getvalue()).decode()
-            ],
-        }
+        samples = []
+        for index, width in enumerate((256, 320)):
+            reference = BytesIO()
+            Image.new("RGB", (width, 256), "teal").save(reference, format="PNG")
+            samples.append(
+                {
+                    "prompt": "A red teapot"
+                    + " on a wooden table in the morning" * index,
+                    "width": width,
+                    "height": 256,
+                    "seed": 42 + index,
+                    "image_path": [
+                        "data:image/png;base64,"
+                        + base64.b64encode(reference.getvalue()).decode()
+                    ],
+                }
+            )
         endpoint = f"tcp://{HOST}:{cluster.base_port}"
 
         async def check():
             async with EncodingClient(endpoint, max_in_flight=2) as client:
-                text, image = await asyncio.gather(
-                    client.encode(request, role="text"),
-                    client.encode(request, role="image"),
-                )
-                expected = {**text, **image}
-                self.assertTrue(
-                    all(
-                        t.is_cuda and torch.isfinite(t).all()
-                        for t in tree_leaves(expected)
+                references = []
+                for request in samples:
+                    text, image = await asyncio.gather(
+                        client.encode(request, role="text"),
+                        client.encode(request, role="image"),
                     )
-                )
-                torch.testing.assert_close(
-                    await client.encode(request), expected, rtol=0, atol=0
+                    expected = {**text, **image}
+                    self.assertTrue(
+                        all(
+                            t.is_cuda and torch.isfinite(t).all()
+                            for t in tree_leaves(expected)
+                        )
+                    )
+                    torch.testing.assert_close(
+                        await client.encode(request), expected, rtol=0, atol=0
+                    )
+                    references.append(text)
+                self.assertNotEqual(
+                    tree_leaves(references[0])[0].shape,
+                    tree_leaves(references[1])[0].shape,
                 )
                 async with client.prefetch(
-                    [request] * 6, role="text", depth=3
+                    samples * 3, role="text", depth=3
                 ) as batches:
                     count = 0
                     async for result in batches:
-                        torch.testing.assert_close(result, text, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            result, references[count % 2], rtol=0, atol=0
+                        )
                         count += 1
                     self.assertEqual(count, 6)
                 async with client.prefetch(
-                    [request] * 20, role="image", depth=3
+                    samples * 10, role="image", depth=3
                 ) as batches:
                     await anext(batches)
                 self.assertFalse(client.pending)
                 with self.assertRaises(RuntimeError):
-                    await client.encode(request, role="missing")
+                    await client.encode(samples[0], role="missing")
                 torch.testing.assert_close(
-                    await client.encode(request, role="text"), text, rtol=0, atol=0
+                    await client.encode(samples[0], role="text"),
+                    references[0],
+                    rtol=0,
+                    atol=0,
                 )
 
         with TemporaryDirectory(prefix="encoder-pools-") as directory:
@@ -740,6 +758,7 @@ class TestStageEncoderPools(CustomTestCase):
                             "1",
                             "--warmup-mode",
                             "off",
+                            "--disable-conditioning-cache",
                             "--master-port",
                             str(find_free_port(HOST)),
                             "--scheduler-port",

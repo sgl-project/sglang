@@ -35,8 +35,8 @@ class DisaggServerArgsMixin:
             kwargs.update(
                 model_path=self.model_path, pipeline_config=self.pipeline_config
             )
-        kwargs = copy.deepcopy(kwargs)
         kwargs.update(overrides)
+        kwargs = copy.deepcopy(kwargs)
         kwargs.update(
             stage_deployment=self.stage_deployment,
             stage_role=role,

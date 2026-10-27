@@ -3705,6 +3705,10 @@ class TestPerRoleParallelism(unittest.TestCase):
             self.assertFalse(image.is_arg_explicitly_set("attention_backend"))
             self.assertEqual(image.disagg_timeout, 17)
             self.assertEqual(image.stage_deployment, "pools.json")
+            overridden = source.for_stage_role(
+                "image", model_path="/image", pipeline_config=image.pipeline_config
+            )
+            self.assertIsNot(overridden.pipeline_config, image.pipeline_config)
             self.assertEqual(source.num_gpus, 2)
             self.assertIsNone(source.stage_role)
 
