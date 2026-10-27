@@ -479,11 +479,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if isinstance(runner, EAGLEDraftExtendCudaGraphRunner):
-                    cpu_update_input = self._eagle_draft_extend_update_lengths(
-                        runner, static_forward_batch
+                    seq_lens = static_forward_batch.seq_lens_cpu.tolist() + [0] * (
+                        runner.bs - runner.raw_bs
                     )
                     return self.replay_with_input_update(
-                        shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                        shape_key,
+                        seq_lens=seq_lens,
+                        attr_name=self.get_update_attr_name(),
+                        attr_type=[],
                     )
                 if isinstance(runner, EAGLEDraftCudaGraphRunner):
                     cpu_update_input = self._build_eagle_draft_update_payload(
@@ -500,13 +503,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
-
-    @staticmethod
-    def _eagle_draft_extend_update_lengths(runner, forward_batch):
-        seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
-            runner.bs - runner.raw_bs
-        )
-        return [{"actual_seq_lengths_kv": seq_lens}]
 
     def _build_eagle_draft_update_payload(self, forward_batch):
         runner = self._decode_runner
