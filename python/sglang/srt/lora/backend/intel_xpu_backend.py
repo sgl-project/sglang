@@ -117,12 +117,12 @@ class IntelXpuLoRABackend(TritonLoRABackend):
             input_ids=input_ids,
             weights=weights,
             vocab_size=vocab_size,
-            max_len=bi.max_len,
             seg_indptr=bi.seg_indptr,
             weight_indices=bi.weight_indices,
             lora_ranks=bi.lora_ranks,
             extra_embeddings=extra_embeddings,
             seg_lens=bi.seg_lens,
+            max_len=bi.max_len
         )
 
     def run_lora_a_sgemm(
