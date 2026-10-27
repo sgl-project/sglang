@@ -1640,6 +1640,63 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
+    def test_dsv41_compressed_budget_matches_allocated_pages(self):
+        """FP4 prefix storage was priced as FP8, leaving its memory budget unused.
+
+        Compare the planner against actual CPU allocations for the same source
+        layers, including explicit FP8 and the page-padded legacy layout.
+        """
+        import torch
+
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+            resolve_compressed_kv_layout,
+        )
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified = False
+        cfg.kv_bytes = 584
+        cfg.low_ratio_index_bytes = 68  # 128 FP4 values + four FP8 scales.
+        cfg.stage_owner_layers = {2: [2, 8, 14], 1: [20]}
+        cfg.swa_cap_tokens = 0
+        cfg.bytes_per_swa_token = 0
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        for layout, option in (
+            (KVLayout.V41, "auto"),
+            (KVLayout.V41_NEW, "auto"),
+            (KVLayout.V41, "fp8"),
+            (KVLayout.V4, "fp8"),
+        ):
+            for page_size in (128, 256):
+                with self.subTest(layout=layout, option=option, page_size=page_size):
+                    cfg.page_size = page_size
+                    allocated = 0
+                    for ratio, owners in cfg.stage_owner_layers.items():
+                        pool = object.__new__(DeepSeekV4SingleKVPool)
+                        pool.kv_layout = resolve_compressed_kv_layout(
+                            layout, ratio, option
+                        )
+                        pool.page_size = page_size // ratio
+                        pool.qk_nope_head_dim = 448
+                        pool.qk_rope_head_dim = 64
+                        pool.rope_storage_dtype = torch.bfloat16
+                        pool.quantize_block_size = pool.kv_layout.tile_size
+                        pool.scale_pad = 1
+                        pool.store_dtype = torch.uint8
+                        pool.device = "cpu"
+                        allocated += len(owners) * (
+                            pool.create_buffer(num_pages=1).nbytes
+                            + pool.page_size * cfg.low_ratio_index_bytes
+                        )
+                    with patch(
+                        "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+                        return_value=(layout, option),
+                    ):
+                        self.assertEqual(
+                            cfg._get_bytes_per_full_token() * page_size, allocated
+                        )
+
     def _dspark_replay_planner(self, *, draft_ring):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
