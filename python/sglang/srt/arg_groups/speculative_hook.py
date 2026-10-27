@@ -1110,6 +1110,46 @@ def _check_oot_speculative_algorithm(algorithm: str, device: str) -> None:
         )
 
 
+# Head sizes the paged prefill/decode kernels behind intel_xpu accept (sgl-kernel-xpu
+# src/sycl/flash_attention.cpp); any other head size raises on the first draft forward.
+_INTEL_XPU_PAGED_ATTENTION_HEAD_SIZES = (64, 96, 128, 192, 256, 512)
+
+
+def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> None:
+    """Give an EAGLE draft the triton backend when intel_xpu cannot run its head size."""
+    cfg = resolving_view(server_args)
+    if (
+        not get_platform().is_xpu
+        or cfg.speculative_draft_attention_backend is not None
+        or cfg.speculative_draft_model_path is None
+        or attention_backends_of(resolved_view(server_args))[0] != "intel_xpu"
+    ):
+        return
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+    )
+    # head_dim is optional in HF configs; without it the head size is hidden / heads.
+    head_dim = getattr(draft_hf_config, "head_dim", None) or (
+        draft_hf_config.hidden_size // draft_hf_config.num_attention_heads
+    )
+    if head_dim in _INTEL_XPU_PAGED_ATTENTION_HEAD_SIZES:
+        return
+    logger.info(
+        "intel_xpu attention does not support the draft model's head size %d; "
+        "using --speculative-draft-attention-backend triton for the draft.",
+        head_dim,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_eagle_family",
+        speculative_draft_attention_backend="triton",
+    )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _check_oot_speculative_algorithm(
@@ -1197,6 +1237,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 )
 
     _handle_iquest_q1_mtp_draft(server_args)
+    _fall_back_xpu_draft_attention_for_head_size(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
         assert (
             cfg.speculative_eagle_topk is None
