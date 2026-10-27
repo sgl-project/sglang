@@ -1027,7 +1027,8 @@ if _is_hip:
         """Native PyTorch fallback for static FP8 quantization when AITER is disabled."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        # num_token_padding can give output more rows than input; fill only the real ones.
+        output[: input.shape[0]].copy_(output_data)
 
     def scaled_fp8_quant(
         input: torch.Tensor,
