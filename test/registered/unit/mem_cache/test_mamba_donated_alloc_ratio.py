@@ -425,6 +425,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            allocate_intermediate_ssm=True,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
