@@ -228,12 +228,12 @@ def resolve_cutedsl_standard_scales(
 
 
 def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
-    if activation == "silu":
+    if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
         return activation_type_cls.Relu2
     raise ValueError(
-        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
+        f"CuteDSL MoE wrapper supports 'silu'/'situ' (gated) or 'relu2' (non-gated) "
         f"activation, got {activation!r}."
     )
 
@@ -344,6 +344,17 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # gathered together, so scale the per-rank forward bound by num_dp_ranks.
         max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+    activation_kwargs = {}
+    if layer.moe_runner_config.activation == "situ":
+        # FlashInfer selects SiTU through situ_beta, using the SwiGLU weight layout.
+        activation_kwargs = {
+            "situ_beta": (
+                layer.moe_runner_config.gemm1_alpha
+                if layer.moe_runner_config.gemm1_alpha is not None
+                else 4.0
+            ),
+            "situ_linear_beta": layer.moe_runner_config.gemm1_clamp_limit,
+        }
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
     # _dummy_run which runs under inference_mode(); inference tensors cannot
@@ -366,6 +377,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            **activation_kwargs,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -447,9 +459,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
@@ -540,9 +553,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
