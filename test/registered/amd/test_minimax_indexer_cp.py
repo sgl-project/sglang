@@ -105,7 +105,7 @@ def _nvfp4_verify_inputs(prefixes, num_draft, seed, tied_pages=False):
     """DSpark verify rows over the packed NVFP4 index-K pool: whole 128-token pages,
     shuffled. With ``tied_pages`` most pages copy page 1, so most blocks tie."""
     from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
-    from sglang.kernels.ops.quantization.nvfp4_kv_triton import nvfp4_kv_quantize
+    from sglang.test.kernels.nvfp4_kv import nvfp4_kv_quantize
 
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(seed)
