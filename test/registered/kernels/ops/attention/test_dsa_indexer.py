@@ -1415,7 +1415,8 @@ class TestDSAIndexer(CustomTestCase):
     def test_packed_paged_extend_dispatch(self):
         """PAGED extend top-k with row starts runs the packed v2 kernel, exactly.
 
-        That holds for a whole-forward call and for the indexer's row chunks.
+        That holds for a whole-forward call and for the indexer's row chunks. A
+        prefill-CP rank's token shard stays on legacy for both calls.
         """
         import sgl_kernel
 
@@ -1435,7 +1436,6 @@ class TestDSAIndexer(CustomTestCase):
         token_to_batch_idx = torch.tensor(
             [q for q, (_, _, ws) in enumerate(requests) for _ in ws], **i32
         )
-        q_lens = torch.tensor([len(ws) for _, _, ws in requests], **i32)
         keys = torch.tensor([n for _, n, _ in requests], **i32)
         num_rows = lengths.shape[0]
 
@@ -1459,44 +1459,65 @@ class TestDSAIndexer(CustomTestCase):
                 torch.cumsum(x, 0, dtype=torch.int32), (1, 0)
             )
 
-        clipped = torch.clamp(lengths, max=topk)
-        metadata = DSAIndexerMetadata(
-            attn_metadata=DSAMetadata(
-                page_size=page_size,
-                cache_seqlens_int32=keys,
-                max_seq_len_q=int(q_lens.max()),
-                max_seq_len_k=int(keys.max()),
-                cu_seqlens_q=cumsum(q_lens),
-                cu_seqlens_k=cumsum(keys),
-                page_table_1=page_table_1,
-                real_page_table=real_page_table,
-                dsa_cache_seqlens_int32=clipped,
-                dsa_cu_seqlens_q=torch.arange(num_rows + 1, **i32),
-                dsa_cu_seqlens_k=cumsum(clipped),
-                dsa_extend_seq_lens_list=q_lens.tolist(),
-                dsa_seqlens_expanded=lengths,
-                token_to_batch_idx=token_to_batch_idx,
-            ),
-            topk_transform_method=TopkTransformMethod.PAGED,
-            topk_backend=DSATopKBackend.SGL_KERNEL,
-        )
-
-        scores = self._make_tie_free_logits(num_rows, row_stride)
-        chunk = slice(1, 5)  # crosses the request boundary
-        cases = [
-            ("whole forward", slice(None), {}),
-            (
-                "indexer row chunk",
-                chunk,
-                dict(
-                    cu_seqlens_q=torch.ones(4, **i32),
-                    ke_offset=lengths[chunk],
-                    batch_idx_list=token_to_batch_idx[chunk],
+        def make_metadata(rows, prefill_cp_sharded=False):
+            row_lengths = lengths[rows]
+            row_batch = token_to_batch_idx[rows]
+            q_lens = torch.bincount(row_batch, minlength=len(requests)).to(torch.int32)
+            clipped = torch.clamp(row_lengths, max=topk)
+            return DSAIndexerMetadata(
+                attn_metadata=DSAMetadata(
+                    page_size=page_size,
+                    cache_seqlens_int32=keys,
+                    max_seq_len_q=int(q_lens.max()),
+                    max_seq_len_k=int(keys.max()),
+                    cu_seqlens_q=cumsum(q_lens),
+                    cu_seqlens_k=cumsum(keys),
+                    page_table_1=page_table_1,
+                    real_page_table=real_page_table,
+                    dsa_cache_seqlens_int32=clipped,
+                    dsa_cu_seqlens_q=torch.arange(row_lengths.shape[0] + 1, **i32),
+                    dsa_cu_seqlens_k=cumsum(clipped),
+                    dsa_extend_seq_lens_list=q_lens.tolist(),
+                    dsa_seqlens_expanded=row_lengths,
+                    token_to_batch_idx=row_batch,
+                    prefill_cp_sharded=prefill_cp_sharded,
                 ),
+                topk_transform_method=TopkTransformMethod.PAGED,
+                topk_backend=DSATopKBackend.SGL_KERNEL,
+            )
+
+        def chunk_kwargs(rows):
+            return dict(
+                cu_seqlens_q=torch.ones(lengths[rows].shape[0], **i32),
+                ke_offset=lengths[rows],
+                batch_idx_list=token_to_batch_idx[rows],
+            )
+
+        whole = make_metadata(slice(None))
+        # Interleaved prefill CP, rank 1 of 2: every second token of the batch.
+        # Both requests keep tokens here, so their indices and key bases hold.
+        cp_rows = torch.arange(1, num_rows, 2, device=self.device)
+        cp_shard = make_metadata(cp_rows, prefill_cp_sharded=True)
+        chunk = slice(1, 5)  # crosses the request boundary
+        cp_chunk = cp_rows[:2]  # crosses it on the CP rank
+        # (call, metadata, rows of the unsharded batch, kwargs, (packed, legacy) calls)
+        cases = [
+            ("whole forward", whole, slice(None), {}, (1, 0)),
+            ("indexer row chunk", whole, chunk, chunk_kwargs(chunk), (1, 0)),
+            ("prefill-CP whole forward", cp_shard, cp_rows, {}, (0, 1)),
+            (
+                "prefill-CP row chunk",
+                cp_shard,
+                cp_chunk,
+                chunk_kwargs(cp_chunk),
+                (0, 1),
             ),
         ]
-        for name, rows, kwargs in cases:
+        scores = self._make_tie_free_logits(num_rows, row_stride)
+        for name, metadata, rows, kwargs, want_calls in cases:
             with self.subTest(call=name):
+                # Row-gather first, then cut the columns: the logits keep
+                # DeepGEMM's padded row stride, as the packed path requires.
                 with (
                     envs.SGLANG_DSA_FUSE_TOPK.override(True),
                     envs.SGLANG_OPT_USE_TOPK_V2.override(True),
@@ -1511,14 +1532,14 @@ class TestDSAIndexer(CustomTestCase):
                     ) as legacy,
                 ):
                     out = metadata.topk_transform(
-                        scores.clone()[rows, :num_cols],
+                        scores[rows].clone()[:, :num_cols],
                         topk,
                         ks=row_starts[rows],
                         **kwargs,
                     )
                 self.assertEqual(
                     (packed.call_count, legacy.call_count),
-                    (1, 0),
+                    want_calls,
                     "(packed, legacy) calls",
                 )
                 with (
@@ -1526,7 +1547,7 @@ class TestDSAIndexer(CustomTestCase):
                     envs.SGLANG_OPT_USE_TOPK_V2.override(False),
                 ):
                     ref = metadata.topk_transform(
-                        scores.clone()[rows, :num_cols],
+                        scores[rows].clone()[:, :num_cols],
                         topk,
                         ks=row_starts[rows],
                         **kwargs,

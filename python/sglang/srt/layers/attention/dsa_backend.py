@@ -308,6 +308,8 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    # Prefill CP (interleave): the rows are this rank's token shard.
+    prefill_cp_sharded: bool = False
 
     pooled_index_kpool: int = 1
     pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
@@ -1414,6 +1416,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            prefill_cp_sharded=bs_idx_cpu is not None,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         metadata = self._init_kpool_metadata(

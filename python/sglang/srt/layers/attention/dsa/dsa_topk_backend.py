@@ -153,16 +153,19 @@ class DSATopKBackend(Enum):
         # trtllm with an fp8 KV cache). Unsupported shapes fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
+        # Prefill CP (interleave) stays on legacy: its rows are the rank's token
+        # shard, a layout no packed-kernel test covers.
         if batch_idx_list is None:
             row_to_batch = attn_metadata.token_to_batch_idx
         elif isinstance(batch_idx_list, torch.Tensor):
             row_to_batch = batch_idx_list
         else:
-            # The prefill-CP list selects requests, not rows: leave it on legacy.
+            # A Python list selects requests, not rows: leave it on legacy.
             row_to_batch = None
         if (
             self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
+            and not attn_metadata.prefill_cp_sharded
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0]
             and logits.dtype == torch.float32

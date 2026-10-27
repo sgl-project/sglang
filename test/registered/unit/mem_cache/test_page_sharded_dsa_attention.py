@@ -4,10 +4,11 @@
 
 The pool tests check byte-exact indexer keys, scales, and latent KV on 2 and 4
 GPUs, including packed FP8 reads, page reuse, and asynchronous layer prefetch.
-Writer and metadata tests cover fused stores and CP request filtering. The
-attention test reuses the pool fixture to compare real indexer reads and sparse
-attention with an unsharded cache, including full and shared indexer layers,
-packed FlashMLA FP8, and raw TRT-LLM FP8 caches.
+Writer and metadata tests cover fused stores, CP request filtering, and the
+prefill top-k route of a CP shard. The attention test reuses the pool fixture
+to compare real indexer reads and sparse attention with an unsharded cache,
+including full and shared indexer layers, packed FlashMLA FP8, and raw TRT-LLM
+FP8 caches.
 
 General placement, allocation, scratch planning, and MLA/MHA gather tests live
 in ``test_page_interleave_shard.py``.
@@ -812,6 +813,89 @@ class TestShardedDSAMetadata(unittest.TestCase):
         )
         self.assertIs(pool.begin_args[1], req_ids)
         self.assertEqual(pool.begin_args[2], [128, 64, 192])
+
+    def test_prefill_cp_shard_keeps_the_legacy_topk(self):
+        """The packed prefill top-k takes an unsharded batch, never a CP shard."""
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa import dsa_topk_backend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        # Two requests extend 3 and 2 tokens over 7 and 4 keys. Rank 1 of an
+        # interleaved CP2 holds batch tokens 1 and 3: one of each request.
+        lengths = torch.tensor([7, 4])
+        req_to_token = torch.arange(2 * 7).view(2, 7)
+        cp2_rank1 = SimpleNamespace(
+            shard_local_tokens=lambda tensor: tensor[1::2],
+            shard_per_request=lambda *_: (
+                [1, 1],
+                torch.tensor([1, 1], dtype=torch.int32),
+                [0, 1],
+                torch.tensor([0, 1]),
+            ),
+        )
+        for cp_sharded, want_calls in ((False, (1, 0)), (True, (0, 1))):
+            with self.subTest(cp_sharded=cp_sharded):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=2,
+                    req_pool_indices=torch.tensor([0, 1]),
+                    seq_lens=lengths,
+                    seq_lens_cpu=lengths,
+                    seq_lens_sum=int(lengths.sum()),
+                    extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+                    extend_seq_lens_cpu=[3, 2],
+                    extend_prefix_lens_cpu=[4, 2],
+                    attn_cp_metadata=object() if cp_sharded else None,
+                )
+                pool = SimpleNamespace(
+                    dsa_kv_cache_store_fp8=True, dtype=torch.float8_e4m3fn
+                )
+                backend = _attention_backend(pool, req_to_token, "cpu")
+                # trtllm prefill with an fp8 cache: the PAGED top-k transform.
+                backend.dsa_prefill_impl = "trtllm"
+                backend.use_fused_topk = True
+                with (
+                    patch.object(
+                        dsa_backend,
+                        "can_dsa_prefill_cp_interleave",
+                        return_value=cp_sharded,
+                    ),
+                    patch.object(
+                        dsa_backend, "get_cp_strategy", return_value=cp2_rank1
+                    ),
+                    patch.object(
+                        dsa_backend, "pad_dsa_cache_seqlens", side_effect=lambda _, x: x
+                    ),
+                ):
+                    backend.init_forward_metadata(batch)
+                metadata = backend.get_indexer_metadata(0, batch)
+                ks, _ = metadata.get_indexer_kvcache_range()
+                self.assertEqual(ks.shape[0], 2 if cp_sharded else 5)
+
+                legacy = MagicMock(name="fast_topk_transform_fused")
+                sgl_kernel = types.ModuleType("sgl_kernel")
+                sgl_kernel.fast_topk_transform_fused = legacy
+                sgl_kernel.fast_topk_transform_ragged_fused = MagicMock()
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+                    patch.dict(sys.modules, {"sgl_kernel": sgl_kernel}),
+                    patch.object(
+                        dsa_topk_backend, "_topk_transform_v2_packed"
+                    ) as packed,
+                ):
+                    # fp32 logits with a 16-byte row stride: the packed path's
+                    # shape conditions hold, so only the CP check can decline it.
+                    metadata.topk_transform(torch.zeros(ks.shape[0], 16), 2048, ks=ks)
+                self.assertEqual(
+                    (packed.call_count, legacy.call_count),
+                    want_calls,
+                    "(packed, legacy) calls",
+                )
 
 
 def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
