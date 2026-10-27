@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
 )
 
 # Full GLM-5.3 weights require the same runner as the existing B200 recipe.
-register_cuda_ci(est_time=1200, stage="extra-a", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1200, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 TRACK_INTERVAL = 256
