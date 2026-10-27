@@ -1,11 +1,12 @@
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from sglang.srt.distributed.device_communicators import custom_all_reduce_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _patch_group(monkeypatch, *, world_size, same_node):
@@ -86,6 +87,29 @@ def test_topology_capability(
         )
     else:
         intra_node_capability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
+    [
+        (False, True, 1024, 4, True),
+        (False, True, 1025, 4, False),
+        (False, True, 1024, 5, False),
+        (False, True, 0, 1, False),
+        (False, False, 1024, 4, True),
+        (True, None, 1024, 4, False),
+    ],
+)
+def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
+    """Push is offered within the plane's inclusive capacity, with or without multicast."""
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = disabled
+    # A disabled communicator never builds its planes, so these stay unset.
+    if not disabled:
+        comm.has_multicast = has_multicast
+        comm.max_push_size = 1024
+        comm._push_counter = torch.zeros(4)
+    assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
 
 
 if __name__ == "__main__":
