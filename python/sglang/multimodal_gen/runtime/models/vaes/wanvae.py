@@ -59,11 +59,12 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_gfx1250_supported
 
 if (
     current_platform.is_cuda()
-    or current_platform.is_rocm()
     or current_platform.is_xpu()
+    or (current_platform.is_rocm() and is_gfx1250_supported())
 ):
     try:
         from sglang.kernels.ops.diffusion import (

@@ -242,19 +242,20 @@ class RocmPlatform(Platform):
                     count,
                 )
 
-        try:
-            from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
-                maybe_optimize_qwen_image_vae,
-                maybe_optimize_wan_vae,
-            )
+        if is_gfx1250_supported():
+            try:
+                from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                    maybe_optimize_qwen_image_vae,
+                    maybe_optimize_wan_vae,
+                )
 
-            vae = maybe_optimize_wan_vae(vae)
-            vae = maybe_optimize_qwen_image_vae(vae)
-        except Exception:
-            logger.warning(
-                "Failed to apply the Wan VAE fast path; using the unmodified VAE.",
-                exc_info=True,
-            )
+                vae = maybe_optimize_wan_vae(vae)
+                vae = maybe_optimize_qwen_image_vae(vae)
+            except Exception:
+                logger.warning(
+                    "Failed to apply the Wan VAE fast path; using the unmodified VAE.",
+                    exc_info=True,
+                )
 
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
@@ -453,7 +454,9 @@ class RocmPlatform(Platform):
                 .reshape(child.out_channels, kt * child.in_channels, kh, kw)
                 .contiguous()
             )
-            if child.weight.is_contiguous(memory_format=torch.channels_last_3d):
+            if is_gfx1250_supported() and child.weight.is_contiguous(
+                memory_format=torch.channels_last_3d
+            ):
                 weight_2d = weight_2d.to(memory_format=torch.channels_last)
                 if use_bf16:
                     weight_2d = weight_2d.to(torch.bfloat16)
