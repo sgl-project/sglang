@@ -152,6 +152,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.beam_group = None
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -573,6 +574,43 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 175
         )  # 50 + 75 + 100 - 50 = 175
+        running_batch.release_req.assert_called_once()
+
+    def _preempt_with_beam_leader(self, params, beam_rid):
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        for req in running_reqs:
+            if req.rid == beam_rid:
+                req.beam_group = SimpleNamespace(beam_width=2)
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        total = sum(max_new_tokens for _, _, max_new_tokens in params)
+        self.mock_token_allocator.full_available_size.return_value = total
+        self.mock_token_allocator.available_size.return_value = total
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
+        return running_reqs, running_batch, adder, adder.preempt_to_schedule(new_req)
+
+    def test_preempt_skips_a_beam_group_leader(self):
+        # The only lower-priority request leads a beam group; its member rows
+        # alias its KV, so it must stay put.
+        running_reqs, running_batch, adder, success = self._preempt_with_beam_leader(
+            [("run1", 0, 50), ("run2", 1, 75), ("run3", 2, 100)], beam_rid="run1"
+        )
+
+        self.assertFalse(success)
+        self.assertEqual(adder.preempt_list, [])
+        running_batch.release_req.assert_not_called()
+
+    def test_preempt_takes_a_plain_request_next_to_a_beam_group_leader(self):
+        running_reqs, running_batch, adder, success = self._preempt_with_beam_leader(
+            [("run1", 0, 50), ("run0", 0, 50), ("run3", 2, 100)], beam_rid="run1"
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(adder.preempt_list, [running_reqs[1]])
         running_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first(self):

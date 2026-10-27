@@ -1653,10 +1653,13 @@ class PrefillAdder:
         # Preemption runs between these two phases (inside get_new_batch_prefill),
         # so running_batch may still contain requests whose KV cache is already freed.
         # We must skip them here to avoid a double-free on release_req.
+        # A beam group cannot be preempted: its member rows ride the leader's
+        # decode and alias its KV, and requeueing the leader would leave them
+        # writing into freed slots. Retraction aborts such groups instead.
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
-            if r not in self.preempt_list and not r.finished()
+            if r not in self.preempt_list and not r.finished() and r.beam_group is None
         )
 
         sorted_valid_running_reqs = sorted(
