@@ -51,7 +51,7 @@ jobs:
           git checkout -b "$BRANCH_NAME"
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
-      - name: Commit and create PR
+      - name: Commit and create or update PR
         if: steps.bump.outputs.needs_bump == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}

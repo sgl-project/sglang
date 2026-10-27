@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Script to commit an sgl-amd-mono pin bump to SGLang and create or update its pull request
+# Script to commit an sgl-amd-mono pin bump and create or update its pull request
 # Usage: commit_and_pr_sgl_amd_mono.sh <old_commit> <new_commit> <branch_name>
 #
 # Arguments:
@@ -23,11 +23,11 @@ MONO_REPO="sgl-project/sgl-amd-mono"
 OLD_SHORT_SHA="${OLD_COMMIT:0:8}"
 NEW_SHORT_SHA="${NEW_COMMIT:0:8}"
 
-OPEN_PR=$(gh pr list --head "$BRANCH_NAME" --base main --state open --json number --jq '.[].number')
+OPEN_PR_NUMBER=$(gh pr list --head "$BRANCH_NAME" --base main --state open --json number --jq '.[].number')
 # A force-push restarts the PR's CI, so skip it when the PR already pins this commit.
-if [ -n "$OPEN_PR" ] && git fetch -q origin "$BRANCH_NAME" \
+if [ -n "$OPEN_PR_NUMBER" ] && git fetch -q --depth=1 origin "$BRANCH_NAME" \
     && git show FETCH_HEAD:python/pyproject_other.toml | grep -qF "sgl-amd-mono.git@${NEW_COMMIT}"; then
-    echo "#${OPEN_PR} already pins sgl-amd-mono at ${NEW_SHORT_SHA}; nothing to do."
+    echo "#${OPEN_PR_NUMBER} already pins sgl-amd-mono at ${NEW_SHORT_SHA}; nothing to do."
     exit 0
 fi
 
@@ -64,10 +64,10 @@ up from ${OLD_COMMIT}.
 echo "Pushing to ${BRANCH_NAME}..."
 git push --force origin "${BRANCH_NAME}"
 
-if [ -n "$OPEN_PR" ]; then
-    echo "Updating pull request #${OPEN_PR}..."
-    gh pr edit "$OPEN_PR" --title "$PR_TITLE" --body "$PR_BODY"
-    PR_URL=$(gh pr view "$OPEN_PR" --json url --jq .url)
+if [ -n "$OPEN_PR_NUMBER" ]; then
+    echo "Updating pull request #${OPEN_PR_NUMBER}..."
+    gh pr edit "$OPEN_PR_NUMBER" --title "$PR_TITLE" --body "$PR_BODY"
+    PR_URL=$(gh pr view "$OPEN_PR_NUMBER" --json url --jq .url)
 else
     echo "Creating pull request..."
     PR_URL=$(gh pr create \
