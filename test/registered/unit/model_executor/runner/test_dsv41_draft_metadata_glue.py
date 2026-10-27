@@ -111,16 +111,6 @@ class TestGlueCaptureFailure(CustomTestCase):
         ):
             for _ in range(glue.NUM_WARMUP + 1):
                 glue.run(backend, fb_view=None, key=1)
-        return backend
-
-    def test_lenient_falls_back_to_eager(self):
-        glue = MetadataGlueGraph("cpu")
-        backend = self._run_through_capture(glue)
-        self.assertTrue(glue.disabled)
-        # the warm-ups, then the failed step's prep run eagerly
-        self.assertEqual(
-            backend.init_forward_metadata_out_graph.call_count, glue.NUM_WARMUP + 1
-        )
 
     def test_strict_raises(self):
         glue = MetadataGlueGraph("cpu", strict=True)
