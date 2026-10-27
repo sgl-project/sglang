@@ -19,11 +19,12 @@ The CUDA side is split into independent pieces:
 All storage is allocated and owned here, in Python.
 
 On single-node groups, CUDA-graph inputs are exchanged from Python after
-capture (cudaIpc handles for cudaMalloc-backed pointers, posix-fd VMM mapping
+capture (cudaIpc handles for cudaMalloc-backed pointers, FABRIC/POSIX-fd VMM mapping
 for expandable segments) and written into a device-side pointer table
 (``graph_params``); the kernel captured in the graph dereferences its row at
-replay time. Multi-node (MNNVL) groups skip this and pull from the symm-mem
-workspace inside graphs too, so they need no particular allocator.
+replay time. Multi-node (MNNVL) groups skip direct graph-input registration
+and use the torch symmetric-memory workspace during capture and replay too.
+Their input tensors therefore do not require a VMM-backed caching allocator.
 """
 
 import logging
