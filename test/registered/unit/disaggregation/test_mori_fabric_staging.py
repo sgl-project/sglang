@@ -289,6 +289,60 @@ class TestFabricStagingSizing(CustomTestCase):
 
 
 class TestFabricStagingTransfer(CustomTestCase):
+    def test_terminal_completion_is_independent_of_aux(self):
+        for last_rank, aux_index in ((False, 3), (True, None), (True, 3)):
+            with self.subTest(last_rank=last_rank, aux_index=aux_index):
+                manager = _staging_manager()
+                manager.local_ip, manager.rank_port = "10.0.0.1", 6000
+                manager.pp_group = types.SimpleNamespace(is_last_rank=last_rank)
+                manager.deferred_bootstrap = None
+                manager.transfer_infos[11]["decode"].dst_aux_index = 5
+                manager.send_aux = MagicMock()
+                manager.send_kv_status_message = MagicMock()
+                status = MagicMock()
+                status.InProgress.return_value = False
+                manager.engine = MagicMock()
+                manager.engine.batch_write.return_value = [status]
+                manager.engine.wait_all.return_value = StatusCode.SUCCESS
+                ready = []
+
+                def reply(msg):
+                    self.assertEqual(msg[0], FABRIC_CHUNK_READY)
+                    self.assertEqual(manager.request_status[11], KVPoll.Transferring)
+                    manager.engine.wait_all.assert_called_with([status])
+                    ready.append(msg)
+                    manager._handle_fabric_chunk_ack(
+                        [FABRIC_CHUNK_ACK, msg[1], msg[10], msg[11], msg[3], msg[9]]
+                    )
+
+                manager._connect_threadsafe = lambda *a, **kw: types.SimpleNamespace(
+                    send_multipart=reply
+                )
+                for last_chunk in (False, True):
+                    chunk = _chunk()
+                    chunk.is_last_chunk = last_chunk
+                    chunk.prefill_aux_index = aux_index
+                    with patch(PACK, return_value=256):
+                        self.assertTrue(manager._process_transfer_chunk(chunk))
+                    self.assertEqual(len(ready), 1 + int(last_chunk))
+                    self.assertEqual(ready[-1][4], b"1" if last_chunk else b"0")
+                    self.assertEqual(
+                        manager.request_status[11],
+                        KVPoll.Success if last_chunk else KVPoll.Transferring,
+                    )
+                    if last_chunk:
+                        self.assertEqual(
+                            manager.send_kv_status_message.call_args.kwargs["status"],
+                            KVPoll.Success,
+                        )
+                    else:
+                        manager.send_kv_status_message.assert_not_called()
+                        manager.send_aux.assert_not_called()
+                self.assertEqual(
+                    manager.send_aux.call_count,
+                    int(last_rank and aux_index is not None),
+                )
+
     def test_invalid_chunk_fails_before_any_copy(self):
         for rows, state, remote, error in (
             (np.arange(26), None, 7000, "overflow before gather"),

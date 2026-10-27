@@ -903,19 +903,16 @@ class MoriKVManager(CommonKVManager):
         )
         logger.debug("Mori fabric staging %s acknowledged", trace)
 
-        if (
-            kv_chunk.is_last_chunk
-            and kv_chunk.prefill_aux_index is not None
-            and self.pp_group.is_last_rank
-        ):
-            for target in targets:
-                if target.info.dst_aux_index >= 0:
-                    self.send_aux(
-                        target.peer_info,
-                        kv_chunk.prefill_aux_index,
-                        target.info.dst_aux_index,
-                        room,
-                    )
+        if kv_chunk.is_last_chunk:
+            if kv_chunk.prefill_aux_index is not None and self.pp_group.is_last_rank:
+                for target in targets:
+                    if target.info.dst_aux_index >= 0:
+                        self.send_aux(
+                            target.peer_info,
+                            kv_chunk.prefill_aux_index,
+                            target.info.dst_aux_index,
+                            room,
+                        )
             self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
         return True
 
