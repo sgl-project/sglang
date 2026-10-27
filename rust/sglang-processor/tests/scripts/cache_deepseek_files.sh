@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cache the files of the DeepSeek checkpoints the openai_parity fixtures pin, as
 # a pinned commit's snapshot in the HF cache, where `resolve_model_file` finds
-# them: the tokenizer the DeepSeek output tests decode with, and the config that
+# them: the tokenizer the DeepSeek tests decode with, and the config that
 # selects the checkpoint's renderer.
 set -euo pipefail
 
