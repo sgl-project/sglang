@@ -364,6 +364,71 @@ class StaticKVStorage:
     def release_rehomed_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)
 
+    # -- the prefix tree's state effects: the tree decides, the storage executes --
+
+    def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
+        """``count`` free state slots of ``sub_pool``; None when none are free."""
+        return self._allocator.state_slots.alloc(count)
+
+    def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
+        self._allocator.state_slots.free(slots)
+
+    def copy_state(self, sub_pool: str, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Copy the state in slots ``src`` into slots ``dst``."""
+        ids = self._allocator.state_ids(sub_pool)
+        self._allocator.state.pool.copy_from(ids.ids(src), ids.ids(dst))
+
+    def release_state(
+        self, sub_pool: str, req: Req, *, keep: Optional[int] = None
+    ) -> None:
+        """Give back a finished request's state slots, keeping its tracking
+        slot ``keep`` when the tree took that one."""
+        self._allocator.state.release(
+            self.requests, req, mamba_ping_pong_track_buffer_to_keep=keep
+        )
+
+    def donate_tracking_slot(
+        self, sub_pool: str, req: Req, new_slot: torch.Tensor
+    ) -> torch.Tensor:
+        """Hand the tree the request's kept tracking slot, giving the request
+        ``new_slot`` in its place."""
+        return self.requests.donate_mamba_ping_pong_slot(req, new_slot)
+
+    def quantizes_checkpoints(self, sub_pool: str) -> bool:
+        """Whether the tree's state checkpoints live in a quantized pool of
+        their own rather than in state slots."""
+        return self._allocator.state.ckpt_pool is not None
+
+    def take_checkpoint_slot(self, sub_pool: str) -> Optional[torch.Tensor]:
+        return self._allocator.state.ckpt_pool.alloc(1)
+
+    def store_checkpoint(
+        self, sub_pool: str, active: torch.Tensor, checkpoint: torch.Tensor
+    ) -> None:
+        """Quantize the state in slots ``active`` into ``checkpoint``."""
+        state = self._allocator.state
+        state.ckpt_pool.store_from_active(state.pool, active.view(-1), checkpoint)
+
+    def free_checkpoints(self, sub_pool: str, checkpoints: torch.Tensor) -> None:
+        self._allocator.state.ckpt_pool.free(checkpoints)
+
+    def settle_replay(self, sub_pool: str, slot: torch.Tensor) -> int:
+        """At a request's finish: the tokens its slot's state lags behind the
+        request (its replay ring's unflushed depth, 0 without one); the lag
+        restarts at zero."""
+        write_pos = self._allocator.state.pool.replayssm_write_pos
+        if write_pos is None:
+            return 0
+        lag = int(write_pos[slot].item())
+        write_pos[slot] = 0
+        return lag
+
+    def restart_replay(self, sub_pool: str, slots: torch.Tensor) -> None:
+        """A loaded state is current: its replay lag restarts at zero."""
+        write_pos = self._allocator.state.pool.replayssm_write_pos
+        if write_pos is not None:
+            write_pos[self._allocator.state_ids(sub_pool).ids(slots)] = 0
+
     def accounting_violations(self) -> List[str]:
         return self._allocator.verify_byte_accounting()
 

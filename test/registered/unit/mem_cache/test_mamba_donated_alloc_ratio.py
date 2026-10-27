@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -53,11 +54,17 @@ class _RatioCache:
     def __init__(self, pool_size: int):
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.allocator = _BoundedMambaAllocator(pool_size)
-        self.token_to_kv_pool_allocator = SimpleNamespace(state_slots=self.allocator)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=self.allocator, storage=None
+        )
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
         self.alloc_evict_params = []
+
+    def kv_storage(self):
+        # Static pools: the component's slot takes reach the bounded allocator.
+        return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
     def evict_for_alloc(self, params: EvictParams):
         self.alloc_evict_params.append(params)
