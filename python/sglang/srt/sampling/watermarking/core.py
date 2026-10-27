@@ -563,12 +563,9 @@ class WatermarkState:
         if not batch.forward_mode.is_extend_without_speculative():
             return None
 
-        num_prefill_reqs = len(batch.reqs)
-        if batch.forward_mode.is_mixed():
-            num_prefill_reqs -= len(batch.mix_running_indices_cpu)
-        elif batch.decoding_reqs is not None:
-            num_prefill_reqs = 0
-
+        # Prefill rows come first; decode rows mixed in, or a decode step run
+        # as extend, have no prompt tail.
+        num_prefill_reqs = len(batch.prefill_reqs())
         if num_prefill_reqs == 0:
             return None
 

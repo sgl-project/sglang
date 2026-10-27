@@ -154,12 +154,11 @@ def test_retracted_request_restores_context_history():
     )
     forward_mode = SimpleNamespace(
         is_extend_without_speculative=lambda: True,
-        is_mixed=lambda: False,
     )
     batch = SimpleNamespace(
         forward_mode=forward_mode,
         reqs=[request],
-        decoding_reqs=None,
+        prefill_reqs=lambda: [request],
     )
     history = state.retracted_context_hashes(batch)
     assert history is not None
