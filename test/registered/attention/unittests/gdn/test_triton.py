@@ -241,11 +241,26 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             num_v_heads=2,
             page_size=1,
             prefix_lens=(0,),
-            extend_lens=(198,),
-            mis_delimiter_indices=((5, 68, 132, 197),),
+            extend_lens=(201,),
+            mis_delimiter_indices=((5, 69, 134, 200),),
             conv_history_weight=0.25,
         )
         run_gdn_attention_case(self, case, max_context_len=256)
+
+    def test_multi_item_scoring_empty_item_readouts(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_empty_item_readouts",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0),
+            extend_lens=(6, 6),
+            mis_delimiter_indices=((0, 1, 4, 5), (3, 4, 5)),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case)
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # shuffled_pages is the default for all tests; this method opts
