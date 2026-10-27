@@ -39,11 +39,10 @@ from sglang.srt.mem_cache.memory_pool import (
     write_loc_is_physical,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedKVPool,
     UnifiedMHATokenToKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
@@ -102,7 +101,7 @@ def _unified_mha_pool(ps=1):
         store_dtype=_DTYPE,
         grow_direction="up",
     )
-    kv = UnifiedKVPool(
+    kv = arena_of(
         total_bytes=full.entry_bytes() * 32 + swa.entry_bytes() * 16,
         sub_pool_specs=[full, swa],
         device=_DEV,
@@ -110,7 +109,7 @@ def _unified_mha_pool(ps=1):
         page_size=ps,
     )
     return UnifiedMHATokenToKVPool(
-        unified_buffer=kv, sub_pool_name="full", page_size=ps, enable_alt_stream=False
+        arena=kv, spec=kv.spec("full"), page_size=ps, enable_alt_stream=False
     )
 
 

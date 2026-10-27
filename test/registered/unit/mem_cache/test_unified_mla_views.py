@@ -22,6 +22,7 @@ GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -37,7 +38,6 @@ from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedKVPool,
     UnifiedMLATokenToKVPool,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -85,7 +85,7 @@ def _make_unified(page_size=1, n_full_tokens=64, n_mamba_slots=8):
     full = _mla_spec()
     mamba = _mamba_spec()
     total = full.entry_bytes() * n_full_tokens + mamba.entry_bytes() * n_mamba_slots
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full, mamba],
         device=_DEV,
@@ -165,14 +165,14 @@ class TestUnifiedKVPoolMLA(unittest.TestCase):
         )
         for spec in (full, mamba):
             self.assertGreaterEqual(
-                pool.min_slot_index(spec.name) * spec.entry_bytes(), floor
+                pool.first_entry(spec.name) * spec.entry_bytes(), floor
             )
 
     def test_mla_views_accessor(self):
         pool, full, _ = _make_unified(page_size=1)
-        views = pool.mla_views_for("full")
+        views = pool.spec("full").views(pool)
         self.assertEqual(len(views), _L)
-        self.assertIs(pool.mla_spec("full"), full)
+        self.assertIs(pool.spec("full"), full)
         self.assertEqual(views[0].stride(0) * _ITEM, full.entry_bytes())
 
 
@@ -180,8 +180,8 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
     def _make(self, ps=1):
         pool, full, mamba = _make_unified(page_size=ps)
         kv_pool = UnifiedMLATokenToKVPool(
-            unified_buffer=pool,
-            sub_pool_name="full",
+            arena=pool,
+            spec=pool.spec("full"),
             kv_cache_dtype=_DTYPE,
             page_size=ps,
         )
@@ -191,7 +191,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         pool, kv_pool = self._make(ps=1)
         self.assertEqual(len(kv_pool.kv_buffer), _L)
         self.assertEqual(kv_pool.get_kv_size_bytes(), 0)
-        self.assertEqual(kv_pool.size, pool.max_slots("full") - 1)
+        self.assertEqual(kv_pool.size, pool.num_entries("full") - 1)
         k = kv_pool.get_key_buffer(1)
         v = kv_pool.get_value_buffer(1)
         self.assertEqual(k.shape[-1], _D)
@@ -219,7 +219,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                     ),
                 ):
                     saved = kv_pool.get_cpu_copy(phys)
-                    pool._raw.zero_()
+                    pool.raw.zero_()
                     kv_pool.load_cpu_copy(saved, phys)
 
                 for layer in range(_L):
@@ -229,14 +229,14 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                         f"layer {layer} did not round-trip at page_size {ps}",
                     )
 
-    def test_move_kv_cache_moves_page_envelopes(self):
+    def test_arena_moves_page_envelopes(self):
         """Whole page envelopes relocate, in raw bytes and (at ps=4) as read
         back through the per-layer views at the destination ids."""
         for ps in (1, 4):
             pool, kv_pool = self._make(ps=ps)
-            num_pages = pool.max_slots("full") // ps
-            page_bytes = ps * pool.mla_spec("full").entry_bytes()
-            env = pool._raw[: num_pages * page_bytes].view(num_pages, page_bytes)
+            num_pages = pool.num_entries("full") // ps
+            page_bytes = ps * pool.spec("full").entry_bytes()
+            env = pool.raw[: num_pages * page_bytes].view(num_pages, page_bytes)
             src_pages = torch.tensor([num_pages - 2, num_pages - 4, num_pages - 3])
             dst_pages = torch.tensor([2, 3, 5])
             env[src_pages[0]] = 7
@@ -248,11 +248,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                         kv_pool.kv_buffer[l][int(src_pages[2]) * ps + s] = float(
                             l * ps + s + 1
                         )
-            # page-major token runs, exactly how compaction expands pages
-            offsets = torch.arange(ps, dtype=torch.int64)
-            src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
-            dst_t = (dst_pages[:, None] * ps + offsets).reshape(-1)
-            kv_pool.move_kv_cache(dst_t, src_t)
+            pool.move_units("full", dst_pages, src_pages)
             self.assertTrue(torch.all(env[dst_pages[0]] == 7), f"ps={ps}")
             self.assertTrue(torch.all(env[dst_pages[1]] == 9), f"ps={ps}")
             if ps == 4:
@@ -265,10 +261,18 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
 
 
 class _FakeKVCache:
-    def __init__(self, max_slots: int):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+    def __init__(self, source, name=None):
+        # A bare size for a pool no arena moves; else the band of ``source``
+        # (a test arena) whose unit moves this buffer follows.
+        if name is None:
+            size = source
+        else:
+            size = source.num_entries(name)
+            source.follow(name, self)
+        # buf[p] == virtual id currently stored at physical slot p (-1 if free).
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
 
-    def move_physical_pages(
+    def move_units(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
     ):
         slots = torch.arange(page_size, device=dst_pages.device)
@@ -281,16 +285,16 @@ class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "full"),
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             page_size=ps,
         )
         mamba_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "mamba"),
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -396,15 +400,15 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
 
     def _build(self, ps=1):
         pool, _, _ = _make_unified(page_size=ps)
-        owner = _RecordingView(pool.max_slots("full"))
+        owner = _RecordingView(pool.num_entries("full"))
         with get_parallel().override(
             dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
         ):
             allocator = ChainAllocator(
                 roles=ChainRoles(owner="full", state="mamba"),
-                unified_buffer=pool,
+                arena=pool,
                 kvcache=owner,
-                views={"full": owner, "mamba": _FakeKVCache(pool.max_slots("mamba"))},
+                views={"full": owner, "mamba": _FakeKVCache(pool, "mamba")},
                 device=_DEV,
                 page_size=ps,
             )

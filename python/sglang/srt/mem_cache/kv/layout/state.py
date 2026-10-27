@@ -1,7 +1,7 @@
 """The state sub-pool layout: conv and temporal state rows of every layer in one slot entry."""
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.layout.fused_draft import DraftStateRegion
 from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
     align_part_offset,
+    build_mamba_entry_views,
 )
 
 
@@ -75,3 +76,36 @@ class MambaSubPoolSpec(SubPoolSpec):
 
     def get_dtype(self) -> torch.dtype:
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
+
+    def views(self, arena) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Per-layer conv and temporal views over this sub-pool's band of
+        ``arena``, indexed by the physical slot id."""
+        return build_mamba_entry_views(
+            arena.raw,
+            layer_num=self.layer_num,
+            conv_state_shapes=self.conv_state_shapes,
+            conv_dtype=self.conv_dtype,
+            temporal_state_shape=self.temporal_state_shape,
+            temporal_dtype=self.temporal_dtype,
+            max_slots=arena.extent_entries(self.name),
+            entry_bytes=self.entry_bytes(),
+        )
+
+    def draft_views(self, arena) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Per-layer conv and temporal views of the draft state block fused
+        into this sub-pool's entries: the same slots, the same ids."""
+        region = self.draft_region
+        assert isinstance(region, DraftStateRegion), (
+            f"sub-pool {self.name!r} carries no fused draft state region"
+        )
+        return build_mamba_entry_views(
+            arena.raw,
+            layer_num=region.lane_num,
+            conv_state_shapes=region.state.conv_state_shapes,
+            conv_dtype=region.state.conv_dtype,
+            temporal_state_shape=region.state.temporal_state_shape,
+            temporal_dtype=region.state.temporal_dtype,
+            max_slots=arena.extent_entries(self.name),
+            entry_bytes=self.entry_bytes(),
+            offset_bytes=self.draft_offset_in_entry(),
+        )

@@ -70,7 +70,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         full, swa = _RecordingPool(), _RecordingPool()
         # layer 0 -> full attention; layer 1 -> SWA, each index 0 in its view.
         pool = RoutedKVCache(
-            unified_buffer=types.SimpleNamespace(device="cpu"),
+            arena=types.SimpleNamespace(device="cpu"),
             owner="full",
             layer_maps=[("full", full, {0: 0}), ("swa", swa, {1: 0})],
             page_size=1,

@@ -76,7 +76,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 allocator = bundle.token_to_kv_pool_allocator
                 indices = allocator.alloc(12)
                 allocator.free_swa(indices[:tombstone_tokens])
-                raw = bundle.unified_memory_pool._raw
+                raw = bundle.arena.raw
                 raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
                 manager = object.__new__(DecodeKVCacheOffloadManager)
                 manager.token_to_kv_pool_allocator = allocator
@@ -105,7 +105,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
         pool = bundle.token_to_kv_pool
         indices = allocator.alloc(12)
         allocator.free_swa(indices[:4])
-        raw = bundle.unified_memory_pool._raw
+        raw = bundle.arena.raw
         raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
         full_pages = allocator.translate_kv_indices_for_transfer(indices)[::4] // 4
         swa_pages = allocator.translate_swa_indices_for_transfer(indices[4:])[::4] // 4

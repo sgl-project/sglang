@@ -231,7 +231,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     @staticmethod
     def _sub_pools(alloc: ChainAllocator) -> Set[str]:
-        return {spec.name for spec in alloc.unified_buffer.sub_pool_specs}
+        return {band.name for band in alloc.arena.bands}
 
     def test_transfer_translate_is_not_inherited_identity(self):
         virtual = torch.tensor([1, 3], dtype=torch.int32)

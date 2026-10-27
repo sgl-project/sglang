@@ -32,9 +32,8 @@ from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -59,7 +58,7 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
         store_dtype=torch.float16,
         grow_direction="down",
     )
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes(),
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -67,7 +66,7 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
     )
     return ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=_FakeUnifiedSWAKVPool(pool),
         views=stand_in_views(
             ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)

@@ -41,9 +41,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -69,7 +68,7 @@ def _build_swa_composite(n_full=64, n_swa=64):
         grow_direction="down",
     )
     total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -78,7 +77,7 @@ def _build_swa_composite(n_full=64, n_swa=64):
     kvcache = _FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kvcache,
         views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,

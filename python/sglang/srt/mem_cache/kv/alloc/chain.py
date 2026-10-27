@@ -1,4 +1,4 @@
-"""One allocator over the chain of sub-pools in a `UnifiedKVPool`.
+"""One allocator over the chain of bands in a `KVArena`.
 
 Every sub-pool is a band allocator, an end or a float of the chain. The owner
 band mints the virtual token ids; a window band binds the owner's virtual
@@ -35,8 +35,8 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
     interim_policy_for,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
+from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import expect, resolve_level
@@ -100,7 +100,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         *,
-        unified_buffer: UnifiedKVPool,
+        arena: KVArena,
         roles: ChainRoles,
         kvcache,
         views: Dict[str, Any],
@@ -120,19 +120,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(
             size=0,
             page_size=page_size * dcp_size,
-            dtype=unified_buffer.spec(roles.owner).get_dtype(),
+            # The chain hands out units of the arena's bytes.
+            dtype=torch.uint8,
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
         )
-        self.unified_buffer = unified_buffer
+        self.arena = arena
         self.roles = roles
         # Each sub-pool's view, by sub-pool name: what its band moves, zeroes
         # and copies.
         self.views = dict(views)
         self.lazy_compaction = lazy_compaction
         band = dict(
-            unified_buffer=unified_buffer,
+            arena=arena,
             device=device,
             need_sort=need_sort,
             forward_stream=forward_stream,
@@ -148,7 +149,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.swa_attn_allocator: Optional[MultiEndedAllocator] = None
         if roles.window is not None:
-            floats = unified_buffer.spec(roles.window).grow_direction == "float"
+            floats = arena.band(roles.window).grow_direction == "float"
             # A float never runs the lazy event pipeline: frees mark holes and
             # allocations reuse them in place.
             self.swa_attn_allocator = (
@@ -223,9 +224,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             pool = self.views[band.sub_pool_name]
             pool.host_capacity_tokens = tokens
-            pool.host_capacity_bytes = (
-                tokens * self.unified_buffer.spec(band.sub_pool_name).entry_bytes()
-            )
+            pool.host_capacity_bytes = tokens * band.entry_bytes
 
     @property
     def has_window_pool(self) -> bool:
@@ -257,7 +256,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._snapshot_memo = snapshot_chain(
                 self.bands,
                 page_size=self.page_size,
-                total_bytes=self.unified_buffer.total_bytes,
+                total_bytes=self.arena.total_bytes,
                 positions=self._band_positions,
             )
             self._snapshot_key = key
@@ -271,7 +270,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         fresh = snapshot_chain(
             self.bands,
             page_size=self.page_size,
-            total_bytes=self.unified_buffer.total_bytes,
+            total_bytes=self.arena.total_bytes,
         )
         if fresh == self._snapshot_memo:
             return []

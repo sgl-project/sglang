@@ -58,7 +58,7 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
 class TestConvCompaction(CustomTestCase):
     def _exercise(self, device, page_size, mode):
         bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
-        pool = bundle.unified_memory_pool
+        pool = bundle.arena
         composite = bundle.token_to_kv_pool_allocator
         state = composite.state.pool
         alloc = composite.mamba_allocator
@@ -82,11 +82,11 @@ class TestConvCompaction(CustomTestCase):
         reference = torch.randint(
             0,
             64,
-            pool._raw.shape,
+            pool.raw.shape,
             dtype=torch.uint8,
             generator=torch.Generator().manual_seed(781),
         )
-        pool._raw.copy_(reference)
+        pool.raw.copy_(reference)
         if device == "cuda":
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -112,7 +112,7 @@ class TestConvCompaction(CustomTestCase):
             )
         )
         self.assertEqual(composite.verify_byte_accounting(), [])
-        actual = pool._raw.cpu()
+        actual = pool.raw.cpu()
         moved = 0
         for group, (a, virtual, old) in enumerate(
             zip(allocators, live_ids, before_maps)

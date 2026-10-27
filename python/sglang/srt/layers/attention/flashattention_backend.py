@@ -1313,7 +1313,7 @@ class FlashAttentionBackend(AttentionBackend):
         # the plan capture also kicks the first layer's prefix gather.
         #
         # Runs after KVIndexTranslator and before the `// page_size` reduction.
-        # The unified-memory UnifiedKVPool and page-interleaved pools are
+        # The unified-memory arena and page-interleaved pools are
         # alternatives, so at most one translation fires.
         if self._kv_shard_pool is not None and prepare_kv_shard_forward(
             self._kv_shard_pool,

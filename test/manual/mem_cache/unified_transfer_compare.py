@@ -97,7 +97,7 @@ def pd_summary(bundle, total_layers: int) -> dict:
 
     pool = bundle.token_to_kv_pool
     allocator = bundle.token_to_kv_pool_allocator
-    base = bundle.unified_memory_pool._raw.data_ptr()
+    base = bundle.arena.raw.data_ptr()
     storage = getattr(allocator, "storage", None)
     kv_args = KVArgs()
     setup = inspect.signature(pd.setup_state_kv_args).parameters

@@ -8,7 +8,6 @@ import torch
 from test_unified_mamba_views import _make_pool
 
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,13 +29,13 @@ class TestMambaCompaction(CustomTestCase):
             grow_direction=direction,
         )
         kv = UnifiedMambaPool(
-            unified_buffer=pool,
-            sub_pool_name="mamba",
+            arena=pool,
+            spec=pool.spec("mamba"),
             spec_state_size=0,
             mamba_layer_ids=[1, 3],
         )
         alloc = MultiEndedAllocator(
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="mamba",
             kvcache=kv,
             device=device,
@@ -44,7 +43,7 @@ class TestMambaCompaction(CustomTestCase):
             lazy_compaction=lazy,
         )
         full = MultiEndedAllocator(
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             kvcache=Mock(),
             device=device,
@@ -58,35 +57,20 @@ class TestMambaCompaction(CustomTestCase):
         ids = alloc.alloc(count).clone()
         ids = ids[torch.argsort(alloc.virtual_to_physical[ids])]
         original_pages = alloc.virtual_to_physical[ids].cpu().tolist()
-        short = ShortConvPool(
-            size=pool.max_slots("mamba") - 1,
-            state_shape=(32, 3),
-            layer_ids=[1, 3],
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        ngram = NGramPool(
-            size=pool.max_slots("mamba") - 1,
-            context_len=8,
-            eos_token_id=0,
-            device=device,
-        )
-        kv.register_slot_state(short)
-        kv.register_slot_state(ngram)
         # Independent, byte-varying reference. Keep floating values finite for COW.
         gen = torch.Generator().manual_seed(42137)
-        raw = torch.randint(0, 64, pool._raw.shape, dtype=torch.uint8, generator=gen)
-        pool._raw.copy_(raw)
-        short.conv_state.copy_(
-            torch.arange(short.conv_state.numel()).reshape(short.conv_state.shape) % 127
-        )
-        ngram.context.copy_(
-            torch.arange(ngram.context.numel()).reshape(ngram.context.shape)
-        )
-        short_ref = short.conv_state.cpu().clone()
-        ngram_ref = ngram.context.cpu().clone()
-        move = Mock(wraps=kv.move_kv_cache)
-        kv.move_kv_cache = move
+        raw = torch.randint(0, 64, pool.raw.shape, dtype=torch.uint8, generator=gen)
+        pool.raw.copy_(raw)
+        # Unit moves of the state band, as (dst, src) per call.
+        move = Mock()
+        arena_move = pool.move_units
+
+        def recorded(name, dst, src):
+            if name == "mamba":
+                move(dst, src)
+            return arena_move(name, dst, src)
+
+        pool.move_units = recorded
         return SimpleNamespace(
             pool=pool,
             spec=spec,
@@ -97,16 +81,12 @@ class TestMambaCompaction(CustomTestCase):
             original_pages=original_pages,
             full_pages=full_pages,
             raw=raw,
-            short=short,
-            ngram=ngram,
-            short_ref=short_ref,
-            ngram_ref=ngram_ref,
             move=move,
             count=count,
         )
 
     def _verify(self, f, freed):
-        raw = f.pool._raw.cpu()
+        raw = f.pool.raw.cpu()
         current = f.alloc.virtual_to_physical[f.ids].cpu().tolist()
         expected_pairs = set()
         for i, (v, old, new) in enumerate(
@@ -124,10 +104,6 @@ class TestMambaCompaction(CustomTestCase):
                 )
             )
             self.assertEqual(int(f.alloc.physical_to_virtual[new]), v)
-            self.assertTrue(
-                torch.equal(f.short.conv_state[:, new].cpu(), f.short_ref[:, old])
-            )
-            self.assertTrue(torch.equal(f.ngram.context[new].cpu(), f.ngram_ref[old]))
         self.assertTrue(
             torch.equal(raw[: f.spec.entry_bytes()], f.raw[: f.spec.entry_bytes()])
         )
@@ -161,40 +137,32 @@ class TestMambaCompaction(CustomTestCase):
         if device == "cuda":
             torch.cuda.synchronize()
             extra_peak = torch.cuda.max_memory_allocated() - before
-            # Bound this fixture, including its small real PLE siblings. Arbitrary
-            # sibling geometries retain their own gather scratch requirements.
+            # A unit move copies in place: no entry-sized scratch.
             self.assertLess(extra_peak, f.spec.entry_bytes())
         self._verify(f, set(range(holes, 2 * holes)))
         self.assertEqual(sum(c.args[0].numel() for c in f.move.call_args_list), holes)
         self.assertEqual(f.alloc.flush_for_allocation(), 0)
-        # Ordinary COW still copies the real sibling pools after relocation.
+        # Ordinary COW copies whole entries after relocation.
         cow_id = f.alloc.alloc(1).clone()
         dst = f.alloc.virtual_to_physical[cow_id]
         src = f.alloc.virtual_to_physical[f.ids[-1:]]
         f.kv.copy_from(src, dst)
-        for tensor in [
-            *f.kv.mamba_cache.conv,
-            f.kv.mamba_cache.temporal,
-            f.short.conv_state,
-        ]:
+        state_tensors = [*f.kv.mamba_cache.conv, f.kv.mamba_cache.temporal]
+        for tensor in state_tensors:
             self.assertTrue(torch.equal(tensor[:, src], tensor[:, dst]))
-        self.assertTrue(torch.equal(f.ngram.context[src], f.ngram.context[dst]))
-        state_tensors = [
-            *f.kv.mamba_cache.conv,
-            f.kv.mamba_cache.temporal,
-            f.short.conv_state,
-        ]
         sources = [t[:, src].clone() for t in state_tensors]
-        ngram_source = f.ngram.context[src].clone()
         f.kv.clear_slots(dst)
         for tensor, source in zip(state_tensors, sources):
             self.assertEqual(torch.count_nonzero(tensor[:, dst]).item(), 0)
             self.assertTrue(torch.equal(tensor[:, src], source))
-        self.assertEqual(torch.count_nonzero(f.ngram.context[dst]).item(), 0)
-        self.assertTrue(torch.equal(f.ngram.context[src], ngram_source))
-        before_empty = f.pool._raw.clone()
-        f.kv.move_kv_cache(f.ids[:0], f.ids[:0])
-        self.assertTrue(torch.equal(f.pool._raw, before_empty))
+        before_empty = f.pool.raw.clone()
+        f.pool.move_units("mamba", f.ids[:0], f.ids[:0])
+        self.assertTrue(torch.equal(f.pool.raw, before_empty))
+
+    def test_side_states_beside_the_entry_are_refused(self):
+        f = self._fixture("cpu", "down", False, count=4)
+        with self.assertRaisesRegex(ValueError, "whole state in its entry"):
+            f.kv.register_slot_state(object())
 
     def test_cpu_directions_and_move_paths(self):
         for direction in ("up", "down"):
@@ -228,9 +196,9 @@ class TestMambaCompaction(CustomTestCase):
                     # pending before entry; don't count already-fired coverage.
                     torch.cuda._sleep(1_000_000_000)
                     if writer == "write":
-                        host.copy_(f.pool._raw, non_blocking=True)
+                        host.copy_(f.pool.raw, non_blocking=True)
                     else:
-                        f.pool._raw.copy_(host, non_blocking=True)
+                        f.pool.raw.copy_(host, non_blocking=True)
                     done.record()
                 self.assertFalse(done.query())
                 if writer == "forward":
@@ -272,7 +240,7 @@ class TestMambaCompaction(CustomTestCase):
         with torch.cuda.stream(stream):
             torch.cuda._sleep(1_000_000_000)
             for i, p in enumerate(old_sources):
-                observed[i].copy_(f.pool._raw[p * n : (p + 1) * n])
+                observed[i].copy_(f.pool.raw[p * n : (p + 1) * n])
             done.record()
         self.assertFalse(done.query())
         f.alloc.pin_sources = (lambda: True,)
@@ -294,7 +262,7 @@ class TestMambaCompaction(CustomTestCase):
         reused = f.alloc.alloc(1).clone()
         physical = int(f.alloc.virtual_to_physical[reused][0])
         self.assertIn(physical, old_sources)
-        f.pool._raw[physical * n : (physical + 1) * n].fill_(77)
+        f.pool.raw[physical * n : (physical + 1) * n].fill_(77)
         # The recycled virtual ID can be one of the freed IDs; verify only the
         # original survivors and their relocated bytes after overwriting src.
         for i, old in enumerate(f.original_pages):
@@ -303,7 +271,7 @@ class TestMambaCompaction(CustomTestCase):
             current = int(f.alloc.virtual_to_physical[f.ids[i]])
             self.assertTrue(
                 torch.equal(
-                    f.pool._raw[current * n : (current + 1) * n].cpu(),
+                    f.pool.raw[current * n : (current + 1) * n].cpu(),
                     f.raw[old * n : (old + 1) * n],
                 )
             )

@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiEndedAllocator: one allocator per sub-pool over a `UnifiedKVPool`.
+"""MultiEndedAllocator: one allocator per band of a `KVArena`.
 
 `alloc*` run the upstream kernels ONCE in virtual space using `free_virtual_ids`
 as the free-page pointer, then bind consumed virtual pages to physical pages so
@@ -53,11 +53,7 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedKVPool,
-    UnifiedMHATokenToKVPool,
-    UnifiedMLATokenToKVPool,
-)
+from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
@@ -252,7 +248,7 @@ def _full_tokens_before_mamba_recheck(
 
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for one sub-pool over a `UnifiedKVPool`.
+    """Allocator for one band of a `KVArena`.
 
     ``need_sort`` applies to transfer-facing physical ids, not virtual ids.
     Physical free pages are sorted during compaction, and allocation hands out
@@ -272,7 +268,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self,
         *,
         kvcache,
-        unified_buffer: UnifiedKVPool,
+        arena: KVArena,
         sub_pool_name: str,
         device: str,
         is_id_owner: bool,
@@ -283,8 +279,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
-        spec = unified_buffer.spec(sub_pool_name)
-        max_slots = unified_buffer.max_slots(sub_pool_name)
+        band = arena.band(sub_pool_name)
+        max_slots = arena.num_entries(sub_pool_name)
         # DCP shards KV tokens only. Mamba state and the SWA rows are
         # replicated, so they stay slot-granular whatever the process width is.
         self.shards_under_dcp = shards_under_dcp
@@ -292,23 +288,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(
             size=max_slots * dcp_size,
             page_size=page_size * dcp_size,
-            dtype=spec.get_dtype(),
+            # A band hands out units of the arena's bytes.
+            dtype=torch.uint8,
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
         )
-        self.unified_buffer = unified_buffer
+        self.arena = arena
         self.sub_pool_name = sub_pool_name
-        self.spec = spec
         self.max_slots = max_slots
-        self.grow_direction = spec.grow_direction
-        self.entry_bytes = spec.entry_bytes()
-        self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
+        self.grow_direction = band.grow_direction
+        self.entry_bytes = band.entry_bytes
+        self.min_slot_index = arena.first_entry(sub_pool_name)
         self.is_id_owner = is_id_owner
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
-        self._zero_pages_on_alloc = isinstance(
-            kvcache, (UnifiedMHATokenToKVPool, UnifiedMLATokenToKVPool)
-        )
+        self._zero_pages_on_alloc = band.zero_on_handout
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -322,10 +316,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # table -- byte budget, compaction moves, translate -- stays on
         # `pool_page_size`.
         self.pool_page_size = page_size
+        assert band.unit_entries == page_size, (
+            f"band {sub_pool_name!r} moves units of {band.unit_entries} entries, "
+            f"but its allocator pages {page_size}"
+        )
         self.page_size = page_size * dcp_size
         self.num_pages = max_slots // self.pool_page_size
         # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
-        # reserved sink floor covered (see `_reserved_floor_bytes`).
+        # padding sink covered (see `KVStoragePlan.sink_bytes`).
         self.min_page_index = (
             self.min_slot_index + self.pool_page_size - 1
         ) // self.pool_page_size
@@ -586,7 +584,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Per-sub-pool conservation strings; empty == healthy. Idle-time
         diagnostic -- pure host arithmetic."""
         out: List[str] = []
-        total = self.unified_buffer.total_bytes
+        total = self.arena.total_bytes
         lo_b, hi_b = self._byte_low_frontier(), self._byte_high_frontier()
         if not (0 <= lo_b <= hi_b <= total):
             out.append(
@@ -651,7 +649,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         while p is not None and p._is_frontier_transparent():
             p = p.high_peer
         if p is None:
-            return self.unified_buffer.total_bytes
+            return self.arena.total_bytes
         return p._byte_low_frontier()
 
     def _chain_high_frontier_below_bytes(self) -> int:
@@ -1046,7 +1044,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
             return
         with record_function("MultiEndedAlloc._maybe_zero_pages"):
-            self._kvcache.zero_physical_pages(phys_pages)
+            self.arena.zero_units(self.sub_pool_name, phys_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
@@ -1514,12 +1512,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # this returns. Callers pass disjoint src/dst sets, so no launch reads
         # a page another launch writes.
         for start in range(0, src_pages.numel(), self._move_max_pages):
-            # Un-translated copy: the public copy_from translates virtual ids,
-            # which we must NOT do here.
-            self._kvcache.move_physical_pages(
+            self.arena.move_units(
+                self.sub_pool_name,
                 dst_pages[start : start + self._move_max_pages],
                 src_pages[start : start + self._move_max_pages],
-                self.pool_page_size,
             )
 
     def prewarm_compaction(self) -> None:
@@ -2694,7 +2690,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     def _byte_accounting_violations(self) -> List[str]:
         out: List[str] = []
-        total = self.unified_buffer.total_bytes
+        total = self.arena.total_bytes
         lo_b, hi_b = self._byte_low_frontier(), self._byte_high_frontier()
         if not self._is_frontier_transparent() and not (0 <= lo_b <= hi_b <= total):
             out.append(

@@ -666,18 +666,18 @@ class _TokenEndsPolicy(_WindowPolicy):
 
     def resize(self, c: ChainAllocator, config) -> None:
         """Synchronize allocator capacity after the shared pool is finalized."""
-        if not c.unified_buffer.post_capture_active:
+        if not c.arena.backed_after_capture:
             raise RuntimeError("ChainAllocator.resize requires post-capture backing")
         final_pool_bytes = config.unified_memory_pool_bytes
         if final_pool_bytes is None:
             raise ValueError(
                 "ChainAllocator.resize requires config.unified_memory_pool_bytes"
             )
-        if int(final_pool_bytes) != c.unified_buffer.total_bytes:
+        if int(final_pool_bytes) != c.arena.total_bytes:
             raise RuntimeError(
-                "UnifiedKVPool.finalize_backing must run before allocator.resize: "
+                "the arena must be backed before allocator.resize: "
                 f"config has {int(final_pool_bytes)} bytes but the pool exposes "
-                f"{c.unified_buffer.total_bytes} bytes"
+                f"{c.arena.total_bytes} bytes"
             )
         fa, sa = c.full_attn_allocator, c.swa_attn_allocator
         for allocator in (fa, sa):
@@ -686,9 +686,9 @@ class _TokenEndsPolicy(_WindowPolicy):
                     f"cannot resize non-empty unified allocator "
                     f"{allocator.sub_pool_name!r}"
                 )
-        fa._set_capacity(c.unified_buffer.max_slots(fa.sub_pool_name))
+        fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
         sa._set_capacity(
-            c.unified_buffer.max_slots(sa.sub_pool_name),
+            c.arena.num_entries(sa.sub_pool_name),
             virtual_num_pages=fa.num_virtual_ids,
         )
         self._empty_shared_gap_bytes = fa._current_gap_bytes()
@@ -708,10 +708,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             pool._num_pages = allocator.num_pages
             pool.size = allocator.num_pages * c.page_size - c.page_size
             pool.host_capacity_tokens = host_capacity
-            pool.host_capacity_bytes = (
-                host_capacity
-                * c.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
-            )
+            pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
 
 
 class _FloatChainPolicy(_WindowPolicy):

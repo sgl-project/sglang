@@ -59,7 +59,6 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -68,7 +67,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    plan_stand_in,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=35, stage="weekly", runner_config="cpu")
 maybe_stub_sgl_kernel()
@@ -80,9 +83,20 @@ from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
 
 
 class _FakeKVCache:
-    def __init__(self, max_slots):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+    def __init__(self, source, name=None):
+        # A bare size for a private pool; else the band of ``source`` (a test
+        # arena) whose unit moves this buffer follows.
+        size = source if name is None else source.num_entries(name)
+        if name is not None:
+            source.follow(name, self)
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
         self.allocator = None
+
+    def move_units(self, dst_pages, src_pages, page_size):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
+        self.buf[dst_loc] = self.buf[src_loc].clone()
 
     def attach_allocator(self, allocator):
         self.allocator = allocator
@@ -90,8 +104,8 @@ class _FakeKVCache:
 
 class _FakeUnifiedSWAKVPool:
     def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool.max_slots("full"))
-        self.swa_kv_pool = _FakeKVCache(shared_pool.max_slots("swa"))
+        self.full_kv_pool = _FakeKVCache(shared_pool, "full")
+        self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
         self.full_to_swa_index_mapping = None
 
     def attach_allocators(self, *, full_allocator, swa_allocator):
@@ -201,23 +215,22 @@ class TestDraftBindingDispatch(CustomTestCase):
             draft_region=region if host == "swa" else None,
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-        pool = UnifiedKVPool(
+        placement = (
+            FusedDraftPlacement.from_counts(counts={host: [1]}, regions={host: region})
+            if region is not None
+            else None
+        )
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device="cpu",
             enable_memory_saver=False,
             page_size=_PS,
-            fused_draft=(
-                FusedDraftPlacement.from_counts(
-                    counts={host: [1]}, regions={host: region}
-                )
-                if region is not None
-                else None
-            ),
+            fused_draft=placement,
         )
-        return ChainAllocator(
+        alloc = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
             views=stand_in_views(
                 ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
@@ -229,6 +242,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             need_sort=False,
             forward_stream=None,
         )
+        # The target's KV storage, as far as draft binding reads it.
+        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        return alloc
 
     def _run(
         self,

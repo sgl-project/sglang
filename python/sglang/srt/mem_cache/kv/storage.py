@@ -87,6 +87,11 @@ class KVStorage:
         self._sub_pools = tuple(sub_pools)
 
     @property
+    def plan(self) -> KVStoragePlan:
+        """The plan this storage was built from (read-only)."""
+        return self._plan
+
+    @property
     def owner(self) -> str:
         """The sub-pool that owns the token id space: the anchor of host
         stacks, and the transfer's KV entries."""

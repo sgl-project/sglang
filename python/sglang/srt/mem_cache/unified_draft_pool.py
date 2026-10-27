@@ -12,6 +12,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.memory.arena import KVArena
+from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -23,7 +27,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     draft_swa_layer_ids,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool, MHATokenToKVPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
@@ -44,12 +47,15 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
     def __init__(
         self,
         *,
-        unified_buffer: UnifiedKVPool,
-        host_sub_pool_name: str,
+        arena: KVArena,
+        host_spec: SubPoolSpec,
         layer_lanes: Mapping[int, int],
         page_size: int = 1,
     ):
-        region = unified_buffer.require_draft_host_spec(host_sub_pool_name).draft_region
+        region = host_spec.draft_region
+        assert region is not None, (
+            f"sub-pool {host_spec.name!r} carries no fused draft region"
+        )
         layer_ids = sorted(layer_lanes)
         assert layer_ids, "UnifiedDraftKVPool binds at least one layer"
         start_layer = layer_ids[0]
@@ -60,11 +66,11 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         assert len(set(lanes)) == len(lanes) and all(
             0 <= s < region.lane_num for s in lanes
         ), f"draft lanes {lanes} must be distinct and within range({region.lane_num})"
-        k_views, v_views = unified_buffer.build_dense_draft_views(host_sub_pool_name)
-        max_slots = unified_buffer.max_slots(host_sub_pool_name)
+        k_views, v_views = host_spec.draft_views(arena)
+        max_slots = arena.extent_entries(host_spec.name)
 
-        self._unified_buffer = unified_buffer
-        self._host_sub_pool_name = host_sub_pool_name
+        self._arena = arena
+        self._host_sub_pool_name = host_spec.name
         self.layer_lanes: Dict[int, int] = dict(layer_lanes)
         self._k_views: List[torch.Tensor] = [k_views[s] for s in lanes]
         self._v_views: List[torch.Tensor] = [v_views[s] for s in lanes]
@@ -79,8 +85,8 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
             head_num=region.head_num,
             head_dim=region.head_dim,
             layer_num=len(layer_ids),
-            device=unified_buffer.device,
-            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            device=arena.device,
+            enable_memory_saver=False,  # the arena owns the bytes
             v_head_dim=region.resolved_v_head_dim(),
             start_layer=start_layer,
             end_layer=start_layer + len(layer_ids) - 1,
@@ -93,10 +99,10 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         self.v_buffer = self._v_views
 
     def _clear_buffers(self):
-        pass  # lifetime owned by UnifiedKVPool
+        pass  # the arena owns the bytes
 
     def get_kv_size_bytes(self):
-        return 0, 0  # fused into the host entries; UnifiedKVPool logs the total
+        return 0, 0  # fused into the host entries; the arena logs the total
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError(
@@ -128,14 +134,13 @@ class UnifiedDraftMambaPool(MambaPool):
     def __init__(
         self,
         *,
-        unified_buffer: UnifiedKVPool,
-        sub_pool_name: str,
+        arena: KVArena,
+        spec: MambaSubPoolSpec,
         layer_lanes: Mapping[int, int],
     ):
-        spec = unified_buffer.mamba_spec(sub_pool_name)
         region = spec.draft_region
         assert isinstance(region, DraftStateRegion), (
-            f"UnifiedDraftMambaPool: sub-pool {sub_pool_name!r} carries no fused "
+            f"UnifiedDraftMambaPool: sub-pool {spec.name!r} carries no fused "
             "draft state region"
         )
         layer_ids = sorted(layer_lanes)
@@ -150,19 +155,17 @@ class UnifiedDraftMambaPool(MambaPool):
             f"draft state lanes {lanes} must be a contiguous range within "
             f"{region.lane_num}"
         )
-        conv_views, temporal_view = unified_buffer.build_draft_state_views(
-            sub_pool_name
-        )
+        conv_views, temporal_view = spec.draft_views(arena)
         stop = start + len(lanes)
 
-        self._unified_buffer = unified_buffer
-        self._sub_pool_name = sub_pool_name
+        self._arena = arena
+        self._sub_pool_name = spec.name
         self.layer_lanes: Dict[int, int] = dict(layer_lanes)
         self.mamba_layer_ids = layer_ids
         self.num_mamba_layers = len(layer_ids)
-        self._max_size = unified_buffer.max_slots(sub_pool_name) - 1
+        self._max_size = arena.extent_entries(spec.name) - 1
         self.size = self._max_size
-        self.device = unified_buffer.device
+        self.device = arena.device
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
@@ -267,13 +270,14 @@ class FusedDraftBinding(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class BindContext(msgspec.Struct, frozen=True, kw_only=True):
-    """One runner's inputs to every binder: the target's buffer, the name of
-    its owner sub-pool (whose ids the batch's write locs carry), and its
-    recurrent state."""
+    """One runner's inputs to every binder: the target's arena and plan, the
+    name of its owner sub-pool (whose ids the batch's write locs carry), and
+    its recurrent state."""
 
     placement: FusedDraftPlacement
     runner: int
-    unified_buffer: Any
+    arena: Any  # KVArena
+    plan: Any  # KVStoragePlan
     owner: str
     target_state: Optional[StateStorage]
     model: Any
@@ -307,7 +311,8 @@ def bind_fused_draft(
     *,
     placement: FusedDraftPlacement,
     runner: int,
-    unified_buffer: UnifiedKVPool,
+    arena: KVArena,
+    plan: KVStoragePlan,
     owner: str,
     target_state: Optional[StateStorage],
     model,
@@ -321,7 +326,8 @@ def bind_fused_draft(
     ctx = BindContext(
         placement=placement,
         runner=runner,
-        unified_buffer=unified_buffer,
+        arena=arena,
+        plan=plan,
         owner=owner,
         target_state=target_state,
         model=model,
@@ -383,14 +389,15 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
     )
     if hosts == (ctx.owner,):
         pool = UnifiedDraftKVPool(
-            unified_buffer=ctx.unified_buffer,
-            host_sub_pool_name=ctx.owner,
+            arena=ctx.arena,
+            host_spec=ctx.plan.sub_pool(ctx.owner).spec,
             layer_lanes=dict(zip(layers_by_host[ctx.owner], lanes_by_host[ctx.owner])),
             page_size=ctx.page_size,
         )
         return msgspec.structs.replace(binding, token_to_kv_pool=pool)
     pool = routed_draft_pool(
-        unified_buffer=ctx.unified_buffer,
+        arena=ctx.arena,
+        plan=ctx.plan,
         owner=ctx.owner,
         page_size=ctx.page_size,
         lanes_by_host={
@@ -402,7 +409,8 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
 
 def routed_draft_pool(
     *,
-    unified_buffer: UnifiedKVPool,
+    arena: KVArena,
+    plan: KVStoragePlan,
     owner: str,
     page_size: int,
     lanes_by_host: Mapping[str, Mapping[int, int]],
@@ -416,8 +424,8 @@ def routed_draft_pool(
     for host, layer_lanes in lanes_by_host.items():
         layer_ids = sorted(layer_lanes)
         view = UnifiedDraftKVPool(
-            unified_buffer=unified_buffer,
-            host_sub_pool_name=host,
+            arena=arena,
+            host_spec=plan.sub_pool(host).spec,
             layer_lanes={
                 idx: layer_lanes[layer_id] for idx, layer_id in enumerate(layer_ids)
             },
@@ -429,13 +437,13 @@ def routed_draft_pool(
     layer_ids = [layer_id for _, _, indices in layer_maps for layer_id in indices]
     lead = layer_maps[0][1]
     return RoutedKVCache(
-        unified_buffer=unified_buffer,
+        arena=arena,
         owner=owner,
         layer_maps=layer_maps,
         page_size=page_size,
         start_layer=min(layer_ids),
         end_layer=max(layer_ids),
-        size=unified_buffer.max_slots(owner) - 1,
+        size=arena.num_entries(owner) - 1,
         head_num=lead.head_num,
         head_dim=lead.head_dim,
     )
@@ -459,7 +467,8 @@ def _runner_state_layer_ids(ctx: BindContext) -> Tuple[int, ...]:
 def fused_draft_state(
     *,
     target: StateStorage,
-    unified_buffer: UnifiedKVPool,
+    arena: KVArena,
+    spec: MambaSubPoolSpec,
     layer_lanes: Mapping[int, int],
 ) -> StateStorage:
     """A draft runner's recurrent state over the draft block fused into the
@@ -468,8 +477,8 @@ def fused_draft_state(
     return StateStorage(
         sub_pool=target.sub_pool,
         pool=UnifiedDraftMambaPool(
-            unified_buffer=unified_buffer,
-            sub_pool_name=target.sub_pool,
+            arena=arena,
+            spec=spec,
             layer_lanes=layer_lanes,
         ),
         slots=target.slots,
@@ -497,7 +506,8 @@ def _bind_state(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
     )
     state = fused_draft_state(
         target=target,
-        unified_buffer=ctx.unified_buffer,
+        arena=ctx.arena,
+        spec=ctx.plan.sub_pool(target.sub_pool).spec,
         layer_lanes=dict(zip(layer_ids, lanes)),
     )
     return msgspec.structs.replace(binding, state=state)

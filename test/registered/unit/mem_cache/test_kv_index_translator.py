@@ -23,7 +23,7 @@ Triton kernel.
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,7 +65,7 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     )
     n_full, n_swa = n_full_pages * ps, n_swa_pages * ps
     total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -76,7 +75,7 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     kvcache = _FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kvcache,
         views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
@@ -507,7 +506,7 @@ class TestWriteIds(CustomTestCase):
                 self.subTest(dcp_size=dcp_size),
                 get_parallel().override(attn_dcp_size=dcp_size),
             ):
-                pool = UnifiedKVPool(
+                pool = arena_of(
                     total_bytes=2048,
                     sub_pool_specs=[
                         MHASubPoolSpec(
@@ -534,21 +533,21 @@ class TestWriteIds(CustomTestCase):
                 )
                 allocator = ChainAllocator(
                     roles=ChainRoles(owner="full", state="mamba"),
-                    unified_buffer=pool,
+                    arena=pool,
                     kvcache=SimpleNamespace(
-                        full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                        mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                        full_kv_pool=_FakeKVCache(pool, "full"),
+                        mamba_pool=_FakeKVCache(pool, "mamba"),
                     ),
                     views=stand_in_views(
                         ChainRoles(owner="full", state="mamba"),
                         SimpleNamespace(
-                            full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                            mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                            full_kv_pool=_FakeKVCache(pool, "full"),
+                            mamba_pool=_FakeKVCache(pool, "mamba"),
                         ),
                         (
                             SimpleNamespace(
-                                full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                                mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                                full_kv_pool=_FakeKVCache(pool, "full"),
+                                mamba_pool=_FakeKVCache(pool, "mamba"),
                             )
                         ).mamba_pool,
                     ),

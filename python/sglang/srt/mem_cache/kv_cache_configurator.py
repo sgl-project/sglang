@@ -248,10 +248,8 @@ def _pp_local_per_request_bytes(
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        UnifiedKVPool,
-        UnifiedPoolBundle,
-    )
+    from sglang.srt.mem_cache.kv.memory.arena import KVArena
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedPoolBundle
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
     )
@@ -272,14 +270,14 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
-    unified_memory_pool: Optional[UnifiedKVPool] = None
+    arena: Optional[KVArena] = None
 
 
 class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    unified_memory_pool: Optional[UnifiedKVPool] = None
+    arena: Optional[KVArena] = None
     # The recurrent state the KV pool's router routes, when the model has it.
     state: Optional[StateStorage] = None
 
@@ -528,7 +526,7 @@ class KVCacheConfigurator:
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
             memory_pool_config=config,
-            unified_memory_pool=pools.unified_memory_pool,
+            arena=pools.arena,
         )
 
     # Note(kpham-sgl):
@@ -633,7 +631,7 @@ class KVCacheConfigurator:
                 req_to_token_pool=bundle.req_to_token_pool,
                 token_to_kv_pool=bundle.token_to_kv_pool,
                 token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
-                unified_memory_pool=bundle.unified_memory_pool,
+                arena=bundle.arena,
                 state=bundle.token_to_kv_pool_allocator.state,
             )
 
@@ -668,7 +666,8 @@ class KVCacheConfigurator:
                     binding = bind_fused_draft(
                         placement=placement,
                         runner=runner,
-                        unified_buffer=alloc.unified_buffer,
+                        arena=alloc.arena,
+                        plan=alloc.storage.plan,
                         owner=alloc.roles.owner,
                         target_state=alloc.state,
                         model=self.model,
@@ -680,7 +679,7 @@ class KVCacheConfigurator:
                         req_to_token_pool=binding.req_to_token_pool,
                         token_to_kv_pool=binding.token_to_kv_pool,
                         token_to_kv_pool_allocator=alloc,
-                        unified_memory_pool=None,
+                        arena=None,
                         state=binding.state,
                     )
                 draft_virtual_id_space = alloc.draft_virtual_id_space
@@ -824,7 +823,7 @@ class KVCacheConfigurator:
             self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
             return None
-        placement = alloc.unified_buffer.fused_draft
+        placement = alloc.storage.plan.fused_draft
         if placement is None:
             logger.info(
                 "[unified-memory-pool] no fused draft placement on the target's "
@@ -1053,7 +1052,7 @@ class KVCacheConfigurator:
         if req_to_token_pool is None:
             return bundle
         return UnifiedPoolBundle(
-            unified_memory_pool=bundle.unified_memory_pool,
+            arena=bundle.arena,
             token_to_kv_pool=bundle.token_to_kv_pool,
             token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
             req_to_token_pool=req_to_token_pool,

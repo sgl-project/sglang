@@ -7,12 +7,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
+    arena_of,
     stand_in_views,
     tri_sub_pool_specs,
 )
@@ -29,7 +29,7 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         head_dim=8,
     )
     total = (fs.entry_bytes() + ss.entry_bytes()) * ps * 32 + ms.entry_bytes() * 9
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[fs, ss, ms],
         device="cpu",
@@ -37,10 +37,10 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         page_size=ps,
     )
     kv = FakeUnifiedSWAKVPool(pool)
-    mk = FakeKVCache(pool.max_slots("mamba"))
+    mk = FakeKVCache(pool, "mamba")
     a = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa", state="mamba"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kv,
         views=stand_in_views(
             ChainRoles(owner="full", window="swa", state="mamba"), kv, mk
@@ -156,9 +156,7 @@ class TestFloatMovementGate(CustomTestCase):
                         wraps=sa._settle_inflight_forward,
                     ) as settle,
                     patch.object(
-                        kv.swa_kv_pool,
-                        "move_physical_pages",
-                        wraps=kv.swa_kv_pool.move_physical_pages,
+                        a.arena, "move_units", wraps=a.arena.move_units
                     ) as copies,
                 ):
                     if method == "make_room":
@@ -175,9 +173,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.assertEqual(snapshot(a), before)
                 sa.pin_sources = ()
                 with patch.object(
-                    kv.swa_kv_pool,
-                    "move_physical_pages",
-                    wraps=kv.swa_kv_pool.move_physical_pages,
+                    a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
                     if method == "make_room":
                         self.assertGreaterEqual(
@@ -201,9 +197,7 @@ class TestFloatMovementGate(CustomTestCase):
                 a, kv, mk = build_geometry(1, ratio, True, pattern, True)
                 saved = payload(a, kv, mk)
                 with patch.object(
-                    kv.swa_kv_pool,
-                    "move_physical_pages",
-                    wraps=kv.swa_kv_pool.move_physical_pages,
+                    a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
                     a.ensure_capacity(demand, demand)
                     got = a.alloc(demand)
@@ -217,11 +211,7 @@ class TestFloatMovementGate(CustomTestCase):
                     self.check_saved(a, saved)
         a, kv, mk = build_geometry(1, (1, 1), True, "paired", True)
         saved = payload(a, kv, mk)
-        with patch.object(
-            kv.swa_kv_pool,
-            "move_physical_pages",
-            wraps=kv.swa_kv_pool.move_physical_pages,
-        ) as copies:
+        with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
             self.assertIsNotNone(a.alloc(2))
         self.assertEqual(copies.call_count, 0)
         self.check_saved(a, saved)
@@ -233,20 +223,12 @@ class TestFloatMovementGate(CustomTestCase):
         saved = payload(a, kv, mk)
         demand = ma.available_size() + 1
         sa.pin_sources = (lambda: True,)
-        with patch.object(
-            kv.swa_kv_pool,
-            "move_physical_pages",
-            wraps=kv.swa_kv_pool.move_physical_pages,
-        ) as copies:
+        with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
             self.assertIsNone(ma.alloc(demand))
         self.assertEqual(copies.call_count, 0)
         self.check_saved(a, saved)
         sa.pin_sources = ()
-        with patch.object(
-            kv.swa_kv_pool,
-            "move_physical_pages",
-            wraps=kv.swa_kv_pool.move_physical_pages,
-        ) as copies:
+        with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
             self.assertIsNotNone(ma.alloc(demand))
         self.assertGreater(copies.call_count, 0)
         self.check_saved(a, saved)

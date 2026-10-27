@@ -170,15 +170,17 @@ def _recorded_stream():
 
 def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
-    for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-        kvcache = side._kvcache
-        move = kvcache.move_physical_pages
+    arena = allocator.arena
+    move = arena.move_units
+    sides = {allocator.full_attn_allocator.sub_pool_name}
+    sides.add(allocator.swa_attn_allocator.sub_pool_name)
 
-        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
+    def recorded(name, dst, src):
+        if name in sides:
             log.append(("move", name))
-            return move(dst, src, page_size)
+        return move(name, dst, src)
 
-        kvcache.move_physical_pages = recorded
+    arena.move_units = recorded
 
 
 class _ConfigCase(unittest.TestCase):

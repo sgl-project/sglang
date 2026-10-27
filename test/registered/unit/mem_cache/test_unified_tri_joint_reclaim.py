@@ -1084,9 +1084,7 @@ class TestTriGeometry(CustomTestCase):
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
                 )
                 with patch.object(
-                    kv.swa_kv_pool,
-                    "move_physical_pages",
-                    wraps=kv.swa_kv_pool.move_physical_pages,
+                    a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
                     self.assertFalse(a.ensure_capacity(5, 5))
                 self.assertEqual(copies.call_count, 0)

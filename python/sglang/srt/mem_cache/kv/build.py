@@ -1,7 +1,7 @@
 """Build the unified KV pool stack from declarations: plan, size, then construct.
 
-`build_unified_pools` is the one entry point. Every plan gets one byte
-buffer, a view per sub-pool, one `RoutedKVCache` over the token views and one
+`build_unified_pools` is the one entry point. Every plan gets one arena of
+bytes, a view per sub-pool, one `RoutedKVCache` over the token views and one
 `ChainAllocator` over all of them.
 """
 
@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
     PlannedSubPool,
@@ -36,9 +37,7 @@ from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
-    GB,
     UnifiedHybridReqToTokenPool,
-    UnifiedKVPool,
     UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
@@ -105,7 +104,7 @@ def _build_state_request_table(
 
 
 def _build_state_storage(
-    plan: KVStoragePlan, shared_pool: UnifiedKVPool, ctx: UnifiedBuildContext
+    plan: KVStoragePlan, arena: KVArena, ctx: UnifiedBuildContext
 ) -> StateStorage:
     """The state sub-pool's storage, without its slots: those come from the
     chain allocator's state band (`_wire_mamba_slot_allocator`). The PLE side
@@ -119,8 +118,8 @@ def _build_state_storage(
     return StateStorage(
         sub_pool=state.name,
         pool=UnifiedMambaPool(
-            unified_buffer=shared_pool,
-            sub_pool_name=state.name,
+            arena=arena,
+            spec=state.spec,
             spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates
             mamba_layer_ids=layer_ids,
             enable_memory_saver=ctx.enable_memory_saver,
@@ -141,7 +140,7 @@ def _build_state_storage(
 
 def _build_token_view(
     sub_pool: PlannedSubPool,
-    shared_pool: UnifiedKVPool,
+    arena: KVArena,
     plan: KVStoragePlan,
     ctx: UnifiedBuildContext,
 ):
@@ -149,14 +148,14 @@ def _build_token_view(
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
         return UnifiedMLATokenToKVPool(
-            unified_buffer=shared_pool,
-            sub_pool_name=sub_pool.name,
+            arena=arena,
+            spec=sub_pool.spec,
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
             page_size=plan.page_size,
         )
     return UnifiedMHATokenToKVPool(
-        unified_buffer=shared_pool,
-        sub_pool_name=sub_pool.name,
+        arena=arena,
+        spec=sub_pool.spec,
         page_size=plan.page_size,
         start_layer=ctx.start_layer,
         end_layer=ctx.end_layer,
@@ -184,22 +183,24 @@ def build_kv_storage(
             "--enable-unified-memory has no pool stack for sub-pools "
             f"{[s.name for s in plan.sub_pools]}"
         )
-    shared_pool = UnifiedKVPool(
+    for s in plan.sub_pools:
+        expected = None if plan.fused_draft is None else plan.fused_draft.region(s.name)
+        assert s.spec.draft_region is expected, (
+            f"sub-pool {s.name!r}: draft_region {s.spec.draft_region} does not "
+            f"match the fused draft placement's {expected}"
+        )
+    arena = KVArena(
+        bands=plan_bands(plan),
         total_bytes=sized.total_bytes,
-        sub_pool_specs=plan.specs(),
+        sink_bytes=plan.sink_bytes(),
         device=ctx.device,
         enable_memory_saver=ctx.enable_memory_saver,
-        page_size=plan.page_size,
-        post_capture_active=(
+        backed_after_capture=(
             ctx.post_capture_active and resized_after_capture(plan.lifetime_types())
         ),
-        bs1_floor_terms=list(sized.bs1_floor_terms),
-        fused_draft=plan.fused_draft,
     )
     token_sub_pools = [s for s in plan.owner_first() if s is not state]
-    views = {
-        s.name: _build_token_view(s, shared_pool, plan, ctx) for s in token_sub_pools
-    }
+    views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
     for s in token_sub_pools:
         # Only the pool routing a layer knows its model id.
         if isinstance(views[s.name], UnifiedMHATokenToKVPool):
@@ -208,12 +209,12 @@ def build_kv_storage(
     # the owner is the only token sub-pool, else its slots (until sizing
     # follows one rule for every chain).
     kv_size = (
-        sizing.full_tokens if window is None else shared_pool.max_slots(owner.name) - 1
+        sizing.full_tokens if window is None else arena.num_entries(owner.name) - 1
     )
     owner_spec = owner.spec
     owner_is_mha = isinstance(owner_spec, MHASubPoolSpec)
     token_to_kv_pool = RoutedKVCache(
-        unified_buffer=shared_pool,
+        arena=arena,
         owner=owner.name,
         layer_maps=[
             (
@@ -230,12 +231,13 @@ def build_kv_storage(
         # An MHA owner's heads; an MLA latent records the model's.
         head_num=owner_spec.head_num if owner_is_mha else ctx.head_num,
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
+        bs1_floor_terms=sized.bs1_floor_terms,
     )
     req_to_token_pool = None
     state_storage = None
     if state is not None:
         req_to_token_pool = _build_state_request_table(plan, ctx)
-        state_storage = _build_state_storage(plan, shared_pool, ctx)
+        state_storage = _build_state_storage(plan, arena, ctx)
         views[state.name] = state_storage.pool
     legacy_capacities = {}
     if window is not None and (sizing.token_budget_bytes is None or state is not None):
@@ -244,7 +246,7 @@ def build_kv_storage(
             "swa_max_total_num_tokens": sizing.window_tokens,
         }
     allocator = ChainAllocator(
-        unified_buffer=shared_pool,
+        arena=arena,
         roles=ChainRoles(
             owner=owner.name,
             window=None if window is None else window.name,
@@ -306,7 +308,7 @@ def build_kv_storage(
         ),
     )
     return UnifiedPoolBundle(
-        unified_memory_pool=shared_pool,
+        arena=arena,
         token_to_kv_pool=token_to_kv_pool,
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=req_to_token_pool,

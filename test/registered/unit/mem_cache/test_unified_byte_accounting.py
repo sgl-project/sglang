@@ -140,7 +140,7 @@ class TestChainFrontierOrder(unittest.TestCase):
         up, down = chain
         self.assertEqual(up.grow_direction, "up")
         self.assertIsNotNone(down.alloc(down.page_size * 2))  # down side live
-        self.assertLess(down._byte_low_frontier(), up.unified_buffer.total_bytes)
+        self.assertLess(down._byte_low_frontier(), up.arena.total_bytes)
         up.watermark_physical = up.num_pages  # up band swallows the buffer
         out = mea._chain_byte_accounting_violations(chain)
         self.assertTrue(any("overlap" in s for s in out), out)

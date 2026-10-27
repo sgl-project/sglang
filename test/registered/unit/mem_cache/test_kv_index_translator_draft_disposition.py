@@ -42,11 +42,14 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     routed_draft_pool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    plan_stand_in,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -58,9 +61,20 @@ class _FakeKVCache:
     # A private pool, indexed by the allocator's ids as they are.
     requires_physical_write_loc = False
 
-    def __init__(self, max_slots):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+    def __init__(self, source, name=None):
+        # A bare size for a private pool; else the band of ``source`` (a test
+        # arena) whose unit moves this buffer follows.
+        size = source if name is None else source.num_entries(name)
+        if name is not None:
+            source.follow(name, self)
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
         self.allocator = None
+
+    def move_units(self, dst_pages, src_pages, page_size):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
+        self.buf[dst_loc] = self.buf[src_loc].clone()
 
     def id_spaces(self):
         return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
@@ -74,8 +88,8 @@ class _FakeKVCache:
 
 class _FakeUnifiedSWAKVPool:
     def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool.max_slots("full"))
-        self.swa_kv_pool = _FakeKVCache(shared_pool.max_slots("swa"))
+        self.full_kv_pool = _FakeKVCache(shared_pool, "full")
+        self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
         self.full_to_swa_index_mapping = None
 
     def attach_allocators(self, *, full_allocator, swa_allocator):
@@ -110,7 +124,7 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
     if swa_region is not None:
         counts["swa"] = [1]
         regions["swa"] = swa_region
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -121,7 +135,7 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
     kvcache = _FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kvcache,
         views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
@@ -132,8 +146,8 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         forward_stream=None,
     )
     draft_pool = UnifiedDraftKVPool(
-        unified_buffer=pool,
-        host_sub_pool_name="full",
+        arena=pool,
+        host_spec=pool.spec("full"),
         layer_lanes={0: 0},
         page_size=_PS,
     )
@@ -188,7 +202,8 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         )
         pool, allocator, kvcache, _ = _build(swa_region=swa_region)
         composite = routed_draft_pool(
-            unified_buffer=pool,
+            arena=pool,
+            plan=plan_stand_in(pool),
             owner="full",
             page_size=_PS,
             lanes_by_host={"full": {0: 0}, "swa": {1: 0}},
@@ -241,7 +256,8 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         )
         pool, allocator, kvcache, dense_pool = _build(swa_region=swa_region)
         window_pool = routed_draft_pool(
-            unified_buffer=pool,
+            arena=pool,
+            plan=plan_stand_in(pool),
             owner="full",
             page_size=_PS,
             lanes_by_host={"swa": {1: 0}},

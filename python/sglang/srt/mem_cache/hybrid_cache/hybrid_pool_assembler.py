@@ -2066,7 +2066,7 @@ def validate_fused_hicache_draft(
             "the fused draft bytes."
         )
     target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._unified_buffer is not target._unified_buffer:
+    if draft_device_pools[0]._arena is not target._arena:
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 

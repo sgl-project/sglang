@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -422,12 +422,10 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     def _swa_composite(self, lazy=True, ps=None):
         from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-
         full = _make_mha_spec("full", "up", layer_num=4)
         swa = _make_mha_spec("swa", "down", layer_num=2)
         total = 64 * full.entry_bytes() + 64 * swa.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device="cpu",
@@ -437,15 +435,15 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
 
         class _KV:
             def __init__(self, p):
-                self.full_kv_pool = _FakeKVCache(p.max_slots("full"))
-                self.swa_kv_pool = _FakeKVCache(p.max_slots("swa"))
+                self.full_kv_pool = _FakeKVCache(p, "full")
+                self.swa_kv_pool = _FakeKVCache(p, "swa")
 
             def attach_allocators(self, **kwargs):
                 pass
 
         return chain.ChainAllocator(
             roles=chain.ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_KV(pool),
             views=stand_in_views(
                 chain.ChainRoles(owner="full", window="swa"), _KV(pool)

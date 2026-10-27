@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
+    arena_of,
     chain_snapshot,
     stand_in_views,
     token_ends,
@@ -53,7 +54,6 @@ from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedKVPool,
     UnifiedMambaSlotAllocator,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -96,14 +96,21 @@ class _FakeKVCache:
     """Tracks, per physical slot, the virtual id whose data lives there, so a
     test can assert the data followed a compaction move."""
 
-    def __init__(self, max_slots: int):
+    def __init__(self, source, name=None):
+        # A bare size for a pool no arena moves; else the band of ``source``
+        # (a test arena) whose unit moves this buffer follows.
+        if name is None:
+            size = source
+        else:
+            size = source.num_entries(name)
+            source.follow(name, self)
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
 
     def id_spaces(self):
         return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
-    def move_physical_pages(
+    def move_units(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
     ):
         slots = torch.arange(page_size, device=dst_pages.device)
@@ -142,35 +149,35 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         entry_max = max(full.entry_bytes(), mamba.entry_bytes())
         total = full.entry_bytes() * 64 + mamba.entry_bytes() * 16
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
         for s in (full, mamba):
-            min_idx = pool.min_slot_index(s.name)
+            min_idx = pool.first_entry(s.name)
             # real data of every pool begins at bytes >= entry_max
             self.assertGreaterEqual(min_idx * s.entry_bytes(), entry_max)
-            self.assertGreater(pool.max_slots(s.name), min_idx)
+            self.assertGreater(pool.num_entries(s.name), min_idx)
 
     def test_mha_view_roundtrip(self):
         full = _make_mha_spec("full", "up", layer_num=3, head_num=2, head_dim=4)
         swa = _make_mha_spec("swa", "down", layer_num=2, head_num=2, head_dim=4)
         total = full.entry_bytes() * 32 + swa.entry_bytes() * 32
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device=_DEV,
             enable_memory_saver=False,
         )
-        k_full, v_full = pool.mha_views_for("full")
-        k_swa, v_swa = pool.mha_views_for("swa")
+        k_full, v_full = pool.spec("full").views(pool)
+        k_swa, v_swa = pool.spec("swa").views(pool)
         self.assertEqual(len(k_full), 3)
         self.assertEqual(len(k_swa), 2)
         # "full" and "swa" share the buffer from byte 0 and grow toward each
         # other, so a low "swa" slot would byte-overlap "full" slot 5.
-        swa_slot = pool.max_slots("swa") - 1
+        swa_slot = pool.num_entries("swa") - 1
         for lyr in range(3):
             k_full[lyr][5] = float(lyr + 1)
             v_full[lyr][5] = float(-(lyr + 1))
@@ -188,14 +195,14 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=3)
         total = full.entry_bytes() * 16 + mamba.entry_bytes() * 8
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
-        max_slots = pool.max_slots("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
+        max_slots = pool.num_entries("mamba")
         self.assertEqual(len(conv_views), 1)
         self.assertEqual(tuple(conv_views[0].shape), (3, max_slots, 4, 3))
         self.assertEqual(tuple(temporal_view.shape), (3, max_slots, 2, 2, 2))
@@ -217,24 +224,24 @@ class TestMultiEndedAllocator(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         full_alloc = MultiEndedAllocator(
             kvcache=full_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
         mamba_alloc = MultiEndedAllocator(
             kvcache=mamba_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -363,17 +370,17 @@ class TestMultiEndedAllocator(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         full_alloc = MultiEndedAllocator(
             kvcache=full_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
@@ -381,7 +388,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         mamba_alloc = MultiEndedAllocator(
             kvcache=mamba_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -541,7 +548,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
             with self.subTest(sub_pool=alloc.sub_pool_name):
                 v2p, p2v = alloc.virtual_to_physical, alloc.physical_to_virtual
-                new_slots = pool.max_slots(alloc.sub_pool_name) // 2
+                new_slots = pool.num_entries(alloc.sub_pool_name) // 2
                 alloc._set_capacity(new_slots)
                 self.assertIs(alloc.virtual_to_physical, v2p)
                 self.assertIs(alloc.physical_to_virtual, p2v)
@@ -577,16 +584,16 @@ class _FakeUnifiedSWAKVPool:
     construct `UnifiedMHATokenToKVPool` views, heavier than these tests need."""
 
     class _SubKV(_FakeKVCache):
-        def __init__(self, max_slots):
-            super().__init__(max_slots)
+        def __init__(self, arena, name):
+            super().__init__(arena, name)
             self.allocator = None
 
         def attach_allocator(self, allocator):
             self.allocator = allocator
 
-    def __init__(self, shared_pool: UnifiedKVPool):
-        self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
-        self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
+    def __init__(self, shared_pool):
+        self.full_kv_pool = self._SubKV(shared_pool, "full")
+        self.swa_kv_pool = self._SubKV(shared_pool, "swa")
         self._full_allocator = None
         self._swa_allocator = None
 
@@ -635,7 +642,7 @@ class TestWindowChainAllocator(unittest.TestCase):
             n_full_slots * full_spec.entry_bytes()
             + n_swa_slots * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
@@ -645,7 +652,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         kvcache = _FakeUnifiedSWAKVPool(pool)
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=kvcache,
             views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
@@ -1224,17 +1231,18 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * self.PAGE_SIZE * full_spec.entry_bytes()
             + n_swa_pages * self.PAGE_SIZE * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=self.PAGE_SIZE,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        swa_kv = _FakeKVCache(pool.max_slots("swa"))
+        full_kv = _FakeKVCache(pool, "full")
+        swa_kv = _FakeKVCache(pool, "swa")
         full_alloc = MultiEndedAllocator(
             kvcache=full_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
@@ -1242,7 +1250,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         swa_alloc = MultiEndedAllocator(
             kvcache=swa_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="swa",
             device=_DEV,
             is_id_owner=True,
@@ -1421,16 +1429,17 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * self.PAGE_SIZE * full_spec.entry_bytes()
             + n_swa_pages * self.PAGE_SIZE * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=self.PAGE_SIZE,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=kvcache,
             views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
@@ -1770,18 +1779,19 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * PS * full_spec.entry_bytes()
             + n_swa_pages * PS * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         full_max = n_full_pages * PS
         swa_max = n_swa_pages * PS
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=kvcache,
             views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
@@ -1851,15 +1861,16 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * PS * full_spec.entry_bytes()
             + n_mamba_slots * mamba_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, mamba_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv = _FakeKVCache(pool, "full")
         full_kv.attach_allocator = lambda allocator: None
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv.attach_allocator = lambda allocator: None
         # The physical-move contract for the mamba sub-pool (un-translated);
         # _FakeKVCache already provides move_physical_pages, so nothing extra.
@@ -1870,7 +1881,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
             views=stand_in_views(
                 ChainRoles(owner="full", state="mamba"),
@@ -1935,16 +1946,17 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_pages * PS * full_spec.entry_bytes()
             + n_pages * PS * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=kvcache,
             views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
@@ -2007,17 +2019,17 @@ class TestLazyCompaction(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         full_alloc = MultiEndedAllocator(
             kvcache=full_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
@@ -2025,7 +2037,7 @@ class TestLazyCompaction(unittest.TestCase):
         )
         mamba_alloc = MultiEndedAllocator(
             kvcache=mamba_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -2301,17 +2313,18 @@ class TestO3FusedAllocBind(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device="cuda",
             enable_memory_saver=False,
+            page_size=page_size,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         fa = MultiEndedAllocator(
             kvcache=full_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device="cuda",
             is_id_owner=True,
@@ -2320,7 +2333,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         )
         ma = MultiEndedAllocator(
             kvcache=mamba_kv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="mamba",
             device="cuda",
             is_id_owner=True,
@@ -2406,7 +2419,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         )
         n_full, n_swa = 64, 32  # tokens = 16 / 8 pages at PS=4
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
@@ -2416,7 +2429,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         kvcache = _FakeUnifiedSWAKVPool(pool)
         return ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=kvcache,
             views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
@@ -2544,16 +2557,16 @@ class TestPs64MLAChainFeasibility(unittest.TestCase):
         )
         n_full = 8 * self.PS  # 8 pages incl. the sink page
         total = n_full * full.entry_bytes() + 16 * mamba.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
             page_size=self.PS,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv = _FakeKVCache(pool, "full")
         full_kv.attach_allocator = lambda allocator: None
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv.attach_allocator = lambda allocator: None
         mamba_kv._copy_from_physical = lambda src, dst: None
 
@@ -2563,7 +2576,7 @@ class TestPs64MLAChainFeasibility(unittest.TestCase):
 
         return ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
             views=stand_in_views(
                 ChainRoles(owner="full", state="mamba"),
@@ -2631,22 +2644,22 @@ class TestChainFrontierWalk(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * 64 + mamba.entry_bytes() * 16
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
         fa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "full"),
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
         ma = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "mamba"),
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -2770,31 +2783,31 @@ class TestFloatMultiEndedAllocator(CustomTestCase):
             + fl.entry_bytes() * n_float
             + full.entry_bytes() * n_full
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, fl, state],
             device=device,
             enable_memory_saver=False,
         )
         sa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("state")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "state"),
+            arena=pool,
             sub_pool_name="state",
             device=device,
             is_id_owner=True,
         )
-        fkv = _FakeKVCache(pool.max_slots("swa"))
+        fkv = _FakeKVCache(pool, "swa")
         fla = FloatMultiEndedAllocator(
             kvcache=fkv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="swa",
             device=device,
             is_id_owner=True,
         )
-        dkv = _FakeKVCache(pool.max_slots("full"))
+        dkv = _FakeKVCache(pool, "full")
         da = MultiEndedAllocator(
             kvcache=dkv,
-            unified_buffer=pool,
+            arena=pool,
             sub_pool_name="full",
             device=device,
             is_id_owner=True,
@@ -3133,7 +3146,7 @@ class TestDcpWidening(unittest.TestCase):
         """(full, mamba) as the composite wires them: only full shards."""
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=full.entry_bytes() * n_full_slots + mamba.entry_bytes() * 16,
             sub_pool_specs=[full, mamba],
             device=_DEV,
@@ -3141,8 +3154,8 @@ class TestDcpWidening(unittest.TestCase):
             page_size=page_size,
         )
         alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "full"),
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
@@ -3151,8 +3164,8 @@ class TestDcpWidening(unittest.TestCase):
         )
         # The peer stays slot-granular: mamba state is replicated, not sharded.
         mamba = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+            kvcache=_FakeKVCache(pool, "mamba"),
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -3252,7 +3265,7 @@ class TestDcpWidening(unittest.TestCase):
 
         full_spec = _make_mha_spec("full", "up", layer_num=2)
         mamba_spec = _make_mamba_spec("mamba", "down", layer_num=2)
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=16 * page_size * full_spec.entry_bytes()
             + 8 * mamba_spec.entry_bytes(),
             sub_pool_specs=[full_spec, mamba_spec],
@@ -3260,8 +3273,8 @@ class TestDcpWidening(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv._copy_from_physical = lambda src, dst: None
 
         class _FakeHybridLinearKVPool:
@@ -3270,7 +3283,7 @@ class TestDcpWidening(unittest.TestCase):
 
         return ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
             views=stand_in_views(
                 ChainRoles(owner="full", state="mamba"),
