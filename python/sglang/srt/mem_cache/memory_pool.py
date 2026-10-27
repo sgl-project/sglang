@@ -655,6 +655,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_ubtree_factorized_kda: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -681,7 +682,9 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         self.factorized_kda_tree = bool(
-            not _is_npu
+            enable_ubtree_factorized_kda
+            and spec_state_size == 1
+            and not _is_npu
             and not _is_cpu
             and cache_params.is_kda
             and speculative_eagle_topk is not None
@@ -1425,6 +1428,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        enable_ubtree_factorized_kda: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1447,6 +1451,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self.ple_window_cache = None
+        self.enable_ubtree_factorized_kda = enable_ubtree_factorized_kda
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1498,6 +1503,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_ubtree_factorized_kda=self.enable_ubtree_factorized_kda,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

@@ -141,6 +141,11 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         if not get_exec().graph.disable_cuda_graph:
             self.model_runner.capture_tail_hooks.append(self._capture_verify_epilogue)
 
+    def _defer_target_verify_gather(self):
+        # The graph-folded argmax consumes global vocabulary IDs. Keep
+        # DFlash's deferred local-logits optimization out of UBTree.
+        return None
+
     def _capture_verify_epilogue(
         self, runner, out, forward_batch, num_tokens: int
     ) -> None:

@@ -1677,6 +1677,10 @@ class KVCacheConfigurator:
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
+            # Other speculative algorithms keep their per-node state cache.
+            enable_ubtree_factorized_kda=(
+                self.spec_algorithm.is_ubtree() and not self.is_draft_worker
+            ),
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

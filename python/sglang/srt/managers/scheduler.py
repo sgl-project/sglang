@@ -336,6 +336,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
+from sglang.srt.speculative.ubtree_components.validation import validate_ubtree_request
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -3086,7 +3087,21 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return
 
-        if self.spec_algorithm.is_dflash_family():
+        if self.spec_algorithm.is_ubtree():
+            error_msg = validate_ubtree_request(req)
+            if error_msg is not None:
+                abort_req = _make_abort_req(
+                    req,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": error_msg,
+                    },
+                )
+                req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+                self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+                return
+        elif self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

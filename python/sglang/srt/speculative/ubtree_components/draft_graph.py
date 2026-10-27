@@ -26,6 +26,8 @@ class _CapturedFullDraftBucket:
     input_ids: torch.Tensor
     positions: torch.Tensor
     out_cache_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
     forward_batch: object
     graph: torch.cuda.CUDAGraph
     output: LogitsProcessorOutput | None
@@ -110,17 +112,23 @@ class UBTreeDraftSegmentGraphRunner:
         captured_input_ids.copy_(input_ids)
         captured_positions.copy_(positions)
         out_cache_loc.copy_(forward_batch.out_cache_loc)
+        seq_lens = forward_batch.seq_lens.clone()
+        req_pool_indices = forward_batch.req_pool_indices.clone()
 
         captured_forward_batch = copy(forward_batch)
         captured_forward_batch.input_ids = captured_input_ids
         captured_forward_batch.positions = captured_positions
         captured_forward_batch.out_cache_loc = out_cache_loc
+        captured_forward_batch.seq_lens = seq_lens
+        captured_forward_batch.req_pool_indices = req_pool_indices
         captured_forward_batch.input_embeds = None
 
         placeholder = _CapturedFullDraftBucket(
             input_ids=captured_input_ids,
             positions=captured_positions,
             out_cache_loc=out_cache_loc,
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
             forward_batch=captured_forward_batch,
             graph=torch.cuda.CUDAGraph(),
             output=None,
@@ -170,6 +178,11 @@ class UBTreeDraftSegmentGraphRunner:
         captured.input_ids.copy_(input_ids)
         captured.positions.copy_(positions)
         captured.out_cache_loc.copy_(forward_batch.out_cache_loc)
+        # The scheduler may replace these tensors between decode rounds or
+        # requests. Both the model metadata and proposal tail must read stable
+        # graph-owned addresses containing this replay's values.
+        captured.seq_lens.copy_(forward_batch.seq_lens)
+        captured.req_pool_indices.copy_(forward_batch.req_pool_indices)
         self.attn_backend.init_forward_metadata_out_graph(forward_batch)
         captured.graph.replay()
         assert captured.output is not None

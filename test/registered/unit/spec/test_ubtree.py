@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
@@ -26,6 +27,7 @@ from sglang.srt.speculative.ubtree_components.tree import (
     build_ubtree_batch,
     compact_tree_values_to_front,
 )
+from sglang.srt.speculative.ubtree_components.validation import validate_ubtree_request
 from sglang.srt.speculative.ubtree_components.vocab import vocab_parallel_topk
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -335,6 +337,7 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             pp_size=1,
             dp_size=1,
             max_running_requests=1,
+            enable_strict_thinking=False,
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
             speculative_use_rejection_sampling=False,
@@ -369,6 +372,44 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 validate_runtime_config(
                     SimpleNamespace(**(vars(cfg) | {field: value})), ("fa3",)
                 )
+
+
+class TestUBTreeRequestValidation(CustomTestCase):
+    @staticmethod
+    def _request(**overrides):
+        fields = dict(
+            sampling_params=SamplingParams(temperature=0),
+            custom_logit_processor=None,
+            return_hidden_states=False,
+            return_sampling_mask=False,
+            return_logprob=False,
+            grammar=None,
+        )
+        return SimpleNamespace(**(fields | overrides))
+
+    def test_requests_without_custom_processor_are_allowed(self):
+        for processor in (None, ""):
+            with self.subTest(processor=processor):
+                req = self._request(custom_logit_processor=processor)
+                self.assertIsNone(validate_ubtree_request(req))
+
+    def test_custom_processors_are_rejected_without_deserialization(self):
+        for processor in ('{"callable": "invalid-hex"}', "invalid-processor"):
+            with self.subTest(processor=processor):
+                req = self._request(custom_logit_processor=processor)
+                self.assertEqual(
+                    validate_ubtree_request(req),
+                    "UBTREE does not support custom_logit_processor.",
+                )
+
+    def test_unsupported_outputs_are_still_rejected(self):
+        for field in ("return_hidden_states", "return_sampling_mask"):
+            with self.subTest(field=field):
+                req = self._request(
+                    return_hidden_states=field == "return_hidden_states",
+                    return_sampling_mask=field == "return_sampling_mask",
+                )
+                self.assertIn(field, validate_ubtree_request(req))
 
 
 if __name__ == "__main__":

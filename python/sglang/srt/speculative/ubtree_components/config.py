@@ -129,6 +129,11 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
         raise ValueError("UBTREE currently requires --pp-size 1 and --dp-size 1")
     if cfg.max_running_requests != 1:
         raise ValueError("UBTREE currently requires --max-running-requests 1")
+    if cfg.enable_strict_thinking:
+        raise ValueError(
+            "UBTREE does not support --enable-strict-thinking because it requires "
+            "grammar decoding"
+        )
     if cfg.speculative_draft_window_size is not None:
         raise ValueError("UBTREE does not support --speculative-draft-window-size")
     if cfg.speculative_draft_sink_size is not None:
