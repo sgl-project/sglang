@@ -74,6 +74,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    prefill_input_len,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -255,6 +256,7 @@ class PrefillBootstrapQueue:
             self.scheduler.kv_checksum_computer = None
 
     def _init_kv_manager(self) -> CommonKVManager:
+        encoder_only = get_disagg().dsv41_encoder_only_prefill
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
@@ -274,7 +276,7 @@ class PrefillBootstrapQueue:
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
-        transfer_draft_cache = (
+        transfer_draft_cache = not encoder_only and (
             not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
         )
         kv_args.prefill_start_layer = (
@@ -290,7 +292,7 @@ class PrefillBootstrapQueue:
             )
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            self.token_to_kv_pool
+            self.token_to_kv_pool, encoder_only=encoder_only
         )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
@@ -332,6 +334,7 @@ class PrefillBootstrapQueue:
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            encoder_only=encoder_only,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -353,6 +356,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            encoder_only=encoder_only,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -445,7 +449,12 @@ class PrefillBootstrapQueue:
 
     def _num_pages_to_send(self, req: Req, decode_prefix_len: int) -> int:
         return kv_to_page_num(
-            len(req.origin_input_ids) - decode_prefix_len,
+            (
+                prefill_input_len(req)
+                if get_disagg().dsv41_encoder_only_prefill
+                else len(req.origin_input_ids)
+            )
+            - decode_prefix_len,
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
@@ -584,6 +593,9 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
+        if get_disagg().dsv41_encoder_only_prefill and req.extend_end == 0:
+            # Empty prefixes own no row and publish no cache entry.
+            return
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
@@ -661,6 +673,15 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch.batch_is_full = False
 
         self.resolve_waiting_queue_bootstrap()
+        if get_disagg().dsv41_encoder_only_prefill:
+            waiting = []
+            for req in self.waiting_queue:
+                if not is_aborted(req) and prefill_input_len(req) == 0:
+                    req.extend_end = 0
+                    self.finish_encoder_only_prefill(req)
+                else:
+                    waiting.append(req)
+            self.waiting_queue = waiting
 
         # Skip repeated chunk processing while polling a pending batch.
         if last_batch is None or not last_batch.prefill_chunk_processed:
@@ -898,6 +919,21 @@ class SchedulerDisaggregationPrefillMixin:
             raise RuntimeError("Prefill result copy must be submitted before polling")
         return state == 2
 
+    def finish_encoder_only_prefill(self: Scheduler, req: Req) -> None:
+        """Publish the prefix boundary, including a metadata-only empty prefix."""
+        now = time.perf_counter()
+        if req.extend_end == 0:
+            req.time_stats.set_forward_entry_time(now)
+        req.time_stats.set_prefill_finished_time(now)
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = req.extend_end
+        self.checkpoint_disagg_prefill(req)
+        self.disagg_prefill_inflight_queue.append(req)
+        req.disagg_kv_sender.mark_prefill_complete()
+        if not req.pending_bootstrap:
+            self.send_kv_chunk(req, last_chunk=True)
+        req.time_stats.set_prefill_transfer_queue_entry_time()
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -949,7 +985,11 @@ class SchedulerDisaggregationPrefillMixin:
                     "cpu", non_blocking=False
                 )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = (
+            [None] * len(batch.reqs)
+            if result.cache_only
+            else result.next_token_ids.tolist()
+        )
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -988,6 +1028,21 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
+                    continue
+
+                if result.cache_only:
+                    if req.extend_end != prefill_input_len(req):
+                        prepare_abort(
+                            req,
+                            f"Invalid encoder-only prefix coverage for {req.rid}: "
+                            f"got {req.extend_end}, expected {prefill_input_len(req)}",
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        continue
+                    self.finish_encoder_only_prefill(req)
                     continue
 
                 sampling_mask_finish_reason = None
@@ -1083,7 +1138,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
                     req.extend_end is not None
-                    and req.extend_end >= len(req.origin_input_ids)
+                    and req.extend_end
+                    >= (
+                        prefill_input_len(req)
+                        if result.cache_only
+                        else len(req.origin_input_ids)
+                    )
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -1198,6 +1258,10 @@ class SchedulerDisaggregationPrefillMixin:
                     poll == KVPoll.Bootstrapping
                     and get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"
+                    and (
+                        not get_disagg().dsv41_encoder_only_prefill
+                        or req.extend_end != 0
+                    )
                     and self.req_to_token_pool.available_size() == 0
                     and (
                         self.waiting_queue
@@ -1225,7 +1289,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                if not get_disagg().dsv41_encoder_only_prefill or req.extend_end != 0:
+                    release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
@@ -1302,7 +1367,8 @@ class SchedulerDisaggregationPrefillMixin:
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        if not get_disagg().dsv41_encoder_only_prefill or req.extend_end != 0:
+            release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1530,6 +1596,16 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        if (
+            last_chunk
+            and get_disagg().dsv41_encoder_only_prefill
+            and req.extend_end == 0
+        ):
+            self.disagg_metadata_buffers.set_buf(req)
+            req.disagg_kv_sender.send(np.empty(0, dtype=np.int32), num_kv_tokens=0)
+            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            return
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
@@ -1660,6 +1736,10 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _request_state_payload():
                 kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                if get_disagg().dsv41_encoder_only_prefill:
+                    return kvcache.encoder_only_pair_state_transfer_indices(
+                        int(req.kv.req_pool_idx), seq_len
+                    )
                 return kvcache.request_state_transfer_indices(
                     int(req.kv.req_pool_idx), c128_seq_len
                 )

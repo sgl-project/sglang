@@ -66,7 +66,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
@@ -1626,6 +1626,68 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
+    def test_fake_handoff_ignores_reused_cache_only_metadata(self):
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        # A fake receiver never overwrites a slot previously used by real PD.
+        # Real transfers must still validate that slot's advertised coverage.
+        for fake, input_len, aborted in (
+            (True, 1, False),
+            (False, 8192, False),
+            (False, 1, True),
+        ):
+            with (
+                self.subTest(fake=fake, input_len=input_len),
+                published_topology(role="tokenizer", dsv41_encoder_only_prefill=True),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=4,
+                )
+                previous = self._make_req(None)
+                previous.dsv41_cache_only_replay = True
+                previous.dsv41_cache_only_coverage = 8064
+                buffers.set_buf(previous)
+                req = Req(
+                    rid="HEALTH_CHECK_reused_slot" if fake else "real_transfer",
+                    origin_input_text=None,
+                    origin_input_ids=[1] * input_len,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    bootstrap_host=FAKE_BOOTSTRAP_HOST if fake else "127.0.0.1",
+                    bootstrap_room=9,
+                    vocab_size=128,
+                )
+                req.kv.kv_committed_len = input_len
+                queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                queue.scheduler = SimpleNamespace(
+                    kv_checksum_computer=None,
+                    batch_result_processor=SimpleNamespace(
+                        _maybe_update_reasoning_tokens=lambda req, token_id: None
+                    ),
+                )
+                queue.spec_algorithm = SpeculativeAlgorithm.NONE
+                queue.metadata_buffers = buffers
+                transfer = DecodeRequest(
+                    req=req,
+                    kv_receiver=SimpleNamespace(clear=lambda: None),
+                    metadata_buffer_index=0,
+                )
+                queue._commit_transfer_to_req(transfer)
+                self.assertEqual(req.finished_reason is not None, aborted)
+                self.assertIsNone(transfer.kv_receiver)
+                if fake:
+                    self.assertFalse(req.dsv41_cache_only_replay)
+                    self.assertEqual(len(req.output_ids), 1)
+                    self.assertTrue(0 <= req.output_ids[0] < req.vocab_size)
+                elif not aborted:
+                    self.assertTrue(req.dsv41_cache_only_replay)
+                    self.assertEqual(req.dsv41_cache_only_coverage, 8064)
+                    self.assertEqual(len(req.output_ids), 0)
+
     @staticmethod
     def _make_req(
         seed,
@@ -1755,6 +1817,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             with (
                 self.subTest(sampling_logprobs_mode=mode),
                 envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+                published_topology(role="tokenizer"),
             ):
                 buffers = MetadataBuffers(
                     size=1,
@@ -1810,7 +1873,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
     def test_rebootstrap_replay_keeps_one_sampling_mask_row_per_token(self):
         """A PD rebootstrap that replays an already-emitted token keeps that token's
         sampling-mask row instead of adding the prefill worker's fresh one."""
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+        with (
+            envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+            published_topology(role="tokenizer"),
+        ):
             buffers = MetadataBuffers(
                 size=1,
                 hidden_size=2,

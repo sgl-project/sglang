@@ -48,6 +48,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
+    prefill_input_len,
     split_cached_prefix_by_tier,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -424,7 +425,7 @@ class SchedulePolicy:
             or budget < 2 * page_size
         ):
             return None
-        remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        remaining = prefill_input_len(chunked_req) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -824,7 +825,7 @@ class PrefillAdder:
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             max_new_tokens=self._swa_new_tokens(req),
-            input_tokens=len(req.full_untruncated_fill_ids),
+            input_tokens=prefill_input_len(req),
             swa_host_hit_length=swa_host_hit_length,
             chunk_limit=chunk_limit,
             auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
@@ -851,7 +852,7 @@ class PrefillAdder:
         self, req: Req, *, extend_input_len: Optional[int] = None
     ) -> int:
         if extend_input_len is None:
-            extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+            extend_input_len = prefill_input_len(req) - req.prefix_len
         return self.token_to_kv_pool_allocator.request_slot_reserve(
             has_req_pool_slot=req.kv.req_pool_idx is not None,
             prefill_tokens=req.prefix_len + extend_input_len,
@@ -1022,7 +1023,7 @@ class PrefillAdder:
             remaining = (
                 req.dllm_block_offset - prefix_len
                 if req.is_dllm_prefill()
-                else len(req.full_untruncated_fill_ids) - prefix_len
+                else prefill_input_len(req) - prefix_len
             )
             limit = self.rem_dllm_tokens
             if not req.is_dllm_prefill():
@@ -1094,7 +1095,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        cand_extend_input_len = prefill_input_len(req) - req.prefix_len
         if (
             self.dllm_config.requires_separate_context_encoding
             and req.is_dllm_prefill()
@@ -1170,7 +1171,7 @@ class PrefillAdder:
             assert self.chunked_req_limit > 0
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        cand_extend_input_len = prefill_input_len(req) - req.prefix_len
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1239,7 +1240,7 @@ class PrefillAdder:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
     def add_one_req_ignore_eos(self, req: Req):
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        cand_extend_input_len = prefill_input_len(req) - req.prefix_len
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
@@ -1339,7 +1340,7 @@ class PrefillAdder:
                 extend_len=cand_extend_input_len,
             ):
                 return AddReqResult.OTHER
-            req.extend_end = len(req.full_untruncated_fill_ids)
+            req.extend_end = prefill_input_len(req)
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -1408,7 +1409,7 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        cand_extend_input_len = prefill_input_len(req) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         # Reserve request and load-back state slots before init_load_back binds
         # the request slot. Reuse this reservation when committing admission.
@@ -1524,10 +1525,10 @@ class PrefillAdder:
                     extend_len = admission.extend_len
                     if self.dllm_config is None:
                         extend_len = min(
-                            extend_len, len(req.full_untruncated_fill_ids) - prefix_len
+                            extend_len, prefill_input_len(req) - prefix_len
                         )
                     is_chunked = admission.is_chunked and (
-                        prefix_len + extend_len < len(req.full_untruncated_fill_ids)
+                        prefix_len + extend_len < prefill_input_len(req)
                     )
                     max_new_tokens = admission.max_new_tokens
                     if admission.is_chunked and not is_chunked:
@@ -1580,7 +1581,7 @@ class PrefillAdder:
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
         prefix_len = req.prefix_len + host_hit_length
-        extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        extend_len = prefill_input_len(req) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
@@ -1713,7 +1714,7 @@ class PrefillAdder:
 
         preemptible_reqs = []
         min_tokens_to_remove = (
-            len(req.full_untruncated_fill_ids)
+            prefill_input_len(req)
             - req.prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             + self._request_slot_reserve_for_req(req)

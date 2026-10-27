@@ -2,6 +2,7 @@ import json
 import sys
 import threading
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,21 +26,91 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
+    ScheduleBatch,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestCacheOnlyDecodeScheduling(CustomTestCase):
+    def test_overlap_replay_commits_then_resumes_existing_decode(self):
+        """A replay must neither lose existing rows nor admit another replay first."""
+        with published_topology(role="scheduler", dsv41_encoder_only_prefill=True):
+            batches = []
+            for row in (0, 1):
+                req = Req(
+                    rid=f"r{row}",
+                    origin_input_text=None,
+                    origin_input_ids=[1] * 256,
+                    sampling_params=SamplingParams(max_new_tokens=8),
+                )
+                batches.append(
+                    ScheduleBatch(
+                        reqs=[req],
+                        device="cpu",
+                        model_config=SimpleNamespace(is_encoder_decoder=False),
+                        sampling_info=SimpleNamespace(merge_batch=lambda other: None),
+                        req_pool_indices=torch.tensor([row]),
+                        req_pool_indices_cpu=torch.tensor([row]),
+                        seq_lens=torch.tensor([256]),
+                        orig_seq_lens=torch.tensor([256]),
+                    )
+                )
+            running, replay = batches
+            replay.dsv41_cache_only_replay = True
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.scheduler_stage_metrics = None
+            scheduler.chunked_req = None
+            scheduler.dsv41_suspended_decode_batch = None
+            scheduler.get_new_prebuilt_batch = lambda batch: replay
+            plan = scheduler.get_next_disagg_decode_batch_to_run(running)
+            self.assertIs(plan.batch_to_run, replay)
+            self.assertIs(scheduler.dsv41_suspended_decode_batch, running)
+            scheduler.running_batch = plan.running_batch
+            scheduler.last_batch = replay
+            snapshot = replay.copy()
+            result = GenerationBatchResult(next_token_ids=torch.tensor([17]))
+            scheduler.result_queue = deque([(snapshot, result)])
+
+            def commit(batch, output):
+                self.assertEqual(scheduler.running_batch.req_pool_indices.tolist(), [1])
+                batch.reqs[0].output_ids.append(output.next_token_ids.item())
+
+            scheduler.process_batch_result = commit
+            scheduler._finish_dsv41_overlap_replay()
+            self.assertEqual(
+                [r.rid for r in scheduler.running_batch.reqs], ["r1", "r0"]
+            )
+            self.assertEqual(scheduler.running_batch.req_pool_indices.tolist(), [1, 0])
+            self.assertEqual(list(scheduler.running_batch.reqs[0].output_ids), [17])
+            self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
+            self.assertIsNone(scheduler.last_batch)
+            self.assertEqual(len(scheduler.result_queue), 0)
+            scheduler.get_new_prebuilt_batch = lambda batch: self.fail(
+                "replay starves Decode"
+            )
+            scheduler.update_running_batch = lambda batch: batch
+            scheduler.dp_attn_adapter = SimpleNamespace(
+                maybe_prepare_mlp_sync_batch=lambda batch: batch
+            )
+            next_plan = scheduler.get_next_disagg_decode_batch_to_run(
+                scheduler.running_batch
+            )
+            self.assertEqual([r.rid for r in next_plan.batch_to_run.reqs], ["r1", "r0"])
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -377,7 +448,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             extend_end=5,
         )
 
-        SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
+        with published_topology(role="tokenizer"):
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                scheduler, req
+            )
 
         cache.advance_unpublished_req.assert_called_once_with(req)
         # The next chunk still resumes after this one.

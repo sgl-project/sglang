@@ -1248,6 +1248,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Reserve the draft worker by inflating per-token bytes by
             # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.
             draft_layers = 1
+            if (
+                get_disagg().dsv41_encoder_only_prefill
+                and kvc.spec_algorithm.is_dspark()
+            ):
+                aux = kvc.spec_aux_config
+                draft_layers = int(
+                    aux.dspark_num_stages or aux.dflash_draft_num_layers or 1
+                )
             target_layers = self.num_layers_total
             self._spec_infl = (target_layers + draft_layers) / target_layers
             self.bytes_per_full_token *= self._spec_infl

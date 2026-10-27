@@ -4,6 +4,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.utils.common import async_h2d, is_pin_memory_available
 
 
@@ -39,7 +40,7 @@ def resets_swa_window(req) -> bool:
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
     The prefill budget, the MLP-sync row count and the fold all read this."""
-    return min(prefix_len, 128)
+    return min(prefix_len, DSV41_REPLAY_WINDOW)
 
 
 def folded_replay_rows(batch) -> int:

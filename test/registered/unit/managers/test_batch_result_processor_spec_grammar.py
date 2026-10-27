@@ -7,11 +7,12 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import restore_cache_only_rebootstrap_tokens
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -24,7 +25,7 @@ from sglang.srt.sampling.sampling_params import (
     SamplingParams,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -158,7 +159,8 @@ def _commit_disagg_handoff(
         is_rebootstrap=replayed_boundary,
     )
 
-    queue._commit_transfer_to_req(decode_req)
+    with published_topology(role="tokenizer"):
+        queue._commit_transfer_to_req(decode_req)
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
@@ -294,6 +296,87 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
+
+
+class TestCacheOnlyRebootstrap(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(published_topology(role="tokenizer"))
+
+    def test_restores_only_rebootstrapped_rows_before_token_consumers(self):
+        """New requests keep their sample; rebootstrap restores the emitted boundary."""
+        fresh = _make_req(99)
+        restored = _make_req(99)
+        restored.pd_rebootstrap_in_progress = True
+        restored.pd_rebootstrap_forced_output_id = 12
+        reqs = [fresh, restored]
+        sampled = torch.tensor([31, 32])
+        batch = SimpleNamespace(reqs=reqs, dsv41_cache_only_replay=False)
+        self.assertIs(restore_cache_only_rebootstrap_tokens(batch, sampled), sampled)
+        batch.dsv41_cache_only_replay = True
+        actual = restore_cache_only_rebootstrap_tokens(batch, sampled)
+        self.assertEqual(actual.tolist(), [31, 12])
+        self.assertEqual(sampled.tolist(), [31, 32])
+        # Sampling must not consume the CPU commit marker before result processing.
+        self.assertTrue(restored.pd_rebootstrap_in_progress)
+        self.assertEqual(restored.pd_rebootstrap_forced_output_id, 12)
+
+    def test_cache_only_rebootstrap_commits_boundary_without_reaccounting(self):
+        req = _make_req(terminate_after=99)
+        req.output_ids.extend([10, 11])
+        req.pd_rebootstrap_in_progress = True
+        req.pd_rebootstrap_forced_output_id = 12
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = max(
+            0, len(req.origin_input_ids) + len(req.output_ids) - 128
+        )
+        req.inflight_middle_chunks = 0
+        req.is_retracted = False
+        req.beam_group = None
+        req.time_stats = MagicMock()
+        req.require_reasoning = True
+        req.reasoning_tokens = 3
+        req.grammar.accept_token(12)
+
+        batch = SimpleNamespace(
+            reqs=[req],
+            dsv41_cache_only_replay=True,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=0,
+            spec_info=None,
+            decoding_reqs=[],
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+            forward_iter=1,
+        )
+        result = GenerationBatchResult(
+            logits_output=SimpleNamespace(
+                hidden_states=None,
+                customized_info=None,
+                sampling_mask_output=None,
+            ),
+            next_token_ids=torch.tensor([12], dtype=torch.long),
+        )
+        processor = replace(
+            _make_processor(),
+            token_to_kv_pool_allocator=MagicMock(),
+            tree_cache=MagicMock(),
+            output_streamer=MagicMock(),
+        )
+        processor.model_config.think_end_ids = [99]
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.checkpoint_kv_cache"
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(list(req.output_ids), [10, 11, 12])
+        self.assertIsNone(req.pd_rebootstrap_forced_output_id)
+        self.assertFalse(req.pd_rebootstrap_in_progress)
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertEqual(req.grammar.accepted, [12])
 
 
 class TestFinishedMambaSpecCheckpoint(CustomTestCase):

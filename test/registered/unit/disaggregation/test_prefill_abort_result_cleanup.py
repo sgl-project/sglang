@@ -4,11 +4,15 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -99,6 +103,69 @@ class TestPrefillCompleteResult(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+
+    def test_empty_encoder_prefix_transfer_failure_releases_metadata_once(self):
+        """A failed metadata-only handoff owns no KV row to checkpoint/free."""
+        for already_aborted in (False, True):
+            with (
+                self.subTest(already_aborted=already_aborted),
+                get_context().override_server_args(
+                    dsv41_encoder_only_prefill=True, disaggregation_mode="prefill"
+                ),
+                get_parallel().override(tp_rank=0),
+            ):
+                req = Req(
+                    rid="empty-prefix",
+                    origin_input_text=None,
+                    origin_input_ids=[1] * 128,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    bootstrap_room=7,
+                )
+                req.extend_end = 0
+                req.pending_bootstrap = False
+                req.disagg_kv_sender = Mock()
+                if already_aborted:
+                    req.finished_reason = FINISH_ABORT("client cancelled")
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.scheduler_stage_metrics = None
+                scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+                scheduler.disagg_prefill_inflight_queue = [req]
+                scheduler.req_to_metadata_buffer_idx_allocator = (
+                    ReqToMetadataIdxAllocator(1)
+                )
+                req.metadata_buffer_index = (
+                    scheduler.req_to_metadata_buffer_idx_allocator.alloc()
+                )
+                outcomes = []
+                scheduler.tree_cache = SimpleNamespace(
+                    supports_mamba=lambda: False,
+                    finish=lambda handle, outcome: outcomes.append(outcome),
+                )
+                scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+                outputs = []
+                scheduler.output_streamer = SimpleNamespace(
+                    stream_output=lambda reqs, *args: outputs.extend(reqs)
+                )
+                with patch(
+                    "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                    return_value=[KVPoll.Failed],
+                ):
+                    self.assertEqual(
+                        scheduler.process_disagg_prefill_inflight_queue(), [req]
+                    )
+                self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+                self.assertFalse(req.kv.holds_kv)
+                self.assertEqual(req.metadata_buffer_index, -1)
+                self.assertEqual(
+                    scheduler.req_to_metadata_buffer_idx_allocator.available_size(), 1
+                )
+                self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+                self.assertEqual(outputs, [req])
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
+                self.assertEqual(
+                    scheduler.req_to_metadata_buffer_idx_allocator.available_size(), 1
+                )
 
     @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):

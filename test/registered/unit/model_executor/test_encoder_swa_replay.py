@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -577,6 +579,44 @@ class TestEncoderReplayPrefillGraphGate(CustomTestCase):
             self.assertRaisesRegex(ValueError, "prefill CUDA graph on ROCm"),
         ):
             self._validate(Backend.BREAKABLE)
+
+
+class TestEncoderOnlyWindowConfig(CustomTestCase):
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_accepts_official_sliding_window_field(self):
+        """The official nested config names its window sliding_window, not window_size."""
+        for window in (128, 256):
+            with self.subTest(window=window):
+                hf = DeepseekV41Config(
+                    text_config={
+                        "sliding_window": window,
+                        "num_hidden_layers": 40,
+                        "num_nextn_predict_layers": 3,
+                        "kv_source_layer_ids": [2, 8, 14, 20],
+                        "index_source_layer_ids": [2, 8, 14, 20],
+                        "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+                    },
+                    language_model_only=True,
+                )
+                model = ModelConfig.__new__(ModelConfig)
+                model.hf_config = model.hf_text_config = hf
+                model.sliding_window_size = model._get_sliding_window_size()
+                args = ServerArgs(
+                    model_path="local-deepseek-v41",
+                    dsv41_encoder_only_prefill=True,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mooncake",
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=Backend.DISABLED)
+                    ),
+                )
+                args._model_config = model
+                with patch(f"{_ENV_GATE}.is_unified_kv_triton", return_value=False):
+                    if window == 128:
+                        deepseek_v4_hook.validate_deepseek_v41_features(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "window_size=128"):
+                            deepseek_v4_hook.validate_deepseek_v41_features(args)
 
 
 class TestFoldMlpSync(CustomTestCase):
