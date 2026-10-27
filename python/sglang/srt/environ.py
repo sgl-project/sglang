@@ -1196,6 +1196,11 @@ class Envs:
     # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # On by default; set SGLANG_ENABLE_FP8_SMALL_M_W8A16=0 as a kill switch.
+    # SM103 W8A16 GEMM for the block-FP8 decode projections at M <= 16
+    # (kernels/ops/gemm/fused_a_gemm.py). An explicit --fp8-gemm-backend also
+    # keeps every layer on that backend.
+    SGLANG_ENABLE_FP8_SMALL_M_W8A16 = EnvBool(True)
 
     # ===================================================================
     # Humming quantization

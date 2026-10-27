@@ -225,7 +225,7 @@ def fp8_projection(cuda_device, monkeypatch):
 
     from sglang.kernels.ops.gemm import fused_a_gemm as dispatch
     from sglang.srt import runtime_context
-    from sglang.srt.layers.quantization import fp8
+    from sglang.srt.layers.quantization import fp8, fp8_utils
 
     # Backend selection is unrelated to the stored-layout dispatch contract.
     monkeypatch.setattr(fp8, "dispatch_w8a8_block_fp8_linear", lambda **kw: None)
@@ -237,6 +237,11 @@ def fp8_projection(cuda_device, monkeypatch):
         lambda: SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False)
         ),
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_fp8_gemm_runner_backend",
+        lambda: fp8_utils.Fp8GemmRunnerBackend.AUTO,
     )
     monkeypatch.setattr(dispatch, "_DEVICE_SM", 103)
     monkeypatch.setattr(dispatch, "_FP8_SMALL_M_SHAPES", frozenset({(144, 640)}))
@@ -312,6 +317,31 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
         weight_block_size=block_size,
         block_fp8_as_mxfp8=mxfp8_view,
     ) == (case == "eligible")
+
+
+@pytest.mark.parametrize("case", ["explicit_backend", "kill_switch"])
+def test_fp8_small_m_respects_user_selection(fp8_projection, monkeypatch, case):
+    """An explicit --fp8-gemm-backend or SGLANG_ENABLE_FP8_SMALL_M_W8A16=0 keeps the selected W8A8 backend."""
+    from sglang.kernels.ops.gemm import fused_a_gemm as dispatch
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization import fp8_utils
+
+    def eligible():
+        return dispatch.fp8_small_m_eligible(
+            layer=fp8_projection, weight_block_size=[128, 128], block_fp8_as_mxfp8=False
+        )
+
+    assert eligible()
+    if case == "explicit_backend":
+        monkeypatch.setattr(
+            fp8_utils,
+            "get_fp8_gemm_runner_backend",
+            lambda: fp8_utils.Fp8GemmRunnerBackend.DEEP_GEMM,
+        )
+        assert not eligible()
+    else:
+        with envs.SGLANG_ENABLE_FP8_SMALL_M_W8A16.override(False):
+            assert not eligible()
 
 
 @pytest.mark.parametrize("case", ["too_many_rows", "strided", "fp16"])

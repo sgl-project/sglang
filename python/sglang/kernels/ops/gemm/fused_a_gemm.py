@@ -13,13 +13,15 @@ weight ``[K, N]`` (``weight.T``).
 On SM103, the block-FP8 projections in ``_FP8_SMALL_M_SHAPES`` are served by the JIT
 W8A16 kernel (row-major weights, BF16 activations): ``Fp8LinearMethod`` checks
 ``fp8_small_m_eligible`` once after weight loading and calls ``fp8_small_m_linear``
-from ``apply``. Other layers keep their normal dispatch.
+from ``apply``. Other layers keep their normal dispatch, and so does every layer when
+``--fp8-gemm-backend`` is set explicitly or ``SGLANG_ENABLE_FP8_SMALL_M_W8A16=0``.
 """
 
 from enum import Enum
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
 
 
@@ -69,7 +71,15 @@ def fp8_small_m_eligible(
         or layer.bias is not None
     ):
         return False
+    from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
     from sglang.srt.runtime_context import get_exec
+
+    # An explicit --fp8-gemm-backend or the kill switch keeps the selected W8A8 backend for every M.
+    if (
+        not envs.SGLANG_ENABLE_FP8_SMALL_M_W8A16.get()
+        or not get_fp8_gemm_runner_backend().is_auto()
+    ):
+        return False
 
     weight, scale = layer.weight, layer.weight_scale_inv
     n, k = weight.shape
