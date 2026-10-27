@@ -322,7 +322,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
                 self.assertEqual(allocations, [])
                 graph = self.BreakableCUDAGraph()
                 original_copy = bcg._copy_into_output
-                with patch.object(bcg, "_copy_into_output", side_effect=copy_output):
+                with patch.object(bcg, "_copy_into_output", new=copy_output):
                     with self.BreakableCUDAGraphCapture(
                         graph, stream=torch.cuda.Stream()
                     ):
