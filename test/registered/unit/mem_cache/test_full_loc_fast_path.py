@@ -173,11 +173,11 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """
 
     def _make_bare_band(self, page_size, v2p):
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+        from sglang.srt.mem_cache.kv.alloc.band import Band
 
         # A real sub-allocator (not a stand-in): the translation reads its v2p
         # table.
-        swa_allocator = object.__new__(MultiEndedAllocator)
+        swa_allocator = object.__new__(Band)
         # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
         # rows per page; equal at dcp_size == 1, which is what this fixture is.
         swa_allocator.page_size = page_size

@@ -19,16 +19,21 @@ from torch.profiler import record_function
 
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import (
+    alloc_decode_kernel,
+    alloc_extend_kernel,
+)
 from sglang.srt.mem_cache.allocator.swa import (
     UNIFIED_SWA_SEGMENT_BOUND,
     UNIFIED_SWA_SEGMENT_RELEASED,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
-    _chain_byte_accounting_violations,
-    _flush_deferred_free_group,
-    _full_tokens_before_mamba_recheck,
+from sglang.srt.mem_cache.kv.alloc.band import (
+    Band,
+    FloatBand,
+    chain_byte_accounting_violations,
+    flush_deferred_free_group,
+    full_tokens_before_mamba_recheck,
+    relieve_for_alloc,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
@@ -38,7 +43,7 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 from sglang.srt.utils.invariants import expect, resolve_level
 
 logger = logging.getLogger(__name__)
@@ -53,13 +58,13 @@ class ChainRoles(msgspec.Struct, frozen=True, kw_only=True):
     state: Optional[str] = None
 
 
-def _chain_order(bands: Sequence[MultiEndedAllocator]) -> Tuple[MultiEndedAllocator]:
+def _chain_order(bands: Sequence[Band]) -> Tuple[Band]:
     """Low byte to high byte: the grow-up end, the floats, the grow-down end."""
     rank = {"up": 0, "float": 1, "down": 2}
     return tuple(sorted(bands, key=lambda band: rank[band.grow_direction]))
 
 
-def _wire_chain(chain: Sequence[MultiEndedAllocator]) -> None:
+def _wire_chain(chain: Sequence[Band]) -> None:
     if len(chain) == 2:
         low, high = chain
         low.bind_peer(high)
@@ -70,7 +75,7 @@ def _wire_chain(chain: Sequence[MultiEndedAllocator]) -> None:
         high.bind_low_peer(low)
 
 
-def slot_id_space(band: MultiEndedAllocator, *, owner: Hashable) -> IdSpace:
+def slot_id_space(band: Band, *, owner: Hashable) -> IdSpace:
     """How a state band's slots are named: a request's slot id is virtual and
     maps to its physical slot through the band's table, one slot per entry, so
     the write is exactly a gather through ``read_v2p``, which a fused index
@@ -81,6 +86,44 @@ def slot_id_space(band: MultiEndedAllocator, *, owner: Hashable) -> IdSpace:
         read_v2p=band.virtual_to_physical,
         table=band.virtual_to_physical,
     )
+
+
+def take_new_pages(
+    owner: Band,
+    num_new_pages: int,
+    page_tokens: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    copy_new_pages: bool,
+) -> Optional[torch.Tensor]:
+    """Give a batch of requests the owner pages its next tokens need.
+
+    ``page_tokens`` runs a paging kernel over the owner's free virtual pages:
+    each request first fills its tail page, then takes new pages in order, and
+    the kernel returns the virtual token ids. The pages it took are then placed
+    in the owner's band (else v2p stays -1 and translation yields negative
+    ids)."""
+    if num_new_pages > len(owner.free_virtual_ids):
+        return None
+    # Physical-capacity pre-check; on shortfall run the relief ladder.
+    need_tokens = num_new_pages * owner.page_size
+    if need_tokens > owner.available_size():
+        if not relieve_for_alloc(owner, need_tokens):
+            return None
+    # The free list is only rebound, not mutated in place, so its consumed
+    # prefix still names the pages the kernel takes.
+    new_virtual_pages = None
+    if num_new_pages > 0:
+        new_virtual_pages = owner.free_virtual_ids[:num_new_pages]
+        if copy_new_pages:
+            new_virtual_pages = new_virtual_pages.clone()
+    out_indices = page_tokens(owner.free_virtual_ids)
+    if new_virtual_pages is not None:
+        if owner.place_pages(new_virtual_pages, num_new_pages) is None:
+            return None  # defensive; the pre-check should have prevented it
+    # A rebind moves the capacity epoch; a step within its pages takes none.
+    if num_new_pages > 0:
+        owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
+    return out_indices
 
 
 class ChainAllocator(BaseTokenToKVPoolAllocator):
@@ -138,8 +181,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
         )
-        self.full_attn_allocator = MultiEndedAllocator(
-            kvcache=self.views[roles.owner],
+        self.full_attn_allocator = Band(
             sub_pool_name=roles.owner,
             is_id_owner=True,
             page_size=page_size,
@@ -147,15 +189,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=lazy_compaction,
             **band,
         )
-        self.swa_attn_allocator: Optional[MultiEndedAllocator] = None
+        self.swa_attn_allocator: Optional[Band] = None
         if roles.window is not None:
             floats = arena.band(roles.window).grow_direction == "float"
             # A float never runs the lazy event pipeline: frees mark holes and
             # allocations reuse them in place.
-            self.swa_attn_allocator = (
-                FloatMultiEndedAllocator if floats else MultiEndedAllocator
-            )(
-                kvcache=self.views[roles.window],
+            self.swa_attn_allocator = (FloatBand if floats else Band)(
                 sub_pool_name=roles.window,
                 is_id_owner=False,  # binds the virtual pages the owner mints
                 page_size=page_size,
@@ -163,10 +202,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
                 **band,
             )
-        self.mamba_allocator: Optional[MultiEndedAllocator] = None
+        self.mamba_allocator: Optional[Band] = None
         if roles.state is not None:
-            self.mamba_allocator = MultiEndedAllocator(
-                kvcache=self.views[roles.state],
+            self.mamba_allocator = Band(
                 sub_pool_name=roles.state,
                 is_id_owner=True,
                 page_size=1,  # state is per request, orthogonal to KV paging
@@ -174,7 +212,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 **band,
             )
         # Role order: owner, window, state. Every fan-out walks this tuple.
-        self.members: Tuple[MultiEndedAllocator, ...] = tuple(
+        self.members: Tuple[Band, ...] = tuple(
             b
             for b in (
                 self.full_attn_allocator,
@@ -231,7 +269,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self.swa_attn_allocator is not None
 
     @property
-    def _windows(self) -> Tuple[MultiEndedAllocator, ...]:
+    def _windows(self) -> Tuple[Band, ...]:
         return () if self.swa_attn_allocator is None else (self.swa_attn_allocator,)
 
     # -- capacity views (the interim policy of the chain's shape) --
@@ -393,7 +431,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def flush_deferred_full_frees(self) -> None:
         """Expose grouped owner frees without ending the caller's free group."""
-        _flush_deferred_free_group(
+        flush_deferred_free_group(
             self,
             (
                 self.free_group,
@@ -404,7 +442,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
-        return _full_tokens_before_mamba_recheck(
+        return full_tokens_before_mamba_recheck(
             self.full_attn_allocator, self.mamba_allocator, target_size
         )
 
@@ -600,7 +638,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def verify_byte_accounting(self) -> List[str]:
         return (
-            _chain_byte_accounting_violations(list(self.bands))
+            chain_byte_accounting_violations(list(self.bands))
             + self._policy.memo_violations(self)
             + self._snapshot_memo_violations()
         )
@@ -659,14 +697,30 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int,
     ) -> Callable[[], Optional[torch.Tensor]]:
-        return lambda: self.full_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
+        def extend_tokens(free_pages: torch.Tensor) -> torch.Tensor:
+            bs = len(prefix_lens)
+            out_indices = torch.empty(
+                (extend_num_tokens,), dtype=torch.int64, device=self.device
+            )
+            # The kernel computes `page_id * page_size + offset`, so the free
+            # virtual pages yield virtual token ids.
+            with record_function("ChainAllocator.alloc_extend.kernel"):
+                alloc_extend_kernel[(bs,)](
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    free_pages,
+                    out_indices,
+                    next_power_of_2(bs),
+                    self.full_attn_allocator.page_size,
+                )
+            return out_indices
+
+        return lambda: take_new_pages(
+            self.full_attn_allocator,
+            num_new_pages,
+            extend_tokens,
+            copy_new_pages=False,
         )
 
     def alloc_extend(
@@ -682,14 +736,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         virtual pages the owner consumed."""
         with record_function("ChainAllocator.alloc_extend"):
             if not self._policy.prices_before_take:
-                return self.full_attn_allocator.alloc_extend(
+                return self._paged_take(
                     prefix_lens,
                     prefix_lens_cpu,
                     seq_lens,
                     seq_lens_cpu,
                     last_loc,
                     extend_num_tokens,
-                )
+                    get_num_new_pages(
+                        seq_lens=seq_lens_cpu,
+                        page_size=self.full_attn_allocator.page_size,
+                        prefix_lens=prefix_lens_cpu,
+                    ),
+                )()
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
@@ -785,21 +844,34 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Paged decode: one new token per request, consuming a page only when the
         decode wraps."""
         with record_function("ChainAllocator.alloc_decode"):
-            if not self._policy.prices_before_take:
-                # The owner counts, prices and relieves its own decode pages.
-                return self.full_attn_allocator.alloc_decode(
-                    seq_lens, seq_lens_cpu, last_loc
-                )
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
+
+            def decode_tokens(free_pages: torch.Tensor) -> torch.Tensor:
+                bs = len(seq_lens)
+                out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+                with record_function("ChainAllocator.alloc_decode.kernel"):
+                    alloc_decode_kernel[(bs,)](
+                        seq_lens,
+                        last_loc,
+                        free_pages,
+                        out_indices,
+                        next_power_of_2(bs),
+                        self.full_attn_allocator.page_size,
+                    )
+                return out_indices
+
             need_tokens = num_new_pages * self.page_size
             return self._allocate(
                 full_tokens=need_tokens,
                 swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
-                owner_take=lambda: self.full_attn_allocator.alloc_decode(
-                    seq_lens, seq_lens_cpu, last_loc
+                owner_take=lambda: take_new_pages(
+                    self.full_attn_allocator,
+                    num_new_pages,
+                    decode_tokens,
+                    copy_new_pages=True,
                 ),
             )
 
@@ -870,9 +942,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._free_window_page_reps(window, reps)
             window.clear_inverse_history()
 
-    def _free_window_page_reps(
-        self, window: MultiEndedAllocator, reps: torch.Tensor
-    ) -> None:
+    def _free_window_page_reps(self, window: Band, reps: torch.Tensor) -> None:
         v_pages = reps // self.page_size
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
@@ -960,7 +1030,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()` for a segment whose window pages
-        are all bound; see `MultiEndedAllocator._page_reps`."""
+        are all bound; see `Band._page_reps`."""
         if free_index is None or free_index.numel() == 0:
             return
         if not self._windows and self.page_size == 1:

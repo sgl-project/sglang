@@ -28,11 +28,11 @@ import torch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.kv.alloc.band import (
+    Band,
+    FloatBand,
+)
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
 from sglang.srt.mem_cache.kv.lifecycle import acquire
@@ -64,6 +64,10 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
+
+# The owner page take behind the paged extend; stubbed so these CPU tests
+# never launch the GPU paging kernel.
+_TAKE_NEW_PAGES = "sglang.srt.mem_cache.kv.alloc.chain.take_new_pages"
 
 
 class TestUnifiedTriPool(unittest.TestCase):
@@ -120,7 +124,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
         ma = allocator.mamba_allocator
-        self.assertIsInstance(sa, FloatMultiEndedAllocator)
+        self.assertIsInstance(sa, FloatBand)
         self.assertIs(ma.high_peer, sa)
         self.assertIs(sa.low_peer, ma)
         self.assertIs(sa.high_peer, fa)
@@ -137,9 +141,9 @@ class TestUnifiedTriPool(unittest.TestCase):
         # With an empty prefix, ordinary allocation supplies the same virtual
         # pages without launching the GPU extend kernel. All page binding and
         # capacity accounting still run through the real sub-allocators.
-        full = allocator.full_attn_allocator
-        with patch.object(
-            full, "alloc_extend", side_effect=lambda *a, **kw: full.alloc(12)
+        with patch(
+            _TAKE_NEW_PAGES,
+            side_effect=lambda owner, n, *a, **kw: owner.alloc(n * owner.page_size),
         ):
             virtual = allocator.alloc_extend_swa_tail(
                 prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
@@ -167,10 +171,11 @@ class TestUnifiedTriPool(unittest.TestCase):
                     self.assertTrue(allocator.can_reserve(length, tail_len))
                     prefix = torch.tensor([0], dtype=torch.int64)
                     seq = torch.tensor([length], dtype=torch.int64)
-                    with patch.object(
-                        full,
-                        "alloc_extend",
-                        side_effect=lambda *a, **kw: full.alloc(length),
+                    with patch(
+                        _TAKE_NEW_PAGES,
+                        side_effect=lambda owner, n, *a, **kw: owner.alloc(
+                            n * owner.page_size
+                        ),
                     ):
                         virtual = allocator.alloc_extend_swa_tail(
                             prefix,
@@ -198,7 +203,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         length = full.available_size() + 4
         prefix = torch.tensor([0], dtype=torch.int64)
         seq = torch.tensor([length], dtype=torch.int64)
-        with patch.object(full, "alloc_extend") as extend:
+        with patch(_TAKE_NEW_PAGES) as extend:
             self.assertIsNone(
                 allocator.alloc_extend_swa_tail(
                     prefix, prefix, seq, seq, torch.tensor([-1]), length, 0
@@ -348,9 +353,9 @@ class TestUnifiedTriPool(unittest.TestCase):
         sa = allocator.swa_attn_allocator
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
+        from sglang.srt.mem_cache.kv.alloc.band import relieve_for_alloc
 
-        _relieve_for_alloc(allocator, 1)
+        relieve_for_alloc(allocator, 1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
     def test_full_donor_stops_after_float_exposes_mamba_capacity(self):
@@ -600,10 +605,10 @@ class TestGeneralizedRebalance(unittest.TestCase):
         """Raw end+float+end chain, BOTH orientations in one fixture: the
         up-growing end opens the float's LOW side, the down-growing end its
         HIGH side."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatBand
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatBand(
+            [m for m in dir(TestFloatBand) if m.startswith("test_")][0]
         )
         _pool, up_end, fla, down_end, _kv = inst._build_tri()
         v = fla.alloc(8)  # opaque float mid-region
@@ -628,9 +633,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
         self.assertLess(fla.high_wm_page, high_before)  # opened HIGH side
 
     def test_two_pool_chain_rebalance_is_a_noop(self):
-        from test_multi_ended_allocator import (
-            TestPagedMultiEndedAllocator as _PagedFixture,
-        )
+        from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 
         inst = _PagedFixture(
             [m for m in dir(_PagedFixture) if m.startswith("test_")][0]
@@ -885,9 +888,9 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
+        from sglang.srt.mem_cache.kv.alloc.band import relieve_for_alloc
 
-        _relieve_for_alloc(alloc, 1)  # the ladder
+        relieve_for_alloc(alloc, 1)  # the ladder
         self.assertEqual(sa._hole_pages(), 0)  # rung 0 ran
         self.assertEqual(len(sa._inverse_history), moves_before)  # zero copies
 
@@ -1676,7 +1679,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
     def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
         """The settle before a float move must be a stream wait: a host sync
         there would land on the alloc-shortfall path every time the float moves."""
-        src = inspect.getsource(MultiEndedAllocator._settle_inflight_forward)
+        src = inspect.getsource(Band._settle_inflight_forward)
         self.assertIn("wait_event", src)
         self.assertNotIn(".item()", src)
         self.assertNotIn("synchronize()", src)

@@ -342,9 +342,9 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+    from sglang.srt.mem_cache.kv.alloc.band import Band
 
-    if isinstance(allocator, MultiEndedAllocator):
+    if isinstance(allocator, Band):
         # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,

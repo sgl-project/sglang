@@ -440,7 +440,7 @@ class UnifiedMambaSlotAllocator:
             return torch.empty((0,), dtype=torch.int64, device=self._device)
         return torch.arange(start, end, dtype=torch.int64, device=self._device)
 
-    # -- slot management (delegates to the MultiEndedAllocator) --
+    # -- slot management (delegates to the Band) --
 
     def alloc(self, need_size: int):
         # alloc_group fast path: single-slot draws from the prefetched batch.

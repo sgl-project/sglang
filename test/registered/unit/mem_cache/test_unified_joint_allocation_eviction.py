@@ -322,7 +322,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 extra_tokens = sum(b - a for a, b in zip(prefixes, lengths))
                 before_pages = allocator.full_attn_allocator.allocated_count() // 4
                 with patch(
-                    "sglang.srt.mem_cache.allocator.unified_sub_pool.alloc_extend_kernel",
+                    "sglang.srt.mem_cache.kv.alloc.chain.alloc_extend_kernel",
                     CPUReferenceKernel(),
                 ):
                     out = alloc_paged_token_slots_extend(

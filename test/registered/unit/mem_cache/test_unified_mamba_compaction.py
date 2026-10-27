@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import torch
 from test_unified_mamba_views import _make_pool
 
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,18 +34,16 @@ class TestMambaCompaction(CustomTestCase):
             spec_state_size=0,
             mamba_layer_ids=[1, 3],
         )
-        alloc = MultiEndedAllocator(
+        alloc = Band(
             arena=pool,
             sub_pool_name="mamba",
-            kvcache=kv,
             device=device,
             is_id_owner=True,
             lazy_compaction=lazy,
         )
-        full = MultiEndedAllocator(
+        full = Band(
             arena=pool,
             sub_pool_name="full",
-            kvcache=Mock(),
             device=device,
             is_id_owner=True,
             lazy_compaction=lazy,

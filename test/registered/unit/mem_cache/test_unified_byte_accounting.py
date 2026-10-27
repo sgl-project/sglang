@@ -26,10 +26,10 @@ live + holes + pending pages at EVERY point of a lifecycle, not just at rest.
 
 import unittest
 
-from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
+from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
 
-from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
+from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -142,7 +142,7 @@ class TestChainFrontierOrder(unittest.TestCase):
         self.assertIsNotNone(down.alloc(down.page_size * 2))  # down side live
         self.assertLess(down._byte_low_frontier(), up.arena.total_bytes)
         up.watermark_physical = up.num_pages  # up band swallows the buffer
-        out = mea._chain_byte_accounting_violations(chain)
+        out = mea.chain_byte_accounting_violations(chain)
         self.assertTrue(any("overlap" in s for s in out), out)
 
 

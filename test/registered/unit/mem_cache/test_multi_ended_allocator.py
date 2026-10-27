@@ -39,12 +39,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
+from sglang.srt.mem_cache.kv.alloc.band import (
+    Band,
+    FloatBand,
+)
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
@@ -213,7 +213,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         self.assertTrue(torch.all(temporal_view[2, 6] == -1.25))
 
 
-class TestMultiEndedAllocator(unittest.TestCase):
+class TestBand(unittest.TestCase):
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()
@@ -232,15 +232,13 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool, "full")
         mamba_kv = _FakeKVCache(pool, "mamba")
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
+        full_alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
+        mamba_alloc = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
@@ -250,7 +248,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, mamba_alloc, full_kv, mamba_kv
 
-    def _check_invariants(self, alloc: MultiEndedAllocator, kv: _FakeKVCache):
+    def _check_invariants(self, alloc: Band, kv: _FakeKVCache):
         v2p = alloc.virtual_to_physical
         p2v = alloc.physical_to_virtual
         # live virtual ids = those with v2p != -1, excluding the reserved id 0.
@@ -279,7 +277,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         self.assertEqual(free_set & set(live_v), set())
 
-    def _alloc(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, n: int):
+    def _alloc(self, alloc: Band, kv: _FakeKVCache, n: int):
         avail = alloc.available_size()
         v = alloc.alloc(n)
         if n > avail:
@@ -292,7 +290,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         kv.buf[p] = v
         return v
 
-    def _free(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v: torch.Tensor):
+    def _free(self, alloc: Band, kv: _FakeKVCache, v: torch.Tensor):
         p = alloc.virtual_to_physical[v]
         kv.buf[p] = -1  # the freed virtual id's data is gone
         alloc.free(v)
@@ -378,16 +376,14 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool, "full")
         mamba_kv = _FakeKVCache(pool, "mamba")
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
+        full_alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             lazy_compaction=True,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
+        mamba_alloc = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
@@ -1195,8 +1191,8 @@ class TestWindowChainAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPagedMultiEndedAllocator(unittest.TestCase):
-    """`MultiEndedAllocator(page_size=8)`: free-list, v2p/p2v and compaction are
+class TestPagedBand(unittest.TestCase):
+    """`Band(page_size=8)`: free-list, v2p/p2v and compaction are
     page-granular, while the external API stays in token ids as at page_size 1."""
 
     def setUp(self):
@@ -1240,16 +1236,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool, "full")
         swa_kv = _FakeKVCache(pool, "swa")
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
+        full_alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
         )
-        swa_alloc = MultiEndedAllocator(
-            kvcache=swa_kv,
+        swa_alloc = Band(
             arena=pool,
             sub_pool_name="swa",
             device=_DEV,
@@ -1260,9 +1254,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         swa_alloc.bind_peer(full_alloc)
         return pool, full_alloc, swa_alloc, full_kv, swa_kv
 
-    def _stamp_tokens(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
-    ):
+    def _stamp_tokens(self, alloc: Band, kv: _FakeKVCache, v_tokens: torch.Tensor):
         """Stamp each returned token's own id into `kv.buf` at its physical token."""
         if v_tokens.numel() == 0:
             return
@@ -1273,9 +1265,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         phys_tokens = phys_pages * ps + offsets
         kv.buf[phys_tokens] = v_tokens
 
-    def _check_invariants(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, stamped_tokens: dict
-    ):
+    def _check_invariants(self, alloc: Band, kv: _FakeKVCache, stamped_tokens: dict):
         v2p = alloc.virtual_to_physical
         p2v = alloc.physical_to_virtual
         ps = alloc.page_size
@@ -1474,7 +1464,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 9. Regression: alloc_extend must bind v2p / p2v; an unbound page leaves
     # v2p at -1, and translate_kv_loc then emits negative (OOB) token ids.
     def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1482,37 +1472,15 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Stub the kernel: driving the real Triton one needs a GPU, and the
-        # binding contract holds regardless of what it writes to out_indices.
-        original_kernel = mea_mod.alloc_extend_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_extend_kernel = _NoOpKernelGrid()
-        try:
-            # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEV)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            seq_lens = torch.tensor([2 * PS], dtype=torch.int64, device=_DEV)
-            seq_lens_cpu = torch.tensor([2 * PS], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=_DEV)
-
-            out = full_alloc.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                2 * PS,
-                num_new_pages=2,
-            )
-        finally:
-            mea_mod.alloc_extend_kernel = original_kernel
+        # The paging kernel is stubbed: driving the real Triton one needs a GPU,
+        # and the binding contract holds regardless of the token ids it writes.
+        # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
+        out = take_new_pages(
+            full_alloc,
+            2,
+            lambda free_pages: torch.empty(2 * PS, dtype=torch.int64, device=_DEV),
+            copy_new_pages=False,
+        )
 
         self.assertIsNotNone(out)
         consumed_pages = free_before[:2]
@@ -1550,7 +1518,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 10. Regression: alloc_decode must bind v2p / p2v when it wraps to a new
     # page; most decode steps reuse the prefix's tail page and bind nothing.
     def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
+        from sglang.srt.utils.common import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1573,20 +1542,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
         )
 
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        # The paging kernel is stubbed; the binding contract does not depend
+        # on the token ids it writes.
+        out = take_new_pages(
+            full_alloc,
+            get_num_new_pages(seq_lens=seq_lens_cpu, page_size=PS, decode=True),
+            lambda free_pages: torch.empty(1, dtype=torch.int64, device=_DEV),
+            copy_new_pages=True,
+        )
 
         self.assertIsNotNone(out)
         # 1 virtual page consumed from the head of free_virtual_ids.
@@ -1626,7 +1589,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 11. Regression: alloc_decode with num_new_pages == 0 must not advance
     # the watermark or touch v2p / p2v.
     def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
+        from sglang.srt.utils.common import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1646,20 +1610,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
         )
 
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        # The paging kernel is stubbed; the binding contract does not depend
+        # on the token ids it writes.
+        out = take_new_pages(
+            full_alloc,
+            get_num_new_pages(seq_lens=seq_lens_cpu, page_size=PS, decode=True),
+            lambda free_pages: torch.empty(1, dtype=torch.int64, device=_DEV),
+            copy_new_pages=True,
+        )
 
         self.assertIsNotNone(out)
         # Nothing should have moved -- no new page consumed.
@@ -2027,16 +1985,14 @@ class TestLazyCompaction(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool, "full")
         mamba_kv = _FakeKVCache(pool, "mamba")
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
+        full_alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             lazy_compaction=lazy,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
+        mamba_alloc = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
@@ -2047,7 +2003,7 @@ class TestLazyCompaction(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, full_kv
 
-    def _stamp_kv(self, kv: _FakeKVCache, alloc: MultiEndedAllocator, tokens) -> None:
+    def _stamp_kv(self, kv: _FakeKVCache, alloc: Band, tokens) -> None:
         """Write a marker into KV[phys] for each freshly-alloced virtual
         token id, so we can later check the data followed any relocation.
         """
@@ -2288,7 +2244,7 @@ class TestLazyCompaction(unittest.TestCase):
 
 
 class TestO3FusedAllocBind(unittest.TestCase):
-    """Fused take_physical_pages + bind via `_alloc_bind_fast_or_slow`.
+    """Fused take_physical_pages + bind via `place_pages`.
     GPU-only: the fused kernel is Triton."""
 
     def setUp(self):
@@ -2322,8 +2278,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         )
         full_kv = _FakeKVCache(pool, "full")
         mamba_kv = _FakeKVCache(pool, "mamba")
-        fa = MultiEndedAllocator(
-            kvcache=full_kv,
+        fa = Band(
             arena=pool,
             sub_pool_name="full",
             device="cuda",
@@ -2331,8 +2286,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
             page_size=page_size,
             lazy_compaction=lazy,
         )
-        ma = MultiEndedAllocator(
-            kvcache=mamba_kv,
+        ma = Band(
             arena=pool,
             sub_pool_name="mamba",
             device="cuda",
@@ -2353,7 +2307,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         wm_before = fa.watermark_physical
         # Only v_pages' numel matters to the helper.
         v_pages = torch.zeros(N, dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, N)
+        phys = fa.place_pages(v_pages, N)
         self.assertIsNone(phys)
         # Allocator state unchanged.
         self.assertEqual(fa.watermark_physical, wm_before)
@@ -2367,7 +2321,7 @@ class TestO3FusedAllocBind(unittest.TestCase):
         _pool_b, fa_b, _kv_b = self._make_full(lazy=True)
         v_pages = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64, device="cuda")
         # Fast path on fa_a.
-        phys_a = fa_a._alloc_bind_fast_or_slow(v_pages, 5)
+        phys_a = fa_a.place_pages(v_pages, 5)
         # Slow path on fa_b: directly call take_physical_pages + bind
         # (the unfused reference implementation).
         phys_b = fa_b.take_physical_pages(5)
@@ -2650,15 +2604,13 @@ class TestChainFrontierWalk(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
         )
-        fa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "full"),
+        fa = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        ma = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "mamba"),
+        ma = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
@@ -2763,7 +2715,7 @@ class TestChainFrontierWalk(unittest.TestCase):
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
 
 
-class TestFloatMultiEndedAllocator(CustomTestCase):
+class TestFloatBand(CustomTestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
     and the on-demand movers `make_room` and `compact_holes`."""
@@ -2789,24 +2741,21 @@ class TestFloatMultiEndedAllocator(CustomTestCase):
             device=device,
             enable_memory_saver=False,
         )
-        sa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "state"),
+        sa = Band(
             arena=pool,
             sub_pool_name="state",
             device=device,
             is_id_owner=True,
         )
         fkv = _FakeKVCache(pool, "swa")
-        fla = FloatMultiEndedAllocator(
-            kvcache=fkv,
+        fla = FloatBand(
             arena=pool,
             sub_pool_name="swa",
             device=device,
             is_id_owner=True,
         )
         dkv = _FakeKVCache(pool, "full")
-        da = MultiEndedAllocator(
-            kvcache=dkv,
+        da = Band(
             arena=pool,
             sub_pool_name="full",
             device=device,
@@ -3153,8 +3102,7 @@ class TestDcpWidening(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "full"),
+        alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
@@ -3163,8 +3111,7 @@ class TestDcpWidening(unittest.TestCase):
             shards_under_dcp=True,
         )
         # The peer stays slot-granular: mamba state is replicated, not sharded.
-        mamba = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "mamba"),
+        mamba = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,

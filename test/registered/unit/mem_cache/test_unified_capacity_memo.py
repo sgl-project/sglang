@@ -159,10 +159,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         (the span flips transparency, walling off their gaps) keep serving
         pre-move values. Exercised on a hand-wired end+float+end chain so no
         end-pool descriptor write can mask a missing span bump."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatBand
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatBand(
+            [m for m in dir(TestFloatBand) if m.startswith("test_")][0]
         )
         _pool, sa, fla, da, _kv = inst._build_tri()
         self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path
@@ -294,7 +294,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
 
 # The paging kernels are Triton; neither the epoch nor the memos depend on the
 # ids they write, so they are stood in for on CPU.
-_PAGING_KERNELS = "sglang.srt.mem_cache.allocator.unified_sub_pool"
+_PAGING_KERNELS = "sglang.srt.mem_cache.kv.alloc.chain"
 
 
 class _NoOpKernel:

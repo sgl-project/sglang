@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvAttnBackend,
     InklingShortConvHybridAttnBackend,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
@@ -74,8 +74,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_state_size=0,
             mamba_layer_ids=[0, 1],
         )
-        allocator = MultiEndedAllocator(
-            kvcache=pool,
+        allocator = Band(
             arena=shared,
             sub_pool_name="mamba",
             device="cuda",

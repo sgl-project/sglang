@@ -11,13 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiEndedAllocator: one allocator per band of a `KVArena`.
+"""A band: one sub-pool's units in a `KVArena`.
 
-`alloc*` run the upstream kernels ONCE in virtual space using `free_virtual_ids`
-as the free-page pointer, then bind consumed virtual pages to physical pages so
-`translate_kv_loc` resolves. Public methods take/return TOKEN-granular tensors;
-`free_virtual_ids` and the v2p/p2v tables are page-granular. For `page_size == 1`
-page math collapses to slot math byte-identically.
+A band places its sub-pool's units in its stretch of the arena's bytes: an end
+grows from one end of the arena toward the other, a float holds a span between
+two neighbours. It takes and frees physical units, binds them to the virtual
+units its sub-pool names (the owner mints those; a window binds the owner's),
+and moves units to compact or make room, lazily behind the forward that may
+still read them. Counts are in the sub-pool's tokens (`page_size` per unit).
+
+Requests are not a band's concern: the chain allocator turns a request's token
+positions into new units and hands them to its bands.
 """
 
 from __future__ import annotations
@@ -48,14 +52,8 @@ from sglang.kernels.ops.memory.virtual_slot import (
     translate_token_ids,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import (
-    alloc_decode_kernel,
-    alloc_extend_kernel,
-)
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +68,7 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
 )
 # Signal handler emits each instance's final counters (atexit misses signal exits).
-_STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
+_STATS_INSTANCES: weakref.WeakSet[Band] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
@@ -190,7 +188,7 @@ def _float_open_short_side(flt, demand) -> None:
         flt.make_room(side=short, min_bytes=sides[short] + f_bytes + slack)
 
 
-def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
+def relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     """THE shortfall ladder: every allocation shortfall in the unified pool runs
     exactly this, whether a single band's own alloc or the chain allocator's coupled
     multi-band alloc. The urgent flush is called unconditionally -- an eager END no-ops
@@ -215,8 +213,8 @@ def _drains_on_urgent_flush(neighbor) -> bool:
     )
 
 
-def _flush_deferred_free_group(
-    allocator: BaseTokenToKVPoolAllocator,
+def flush_deferred_free_group(
+    allocator,
     pending_groups: Sequence[Optional[Sequence[torch.Tensor]]],
 ) -> None:
     """Apply queued frees and reopen the caller's free-group scope."""
@@ -226,9 +224,9 @@ def _flush_deferred_free_group(
     allocator.free_group_begin()
 
 
-def _full_tokens_before_mamba_recheck(
-    full_allocator: MultiEndedAllocator,
-    mamba_allocator: MultiEndedAllocator,
+def full_tokens_before_mamba_recheck(
+    full_allocator: Band,
+    mamba_allocator: Band,
     target_size: int,
 ) -> int:
     """Conservative Full-token lower bound for the next Mamba capacity check.
@@ -247,8 +245,8 @@ def _full_tokens_before_mamba_recheck(
     return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
 
 
-class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for one band of a `KVArena`.
+class Band:
+    """One sub-pool's units in a `KVArena`: an end of the chain.
 
     ``need_sort`` applies to transfer-facing physical ids, not virtual ids.
     Physical free pages are sorted during compaction, and allocation hands out
@@ -267,7 +265,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         *,
-        kvcache,
         arena: KVArena,
         sub_pool_name: str,
         device: str,
@@ -285,15 +282,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # replicated, so they stay slot-granular whatever the process width is.
         self.shards_under_dcp = shards_under_dcp
         dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
-        super().__init__(
-            size=max_slots * dcp_size,
-            page_size=page_size * dcp_size,
-            # A band hands out units of the arena's bytes.
-            dtype=torch.uint8,
-            device=device,
-            kvcache=kvcache,
-            need_sort=need_sort,
-        )
+        self.size = max_slots * dcp_size
+        self.device = device
+        self.need_sort = need_sort
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group: Optional[List[torch.Tensor]] = None
         self.arena = arena
         self.sub_pool_name = sub_pool_name
         self.max_slots = max_slots
@@ -354,8 +347,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
-        self.low_peer: Optional[MultiEndedAllocator] = None
-        self.high_peer: Optional[MultiEndedAllocator] = None
+        self.low_peer: Optional[Band] = None
+        self.high_peer: Optional[Band] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
         self._inverse_history: List[
@@ -447,7 +440,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
         logger.info(
-            "[unified-memory-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
+            "[unified-memory-pool] Band(%r) ready: grow=%s, max_slots=%d, "
             "min_slot_index=%d, page_size=%d, num_pages=%d, min_page_index=%d, "
             "entry_bytes=%d, entry_bytes_per_page=%d, is_id_owner=%s, "
             "initial_watermark_page=%d, allocatable_pages=%d",
@@ -467,7 +460,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- chain-neighbor binding --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_peer(self, peer: Band) -> None:
         """Bind the OTHER end as this end's growth-side neighbor: a grow-up
         pool's neighbor sits above it, a grow-down pool's below.
         """
@@ -485,11 +478,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_low_peer(self, peer: Band) -> None:
         self.low_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
-    def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
+    def bind_high_peer(self, peer: Band) -> None:
         self.high_peer = peer
         self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
@@ -678,7 +671,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             p = p.high_peer
         return total
 
-    def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
+    def _growth_side_neighbor(self) -> Optional[Band]:
         """Nearest NON-transparent chain member on this pool's GROWTH side -- the
         one whose compaction releases bytes reachable at this pool's frontier."""
         p = self.high_peer if self.grow_direction == "up" else self.low_peer
@@ -790,7 +783,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """A band short on its OWN pages asks the growth-side member, if it is a
         float, to open the side facing it; the policy is `_float_open_short_side`."""
         blocker = self._growth_side_neighbor()
-        if not isinstance(blocker, FloatMultiEndedAllocator):
+        if not isinstance(blocker, FloatBand):
             return
         _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
 
@@ -800,7 +793,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Reserve `need_size` TOKENS (multiple of page_size), returning backing
         physical PAGE ids, or `None` on shortfall.
         """
-        with record_function("MultiEndedAlloc.take_physical"):
+        with record_function("Band.take_physical"):
             if need_size <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
             assert need_size % self.page_size == 0, (
@@ -927,7 +920,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         """Page-granular wrapper around ``take_physical``."""
-        with record_function("MultiEndedAlloc.take_physical_pages"):
+        with record_function("Band.take_physical_pages"):
             return self.take_physical(num_pages * self.page_size)
 
     def _sorted_free_phys_pages(self) -> torch.Tensor:
@@ -965,7 +958,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Bind page-granular virtual ids to physical ids."""
-        with record_function("MultiEndedAlloc.bind"):
+        with record_function("Band.bind"):
             bind_inplace(
                 virtual_ids,
                 physical_ids,
@@ -975,14 +968,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- fused take_physical_pages + bind --
 
-    def _alloc_bind_fast_or_slow(
-        self, v_pages: torch.Tensor, N: int
-    ) -> Optional[torch.Tensor]:
+    def place_pages(self, v_pages: torch.Tensor, N: int) -> Optional[torch.Tensor]:
         """Fuse `take_physical_pages` + `bind` into ONE Triton kernel when no
         holes need draining; fall through to the slow path (drains holes first)
         when holes exist. Returns physical page ids [N], or None on shortfall.
         """
-        with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
+        with record_function("Band.place_pages"):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
 
@@ -1043,7 +1034,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
             return
-        with record_function("MultiEndedAlloc._maybe_zero_pages"):
+        with record_function("Band._maybe_zero_pages"):
             self.arena.zero_units(self.sub_pool_name, phys_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
@@ -1068,7 +1059,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         consumer whose kernel ABI wants int32 narrows where it fills that
         buffer.
         """
-        with record_function("MultiEndedAlloc.translate_kv_loc"):
+        with record_function("Band.translate_kv_loc"):
             return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
 
     def _translate_loc_fused(
@@ -1108,7 +1099,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
-        with record_function("MultiEndedAlloc.translate_write_loc"):
+        with record_function("Band.translate_write_loc"):
             return self._translate_loc_fused(
                 widened_loc,
                 dcp_size=dcp_size,
@@ -1127,27 +1118,27 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         `wait_stream` barrier because its v2p/p2v writes are picked up by the
         forward via `forward_stream.wait_stream(schedule_stream)` in `run_batch`.
         """
-        with record_function("MultiEndedAlloc.alloc"):
+        with record_function("Band.alloc"):
             assert self.is_id_owner, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc called on a "
+                f"Band({self.sub_pool_name!r}).alloc called on a "
                 "non-id-owner allocator; use alloc_with_virtual instead"
             )
             if need_size <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
             assert need_size % self.page_size == 0, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc: need_size="
+                f"Band({self.sub_pool_name!r}).alloc: need_size="
                 f"{need_size} must be a multiple of page_size={self.page_size}"
             )
             if need_size > self.available_size():
                 # Shortfall: flush the PEER, not own -- see `_flush_targets`.
-                if not _relieve_for_alloc(self, need_size):
+                if not relieve_for_alloc(self, need_size):
                     return None
             num_pages = need_size // self.page_size
             if num_pages > len(self.free_virtual_ids):
                 return None
             v_pages = self.free_virtual_ids[:num_pages]
             self.free_virtual_ids = self.free_virtual_ids[num_pages:]
-            phys_pages = self._alloc_bind_fast_or_slow(v_pages, num_pages)
+            phys_pages = self.place_pages(v_pages, num_pages)
             if phys_pages is None:
                 self.free_virtual_ids = torch.cat([v_pages, self.free_virtual_ids])
                 return None
@@ -1158,148 +1149,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ids), for a physical-holding non-owner such as the SWA `swa` sub-allocator.
         The chain allocator snapshots the virtual pages before the id-owner consumes them.
         """
-        with record_function("MultiEndedAlloc.alloc_with_virtual"):
+        with record_function("Band.alloc_with_virtual"):
             if virtual_pages.numel() == 0:
                 return
-            phys_pages = self._alloc_bind_fast_or_slow(
-                virtual_pages, int(virtual_pages.numel())
-            )
+            phys_pages = self.place_pages(virtual_pages, int(virtual_pages.numel()))
             assert phys_pages is not None, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
+                f"Band({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the chain allocator's byte-budget check should have "
                 "caught this)"
             )
-
-    # -- paged alloc surface --
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        num_new_pages: Optional[int] = None,
-    ) -> Optional[torch.Tensor]:
-        """Allocate ``extend_num_tokens`` new tokens across ``bs`` requests,
-        preserving the tail-page-reuse contract.
-
-        Runs the kernel in VIRTUAL space (``free_page_ptr == free_virtual_ids``),
-        so ``out_indices`` are virtual token ids; each consumed virtual page is
-        then bound to a physical page here, else v2p stays -1 and translation
-        yields negative ids (CUDA OOB).
-        """
-        with record_function("MultiEndedAlloc.alloc_extend"):
-            assert self.is_id_owner, (
-                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
-            if num_new_pages is None:
-                num_new_pages = get_num_new_pages(
-                    seq_lens=seq_lens_cpu,
-                    page_size=self.page_size,
-                    prefix_lens=prefix_lens_cpu,
-                )
-            if num_new_pages > len(self.free_virtual_ids):
-                return None
-            # Lazy: physical-capacity pre-check; on shortfall run the ladder.
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
-            bs = len(prefix_lens)
-            # The free list is only rebound, not mutated in place. Retain its
-            # consumed slice for binding without launching a redundant copy.
-            if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages]
-            else:
-                new_virtual_pages = None
-
-            out_indices = torch.empty(
-                (extend_num_tokens,), dtype=torch.int64, device=self.device
-            )
-            # `free_virtual_ids` passed as `free_page_ptr`: the kernel does
-            # `page_id * page_size + offset` regardless of virtual vs physical.
-            with record_function("MultiEndedAlloc.alloc_extend.kernel"):
-                alloc_extend_kernel[(bs,)](
-                    prefix_lens,
-                    seq_lens,
-                    last_loc,
-                    self.free_virtual_ids,
-                    out_indices,
-                    next_power_of_2(bs),
-                    self.page_size,
-                )
-
-            # Bind the consumed virtual pages to fresh physical pages here. The
-            # peer (swa side) binds the same pages via `alloc_with_virtual`.
-            if new_virtual_pages is not None:
-                phys_pages = self._alloc_bind_fast_or_slow(
-                    new_virtual_pages, num_new_pages
-                )
-                if phys_pages is None:
-                    return None  # defensive; pre-check should have prevented it
-
-            # A rebind moves the capacity epoch; a step within its pages takes none.
-            if num_new_pages > 0:
-                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-            return out_indices  # virtual token ids
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Allocate one new token per request (decode), preserving the
-        tail-page-reuse contract. Runs in virtual space, binding each consumed
-        virtual page here (else v2p stays -1 and translation goes OOB).
-        """
-        with record_function("MultiEndedAlloc.alloc_decode"):
-            assert self.is_id_owner, (
-                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
-            bs = len(seq_lens)
-            # CPU-only count BEFORE the kernel, to snapshot the exact slice the
-            # kernel will consume.
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-            )
-            if num_new_pages > len(self.free_virtual_ids):
-                return None
-            # Lazy: physical-capacity pre-check; on shortfall flush PEER.
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
-            # Most decode steps reuse the prefix's tail page -> num_new_pages == 0.
-            if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
-            else:
-                new_virtual_pages = None
-
-            out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-            with record_function("MultiEndedAlloc.alloc_decode.kernel"):
-                alloc_decode_kernel[(bs,)](
-                    seq_lens,
-                    last_loc,
-                    self.free_virtual_ids,
-                    out_indices,
-                    next_power_of_2(bs),
-                    self.page_size,
-                )
-
-            if new_virtual_pages is not None:
-                phys_pages = self._alloc_bind_fast_or_slow(
-                    new_virtual_pages, num_new_pages
-                )
-                if phys_pages is None:
-                    return None
-
-            # A rebind moves the capacity epoch; a step within its pages takes none.
-            if num_new_pages > 0:
-                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-            return out_indices  # virtual token ids
 
     # -- free with eager compaction --
 
@@ -1316,7 +1174,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         in-flight forward; LAZY needs none (a freed `v` has no live reader) and
         defers compaction to `_flush`.
         """
-        with record_function("MultiEndedAlloc.free"):
+        with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
@@ -1330,9 +1188,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # Near-no-op in normal mode (sampling's CPU sync already drained
             # forward_stream); in overlap mode it does the serializing.
             if self.forward_stream is not None:
-                with record_function("MultiEndedAlloc.free.wait_stream"):
+                with record_function("Band.free.wait_stream"):
                     torch.cuda.current_stream().wait_stream(self.forward_stream)
-            with record_function("MultiEndedAlloc.free.v2p_lookup"):
+            with record_function("Band.free.v2p_lookup"):
                 free_v_pages = (
                     _pages
                     if _pages is not None
@@ -1341,7 +1199,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     )
                 )
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
-            with record_function("MultiEndedAlloc.free.sync_check"):
+            with record_function("Band.free.sync_check"):
                 # `.item()` forces a CPU/GPU sync -- own trace region to measure it.
                 if bool((freed_p_pages < 0).any().item()):
                     self._raise_stale_slot_assertion(
@@ -1351,6 +1209,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
+
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
 
     def _page_reps(self, free_index: torch.Tensor, start_pos: int) -> torch.Tensor:
         """One token of every page touched by a page-aligned kv-row segment:
@@ -1383,7 +1246,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         must not double-free -- a tombstone (-1) here would join the free list.
         """
         self._stats_n_free_lazy += 1
-        with record_function("MultiEndedAlloc._free_lazy"):
+        with record_function("Band._free_lazy"):
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if pages is not None:
                 # `free_segment` already derived these by stride slicing.
@@ -1413,7 +1276,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if pages.numel() == 0:
             return
         self._stats_n_release_batch += 1
-        with record_function("MultiEndedAlloc._release_phys_pages_batch"):
+        with record_function("Band._release_phys_pages_batch"):
             self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
@@ -1422,7 +1285,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         copy is order-independent; the caller's `wait_stream` already serialized us
         with the in-flight forward.
         """
-        with record_function("MultiEndedAlloc._compact_pending"):
+        with record_function("Band._compact_pending"):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
@@ -1538,7 +1401,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if torch.device(self.device).type != "cuda":
             return
         assert self.min_page_index >= 1, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).prewarm_compaction needs "
+            f"Band({self.sub_pool_name!r}).prewarm_compaction needs "
             "the reserved sink page 0"
         )
         # The sink page copied onto itself, listed twice: every byte written is
@@ -1558,7 +1421,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Stash the most-recent forward's `forward_done` event; `_pending_reuse`
         uses it to gate src reuse on read-path settling. None = no in-flight forward.
         """
-        with record_function("MultiEndedAlloc.set_latest_forward_done_event"):
+        with record_function("Band.set_latest_forward_done_event"):
             self._latest_forward_done_event = event
 
     def set_inflight_forward(
@@ -1572,7 +1435,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         write this pool (Mamba state goes through mamba kernels, not
         `set_kv_buffer`). No-op in eager mode.
         """
-        with record_function("MultiEndedAlloc.set_inflight_forward"):
+        with record_function("Band.set_inflight_forward"):
             if not self.lazy_compaction:
                 return
             if out_cache_loc_virtual is None or out_cache_loc_virtual.numel() == 0:
@@ -1597,7 +1460,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._inflight_forward = None
             return None
         # `oclv` is non-None here (set_inflight_forward clears the slot otherwise).
-        with record_function("MultiEndedAlloc._materialize_inflight_write_set"):
+        with record_function("Band._materialize_inflight_write_set"):
             # `oclv` is a WIDENED virtual id under DCP; collapse it. A widened page
             # covers the same page, so the non-owned ids fold in harmlessly.
             dcp_size = get_parallel().attn_dcp_size if self.shards_under_dcp else 1
@@ -1684,7 +1547,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_n_drain_calls += 1
         if not self._pending_reuse:
             return
-        with record_function("MultiEndedAlloc._drain_pending_reuse"):
+        with record_function("Band._drain_pending_reuse"):
             ready_tensors: List[torch.Tensor] = []
             ready_entries: List[Tuple[torch.cuda.Event, List[int]]] = []
             for event, (cpu_list, gpu_batches) in self._pending_reuse.items():
@@ -1815,7 +1678,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return 0
         self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
-        with record_function("MultiEndedAlloc._flush"):
+        with record_function("Band._flush"):
             self._drain_pending_reuse(urgent=urgent)
 
             # Sort ASCENDING.
@@ -1979,13 +1842,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         assert not self.moves_blocked(), (
             f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
-        with record_function("MultiEndedAlloc._commit_move_batch"):
+        with record_function("Band._commit_move_batch"):
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
             dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
             v_moveds_t = self.physical_to_virtual[src_pages_t]
             torch._assert_async(
                 (v_moveds_t >= 0).all(),
-                "invalid p2v mapping in MultiEndedAllocator._flush",
+                "invalid p2v mapping in Band._flush",
             )
             self._move_pages(src_pages_t, dst_pages_t)
             # ONE bulk remap (single-writer on schedule_stream), issued after the
@@ -2009,7 +1872,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def flush_for_allocation(self) -> int:
         """Public urgent flush used by peer allocation-pressure recovery."""
-        with record_function("MultiEndedAlloc.flush_for_allocation"):
+        with record_function("Band.flush_for_allocation"):
             return self._flush(urgent=True)
 
     def flush_opportunistic(self) -> int:
@@ -2017,7 +1880,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         `schedule_stream`. Fast-path the empty state: the scheduler triggers this
         very often and ~99% of calls have no holes and no pending entries.
         """
-        with record_function("MultiEndedAlloc.flush_opportunistic"):
+        with record_function("Band.flush_opportunistic"):
             if not self.lazy_compaction:
                 return 0
             if self._free_phys_pages.numel() == 0 and not self._pending_reuse:
@@ -2029,7 +1892,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         frames = inspect.stack()[1:9]
         callers = " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames)
         raise AssertionError(
-            f"MultiEndedAllocator({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
+            f"Band({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
             f"virtual_to_physical == -1 (double-free or never-allocated). "
             f"State: {self.allocator_state_str()}. free_index unique={free_v.tolist()}. "
             f"recent _inverse_history (last 3): "
@@ -2040,12 +1903,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     # -- free-group --
 
     def free_group_begin(self) -> None:
-        super().free_group_begin()
+        assert self.free_group is None, "free groups cannot be nested"
+        self.free_group = []
         self.free_page_reps_group = []
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
-        super().free_group_end()
+        pending_frees, self.free_group = self.free_group, None
+        if pending_frees:
+            self.free(torch.cat(pending_frees))
         if pending:
             reps = torch.cat(pending)
             self.free(reps, _pages=reps // self.page_size)
@@ -2100,11 +1966,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if need_size <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         assert need_size % self.page_size == 0, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_physical: need_size="
+            f"Band({self.sub_pool_name!r}).alloc_physical: need_size="
             f"{need_size} must be a multiple of page_size={self.page_size}"
         )
         if need_size > self.available_size():
-            if not _relieve_for_alloc(self, need_size):
+            if not relieve_for_alloc(self, need_size):
                 return None
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
@@ -2119,7 +1985,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return
         num_pages = free_index.numel() // self.page_size
         assert num_pages <= self._load_pinned_pages, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
+            f"Band({self.sub_pool_name!r}) released {num_pages} "
             f"HiCache pages with only {self._load_pinned_pages} pending"
         )
         self._load_pinned_pages -= num_pages
@@ -2130,7 +1996,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if free_index is None or free_index.numel() == 0:
             return
         assert free_index.numel() % self.page_size == 0, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).free_physical: "
+            f"Band({self.sub_pool_name!r}).free_physical: "
             f"{free_index.numel()} tokens must contain whole pages of "
             f"size {self.page_size}"
         )
@@ -2151,8 +2017,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._compact_pending(physical_pages)
 
 
-def _chain_byte_accounting_violations(
-    chain: List[MultiEndedAllocator],
+def chain_byte_accounting_violations(
+    chain: List[Band],
 ) -> List[str]:
     """Conservation for an ordered low-to-high chain of band allocators: each
     member's own accounting, plus the frontier total order -- a member's low
@@ -2177,15 +2043,13 @@ def _chain_byte_accounting_violations(
     return out
 
 
-def _end_pair_chain(
-    a: MultiEndedAllocator, b: MultiEndedAllocator
-) -> List[MultiEndedAllocator]:
+def _end_pair_chain(a: Band, b: Band) -> List[Band]:
     """Order an end pair low→high by grow direction (the factories and the
     unit fixtures orient the pair differently; the chain check must not care)."""
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
-class FloatMultiEndedAllocator(MultiEndedAllocator):
+class FloatBand(Band):
     """Float MIDDLE cache pool: a span ``[low_wm_page, high_wm_page)`` between
     two chain neighbors, with freed HOLES allowed inside the span.
 
@@ -2220,7 +2084,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     def __init__(self, **kwargs):
         assert not kwargs.get("lazy_compaction", False), (
-            "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
+            "FloatBand is holes-first; the lazy event pipeline "
             "is end-pool machinery and must stay off for float middles"
         )
         # Base __init__ ends with self.clear(), which reads these via our
@@ -2229,8 +2093,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         self.high_wm_page = 0
         super().__init__(**kwargs)
         assert self.grow_direction == "float", (
-            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
-            f"{self.grow_direction!r}"
+            f"FloatBand needs a 'float' sub-pool spec; got {self.grow_direction!r}"
         )
 
     # -- span / frontier state --
@@ -2296,7 +2159,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- availability --
 
-    def _side_neighbor(self, side: str) -> Optional[MultiEndedAllocator]:
+    def _side_neighbor(self, side: str) -> Optional[Band]:
         """Nearest non-transparent member on ``side``."""
         p = self.low_peer if side == "low" else self.high_peer
         while p is not None and p._is_frontier_transparent():
@@ -2412,9 +2275,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         )
         return self.take_physical_pages(need_size // self.page_size)
 
-    def _alloc_bind_fast_or_slow(
-        self, v_pages: torch.Tensor, N: int
-    ) -> Optional[torch.Tensor]:
+    def place_pages(self, v_pages: torch.Tensor, N: int) -> Optional[torch.Tensor]:
         # Holes-first always routes through take_physical_pages (no fused
         # watermark fast path -- float alloc cadence doesn't need it).
         if N == 0:
@@ -2438,7 +2299,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         them again via `torch.unique` is a data-dependent-shape op, i.e. a HOST
         SYNC on the per-step free path.
         """
-        with record_function("FloatMultiEndedAlloc.free"):
+        with record_function("FloatBand.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
@@ -2724,7 +2585,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         """Public gated wrapper around `_flush(urgent=False)`. The override exists
         only for the gate: the base keys its fast path on `lazy_compaction`, which
         a float never has, so a float keys on `_holes_dirty` instead."""
-        with record_function("FloatMultiEndedAlloc.flush_opportunistic"):
+        with record_function("FloatBand.flush_opportunistic"):
             if not self._holes_dirty or self._free_phys_pages.numel() == 0:
                 return 0
             return self._flush(urgent=False)
@@ -2750,7 +2611,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- band-incompatible base APIs --
 
-    def bind_peer(self, peer: MultiEndedAllocator) -> None:  # pragma: no cover
+    def bind_peer(self, peer: Band) -> None:  # pragma: no cover
         raise AssertionError(
             "float middles must be wired via bind_low_peer/bind_high_peer"
         )

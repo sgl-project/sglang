@@ -31,7 +31,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -284,16 +284,14 @@ class _FakeKVCache:
 class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
-        full_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "full"),
+        full_alloc = Band(
             arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             page_size=ps,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool, "mamba"),
+        mamba_alloc = Band(
             arena=pool,
             sub_pool_name="mamba",
             device=_DEV,

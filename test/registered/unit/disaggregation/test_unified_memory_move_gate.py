@@ -22,7 +22,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     disagg_transfers_in_flight,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -149,7 +149,7 @@ class TestPrefillMoveGate(CustomTestCase):
 class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While a pin source is busy that flush relocates nothing, so
-    crediting them lets the scheduler admit work `_relieve_for_alloc` cannot
+    crediting them lets the scheduler admit work `relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """
@@ -166,8 +166,8 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
             return False
 
         # Exercise the production predicates when checking each source.
-        moves_blocked = MultiEndedAllocator.moves_blocked
-        pinned_by_source = MultiEndedAllocator.pinned_by_source
+        moves_blocked = Band.moves_blocked
+        pinned_by_source = Band.pinned_by_source
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from
@@ -179,12 +179,12 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
             self.high_peer = peer
             self.low_peer = None
 
-        _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
+        _growth_side_neighbor = Band._growth_side_neighbor
 
     def _credit(self, *sources):
         peer = self._Peer(sources)
         owner = self._Owner(peer)
-        return MultiEndedAllocator._peer_drainable_hole_bytes(owner)
+        return Band._peer_drainable_hole_bytes(owner)
 
     def test_credit_follows_the_pins(self):
         # No pin source (non-disagg): holes are realizable as before.

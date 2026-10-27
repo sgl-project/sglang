@@ -284,7 +284,7 @@ class TestTriJointReclaim(CustomTestCase):
                 seq = torch.tensor([396])
                 last = torch.tensor([-1])
                 with patch(
-                    "sglang.srt.mem_cache.allocator.unified_sub_pool.alloc_extend_kernel",
+                    "sglang.srt.mem_cache.kv.alloc.chain.alloc_extend_kernel",
                     CPUReferenceKernel(),
                 ):
                     got = alloc_paged_token_slots_extend(
@@ -750,7 +750,7 @@ class TestTriJointReclaim(CustomTestCase):
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
                     patch.object(sa, "make_room", side_effect=checked_move),
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
                             "certified allocation used fallback"
                         ),
@@ -810,7 +810,7 @@ class TestTriJointReclaim(CustomTestCase):
                     ),
                     patch.object(sa, "make_room", wraps=sa.make_room) as movement,
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError("stale plan used fallback"),
                     ),
                 ):
@@ -861,7 +861,7 @@ class TestTriJointReclaim(CustomTestCase):
                         sa, "_relocate_to_positions", wraps=sa._relocate_to_positions
                     ) as whole,
                     patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
                             "positive certificate used fallback"
                         ),
@@ -981,7 +981,7 @@ class TestTriGeometry(CustomTestCase):
                             wraps=sa._relocate_to_positions,
                         ) as whole,
                         patch(
-                            "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                            "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                             side_effect=AssertionError(
                                 "positive certificate used fallback"
                             ),
@@ -1018,7 +1018,7 @@ class TestTriGeometry(CustomTestCase):
                 recognized.add(ps)
                 saved = payload(a, kv, mk)
                 with patch(
-                    "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
+                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                     side_effect=AssertionError("FLOAT certificate used fallback"),
                 ):
                     self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 import msgspec
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+    from sglang.srt.mem_cache.kv.alloc.band import Band
 
 
 class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
@@ -108,7 +108,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         return max(0, band.low_byte - self.high_frontier_below(name))
 
 
-def snapshot_band(band: MultiEndedAllocator) -> BandSnapshot:
+def snapshot_band(band: Band) -> BandSnapshot:
     floats = band.grow_direction == "float"
     span = band._allocated_pages()
     free_virtual_ids = band.free_virtual_ids
@@ -138,7 +138,7 @@ def snapshot_band(band: MultiEndedAllocator) -> BandSnapshot:
 
 
 def snapshot_chain(
-    bands: Tuple[MultiEndedAllocator, ...],
+    bands: Tuple[Band, ...],
     *,
     page_size: int,
     total_bytes: int,

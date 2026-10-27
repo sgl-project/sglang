@@ -13,7 +13,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
@@ -66,8 +66,7 @@ def _build(device, page_size=1):
         kv_cache_dtype=torch.bfloat16,
         page_size=page_size,
     )
-    allocator = MultiEndedAllocator(
-        kvcache=kvcache,
+    allocator = Band(
         arena=buf,
         sub_pool_name="full",
         device=device,
@@ -107,8 +106,7 @@ def _build_mha(device, page_size=8):
     kvcache = UnifiedMHATokenToKVPool(
         arena=buf, spec=buf.spec("full"), page_size=page_size
     )
-    allocator = MultiEndedAllocator(
-        kvcache=kvcache,
+    allocator = Band(
         arena=buf,
         sub_pool_name="full",
         device=device,

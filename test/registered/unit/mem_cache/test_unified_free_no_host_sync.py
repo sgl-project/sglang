@@ -32,12 +32,12 @@ import unittest
 from unittest import mock
 
 import torch
-from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
+from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.mem_cache.kv.alloc import chain
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -51,7 +51,7 @@ PAGE_SIZE = _PagedFixture.PAGE_SIZE
 
 
 def _paged_allocator(lazy: bool):
-    """A real paged `MultiEndedAllocator` from the sibling fixture."""
+    """A real paged `Band` from the sibling fixture."""
     inst = _PagedFixture([m for m in dir(_PagedFixture) if m.startswith("test_")][0])
     _pool, full, _swa, _fkv, _skv = inst._build()
     full.lazy_compaction = lazy
@@ -100,14 +100,14 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
 # a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
-    (mea.MultiEndedAllocator, "_free_lazy"),
-    (mea.MultiEndedAllocator, "free"),
-    (mea.MultiEndedAllocator, "free_physical"),
-    (mea.MultiEndedAllocator, "_commit_move_batch"),
-    (mea.FloatMultiEndedAllocator, "free"),
-    (mea.FloatMultiEndedAllocator, "free_physical"),
-    (mea.FloatMultiEndedAllocator, "make_room"),
-    (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
+    (mea.Band, "_free_lazy"),
+    (mea.Band, "free"),
+    (mea.Band, "free_physical"),
+    (mea.Band, "_commit_move_batch"),
+    (mea.FloatBand, "free"),
+    (mea.FloatBand, "free_physical"),
+    (mea.FloatBand, "make_room"),
+    (mea.FloatBand, "_relocate_to_positions"),
 ]
 
 
@@ -120,7 +120,8 @@ _UNIFIED_MODULES = (mea, chain)
 
 
 def _allocators_in_module():
-    """Every allocator class DEFINED in the unified allocator modules (not imported)."""
+    """Every allocator and band class DEFINED in the unified allocator modules
+    (not imported)."""
     return sorted(
         (
             c
@@ -128,7 +129,7 @@ def _allocators_in_module():
             for c in vars(mod).values()
             if isinstance(c, type)
             and c.__module__ == mod.__name__
-            and "Allocator" in c.__name__
+            and ("Allocator" in c.__name__ or issubclass(c, mea.Band))
         ),
         key=lambda c: c.__name__,
     )
@@ -335,7 +336,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
 
     def test_all_overridden(self):
         for cls in (
-            mea.MultiEndedAllocator,
+            mea.Band,
             chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):
@@ -353,7 +354,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         """Every allocator that can receive a segment free needs the group
         buffer, or `free_segment` raises inside a group."""
         for cls in (
-            mea.MultiEndedAllocator,
+            mea.Band,
             chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):

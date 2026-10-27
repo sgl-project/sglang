@@ -16,11 +16,11 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
+from sglang.srt.mem_cache.kv.alloc.band import (
+    FloatBand,
     _float_open_short_side,
-    _flush_deferred_free_group,
-    _relieve_for_alloc,
+    flush_deferred_free_group,
+    relieve_for_alloc,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
@@ -185,7 +185,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         if target_size > c.mamba_allocator.schedulable_available_size():
             return
         if target_size > c.mamba_allocator.available_size():
-            _relieve_for_alloc(c.mamba_allocator, target_size)
+            relieve_for_alloc(c.mamba_allocator, target_size)
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(
@@ -268,7 +268,7 @@ class _WindowPolicy(_InterimPolicy):
         self._full_max_total_num_tokens = self._size_full
         self._swa_max_total_num_tokens = self._size_swa
         # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates -- see `MultiEndedAllocator._chain_capacity_epoch`).
+        # mutation invalidates -- see `Band._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
@@ -335,7 +335,7 @@ class _WindowPolicy(_InterimPolicy):
         )
 
     def memo_violations(self, c: ChainAllocator) -> List[str]:
-        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
+        """Idle-time twin of `Band._capacity_memo_violations`
         for the joint view. Empty == healthy."""
         if (
             self._joint_avail_memo_epoch
@@ -635,7 +635,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             and memory.hicache_storage_backend is not None
         ) or get_disagg().disaggregation_mode == "decode"
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        _flush_deferred_free_group(
+        flush_deferred_free_group(
             c,
             (
                 c.free_group,
@@ -868,7 +868,7 @@ class _FloatChainPolicy(_WindowPolicy):
         if float_byte_shortfall(_snapshot(c), chain, need_tokens) > 0:
             return False
         # Today's last resort, imperative: where the float's holes sit decides it.
-        return _relieve_for_alloc(c, need_tokens)
+        return relieve_for_alloc(c, need_tokens)
 
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
@@ -900,7 +900,7 @@ class _FloatChainPolicy(_WindowPolicy):
         demand = self._alloc_demand(c, need_tokens)
         flt = None
         for b in demand:
-            if isinstance(b, FloatMultiEndedAllocator):
+            if isinstance(b, FloatBand):
                 flt = b
         _float_open_short_side(flt, demand)
 
@@ -913,7 +913,7 @@ class _FloatChainPolicy(_WindowPolicy):
         if target_size <= c.mamba_allocator.available_size():
             return
         c.full_attn_allocator.flush_for_allocation()
-        _relieve_for_alloc(c.mamba_allocator, target_size)
+        relieve_for_alloc(c.mamba_allocator, target_size)
 
     def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
