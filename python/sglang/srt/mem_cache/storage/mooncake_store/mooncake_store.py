@@ -667,6 +667,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
 
+            self._wholepage_staging_cap_bytes = (
+                envs.SGLANG_HICACHE_MOONCAKE_WHOLEPAGE_STAGING_MB.get() * 1024 * 1024
+            )
+            self._wholepage_staging = None
+            self._wholepage_retired = []
+
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -943,14 +949,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
-            # Mamba stores one temporal object plus one object per conv state.
-            # conv-only models have no ssm state; drop the 0-element temporal
-            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
-            # its temporal pointer under the same condition to stay aligned.
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+            if getattr(host_pool, "slot_state_device_tensors", None):
+                # Registered PLE slot side states cannot be addressed by the
+                # zero-copy meta (get_page_buffer_meta raises), so the page is
+                # materialized whole (temporal + conv + side states) into one
+                # object per page. batch_exists_v2 probes the same key.
+                suffixes = [f"_{self.mha_suffix}_wholepage"]
+            else:
+                # Mamba stores one temporal object plus one object per conv state.
+                # conv-only models have no ssm state; drop the 0-element temporal
+                # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
+                # its temporal pointer under the same condition to stay aligned.
+                conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+                suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+                if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                    suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
@@ -1101,12 +1114,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
+    @staticmethod
+    def _needs_wholepage_io(host_pool) -> bool:
+        # Mamba pools with registered PLE slot side states cannot use the
+        # zero-copy page meta (get_page_buffer_meta raises); their pages are
+        # materialized whole instead. Absent on every other pool type.
+        return bool(getattr(host_pool, "slot_state_device_tensors", None))
+
     def _batch_io_v2(
         self,
         transfers: List[PoolTransfer],
         is_set: bool,
         session_id: Optional[str] = None,
     ):
+        # Pools with registered slot side states take the whole-page path:
+        # they would raise inside get_page_buffer_meta below.
+        wholepage_transfers = []
+        zero_copy_transfers = []
+        for transfer in transfers:
+            host_pool = self.registered_pools.get(transfer.name)
+            if host_pool is None:
+                raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
+            if self._needs_wholepage_io(host_pool):
+                wholepage_transfers.append(transfer)
+            else:
+                zero_copy_transfers.append(transfer)
+
+        results: dict = {}
+        if wholepage_transfers:
+            results.update(
+                self._wholepage_io_v2(wholepage_transfers, is_set, session_id)
+            )
+        if not zero_copy_transfers:
+            return results
+        transfers = zero_copy_transfers
+
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
         prepared = []
@@ -1253,6 +1295,122 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             pool_ptrs[index] = ptr
             pool_sizes[index] = size
         return pool_ptrs, pool_sizes
+
+    def _ensure_wholepage_staging(self, min_bytes: int) -> torch.Tensor:
+        if (
+            self._wholepage_staging is not None
+            and self._wholepage_staging.numel() >= min_bytes
+        ):
+            return self._wholepage_staging
+        tensor = torch.empty(min_bytes, dtype=torch.uint8)
+        try:
+            tensor = tensor.pin_memory()
+        except Exception:
+            logger.warning(
+                "Whole-page staging buffer could not be pinned; "
+                "RDMA transfer may fall back to a slower path."
+            )
+        self.register_buffer(tensor)
+        if self._wholepage_staging is not None:
+            # The store exposes no unregister: retired buffers must outlive
+            # the registered memory segment they describe.
+            self._wholepage_retired.append(self._wholepage_staging)
+        self._wholepage_staging = tensor
+        return tensor
+
+    def _wholepage_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools.get(transfer.name)
+            keys = transfer.keys
+            page_size = host_pool.page_size or 1
+            host_indices = transfer.host_indices
+            assert len(keys) > 0
+            assert len(keys) == len(host_indices) // page_size
+            # size_per_token counts uint8 elements of the flat data page.
+            page_bytes = page_size * host_pool.size_per_token
+            tagged_keys = self._tag_keys(keys)
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            assert key_multiplier == 1
+            key_strs = self._tag_keys(key_strs)
+
+            pages_per_chunk = max(1, self._wholepage_staging_cap_bytes // page_bytes)
+            host_indices_cpu = host_indices.detach().to(device="cpu")
+
+            if is_set:
+                exist_states = self._batch_exist(key_strs)
+                page_results = [0 if state == 1 else -1 for state in exist_states]
+                missing_pages = [
+                    p for p, state in enumerate(exist_states) if state != 1
+                ]
+                group_ids = (
+                    self._expand_group_ids(tagged_keys, 1)
+                    if self._can_use_group_semantics()
+                    else None
+                )
+                for chunk_start in range(0, len(missing_pages), pages_per_chunk):
+                    chunk = missing_pages[chunk_start : chunk_start + pages_per_chunk]
+                    staging = self._ensure_wholepage_staging(len(chunk) * page_bytes)
+                    chunk_keys, ptrs, sizes = [], [], []
+                    for j, page in enumerate(chunk):
+                        host_idx = host_indices_cpu[page * page_size].item()
+                        data_page = host_pool.get_data_page(host_idx, flat=True)
+                        offset = j * page_bytes
+                        staging[offset : offset + page_bytes].copy_(data_page)
+                        chunk_keys.append(key_strs[page])
+                        ptrs.append(staging.data_ptr() + offset)
+                        sizes.append(page_bytes)
+                    put_results = self._put_batch_zero_copy_impl(
+                        chunk_keys,
+                        ptrs,
+                        sizes,
+                        self._filter_group_ids(group_ids, chunk),
+                        session_ids=(
+                            [session_id] * len(chunk)
+                            if session_id and self._supports_session_ids
+                            else None
+                        ),
+                    )
+                    for page, res in zip(chunk, put_results):
+                        page_results[page] = res
+            else:
+                page_results = [-1] * len(keys)
+                all_pages = list(range(len(keys)))
+                for chunk_start in range(0, len(all_pages), pages_per_chunk):
+                    chunk = all_pages[chunk_start : chunk_start + pages_per_chunk]
+                    staging = self._ensure_wholepage_staging(len(chunk) * page_bytes)
+                    chunk_keys, ptrs, sizes = [], [], []
+                    for j, page in enumerate(chunk):
+                        offset = j * page_bytes
+                        chunk_keys.append(key_strs[page])
+                        ptrs.append(staging.data_ptr() + offset)
+                        sizes.append(page_bytes)
+                    get_results = self._get_batch_zero_copy_impl(
+                        chunk_keys, ptrs, sizes
+                    )
+                    for j, (page, res) in enumerate(zip(chunk, get_results)):
+                        page_results[page] = res
+                        if res > 0:
+                            host_idx = host_indices_cpu[page * page_size].item()
+                            offset = j * page_bytes
+                            host_pool.set_from_flat_data_page(
+                                host_idx,
+                                staging[offset : offset + page_bytes],
+                            )
+
+            results[transfer.name] = self._batch_postprocess(
+                page_results,
+                is_set_operate=is_set,
+                key_multiplier=1,
+            )
+        return results
 
     def batch_get_v2(
         self,
