@@ -83,7 +83,7 @@ def _agg_kernel(
     Taking the global max before exponentiating makes this bit-comparable to
     the 2-kernel pipeline rather than to the SM100 kernel.
     """
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)  # t * stride_bm overflows int32
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
 

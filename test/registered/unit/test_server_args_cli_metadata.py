@@ -7,7 +7,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestServerArgsMigratedCliMetadata(CustomTestCase):
@@ -29,6 +29,18 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", *flags])
                 self.assertIs(
                     ServerArgs.from_cli_args(args).trust_request_chat_template, expected
+                )
+
+    def test_http_worker_reuseport_requires_explicit_opt_in(self):
+        for flags, expected in (
+            ([], False),
+            (["--enable-http-worker-reuseport"], True),
+        ):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).enable_http_worker_reuseport,
+                    expected,
                 )
 
     def test_prefill_max_context_accepts_human_readable_values(self):

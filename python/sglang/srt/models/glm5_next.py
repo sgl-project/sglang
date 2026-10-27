@@ -54,7 +54,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -67,8 +67,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
     prepare_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -119,6 +119,8 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_spec,
+    linear_attn_parallel_group,
+    linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -137,7 +139,7 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
-# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
+# Matches deepseek_v4_mhc.MHC_POST_MULT_VALUE; the fused and unfused boundaries
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -397,11 +399,6 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        from sglang.srt.runtime_context import (
-            linear_attn_parallel_group,
-            linear_attn_tp_size,
-        )
-
         head_shard_size = linear_attn_tp_size()
         head_parallel_group = linear_attn_parallel_group()
 
@@ -662,7 +659,7 @@ class Glm5NextLinearAttention(nn.Module):
                 hidden_states, forward_batch
             )
 
-        if not forward_batch.forward_mode.is_decode():
+        if not forward_batch.logical_forward_mode.is_decode():
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -842,7 +839,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 update=residual.attn_update,
                 tp_group=SumGroup.TP
                 if config.is_kda_layer(layer_id)
-                and get_parallel().enable_cp_tp_group_sharing
+                and linear_attn_parallel_group() == "tp"
                 else SumGroup.ATTN_TP,
             ),
             declare_ffn(
@@ -1277,7 +1274,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.lm_head = None
         self.logits_processor = None
         if not self.encoder_only:
-            self.determine_num_fused_shared_experts()
+            # The weight loader reads this after the build.
+            self.num_fused_shared_experts = get_num_fused_shared_experts()
+            if self.num_fused_shared_experts:
+                log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
             self.model = Glm5NextModel(
                 text_config, quant_config, prefix=add_prefix("model", prefix)
             )
@@ -1491,16 +1491,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 return reason
         return None
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Return the model's fusable shared-expert count."""
+        num_shared_experts = hf_config.text_config.n_shared_experts
+        assert num_shared_experts == 1, (
+            f"Only 1 fused shared expert is supported for {cls.__name__}"
         )
-        if self.num_fused_shared_experts == 0:
-            return
-        assert self.num_fused_shared_experts == 1, (
-            f"Only 1 fused shared expert is supported for {type(self).__name__}"
-        )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+        return num_shared_experts
 
     def wants_prefill_autotune(self) -> bool:
         backend = get_moe_runner_backend()
@@ -1559,8 +1557,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
