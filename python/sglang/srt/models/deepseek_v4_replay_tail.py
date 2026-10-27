@@ -222,6 +222,7 @@ class DecoderReplayTail:
             or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
             or not self._can_capture_moe_bound(forward_batch)
+            or forward_batch.dp_spec_prefill_coordination_applied
         ):
             return False, None
         if not dp:
