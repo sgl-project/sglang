@@ -26,7 +26,7 @@ from sglang.srt.hardware_backend.npu.eplb import (
 
 
 class _NpuAccumulatorMixin:
-    """Use the small EPLB group for all NPU statistics modes."""
+    """Use the dedicated EPLB group for all NPU statistics modes."""
 
     # Resolve lazily so distributed initialization and WORLD replacement remain valid.
     @property

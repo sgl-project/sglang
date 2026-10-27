@@ -44,16 +44,15 @@ def get_eplb_device_group() -> dist.ProcessGroup:
         import torch_npu
 
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        # WORLD inherits DEEPEP_HCCL_BUFFSIZE; using it can allocate large buffers.
-        # Keep EPLB's buffer budget small without changing WORLD's options.
+        # Keep migration off the forward communicator with a small HOST buffer.
         options.hccl_config = {
-            "hccl_buffer_size": 32,
+            "hccl_buffer_size": 64,
             "hccl_op_expansion_mode": 1,
         }
         _device_group = dist.new_group(backend="hccl", pg_options=options)
         _group_world = world
         logger.info(
-            "[NPU EPLB host group] world=%d buffer=32MiB", dist.get_world_size()
+            "[NPU EPLB host group] world=%d buffer=64MiB", dist.get_world_size()
         )
     return _device_group
 
@@ -159,35 +158,24 @@ def prepare_expert_weight_update(
 def _validate_migration_weights(
     weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
 ) -> None:
-    def specification(tensor):
-        return (
-            tuple(tensor.shape),
-            tensor.dtype,
-            tensor.device,
-            needs_nd_staging(tensor),
-        )
+    def specification(weights):
+        return [
+            (tuple(t.shape), t.dtype, t.device, needs_nd_staging(t)) for t in weights
+        ]
 
     sample_layer = layer_ids[0]
-    expected = [specification(t) for t in weights_by_layer[sample_layer]]
+    expected = specification(weights_by_layer[sample_layer])
     if not expected:
         raise ValueError(
             f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
         )
     for layer in layer_ids[1:]:
-        weights = weights_by_layer[layer]
-        if len(weights) != len(expected):
+        if specification(weights_by_layer[layer]) != expected:
             raise ValueError(
-                f"[NPU EPLB] rank={rank} layer={layer}: expected {len(expected)} "
-                f"weight tensors from layer {sample_layer}, got {len(weights)}"
+                f"[NPU EPLB] rank={rank} layer={layer}: migration weights must match "
+                f"layer {sample_layer} in tensor count, shape, dtype, device, "
+                "and ND staging requirements"
             )
-        for index, (tensor, spec) in enumerate(zip(weights, expected)):
-            actual = specification(tensor)
-            if actual != spec:
-                raise ValueError(
-                    f"[NPU EPLB] rank={rank} layer={layer} tensor={index}: incompatible "
-                    f"migration workspace; (shape, dtype, device, needs_nd_staging) "
-                    f"expected {spec} from layer {sample_layer}, got {actual}"
-                )
 
 
 def needs_nd_staging(tensor: torch.Tensor) -> bool:
