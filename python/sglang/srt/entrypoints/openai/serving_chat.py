@@ -105,6 +105,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
+    hoist_json_schema_defs,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
 )
@@ -1168,6 +1169,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
+                hoist_json_schema_defs(tool.function.parameters)
                 Draft202012Validator.check_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"

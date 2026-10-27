@@ -110,6 +110,34 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertEqual(item_schema["properties"]["name"]["enum"], ["get_weather"])
         self.assertIn("parameters", item_schema["properties"])
 
+    def test_specific_tool_choice_resolves_defs(self):
+        self.tools[0].function.parameters = {
+            "type": "object",
+            "properties": {"wait": {"$ref": "#/$defs/WaitFor"}},
+            "required": ["wait"],
+            "$defs": {
+                "WaitFor": {
+                    "type": "object",
+                    "properties": {"delay": {"$ref": "#/$defs/Delay"}},
+                    "required": ["delay"],
+                },
+                "Delay": {"type": "integer", "minimum": 0},
+            },
+        }
+        # A conflicting definition in an unselected tool must not leak in.
+        self.tools[1].function.parameters["$defs"] = {"Delay": {"type": "string"}}
+        schema = get_json_schema_constraint(
+            self.tools, ToolChoice(function={"name": "get_weather"})
+        )
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(
+            [{"name": "get_weather", "parameters": {"wait": {"delay": 1}}}]
+        )
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(
+                [{"name": "get_weather", "parameters": {"wait": {"delay": -1}}}]
+            )
+
     def test_specific_tool_choice_dict_schema(self):
         """Test schema generation for specific tool choice as ToolChoice object"""
         tool_choice = ToolChoice(
