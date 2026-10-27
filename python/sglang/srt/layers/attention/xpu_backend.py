@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
@@ -905,6 +906,19 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            extend_kwargs = {
+                "softmax_scale": layer.scaling,
+                "causal": causal_arg,
+                "window_size": window_size,
+                "softcap": layer.logit_cap,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+                "return_softmax_lse": use_cascade_attn,
+                **kwargs,
+            }
+            if bidirectional_block_ids is not None:
+                extend_kwargs["bidirectional_block_ids"] = bidirectional_block_ids
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -914,14 +928,6 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=causal_arg,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                bidirectional_block_ids=bidirectional_block_ids,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
                 # `out` is injected via out_kwargs only on the graph path (buffer
                 # present, non-cascade); the eager path omits it for flash_attn
                 # builds that lack the kwarg. Piecewise XPU graph for prefill
@@ -937,7 +943,7 @@ class XPUAttentionBackend(AttentionBackend):
                     if not use_cascade_attn and forward_batch._attn_output is not None
                     else {}
                 ),
-                **kwargs,
+                **extend_kwargs,
             )
 
             if use_cascade_attn:
@@ -1151,6 +1157,14 @@ class XPUAttentionBackend(AttentionBackend):
         extend_rows = torch.arange(q.shape[0], device=q.device) + prefix_offsets
         padded_q = q.new_zeros((num_kv_tokens, *q.shape[1:]))
         padded_q[extend_rows] = q
+        flat_kwargs = {
+            "softmax_scale": scale,
+            "causal": False,
+            "softcap": softcap,
+            "num_splits": self.num_splits,
+        }
+        if block_ids is not None:
+            flat_kwargs["bidirectional_block_ids"] = block_ids
         o = flash_attn_with_kvcache(
             q=padded_q,
             k_cache=key_cache,
@@ -1159,11 +1173,7 @@ class XPUAttentionBackend(AttentionBackend):
             cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_q=metadata.cu_seqlens_k,
             max_seqlen_q=metadata.max_seq_len_k,
-            softmax_scale=scale,
-            causal=False,
-            softcap=softcap,
-            bidirectional_block_ids=block_ids,
-            num_splits=self.num_splits,
+            **flat_kwargs,
         )
         return o[extend_rows]
 
@@ -2022,10 +2032,18 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             num_out = forward_batch.out_cache_loc.shape[0]
-            swa_write_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
+            assert_buffer_fits(
+                num_out,
+                self.full_cg_prefill_swa_out_cache_loc.shape[0],
+                "full-CG prefill SWA write-location buffer",
             )
-            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
+            if in_capture:
+                self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
+            else:
+                swa_write_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+                self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
             m.swa_out_cache_loc = self.full_cg_prefill_swa_out_cache_loc[:num_out]
 
