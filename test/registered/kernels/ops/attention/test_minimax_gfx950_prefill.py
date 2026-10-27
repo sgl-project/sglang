@@ -30,7 +30,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import msa_v1_page_row_bytes
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.kernels.nvfp4_kv import nvfp4_kv_quantize
+from sglang.test.quant_ref_utils import nvfp4_kv_quantize
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
