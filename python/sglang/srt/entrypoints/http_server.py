@@ -70,7 +70,7 @@ from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.configs.model_config import load_joint_head_config
+from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -91,6 +91,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -1196,6 +1197,25 @@ async def hicache_storage_backend_status():
     }
 
 
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.hicache_storage import (
+        disabled_l3_layout,
+        merge_l3_layouts,
+    )
+
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
@@ -1716,15 +1736,27 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(
-        tools=obj.tools,
-        tool_call_parser=obj.tool_call_parser,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.tool_call_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
+    else:
+        # 1) Initialize the parser based on the request body
+        parser = FunctionCallParser(
+            tools=obj.tools,
+            tool_call_parser=obj.tool_call_parser,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+        # 2) Call the non-stream parsing method (non-stream)
+        normal_text, calls = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1744,22 +1776,38 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(
-        model_type=obj.reasoning_parser,
-        request=request,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
-
-    # 2) Call the non-stream parsing method (non-stream)
-    if obj.return_blocks:
-        blocks = parser.parse_non_stream_blocks(obj.text)
-        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
-        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
-        reasoning_text = "".join(reasoning_blocks)
-        normal_text = "".join(text_blocks)
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.reasoning_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
+        blocks = (
+            [{"type": "reasoning", "text": reasoning_text}] if reasoning_text else []
+        )
+        blocks.append({"type": "text", "text": normal_text})
     else:
-        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+        # 1) Initialize the parser based on the request body
+        parser = ReasoningParser(
+            model_type=obj.reasoning_parser,
+            request=request,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
+
+        # 2) Call the non-stream parsing method (non-stream)
+        if obj.return_blocks:
+            blocks = parser.parse_non_stream_blocks(obj.text)
+            reasoning_text = "".join(
+                b["text"] for b in blocks if b["type"] == "reasoning"
+            )
+            normal_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        else:
+            reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1767,8 +1815,12 @@ async def separate_reasoning_request(
         "text": normal_text,
     }
     if obj.return_blocks:
-        response_data["reasoning_blocks"] = reasoning_blocks
-        response_data["text_blocks"] = text_blocks
+        response_data["reasoning_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "reasoning"
+        ]
+        response_data["text_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "text"
+        ]
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -2135,8 +2187,14 @@ async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """SageMaker health check: 200 when is_healthy(), else 503.
+
+    Unlike /ready, a paused server still reports 200, so an intentional pause
+    (e.g. a weight sync) does not get the instance replaced. Stays a flag check
+    because SageMaker times out /ping after 2 seconds.
+    """
+    status_code = 200 if _global_state.tokenizer_manager.is_healthy() else 503
+    return Response(status_code=status_code)
 
 
 @app.post("/invocations")
@@ -2406,13 +2464,18 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    if (
-        not model_info["is_generation"]
-        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
-        and load_joint_head_config(get_model().model_path, get_model().revision)
-        is not None
+    model = get_model()
+    if not model_info["is_generation"] and (
+        (
+            model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+            and load_joint_head_config(model.model_path, model.revision) is not None
+        )
+        or (
+            model_info.get("architectures") == ["Qwen3_5ForCausalLM"]
+            and load_pointer_head(model.model_path, model.revision) is not None
+        )
     ):
-        # A Clef checkpoint answers /v1/systemone decisions only.
+        # A Clef or Kev checkpoint answers /v1/systemone decisions only.
         request_name = "/v1/systemone"
         json_data = {
             "model": "warmup",
@@ -2674,6 +2737,19 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _granian_http1_settings():
+    from granian.http import HTTP1Settings
+
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+
+
 def _run_granian_server(
     host,
     port,
@@ -2717,6 +2793,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,

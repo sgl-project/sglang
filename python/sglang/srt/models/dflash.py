@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,10 +14,11 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -255,9 +257,10 @@ class DFlashAttention(nn.Module):
             prefix=f"{prefix}.o_proj" if prefix else "o_proj",
         )
 
-        # Per-head Q/K RMSNorm, matching HF Qwen3.
-        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        self.use_gemma_norm = bool(getattr(config, "use_gemma_norm", False))
+        norm_cls = GemmaRMSNorm if self.use_gemma_norm else RMSNorm
+        self.q_norm = norm_cls(head_dim, eps=rms_norm_eps)
+        self.k_norm = norm_cls(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
         rotary_dim = head_dim
@@ -292,6 +295,7 @@ class DFlashAttention(nn.Module):
         rotary = self.rotary_emb
         self.use_table_qk_norm_rope = (
             not _is_npu
+            and not self.use_gemma_norm
             and hasattr(rotary, "cos_sin_cache")
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
@@ -355,6 +359,14 @@ class DFlashAttention(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
 
+        if self.use_gemma_norm:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = apply_qk_norm(
+                q, k, self.q_norm, self.k_norm, self.head_dim, allow_inplace=False
+            )
+            q, k = self.rotary_emb(positions, q, k)
+            return q, k, v
+
         if self.attn.layer_id == 0:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
@@ -400,7 +412,15 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+            # In-place QK kernels use weight directly; Gemma requires 1 + weight.
+            q, k = apply_qk_norm(
+                q,
+                k,
+                self.q_norm,
+                self.k_norm,
+                self.head_dim,
+                allow_inplace=not self.use_gemma_norm,
+            )
             q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
@@ -484,11 +504,23 @@ class DFlashMLP(nn.Module):
             prefix="down_proj" if not prefix else f"{prefix}.down_proj",
         )
         hidden_act = getattr(config, "hidden_act", "silu")
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported DFlash activation: {hidden_act}. Only silu is supported for now."
+        if hidden_act == "silu":
+            self.act_fn = SiluAndMul()
+        elif hidden_act == "swigluoai":
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                swiglu_no_interleaved_with_alpha_and_limit,
             )
-        self.act_fn = SiluAndMul()
+
+            self.act_fn = partial(
+                swiglu_no_interleaved_with_alpha_and_limit,
+                gemm1_alpha=float(config.swiglu_alpha),
+                gemm1_limit=float(config.swiglu_limit),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported DFlash activation: {hidden_act}. "
+                "Supported activations are silu and swigluoai."
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -588,7 +620,8 @@ class DFlashDecoderLayer(nn.Module):
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        norm_cls = GemmaRMSNorm if getattr(config, "use_gemma_norm", False) else RMSNorm
+        self.input_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         attention_prefix = f"{prefix}.self_attn" if prefix else ""
         self.self_attn = self.attention_cls(
             config=config,
@@ -596,7 +629,7 @@ class DFlashDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=attention_prefix,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
         self.mlp = DFlashMLP(
             config=config, quant_config=quant_config, prefix=mlp_prefix
@@ -657,6 +690,8 @@ class DFlashDraftModel(nn.Module):
       - `norm.weight` for final normalization
     """
 
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
@@ -670,6 +705,11 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.rms_norm_eps = rms_norm_eps
+        use_gemma_norm = bool(getattr(config, "use_gemma_norm", False))
+        norm_cls = GemmaRMSNorm if use_gemma_norm else RMSNorm
+        if use_gemma_norm:
+            # Fused context KV materialization assumes ordinary RMSNorm weights.
+            self.supports_fused_context_kv = False
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
@@ -715,7 +755,7 @@ class DFlashDraftModel(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.norm = norm_cls(hidden_size, eps=rms_norm_eps)
 
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
@@ -745,7 +785,7 @@ class DFlashDraftModel(nn.Module):
             self.fc = nn.Linear(
                 self.num_context_features * hidden_size, hidden_size, bias=False
             )
-        self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.hidden_norm = norm_cls(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while
@@ -1275,8 +1315,16 @@ class DFlash2DraftModel(DFlashDraftModel):
         return ids, self._transform_unary_logits(vals)
 
 
+class MiniMaxDFlash2DraftModel(DFlash2DraftModel):
+    """Compatibility alias for existing MiniMax DFlash2 checkpoint configs."""
+
+
 class MuseGlimmerAssistantModel(DFlashDraftModel):
     """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
+
+
+class DFlash2BeamDraftModel(DFlash2DraftModel):
+    """Alias for checkpoints declaring architectures=["DFlash2BeamDraftModel"]."""
 
 
 EntryClass = [
@@ -1284,4 +1332,6 @@ EntryClass = [
     DFlashLagunaForCausalLM,
     MuseGlimmerAssistantModel,
     DFlash2DraftModel,
+    DFlash2BeamDraftModel,
+    MiniMaxDFlash2DraftModel,
 ]
