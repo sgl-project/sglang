@@ -7,8 +7,5 @@
 //! `proto/sglang/runtime/v1/`; edit the .proto file and regenerate, never
 //! these files.
 
-// Generated code optimizes for template uniformity, not lint cleanliness.
-#![allow(clippy::all)]
-
 include!("generated/sglang.runtime.v1.rs");
 include!("generated/sglang.runtime.v1.tonic.rs");
