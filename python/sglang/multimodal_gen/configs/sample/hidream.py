@@ -1,12 +1,8 @@
 """Sampling parameters for the HiDream-O1-Image model family.
 
-Three checkpoints share one pipeline; the recipe is resolved per served
-model path in _adjust (official inference.py model_type semantics):
-- HiDream-O1-Image-Dev-2604: DEV, flash scheduler, noise 8.0/8.0, no clip.
-- HiDream-O1-Image-Dev:      DEV, flash scheduler, noise 7.5/7.5, clip 2.5;
-  editing tasks (one ref image) default to the flow_match scheduler.
-- HiDream-O1-Image:          FULL, UniPC, 50 steps, CFG 5.0, shift 3.0,
-  computed schedule, no noise injection.
+One pipeline serves three checkpoints; the recipe is resolved per served
+model path in _adjust. Noise scales are a deliberate deployment deviation
+from the official README checkpoint table.
 """
 
 from dataclasses import dataclass
@@ -33,37 +29,38 @@ def _is_full_model(model_path: str | None) -> bool:
     return _resolve_variant(model_path) == "full"
 
 
-# Per-variant recipe defaults for None sentinels (official inference.py).
 _VARIANT_DEFAULTS = {
     "dev-2604": {
         "guidance_scale": 0.0,
         "shift": 1.0,
         "scheduler_name": "flash",
         "model_type": "dev",
-        "noise_scale_start": 8.0,
-        "noise_scale_end": 8.0,
-        "noise_clip_std": 0.0,
+        "torch_dtype": "bfloat16",
+        "noise_scale_start": 7.5,
+        "noise_scale_end": 7.5,
+        "noise_clip_std": 2.5,
     },
     "dev": {
         "guidance_scale": 0.0,
         "shift": 1.0,
         "scheduler_name": "flash",
         "model_type": "dev",
-        "noise_scale_start": 7.5,
-        "noise_scale_end": 7.5,
-        "noise_clip_std": 2.5,
+        "torch_dtype": "float32",
+        "noise_scale_start": 8.0,
+        "noise_scale_end": 8.0,
+        "noise_clip_std": 8.0,
     },
     "full": {
         "guidance_scale": 5.0,
         "shift": 3.0,
         "scheduler_name": "default",
         "model_type": "full",
-        "noise_scale_start": 8.0,
-        "noise_scale_end": 8.0,
-        "noise_clip_std": 0.0,
+        "torch_dtype": "bfloat16",
+        "noise_scale_start": 7.5,
+        "noise_scale_end": 7.5,
+        "noise_clip_std": 2.5,
     },
 }
-
 
 @dataclass
 class HiDreamSamplingParams(SamplingParams):
@@ -79,7 +76,7 @@ class HiDreamSamplingParams(SamplingParams):
     width: int = 2048
     guidance_scale: Optional[float] = None
     shift: Optional[float] = None
-    seed: int = 32
+    seed: int = 42
     negative_prompt: str = " "
 
     # "flash" (DEV), "flow_match" (DEV editing), "default" (UniPC/FULL)
@@ -93,7 +90,6 @@ class HiDreamSamplingParams(SamplingParams):
     # Reference images for I2I/TI2I
     ref_images: Optional[List[str]] = None
     layout_bboxes: Optional[str] = None
-    keep_original_aspect: bool = False
 
     model_type: Optional[str] = None
 

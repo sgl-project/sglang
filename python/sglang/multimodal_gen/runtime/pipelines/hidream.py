@@ -23,7 +23,11 @@ from sglang.multimodal_gen.configs.models.dits.hidream import HiDreamDitConfig
 from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
     HiDreamPipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.hidream import HiDreamSamplingParams
+from sglang.multimodal_gen.configs.sample.hidream import (
+    _VARIANT_DEFAULTS,
+    _resolve_variant,
+    HiDreamSamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.hidream import HiDreamForCausalLM
@@ -130,7 +134,12 @@ class HiDreamPipeline(ComposedPipelineBase):
         logger.info("HiDream model loaded successfully (%d/%d params loaded)",
                      len(loaded_keys), len(params_dict))
 
-        model = model.to(torch.bfloat16).eval()
+        # Variant dtype policy (deliberate deployment mapping, mirrored in
+        # _VARIANT_DEFAULTS)
+        variant = _resolve_variant(model_path)
+        w_dtype = getattr(torch, _VARIANT_DEFAULTS[variant]["torch_dtype"])
+        model = model.to(w_dtype).eval()
+        logger.info("HiDream %s weights cast to %s", variant, w_dtype)
         device = get_local_torch_device()
         if device.type != "cpu":
             model = model.to(device)

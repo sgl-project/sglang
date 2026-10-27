@@ -86,7 +86,6 @@ class FlashFlowMatchScheduler:
     def __init__(self):
         self.timesteps = None
         self.sigmas = None
-        self._step_index = None
         self.num_inference_steps = None
 
     def set_timesteps(self, num_inference_steps: int, shift: float,
@@ -104,7 +103,6 @@ class FlashFlowMatchScheduler:
         self.timesteps = torch.from_numpy(timesteps).to(
             device=device, dtype=torch.float32)
         self.num_inference_steps = num_inference_steps
-        self._step_index = None
 
     def set_timesteps_list(self, timesteps_list, device: torch.device):
         timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.long)
@@ -113,26 +111,27 @@ class FlashFlowMatchScheduler:
         self.sigmas = torch.tensor(sigmas, device=device, dtype=torch.float32)
         self.timesteps = timesteps
         self.num_inference_steps = len(timesteps)
-        self._step_index = None
 
     def step(self, model_output: torch.Tensor, timestep: torch.Tensor,
              sample: torch.Tensor, s_noise: float = 1.0,
-             noise_clip_std: float = 0.0) -> torch.Tensor:
-        if self._step_index is None:
-            self._step_index = 0
-        sigma = self.sigmas[self._step_index]
+             noise_clip_std: float = 0.0,
+             generator: torch.Generator | None = None) -> torch.Tensor:
+        step_idx = (self.timesteps == timestep.long()).nonzero(
+            as_tuple=True)[0][0].item()
+        sigma = self.sigmas[step_idx]
         sample = sample.to(torch.float32)
         denoised = sample - model_output * sigma
-        if self._step_index < self.num_inference_steps:
-            sigma_next = self.sigmas[self._step_index + 1]
-            noise = torch.randn(model_output.shape, device=model_output.device,
-                                dtype=denoised.dtype)
+        if step_idx + 1 < len(self.sigmas):
+            sigma_next = self.sigmas[step_idx + 1]
+            noise = torch.randn(model_output.shape,
+                                device=generator.device,
+                                dtype=denoised.dtype, generator=generator)
+            noise = noise.to(model_output.device)
             if noise_clip_std > 0:
                 clip_val = noise_clip_std * noise.std().item()
                 noise = noise.clamp(min=-clip_val, max=clip_val)
             sample = (sigma_next * noise * s_noise
                       + (1.0 - sigma_next) * denoised)
-        self._step_index += 1
         return sample
 
 
@@ -707,6 +706,42 @@ def build_ti2i_text_sample(prompt, ref_pils_vlm, ref_pils_resized, height, width
     }
 
 
+def _per_prompt_work(batch: Req, prompts: list) -> list[tuple]:
+    """(prompt, height, width, seed) per image of a possibly merged request;
+    validation prevents zip from silently truncating it."""
+    n = len(prompts)
+    if int(batch.num_outputs_per_prompt) != 1:
+        raise ValueError(
+            "HiDream expects per-output expansion before generation; "
+            f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
+        )
+
+    def broadcast(value, name):
+        values = value if isinstance(value, list) else [value]
+        if len(values) == 1:
+            values *= n
+        if len(values) != n:
+            raise ValueError(
+                f"HiDream requires one {name} per prompt; got "
+                f"{len(values)} for {n} prompts"
+            )
+        return values
+
+    seeds = batch.seeds
+    if seeds is None:
+        seeds = batch.extra.get("dynamic_batch_seeds") or batch.seed
+    if not isinstance(seeds, list):
+        seeds = [seeds]
+    seeds = [s[0] if isinstance(s, list) else int(s) for s in seeds]
+
+    return list(zip(
+        prompts,
+        broadcast(batch.height, "height"),
+        broadcast(batch.width, "width"),
+        broadcast(seeds, "seed"),
+    ))
+
+
 class HiDreamGenerationStage(PipelineStage):
     """Full generation stage: preprocessing -> denoising -> decoding."""
 
@@ -720,13 +755,14 @@ class HiDreamGenerationStage(PipelineStage):
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        device = next(self.model.parameters()).device
-        dtype = torch.bfloat16
+        first_param = next(self.model.parameters())
+        device = first_param.device
 
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
-        heights = batch.height if isinstance(batch.height, list) else [batch.height]
-        widths = batch.width if isinstance(batch.width, list) else [batch.width]
         sampling_params = getattr(batch, "sampling_params", None)
+        dtype = torch.bfloat16
+        w_dtype = first_param.dtype
+
         requested_steps = int(
             getattr(sampling_params, "num_inference_steps", None)
             or getattr(batch, "num_inference_steps", None)
@@ -750,7 +786,6 @@ class HiDreamGenerationStage(PipelineStage):
         if guidance_scale is None:
             guidance_scale = 0.0
         guidance_scale = float(guidance_scale)
-        seeds = batch.seed if isinstance(batch.seed, list) else [batch.seed]
         scheduler_name = (
             batch.scheduler_name if batch.scheduler_name is not None else "flash")
         noise_scale_start = float(
@@ -762,20 +797,11 @@ class HiDreamGenerationStage(PipelineStage):
         noise_clip_std = float(
             batch.noise_clip_std if batch.noise_clip_std is not None else 0.0)
         shift = float(batch.shift) if batch.shift is not None else 1.0
-        keep_original_aspect = bool(batch.keep_original_aspect)
         layout_bboxes = batch.layout_bboxes
-        logger.info(
-            "HiDream recipe: model_type=%s scheduler=%s guidance_scale=%s "
-            "shift=%s steps=%d noise=(%s->%s, clip=%s)",
-            model_type, scheduler_name, guidance_scale, shift,
-            num_steps, noise_scale_start, noise_scale_end, noise_clip_std,
-        )
 
         tokenizer = self.processor.tokenizer if hasattr(self.processor, "tokenizer") else self.processor
         model_config = self.model.config
-        ref_images_batch = getattr(batch, "ref_images", None)
-        if not ref_images_batch:
-            ref_images_batch = getattr(batch, "image_path", None)
+        ref_images_batch = getattr(batch, "image_path", None)
 
         # Prompt enhancement: skip editing prompts and warmup requests.
         if (
@@ -788,8 +814,9 @@ class HiDreamGenerationStage(PipelineStage):
                 for p in prompts
             ]
 
+
         results = []
-        for prompt, height, width, seed in zip(prompts, heights, widths, seeds):
+        for prompt, height, width, seed in _per_prompt_work(batch, prompts):
             height, width = int(height), int(width)
 
             ref_paths = None
@@ -800,23 +827,26 @@ class HiDreamGenerationStage(PipelineStage):
                 if not ref_paths:
                     ref_paths = None
 
-            # keep_original_aspect: size the target from the single reference.
+            # TI2I (single reference) keeps the reference aspect by default:
+            # the target size derives from the reference resized to 2048
+            # (patch-aligned). An explicit width AND height in the request
+            # wins (snapped); T2I always snaps the requested size.
             preresized_ref_pil = None
-            if keep_original_aspect and ref_paths and len(ref_paths) == 1:
+            explicit_fields = getattr(
+                sampling_params, "_explicit_fields", None) or ()
+            explicit_size = ("width" in explicit_fields
+                             and "height" in explicit_fields)
+            if ref_paths and len(ref_paths) == 1 and not explicit_size:
                 preresized_ref_pil = resize_pilimage(
                     Image.open(ref_paths[0]).convert("RGB"), 2048, PATCH_SIZE)
                 width, height = preresized_ref_pil.size
-                logger.info(
-                    "keep_original_aspect: target size set to %dx%d "
-                    "from reference image", width, height)
+                logger.info("TI2I: target size %dx%d from reference aspect",
+                            width, height)
             else:
-                if keep_original_aspect:
-                    logger.warning(
-                        "keep_original_aspect requires exactly one reference "
-                        "image; falling back to resolution snapping.")
                 best_w, best_h = find_closest_resolution(width, height)
                 if best_w != width or best_h != height:
-                    logger.info("Resolution snapped from %dx%d to %dx%d", width, height, best_w, best_h)
+                    logger.info("Resolution snapped from %dx%d to %dx%d",
+                                width, height, best_w, best_h)
                     width, height = best_w, best_h
 
             h_patches = height // PATCH_SIZE
@@ -862,7 +892,7 @@ class HiDreamGenerationStage(PipelineStage):
                 ref_images = []
                 transform = _ref_tensor_transform()
                 for pil in ref_pils:
-                    # already patch-aligned via keep_original_aspect
+                    # already patch-aligned via the TI2I reference resize
                     if preresized_ref_pil is not None and pil is preresized_ref_pil:
                         pil_r = pil
                     else:
@@ -918,6 +948,17 @@ class HiDreamGenerationStage(PipelineStage):
                 uncond_sample = to_device(uncond_sample)
 
             is_editing = ref_paths is not None and len(ref_paths) == 1
+            # official --editing_scheduler applies to DEV only ("Ignored for
+            # full model"); the FULL model keeps UniPC for every task
+            if (is_editing and model_type != "full"
+                    and "scheduler_name" not in set(
+                        getattr(sampling_params, "_explicit_fields", ()) or ())):
+                if scheduler_name != "flow_match":
+                    logger.info(
+                        "Editing: scheduler %s -> flow_match (official "
+                        "editing default)", scheduler_name)
+                # official --editing_scheduler default is flow_match
+                scheduler_name = "flow_match"
             if model_type == "full":
                 sched = FlowUniPCScheduler(shift=shift)
                 sched.set_timesteps(num_steps, device)
@@ -935,28 +976,46 @@ class HiDreamGenerationStage(PipelineStage):
                 sched.set_timesteps_list(DEFAULT_TIMESTEPS, device)
                 inject_noise = True
             num_steps = len(sched.timesteps)
-            if inject_noise:
-                if num_steps > 1:
-                    noise_scale_schedule = [
-                        noise_scale_start
-                        + (noise_scale_end - noise_scale_start) * i / (num_steps - 1)
-                        for i in range(num_steps)
-                    ]
-                else:
-                    noise_scale_schedule = [noise_scale_start]
-                init_noise_scale = noise_scale_start
+            if inject_noise and num_steps > 1:
+                noise_scale_schedule = [
+                    noise_scale_start
+                    + (noise_scale_end - noise_scale_start) * i / (num_steps - 1)
+                    for i in range(num_steps)
+                ]
             else:
-                init_noise_scale = NOISE_SCALE
+                noise_scale_schedule = [noise_scale_start]
 
-            torch.manual_seed(int(seed) + 1)
-            noise = init_noise_scale * torch.randn(
-                (1, 3, height, width),
-                generator=torch.Generator("cpu").manual_seed(int(seed) + 1),
-            ).to(device, dtype)
-            z = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
-            z = z.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(1, h_patches * w_patches, -1)
+            init_noise_scale = noise_scale_start
+
+            noise_note = (
+                f" (per-step noise={noise_scale_start}->{noise_scale_end} "
+                f"clip={noise_clip_std})" if inject_noise else ""
+            )
+            logger.info(
+                "HiDream %s/%s: cfg=%s shift=%s steps=%d z_init=%s "
+                "inject=%s%s seed=%s weights=%s",
+                model_type, scheduler_name, guidance_scale, shift, num_steps,
+                init_noise_scale,
+                "per-step" if inject_noise else "off",
+                noise_note, batch.seed, w_dtype,
+            )
 
             tgt_image_len = h_patches * w_patches
+
+            # All noise is drawn through a private CPU generator seeded with
+            # this image's seed (official pipeline.py:315; CPU is the
+            # reference-quality RNG on NPU).
+            generator = torch.Generator("cpu")
+            generator.manual_seed(int(seed))
+            noise = init_noise_scale * torch.randn(
+                (1, 3, height, width),
+                generator=generator,
+                device=generator.device,
+                dtype=torch.float32,
+            ).to(device, dtype)
+            z = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
+            z = z.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(
+                1, h_patches * w_patches, -1)
 
             precomputed_image_embeds = None
             precomputed_deepstack_image_embeds = None
@@ -969,21 +1028,26 @@ class HiDreamGenerationStage(PipelineStage):
                 vinputs = (torch.cat([z, ref_patches], dim=1)
                            if ref_patches is not None else z.clone())
 
-                with torch.autocast(device_type=device.type if isinstance(device.type, str) else "cpu",
-                                    dtype=dtype, cache_enabled=False):
+                with torch.autocast(
+                    device_type=device.type, dtype=dtype, cache_enabled=False,
+                ):
                     x_pred_cond, embeds = self._forward_once(
                         cond_sample, vinputs, t_pixeldit.to(device),
                         precomputed_image_embeds,
                         precomputed_deepstack_image_embeds,
                     )
                 if embeds is not None:
-                    precomputed_image_embeds, precomputed_deepstack_image_embeds = embeds
+                    precomputed_image_embeds, \
+                        precomputed_deepstack_image_embeds = embeds
                 x_tgt = x_pred_cond[:, :tgt_image_len]
+
                 v_cond = (x_tgt.float() - z.float()) / sigma
 
                 if uncond_sample is not None:
-                    with torch.autocast(device_type=device.type if isinstance(device.type, str) else "cpu",
-                                        dtype=dtype, cache_enabled=False):
+                    with torch.autocast(
+                        device_type=device.type, dtype=dtype,
+                        cache_enabled=False,
+                    ):
                         x_pred_uncond, _ = self._forward_once(
                             uncond_sample, vinputs, t_pixeldit.to(device),
                             precomputed_image_embeds,
@@ -1000,7 +1064,8 @@ class HiDreamGenerationStage(PipelineStage):
                     z = sched.step(
                         model_output.float(), step_t.to(dtype=torch.float32),
                         z.float(), s_noise=noise_scale_schedule[step_idx],
-                        noise_clip_std=noise_clip_std).to(dtype)
+                        noise_clip_std=noise_clip_std,
+                        generator=generator).to(dtype)
                 else:
                     z = sched.step(model_output.float(),
                                    step_t.to(dtype=torch.float32),

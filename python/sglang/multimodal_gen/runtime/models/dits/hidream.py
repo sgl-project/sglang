@@ -105,6 +105,7 @@ class HiDreamTextAttention(nn.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         q = self.q_norm(q.view(hidden_shape)).transpose(1, 2)
         k = self.k_norm(k.view(hidden_shape)).transpose(1, 2)
         v = v.view(hidden_shape).transpose(1, 2)
@@ -379,6 +380,7 @@ class HiDreamForCausalLM(BaseDiT):
 
             qkv, _ = attn.qkv_proj(normed)
             q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             q = attn.q_norm(q.view(hidden_shape)).transpose(1, 2)
             k = attn.k_norm(k.view(hidden_shape)).transpose(1, 2)
             v = v.view(hidden_shape).transpose(1, 2)

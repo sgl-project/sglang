@@ -26,20 +26,9 @@ class HiDreamArchConfig(DiTArchConfig):
     vocab_size: int = 151936
     max_position_embeddings: int = 262144
 
-    # Vision encoder (from config.json vision_config)
-    vision_hidden_size: int = 1152
-    vision_depth: int = 27
-    vision_num_heads: int = 16
-    vision_intermediate_size: int = 4304
-    vision_patch_size: int = 16
-    vision_temporal_patch_size: int = 2
+    # Vision encoder: the SRT Qwen3VLMoeVisionModel reads config.json's
+    # vision_config directly; only the merge size is consumed by the pipeline.
     vision_spatial_merge_size: int = 2
-    vision_in_channels: int = 3
-    vision_out_hidden_size: int = 4096
-    vision_num_position_embeddings: int = 2304
-    deepstack_visual_indexes: List[int] = field(
-        default_factory=lambda: [8, 16, 24]
-    )
 
     # Diffusion-specific (from model code constants)
     dit_patch_size: int = 32
@@ -51,7 +40,6 @@ class HiDreamArchConfig(DiTArchConfig):
     image_token_id: int = 151655
     video_token_id: int = 151656
     vision_start_token_id: int = 151652
-    vision_end_token_id: int = 151653
     tms_token_id: int = 151673
 
     num_channels_latents: int = 3  # direct patch output, no VAE

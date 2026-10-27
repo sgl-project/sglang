@@ -163,22 +163,11 @@ class InputValidationStage(PipelineStage):
                 seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         batch.seeds = seeds
 
-        # Create generators based on generator_device parameter
-        # Note: This will overwrite any existing batch.generator
-        generator_device = batch.generator_device
-        if generator_device is None:
-            generator_device = (
-                getattr(server_args.pipeline_config, "generator_device", None)
-                or current_platform.device_type
-            )
-
-        if generator_device == "cpu":
-            device_str = "cpu"
-        else:
-            device_str = current_platform.device_type
-
+        # Generators are always created on CPU: the reference-quality RNG
+        # for noise draws. Stages move the drawn tensors to the model
+        # device themselves. (Overwrites any existing batch.generator.)
         batch.generator = [
-            torch.Generator(device_str).manual_seed(seed) for seed in seeds
+            torch.Generator("cpu").manual_seed(seed) for seed in seeds
         ]
 
     def preprocess_condition_image(
