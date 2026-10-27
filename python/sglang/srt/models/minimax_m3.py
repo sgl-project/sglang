@@ -1796,8 +1796,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 defers_finalize=self.is_layer_sparse
                 and self.mlp.supports_deferred_finalize,
             )
-        elif self._norm_quant is not None:
-            options = self._norm_quant.boundary_options(config.hidden_size)
         attn, ffn = self.stage_facts(config, layer_id)
         if self._norm_quant is not None:
             ffn = dataclasses.replace(ffn, read=self._norm_quant.ffn_read())

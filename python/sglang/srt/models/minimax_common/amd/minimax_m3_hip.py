@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
 from sglang.kernels.ops.quantization.aiter_fp8_quant_triton import swiglu_oai_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NormReadout,
     _is_gfx95_supported,
@@ -231,35 +230,6 @@ class Gfx950NormQuant:
 
     def ffn_read(self) -> NormFp8Readout:
         return NormFp8Readout(quant_format_for=self.ffn_quant_format)
-
-    def boundary_options(self, hidden_size: int) -> dict:
-        """The decode boundaries fused into one kernel on AITER's TP4 custom all-reduce."""
-        from sglang.kernels.ops.communication.all_reduce_norm_quant_hip import (
-            HIDDEN_SIZE,
-            WORLD_SIZE,
-        )
-
-        parallel = get_parallel()
-        if not (
-            hidden_size == HIDDEN_SIZE
-            and parallel.tp_size == WORLD_SIZE
-            and parallel.attn_tp_size == parallel.tp_size
-            and parallel.attn_cp_size == 1
-            and parallel.pp_size == 1
-            and not is_dense_ffn_fully_dp()
-            and get_moe_a2a_backend().is_none()
-        ):
-            return {}
-        from sglang.srt.models.minimax_common.amd.minimax_m3_all_reduce_norm_quant import (
-            AllReduceNormQuantFusion,
-        )
-
-        return {
-            "fusions": AllReduceNormQuantFusion(
-                attn_quant_format_for=self.attn_quant_format,
-                ffn_quant_format_for=self.ffn_quant_format,
-            )
-        }
 
     def bind(self) -> None:
         """Bind each norm to the GEMM that reads its fused fp8 output."""
