@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.model_overrides import interns2_mobius  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import iquest_q1  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import kimi_k3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import lfm2  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import lfm3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import llama4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import mimo_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import minicpm  # noqa: F401

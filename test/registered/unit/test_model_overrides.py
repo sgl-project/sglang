@@ -4036,5 +4036,16 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestLfm3SpeculativeDecoding(CustomTestCase):
+    def test_speculative_decoding_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = SimpleNamespace(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "speculative decoding"):
+                    _lfm3_overrides(args, None)
+
+
 if __name__ == "__main__":
     unittest.main()

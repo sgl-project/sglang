@@ -470,9 +470,7 @@ def _is_minicpm5(ctx):
 
 
 def _is_lfm2(ctx):
-    return (
-        ctx.has_text("<|tool_call_start|>") or ctx.has_vocab("<|tool_call_start|>")
-    ) and (ctx.has_text("<|tool_call_end|>") or ctx.has_vocab("<|tool_call_end|>"))
+    return ctx.has_text("<|tool_call_start|>") and ctx.has_text("<|tool_call_end|>")
 
 
 def _is_step3p5(ctx):

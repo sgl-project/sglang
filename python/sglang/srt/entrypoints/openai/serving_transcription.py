@@ -97,7 +97,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         else:
             sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
-            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
+            text=self._adapter.build_prompt(request, self.tokenizer_manager.tokenizer),
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -336,7 +336,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         sampling_params = adapted_request.sampling_params
         assert isinstance(sampling_params, dict)
         chunk_request = GenerateReqInput(
-            text="",
+            text=adapted_request.text,
             audio_data=chunk_audio,
             sampling_params=dict(sampling_params),
             stream=stream,

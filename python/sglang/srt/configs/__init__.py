@@ -50,6 +50,10 @@ from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
+from sglang.srt.configs.lfm3 import Lfm3Config
+from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
+from sglang.srt.configs.lfm3_omni import Lfm3OmniConfig
+from sglang.srt.configs.lfm3_vl import Lfm3VlConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
@@ -154,6 +158,10 @@ __all__ = [
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
+    "Lfm3Config",
+    "Lfm3AudioConfig",
+    "Lfm3OmniConfig",
+    "Lfm3VlConfig",
     "LocateAnythingConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
