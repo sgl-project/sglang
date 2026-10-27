@@ -13,6 +13,7 @@ Transposed form per wave: S^T = K Q^T (keys x query columns) and O^T = V^T P^T o
     contiguous ds_write_b128 and read back as the V^T A operand with ds_read_b64_tr_b8 (16-byte chunks XOR-swizzled
     by row so the transposed reads are bank-conflict free).
   * Page ids are loaded one pair ahead of use (vector loads in order with K / V by default, or SMEM).
+  * K / V are read with 64-bit global loads: a layer's pool can exceed the 2^31-byte reach of buffer offsets.
   * NS register load slots refilled right after use keep ~NS chunks in flight per wave.
 """
 
@@ -90,6 +91,12 @@ def _cvt8(lo_word, hi_word):
     return _to_raw(fx.Vector.from_elements(parts, fx.Int32).bitcast(fx.BFloat16))
 
 
+def _global_load16(addr):
+    """16 bytes (vector<4 x i32>) at the 64-bit global byte address ``addr``."""
+    ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+    return llvm.LoadOp(T.vec(4, T.i32), _to_raw(ptr), alignment=16).result
+
+
 def _i64(lo, hi):
     return _to_raw(fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(fx.Int64)[0])
 
@@ -130,7 +137,7 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
     groups = kvh // hpg
     lds_wave = 2 * CHUNK * HD  # two V stages of 32 rows x 64 bytes per wave
     exp_scale = float(scale) * LOG2E
-    s0w, s1w = kv_s0 // 4, kv_s1 // 4  # dword strides
+    s1w = kv_s1 // 4  # dword stride
 
     q_wave = 8 * 64 * 16  # 8 B-fragments x 64 lanes x 16 bytes
     rescale = RESCALE_PVF8 if pvf8 else RESCALE
@@ -177,8 +184,8 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
         tb_r = buffer_ops.create_buffer_resource(table, max_size=True)
         kd_r = buffer_ops.create_buffer_resource(kd, max_size=True)
         q_r = buffer_ops.create_buffer_resource(q, max_size=True)
-        k_r = buffer_ops.create_buffer_resource(k, max_size=True)
-        v_r = buffer_ops.create_buffer_resource(v, max_size=True)
+        k_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(k)))
+        v_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(v)))
         p_r = buffer_ops.create_buffer_resource(part, max_size=True)
         m_r = buffer_ops.create_buffer_resource(maxi, max_size=True)
         d_r = buffer_ops.create_buffer_resource(den, max_size=True)
@@ -283,15 +290,19 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             v_keys.append(key)
             v_offs.append((key % 16) * s1w + h * (HD // 4) + logical * 4)
 
+        # per-lane 64-bit base addresses; a load adds its page's 64-bit byte offset
+        k_lane = k_addr + fx.Int64(k_off * 4)
+        v_lane = [v_addr + fx.Int64(v_offs[u] * 4) for u in range_constexpr(2)]
+
         def issue(pids):
             p0, p1 = pids
             loads = []
             for mt in range_constexpr(2):
                 page = p0 if mt == 0 else p1
-                loads.append(buffer_ops.buffer_load(k_r, page * s0w + k_off, vec_width=4, dtype=T.i32))
+                loads.append(_global_load16(k_lane + fx.Int64(page) * kv_s0))
             for u in range_constexpr(2):
                 page = (v_keys[u] < 16).select(p0, p1)
-                loads.append(buffer_ops.buffer_load(v_r, page * s0w + v_offs[u], vec_width=4, dtype=T.i32))
+                loads.append(_global_load16(v_lane[u] + fx.Int64(page) * kv_s0))
             return loads
 
         def prepare(chunk, loaded, stage, masked):
@@ -555,8 +566,6 @@ def verify_fly_partials(
     assert q.dtype == torch.bfloat16 and q.shape[-1] == HD and heads == GQA * kvh and q.shape[0] == n * QL
     assert k.shape[1] == PAGE and k.stride() == v.stride() and k.stride(2) == HD and k.stride(3) == 1
     assert q.stride(2) == 1 and q.stride(1) == HD
-    # buffer offsets are 32-bit byte offsets
-    assert k.numel() < 2**31 and v.numel() < 2**31
     assert work_splits is None or splits <= 2 * work_splits <= 2 * splits
     st = (q.shape[0], heads, splits)
     part = torch.empty((*st, HD), dtype=torch.float32, device=q.device)
