@@ -3408,9 +3408,7 @@ class Scheduler(
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
             # read for hash/extra-key context here (never locked), so a device
-            # node serves. Cache mode keeps the is_backuped gate below: its
-            # write-through prefix is contiguous from root, so an unbacked
-            # anchor means a guaranteed storage miss.
+            # node serves.
             if (
                 buffer_mode
                 and tree_cache.is_root(last_host_node)
@@ -3421,11 +3419,13 @@ class Scheduler(
             matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
 
+            # Write-back keeps a host-only suffix below a device-only anchor, and
+            # another writer (e.g. a P/D decode) may have stored that suffix.
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
                 or (
-                    buffer_mode
+                    (buffer_mode or tree_cache.is_write_back)
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
