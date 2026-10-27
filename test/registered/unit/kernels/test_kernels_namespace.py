@@ -16,7 +16,7 @@ from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
@@ -246,6 +246,14 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     group = op.split(".")[0]
     assert spec.target.startswith(f"sglang.kernels.ops.{group}.")
     assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type=device))
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_router_gemv_is_inventoried_for_cuda_and_hip():
+    """CUDA serves FP32 gates and ROCm gfx950 BF16 gates through one Triton GEMV."""
+    spec = K.select_kernel("gemm.router_gemv", backend=KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 

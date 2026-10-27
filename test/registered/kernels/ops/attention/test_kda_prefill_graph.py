@@ -149,6 +149,11 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.a = torch.zeros(1, BUCKET, HEADS * HEAD_DIM, device="cuda")
         self.a = self.a.to(torch.bfloat16)
         self.b = torch.zeros(1, BUCKET, HEADS, device="cuda", dtype=torch.bfloat16)
+        self.gate_4d = False
+
+    def _gate(self, num_tokens):
+        a = self.a[:, :num_tokens]
+        return a.unflatten(-1, (HEADS, HEAD_DIM)) if self.gate_4d else a
 
     def _fill(self, meta, batch):
         with patch(
@@ -179,7 +184,7 @@ class TestKDAPrefillGraph(CustomTestCase):
                 self.layer,
                 capture_batch,
                 self.mixed[:num_tokens],
-                self.a[:, :num_tokens],
+                self._gate(num_tokens),
                 self.b[:, :num_tokens],
             )
 
@@ -221,7 +226,7 @@ class TestKDAPrefillGraph(CustomTestCase):
             self.layer,
             ref_batch,
             self.mixed[:total],
-            self.a[:, :total],
+            self._gate(total),
             self.b[:, :total],
         )
 
@@ -286,6 +291,21 @@ class TestKDAPrefillGraph(CustomTestCase):
                     track=track,
                     seed=100 + i,
                 )
+
+    def test_replays_match_eager_4d_gate(self):
+        """Kimi passes the gate as [1, T, H, K]; the graph must still apply the
+        beta sigmoid the eager extend applies."""
+        self.gate_4d = True
+        meta, graph, out = self._capture()
+        self._check_replay(
+            meta,
+            graph,
+            out,
+            lens=[37, 100, 5, 192],
+            prefixes=[0, 64, 130, 0],
+            track={1: 70, 3: 192},
+            seed=200,
+        )
 
     def test_capacity(self):
         meta = KDAPrefillGraphMetadata.allocate(
