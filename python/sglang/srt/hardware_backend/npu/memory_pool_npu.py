@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -13,10 +14,12 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -708,6 +711,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.indexer_kv_store_int8 = (
             envs.SGLANG_NPU_INDEXER_INT8.get()
+            and not get_memory().enable_hierarchical_cache
             and not self.dsa_kv_cache_store_fp8
             and index_head_dim is not None
         )
@@ -719,6 +723,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_scale_dtype = (
                 torch.float32 if self.dsa_kv_cache_store_fp8 else None
             )
+        logger.info(
+            f"Indexer K Cache type {self.index_k_store_dtype} scale type {self.index_k_scale_dtype}"
+        )
 
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
