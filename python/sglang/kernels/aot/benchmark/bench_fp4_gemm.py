@@ -368,9 +368,9 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             res_fi,
             backend="cudnn",
         )
-        assert torch.allclose(
-            res_fi, res_cutlass, atol=1e-3, rtol=1e-3
-        ), "cudnn fp4 doesn't match cutlass fp4"
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), (
+            "cudnn fp4 doesn't match cutlass fp4"
+        )
         mm_fp4(
             a_fp4,
             b_fp4_T,
@@ -381,9 +381,9 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             res_fi,
             backend="trtllm",
         )
-        assert torch.allclose(
-            res_fi, res_cutlass, atol=1e-3, rtol=1e-3
-        ), "trtllm fp4 doesn't match cutlass fp4"
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), (
+            "trtllm fp4 doesn't match cutlass fp4"
+        )
 
     if csv_file:
         with open(csv_file, "a", newline="") as f:

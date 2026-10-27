@@ -13,12 +13,17 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import copy
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    normalize_deepseek_v41_config,
+)
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -43,6 +48,10 @@ from .common import (
 from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
+# The base and revision that get_config read for each Kev LoRA checkpoint, which
+# has no model config of its own, keyed by checkpoint path and revision.
+POINTER_ADAPTER_BASES: Dict[Tuple[str, Optional[str]], Tuple[str, str]] = {}
+
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
@@ -52,6 +61,94 @@ def _apply_deepseek_ocr_overrides(config, model):
     _override_v_head_dim_if_zero(config)
     _set_architectures(config, "DeepseekOCRForCausalLM")
     config._name_or_path = model
+
+
+_GEMMA4_MODEL_TYPES = (
+    "gemma4",
+    "gemma4_assistant",
+    "gemma4_unified",
+    "gemma4_unified_assistant",
+    "diffusion_gemma",
+    "embedding_gemma2",
+)
+
+
+_GEMMA4_FLATTENED_PER_LAYER_ATTRS = frozenset({"head_dim", "num_key_value_heads"})
+
+
+def _gemma4_attention_shapes(text_config) -> dict[str, tuple[int, int]]:
+    # `_heterogeneity_spec` is the only statement of what the checkpoint
+    # declared per layer; `is_heterogeneous` is a `hasattr` of it.
+    spec = text_config._heterogeneity_spec
+    unsupported = set(spec.per_layer_attributes) - _GEMMA4_FLATTENED_PER_LAYER_ATTRS
+    # `per_layer_attributes` discards `skip`, so it needs its own check.
+    if any("skip" in overrides for overrides in spec.per_layer_overrides.values()):
+        unsupported.add("skip")
+    if unsupported:
+        raise ValueError(
+            f"Gemma4 config declares per-layer {sorted(unsupported)}, which SGLang "
+            f"cannot express: it carries one full-attention and one sliding-window "
+            f"shape, and flattens only {sorted(_GEMMA4_FLATTENED_PER_LAYER_ATTRS)}."
+        )
+
+    # Indexing the view by layer type demands that the whole type be uniform,
+    # and reading the global config raises while the spec is attached.
+    per_layer = text_config.per_layer_config
+    shapes: dict[str, set] = {}
+    for layer_idx, layer_type in enumerate(text_config.layer_types):
+        layer = per_layer[layer_idx]
+        shapes.setdefault(layer_type, set()).add(
+            (layer.head_dim, layer.num_key_value_heads)
+        )
+
+    for layer_type, layer_shapes in shapes.items():
+        if len(layer_shapes) > 1:
+            raise ValueError(
+                f"Gemma4 config gives its '{layer_type}' layers more than one "
+                f"(head_dim, num_key_value_heads): {sorted(layer_shapes)}. SGLang "
+                f"carries a single shape per layer type."
+            )
+
+    return {layer_type: shape.pop() for layer_type, shape in shapes.items()}
+
+
+def _apply_gemma4_attention_overrides(config):
+    # Gemma4 states its shapes SWA-first: base attributes are the sliding-window
+    # values and full-attention overrides them; SGLang's base is full attention.
+    text_config = config.text_config
+
+    if text_config.is_heterogeneous:
+        # transformers states that split as a `per_layer_config`, and
+        # consumes `global_head_dim` / `num_global_key_value_heads` building it.
+        shapes = _gemma4_attention_shapes(text_config)
+        full_head_dim, full_kv_heads = shapes["full_attention"]
+        # The last layer is forced to full attention, so that key is always
+        # present; a model without sliding layers leaves `swa_*` unused.
+        swa_head_dim, swa_kv_heads = shapes.get(
+            "sliding_attention", shapes["full_attention"]
+        )
+        # Dropping the spec discards nothing once the two attributes it may
+        # carry are flattened, and every read of `head_dim` raises until it is.
+        text_config.per_layer_config = None
+    else:
+        # transformers pops `global_head_dim` / `num_global_key_value_heads`
+        # whether or not it builds a spec, so there is no split left to recover.
+        full_head_dim = swa_head_dim = text_config.head_dim
+        full_kv_heads = swa_kv_heads = text_config.num_key_value_heads
+
+    text_config.head_dim = full_head_dim
+    text_config.num_key_value_heads = full_kv_heads
+    text_config.swa_head_dim = swa_head_dim
+    text_config.swa_v_head_dim = swa_head_dim
+    text_config.swa_num_key_value_heads = swa_kv_heads
+
+    if not hasattr(text_config, "v_head_dim"):
+        text_config.v_head_dim = text_config.head_dim
+
+    # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
+    # but the multimodal processor expects `eoa_token_id`.
+    if not hasattr(config, "eoa_token_id") and hasattr(config, "eoa_token_index"):
+        config.eoa_token_id = config.eoa_token_index
 
 
 _LONGCAT_ARCHS = {
@@ -74,6 +171,47 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
+    """Recognize the original state-spaces Mamba-1 checkpoints.
+
+    The raw `state-spaces/mamba-*` repos (e.g. mamba-130m/790m/2.8b, as opposed
+    to the `-hf` conversions) ship a minimal `config.json` with `d_model` /
+    `n_layer` / `ssm_cfg` and NO `model_type` / `architectures`, so
+    `AutoConfig.from_pretrained` rejects them with "Unrecognized model ...".
+    Detect that shape and build our `MambaConfig` (model_type `mamba`, arch
+    `MambaForCausalLM`) with the field-name mapping the SGLang Mamba model
+    expects. Uses `get_config_dict` (which does not require a model_type) so
+    this runs before the failing `AutoConfig` path.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    # Raw state-spaces Mamba: has d_model + ssm_cfg, and no model_type/arch.
+    if config_dict.get("model_type") or config_dict.get("architectures"):
+        return None
+    if "d_model" not in config_dict or "ssm_cfg" not in config_dict:
+        return None
+
+    from sglang.srt.configs.mamba import MambaConfig
+
+    d_model = config_dict["d_model"]
+    # The embedding is padded up to a multiple of pad_vocab_size_multiple; match
+    # the checkpoint (e.g. 50277 -> 50280) so weight shapes line up.
+    pad = config_dict.get("pad_vocab_size_multiple", 1)
+    vocab_size = config_dict.get("vocab_size", 50280)
+    if pad > 1:
+        vocab_size = ((vocab_size + pad - 1) // pad) * pad
+    return MambaConfig(
+        vocab_size=vocab_size,
+        hidden_size=d_model,
+        num_hidden_layers=config_dict["n_layer"],
+        state_size=config_dict.get("ssm_cfg", {}).get("d_state", 16),
+        layer_norm_epsilon=config_dict.get("layer_norm_epsilon", 1e-5),
+        residual_in_fp32=config_dict.get("residual_in_fp32", True),
+        architectures=["MambaForCausalLM"],
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -84,6 +222,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
@@ -136,13 +276,23 @@ class HfModelConfigParser(ModelConfigParserBase):
             _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
+        elif isinstance(config, DeepseekV41Config):
+            config._name_or_path = model
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
                 model_type = "deepseek-ocr"
-            config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                model, revision=revision
-            )
+            # Raw state-spaces Mamba configs are built by
+            # _try_load_raw_mamba_config with architectures injected; reloading
+            # from the checkpoint would drop them, so skip it when the config is
+            # already one of our classes.
+            from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+            from sglang.srt.configs.mamba2 import Mamba2Config
+
+            if not isinstance(config, (Mamba2Config, MambaConfig, FalconMambaConfig)):
+                config = _CONFIG_REGISTRY[model_type].from_pretrained(
+                    model, revision=revision
+                )
 
             # Re-check after reloading config from registry
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
@@ -158,42 +308,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "multi_modality":
             _set_architectures(config, "MultiModalityCausalLM")
 
-        if config.model_type in (
-            "gemma4",
-            "gemma4_assistant",
-            "gemma4_unified",
-            "gemma4_unified_assistant",
-        ):
-            # Gemma4 configs use base attributes for SWA layers and `global_*`
-            # variants for full-attention layers.  SGLang expects the opposite:
-            # base = full-attention, `swa_*` = sliding-window overrides.
-            text_config = config.text_config
-            global_head_dim = getattr(text_config, "global_head_dim", None)
-            global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
-
-            swa_head_dim = text_config.head_dim
-            swa_kv_heads = text_config.num_key_value_heads
-
-            text_config.swa_head_dim = swa_head_dim
-            text_config.swa_v_head_dim = swa_head_dim
-            text_config.swa_num_key_value_heads = swa_kv_heads
-
-            if global_head_dim is not None:
-                text_config.head_dim = global_head_dim
-            if global_kv_heads is not None:
-                text_config.num_key_value_heads = global_kv_heads
-
-            if not hasattr(text_config, "v_head_dim"):
-                text_config.v_head_dim = text_config.head_dim
-            if not hasattr(text_config, "swa_v_head_dim"):
-                text_config.swa_v_head_dim = text_config.swa_head_dim
-
-            # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
-            # but the multimodal processor expects `eoa_token_id`.
-            if not hasattr(config, "eoa_token_id") and hasattr(
-                config, "eoa_token_index"
-            ):
-                config.eoa_token_id = config.eoa_token_index
+        if config.model_type in _GEMMA4_MODEL_TYPES:
+            _apply_gemma4_attention_overrides(config)
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")
@@ -259,11 +375,36 @@ def get_config(
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
     parser = get_model_config_parser(model_config_parser)
-    config = parser.parse(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    try:
+        config = parser.parse(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except (OSError, ValueError):
+        # A Kev LoRA checkpoint has no model config. It serves the text backbone
+        # of the base its head.pt pins.
+        from sglang.srt.configs.model_config import load_pointer_adapter
+
+        meta = load_pointer_adapter(model, revision)
+        if meta is None:
+            raise
+        base = parser.parse(
+            meta["base"],
+            trust_remote_code=trust_remote_code,
+            revision=meta["base_revision"],
+            **kwargs,
+        )
+        if base.model_type != "qwen3_5":
+            raise ValueError(
+                f"Kev checkpoints on a {base.model_type} base are not supported, "
+                "only on Qwen3.5 and Qwen3.8 bases"
+            )
+        config = copy.deepcopy(base.text_config)
+        _set_architectures(config, "Qwen3_5ForCausalLM")
+        POINTER_ADAPTER_BASES[(model, revision)] = (meta["base"], meta["base_revision"])
 
     if model_override_args:
+        if isinstance(config, DeepseekV41Config):
+            model_override_args = normalize_deepseek_v41_config(model_override_args)
         # A plain update() setattrs a dict-valued override straight onto the
         # config, so '{"text_config": {...}}' on a VLM would replace the whole
         # sub-config with a dict and break attribute access downstream.
@@ -271,6 +412,14 @@ def get_config(
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
+            elif (
+                key in ("rope_scaling", "rope_parameters")
+                and isinstance(value, dict)
+                and isinstance(current, dict)
+            ):
+                # v5's rope_scaling setter replaces rope_parameters wholesale;
+                # merge so partial overrides keep rope_theta (#41227).
+                setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
 

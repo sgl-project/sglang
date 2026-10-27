@@ -304,9 +304,9 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
         assert x.shape[-1] == K, f"x last dim {x.shape[-1]} != K={K}"
         M_tok = x.size // K
         T = indices.shape[-1]
-        assert (
-            M_tok * T == indices.size
-        ), f"M_tok({M_tok}) * T({T}) != indices.size({indices.size})"
+        assert M_tok * T == indices.size, (
+            f"M_tok({M_tok}) * T({T}) != indices.size({indices.size})"
+        )
         x_flat = x.reshape(M_tok, K)
         idx_flat = indices.reshape(M_tok * T)
         if idx_flat.dtype != mx.uint32:
@@ -314,9 +314,9 @@ class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
 
         # x_up has N as its last axis and total size M_tok * T * N. The singleton
         # rank dims (1 or 2 of them) get folded away by reshape.
-        assert (
-            x_up.shape[-1] == N and x_up.size == M_tok * T * N
-        ), f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
+        assert x_up.shape[-1] == N and x_up.size == M_tok * T * N, (
+            f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
+        )
         x_up_flat = x_up.reshape(M_tok * T, N)
 
         kernel = metal_jit.get("affine_gather_qmv_silu_mul_4bit_gs64", x.dtype)

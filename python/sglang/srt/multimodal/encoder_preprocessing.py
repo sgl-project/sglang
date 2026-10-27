@@ -1,7 +1,8 @@
 import hashlib
 import inspect
 from collections.abc import Mapping
-from typing import Any, Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 import torch
@@ -9,6 +10,34 @@ import torch
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 LOCAL_PREPROCESSED_KEY = "encoder_local_preprocessed"
+
+
+@dataclass(frozen=True)
+class EncoderMediaProcessorConfig:
+    """Optional model-declared media loading behavior for encoder mode."""
+
+    image_decode_mode: bool | str = False
+    preserve_media_metadata: bool = False
+    # The model hook runs in the preprocess executor and receives videos the
+    # encoder already loaded in its IO executor.
+    preprocess_off_event_loop: bool = False
+    audio_sample_rate: int | None = None
+
+
+@runtime_checkable
+class EncoderMediaProcessorConfigProvider(Protocol):
+    """Model contract for optional encoder-side media preprocessing."""
+
+    encoder_media_processor_config: EncoderMediaProcessorConfig
+
+
+def resolve_encoder_media_processor_config(
+    model: object,
+) -> EncoderMediaProcessorConfig:
+    """Resolve a model-declared capability without model-name dispatch."""
+    if isinstance(model, EncoderMediaProcessorConfigProvider):
+        return model.encoder_media_processor_config
+    return EncoderMediaProcessorConfig()
 
 
 def hash_raw_encoder_item(value: Any) -> int:

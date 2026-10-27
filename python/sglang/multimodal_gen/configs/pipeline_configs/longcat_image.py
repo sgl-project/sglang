@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -16,9 +17,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     TextConditioningOutput,
+    pack_latents_2x2,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -166,17 +172,6 @@ def _unpack_latents(latents, height, width, vae_scale_factor):
     return latents
 
 
-def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(
-        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-    )
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(
-        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-    )
-    return latents
-
-
 def _calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
@@ -252,6 +247,28 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
             keep_resident_components=("text_encoder", "vae"),
         )
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        # Noise/reference latents are built at batch_size = prompts * num_outputs,
+        # but text encoding stays per-prompt; repeat the embeds to match. No-op
+        # for num_outputs == 1. Shared by T2I and Edit.
+        from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+            PromptToSampleBatchExpander,
+        )
+
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
+
     # --- LatentPreparationStage hooks ---
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
@@ -266,7 +283,7 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
     def maybe_pack_latents(self, latents, batch_size, batch):
         num_channels_latents = self.dit_config.arch_config.num_channels_latents
         _, _, h, w = latents.shape
-        return _pack_latents(latents, batch_size, num_channels_latents, h, w)
+        return pack_latents_2x2(latents, batch_size, num_channels_latents, h, w)
 
     def maybe_prepare_latent_ids(self, latents):
         # latents shape after packing: [B, (h//2)*(w//2), C*4]
@@ -416,3 +433,213 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
         noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
         scale = (cond_norm / (noise_norm + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
         return noise_pred * scale
+
+
+def _calculate_edit_dimensions(target_area, ratio):
+    """Output size for LongCat-Image-Edit: fit `target_area`, ceil to /16.
+
+    Copied from diffusers pipeline_longcat_image_edit.calculate_dimensions.
+    Note this intentionally differs from the Qwen-Image pipeline config
+    calculate_dimensions (which rounds to /32).
+    """
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = width if width % 16 == 0 else (width // 16 + 1) * 16
+    height = height if height % 16 == 0 else (height // 16 + 1) * 16
+
+    return int(width), int(height)
+
+
+@dataclass
+class LongCatImageEditPipelineConfig(LongCatImagePipelineConfig):
+    """Configuration for the LongCat-Image-Edit I2I pipeline.
+
+    Mirrors diffusers LongCatImageEditPipeline: the reference image is resized
+    to the output resolution, VAE-encoded with argmax sampling, packed, and
+    concatenated after the noisy latents along the sequence dim. RoPE ids use
+    modality 1 for noisy tokens and modality 2 for reference tokens, both
+    offset by the full text sequence length (VL image tokens + 512 body).
+    """
+
+    task_type: ModelTaskType = ModelTaskType.I2I
+    # diffusers reference draws latent noise with a CPU generator
+    generator_device: str = "cpu"
+
+    # --- InputValidationStage hooks ---
+
+    def calculate_condition_image_size(self, image, width, height):
+        return _calculate_edit_dimensions(1024 * 1024, width / height)
+
+    # --- LatentPreparationStage hooks ---
+
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        # The edit reference draws noise directly in the prompt-embeds dtype
+        # (bf16), unlike the T2I reference which draws in float32.
+        return prompt_dtype
+
+    def maybe_prepare_latent_ids(self, latents):
+        # img_ids (noisy + reference) are built per-step in
+        # prepare_*_cond_kwargs because the text start offset depends on the
+        # VL image token count, which is unknown at latent preparation time.
+        return None
+
+    # --- ImageVAEEncodingStage hooks ---
+
+    def preprocess_vae_encode(self, image, vae):
+        # AutoencoderKL is a 2D image VAE; drop the frames dim added by
+        # ImageVAEEncodingStage ([B, C, 1, H, W] -> [B, C, H, W]).
+        if image.dim() == 5 and image.shape[2] == 1:
+            image = image.squeeze(2)
+        return image
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        if latent_condition.dim() == 5 and latent_condition.shape[2] == 1:
+            latent_condition = latent_condition.squeeze(2)
+        batch_size = batch.batch_size
+        if batch_size > latent_condition.shape[0]:
+            if batch_size % latent_condition.shape[0] != 0:
+                raise ValueError(
+                    f"Cannot duplicate reference image of batch size "
+                    f"{latent_condition.shape[0]} to {batch_size} prompts."
+                )
+            latent_condition = latent_condition.repeat(
+                batch_size // latent_condition.shape[0], 1, 1, 1
+            )
+        _, num_channels_latents, height, width = latent_condition.shape
+        return pack_latents_2x2(
+            latent_condition, batch_size, num_channels_latents, height, width
+        )
+
+    # --- Denoising hooks ---
+
+    def shard_latents_for_sp(self, batch, latents):
+        # (h/2)*(w/2) is odd at most ~1MP edit resolutions, so SP has to pad, and
+        # the pads stay unmasked (USPAttention rejects a mask alongside the
+        # replicated text prefix). Repeat the last token instead of the base
+        # class's zeros, which would carry the RoPE of text token 0.
+        if latents.dim() == 3 and model_parallel_is_initialized():
+            sp_world_size = get_sp_world_size()
+            remainder = latents.shape[1] % sp_world_size
+            if remainder:
+                pad = latents[:, -1:].expand(-1, sp_world_size - remainder, -1)
+                latents = torch.cat([latents, pad], dim=1)
+        return super().shard_latents_for_sp(batch, latents)
+
+    def _maybe_shard_pos_ids_for_sp(self, batch, pos_ids):
+        # RoPE ids must be sharded exactly like their latents, so reuse the same
+        # helper. It reads the SP group, which only exists under model parallelism.
+        if not model_parallel_is_initialized() or get_sp_world_size() == 1:
+            return pos_ids
+        sharded, _ = self.shard_latents_for_sp(batch, pos_ids.unsqueeze(0))
+        return sharded.squeeze(0)
+
+    def _edit_img_ids(self, batch, num_token, device):
+        """Position ids for [noisy | reference] packed latent tokens.
+
+        The reference image is resized to the output resolution, so both grids
+        share the same shape; they differ only in modality id (1 vs 2).
+        """
+        vae_scale_factor = self.vae_config.get_vae_scale_factor()
+        h = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        w = 2 * (int(batch.width) // (vae_scale_factor * 2))
+        noisy_ids = _prepare_pos_ids(
+            modality_id=1,
+            token_type="image",
+            start=(num_token, num_token),
+            height=h // 2,
+            width=w // 2,
+        )
+        ref_ids = _prepare_pos_ids(
+            modality_id=2,
+            token_type="image",
+            start=(num_token, num_token),
+            height=h // 2,
+            width=w // 2,
+        )
+        noisy_ids = self._maybe_shard_pos_ids_for_sp(batch, noisy_ids)
+        ref_ids = self._maybe_shard_pos_ids_for_sp(batch, ref_ids)
+        return torch.cat([noisy_ids, ref_ids], dim=0).to(device)
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        num_token = batch.prompt_embeds[0].shape[1]
+        return {
+            "txt_ids": _prepare_pos_ids(
+                modality_id=0, token_type="text", start=(0, 0), num_token=num_token
+            ).to(device),
+            "img_ids": self._edit_img_ids(batch, num_token, device),
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        num_token = batch.negative_prompt_embeds[0].shape[1]
+        return {
+            "txt_ids": _prepare_pos_ids(
+                modality_id=0, token_type="text", start=(0, 0), num_token=num_token
+            ).to(device),
+            "img_ids": self._edit_img_ids(batch, num_token, device),
+        }
+
+    def slice_noise_pred(self, noise, latents):
+        # Drop predictions over the appended reference-image tokens.
+        return noise[:, : latents.size(1)]
+
+    def post_denoising_loop(self, latents, batch):
+        # The SP gather leaves the noisy latents at their padded length; trim the
+        # trailing pad tokens before unpacking to the (h/2)*(w/2) grid.
+        if latents.dim() == 3:
+            vae_scale_factor = self.vae_config.get_vae_scale_factor()
+            h = 2 * (int(batch.height) // (vae_scale_factor * 2))
+            w = 2 * (int(batch.width) // (vae_scale_factor * 2))
+            expected = (h // 2) * (w // 2)
+            if latents.shape[1] > expected:
+                latents = latents[:, :expected, :]
+        return super().post_denoising_loop(latents, batch)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.longcat_image import (
+        LongCatImageEditSamplingParams,
+        LongCatImageEditTurboSamplingParams,
+        LongCatImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
+    register_configs(
+        sampling_param_cls=LongCatImageEditTurboSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" in hf_id.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LongCatImageEditSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" not in hf_id.lower()
+            ),
+        ],
+    )

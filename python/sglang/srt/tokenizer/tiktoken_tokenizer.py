@@ -76,9 +76,7 @@ class TiktokenTokenizer:
             self,
             text: str,
             *,
-            allowed_special: Union[
-                Literal["all"], AbstractSet[str]
-            ] = set(),  # noqa: B006
+            allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),  # noqa: B006
             disallowed_special: Union[Literal["all"], Collection[str]] = "all",
         ) -> List[int]:
             if isinstance(allowed_special, set):

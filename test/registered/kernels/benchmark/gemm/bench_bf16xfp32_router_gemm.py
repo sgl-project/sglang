@@ -18,7 +18,7 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.kernels.ops.attention.dsv4.gemm import (
+from sglang.kernels.ops.gemm.bf16_fp32 import (
     _linear_bf16_fp32_hpc,
     mark_hpc_bf16xfp32_gemm_enabled,
 )

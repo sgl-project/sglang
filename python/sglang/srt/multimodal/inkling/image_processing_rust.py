@@ -10,8 +10,10 @@ from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import ImageInput
 
-from sglang.srt.multimodal._core import inkling as _rs
 from sglang.srt.multimodal.inkling.image_processing import _load_image_bytes
+from sglang.srt.rust_extensions import load_rust_extension
+
+_rs = load_rust_extension("sglang.srt.rust_extensions._multimodal").inkling
 
 
 def _bits_to_bthwc(
@@ -32,7 +34,11 @@ _pil_pool = ThreadPoolExecutor(max_workers=8)
 
 
 def _pil_decode(raw: bytes) -> np.ndarray:
-    return np.ascontiguousarray(np.array(Image.open(io.BytesIO(raw)).convert("RGB")))
+    try:
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return np.ascontiguousarray(np.array(image))
 
 
 class InklingRustImageProcessor(BaseImageProcessor):

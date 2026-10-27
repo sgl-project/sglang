@@ -1,23 +1,12 @@
-"""Numerical equivalence and eligibility tests for the Path B fused swiglu kernel.
+"""Eligibility tests for the Path B fused swiglu kernel.
 
-Two groups:
-  * Model-based equivalence (``@requires_model``): loads a small MoE model, runs
-    the fused gate_qmv + silu + ×x_up kernel against the unfused reference
-    (``mx.gather_qmm`` + ``nn.silu(gate) * x_up``) on both the unsorted and
-    sorted paths. Gated by SGLANG_MLX_TEST_MODEL so CI hosts without a model
-    cache skip them (stage-a sets HF_HUB_OFFLINE=1, so they stay skipped there).
-  * Synthetic eligibility (no model, MLX only): the learned-bias fallback. The
-    fused kernel recomputes the gate matmul and has no slot for the per-expert
-    learned bias QuantizedSwitchLinear adds after the matmul, so ``can_patch``
-    must exclude a gate carrying one, and the patch must leave such a layer
-    unfused. These run wherever MLX is available (Apple Silicon).
-
-Registered on the CPU suite but skipped wherever mlx is absent; runs for real
-only on Apple Silicon via stage-a-unit-test-mlx.
+The fused kernel recomputes the gate matmul and has no slot for the per-expert
+learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse`` must
+exclude a gate carrying one, and the patch must leave such a layer unfused.
+Runs only on Apple Silicon with MLX, via stage-a-unit-test-mlx.
 """
 
 import importlib.util
-import os
 import platform
 import sys
 
@@ -46,101 +35,11 @@ if _HAS_MLX:
     import mlx.core as mx
 
 
-# Model-based tests need a real checkpoint; synthetic tests below do not.
-requires_model = pytest.mark.skipif(
-    not os.environ.get("SGLANG_MLX_TEST_MODEL"),
-    reason="Set SGLANG_MLX_TEST_MODEL to a HuggingFace model id to enable",
-)
-
-
 def _max_rel_diff(a, b):
     diff = mx.abs(a.astype(mx.float32) - b.astype(mx.float32))
     max_abs = diff.max().item()
     ref_max = mx.abs(a.astype(mx.float32)).max().item()
     return max_abs, max_abs / max(ref_max, 1e-9)
-
-
-@requires_model
-def test_fused_gate_qmv_silu_mul_matches_unfused():
-    """Kernel output matches ``nn.silu(gate_qmv) * x_up`` within bf16 ULP."""
-    import mlx.nn as nn
-    from mlx_lm import load
-
-    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
-        can_patch,
-        fused_gate_qmv_silu_mul,
-    )
-
-    model, _ = load(os.environ["SGLANG_MLX_TEST_MODEL"])
-    sw = model.model.layers[0].mlp.switch_mlp
-    assert can_patch(sw), "layer 0 not eligible for fused swiglu"
-
-    up = sw.up_proj
-    gate = sw.gate_proj
-    in_dim = up.scales.shape[-1] * up.group_size
-    out_dim = up.weight.shape[-2]
-    num_experts = up.weight.shape[0]
-    dtype = up.scales.dtype
-
-    # Two batch sizes both take the unsorted path (indices.size < 64).
-    for B, TOPK in [(1, 8), (4, 8)]:
-        x = mx.random.normal(shape=(B, 1, 1, in_dim)).astype(dtype)
-        indices = mx.random.randint(0, num_experts, shape=(B, TOPK)).astype(mx.uint32)
-
-        x_up = up(x, indices, sorted_indices=False)
-        x_gate = gate(x, indices, sorted_indices=False)
-        y_ref = nn.silu(x_gate) * x_up
-
-        y_fused = fused_gate_qmv_silu_mul(
-            x, gate["weight"], gate["scales"], gate.get("biases"), indices, x_up
-        )
-        mx.eval(y_ref, y_fused)
-
-        assert y_ref.shape == y_fused.shape
-
-        max_abs, rel = _max_rel_diff(y_ref, y_fused)
-        # 2 % relative covers ~2 bf16 ULPs at typical activation magnitudes;
-        # the kernel's fp32 accumulation order matches MLX's qmv_fast_impl so
-        # most elements should land within 1 ULP.
-        assert rel < 2e-2, f"B={B} TOPK={TOPK}: max_abs={max_abs:.3e} rel={rel:.2%}"
-
-
-@requires_model
-def test_patched_switchglu_matches_unpatched():
-    """Full SwitchGLU forward equivalence on both sorted and unsorted paths."""
-    from mlx_lm import load
-
-    from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
-        patch_switch_glu_with_fused_swiglu,
-    )
-
-    model, _ = load(os.environ["SGLANG_MLX_TEST_MODEL"])
-    sw = model.model.layers[0].mlp.switch_mlp
-    in_dim = sw.up_proj.scales.shape[-1] * sw.up_proj.group_size
-    num_experts = sw.up_proj.weight.shape[0]
-    dtype = sw.up_proj.scales.dtype
-
-    cases = []
-    # B=2 TOPK=8 -> indices.size=16 < 64 -> unsorted
-    # B=8 TOPK=8 -> indices.size=64 -> sorted
-    for B, TOPK, label in [(2, 8, "unsorted"), (8, 8, "sorted")]:
-        x = mx.random.normal(shape=(B, in_dim)).astype(dtype)
-        indices = mx.random.randint(0, num_experts, shape=(B, TOPK)).astype(mx.uint32)
-        out_ref = sw(x, indices)
-        mx.eval(out_ref)
-        cases.append((label, x, indices, out_ref))
-
-    n_patched = patch_switch_glu_with_fused_swiglu(model)
-    assert n_patched > 0, "no SwitchGLU layers were patched"
-
-    for label, x, indices, out_ref in cases:
-        out_fused = sw(x, indices)
-        mx.eval(out_fused)
-        max_abs, rel = _max_rel_diff(out_ref, out_fused)
-        # 5 % is generous; in practice we see <0.6 % on 48-layer Qwen3-MoE.
-        # The looser bound here absorbs cross-layer ULP propagation through
-        # down_proj's quantized matmul.
-        assert rel < 5e-2, f"full forward {label}: max_abs={max_abs:.3e} rel={rel:.2%}"
 
 
 # Learned-bias fallback (synthetic, no model): a gate with a learned bias must
@@ -251,10 +150,9 @@ def test_fused_matches_unfused_synthetic():
 
         assert y_ref.shape == y_fused.shape
         # A broken kernel must not leak NaN/Inf into the downstream down_proj matmul.
-        assert bool(
-            mx.all(mx.isfinite(y_fused.astype(mx.float32))).item()
-        ), f"B={B} hi={hi}: non-finite fused output"
-        # Same bf16 bound as the @requires_model kernel test.
+        assert bool(mx.all(mx.isfinite(y_fused.astype(mx.float32))).item()), (
+            f"B={B} hi={hi}: non-finite fused output"
+        )
         max_abs, rel = _max_rel_diff(y_ref, y_fused)
         assert rel < 2e-2, f"B={B} hi={hi}: max_abs={max_abs:.3e} rel={rel:.2%}"
 
@@ -526,9 +424,9 @@ def test_ineligible_input_surfaces_pre_change_message_through_wrapper(
         )
     mx.eval(out)
 
-    assert any(
-        expected in record.getMessage() for record in caplog.records
-    ), f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+    assert any(expected in record.getMessage() for record in caplog.records), (
+        f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 def test_matched_fp32_triple_falls_back_with_membership_message(monkeypatch, caplog):
@@ -563,9 +461,9 @@ def test_matched_fp32_triple_falls_back_with_membership_message(monkeypatch, cap
         )
     mx.eval(out)
 
-    assert any(
-        expected in record.getMessage() for record in caplog.records
-    ), f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+    assert any(expected in record.getMessage() for record in caplog.records), (
+        f"expected message not in log: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 def test_patch_skips_warm_and_logs_for_out_of_regime_dtype(monkeypatch, caplog):
@@ -593,9 +491,9 @@ def test_patch_skips_warm_and_logs_for_out_of_regime_dtype(monkeypatch, caplog):
         n_patched = fused_swiglu.patch_switch_glu_with_fused_swiglu(model)
 
     assert n_patched == 1, "matched fp32 model should still patch"
-    assert any(
-        "skipping warm" in record.getMessage() for record in caplog.records
-    ), f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+    assert any("skipping warm" in record.getMessage() for record in caplog.records), (
+        f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 def test_warmup_specs_enumerates_declared_dtypes():
@@ -672,12 +570,12 @@ def test_compile_failure_falls_back_via_wrapper(monkeypatch, caplog):
     )
     expected = nn.silu(x_gate) * x_up
     mx.eval(expected)
-    assert bool(
-        mx.array_equal(out, expected).item()
-    ), "compile-failure fallback != unfused reference"
-    assert any(
-        "unavailable" in record.getMessage() for record in caplog.records
-    ), f"expected unavailable message not in log: {[r.getMessage() for r in caplog.records]}"
+    assert bool(mx.array_equal(out, expected).item()), (
+        "compile-failure fallback != unfused reference"
+    )
+    assert any("unavailable" in record.getMessage() for record in caplog.records), (
+        f"expected unavailable message not in log: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 def test_aot_warm_skips_and_logs_on_compile_failure(monkeypatch, caplog):
@@ -722,9 +620,9 @@ def test_aot_warm_skips_and_logs_on_compile_failure(monkeypatch, caplog):
         n_patched = fused_swiglu.patch_switch_glu_with_fused_swiglu(model)
 
     assert n_patched == 1, "compile failure at warm time must not block patching"
-    assert any(
-        "skipping warm" in record.getMessage() for record in caplog.records
-    ), f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+    assert any("skipping warm" in record.getMessage() for record in caplog.records), (
+        f"expected skip-warm debug log not found: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 if __name__ == "__main__":

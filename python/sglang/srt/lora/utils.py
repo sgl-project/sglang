@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -6,6 +7,29 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+logger = logging.getLogger(__name__)
+
+
+def warn_if_adapter_targets_embeddings(
+    lora_name: str,
+    embedding_layer_names: Iterable[str],
+    speculative_algorithm: Optional[str],
+) -> None:
+    """Warn once when an adapter carries embedding weights under EAGLE spec."""
+    if speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        return
+    modules = sorted(embedding_layer_names)
+    if not modules:
+        return
+    logger.warning(
+        "LoRA adapter '%s' targets embedding modules (%s) while EAGLE-family "
+        "speculative decoding is enabled. The shared draft consumes their "
+        "base weights, so those deltas do not influence drafting and may "
+        "reduce the accept rate. Outputs are unaffected.",
+        lora_name,
+        ", ".join(modules),
+    )
 
 
 @dataclass
@@ -54,7 +78,7 @@ class LoRABatchInfo:
     seg_lens: Optional[torch.Tensor]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
-    permutation: Optional[torch.Tensor]
+    permutation: Optional[torch.Tensor] = None
 
     # Total number of tokens this batch info expects (host-side int).
     # Used by lm_head LoRA to validate input shape without GPU sync.
@@ -63,6 +87,8 @@ class LoRABatchInfo:
     # CPU-side flag: True when at least one request uses a LoRA adapter.
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
+
+    is_prefill: bool = False
 
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
@@ -81,6 +107,20 @@ class LoRABatchInfo:
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+class Phase(str, Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+def architecture_for_capability(major: int) -> str:
+    """Plan-table name for compute capability major: sm90, sm100 (>= 10) or default."""
+    if major == 9:
+        return "sm90"
+    if major >= 10:
+        return "sm100"
+    return "default"
 
 
 def copy_weight_into_buffer(
@@ -349,7 +389,7 @@ REPLICATED_LINEAR_LORA_NAMES = [
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
-# under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
+# under attention DP is `attn_tp_size = tp_size // attn_dp_size` rather
 # than the outer TP size. in_proj / in_proj_qkvz (linear-attention hybrids)
 # belong here too: their layers are built on the attn-TP group (mamba.py and
 # qwen3_5.py take tp_size/tp_rank from attn_tp when dp attention is enabled).
@@ -465,13 +505,30 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
     return output_dim
 
 
+def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
+    """(total tokens, max tokens per request) for LoRA segment math."""
+    mode = forward_batch.forward_mode
+    if mode.is_idle():
+        return 0, 0
+    if mode.is_decode():
+        return forward_batch.batch_size, 1
+    if mode.is_target_verify():
+        num_tokens_per_req = forward_batch.spec_info.draft_token_num
+        return forward_batch.batch_size * num_tokens_per_req, num_tokens_per_req
+    if mode.is_extend():
+        return forward_batch.extend_num_tokens, max(forward_batch.extend_seq_lens_cpu)
+    raise ValueError(f"Unsupported forward mode: {mode}")
+
+
 def generate_sequence_lengths(
     forward_batch: ForwardBatch, device: Optional[torch.device] = None
 ) -> torch.Tensor:
 
     device = torch.get_default_device() if device is None else device
     with torch.device(device):
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_idle():
+            seg_lens = torch.empty(0, dtype=torch.int32)
+        elif forward_batch.forward_mode.is_decode():
             seg_lens = torch.ones(forward_batch.batch_size, dtype=torch.int32)
         elif forward_batch.forward_mode.is_target_verify():
             seg_lens = torch.full(
@@ -618,3 +675,23 @@ def build_lm_head_pass_segments(
         result.append((seg_wi, seg_lens))
 
     return result
+
+
+def capturing_lora_graph() -> bool:
+    """Whether capture is active, excluding the decode "nolora" variant."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_lora_variant,
+        get_is_capture_mode,
+    )
+
+    return get_is_capture_mode() and get_capture_lora_variant() != "nolora"
+
+
+def kv_b_lora_correction(attn_module) -> str | None:
+    """Select legacy or capture-aware v2 correction, or None."""
+    layer = getattr(attn_module, "kv_b_proj", None)
+    if not getattr(layer, "set_lora", False):
+        return None
+    if layer.lora_backend.name != "triton_v2":
+        return "legacy"
+    return "v2" if layer.lora_active else None

@@ -3,11 +3,11 @@ from dataclasses import dataclass
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
-    fused_causal_conv3d_cat_pad_cuda,
-)
-from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
+from sglang.kernels.ops.diffusion import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
+)
+from sglang.kernels.ops.diffusion import (
+    fused_causal_conv3d_cat_pad_cuda,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

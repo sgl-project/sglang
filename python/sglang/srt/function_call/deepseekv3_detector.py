@@ -162,9 +162,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             )
                         )
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                     if _is_complete_json(func_args_raw):
                         # Update the stored arguments

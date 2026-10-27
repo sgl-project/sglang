@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -15,19 +17,22 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-class SharedReadBoundary(Enum):
-    """Where a backend's scheduler-shared reads end, relative to the replay;
-    the shared-read-done record must land at or after this point. IN_REPLAY
-    means at the captured (in-graph) metadata init."""
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading the shared data"""
 
-    PRE_REPLAY = auto()
-    IN_REPLAY = auto()
-    POST_REPLAY = auto()
-    UNKNOWN = auto()  # not audited -> coarse whole-forward fence
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
+
+    @staticmethod
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Ordered by lateness: the latest end covers every child.
+        return max(items, key=lambda x: x.value)
 
 
 class AttentionBackend(ABC):
@@ -58,6 +63,38 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
+    # skips cached-row compression for replay rows folded into the extend.
+    folds_encoder_swa_replay: bool = False
+    # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
+    # fuse-rope checks) set these in __init__; declared here as None so callers
+    # can read them off ANY backend — including hybrid wrappers that don't set
+    # them — without defensive getattr. See trtllm_mla fuse-rope path.
+    data_type: Optional[torch.dtype] = None
+    kv_cache_dtype: Optional[torch.dtype] = None
+
+    # Wrapper backends (e.g. HybridLinearAttnBackend) set this to their child
+    # backends; leaves keep None. Lets generic code (metadata glue graph)
+    # enumerate every backend whose python-side forward_metadata must be
+    # snapshotted/restored around a captured metadata-prep replay.
+    attn_backend_list: Optional[list] = None
+
+    # Per-iter metadata produced by init_forward_metadata*; backends that use
+    # it assign their own type. Declared here so generic snapshot/restore code
+    # (metadata glue graph) can read it off any backend without hasattr.
+    forward_metadata: Optional[object] = None
+
+    # The runner's KVIndexTranslator; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    kv_index_translator = None
+
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
@@ -66,6 +103,16 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    def glue_target_verify_metadata(self) -> str:
+        """Empty if the target verify prep may be captured into the metadata glue graph
+        (reads only runner slots and backend buffers), else the reason it may not."""
+        return "the attention backend declares no host-free target verify prep"
+
+    def glue_draft_metadata(self) -> str:
+        """Empty if the draft prep may be captured into the metadata glue graph (host
+        inputs constant per replay key), else the reason it may not."""
+        return "the attention backend declares no host-free draft prep"
 
     def init_forward_metadata_out_graph(
         self,
@@ -103,6 +150,8 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    supports_draft_extend_metadata_staging: bool = False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
@@ -124,17 +173,64 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Most requests one replay of that captured metadata can carry (None: no
+    # bound). Fixed at init: the dp-attention replay vote checks it too.
+    prefill_cuda_graph_max_batch_size: Optional[int] = None
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    # Backends may keep MIXED prefill eager under DP attention when replaying
+    # the EXTEND graph is a known serving-performance regression.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
+    # An idle DP rank replays the padded prefill graph without attention
+    # metadata; only backends whose replay reads none on such a rank opt in.
+    skips_prefill_metadata_on_idle_dp_rank: bool = False
+
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
+    # Replayed context limit when the user sets none; None when nothing the backend
+    # captures depends on the context length.
+    prefill_cuda_graph_default_max_seq_len: Optional[int] = None
+    dllm_attention = None
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
+        Override only for audited deviations from this conservative default."""
+        if fm.is_decode() or fm.is_target_verify():
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
 
-        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
-        contract above makes it a safe upper bound for any backend honoring
-        the contract. Override for audited deviations.
+    def resolve_prefill_shared_read_ends(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        build_snapshot: bool = True,
+    ) -> SharedReadEnds:
+        """Return this batch's prefill read end, building a snapshot when asked.
+
+        Spec algorithms with a later draft reader are gated at publish time.
         """
-        if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.UNKNOWN
+        if (
+            envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+            or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+        ):
+            return SharedReadEnds.UNKNOWN
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return SharedReadEnds.UNKNOWN
+        if build_snapshot:
+            return self._snapshot_prefill_shared_reads(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        return self.shared_read_ends(forward_batch.forward_mode)
+
+    def _snapshot_prefill_shared_reads(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SharedReadEnds:
+        """Snapshot late shared reads; return PRE_REPLAY only if none remain.
+
+        Hook-skipping paths read ``shared_read_ends(EXTEND)``; keep it conservative.
+        """
+        return self.shared_read_ends(forward_batch.forward_mode)
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
@@ -160,6 +256,9 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        return
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
@@ -187,6 +286,11 @@ class AttentionBackend(ABC):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Rows this rank runs from a late-layer row switch on (DeepSeek-V4.1
+        decoder SWA bounded replay); None for backends without one."""
+        return None
 
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.

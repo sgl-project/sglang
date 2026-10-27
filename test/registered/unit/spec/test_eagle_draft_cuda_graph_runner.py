@@ -19,13 +19,15 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 CAPTURE_BS = 4
 SEQ_LEN_FILL_VALUE = 1
@@ -59,7 +61,13 @@ class _RecordingDraftBackend:
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
-    def _build_runner(self, backend):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _build_runner(self, backend, graph_output=None):
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.buffers = SimpleNamespace(
@@ -83,7 +91,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
         runner.model_runner = SimpleNamespace(
-            model_config=SimpleNamespace(vocab_size=8),
+            model_config=SimpleNamespace(vocab_size=8, model_is_mrope=False),
             server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
             device_timer=None,
             draft_attn_backend=backend,
@@ -94,7 +102,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         def replay_graph_stub(shape_key, forward_batch):
             # Observe again during graph replay to catch a premature restore.
             backend.observe("graph_replay", forward_batch)
-            return None
+            return graph_output
 
         runner._replay_graph = replay_graph_stub
         return runner
@@ -193,6 +201,17 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_execute_leaves_graph_output_ownership_to_caller(self):
+        backend = _RecordingDraftBackend()
+        pooled_probs = torch.ones(CAPTURE_BS, NUM_STEPS, 8)
+        graph_output = (None, None, None, pooled_probs)
+        runner = self._build_runner(backend, graph_output=graph_output)
+        forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+
+        output = runner.execute(forward_batch)
+
+        self.assertIs(output[-1], pooled_probs)
 
 
 if __name__ == "__main__":

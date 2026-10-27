@@ -1,10 +1,26 @@
+import inspect
 import os
+from dataclasses import fields
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from fastapi import HTTPException
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.ernie_image import (
+    ErnieImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
@@ -13,8 +29,72 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
+    edits,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+
+
+def test_image_edits_declares_perf_dump_path_form_field():
+    assert "perf_dump_path" in inspect.signature(edits).parameters
+
+
+def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
+    monkeypatch.setattr(
+        image_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(input_save_path=None, output_path=None),
+    )
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda _: SamplingParams
+    )
+    monkeypatch.setattr(image_api, "maybe_enhance_prompt", AsyncMock(return_value="p"))
+    captured = {}
+
+    def capture(request_id, **kwargs):
+        captured.update(kwargs)
+        raise HTTPException(status_code=400, detail="captured before inference")
+
+    monkeypatch.setattr(image_api, "_build_request_sampling_params", capture)
+    app = FastAPI()
+    app.include_router(image_api.router)
+    image = BytesIO()
+    Image.new("RGB", (16, 16)).save(image, format="PNG")
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "p",
+                "enable_cache_dit": "true",
+                "cache_dit_params": '{"residual_diff_threshold":0.12}',
+            },
+            files={"image": ("reference.png", image.getvalue(), "image/png")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "captured before inference"
+        assert captured["enable_cache_dit"] is True
+        assert captured["cache_dit_params"] == {"residual_diff_threshold": 0.12}
+        response = client.post(
+            "/v1/images/edits",
+            data={"cache_dit_params": "not json"},
+        )
+        assert response.status_code == 422
+
+
+def test_image_requests_accept_request_level_profiling():
+    request = ImageGenerationsRequest(
+        prompt="p", profile=True, num_profiled_timesteps=4, profile_all_stages=True
+    )
+    assert (request.profile, request.num_profiled_timesteps) == (True, 4)
+    assert request.profile_all_stages is True
+    edit_params = inspect.signature(edits).parameters
+    sampling_fields = {f.name for f in fields(SamplingParams)}
+    for name in ("profile", "num_profiled_timesteps", "profile_all_stages"):
+        assert name in edit_params
+        assert name in sampling_fields
 
 
 def test_url_response_returns_one_item_per_output_path():
@@ -45,7 +125,84 @@ def test_runtime_sampling_quality_preserves_the_openai_default():
     assert _runtime_sampling_quality(None) is None
     assert _runtime_sampling_quality("auto") is None
     assert _runtime_sampling_quality("lossless") == "lossless"
+    assert _runtime_sampling_quality("lossless") == "lossless"
     assert _runtime_sampling_quality("high") == "high"
+
+
+def test_longcat_image_fields_remain_model_specific():
+    field_values = {
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.25,
+        "enable_prompt_rewrite": False,
+    }
+    request = ImageGenerationsRequest(prompt="a lantern", **field_values)
+    base_fields = {field.name for field in fields(SamplingParams)}
+    longcat_fields = {field.name for field in fields(LongCatImageSamplingParams)}
+
+    for field_name, value in field_values.items():
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in longcat_fields
+        assert getattr(request, field_name) == value
+
+    assert request_model_kwargs(request, LongCatImageSamplingParams, "image") == (
+        field_values
+    )
+    assert request_model_kwargs(request, SamplingParams, "image") == {}
+
+
+def test_longcat_image_fields_accept_nested_extra_body():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        enable_prompt_rewrite=True,
+        extra_body={
+            "enable_prompt_rewrite": False,
+            "enable_cfg_renorm": False,
+            "cfg_renorm_min": 0.5,
+        },
+    )
+
+    assert request_model_kwargs(request, LongCatImageSamplingParams, "image") == {
+        "enable_prompt_rewrite": True,
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.5,
+    }
+
+
+def test_other_image_extensions_remain_model_specific():
+    cases = (
+        (Cosmos3SamplingParams, "guidance_interval", [400.0, 1000.0]),
+        (Cosmos3SamplingParams, "use_guardrails", False),
+        (ErnieImageSamplingParams, "use_pe", False),
+        (Ideogram4SamplingParams, "preset", "V4_TURBO_12"),
+    )
+    base_fields = {field.name for field in fields(SamplingParams)}
+
+    for sampling_params_cls, field_name, value in cases:
+        request = ImageGenerationsRequest(
+            prompt="a lantern",
+            extra_body={field_name: value},
+        )
+        model_fields = {field.name for field in fields(sampling_params_cls)}
+
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in model_fields
+        assert request_model_kwargs(request, sampling_params_cls, "image") == {
+            field_name: value
+        }
+        assert request_model_kwargs(request, SamplingParams, "image") == {}
+
+
+def test_cosmos_image_guardrails_alias_is_preserved():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        extra_body={"guardrails": False},
+    )
+
+    assert request_model_kwargs(request, Cosmos3SamplingParams, "image") == {
+        "use_guardrails": False
+    }
 
 
 def test_image_response_includes_resize_for_every_output():
@@ -72,20 +229,30 @@ def test_response_resize_is_only_populated_for_glm_image():
     assert _get_response_resize(SamplingParams(width=1280, height=736)) is None
 
 
-def test_response_resize_uses_actual_generated_image_size(tmp_path):
-    output_path = tmp_path / "output.png"
-    Image.new("RGB", (1280, 736)).save(output_path)
+def test_response_resize_prefers_requested_size_over_generation_canvas():
+    glm_sampling = GlmImageSamplingParams(width=1280, height=736)
+    glm_sampling.requested_width = 1280
+    glm_sampling.requested_height = 720
+
+    assert _get_response_resize(glm_sampling) == "1280x720"
+
+
+def _png_bytes(size: tuple[int, int]) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", size).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_response_resize_uses_actual_generated_image_size():
     glm_sampling = GlmImageSamplingParams(image_path="input.png")
 
-    assert _get_response_resize(glm_sampling, str(output_path)) == "1280x736"
+    assert _get_response_resize(glm_sampling, _png_bytes((1280, 736))) == "1280x736"
 
 
-def test_response_resize_prefers_final_output_over_sampling_canvas(tmp_path):
-    output_path = tmp_path / "upscaled.png"
-    Image.new("RGB", (2560, 1472)).save(output_path)
+def test_response_resize_prefers_final_output_over_sampling_canvas():
     glm_sampling = GlmImageSamplingParams(width=1280, height=736)
 
-    assert _get_response_resize(glm_sampling, str(output_path)) == "2560x1472"
+    assert _get_response_resize(glm_sampling, _png_bytes((2560, 1472))) == "2560x1472"
 
 
 def test_url_response_uses_variant_fallback_urls_for_multiple_persistent_outputs():
@@ -173,3 +340,16 @@ def test_select_image_variant_path_falls_back_to_single_file_path():
 
     assert _select_image_variant_path(item, None) == "only.png"
     assert _select_image_variant_path(item, "0") == "only.png"
+
+
+def test_request_validation_errors_are_client_errors(monkeypatch):
+    """A request that fails sampling-parameter validation returns 400, not 500."""
+
+    def reject(request_id, **kwargs):
+        raise ValueError("unsupported size")
+
+    monkeypatch.setattr(image_api, "build_sampling_params", reject)
+    with pytest.raises(HTTPException) as error:
+        image_api._build_request_sampling_params("request", size="7x7")
+    assert error.value.status_code == 400
+    assert "unsupported size" in error.value.detail

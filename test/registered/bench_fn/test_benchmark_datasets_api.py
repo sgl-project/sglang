@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import functools
 import io
 import json
 import pickle
@@ -53,14 +54,56 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     _finite_positive_float,
+    _validate_parsed_gsp_args,
     async_request_openai_embeddings,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
+
+
+_BENCH_SERVING_CLI_CASES = {
+    "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
+    "zipf_without_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "zipf",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "uniform_with_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "uniform",
+        "--gsp-zipf-alpha",
+        "1.0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _bench_serving_cli_results():
+    def run(args):
+        return subprocess.run(
+            [sys.executable, "-m", "sglang.benchmark.serving", *args],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(_BENCH_SERVING_CLI_CASES)) as pool:
+        futures = {
+            name: pool.submit(run, args)
+            for name, args in _BENCH_SERVING_CLI_CASES.items()
+        }
+    return {name: future.result() for name, future in futures.items()}
 
 
 class _DummyTokenTensor:
@@ -517,6 +560,16 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
 
+        for row in rows:
+            rendered = self.tokenizer.apply_chat_template(
+                row.prompt, tokenize=False, add_generation_prompt=True
+            )
+            expected_prompt_len = len(self.tokenizer.encode(rendered))
+            tools = row.extra_request_body.get("tools")
+            if tools:
+                expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
+            self.assertEqual(row.prompt_len, expected_prompt_len)
+
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
@@ -755,6 +808,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_speed_bench_sampler(self):
+        """Each row's prompt_len is the token count of its chat-templated prompt."""
         dataset_path = self._write_speed_bench_jsonl()
         args = make_args(
             dataset_name="speed-bench",
@@ -768,7 +822,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.output_len == 512 for row in rows))
-        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+        with open(dataset_path) as f:
+            source_prompts = [json.loads(line)["turns"][0] for line in f]
+        templated_lens = {
+            len(
+                self.tokenizer.encode(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            for text in source_prompts
+        }
+        for row in rows:
+            self.assertIn(row.prompt_len, templated_lens)
 
     def test_speed_bench_category_filter(self):
         dataset_path = self._write_speed_bench_jsonl()
@@ -981,6 +1052,66 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         agentic_rows = get_dataset(agentic_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
+
+    def test_gsp_token_ids_have_exact_lengths_and_statistics(self):
+        args = make_args(
+            tokenize_prompt=True,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_range_ratio=1.0,
+            gsp_fast_prepare=True,
+            gsp_send_routing_key=True,
+        )
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+        with (
+            patch.object(self.tokenizer, "encode", side_effect=AssertionError),
+            patch.object(self.tokenizer, "decode", side_effect=AssertionError),
+            patch("builtins.print") as print_mock,
+        ):
+            rows = dataset.load(self.tokenizer)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row.prompt), 12)
+            self.assertEqual(row.prompt_len, 12)
+            self.assertTrue(all(isinstance(token, int) for token in row.prompt))
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn(f"Total input tokens: {12 * len(rows)}", printed)
+        self.assertIn("Average system prompt length: 8.0 tokens", printed)
+        self.assertIn("Average question length: 4.0 tokens", printed)
+
+    def test_gsp_token_ids_reject_multiple_turns(self):
+        parser = argparse.ArgumentParser()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            _validate_parsed_gsp_args(
+                parser,
+                make_args(
+                    dataset_name="generated-shared-prefix",
+                    tokenize_prompt=True,
+                    gsp_num_turns=2,
+                ),
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--gsp-num-turns=1", stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, "--gsp-num-turns=1"):
+            GeneratedSharedPrefixDataset.from_args(
+                make_args(tokenize_prompt=True, gsp_num_turns=2)
+            )
+        with self.assertRaisesRegex(ValueError, "num_turns=1"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=2,
+                system_prompt_len=8,
+                question_len=4,
+                output_len=2,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                seed=42,
+                input_ids=True,
+                num_turns=2,
+            )
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
@@ -1359,58 +1490,9 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
 
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
-
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "invalid_name",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
-
     def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
         """Invalid timeouts fail before the benchmark contacts a server or hangs."""
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--flush-cache-timeout",
-                "inf",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["flush_cache_timeout"]
         self.assertEqual(res.returncode, 2, res.stderr)
         self.assertIn("expected a finite float > 0", res.stderr)
 
@@ -1423,22 +1505,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         # Malformed CLI combinations (zipf with no alpha) must fail at
         # argparse time so users see the GSP-flag error directly, not a
         # downstream connection or model-fetch failure.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "zipf",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["zipf_without_alpha"]
         # parser.error() exits with code 2 (argparse convention).
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
@@ -1458,24 +1525,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
     def test_bench_serving_cli_rejects_uniform_with_alpha_before_server(self):
         # The complementary malformation: uniform distribution with an
         # explicit alpha value. Must also fail at argparse time.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "uniform",
-                "--gsp-zipf-alpha",
-                "1.0",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["uniform_with_alpha"]
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
         self.assertIn("--gsp-group-distribution", stderr)

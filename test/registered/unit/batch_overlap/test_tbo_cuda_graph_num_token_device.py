@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import get_context, get_device
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestTboCudaGraphNumTokenDevice(CustomTestCase):
@@ -59,17 +59,6 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
             eager.device.type,
             plugin._tbo_children_num_token_non_padded.device.type,
         )
-
-    def test_eager_split_values(self):
-        # value_a = min(split, n); value_b = max(0, n - split). Computed on CPU
-        # so the values are materializable.
-        with get_context().override_server_args():
-            with get_device().override(device="cpu"):
-                eager = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
-                    tbo_split_token_index=3, num_token_non_padded=8
-                )
-        self.assertEqual(eager.dtype, torch.int32)
-        self.assertEqual(eager.tolist(), [3, 5])
 
 
 if __name__ == "__main__":

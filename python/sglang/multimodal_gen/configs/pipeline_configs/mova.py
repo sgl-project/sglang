@@ -112,7 +112,7 @@ class MOVAPipelineConfig(PipelineConfig):
         )
         return image
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         if num_frames is None:
             return num_frames
         if num_frames % self.time_division_factor != self.time_division_remainder:
@@ -122,12 +122,13 @@ class MOVAPipelineConfig(PipelineConfig):
                 * self.time_division_factor
                 + self.time_division_remainder
             )
-            logger.warning(
-                "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
-                "Rounding to %s.",
-                num_frames,
-                adjusted,
-            )
+            if log_adjustment:
+                logger.warning(
+                    "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
+                    "Rounding to %s.",
+                    num_frames,
+                    adjusted,
+                )
             return adjusted
         return num_frames
 
@@ -152,19 +153,6 @@ class MOVAPipelineConfig(PipelineConfig):
     def prepare_audio_latent_shape(self, batch_size, num_samples, audio_vae):
         latent_T = (num_samples + audio_vae.hop_length - 1) // audio_vae.hop_length
         return (batch_size, audio_vae.latent_dim, latent_T)
-
-    def normalize_video_latents(self, latents: torch.Tensor, video_vae) -> torch.Tensor:
-        latents_mean = getattr(video_vae.config, "latents_mean", None)
-        latents_std = getattr(video_vae.config, "latents_std", None)
-        if latents_mean is None or latents_std is None:
-            return latents
-        mean = torch.tensor(
-            latents_mean, device=latents.device, dtype=latents.dtype
-        ).view(1, video_vae.config.z_dim, 1, 1, 1)
-        inv_std = (
-            1.0 / torch.tensor(latents_std, device=latents.device, dtype=latents.dtype)
-        ).view(1, video_vae.config.z_dim, 1, 1, 1)
-        return (latents - mean) * inv_std
 
     def denormalize_video_latents(
         self, latents: torch.Tensor, video_vae
@@ -194,3 +182,26 @@ class MOVA720PConfig(MOVAPipelineConfig):
     """Configuration for MOVA 720P (text+image -> video+audio) pipelines."""
 
     max_area: int = 720 * 1280
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.mova import (
+        MOVA_360P_SamplingParams,
+        MOVA_720P_SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )

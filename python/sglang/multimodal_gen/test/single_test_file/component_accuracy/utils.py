@@ -915,10 +915,14 @@ def load_param_with_weight_loader(param, name, lookup, reverse_mapping) -> bool:
                     loader(param, tensor.to(dtype=param.dtype), shard_id)
                 return True
         for cand in candidates:
-            src = lookup.get(cand)
-            if src is not None:
-                loader(param, src.to(dtype=param.dtype))
-                return True
+            source_names = [cand]
+            if "qkv_proj" in cand:
+                source_names.append(cand.replace("qkv_proj", "qkv"))
+            for source_name in source_names:
+                src = lookup.get(source_name)
+                if src is not None:
+                    loader(param, src.to(dtype=param.dtype))
+                    return True
     except Exception:
         return False
     return False

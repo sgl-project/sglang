@@ -5,10 +5,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -28,6 +29,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.use_mla = model_runner.use_mla_backend
         self.max_context_len = model_runner.model_config.context_len
 
         # full->SWA translated out_cache_loc, computed once per forward (the only
@@ -37,9 +39,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
         self.swa_out_cache_loc = None
+        self._swa_req_to_token = None
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
 
         # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
@@ -58,6 +61,8 @@ class IntelAMXAttnBackend(AttentionBackend):
         # Number of KV splits used by decode_attention_cpu; attn_logits is
         # sized [bs, num_head, num_kv_splits, v_head_dim + 1] to match.
         self.num_kv_splits = 8
+
+        self._attn_logits_buffers: dict[tuple[int, int], torch.Tensor] = {}
 
         # speculative decoding params
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
@@ -142,14 +147,53 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.extend_metadata = self._build_extend_metadata(forward_batch)
         self.forward_metadata = (attn_logits, max_extend_len)
 
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+        self._init_swa_forward_metadata(forward_batch.out_cache_loc)
+
+    def _init_swa_forward_metadata(self, out_cache_loc: torch.Tensor | None) -> None:
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             self.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         else:
             self.swa_out_cache_loc = None
+        self._swa_req_to_token = None
+
+    def _is_swa_layer(self, layer_id: int) -> bool:
+        return (
+            self.use_sliding_window_kv_pool
+            and self.token_to_kv_pool.layers_mapping[layer_id][1]
+        )
+
+    def _swa_kv_indices(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """This batch's rows of ``req_to_token``, in the SWA pool's index space.
+
+        ``req_to_token`` holds full-pool indices, but a sliding-window layer's
+        K/V buffer only has ``swa_size`` rows. Feeding it full indices reads out
+        of bounds as soon as the allocator hands one out past that -- and since
+        the allocator walks its free list in order, that first happens long
+        after startup, once cumulative allocations exceed ``swa_size``.
+
+        Returns the compacted table plus the ``req_pool_indices`` that address
+        it; the kernels take their row stride from ``req_to_token.size(1)``.
+        """
+        cached = self._swa_req_to_token
+        if cached is not None and cached[0] is req_to_token:
+            return cached[1], cached[2]
+
+        rows = req_to_token[req_pool_indices, : int(seq_lens.max())]
+        translated = self.token_to_kv_pool.translate_loc_from_full_to_swa(rows).to(
+            req_to_token.dtype
+        )
+        indices = torch.arange(
+            translated.shape[0], dtype=torch.int64, device=translated.device
+        )
+        self._swa_req_to_token = (req_to_token, translated, indices)
+        return translated, indices
 
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
@@ -160,6 +204,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens,
         forward_mode,
         spec_info,
@@ -177,6 +222,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
         self.extend_metadata = None
+        self._init_swa_forward_metadata(out_cache_loc)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -200,31 +246,58 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache and k is not None and v is not None:
             # Cross-attention never writes to the SWA pool, so only thread the
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(cache_loc, swa_loc), k, v
-            )
+            write_loc = KVWriteLoc(cache_loc, swa_loc)
+            if not self.use_mla and key_buffer.dtype == torch.float8_e4m3fn:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    write_loc,
+                    k,
+                    v,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(layer, write_loc, k, v)
 
         # Precomputed once per forward pass in init_forward_metadata (spec
         # verify batches carry no extend_* fields; see _build_extend_metadata).
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
-        seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
+
+        key_scale = layer.k_scale_float or 1.0
+        value_scale = layer.v_scale_float or 1.0
+        is_causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            is_causal = False
+
+        # Gemma4's KV-shared layers pass k=v=None - the layer they share with
+        # already wrote their extend K/V to the cache
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        if self._is_swa_layer(layer.layer_id) and not layer.is_cross_attention:
+            req_to_token, req_pool_indices = self._swa_kv_indices(
+                req_to_token, req_pool_indices, seq_lens
+            )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
             v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
+            key_buffer,
+            value_buffer,
+            key_scale,
+            value_scale,
+            req_to_token,
+            req_pool_indices,
             seq_lens,
             extend_seq_lens,
             extend_start_loc,
@@ -236,8 +309,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
             tree_mask,
+            is_causal,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -249,8 +323,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        attn_logits, _ = self.forward_metadata
-
         if self.draft_decode_metadata is not None:
             req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
         else:
@@ -259,23 +331,61 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
+
+        if layer.v_head_dim == self.v_head_dim and layer.tp_q_head_num == self.num_head:
+            attn_logits, _ = self.forward_metadata
+        else:
+            # This layer's shape differs from the model-wide metadata buffer -
+            # size from the same seq_lens the kernel derives num_seqs from
+            attn_logits = self._get_attn_logits_buffer(
+                seq_lens.shape[0], layer.tp_q_head_num, layer.v_head_dim
+            )
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_scale = layer.k_scale_float or 1.0
+        value_scale = layer.v_scale_float or 1.0
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        if (
+            save_kv_cache
+            and k is not None
+            and v is not None
+            and key_buffer.dtype == torch.float8_e4m3fn
+        ):
+            swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, swa_loc),
+                k,
+                v,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            k = None
+            v = None
+        if self._is_swa_layer(layer.layer_id) and not layer.is_cross_attention:
+            # When k/v survive the block above the kernel writes them itself, so
+            # the write location needs the same translation set_kv_buffer got.
+            cache_loc = self.swa_out_cache_loc
+            req_to_token, req_pool_indices = self._swa_kv_indices(
+                req_to_token, req_pool_indices, seq_lens
+            )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            key_buffer,
+            value_buffer,
+            key_scale,
+            value_scale,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,
@@ -291,7 +401,23 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _get_attn_logits_buffer(
+        self, num_seqs: int, num_heads: int, v_head_dim: int
+    ) -> torch.Tensor:
+        key = (num_heads, v_head_dim)
+        buffer = self._attn_logits_buffers.get(key)
+        if buffer is None or buffer.shape[0] < num_seqs:
+            # decode_attention_cpu writes every element it later reads, so the
+            # buffer needs no initialization and can be reused; it only grows.
+            buffer = torch.empty(
+                (num_seqs, num_heads, self.num_kv_splits, v_head_dim + 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._attn_logits_buffers[key] = buffer
+        return buffer[:num_seqs]
 
     def support_triton(self):
         return False

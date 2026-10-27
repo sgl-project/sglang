@@ -18,6 +18,52 @@ Inspired by the classic three-level cache design of modern CPUs, HiCache organiz
 
 In many modern CPU architectures, the small but fast L1 and L2 caches are private to each core, enabling rapid access to the hottest data, while the larger L3 cache is shared across all cores to significantly reduce redundancy within the cache. Similarly, in HiCache, the L1 and L2 KV caches are private to each inference instance, whereas the L3 KV cache is shared among all inference instances within the cluster.
 
+### Tier Sharing Scope
+
+Which tier is private and which is shared decides where a cache hit can come from, so it is worth stating explicitly:
+
+| Tier | Medium | Scope | Shared across instances? |
+|---|---|---|---|
+| **L1** | GPU memory (HBM) | One inference instance | No |
+| **L2** | Host memory (CPU DRAM) | One inference instance, on its own node | **No** |
+| **L3** | Storage backend (`file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, or a custom one) | Whatever the backend is configured to span | **Only if the backend is set up for it** |
+
+```mermaid
+flowchart TB
+    subgraph N0["Node A"]
+        subgraph I0["Instance 0"]
+            L1A["L1 - GPU memory<br/>private"]
+            L2A["L2 - host memory<br/>private to this instance"]
+            L1A --- L2A
+        end
+        subgraph I1["Instance 1"]
+            L1B["L1 - GPU memory<br/>private"]
+            L2B["L2 - host memory<br/>private to this instance"]
+            L1B --- L2B
+        end
+    end
+
+    subgraph N1["Node B"]
+        subgraph I2["Instance 2"]
+            L1C["L1 - GPU memory<br/>private"]
+            L2C["L2 - host memory<br/>private to this instance"]
+            L1C --- L2C
+        end
+    end
+
+    L3["L3 - storage backend<br/>shared by the instances the backend is configured to span"]
+
+    L2A --> L3
+    L2B --> L3
+    L2C --> L3
+```
+
+**L2 is node-local and instance-private.** It is host memory owned by one inference instance's process, so two instances never read each other's L2, not even two instances on the same node. A KV cache produced by instance 0 becomes visible to instance 1 only after it reaches L3.
+
+This is the answer to a common question: HiCache cannot pool the host memory of several machines into one larger L2. Growing `--hicache-ratio` or `--hicache-size` only makes each instance's own private L2 larger. Cross-instance reuse is the job of L3, so it needs `--hicache-storage-backend`.
+
+L3 is the tier that *can* be shared, but whether it actually is depends on the backend and how it is configured. The `file` backend writes to `/tmp/hicache` by default (`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` overrides it), which is node-local unless that path is a shared mount. Distributed backends such as `mooncake`, `hf3fs`, `nixl` and `aibrix` give cluster-wide scope, but only when every instance is pointed at the same namespace and configuration.
+
 ### HiRadixTree: Metadata Organization in HiCache
 
 For KV cache data organization, HiCache builds upon the RadixTree structure introduced in RadixAttention and proposes HiRadixTree. In RadixAttention, each node of the RadixTree corresponds to the KV cache of a consecutive span of tokens in GPU memory. A path from the root to a leaf node represents the prefix of a request, and shared prefixes across multiple requests can reuse the same nodes, thereby avoiding redundant storage.
@@ -116,6 +162,8 @@ SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the
 
 HiCache encapsulates all read, write, and query operations on L3 backends within the `class HiCacheStorage(ABC)`, exposing a set of simple and consistent interfaces. This design supports a wide range of L3 storage backends and allows users to select the one that best fits their specific use cases.
 
+When a backend is attached, HiCache hands it the host memory pools in a fixed order: `register_mem_pool_host` receives the anchor pool first, then every pool of the host pool group (Mamba state, indexer, SWA, draft sidecars, ...) arrives through `register_mem_host_pool_v2`, and `on_host_pools_registered` fires exactly once when this initial burst is over. Pools attached dynamically later still arrive through `register_mem_host_pool_v2` alone. Backends that talk to an external service whose instance specification must be complete up front (e.g. a remote cache manager) should finalize it inside `on_host_pools_registered`; raising there fails the attach.
+
 - **Mooncake**: Mooncake is a high-performance caching system for LLM inference that leverages RDMA and multi-NIC resources to enable zero-copy, ultra-fast data transfers. Try Mooncake [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/mooncake_store).
 
 - **DeepSeek 3FS (HF3FS)**: HF3FS is a Kubernetes-native distributed storage solution with operator-based deployment. Try HF3FS [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/hf3fs).
@@ -127,6 +175,14 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
+
+### External KV Router Integration
+
+HiCache is not only consumed inside SGLang. An external KV-aware router placed in front of the engines can also query the same L3 data to route requests to the instance that can reuse the most KV cache. Such a router must rebuild the exact object keys the backend uses, which for Mooncake is `{key_prefix}_{page_hash}{suffix}`. The suffix depends on the model's pool layout, the parallelism layout, and the resolved `--page-size`, so the engine exposes its layout instead of letting each router derive the naming itself.
+
+The Mooncake backend describes the physical KV primary, SWA/Mamba components, and registered sidecars; it excludes logical KV anchors with no buffer. Suffixes come from the write-path key builders. KV uses `all_pages`; SWA uses `trailing_pages` with its component's `full_window_pages`, and Mamba uses one trailing page. Sidecars retain their own hit policy and derive a trailing window from their index-source component.
+
+The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout generator. In `/server_info`, the outer `hicache_object_layout` field contains `{enabled, backend, page_size, hicache_object_layout: {pools, key_prefix, is_mla_backend, pp_rank, pp_size}}`; pool entries contain `pool`, `suffixes`, `hit_policy`, and optionally `trailing_pages`. External lookup is enabled only for rank-replicated/MLA pools, including DeepSeek V4 compressed MLA. With pipeline parallelism each stage stores objects under its own `pp_rank` suffix, so the layout lists the pools of every stage and reports `pp_rank: null`; a layout that cannot cover all `pp_size` stages (for example when some stages run on other nodes) is unavailable. MHA or rank-sharded auxiliary pools, missing window metadata, unavailable Mooncake, and inconsistent scheduler replies also return `enabled: false` with a `reason`. Consumers must not register L3 in that case; an absent outer field indicates an older engine and permits legacy fallback. Ordinary DP and Ray startup retain and check scheduler replies rather than selecting the first layout.
 
 ## Related Parameters
 

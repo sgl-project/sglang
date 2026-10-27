@@ -28,6 +28,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -60,6 +61,10 @@ spec:
             value: "{{ metrics_data_file }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
+          - name: RUN_LABEL
+            value: "{{ run_label }}"
+          - name: TROUBLE_SHOTTING
+            value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
           command: ["/bin/bash", "-c"]
@@ -140,6 +145,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -172,6 +178,10 @@ spec:
             value: "{{ metrics_data_file }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
+          - name: RUN_LABEL
+            value: "{{ run_label }}"
+          - name: TROUBLE_SHOTTING
+            value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
           command: ["/bin/bash", "-c"]
@@ -252,6 +262,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -274,6 +285,8 @@ spec:
             value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: RUN_LABEL
+            value: "{{ run_label }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -284,6 +297,8 @@ spec:
             value: "https://hf-mirror.com"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
+          - name: TROUBLE_SHOTTING
+            value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
           command: ["/bin/bash", "-c"]

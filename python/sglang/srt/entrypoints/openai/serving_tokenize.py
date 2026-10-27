@@ -45,6 +45,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
+            # ORJSON accepts signed negative and unsigned positive 64-bit integers.
+            if isinstance(max_model_len, int) and not (
+                -(2**63) <= max_model_len < 2**64
+            ):
+                max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
                 token_ids = self._tokenize_chat_request(request)
@@ -92,6 +97,22 @@ class OpenAIServingTokenize(OpenAIServingBase):
         validation_error = self.chat_serving._validate_request(chat_request)
         if validation_error:
             raise ValueError(validation_error)
+        if chat_request._format_add_generation_prompt is not None:
+            if (
+                self.chat_serving.template_manager.chat_template_name is not None
+                or self.chat_serving.chat_encoding_spec is not None
+            ):
+                raise ValueError(
+                    "add_generation_prompt is supported only with a Jinja chat template."
+                )
+            if (
+                chat_request.continue_final_message
+                and not chat_request._format_add_generation_prompt
+            ):
+                raise ValueError(
+                    "continue_final_message needs add_generation_prompt to open the "
+                    "assistant turn."
+                )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self.chat_serving._process_messages(

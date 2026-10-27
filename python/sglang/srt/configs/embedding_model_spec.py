@@ -5,9 +5,10 @@ implementations, documentation, and benchmarks can consume the same contract
 without each reimplementing a partial list of embedding architectures.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any
 
 
 class EmbeddingTask(str, Enum):
@@ -168,7 +169,35 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "EmbeddingGemma2Model",
+            **_embedding_gemma2_spec().as_dict(),
+        }
+    )
     return rows
+
+
+def _embedding_gemma2_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_gemma2",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.MULTIMODAL,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=True,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+    )
 
 
 def _embedding_gemma_spec() -> EmbeddingModelSpec:
@@ -221,17 +250,17 @@ def _native_embedding_spec(
 
 
 def resolved_embedding_plan(
-    spec: EmbeddingModelSpec, *, server_args: Any, model_config: Any
+    spec: EmbeddingModelSpec, *, config: Any, model_config: Any
 ) -> dict[str, Any]:
     """Combine static capabilities with the effective server configuration.
 
     This boundary deliberately accepts duck-typed arguments so the declarative
     registry remains independent of ServerArgs and ModelConfig import cycles.
+    `config` must answer with the *resolved* configuration -- the readback
+    callers pass `resolving_view(record)`, which is where a decision lives.
     """
 
-    prefill_graph = getattr(
-        getattr(server_args, "cuda_graph_config", None), "prefill", None
-    )
+    prefill_graph = getattr(getattr(config, "cuda_graph_config", None), "prefill", None)
     backend = getattr(prefill_graph, "backend", None)
     backend_value = getattr(backend, "value", backend)
     capture_sizes = getattr(prefill_graph, "bs", None) or []
@@ -239,7 +268,7 @@ def resolved_embedding_plan(
 
     return {
         **spec.as_dict(),
-        "enabled": bool(getattr(server_args, "is_embedding", False)),
+        "enabled": bool(getattr(config, "is_embedding", False)),
         "supports_dimensions": bool(getattr(model_config, "is_matryoshka", False)),
         "matryoshka_dimensions": list(
             getattr(model_config, "matryoshka_dimensions", None) or []
@@ -252,14 +281,10 @@ def resolved_embedding_plan(
         },
         "cache": {
             "kv_cache_disabled": bool(
-                getattr(server_args, "prefill_only_disable_kv_cache", False)
+                getattr(config, "prefill_only_disable_kv_cache", False)
             ),
-            "radix_cache_disabled": bool(
-                getattr(server_args, "disable_radix_cache", False)
-            ),
-            "chunked_prefill_disabled": getattr(
-                server_args, "chunked_prefill_size", None
-            )
+            "radix_cache_disabled": bool(getattr(config, "disable_radix_cache", False)),
+            "chunked_prefill_disabled": getattr(config, "chunked_prefill_size", None)
             == -1,
         },
     }
@@ -279,6 +304,9 @@ def resolve_embedding_model_spec(
     """
 
     architecture_set = set(architectures or ())
+
+    if "EmbeddingGemma2Model" in architecture_set:
+        return _embedding_gemma2_spec()
 
     if is_embedding_gemma:
         return _embedding_gemma_spec()

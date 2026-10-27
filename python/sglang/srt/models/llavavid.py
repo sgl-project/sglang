@@ -228,9 +228,10 @@ class LlavaVidForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
+        device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
-        ).cuda()
+        ).to(device)
         self.vision_tower.eval()
 
         self.vision_feature_layer = self.config.mm_vision_select_layer
