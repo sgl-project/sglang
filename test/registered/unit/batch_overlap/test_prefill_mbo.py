@@ -1,5 +1,5 @@
-"""Two-microbatch prefill: model gating, the split point, the layer operations
-and per-microbatch mHC coefficients."""
+"""Two-microbatch prefill: model gating, the split point, the layer operations,
+microbatch inputs and per-microbatch mHC coefficients."""
 
 import unittest
 from types import SimpleNamespace
@@ -97,6 +97,51 @@ class TestGlm5NextGate(CustomTestCase):
                 self.assertFalse(self._supports(**kwargs))
 
 
+class TestQwen3_5Gate(CustomTestCase):
+    def _supports(self, *, model=None, wrapped=False, **parallel):
+        from sglang.srt.models import qwen3_5
+
+        lm = object.__new__(qwen3_5.Qwen3_5ForCausalLM)
+        lm.config = SimpleNamespace(model_type="qwen3_5_text")
+        lm.layers_to_capture = []
+        lm.flashinfer_mnnvl_cutedsl_fusion = None
+        for k, v in (model or {}).items():
+            setattr(lm, k, v)
+        widths = dict(tp_size=2, attn_tp_size=2, pp_size=1, attn_dcp_size=1)
+        widths.update(parallel)
+        if wrapped:
+            outer = object.__new__(qwen3_5.Qwen3_5ForConditionalGeneration)
+            torch.nn.Module.__init__(outer)
+            outer.model = lm
+            lm = outer
+        with patch.object(
+            qwen3_5, "get_parallel", return_value=SimpleNamespace(**widths)
+        ):
+            return lm.supports_prefill_mbo()
+
+    def test_tp_only_dense_model_is_supported(self):
+        self.assertTrue(self._supports())
+        self.assertTrue(self._supports(wrapped=True))
+
+    def test_unsupported_configurations(self):
+        cases = {
+            "moe": dict(
+                model=dict(config=SimpleNamespace(model_type="qwen3_5_moe_text"))
+            ),
+            "aux capture": dict(model=dict(layers_to_capture=[2, 31])),
+            "cutedsl fusion": dict(
+                model=dict(flashinfer_mnnvl_cutedsl_fusion=object())
+            ),
+            "pp": dict(pp_size=2),
+            "dp attention": dict(attn_tp_size=1),
+            "dcp": dict(attn_dcp_size=2),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._supports(**kwargs))
+                self.assertFalse(self._supports(wrapped=True, **kwargs))
+
+
 class TestSplitPoint(CustomTestCase):
     def setUp(self):
         patcher = patch.object(prefill_mbo, "_child_backends", [object(), object()])
@@ -126,12 +171,30 @@ class TestSplitPoint(CustomTestCase):
             prefill_mbo._split_tokens(_batch(0, 8192, mode=ForwardMode.MIXED))
         )
 
+    def test_only_a_batch_that_splits_leaves_the_prefill_graph(self):
+        with envs.SGLANG_PREFILL_MBO.override(True):
+            self.assertTrue(prefill_mbo.splits(_runner(True), _batch(0, 8192)))
+            self.assertFalse(prefill_mbo.splits(_runner(True), _batch(0, 1024)))
+            self.assertFalse(prefill_mbo.splits(_runner(False), _batch(0, 8192)))
+        with envs.SGLANG_PREFILL_MBO.override(False):
+            self.assertFalse(prefill_mbo.splits(_runner(True), _batch(0, 8192)))
+
 
 class Glm5NextDecoderLayer:
     def __init__(self, name):
         self.op_mbo_attn = f"{name}.attn"
         self.op_mbo_ffn = f"{name}.ffn"
         self.op_mbo_finish = f"{name}.finish"
+
+
+class Qwen3_5LinearDecoderLayer:
+    def __init__(self, name):
+        self.op_mbo_attn = f"{name}.attn"
+        self.op_mbo_ffn = f"{name}.ffn"
+
+
+class Qwen3_5AttentionDecoderLayer(Qwen3_5LinearDecoderLayer):
+    pass
 
 
 class TestLayerOperations(CustomTestCase):
@@ -156,6 +219,67 @@ class TestLayerOperations(CustomTestCase):
             ],
         )
         self.assertEqual(strategy.tbo_delta_stages, 0)
+
+    def test_qwen3_5_alternating_layers_have_no_finish(self):
+        layers = [
+            Qwen3_5LinearDecoderLayer("l0"),
+            Qwen3_5AttentionDecoderLayer("l1"),
+        ]
+        with self.assertRaises(NotImplementedError):
+            OperationsStrategy.init_new_tbo(layers, ForwardMode.EXTEND)
+
+        with patch.object(prefill_mbo, "_child_backends", [object(), object()]):
+            with patch.object(prefill_mbo, "_active", True):
+                strategy = OperationsStrategy.init_new_tbo(layers, ForwardMode.EXTEND)
+        names = [op if isinstance(op, str) else "yield" for op in strategy.operations]
+        self.assertEqual(
+            names,
+            [
+                *("l0.attn", "yield", "l0.ffn", "yield"),
+                *("l1.attn", "yield", "l1.ffn", "yield"),
+            ],
+        )
+
+
+class TestMicrobatchInputs(CustomTestCase):
+    def _child(self, start, end, padded_len=None):
+        return SimpleNamespace(
+            tbo_parent_token_range=(start, end),
+            tbo_padded_len=padded_len or end - start,
+        )
+
+    def test_mrope_positions_split_on_tokens(self):
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+        )
+
+        hidden = torch.arange(10.0).unsqueeze(1)
+        positions = torch.arange(30).view(3, 10)
+        out = _model_forward_filter_inputs(
+            hidden_states=hidden,
+            residual=None,
+            positions=positions,
+            output_forward_batch=self._child(4, 10, padded_len=8),
+            tbo_subbatch_index=1,
+        )
+        self.assertEqual(out["positions"].shape, (3, 8))
+        self.assertTrue(torch.equal(out["positions"][:, :6], positions[:, 4:]))
+        self.assertTrue(torch.equal(out["hidden_states"][:6], hidden[4:]))
+
+    def test_flat_positions_are_unchanged(self):
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+        )
+
+        positions = torch.arange(10)
+        out = _model_forward_filter_inputs(
+            hidden_states=torch.zeros(10, 1),
+            residual=None,
+            positions=positions,
+            output_forward_batch=self._child(0, 4),
+            tbo_subbatch_index=0,
+        )
+        self.assertTrue(torch.equal(out["positions"], positions[:4]))
 
 
 class TestMhcCoefficientsPerMicrobatch(CustomTestCase):

@@ -32,6 +32,8 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.batch_overlap import prefill_mbo
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -1106,7 +1108,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-class Qwen3_5LinearDecoderLayer(nn.Module):
+class _PrefillMboStages:
+    """Prefill microbatch stages of a dense Qwen3.5 layer (see
+    batch_overlap/prefill_mbo.py). Each stage joins the sum it reads, which ran
+    on the side stream while the other microbatch computed, and leaves its own
+    sum running there."""
+
+    def op_mbo_attn(self, state, hidden_states, positions, forward_batch, **kwargs):
+        hidden_states = residual_batch.stream_of(forward_batch).complete(hidden_states)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self._mbo_mixer(positions, hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
+        return dict(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+    def op_mbo_ffn(self, state, hidden_states, forward_batch, **kwargs):
+        stream = residual_batch.stream_of(forward_batch)
+        hidden_states = stream.complete(hidden_states)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states)
+        # The dense MLP leaves its whole sum (reduce_results=False); under the
+        # model gate that sum is over the TP group.
+        produced = self.ffn_boundary.plan.path_for(forward_batch).output
+        hidden_states = residual_batch.stream_of(forward_batch).record(
+            hidden_states, produced.update, declared_sum=produced.group
+        )
+        prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
+        return dict(hidden_states=hidden_states, forward_batch=forward_batch, **kwargs)
+
+
+class Qwen3_5LinearDecoderLayer(_PrefillMboStages, nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
@@ -1220,8 +1256,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states = self.mlp(hidden_states)
         return ffn_exit.finish(hidden_states)
 
+    def _mbo_mixer(self, positions, hidden_states, forward_batch):
+        return self.linear_attn(hidden_states, forward_batch)
 
-class Qwen3_5AttentionDecoderLayer(nn.Module):
+
+class Qwen3_5AttentionDecoderLayer(_PrefillMboStages, nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
@@ -1618,6 +1657,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states = self.mlp(hidden_states)
         return ffn_exit.finish(hidden_states)
 
+    def _mbo_mixer(self, positions, hidden_states, forward_batch):
+        return self.self_attention(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3_5AttentionDecoderLayer,
@@ -1833,6 +1879,20 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def supports_prefill_mbo(self) -> bool:
+        # The microbatch stages assume dense layers whose attention and MLP
+        # each end in one all-reduce over the whole TP group. They do not
+        # capture auxiliary hidden states (EAGLE3 or DFlash).
+        parallel = get_parallel()
+        return (
+            not _qwen3_5_is_moe(self.config)
+            and not self.layers_to_capture
+            and self.flashinfer_mnnvl_cutedsl_fusion is None
+            and parallel.pp_size == 1
+            and parallel.attn_tp_size == parallel.tp_size
+            and parallel.attn_dcp_size == 1
+        )
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1875,33 +1935,44 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStateList()
-        # Pass through decoder layers
-        for layer_idx in range(self.start_layer, self.end_layer):
-            layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=aux_hidden_states
-                    if getattr(layer, "_is_layer_to_capture", False)
-                    else None,
-                )
+        has_deepstack = (
+            input_deepstack_embeds is not None and input_deepstack_embeds.numel() > 0
+        )
+        if prefill_mbo.active_child_backends() is not None and has_deepstack:
+            # Deepstack embeddings are added between layers; run unsplit.
+            prefill_mbo.end_forward()
+        if prefill_mbo.active_child_backends() is not None:
+            hidden_states = model_forward_stages(
+                layers=self.layers[self.start_layer : self.end_layer],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+            )
+        else:
+            # Pass through decoder layers
+            for layer_idx in range(self.start_layer, self.end_layer):
+                layer = self.layers[layer_idx]
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                ):
+                    hidden_states = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        captured_last_layer_outputs=aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None,
+                    )
 
-            # Process deepstack embeddings if provided
-            if (
-                input_deepstack_embeds is not None
-                and input_deepstack_embeds.numel() > 0
-                and layer_idx < 3
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states = residual_batch.add_to_output(
-                    hidden_states,
-                    forward_batch,
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size],
-                )
+                # Process deepstack embeddings if provided
+                if has_deepstack and layer_idx < 3:
+                    sep = self.hidden_size * layer_idx
+                    hidden_states = residual_batch.add_to_output(
+                        hidden_states,
+                        forward_batch,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
+                    )
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
@@ -2346,6 +2417,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def supports_prefill_mbo(self) -> bool:
+        return self.model.supports_prefill_mbo()
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")

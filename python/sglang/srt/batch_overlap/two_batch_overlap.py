@@ -1086,7 +1086,8 @@ def _model_forward_filter_inputs(
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
-    positions = positions[token_slice]
+    # Tokens are the last dim of positions: M-RoPE positions are [3, num_tokens].
+    positions = positions[..., token_slice]
 
     assert output_forward_batch.tbo_padded_len is not None
     padded_len = output_forward_batch.tbo_padded_len
@@ -1101,10 +1102,17 @@ def _model_forward_filter_inputs(
         res[: x.shape[0]] = x
         return res
 
+    def _pad_positions(x):
+        if x.shape[-1] == padded_len:
+            return x
+        res = torch.zeros((*x.shape[:-1], padded_len), dtype=x.dtype, device=x.device)
+        res[..., : x.shape[-1]] = x
+        return res
+
     return dict(
         hidden_states=_pad(hidden_states),
         residual=_pad(residual),
-        positions=_pad(positions),
+        positions=_pad_positions(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )

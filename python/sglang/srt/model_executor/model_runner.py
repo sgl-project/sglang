@@ -25,6 +25,7 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -1966,6 +1967,7 @@ class ModelRunner:
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and forward_batch.token_indices_to_pool is None
+                and not prefill_mbo.splits(self, forward_batch)
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )

@@ -41,6 +41,12 @@ def enabled(model_runner) -> bool:
     return supports is not None and supports()
 
 
+def splits(model_runner, forward_batch: ForwardBatch) -> bool:
+    """Whether maybe_split will split ``forward_batch``. Such a batch runs on the
+    eager path: a prefill CUDA graph replays the whole extend unsplit."""
+    return enabled(model_runner) and _split_tokens(forward_batch) is not None
+
+
 def setup(child_backends: List[AttentionBackend], tp_ranks: List[int]) -> None:
     """Called once on every TP rank in the same order (creates a process group)."""
     global _child_backends, _comm_group, _comm_ranks

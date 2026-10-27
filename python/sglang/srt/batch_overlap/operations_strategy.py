@@ -11,6 +11,14 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
+# Layers with prefill microbatch stages (op_mbo_attn, op_mbo_ffn). A model
+# whose layer types alternate is named by its first layer's type.
+_PREFILL_MBO_LAYERS = (
+    "Glm5NextDecoderLayer",
+    "Qwen3_5LinearDecoderLayer",
+    "Qwen3_5AttentionDecoderLayer",
+)
+
 
 @dataclass
 class OperationsStrategy:
@@ -64,10 +72,10 @@ class OperationsStrategy:
                 ]
             )
         elif (
-            layer_name == "Glm5NextDecoderLayer"
+            layer_name in _PREFILL_MBO_LAYERS
             and prefill_mbo.active_child_backends() is not None
         ):
-            # Only prefill microbatches; GLM-5-Next has no two-batch overlap.
+            # Only prefill microbatches; these models have no two-batch overlap.
             ops: List[Operation] = []
             for layer in layers:
                 ops += [
@@ -76,7 +84,10 @@ class OperationsStrategy:
                     layer.op_mbo_ffn,
                     operations.YieldOperation(),
                 ]
-            ops.append(layers[-1].op_mbo_finish)
+            # A model whose last FFN sum stays outside the residual stream
+            # writes it in a finishing operation.
+            if hasattr(layers[-1], "op_mbo_finish"):
+                ops.append(layers[-1].op_mbo_finish)
             return OperationsStrategy(operations=ops, tbo_delta_stages=0)
         elif layer_name == "DeepseekV4DecoderLayer":
             return OperationsStrategy.concat(
