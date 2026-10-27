@@ -982,6 +982,18 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertEqual(core.trtllm_swa_lens[40].item(), 140)  # window + block
         self.assertIsNone(core.trtllm_c4_indices)
 
+    def test_narrow_swa_lens_stay_at_the_window_after_a_wide_step(self):
+        # Graphs read the narrow lens without refilling them, so a DSpark (wide)
+        # step in between must not leave its block lengths behind.
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        first = self._core(present_ratios=(0,)).trtllm_swa_lens
+        wide = self._core(present_ratios=(0,), swa_width=192)
+        self.assertEqual(wide.trtllm_swa_lens[40].item(), 140)
+        lens = self._core(present_ratios=(0,)).trtllm_swa_lens
+        self.assertEqual(lens.data_ptr(), first.data_ptr())
+        self.assertTrue(torch.all(lens == SWA_WINDOW))
+
     def _small_path_core(self, trtllm: bool):
         """make_core_attn_metadata's small-metadata path (DSv4.1 decode / verify)."""
         from sglang.srt.layers.attention import deepseek_v4_backend as bk

@@ -197,10 +197,11 @@ class TrtllmSparseTablePool:
         width: int = 0,
         *,
         rows_written_by_caller: bool = False,
+        constant: bool = False,
     ) -> torch.Tensor:
         """Rows [:rows] come from ``src``, from the caller (who then writes every
         column the kernel can read), or are re-inerted; rows [rows, rows_pad)
-        are always re-inerted."""
+        are re-inerted too, except in a ``constant`` role, which nothing writes."""
         rows_pad = ceil_align(rows, 64)
         numel = rows_pad * max(width, 1)
         padded = self._parent(role, numel, fill)[:numel]
@@ -211,7 +212,7 @@ class TrtllmSparseTablePool:
             padded[:rows].copy_(src)
         elif rows_written_by_caller:
             padded[rows:].fill_(fill)
-        else:
+        elif not constant:
             padded.fill_(fill)
         return padded[:rows]
 
@@ -293,6 +294,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         pool = self.trtllm_table_pool
         pool.preallocate("d_swa_lens", max_decode_rows, fill=SWA_WINDOW)
+        pool.preallocate("d_swa_lens_wide", max_decode_rows, fill=SWA_WINDOW)
         pool.preallocate("p_swa", max_prefill_rows, fill=-1, width=SWA_WINDOW)
         pool.preallocate("p_swa_lens", max_prefill_rows, fill=SWA_WINDOW)
         if self.has_c4 or self.low_ratios:

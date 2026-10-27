@@ -591,12 +591,19 @@ class DSV4AttnMetadata:
 
         # seq_lens_casual and swa_page_indices need no tile pad: the dense per-token
         # call reads rows [:num_tokens] only.
-        wide_swa = swa_width > SWA_WINDOW
-        self.trtllm_swa_lens = pool.view(
-            "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=wide_swa
-        )
-        if wide_swa:
+        if swa_width > SWA_WINDOW:
+            self.trtllm_swa_lens = pool.view(
+                "d_swa_lens_wide",
+                num_tokens,
+                fill=SWA_WINDOW,
+                rows_written_by_caller=True,
+            )
             torch.clamp(self.swa_topk_lengths, min=SWA_WINDOW, out=self.trtllm_swa_lens)
+        else:
+            # Every row reads all SWA_WINDOW slots, so the role is never written.
+            self.trtllm_swa_lens = pool.view(
+                "d_swa_lens", num_tokens, fill=SWA_WINDOW, constant=True
+            )
         self._zero_empty_low_ratio_lengths()
         if self._has_trtllm_indexed_table():
             assert swa_width == SWA_WINDOW
