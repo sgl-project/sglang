@@ -30,6 +30,19 @@ def handle_hardware_runtime_validation(server_args: Any):
     use_mlx()
 
 
+def validate_mlx_server_args(server_args: Any):
+    if not use_mlx():
+        return
+    cfg = resolving_view(server_args)
+    # The MLX runner never creates a LoRA manager, so the scheduler would
+    # crash on the first LoRA request instead of failing at startup.
+    if cfg.enable_lora or (cfg.enable_lora is None and cfg.lora_paths):
+        raise ValueError(
+            "LoRA is not supported on the MLX backend; unset SGLANG_USE_MLX "
+            "to serve LoRA adapters on the standard Torch MPS path"
+        )
+
+
 def handle_npu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "npu":

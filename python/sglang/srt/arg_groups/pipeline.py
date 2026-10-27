@@ -98,10 +98,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.parallel_hook import validate_prefill_cp_platform
     from sglang.srt.arg_groups.platform_hook import (
         handle_hardware_runtime_validation,
+        validate_mlx_server_args,
     )
 
     run_hook(validate_prefill_cp_platform, server_args)
     run_hook(handle_hardware_runtime_validation, server_args)
+    run_hook(validate_mlx_server_args, server_args)
     if cfg.model_path.lower() in ["none", "dummy"]:
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 

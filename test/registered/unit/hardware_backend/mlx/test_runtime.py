@@ -204,6 +204,30 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         runtime._validate_runtime.cache_clear()
         runtime._validate_runtime()
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("mlx") is not None
+        and torch.backends.mps.is_available()
+        and not Version(torch.__version__).is_prerelease
+        and Version(torch.__version__).release[:2] == (2, 13)
+        and _has_supported_mlx(),
+        "requires the supported MLX runtime",
+    )
+    def test_lora_is_rejected_at_startup(self):
+        """MLX LoRA must fail in ServerArgs, not crash the scheduler on a request."""
+        from sglang.srt.server_args import ServerArgs
+
+        runtime.use_mlx.cache_clear()
+        try:
+            with mock.patch.dict(os.environ, {"SGLANG_USE_MLX": "1"}):
+                for kwargs in ({"enable_lora": True}, {"lora_paths": ["a=/tmp/a"]}):
+                    with self.subTest(**kwargs):
+                        with self.assertRaisesRegex(
+                            ValueError, "LoRA is not supported"
+                        ):
+                            ServerArgs(model_path="dummy", **kwargs).resolve_once()
+        finally:
+            runtime.use_mlx.cache_clear()
+
 
 if __name__ == "__main__":
     unittest.main()
