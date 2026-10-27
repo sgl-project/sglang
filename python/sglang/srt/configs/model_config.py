@@ -2425,6 +2425,7 @@ multimodal_model_archs = [
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "MossVLForConditionalGeneration",
+    "Nemotron3_5AsrForRNNT",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
     "NemotronH_Omni_Reasoning_V3",
@@ -2533,6 +2534,7 @@ def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "Nemotron3_5AsrForRNNT",
     ]
     return any(model in model_architectures for model in models)
 

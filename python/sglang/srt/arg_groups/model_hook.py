@@ -812,6 +812,23 @@ def handle_model_capability_adjustments(server_args: Any):
             "prompt attention."
         )
 
+    # Greedy RNN-T runs a data-dependent number of joint steps per decode step
+    # on per-request state held in the model, which a graph cannot capture.
+    if "Nemotron3_5AsrForRNNT" in hf_config.architectures:
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            disable_cuda_graph=True,
+        )
+        for phase in (Phase.DECODE, Phase.PREFILL):
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
+                ),
+            )
+
     # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
     # attention. Prefix reuse and split prefills would reuse K/V states
     # whose values depend on later prompt tokens, so both are invalid.

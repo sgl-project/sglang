@@ -275,6 +275,11 @@ curl http://localhost:30000/v1/audio/transcriptions \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-ASR-1.7B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>--trust-remote-code</code>. Supports 52 languages.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Nemotron 3.5 ASR</strong> (0.6B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/nemotron-3.5-asr-streaming-0.6b</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FastConformer encoder with greedy RNN-T decoding; whole-clip transcription only (no cache-aware streaming). Requires <code>librosa</code>. <code>language</code> picks the language prompt; omitted, the model detects it.</td>
+    </tr>
   </tbody>
 </table>
 

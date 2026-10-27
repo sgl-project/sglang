@@ -47,6 +47,7 @@ class Schedule(msgspec.Struct):
                 + f"\n\n{human_readable_int.__doc__}"
             ),
             type_parser=human_readable_int,
+            resolvable=True,
         ),
     ] = None
     chunked_prefill_size: A[

@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tokenizer loading utilities."""
 
+import functools
 import json
 import logging
 import warnings
@@ -21,6 +22,7 @@ from typing import Optional, Union
 
 from transformers import (
     AutoTokenizer,
+    ParakeetTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
@@ -423,6 +425,19 @@ def _fix_special_tokens_pattern(tokenizer):
         tokenizer.special_tokens_pattern = "none"
 
 
+def _fix_parakeet_group_tokens(tokenizer):
+    """Stop ParakeetTokenizer from merging repeated ids when decoding.
+
+    Its decode collapses consecutive duplicates by default, a CTC convention.
+    Generated ids are already final, so a repeat is a real token
+    (e.g. "yeah yeah" in RNN-T output).
+    """
+    if isinstance(tokenizer, ParakeetTokenizer):
+        tokenizer._decode = functools.partial(
+            type(tokenizer)._decode, tokenizer, group_tokens=False
+        )
+
+
 def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     """Apply all post-load patches and return the final tokenizer."""
     _install_tokenizer_warnings_filter(tokenizer)
@@ -437,6 +452,7 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
 
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
+    _fix_parakeet_group_tokens(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     return patch_tokenizer(tokenizer)
 

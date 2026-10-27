@@ -17,6 +17,7 @@ from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters import (
     GlmAsrAdapter,
     GraniteSpeechAdapter,
+    Nemotron3_5AsrAdapter,
     Qwen2AudioAdapter,
     WhisperAdapter,
     resolve_adapter,
@@ -45,6 +46,11 @@ class TestTranscriptionAdapterResolution(CustomTestCase):
         for arch, cls, _, _ in _SPEECH_LM_CASES:
             with self.subTest(arch=arch):
                 self.assertIsInstance(resolve_adapter([arch]), cls)
+
+    def test_resolves_nemotron_asr(self):
+        self.assertIsInstance(
+            resolve_adapter(["Nemotron3_5AsrForRNNT"]), Nemotron3_5AsrAdapter
+        )
 
     def test_unknown_architecture_falls_back_to_whisper(self):
         # Whisper is the registered default; a non-ASR arch must not match one
@@ -145,6 +151,23 @@ class TestSpeechLMAdapterContract(CustomTestCase):
         self.assertEqual(
             adapter.postprocess_text("just the transcript"), "just the transcript"
         )
+
+
+class TestNemotronAsrAdapter(CustomTestCase):
+    def test_chunk_texts_stitch_with_word_boundaries(self):
+        # Long audio is split into clips whose texts are concatenated with no
+        # separator, and decoding drops each clip's leading word boundary;
+        # without a restored space, "leaders and" + "Business" fuses.
+        adapter = Nemotron3_5AsrAdapter()
+        chunks = ["leaders and ", "Business science", ""]
+        stitched = "".join(adapter.postprocess_text(t) for t in chunks).strip()
+        self.assertEqual(stitched, "leaders and Business science")
+
+    def test_language_reaches_the_processor(self):
+        # The multimodal processor pops this key to pick the language prompt.
+        request = TranscriptionRequest(model="m", audio_duration_s=3.0, language="de")
+        params = Nemotron3_5AsrAdapter().build_sampling_params(request)
+        self.assertEqual(params["language"], "de")
 
 
 if __name__ == "__main__":

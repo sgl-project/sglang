@@ -187,6 +187,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
                     "disable_radix_cache",
+                    "max_total_tokens",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
