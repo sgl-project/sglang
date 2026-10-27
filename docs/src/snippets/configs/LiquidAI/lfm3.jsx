@@ -86,7 +86,7 @@ sgl-eval run gsm8k \\
 
   // Prefills the issue template's `model` field on "Submit verified cell".
   github: {
-    cookbookModel: "LiquidAI/lfm3",
+    cookbookModel: "LiquidAI/LFM3-1.7B",
   },
 
   // No speculative axis: the server rejects speculative decoding for LFM3.
@@ -95,7 +95,7 @@ sgl-eval run gsm8k \\
     // text model.
     attention: {
       knobs: [
-        { id: "tp", label: "TP", values: [null, 1, 2] },
+        { id: "tp", label: "TP", values: [null, 1, { value: 2, disable: { hw: ["dgx-spark"] } }] },
       ],
     },
     pdDisagg: {
