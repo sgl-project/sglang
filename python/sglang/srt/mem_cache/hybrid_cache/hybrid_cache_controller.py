@@ -157,6 +157,9 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        self.host_capacity_retries = 0
+        self.host_capacity_deadline: Optional[float] = None
+        self.host_capacity_next_retry = 0.0
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
         self.prefetch_kv_page_offset = 0

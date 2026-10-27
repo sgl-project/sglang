@@ -201,6 +201,8 @@ The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout
   - `wait_complete`: Wait for prefetch to complete before proceeding
   - `timeout`: Terminates after specified time or when complete (Recommended for production environments, as setting an appropriate timeout helps the system meet required SLOs)
 
+- **`--hicache-storage-prefetch-host-capacity-wait-ms`**: In single-engine cache mode, a positive value waits up to this many milliseconds for the entire storage-hit span to fit in host memory. Allocation retries are also capped by `--hicache-storage-prefetch-retry-max-attempts`. If either limit is reached, the request falls back to recomputation. The default `0` preserves partial-prefix staging. Buffer-only mode and distributed TP/PP/CP topologies retain their existing behavior. Use this option when host capacity is expected to recover shortly; sustained pressure adds waiting time without saving prefill work. The prefetch stop policy can end the wait earlier.
+
 - **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers. See [Data Write-back](#data-write-back) for details.
   - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
   - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
