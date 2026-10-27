@@ -108,8 +108,8 @@ Begin capture (segment 1)
   ... graphable ops ...
   @eager_on_graph function encountered:
     1. End current capture segment
-    2. Record the function for later replay (it does not run: its inputs
-       were never computed; an optional capture_stub runs host setup)
+    2. Record the function for later replay without running it; an optional
+       capture_stub runs host setup in its place
     3. Begin new capture segment
   ... more graphable ops ...
 End capture (segment N)

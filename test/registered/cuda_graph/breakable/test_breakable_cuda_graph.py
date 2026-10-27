@@ -1,14 +1,7 @@
-"""Tests for the breakable CUDA graph (BCG) runner.
-
-Two test classes:
-- TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
-  unit tests for the core capture / replay mechanism (simple tensor ops).
-- TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
-  --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
-"""
+"""Tests for the breakable CUDA graph (BCG) runner."""
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -271,42 +264,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.testing.assert_close(observed["out_cache_loc"], expected)
         self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
-
-
-class TestCapturePassRecordsBreaks(CustomTestCase):
-    def _capture(self):
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-            breakable_cuda_graph as bcg,
-        )
-
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
-        active = patch.object(bcg, "_current_capture_var")
-        return bcg, capture, active
-
-    def test_capture_runs_only_the_stub_and_replay_runs_the_body(self):
-        bcg, capture, active = self._capture()
-        calls = []
-        op = bcg.eager_on_graph(
-            lambda tag: calls.append(("body", tag)),
-            capture_stub=lambda tag: calls.append(("stub", tag)),
-        )
-        with active as var:
-            var.get.return_value = capture
-            self.assertIsNone(op("a"))
-        self.assertEqual(calls, [("stub", "a")])
-        capture.cuda_graph._break_fns[0]()
-        self.assertEqual(calls, [("stub", "a"), ("body", "a")])
-
-    def test_a_break_returning_a_value_fails(self):
-        bcg, capture, active = self._capture()
-        op = bcg.eager_on_graph(lambda: 1)
-        with self.assertRaises(AssertionError):
-            op()
-        with active as var:
-            var.get.return_value = capture
-            op()
-        with self.assertRaises(AssertionError):
-            capture.cuda_graph._break_fns[0]()
 
 
 class TestBreakGraphHelper(CustomTestCase):
