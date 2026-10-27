@@ -80,13 +80,17 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -2056,6 +2060,12 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        self.defer_cp_decode_attn_tp = (
+            self.use_dsa
+            and q_lora_rank is not None
+            and not reduce_results
+            and can_defer_cp_decode_attn_tp()
+        )
         self.dcp_size = get_parallel().attn_dcp_size
         if (
             is_nextn
@@ -2293,6 +2303,7 @@ class DeepseekV2AttentionMLA(
             [self.q_b_proj, self.o_proj],
             tensor_attrs=tensor_attrs,
             radix_attn=self.attn_mqa,
+            defer_all_reduce=self.defer_cp_decode_attn_tp,
         ):
             if ctx.use_decode_attn_tp:
                 orig_num_local_heads = self.num_local_heads
@@ -2721,7 +2732,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         with too (see make_layers). ``attn_output`` and ``output``: the
         attention's and the FFN's output transforms, if any."""
         return (
-            declare_attn(output_transform=attn_output),
+            declare_attn(
+                output_transform=attn_output,
+                non_cp_tp_group=(
+                    SumGroup.TP
+                    if is_deepseek_dsa(config)
+                    and getattr(config, "q_lora_rank", None) is not None
+                    and can_defer_cp_decode_attn_tp()
+                    else None
+                ),
+            ),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
                 next_layer_sparse=cls._is_layer_sparse(

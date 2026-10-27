@@ -337,6 +337,7 @@ class StageDeclaration:
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
+    non_cp_tp_group: Optional[SumGroup] = None
     in_token_order: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
@@ -438,6 +439,7 @@ def declare_attn(
     gathers_attn_tp_input=True,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
+    non_cp_tp_group=None,
     attn_tp_gather=None,
     in_token_order=False,
     sum_impl=None,
@@ -456,6 +458,8 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
+        non_cp_tp_group: Optional head partition on ordinary (unsharded)
+            batches, e.g. replicated prefill attention dispatched to TP decode.
         attn_tp_gather: Implementation of the gather over attention TP into
             this stage, tried before the boundary's own (see StageDeclaration).
         in_token_order: Compute scans the whole sequence in token order. On a
@@ -482,6 +486,7 @@ def declare_attn(
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
+        non_cp_tp_group=non_cp_tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
         sum_impl=sum_impl,
@@ -702,7 +707,12 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     owes = not sp and axes[TokenAxis.ATTN_TP] > 1
     group = SumGroup.ATTN_TP
     compute_rows = attention
-    if stage.tp_group is SumGroup.TP:
+    tp_group = (
+        stage.non_cp_tp_group
+        if variant is BatchVariant.ORDINARY and stage.non_cp_tp_group is not None
+        else stage.tp_group
+    )
+    if tp_group is SumGroup.TP:
         parallel = get_parallel()
         if parallel.attn_dp_size != 1 or sp or scattered:
             raise NotImplementedError(
@@ -717,7 +727,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             if parallel.attn_cp_size == parallel.tp_size and parallel.attn_cp_size > 1
             else SumGroup.TP
         )
-    elif stage.tp_group is not SumGroup.ATTN_TP:
+    elif tp_group is not SumGroup.ATTN_TP:
         raise ValueError("attention heads must be partitioned over ATTN_TP or TP")
     # On a CP extend a token-order stage takes the whole sequence.
     in_token_order = stage.in_token_order and variant is BatchVariant.CONTEXT_PARALLEL

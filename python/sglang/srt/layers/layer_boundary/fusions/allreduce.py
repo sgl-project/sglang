@@ -119,8 +119,27 @@ def ffn_input_fusions(plan) -> Tuple["FfnInputFusion", ...]:
     given = plan.fusions.ffn_input_fusions(plan) if plan.fusions else ()
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
+    # CP-prefill / TP-decode attention leaves a CP-rank sum on ordinary rows.
+    # Reuse the already initialized MoE fusion workspace only when it has the
+    # very same peers; equal group widths alone are not sufficient.
+    cp_fusion = ()
+    if not _use_aiter and any(
+        edges.incoming.produced.group is SumGroup.ATTN_CP
+        and not edges.incoming.produced.layout.sharded
+        and not edges.incoming.need.layout.sharded
+        for edges in plan.edges.values()
+    ):
+        cp_group = get_parallel().attn_cp_group
+        if cp_group.ranks == post_experts_reduction_group().ranks:
+            cp_fusion = (
+                FfnInputFusion(
+                    completes=SumGroup.ATTN_CP,
+                    run=partial(fused_ffn_input, plan, use_attn_tp_group=False),
+                ),
+            )
     return (
         *given,
+        *cp_fusion,
         FfnInputFusion(
             completes=SumGroup.ATTN_TP,
             run=partial(fused_ffn_input, plan),
@@ -152,6 +171,8 @@ def fused_ffn_input(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
+    *,
+    use_attn_tp_group: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """The attention-TP all-reduce, residual add and norm in one aiter or
     flashinfer kernel; None when neither takes the batch."""
@@ -161,5 +182,5 @@ def fused_ffn_input(
     ):
         return None
     return plan.norm.forward_with_allreduce_fusion(
-        hidden_states, residual, use_attn_tp_group=True
+        hidden_states, residual, use_attn_tp_group=use_attn_tp_group
     )

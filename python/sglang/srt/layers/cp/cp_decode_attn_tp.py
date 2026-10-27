@@ -15,7 +15,7 @@ import torch
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_device, get_exec, get_lora, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,29 @@ CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
 )
 
 _global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
+
+
+def can_defer_cp_decode_attn_tp() -> bool:
+    """Whether a DSA layer may leave its decode sum to its stage boundary.
+
+    This is a construction-time choice, shared by the weight dispatch and the
+    boundary declaration. Only the full-TP CP topology is supported for now;
+    the other configurations retain the inline reduction.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.enable_cp_decode_attn_tp
+        and parallel.enable_prefill_cp
+        and parallel.attn_cp_size == parallel.tp_size
+        and parallel.attn_cp_size > 1
+        and parallel.attn_tp_size == 1
+        and parallel.attn_dp_size == 1
+        and not parallel.enable_layernorm_sp
+        and get_device().device == "cuda"
+        and not get_lora().enable_lora
+        and not get_exec().overlap.enable_two_batch_overlap
+        and not get_exec().comm.enable_quant_communications
+    )
 
 
 def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
@@ -78,10 +101,28 @@ class CpDecodeAttnTpContext:
             forward_batch
         ) and not dsa_use_prefill_cp(forward_batch)
 
-    def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    def _slice(
+        self, tensor: torch.Tensor, dim: int, *, is_scale: bool = False
+    ) -> torch.Tensor:
         assert dim in (0, 1)
         chunk = tensor.shape[dim] // self.decode_tp_size
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
+        if is_scale and tensor.dtype == torch.int32 and tensor.ndim == 2:
+            # DeepGEMM packs four UE8M0 scales per int32 in MN-major order.
+            # An N slice retains the full matrix's column stride, while making
+            # a K slice contiguous changes it to row-major. Re-layout the shard
+            # without unpacking/requantizing; _activate caches this allocation.
+            from deep_gemm.utils import get_tma_aligned_size
+
+            aligned_mn = get_tma_aligned_size(sliced.shape[0], sliced.element_size())
+            packed = torch.empty_strided(
+                (aligned_mn, sliced.shape[1]),
+                (1, aligned_mn),
+                dtype=sliced.dtype,
+                device=sliced.device,
+            )[: sliced.shape[0]]
+            packed.copy_(sliced)
+            return packed
         return sliced if dim == 0 else sliced.contiguous()
 
     def _slice_aiter_bpreshuffled_weight(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -123,7 +164,9 @@ class CpDecodeAttnTpContext:
             ):
                 sliced = self._slice_aiter_bpreshuffled_weight(raw)
             else:
-                sliced = self._slice(raw, dim)
+                sliced = self._slice(
+                    raw, dim, is_scale=attr_name in ("weight_scale_inv", "weight_scale")
+                )
             # Cache shards to avoid recomputation and keep CUDA graph pointers stable.
             cache = (raw, sliced, is_param)
             self._slice_cache[cache_key] = cache
@@ -171,6 +214,7 @@ class CpDecodeAttnTpContext:
         modules: list,
         tensor_attrs: List[Tuple] = None,
         radix_attn: Optional[RadixAttention] = None,
+        defer_all_reduce: bool = False,
     ):
         """Activate decode attention TP for the duration of the block.
 
@@ -179,6 +223,8 @@ class CpDecodeAttnTpContext:
             tensor_attrs: (obj, attr_name, dim) tuples for absorbed weights.
             radix_attn: RadixAttention instance whose tp_q_head_num should be
                 overridden to match the sliced head count during decode TP.
+            defer_all_reduce: The caller's boundary declares and completes the
+                CP-rank sum. Otherwise keep the existing inline row reduction.
         """
         self.set_decode_attn_tp(forward_batch)
         if not self.use_decode_attn_tp:
@@ -210,7 +256,9 @@ class CpDecodeAttnTpContext:
                     row_parallel_decode_flags.append(
                         (linear, linear.use_decode_attn_tp)
                     )
-                    linear.use_decode_attn_tp = True
+                    if defer_all_reduce:
+                        assert not linear.reduce_results
+                    linear.use_decode_attn_tp = not defer_all_reduce
 
             if tensor_attrs:
                 for obj, attr_name, dim in tensor_attrs:
