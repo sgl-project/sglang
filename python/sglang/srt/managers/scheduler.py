@@ -4133,7 +4133,7 @@ class Scheduler(
             bootstrap_queue=(
                 self.disagg_prefill_bootstrap_queue.queue
                 if self.disagg_prefill_bootstrap_queue is not None
-                else None
+                else []
             ),
         )
 

@@ -217,7 +217,7 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
-        bootstrap_queue: Optional[List[Req]] = None,
+        bootstrap_queue: List[Req] = [],
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -286,7 +286,7 @@ class SchedulePolicy:
         self,
         policy: Policy,
         waiting_queue: List[Req],
-        bootstrap_queue: Optional[List[Req]] = None,
+        bootstrap_queue: List[Req] = [],
     ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
@@ -307,9 +307,7 @@ class SchedulePolicy:
         if not refresh:
             return
         # Bootstrap-queued requests run after the waiting queue, so touch them first.
-        for r in reversed(
-            (bootstrap_queue or [])[:WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX]
-        ):
+        for r in reversed(bootstrap_queue[:WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
