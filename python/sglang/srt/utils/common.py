@@ -4512,6 +4512,7 @@ def get_physical_cpus_by_numa():
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
