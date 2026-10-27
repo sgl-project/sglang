@@ -294,6 +294,70 @@ class StaticKVStorage:
     def release_rows(self, rows: List[int]) -> None:
         self.requests.free_rows(rows)
 
+    # -- what the prefix tree's effects reach --
+
+    # A second window component (buffer mode's) reaches the same window rows.
+    _TREE_SUB_POOLS = {
+        "FULL": "kv",
+        "SWA": "swa",
+        "AUXILIARY_SWA": "swa",
+        "MAMBA": "mamba",
+    }
+
+    def tree_sub_pool(self, component: str) -> str:
+        return self._TREE_SUB_POOLS[component]
+
+    def _band(self, sub_pool: str):
+        if sub_pool == "swa":
+            return self._allocator.swa_attn_allocator
+        if self._allocator.has_window_pool:
+            return self._allocator.full_attn_allocator
+        return self._allocator
+
+    def available_units(self, sub_pool: str) -> int:
+        return self._band(sub_pool).available_size()
+
+    def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
+        return self._band(sub_pool).alloc(count)
+
+    def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
+        self._band(sub_pool).free(ids)
+
+    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+        if sub_pool == "swa":
+            self._allocator.free_swa_segment(ids, start_pos=0)
+        else:
+            self._band(sub_pool).free_segment(ids, start_pos=0)
+
+    def free_token_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_segment(ids, start_pos=0)
+
+    def free_owner_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_full_segment(ids, start_pos=0)
+
+    def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
+        return self._allocator.translate_swa_indices_for_transfer(owner_ids).to(
+            torch.int64
+        )
+
+    def bind_window(
+        self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
+    ) -> None:
+        self._allocator.set_full_to_swa_mapping(owner_ids, window_ids)
+
+    def rehome_window(
+        self, sub_pool: str, kept_ids: torch.Tensor, incoming_ids: torch.Tensor
+    ) -> torch.Tensor:
+        # The static window is reached through a token -> window row mapping:
+        # point the kept ids at the incoming rows and clear the incoming ids.
+        window_ids = self.window_ids(sub_pool, incoming_ids)
+        self._allocator.clear_full_to_swa_mapping(incoming_ids)
+        self._allocator.set_full_to_swa_mapping(kept_ids, window_ids)
+        return window_ids
+
+    def release_rehomed_owner_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_full_segment(ids, start_pos=0)
+
     def accounting_violations(self) -> List[str]:
         return self._allocator.verify_byte_accounting()
 

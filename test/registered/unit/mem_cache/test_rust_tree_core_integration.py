@@ -2373,6 +2373,7 @@ def _swa_transfer_core(
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
     from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
@@ -2401,7 +2402,10 @@ def _swa_transfer_core(
             core = RustUnifiedTreeCore(params)
         else:
             cache = SimpleNamespace(
-                token_to_kv_pool_allocator=allocator, enable_session_radix_cache=False
+                token_to_kv_pool_allocator=allocator,
+                enable_session_radix_cache=False,
+                # The window rows' names come from the allocator either way.
+                kv_storage=lambda: StaticKVStorage(None, allocator),
             )
             components = {
                 ComponentType.FULL: FullComponent(cache, params),

@@ -1423,11 +1423,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
+            storage = self.kv_storage()
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
+                storage.free_token_rows(indices)
         elif isinstance(action, FreeDeviceKVFullOnly):
+            storage = self.kv_storage()
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
+                storage.free_owner_rows(indices)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
@@ -3870,6 +3872,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if checkpoint is None:
             return None
         return checkpoint - self._sliding_window_size
+
+    def kv_storage(self):
+        """The storage the tree's values are rows of, and its effects go to."""
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        return kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled

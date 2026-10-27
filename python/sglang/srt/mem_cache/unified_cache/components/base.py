@@ -856,6 +856,12 @@ class TreeComponent(ABC):
         Default no-op for components without host storage."""
         pass
 
+    def storage_and_sub_pool(self):
+        """The storage this component's values are rows of, and the sub-pool
+        among them it holds."""
+        storage = self.cache.kv_storage()
+        return storage, storage.tree_sub_pool(self.component_type.name)
+
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""
         raise NotImplementedError(

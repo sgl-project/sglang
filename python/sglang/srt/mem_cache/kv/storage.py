@@ -245,6 +245,96 @@ class KVStorage:
         """Give back rows `take_rows` handed out; their ids went back before."""
         self.requests.free_rows(rows)
 
+    # -- what the prefix tree's effects reach --
+
+    def tree_sub_pool(self, component: str) -> str:
+        """The sub-pool whose values the prefix tree's ``component`` holds."""
+        for s in self._sub_pools:
+            if s.external.tree_component == component:
+                return s.name
+        raise KeyError(f"no sub-pool backs the tree component {component!r}")
+
+    def _band(self, sub_pool: str):
+        """The band that hands out ``sub_pool``'s rows on their own: the
+        owner's when a window shares its token ids, the window's, or the
+        whole allocator for an owner alone."""
+        if self._plan.sub_pool(sub_pool).external.tree_component == "SWA":
+            return self._allocator.swa_attn_allocator
+        if self._allocator.has_window_pool:
+            return self._allocator.full_attn_allocator
+        return self._allocator
+
+    def available_units(self, sub_pool: str) -> int:
+        """Rows ``take_units`` can hand out without eviction."""
+        return self._band(sub_pool).available_size()
+
+    def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
+        """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
+        when they do not fit."""
+        return self._band(sub_pool).alloc(count)
+
+    def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
+        """Give back rows `take_units` handed out."""
+        self._band(sub_pool).free(ids)
+
+    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+        """Give back a sub-pool's rows the tree held, as page-exact segments of
+        owner token ids: the owner's rows alone, or a window's rows of those
+        token ids."""
+        if self._plan.sub_pool(sub_pool).external.tree_component == "SWA":
+            self._allocator.free_swa_segment(ids, start_pos=0)
+        else:
+            self._band(sub_pool).free_segment(ids, start_pos=0)
+
+    def free_token_rows(self, ids: torch.Tensor) -> None:
+        """Give back every sub-pool's rows of these owner token ids."""
+        self._allocator.free_segment(ids, start_pos=0)
+
+    def free_owner_rows(self, ids: torch.Tensor) -> None:
+        """Give back the owner's rows of token ids whose window rows went back
+        before."""
+        self._allocator.free_full_segment(ids, start_pos=0)
+
+    def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
+        """The window's row ids of these owner token ids, as transfers and the
+        tree's window values name them."""
+        return self._allocator.translate_swa_indices_for_transfer(owner_ids).to(
+            torch.int64
+        )
+
+    def bind_window(
+        self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
+    ) -> None:
+        """Let these owner token ids name these window rows."""
+        self._allocator.set_full_to_swa_mapping(owner_ids, window_ids)
+
+    def rehome_window(
+        self, sub_pool: str, kept_ids: torch.Tensor, incoming_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Hand the window rows of ``incoming_ids`` to ``kept_ids`` (the same
+        tokens, already cached under other ids) and return them by their new
+        name. Nothing is allocated or freed: the window band rebinds the kept
+        ids' pages to the incoming pages' memory and drops the incoming ones."""
+        window = self._allocator.swa_attn_allocator
+        kept_pages, incoming_pages = _page_pairs(
+            kept_ids, incoming_ids, self._allocator.page_size
+        )
+        physical = window.ids.virtual_to_physical[incoming_pages]
+        # `> 0` strict: -1 = dropped, 0 = the padding sink. The incoming ids
+        # were just allocated by the request in flight, so every page is live;
+        # anything else would hand the cached tokens the sink's zeros.
+        assert bool((physical > 0).all()), (
+            f"incoming window pages must all be live, got {physical.tolist()}"
+        )
+        window.ids.bind(kept_pages, physical)
+        window.ids.virtual_to_physical.index_fill_(0, incoming_pages, -1)
+        window.clear_inverse_history()
+        return self.window_ids(sub_pool, kept_ids)
+
+    def release_rehomed_owner_rows(self, ids: torch.Tensor) -> None:
+        """Give back owner token ids whose window rows `rehome_window` moved."""
+        self._allocator.free(ids)
+
     @property
     def plan(self) -> KVStoragePlan:
         """The plan this storage was built from (read-only)."""
@@ -367,3 +457,31 @@ class KVStorage:
             slots = self._allocator.state_slots
             return slots.alloc, slots.free
         return None
+
+
+def _page_pairs(
+    kept_ids: torch.Tensor, incoming_ids: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Page ids of two token ranges that address the same logical tokens.
+
+    Dedupes by first occurrence with one shared mask rather than
+    `torch.unique`: unique sorts by id, and allocation hands out virtual ids in
+    no particular order, so sorting would pair page k of one range with an
+    unrelated page of the other. One mask keeps the pairing positional, hence
+    logical.
+    """
+    kept = kept_ids.detach().to(torch.int64) // page_size
+    incoming = incoming_ids.detach().to(torch.int64) // page_size
+    assert kept.numel() == incoming.numel(), (
+        f"rehoming window rows needs a 1:1 token correspondence, got "
+        f"{kept.numel()} kept vs {incoming.numel()} incoming"
+    )
+    starts = torch.ones_like(kept, dtype=torch.bool)
+    starts[1:] = kept[1:] != kept[:-1]
+    incoming_starts = torch.ones_like(incoming, dtype=torch.bool)
+    incoming_starts[1:] = incoming[1:] != incoming[:-1]
+    assert torch.equal(starts, incoming_starts), (
+        "the two ranges break into pages at different offsets, so no "
+        "page-granular ownership transfer expresses the token mapping"
+    )
+    return kept[starts], incoming[starts]

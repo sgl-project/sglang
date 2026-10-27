@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -229,14 +228,9 @@ class SWAComponent(TreeComponent):
                     )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        swa_indices = (
-            self.cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                full_indices
-            )
-        )
-        # Tree component values use int64 indices; normalize transfer ids at the
-        # tree boundary.
-        return swa_indices.to(torch.int64)
+        # Tree component values use int64 indices; the storage hands them so.
+        storage, sub_pool = self.storage_and_sub_pool()
+        return storage.window_ids(sub_pool, full_indices)
 
     def _unified_allocator(self):
         """The unified pool's allocator, or None when running on the static pool."""
@@ -245,77 +239,12 @@ class SWAComponent(TreeComponent):
             return allocator
         return None
 
-    def _page_pairs(
-        self, full_value: torch.Tensor, incoming_full_value: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Page ids of two token ranges that address the SAME logical tokens.
-
-        Dedupes by FIRST OCCURRENCE with one shared mask rather than
-        `torch.unique`: unique sorts by id value, and allocation hands out
-        virtual ids in no particular order, so sorting would pair page k of one
-        range with an unrelated page of the other. One mask keeps the pairing
-        positional, hence logical.
-        """
-        page_size = self.tree_core.page_size
-        kept = full_value.detach().to(torch.int64) // page_size
-        incoming = incoming_full_value.detach().to(torch.int64) // page_size
-        assert kept.numel() == incoming.numel(), (
-            f"locked-full recovery needs a 1:1 token correspondence, got "
-            f"{kept.numel()} kept vs {incoming.numel()} incoming"
-        )
-        starts = torch.ones_like(kept, dtype=torch.bool)
-        starts[1:] = kept[1:] != kept[:-1]
-        incoming_starts = torch.ones_like(incoming, dtype=torch.bool)
-        incoming_starts[1:] = incoming[1:] != incoming[:-1]
-        assert torch.equal(starts, incoming_starts), (
-            "the two ranges break into pages at different offsets, so no "
-            "page-granular ownership transfer expresses the token mapping"
-        )
-        return kept[starts], incoming[starts]
-
-    def _transfer_swa_pages(
-        self,
-        allocator,
-        full_value: torch.Tensor,
-        incoming_full_value: torch.Tensor,
-    ) -> None:
-        """Move swa page OWNERSHIP from the incoming ids onto the node's ids.
-
-        The static recipe re-points the node's locked full ids at the incoming
-        swa pages through `full_to_swa_index_mapping`. Under the unified pool
-        the swa sub-pool's v2p IS that mapping, so the same move is a rebind:
-        give the node's virtual pages the incoming pages' physical pages, then
-        tombstone the incoming ones. No page is allocated or freed, so no
-        capacity changes — only ownership does.
-        """
-        swa = allocator.swa_attn_allocator
-        kept_pages, incoming_pages = self._page_pairs(full_value, incoming_full_value)
-        physical = swa.ids.virtual_to_physical[incoming_pages]
-        # `> 0` strict: -1 = tombstoned, 0 = the padding sink. The incoming ids
-        # were just allocated by the in-flight request, so every page must be
-        # live; a violation means we would hand the node the sink and serve
-        # zeros, which is worth a hard failure rather than silent corruption.
-        assert bool((physical > 0).all()), (
-            f"incoming swa pages must all be live, got {physical.tolist()}"
-        )
-        swa.ids.bind(kept_pages, physical)
-        swa.ids.virtual_to_physical.index_fill_(0, incoming_pages, -1)
-        swa.clear_inverse_history()
-
     def _set_swa(
         self, kept_full: torch.Tensor, incoming_full: torch.Tensor
     ) -> torch.Tensor:
-        """Move incoming SWA mappings to kept Full IDs and return SWA indices."""
-        unified = self._unified_allocator()
-        if unified is not None:
-            self._transfer_swa_pages(unified, kept_full, incoming_full)
-            return self._translate_full_to_swa(kept_full)
-
-        allocator = self.cache.token_to_kv_pool_allocator
-        swa_value = self._translate_full_to_swa(incoming_full)
-        allocator.clear_full_to_swa_mapping(incoming_full)
-        allocator.set_full_to_swa_mapping(kept_full, swa_value)
-        return swa_value
+        """Move incoming SWA rows to kept Full IDs and return their SWA indices."""
+        storage, sub_pool = self.storage_and_sub_pool()
+        return storage.rehome_window(sub_pool, kept_full, incoming_full)
 
     def refresh_lru(
         self,
@@ -1021,9 +950,7 @@ class SWAComponent(TreeComponent):
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
             return
-        kv_storage_of(
-            self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
-        ).advance(
+        self.cache.kv_storage().advance(
             req,
             pre_len,
             window=self.sliding_window_size,
@@ -1267,11 +1194,11 @@ class SWAComponent(TreeComponent):
         )
         if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
-            allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
-            shortfall = max(0, num_tokens - allocator.available_size())
+            storage, sub_pool = self.storage_and_sub_pool()
+            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
             if shortfall:
                 self.cache.evict(EvictParams(swa_num_tokens=shortfall))
-            transfer.device_indices = allocator.alloc(num_tokens)
+            transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:
                 return None
             transfer.device_indices = transfer.device_indices.to(torch.int64)
@@ -1285,17 +1212,17 @@ class SWAComponent(TreeComponent):
         transfer: PoolTransfer,
         prefix_len: int,
     ) -> Optional[PoolTransfer]:
+        storage, sub_pool = self.storage_and_sub_pool()
         if phase == ExternalLinkerLoadPhase.ABORT:
-            self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
-                transfer.device_indices
-            )
+            storage.release_taken(sub_pool, transfer.device_indices)
             return None
 
-        allocator = self.cache.token_to_kv_pool_allocator
         if phase == ExternalLinkerLoadPhase.PREPARE:
             swa_len = len(transfer.device_indices)
-            allocator.set_full_to_swa_mapping(
-                full_transfer.device_indices[-swa_len:], transfer.device_indices
+            storage.bind_window(
+                sub_pool,
+                full_transfer.device_indices[-swa_len:],
+                transfer.device_indices,
             )
             page = self.cache.page_size
             window = ((self.sliding_window_size + page - 1) // page) * page
@@ -1546,11 +1473,11 @@ class SWAComponent(TreeComponent):
             self.cache.host_pool_group.free(host_value, pool=self.pool_name)
 
     def apply_component_action(self, action: ComponentAction) -> None:
-        alloc = self.cache.token_to_kv_pool_allocator
+        storage, sub_pool = self.storage_and_sub_pool()
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 # Component values are page-aligned copies of a kv row.
-                alloc.free_swa_segment(indices, start_pos=0)
+                storage.free_units(sub_pool, indices)
             return
         if isinstance(action, FreeComponentHostSlot):
             for host_indices in action.host_indices:
@@ -1564,7 +1491,7 @@ class SWAComponent(TreeComponent):
         if isinstance(action, RebuildFullToSWAMapping):
             assert len(action.full_indices) == len(action.swa_indices)
             for full, swa in zip(action.full_indices, action.swa_indices):
-                alloc.set_full_to_swa_mapping(full, swa)
+                storage.bind_window(sub_pool, full, swa)
             return
         if isinstance(action, RecoverEvictedSWA):
             self._set_swa(action.kept_full, action.incoming_full)
@@ -1573,12 +1500,7 @@ class SWAComponent(TreeComponent):
             # Keep the locked full; hand the node the INCOMING ids' swa pages,
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._set_swa(action.kept_full, action.incoming_full)
-            unified = self._unified_allocator()
-            if unified is not None:
-                # The chain allocator skips the detached SWA side and releases Full.
-                unified.free(action.incoming_full)
-            else:
-                alloc.free_full_segment(action.incoming_full, start_pos=0)
+            storage.release_rehomed_owner_rows(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )

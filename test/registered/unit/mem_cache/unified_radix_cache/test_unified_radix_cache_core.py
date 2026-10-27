@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RecoverSWAWithLockedFull,
@@ -1928,6 +1928,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
         swa_value = torch.tensor([7, 8], dtype=torch.int64)
         alloc.translate_swa_indices_for_transfer.return_value = swa_value
+        cache.kv_storage = lambda: StaticKVStorage(None, alloc)
         component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -1995,6 +1996,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         order = mock.Mock()
         cache.linker = order.linker
         cache.token_to_kv_pool_allocator = order.allocator
+        cache.kv_storage = lambda: StaticKVStorage(None, order.allocator)
         cache.components = {
             ComponentType.SWA: order.swa,
             ComponentType.FULL: order.full,
