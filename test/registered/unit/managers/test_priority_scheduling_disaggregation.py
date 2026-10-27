@@ -678,6 +678,45 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             [reqs[0].req, reqs[2].req],
         )
 
+    def test_hisparse_prealloc_reserves_scratch_for_pending_transfers(self):
+        """Pending PD requests consume a full buffer and scratch, not just a buffer."""
+        for available, pending, admitted in (
+            (4160, 0, 0),
+            (8320, 1, 0),
+            (10368, 1, 1),
+            (10368, 0, 2),
+        ):
+            with self.subTest(available=available, pending=pending):
+                reqs = [self._new_decode_req(f"hisparse-{i}", i) for i in range(3)]
+                queue = self._new_queue(reqs)
+                queue.enable_priority_scheduling = False
+                queue.enable_hisparse = True
+                queue.hisparse_coordinator = SimpleNamespace(
+                    padded_buffer_size=4160,
+                    spec_swap=SimpleNamespace(scratch_capacity=1024),
+                )
+                queue.token_to_kv_pool_allocator.logical_attn_allocator = (
+                    SimpleNamespace(available_size=lambda: 32768)
+                )
+                queue.token_to_kv_pool_allocator.hisparse_attn_allocator = (
+                    SimpleNamespace(available_size=lambda: available)
+                )
+                queue.token_to_kv_pool_allocator.page_size = 64
+                queue.token_to_kv_pool.page_size = 64
+                queue.draft_token_to_kv_pool = None
+                queue.transfer_queue.queue = [
+                    SimpleNamespace(host_staged=False) for _ in range(pending)
+                ]
+                queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+                queue._uses_swa_reservation = MagicMock(return_value=False)
+                queue._send_kv_metadata = MagicMock()
+
+                preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
+
+                self.assertEqual(failed, [])
+                self.assertEqual(preallocated, reqs[:admitted])
+                self.assertEqual(queue.queue, reqs[admitted:])
+
     def test_prealloc_queue_schedules_higher_priority_values_first_by_default(self):
         reqs = [
             self._new_decode_req("low", 1),
