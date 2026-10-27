@@ -1267,7 +1267,10 @@ class HiSparseCoordinator:
         # The copy precedes the step's forward, whose results the commit has.
         copied.synchronize()
         allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        page_ids = torch.unique(stale_locs[stale_locs > 0] // allocator.page_size)
+        # Page zero is the padding sink and is never owned by a request.
+        page_ids = torch.unique(
+            stale_locs[stale_locs >= allocator.page_size] // allocator.page_size
+        )
         if page_ids.numel() == 0:
             return
         if is_pin_memory_available(self.device):
