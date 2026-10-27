@@ -26,7 +26,10 @@ from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
-from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
+)
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
@@ -59,6 +62,7 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     _enable_ltx_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    AutoencoderKLWan,
     WanDecoder3d,
     WanDistAttentionBlock,
 )
@@ -207,6 +211,33 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
             )
             config.parallel_decode_mode = "spatial_shard"
             self.assertTrue(should_use_spatial_shard_parallel_decode(config))
+
+    def test_wan_vae_reports_parallel_decode_only_when_it_shards(self):
+        # DecodingStage replicates decode across cfg-parallel ranks when this is True;
+        # only auto mode on gfx1250 may turn it off, explicit modes keep the flag.
+        def wan_vae(mode: str) -> AutoencoderKLWan:
+            config = WanVAEConfig(
+                arch_config=WanVAEArchConfig(
+                    base_dim=8,
+                    z_dim=4,
+                    dim_mult=(1, 2, 2, 2),
+                    num_res_blocks=1,
+                    latents_mean=(0.0,) * 4,
+                    latents_std=(1.0,) * 4,
+                ),
+                load_encoder=False,
+                load_decoder=False,
+            )
+            config.parallel_decode_mode = mode
+            return AutoencoderKLWan(config)
+
+        target = "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported"
+        with patch(target, return_value=True):
+            self.assertFalse(wan_vae("auto").use_parallel_decode)
+            self.assertTrue(wan_vae("spatial_shard").use_parallel_decode)
+            self.assertTrue(wan_vae("patch").use_parallel_decode)
+        with patch(target, return_value=False):
+            self.assertTrue(wan_vae("auto").use_parallel_decode)
 
     def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
         configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
