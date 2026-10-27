@@ -28,7 +28,6 @@ def recording_capture():
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: events.append("end"),
         _begin_new_segment=lambda: events.append("begin"),
     )
@@ -71,14 +70,14 @@ def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypa
         graph.replay()
 
 
-def test_method_capture_stub_and_real_replay():
+def test_method_on_capture_and_real_replay():
     calls = []
 
     class Layer:
-        def _capture_stub(self, x, out):
+        def _on_capture(self, x, out):
             calls.append("stub")
 
-        @bcg.eager_on_graph(capture_stub=_capture_stub)
+        @bcg.eager_on_graph(on_capture=_on_capture)
         def _eager_scale(self, x, out):
             calls.append("real")
             out.copy_(x * get_forward_batch().scale)
@@ -197,9 +196,9 @@ def test_run_eager_binds_instance_and_keeps_one_outer_break():
             self.scale = scale
 
         def stub(self, x, *, offset=0):
-            raise AssertionError("run_eager must bypass the capture stub")
+            raise AssertionError("run_eager must bypass on_capture")
 
-        @bcg.eager_on_graph(capture_stub=stub)
+        @bcg.eager_on_graph(on_capture=stub)
         def inner(self, x, *, offset=0):
             calls.append(self.scale)
             return x * self.scale + offset
