@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
+    array_ipc_request,
     is_local_endpoint,
     materialize_file_refs,
 )
@@ -117,6 +119,8 @@ def _session_key(batch: Any) -> str | None:
     session must land on the same one."""
     reqs = batch if isinstance(batch, list) else [batch]
     for req in reqs:
+        if isinstance(req, ReleaseRealtimeSessionReq):
+            return req.session_id
         if isinstance(req, Req) and req.realtime_session_id:
             return req.realtime_session_id
     return None
@@ -171,12 +175,15 @@ class SchedulerClient:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
-            output_batch = socket.recv_pyobj()
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                output_batch = socket.recv_pyobj()
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
@@ -298,13 +305,16 @@ class AsyncSchedulerClient:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
-            payload = await socket.recv()
-            output_batch = pickle.loads(payload)
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
+                payload = await socket.recv()
+                output_batch = pickle.loads(payload)
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except asyncio.CancelledError:
             if self.failure_reason is not None:
                 raise RuntimeError(self.failure_reason) from None

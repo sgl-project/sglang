@@ -212,6 +212,7 @@ def build_replay_fb_view(
         seq_lens_cpu=(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),
+        max_seq_len_host=forward_batch.max_seq_len_host,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -1211,7 +1212,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(
+                global_num_tokens_cpu
+            ),
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
             can_run_decode_cuda_graph=True,
@@ -2039,6 +2042,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if output.last_hidden_states is not None
                     else None
                 ),
             )
