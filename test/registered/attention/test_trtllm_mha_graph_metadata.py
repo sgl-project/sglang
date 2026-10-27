@@ -25,7 +25,7 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -34,6 +34,13 @@ register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 @pytest.fixture
@@ -118,7 +125,9 @@ def _run_decode_mode_extend(backend, monkeypatch, *, mode, width, decode):
     backend.forward_metadata = SimpleNamespace(
         is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
     )
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    )
     backend._should_use_fused_fp8_path = lambda *a: False
     backend._reshape_paged_kv_cache = lambda *a: (None, None)
     backend._get_bmm_scales = lambda *a: (1.0, 1.0)
@@ -240,7 +249,9 @@ def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
         page_table=torch.arange(bs, dtype=torch.int32)[:, None],
     )
     kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    )
     monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
     workspaces = {}
 
@@ -316,7 +327,7 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
     # V before K in one buffer: never the fused-halves layout fmha_v2 reads
     # without a copy, so the prefill takes the copy path.
     v, k = torch.randn(2, pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+    backend.token_to_kv_pool = _routed(SimpleNamespace(get_kv_buffer=lambda _: (k, v)))
 
     backend.kv_index_translator = SimpleNamespace(
         read_table=lambda plan, rows: SimpleNamespace(

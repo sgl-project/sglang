@@ -294,7 +294,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
             )
 
@@ -310,8 +310,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_extend(
             q_,
             o_,
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
@@ -362,7 +362,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
             )
 
@@ -374,8 +374,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_decode(
             q_,
             o_,
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
