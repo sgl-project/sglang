@@ -1820,6 +1820,58 @@ class TestMambaFinishedOvershootCheckpoint(
                 cache.sanity_check()
 
 
+class TestMambaReplaySSMFinishedCheckpoint(CustomTestCase):
+    def test_donate_only_fully_flushed_state(self):
+        for int8 in (False, True):
+            for pending in (0, 3):
+                with self.subTest(int8=int8, pending=pending):
+                    cfg = CacheConfig(
+                        components=(ComponentType.FULL, ComponentType.MAMBA),
+                        enable_linear_replayssm=True,
+                        enable_int8_mamba_checkpoint=int8,
+                        kv_size=64,
+                        max_context_len=64,
+                    )
+                    cache, allocator, pool = build_fixture(cfg)
+                    committed = 20 + pending
+                    tokens = list(range(committed + 1))
+                    req = Req(
+                        rid="replayssm-finish",
+                        origin_input_text="",
+                        origin_input_ids=array("q", tokens[:4]),
+                        sampling_params=SamplingParams(max_new_tokens=committed - 3),
+                    )
+                    pool.alloc([req])
+                    req.output_ids = array("q", tokens[4:])
+                    req.kv.kv_committed_len = committed
+                    req.kv.kv_allocated_len = committed
+                    pool.write(
+                        (req.kv.req_pool_idx, slice(0, committed)),
+                        allocator.alloc(committed),
+                    )
+                    pool.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = pending
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+
+                    release_kv_cache(req, cache, checkpoint=True)
+                    match = cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                    )
+                    expected = 0 if pending else committed
+                    self.assertEqual(match.device_prefix_len, expected)
+                    self.assertEqual(allocator.available_size(), cfg.kv_size - expected)
+                    self.assertEqual(
+                        pool.mamba_allocator.available_size(),
+                        cfg.mamba_cache_size - (expected > 0 and not int8),
+                    )
+                    if int8:
+                        self.assertEqual(
+                            pool.mamba_ckpt_pool.available_size(),
+                            pool.mamba_ckpt_pool.num_slots - (expected > 0),
+                        )
+                    self.assertTrue(req.kv.is_kv_released)
+                    cache.sanity_check()
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(
     UnifiedRadixCacheInt8MambaCheckpointFixtures, CustomTestCase
 ):

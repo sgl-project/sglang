@@ -97,7 +97,9 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         "2048",
         "--attention-backend",
         "triton",
-        "--linear-attn-backend",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-prefill-backend",
         "triton",
         "--mamba-backend",
         "triton",
@@ -152,6 +154,93 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         self.assertGreaterEqual(kl, -1e-12)
         # Leave room for numerical noise while staying far below the broken run.
         self.assertLess(kl, 1e-4, "Cache reuse changed the next-token distribution")
+
+
+class TestMambaReplaySSMFinishedKL(MambaCacheKLMixin, DefaultServerBase):
+    """An unflushed ReplaySSM slot cannot be cached at the last flush boundary.
+
+    Conv advances every decode step, while temporal advances only on a flush.
+    Compare the same continuation with a warm cache and a cold recompute, both
+    when finishing mid-ring and when finishing with a fully flushed state.
+    """
+
+    ignore_eos = True
+    model = "Qwen/Qwen3.5-0.8B"
+    revision = "2fc06364715b967f1860aea9cf38778875588b17"
+    other_args = [
+        "--revision",
+        revision,
+        "--mamba-radix-cache-strategy",
+        "no_buffer",
+        "--page-size",
+        "1",
+        "--disable-overlap-schedule",
+        "--disable-cuda-graph",
+        "--enable-linear-replayssm",
+        "--linear-replayssm-cache-len",
+        "16",
+        "--mem-fraction-static",
+        "0.25",
+        "--max-total-tokens",
+        "8192",
+        "--max-running-requests",
+        "8",
+        "--max-mamba-cache-size",
+        "128",
+        "--attention-backend",
+        "triton",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-prefill-backend",
+        "triton",
+    ]
+
+    def test_reuse_distribution_after_finish(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model, revision=self.revision)
+        config = AutoConfig.from_pretrained(self.model, revision=self.revision)
+        self.vocab_ids = list(range(config.get_text_config().vocab_size))
+        newline = tokenizer.encode("\n", add_special_tokens=False)
+        cases = (
+            (
+                "count",
+                "Continue the sequence with numbers separated by spaces: 1 2 3 4 5 6 7 8 9 10",
+            ),
+            ("story", "Write a story about a cat who likes fish."),
+        )
+        for name, text in cases:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=True,
+                return_dict=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            # Prefill emits the first token; the remaining tokens run decode.
+            # 23 decode steps leave a partial ring, while 32 flush twice.
+            for limit in (24, 33):
+                with self.subTest(case=name, max_new_tokens=limit):
+                    self._flush_cache()
+                    seed = self._generate(prompt, limit)
+                    probe = prompt + seed["output_ids"] + newline
+                    warm = self._generate(probe, 1, score=True)
+                    cached = warm["meta_info"]["cached_tokens"]
+                    self.assertGreater(cached, 0)
+                    self._flush_cache()
+                    cold = self._generate(probe, 1, score=True)
+                    self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
+                    p, q = self._distribution(cold), self._distribution(warm)
+                    kl = float(np.sum(np.exp(p) * (p - q)))
+                    print(
+                        f"ReplaySSM {name} {limit=} KL(cold || warm)={kl:.9g}, "
+                        f"{cached=}",
+                        flush=True,
+                    )
+                    self.assertGreaterEqual(kl, -1e-12)
+                    self.assertLess(
+                        kl, 5e-3, "ReplaySSM checkpoint corrupted cache reuse"
+                    )
+                    expected = len(prompt) + (32 if limit == 33 else 0)
+                    self.assertEqual(cached, expected)
 
 
 class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
