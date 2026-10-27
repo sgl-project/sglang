@@ -3,8 +3,7 @@ import unittest
 
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK,
-    AISBENCHMARK_DATASET_GSM8K,
+    BENCHSERVING,
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
@@ -15,9 +14,27 @@ logger = logging.getLogger(__name__)
 
 # Pure-decode (low-latency tier) acceptance scenario for Kimi-K3 W4A8 32P
 # (4-node mix): 131072 shared prefix in / 1024 out, C12/N12, mean
-# TPOT <= 30 ms. run_aisbench.sh detects --repeat_rate 100 and switches to
-# the aisbench_auto_tools_prefix toolkit: prefix_cache dataset, --prefix_test
-# priming, --dp warm-up coverage.
+# TPOT <= 30 ms.
+#
+# Benchmark: the framework's built-in sglang.bench_serving path with the
+# generated-shared-prefix (GSP) dataset - the same tool and shape the dev
+# acceptance runs use (test-decode_prefix.sh). The earlier aisbench route
+# (run_aisbench.sh + the aisbench_auto_tools_prefix toolkit) never produced
+# a valid C12 measurement: with --repeat_rate 100 every generated request is
+# byte-identical, the OpenCompass dataset loader dedups them, and only 4
+# unique requests ever ran (run 40431214784: TPOT 41.4-45.8 ms at an
+# effective C4). The aisbench route also pulled in a fragile dependency
+# chain (venv install on a shared PVC, toolkit config patching, tokenizer
+# trust_remote_code); bench_serving needs none of that.
+#
+# GSP parameters: 1 group of 12 prompts sharing one system prompt of
+# 95% x 131072 tokens; the remaining 5% is a per-request question, so the
+# requests are distinct (no dedup) while the prefix still dominates. The
+# 4 warmup requests (first GSP prompt, output capped at 32 tokens) are sent
+# at C4 and prime the shared prefix on all 4 DP ranks via round-robin;
+# pop_sglang_is_in_ci_for_gsp keeps SGLANG_IS_IN_CI out of the bench
+# environment so the warmup prefix cache is NOT flushed before the
+# measured pass.
 #
 # The server config is the B103-proven accuracy baseline (DSPARK draft,
 # radix cache, decode graphs {1,4,16}) - this scenario MUST NOT share a
@@ -129,10 +146,8 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    benchmark_tool = AISBENCHMARK
-    dataset_type = AISBENCHMARK_DATASET_GSM8K
-    # Must be None so run_aisbench() generates the dataset; the shared-prefix
-    # regeneration happens inside run_aisbench.sh (--repeat_rate 100).
+    benchmark_tool = BENCHSERVING
+    dataset_name = "generated-shared-prefix"
     dataset_path = None
     input_len = 131072
     output_len = 1024
@@ -140,10 +155,14 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     max_concurrency = 12
     random_range_ratio = 1
     request_rate = 0
-    repeat_rate = "100"
-    # Prefix warm-up coverage: forward --dp to aisbench_test.py so the
-    # shared prefix is primed on all 4 DP ranks before the measured pass.
-    dp = 4
+    # 95% of the input is the shared system prompt; the rest is a distinct
+    # per-request question (dev's 100-cache dataset is the same shape: one
+    # long natural prefix + a short unique tail per request).
+    repeat_rate = 0.95
+    # One warmup request per DP rank primes the shared prefix everywhere
+    # before the measured pass (bench_serving caps warmup output at 32).
+    warmup_requests = 4
+    pop_sglang_is_in_ci_for_gsp = True
     tpot = 30.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):

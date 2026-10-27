@@ -445,6 +445,12 @@ def run_bench_serving(
             cmd_args.extend(["--num-prompts", str(num_prompts)])
         if request_rate:
             cmd_args.extend(["--request-rate", str(request_rate)])
+        if warmup_requests:
+            # Prime the shared prefix before the measured pass: warmup
+            # requests reuse the first GSP prompt with output capped at 32
+            # tokens, so a handful of them (one per DP rank) fills every
+            # rank's radix cache with the system prompt.
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
         if temperature is not None:
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
