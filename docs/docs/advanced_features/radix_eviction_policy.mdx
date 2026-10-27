@@ -14,6 +14,17 @@ The policy scores each candidate and the **lowest score is evicted first**. Once
 
 A policy only scores. It does not decide how much to free, and it cannot pin KV in memory — a node protected by the policy is still evicted if reclaiming everything else is not enough.
 
+## Batch eviction under sustained pressure
+
+By default, SGLang evicts only the token shortfall required by the current allocation. Under sustained KV-pool saturation, this can trigger many small synchronous radix-cache eviction scans. Set `SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS` to reclaim additional L1 KV slots on the first shortfall and amortize that work across later allocations:
+
+```bash Command
+SGLANG_OPT_KV_CACHE_EVICTION_HEADROOM_TOKENS=131072 \
+python3 -m sglang.launch_server --model-path MODEL_PATH
+```
+
+The headroom applies only after an allocation no longer fits. It is capped by the currently evictable cache and applied independently to Full KV and SWA KV. Reclaimed slots return to the normal free pool; they are not permanently reserved. The default is `0`, which preserves exact-shortfall eviction. Tune the value against your KV-pool size and workload because a larger value reduces eviction frequency but may reclaim reusable prefixes earlier.
+
 ## Available policies
 
 Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.

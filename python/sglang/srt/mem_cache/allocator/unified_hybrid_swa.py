@@ -1224,6 +1224,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
     ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _eviction_target_with_headroom
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
@@ -1243,21 +1244,42 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
                 self.full_page_reps_group,
             ),
         )
+        full_evictable_tokens = tree_cache.full_evictable_size()
+        swa_evictable_tokens = tree_cache.swa_evictable_size()
         reclaim_plan = self.reclaim_plan(
             num_tokens,
             required_swa,
-            full_evictable_tokens=tree_cache.full_evictable_size(),
-            swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
             prefer_swa=prefer_swa,
         )
         if reclaim_plan is None:
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
+            full_reclaim_with_headroom = _eviction_target_with_headroom(
+                full_reclaim, full_evictable_tokens
+            )
+            swa_reclaim_with_headroom = _eviction_target_with_headroom(
+                swa_reclaim, swa_evictable_tokens
+            )
+            # The shared-byte plan returns cumulative eviction quotas. Preserve
+            # the allocation-aware early stop, but include the optional reserve
+            # in the capacity predicate so it is not discarded as soon as the
+            # current allocation alone becomes feasible.
+            full_reserve = full_reclaim_with_headroom - full_reclaim
+            swa_reserve = swa_reclaim_with_headroom - swa_reclaim
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim),
+                EvictParams(
+                    num_tokens=full_reclaim_with_headroom,
+                    swa_num_tokens=swa_reclaim_with_headroom,
+                ),
                 allocation_reclaim_satisfied=lambda: (
-                    self.reclaim_plan(num_tokens, required_swa) == (0, 0)
+                    self.reclaim_plan(
+                        num_tokens + full_reserve,
+                        required_swa + swa_reserve,
+                    )
+                    == (0, 0)
                 ),
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
