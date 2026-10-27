@@ -1564,9 +1564,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV
-            # range actually materialized on prefill. C128 state is request
-            # scoped, so its transfer index must use the logical input length
-            # that decode used to register the destination row.
+            # range actually materialized on prefill. C128 state and the DSA
+            # tail ring are request-scoped, so their transfer index uses the
+            # logical input length decode registered (len(origin_input_ids)).
+            # extend_end can land on a kpool boundary while that length is one
+            # token past it; the tail index is seq_len % pool_size, so the two
+            # lengths then disagree on whether a live slot exists.
             seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
@@ -1637,7 +1640,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
                     req.kv.req_pool_idx,
-                    seq_len,
+                    transfer_input_len,
                 )
 
             def _qsa_pending_payload():
