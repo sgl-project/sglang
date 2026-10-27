@@ -63,6 +63,7 @@ batch size one. Explicit placement and attention overrides preserve each recipe.
 | RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
 | DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
+| Radeon 8060S 128GB unified | Resident / Torch SDPA | 155.0 s | — | 16.8 GB (unified) |
 
 Measured with the original checkpoint on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
 request. Times are median HTTP latency after warmup, including PNG serialization
@@ -95,6 +96,35 @@ single-image 1024×1024 workload. Keep full-image VAE decoding and eager executi
 Generation, editing, transparent generation, and transparent editing were
 verified with PyTorch 2.13.0+cu130. Spark reports no separate VRAM usage in `nvidia-smi`.
 This recipe covers one Spark; multi-node deployment and batching remain unverified.
+
+### Strix Halo (Radeon 8060S)
+
+Select **AMD Strix Halo** for one Radeon 8060S iGPU on Linux with ROCm 7.2. Use the
+source installation above. The recommended configuration keeps the DiT and VAE
+resident and uses Torch SDPA:
+
+```bash Command
+TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 sglang serve \
+  --model-path Qwen/Qwen-Image-2.1 \
+  --attention-backend torch_sdpa
+```
+
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` is a PyTorch requirement on AMD iGPUs,
+not an SGLang flag. Without it, PyTorch falls back from the Flash-efficient
+attention kernel and 1024×1024/40-step latency rises from about 155 s to more
+than 9 minutes in our tests. Pass `--attention-backend torch_sdpa` as well: the
+default AITER path is not verified on this GPU.
+
+The GPU shares the 128 GB unified memory with the CPU. The kernel reports a
+512 MiB VRAM carve-out (`mem_info_vram_total`) instead of separate VRAM use, so
+CPU offload is unnecessary for the verified single-image workload. FP8
+quantization is unavailable on this GPU.
+
+Generation was verified with PyTorch 2.9.1+rocm7.2.4 on Ubuntu 24.04 (kernel
+7.0.0); editing and transparent output remain unverified. To trade a small
+amount of fidelity for speed, enable Cache-DiT with `SGLANG_CACHE_DIT_ENABLED=true`:
+the same request drops to about 57 s at the default cache settings, and quality
+falls from 28.4 dB to 27.5 dB PSNR when `SGLANG_CACHE_DIT_MC` is raised to 6.
 
 ### Batching
 
