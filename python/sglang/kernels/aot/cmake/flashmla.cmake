@@ -1,9 +1,9 @@
 # flash_mla
-# DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
+# DeepSeek v4.1 kernels, 528 B/token caches read as V4.1 by default (sgl-project/FlashMLA@3620b63).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
-    URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3620b63fc4ebe33950c50e1b7701b6607f44150e.tar.gz
+    URL_HASH SHA256=7d7f9819bc1b121ef8226281de7265cd97be0cbe15d6450575fc8e3f241041a2
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -127,6 +127,7 @@ set(FlashMLA_SOURCES
 
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
+        "csrc/flashmla_mega_extension.cc"
         # sm100 dense prefill/bwd.
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
@@ -155,6 +156,21 @@ if(FLASHMLA_ENABLE_SM100)
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu
+    )
+    set(FLASHMLA_MEGA_ROOT ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd)
+    foreach(HEADS 64 128)
+        foreach(NORM norm nonorm)
+            list(APPEND FlashMLA_SOURCES
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_prefill_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41fp4_h${HEADS}_decode_${NORM}.cu
+            )
+        endforeach()
+    endforeach()
+    list(APPEND FlashMLA_SOURCES
+        ${FLASHMLA_MEGA_ROOT}/permute_q_b_proj/kernel.cu
+        ${FLASHMLA_MEGA_ROOT}/permute_wv_proj/kernel.cu
     )
 endif()
 

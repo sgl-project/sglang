@@ -25,6 +25,12 @@ done
 
 OPTIONAL_DEPS="${1:-}"
 
+if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
+  # MiniMax H3 uses ffprobe for input admission and output audio validation.
+  docker exec ci_sglang apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+fi
+
 # Build python extras
 EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
@@ -90,8 +96,10 @@ if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
-# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files.
+# pip running as root disables the cache unless the cache dir itself is owned by root; it
+# never checks the entries beneath it. Simply changing folder permissions reduces chown runtime.
+docker exec ci_sglang chown root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
@@ -167,7 +175,9 @@ else
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  # pyarrow 26 needs NumPy 2 at import, but lmms-eval pins numpy 1.26.4;
+  # drop the cap once lmms-eval allows NumPy 2.
+  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
@@ -221,9 +231,13 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
+# When the image's checkout is already at the pin the reinstall is redundant.
+MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
+IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
+if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
+  echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
+elif docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
-  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
   if [[ -z "${MORI_COMMIT}" ]]; then
     echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"

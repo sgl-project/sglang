@@ -211,7 +211,8 @@ __global__ void kernel(const Params __grid_constant__ params) {
 
 template <bool kFuseRealSin, bool kCopyV>
 struct Kernel {
-  /// \brief Single tensor, out of place: `out = rope(rmsnorm(x))` for a contiguous [B, S, H, 128] bf16 tensor.
+  /// \brief Single tensor, out of place: `out = rope(rmsnorm(x))` for a [B, S, H, 128] bf16 tensor with packed head
+  /// rows.
   static void
   run(tvm::ffi::TensorView x,
       tvm::ffi::TensorView out,
@@ -224,19 +225,31 @@ struct Kernel {
     auto H = SymbolicSize{"heads"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
+    auto Bx = SymbolicSize{"input_batch_stride"};
+    auto Tx = SymbolicSize{"input_token_stride"};
+    TensorMatcher({B, S, H, kHeadDim})
+        .with_strides({Bx, Tx, kHeadDim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(kVecAlignBytes)
+        .verify(x);
     TensorMatcher({B, S, H, kHeadDim})
         .with_dtype<bf16_t>()
         .with_device(device)
         .ensure_alignment(kVecAlignBytes)
-        .verify(x)
         .verify(out);
     TensorMatcher({kHeadDim}).with_dtype<bf16_t>().with_device(device).verify(weight);
-    TensorMatcher({S, kHeadDim}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(rope);
+    TensorMatcher({S, kHeadDim / 2, 2}).with_dtype<fp32_t>().with_device(device).verify(rope);
+    // float4 loads span two complex pairs; only the token rows need 16-byte alignment.
+    CHECK_HOST(reinterpret_cast<uintptr_t>(rope.data_ptr()) % 16 == 0) << "RoPE cache must be 16-byte aligned";
+    CHECK_HOST(
+        Bx.unwrap() % (kVecAlignBytes / sizeof(bf16_t)) == 0 && Tx.unwrap() % (kVecAlignBytes / sizeof(bf16_t)) == 0)
+        << "input batch/token strides must preserve vector alignment";
     const int64_t batch = B.unwrap(), seq = S.unwrap(), heads = H.unwrap();
     if (batch == 0 || seq == 0 || heads == 0) return;
     const int64_t token_stride = heads * kHeadDim;
     Params params{};
-    params.q_src = Rows{static_cast<const bf16_t*>(x.data_ptr()), seq * token_stride, token_stride};
+    params.q_src = Rows{static_cast<const bf16_t*>(x.data_ptr()), Bx.unwrap(), Tx.unwrap()};
     params.q_dst = MutableRows{static_cast<bf16_t*>(out.data_ptr()), seq * token_stride, token_stride};
     params.q_weight = static_cast<const bf16_t*>(weight.data_ptr());
     params.k_weight = params.q_weight;
@@ -301,7 +314,9 @@ struct Kernel {
         .verify(k_prefix)
         .verify(v_prefix);
     TensorMatcher({kHeadDim}).with_dtype<bf16_t>().with_device(device).verify(q_weight).verify(k_weight);
-    TensorMatcher({S, kHeadDim}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(rope);
+    TensorMatcher({S, kHeadDim / 2, 2}).with_dtype<fp32_t>().with_device(device).verify(rope);
+    // float4 loads span two complex pairs; only the token rows need 16-byte alignment.
+    CHECK_HOST(reinterpret_cast<uintptr_t>(rope.data_ptr()) % 16 == 0) << "RoPE cache must be 16-byte aligned";
     const int64_t batch = B.unwrap(), seq = S.unwrap(), heads = H.unwrap(), prefix = P.unwrap();
     CHECK_HOST(PS.unwrap() == prefix + seq) << "k_out/v_out must hold prefix + seq tokens";
     if (batch == 0 || seq == 0 || heads == 0) return;

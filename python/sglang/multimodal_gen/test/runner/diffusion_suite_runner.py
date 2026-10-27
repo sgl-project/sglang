@@ -449,8 +449,19 @@ def _run_file_suite(args, target_dir: Path) -> int:
         print(f"No valid test files found for suite '{args.suite}'.")
         return 1 if args.suite in STRICT_SUITES else 0
 
+    my_files = partition_items_by_index(
+        suite_files_abs, args.partition_id, args.total_partitions
+    )
+    print(
+        f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions} "
+        f"| Files: {len(my_files)}/{len(suite_files_abs)}",
+        flush=True,
+    )
+    if not my_files:
+        return 0
+
     exit_code, _, _ = run_pytest(
-        suite_files_abs,
+        my_files,
         filter_expr=args.filter,
         junit_xml_path=None,
     )

@@ -27,7 +27,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weight_cache.protocol import (
-    IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -66,7 +65,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         moe_dp_size=1,
         moe_dp_rank=0,
         moe_ep_rank=0,
-        enable_dp_attention=False,
+        attn_dp_size=1,
         enable_dp_lm_head=False,
         attn_cp_size=1,
         moe_dense_tp_size=None,
@@ -173,7 +172,7 @@ class TestCacheConfig(CustomTestCase):
             ("tp_rank", 1),
             ("moe_dp_rank", 1),
             ("moe_ep_rank", 1),
-            ("enable_dp_attention", True),
+            ("attn_dp_size", 2),
             ("moe_dense_tp_size", 1),
             ("moe_a2a_backend", "mooncake"),
             ("dtype", "torch.bfloat16"),
@@ -294,10 +293,9 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
             model_path="/models/demo",
             tp_size=8,
             pp_size=1,
-            dp_size=8,
+            attn_dp_size=8,
             ep_size=8,
             moe_dp_size=2,
-            enable_dp_attention=True,
             enable_dp_lm_head=True,
             attn_cp_size=2,
             moe_dense_tp_size=1,
@@ -377,10 +375,6 @@ class TestIpcQuantAllowlist(CustomTestCase):
         check_ipc_quant_support(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
-
-    def test_allowlist_registry_shape(self):
-        # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):

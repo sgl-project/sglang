@@ -41,7 +41,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -457,7 +457,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices
         )
         req.full_untruncated_fill_ids = array("q", self.PROMPT)
-        req.set_extend_range(0, len(self.PROMPT))
+        req.extend_end = len(self.PROMPT)
         req.kv.kv_committed_len = len(self.PROMPT)
         req.kv.kv_allocated_len = len(self.PROMPT)
         req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN

@@ -29,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 def configure_nixl_pd_backend(test_cls):
     test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-    # NIXL backend/network selection is driven by NIXL environment variables
-    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
-    # Mooncake-specific --disaggregation-ib-device argument.
+    # Keep these tests on the configured NIXL/UCX device selection rather than
+    # inheriting the Mooncake fixture's per-side RDMA device lists.
     test_cls.rdma_devices = []
 
 
@@ -97,7 +96,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            _check_rdma_openable()
+            _warn_if_rdma_unopenable()
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
@@ -119,7 +118,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def rdma_devices_for(cls, gpu_indices) -> list:
         """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
-        if not is_in_ci():
+        if not is_in_ci() or not cls.rdma_devices:
             return cls.rdma_devices
         return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
@@ -428,15 +427,16 @@ def _ibverbs_device_names() -> Optional[set]:
 
 
 # Without an openable device the PD transfer backend silently falls back to TCP,
-# and transfers then fail under load instead of at setup.
-def _check_rdma_openable() -> None:
+# and transfers may then fail under load; warn so such failures are traceable.
+def _warn_if_rdma_unopenable() -> None:
     if not _get_available_ib_devices():
         return
     if _ibverbs_device_names() == set():
-        raise RuntimeError(
-            f"Active RDMA devices are listed in {_IB_SYSFS} but ibverbs can open "
-            "none; the PD transfer backend would lose RDMA. "
-            "Check /dev/infiniband in the container."
+        logger.warning(
+            "Active RDMA devices are listed in %s but ibverbs can open none; "
+            "the PD transfer backend will fall back to TCP. "
+            "Check /dev/infiniband in the container.",
+            _IB_SYSFS,
         )
 
 
@@ -531,8 +531,8 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     # createBackend and tcp is the only transport left that can serve it, so
     # keep loopback here.
     net_devices = ",".join([*(f"{d}:1" for d in devices), "lo"])
-    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
-    # device on the host, and that full-device init can stall inside the driver.
+    # Limit default UCX device discovery; opening every RDMA device on the host
+    # can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices
     logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

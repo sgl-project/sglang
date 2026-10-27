@@ -40,6 +40,7 @@ def handle_expert_pack(server_args: Any) -> None:
     parallelism = (
         ("tensor", "--tp-size", cfg.tp_size),
         ("data", "--dp-size", cfg.dp_size),
+        ("attention data", "--attn-dp-size", cfg.attn_dp_size),
         ("expert", "--ep-size", cfg.ep_size),
     )
     for label, option, size in parallelism:

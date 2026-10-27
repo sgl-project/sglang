@@ -68,10 +68,43 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+# Route supported decode shapes that are absent from the tuned table.
+_A16W16_TRITON_MAX_K = 2048
+_A16W16_TRITON_MAX_M = 64
+_A16W16_TRITON_NARROW_K = 512
+_A16W16_TRITON_NARROW_K_MAX_M = 512
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
+    return (
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.shape[1] == k
+        and 0 < k <= _A16W16_TRITON_MAX_K
+        and 0 < x.shape[0] <= max_m
+        and weight.shape[0] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
 
 
 class Bf16GemmBackend(Enum):
@@ -100,6 +133,8 @@ _run_splitk_dense = None
 _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
+_warp_splitk_tactic = None
+_run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
@@ -116,14 +151,10 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (2, 512, 8192): (64, 8, 4, 12),
     (4, 512, 8192): (64, 8, 4, 10),
     (8, 512, 8192): (64, 8, 4, 12),
+    (12, 512, 8192): (64, 8, 4, 12),
     (16, 512, 8192): (64, 8, 4, 12),
     (24, 512, 8192): (64, 8, 4, 12),
     (32, 512, 8192): (64, 16, 4, 9),
-    (1, 2304, 8192): (128, 8, 4, 6),
-    (2, 2304, 8192): (64, 8, 2, 12),
-    (4, 2304, 8192): (128, 8, 4, 6),
-    (8, 2304, 8192): (64, 8, 4, 10),
-    (16, 2304, 8192): (64, 16, 4, 9),
     (24, 2304, 8192): (64, 32, 2, 9),
     (32, 2304, 8192): (64, 32, 2, 9),
     (1, 2560, 8192): (64, 8, 2, 10),
@@ -133,6 +164,23 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # MuseSpark TP8 unpooler slice; only swept M are listed.
+    (4, 1024, 4096): (64, 8, 4, 12),
+    (8, 1024, 4096): (64, 8, 4, 12),
+    (12, 1024, 4096): (64, 16, 4, 8),
+    (16, 1024, 4096): (64, 16, 4, 8),
+    # MuseSpark TP4 qkvg and pooler/unpooler slices on GB300, same method;
+    # only swept M are listed; other M were not tuned and stay on TGV/cuBLAS.
+    (24, 4608, 8192): (64, 32, 2, 9),
+    (32, 4608, 8192): (64, 32, 2, 9),
+    (1, 1024, 8192): (64, 16, 4, 10),
+    (2, 1024, 8192): (64, 16, 4, 10),
+    (4, 1024, 8192): (64, 16, 4, 10),
+    (8, 1024, 8192): (64, 16, 4, 10),
+    (12, 1024, 8192): (64, 16, 4, 10),
+    (16, 1024, 8192): (64, 16, 4, 10),
+    (24, 1024, 8192): (64, 16, 4, 10),
+    (32, 1024, 8192): (64, 16, 4, 10),
     # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
     # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
     (1, 320, 2560): (64, 8, 4, 11),
@@ -177,9 +225,54 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (8, 4120, 2560): (64, 8, 2, 6),
 }
 
+# FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
+# MuseSpark TP4/TP8 on GB300 of the per-M best.
+# Takes precedence over _BF16_SPLITK_TUNED_TACTICS.
+_BF16_WARP_SPLITK_TUNED_TACTICS = {
+    # TP4 qkvg, o_proj and unpooler slice.
+    (1, 4608, 8192): (32, 8, 256, 10, 2),
+    (2, 4608, 8192): (32, 8, 256, 10, 2),
+    (4, 4608, 8192): (32, 8, 256, 10, 2),
+    (8, 4608, 8192): (32, 8, 256, 10, 2),
+    (12, 4608, 8192): (32, 16, 256, 9, 2),
+    (16, 4608, 8192): (32, 16, 256, 9, 2),
+    (1, 8192, 2048): (16, 8, 256, 4, 2),
+    (2, 8192, 2048): (16, 8, 256, 4, 2),
+    (4, 8192, 2048): (16, 8, 256, 4, 2),
+    (8, 8192, 2048): (16, 8, 256, 4, 2),
+    (12, 8192, 2048): (32, 16, 256, 4, 2),
+    (16, 8192, 2048): (32, 16, 256, 4, 2),
+    (1, 2048, 4096): (16, 8, 256, 15, 2),
+    (2, 2048, 4096): (16, 8, 256, 15, 2),
+    (4, 2048, 4096): (16, 8, 256, 15, 2),
+    (8, 2048, 4096): (16, 8, 256, 15, 2),
+    (12, 2048, 4096): (16, 16, 256, 12, 2),
+    (16, 2048, 4096): (16, 16, 256, 12, 2),
+    (24, 2048, 4096): (32, 16, 256, 9, 2),
+    (32, 2048, 4096): (32, 16, 256, 9, 2),
+    # TP8 qkvg, o_proj and unpooler slice.
+    (1, 2304, 8192): (16, 8, 256, 16, 2),
+    (2, 2304, 8192): (16, 8, 256, 16, 2),
+    (4, 2304, 8192): (16, 8, 256, 16, 2),
+    (8, 2304, 8192): (16, 8, 256, 16, 2),
+    (12, 2304, 8192): (16, 16, 256, 13, 2),
+    (16, 2304, 8192): (16, 16, 256, 13, 2),
+    (1, 8192, 1024): (32, 8, 128, 8, 2),
+    (2, 8192, 1024): (32, 8, 128, 8, 2),
+    (4, 8192, 1024): (32, 8, 128, 8, 2),
+    (8, 8192, 1024): (32, 8, 128, 8, 2),
+    (12, 8192, 1024): (32, 16, 256, 4, 2),
+    (16, 8192, 1024): (32, 16, 256, 4, 2),
+    (1, 1024, 4096): (16, 8, 256, 16, 2),
+    (2, 1024, 4096): (16, 8, 256, 16, 2),
+    (24, 1024, 4096): (16, 16, 256, 10, 2),
+    (32, 1024, 4096): (16, 16, 256, 10, 2),
+}
+
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
-    return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+    key = (m, n, k)
+    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
 def precompile_splitk_tactics() -> bool:
@@ -188,7 +281,7 @@ def precompile_splitk_tactics() -> bool:
     if not _enable_bf16_splitk_gemm:
         return False
     device = torch.cuda.current_device()
-    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
@@ -210,6 +303,7 @@ def initialize_bf16_gemm_config() -> None:
     global _direct_default_tactic
     global _prefer_direct
     global _run_direct_dense
+    global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
 
     backend_str = get_exec().kernel.bf16_gemm_backend
@@ -223,8 +317,8 @@ def initialize_bf16_gemm_config() -> None:
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_gemv():
-        if torch.cuda.get_device_capability()[0] != 9:
-            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+        if torch.cuda.get_device_capability()[0] not in (9, 12):
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
@@ -264,12 +358,18 @@ def initialize_bf16_gemm_config() -> None:
             SplitKTactic,
             run_splitk_dense,
         )
+        from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+            WarpSplitKTactic,
+            run_warp_splitk_dense,
+        )
 
         _splitk_tactic = SplitKTactic
         _run_splitk_dense = run_splitk_dense
         _direct_default_tactic = default_tactic
         _prefer_direct = prefer_direct_bf16_gemm_sm100
         _run_direct_dense = run_direct_dense
+        _warp_splitk_tactic = WarpSplitKTactic
+        _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
 
     _BF16_GEMM_BACKEND = backend
@@ -288,7 +388,12 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    if bias is None and _prefer_direct(m, n, k):
+    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
+    if warp_tactic is not None:
+        _run_warp_splitk_dense(
+            x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
+        )
+    elif bias is None and _prefer_direct(m, n, k):
         tactic = _direct_default_tactic(m, n, k)
         _run_direct_dense(x_2d, weight.T, out, True, tactic)
     else:
@@ -328,6 +433,12 @@ def _bf16_gemm_dispatch_impl(
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+        # The GEMV reads x and weight with 16-byte vector loads;
+        # other layouts take the cuBLAS routes below.
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
     ):
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
@@ -479,10 +590,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_cutedsl()
+            (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
@@ -626,6 +739,21 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
+# The two fused expert weights that the flashinfer TRT-LLM BF16 path rewrites
+# into block layout, and the tile geometry it rewrites them with.
+_FUSED_EXPERT_WEIGHT_NAMES = ("w13_weight", "w2_weight")
+_TRTLLM_BF16_EPILOGUE_TILE_M = 128
+_TRTLLM_BF16_BLOCK_K = 128
+
+
+def _fused_expert_weight_name(weight_name: str) -> Optional[str]:
+    """Map a checkpoint-side weight name to the fused expert parameter it loads."""
+    for param_name in _FUSED_EXPERT_WEIGHT_NAMES:
+        if weight_name.endswith(f".experts.{param_name}"):
+            return param_name
+    return None
+
+
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
@@ -642,6 +770,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        self.runner: Optional[MoeRunner] = None
+        self._aiter_runner: Optional[MoeRunner] = None
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
         self.w13_swiglu_interleaved = False
@@ -761,6 +891,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache sizing.
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
         if self.use_flashinfer_cutlass:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,
@@ -772,76 +906,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 layer.w13_weight.device,
             )
 
-        # Reorder rows of W1 for fused gated activation
-        if self.use_flashinfer_trtllm_moe:
-            # The cached indices are GPU tensors. Colocated weight offloading
-            # can release their backing memory between reloads, so rebuild them
-            # once per post-processing cycle.
-            self._cache_permute_indices.clear()
+        self._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
 
-            from flashinfer.fused_moe.core import (
-                _maybe_get_cached_w3_w1_permute_indices,
-                convert_to_block_layout,
-                get_w2_permute_indices_with_cache,
-            )
-
-            # w1 and w3 have been swapped, so we don't need do that here
-            epilogue_tile_m = 128
-            block_k = 128
-            old_shape_w13 = layer.w13_weight.data[0].shape
-            old_shape_w2 = layer.w2_weight.data[0].shape
-            new_shape_w13 = None
-            new_shape_w2 = None
-            for i in range(layer.num_local_experts):
-                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                    self._cache_permute_indices,
-                    layer.w13_weight.data[i].view(torch.uint8),
-                    epilogue_tile_m,
-                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
-                )
-                tmp_weights1 = (
-                    layer.w13_weight.data[i]
-                    .clone()
-                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
-                    .contiguous()
-                )
-
-                permute_indices = get_w2_permute_indices_with_cache(
-                    self._cache_permute_indices,
-                    layer.w2_weight.data[i].view(torch.uint8),
-                    epilogue_tile_m,
-                )
-                tmp_weights2 = (
-                    layer.w2_weight.data[i]
-                    .clone()
-                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
-                    .contiguous()
-                )
-
-                tmp_weights1 = convert_to_block_layout(
-                    tmp_weights1.view(torch.uint8), block_k
-                )
-                tmp_weights2 = convert_to_block_layout(
-                    tmp_weights2.view(torch.uint8), block_k
-                )
-
-                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
-                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
-                layer.w13_weight.data[i] = (
-                    tmp_weights1.view(torch.bfloat16)
-                    .contiguous()
-                    .reshape(old_shape_w13)
-                )
-                layer.w2_weight.data[i] = (
-                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
-                )
-
-            layer.w13_weight.data = layer.w13_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w13
-            )
-            layer.w2_weight.data = layer.w2_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w2
-            )
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
             # the ones that know what their gmms expect. NPUUnquantMoEMethod
@@ -871,10 +937,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return
 
         moe_runner_config = layer.moe_runner_config
+        runner_backend = self.get_moe_runner_backend(layer)
         if not (
             _is_cuda
-            and self._aiter_runner is None
-            and self.runner.runner_backend.is_triton()
+            and runner_backend is not None
+            and runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
             and not self.with_bias
             and layer.w13_weight.dtype == torch.bfloat16
@@ -906,37 +973,160 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
         )
 
+    def _maybe_apply_flashinfer_trtllm_bf16_block_layout(
+        self, layer: torch.nn.Module
+    ) -> None:
+        """Pack canonical BF16 expert weights; already-blocked weights stay intact."""
+        if not self.use_flashinfer_trtllm_moe:
+            return
+
+        # Colocated offloading can release the cached GPU indices' backing memory.
+        self._cache_permute_indices.clear()
+        for name, param in (
+            ("w13_weight", layer.w13_weight),
+            ("w2_weight", layer.w2_weight),
+        ):
+            if tuple(param.data.shape) == self._canonical_expert_weight_shape(
+                layer, name
+            ):
+                self._apply_trtllm_bf16_block_layout(layer, param, name)
+
+    def _trtllm_bf16_row_permutation(
+        self, layer: torch.nn.Module, param_name: str, expert_tile: torch.Tensor
+    ) -> torch.Tensor:
+        """flashinfer's row permutation for one expert tile, viewed as uint8."""
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        if param_name == "w13_weight":
+            # w1 and w3 have been swapped, so we don't need do that here
+            return _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                expert_tile,
+                _TRTLLM_BF16_EPILOGUE_TILE_M,
+                is_gated_act_gemm=layer.moe_runner_config.is_gated,
+            )
+        return get_w2_permute_indices_with_cache(
+            self._cache_permute_indices,
+            expert_tile,
+            _TRTLLM_BF16_EPILOGUE_TILE_M,
+        )
+
+    def _apply_trtllm_bf16_block_layout(
+        self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
+    ) -> None:
+        """Canonical -> block layout, in place, for one fused expert weight."""
+        from flashinfer.fused_moe.core import convert_to_block_layout
+
+        canonical_expert_shape = param.data[0].shape
+        blocked_expert_shape = None
+        for i in range(layer.num_local_experts):
+            permute_indices = self._trtllm_bf16_row_permutation(
+                layer, param_name, param.data[i].view(torch.uint8)
+            )
+            tile = (
+                param.data[i]
+                .clone()
+                .view(torch.uint8)[permute_indices.to(param.data.device)]
+                .contiguous()
+            )
+            tile = convert_to_block_layout(tile, _TRTLLM_BF16_BLOCK_K)
+            blocked_expert_shape = tile.view(torch.bfloat16).shape
+            param.data[i] = (
+                tile.view(torch.bfloat16).contiguous().reshape(canonical_expert_shape)
+            )
+
+        param.data = param.data.reshape(layer.num_local_experts, *blocked_expert_shape)
+
+    def _restore_trtllm_bf16_canonical_layout(
+        self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
+    ) -> None:
+        """Undo the block/row permutations in place, preserving untouched experts."""
+        canonical_shape = self._canonical_expert_weight_shape(layer, param_name)
+        blocked_expert_shape = tuple(param.data[0].shape)
+        param.data = param.data.reshape(canonical_shape)
+
+        inverse_indices = None
+        for i in range(layer.num_local_experts):
+            blocked = param.data[i].reshape(blocked_expert_shape).view(torch.uint8)
+            rows = blocked.shape[1]
+            tile = blocked.permute(1, 0, 2).contiguous().reshape(rows, -1)
+            if inverse_indices is None:
+                # Keyed on tile shape, identical for every expert: invert once.
+                permute_indices = self._trtllm_bf16_row_permutation(
+                    layer, param_name, tile
+                ).to(tile.device)
+                # argsort only inverts a bijection. It is one today; fail loudly
+                # rather than silently scrambling rows if that ever changes.
+                if not torch.equal(
+                    permute_indices.sort().values,
+                    torch.arange(permute_indices.numel(), device=tile.device),
+                ):
+                    raise RuntimeError(
+                        f"flashinfer TRT-LLM row permutation for {param_name} is "
+                        "not a bijection, so the block layout cannot be undone "
+                        "for a weight update."
+                    )
+                inverse_indices = torch.argsort(permute_indices)
+            param.data[i] = (
+                tile[inverse_indices]
+                .contiguous()
+                .view(torch.bfloat16)
+                .reshape(canonical_shape[1:])
+            )
+
+    def _canonical_expert_weight_shape(
+        self, layer: torch.nn.Module, param_name: str
+    ) -> Optional[tuple]:
+        """The shape ``create_weights`` allocated for a fused expert weight."""
+        if param_name == "w13_weight":
+            w13_rows = (
+                2 * layer.intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else layer.intermediate_size_per_partition
+            )
+            return (layer.num_local_experts, w13_rows, layer.hidden_size)
+        if param_name == "w2_weight":
+            return (
+                layer.num_local_experts,
+                layer.hidden_size,
+                layer.intermediate_size_per_partition,
+            )
+        return None
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Restore canonical destinations for loader-free P2P/RDMA refits."""
+        if not self.use_flashinfer_trtllm_moe:
+            return
+
+        self._cache_permute_indices.clear()
+        for name, param in (
+            ("w13_weight", layer.w13_weight),
+            ("w2_weight", layer.w2_weight),
+        ):
+            if tuple(param.data.shape) != self._canonical_expert_weight_shape(
+                layer, name
+            ):
+                self._restore_trtllm_bf16_canonical_layout(layer, param, name)
+
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
         layer: torch.nn.Module,
         param: torch.nn.Parameter,
         weight_name: str,
     ) -> None:
-        """Restore canonical BF16 MoE load shapes before hot weight copy.
-
-        The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
-        block layout. During weight update, checkpoint tensors are in
-        canonical layout and need a temporary shape restore for copy.
-        """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        """Restore checkpoint layout for both routed and non-routed TRT-LLM backends."""
+        if not self.use_flashinfer_trtllm_moe:
             return
 
-        expected_shape = None
-        if weight_name.endswith(".experts.w13_weight"):
-            w13_rows = (
-                2 * layer.intermediate_size_per_partition
-                if layer.moe_runner_config.is_gated
-                else layer.intermediate_size_per_partition
-            )
-            expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
-        elif weight_name.endswith(".experts.w2_weight"):
-            expected_shape = (
-                layer.num_local_experts,
-                layer.hidden_size,
-                layer.intermediate_size_per_partition,
-            )
+        param_name = _fused_expert_weight_name(weight_name)
+        if param_name is None:
+            return
 
-        if expected_shape is None or tuple(param.data.shape) == expected_shape:
+        expected_shape = self._canonical_expert_weight_shape(layer, param_name)
+        if tuple(param.data.shape) == expected_shape:
             return
 
         expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
@@ -946,7 +1136,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
             )
 
-        param.data = param.data.reshape(expected_shape)
+        self._cache_permute_indices.clear()
+        self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
@@ -1028,6 +1219,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     "using triton MoE runner."
                 )
 
+    def get_moe_runner_backend(self, layer):
+        runner = self._aiter_runner if self._aiter_runner is not None else self.runner
+        return runner.runner_backend if runner is not None else None
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
@@ -1105,10 +1300,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -1243,8 +1434,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
                 activation=moe_runner_config.activation,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
         else:

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import enum
 import logging
 from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.environ import envs
+from sglang.srt.arg_groups.overrides import flashinfer_a2a_max_dispatch_tokens_per_rank
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
@@ -35,9 +36,14 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
-    get_moe_runner_backend,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_spec,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 try:
@@ -57,6 +63,12 @@ logger = logging.getLogger(__name__)
 # FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
 # concurrently live paths distinct persistent workspaces without extra token work.
 _WORKSPACE_NAMESPACE_ALIGNMENT = 128
+
+
+class _WorkspaceNamespace(enum.IntEnum):
+    DECODE = 0
+    SPECULATIVE = 1
+    SP_PREFILL = 2
 
 
 def _max_tokens_per_scattered_source(
@@ -80,9 +92,21 @@ def _scattered_source_token_counts(
     return counts
 
 
-def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> int:
-    slot = int(speculative)
-    return workspace_size + slot * _WORKSPACE_NAMESPACE_ALIGNMENT
+def _workspace_size_for_namespace(
+    workspace_size: int,
+    *,
+    namespace: Optional[_WorkspaceNamespace] = None,
+    speculative: Optional[bool] = None,
+) -> int:
+    if namespace is not None and speculative is not None:
+        raise ValueError("Specify either namespace or speculative, not both.")
+    if namespace is None:
+        namespace = (
+            _WorkspaceNamespace.SPECULATIVE
+            if speculative
+            else _WorkspaceNamespace.DECODE
+        )
+    return workspace_size + int(namespace) * _WORKSPACE_NAMESPACE_ALIGNMENT
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -128,6 +152,7 @@ class FlashinferDispatcher(BaseDispatcher):
         hidden_size: int = None,
         params_dtype: torch.dtype = None,  # Unused
         moe_runner_config=None,
+        enable_sp_prefill_a2a: bool = False,
     ):
         super().__init__()
         if not use_flashinfer:
@@ -136,24 +161,33 @@ class FlashinferDispatcher(BaseDispatcher):
                 "Please install the appropriate version of Flashinfer."
             )
 
+        self.runner_backend = (
+            moe_runner_config.runner_backend if moe_runner_config is not None else None
+        )
         self.ep_size = group.size()
         self.ep_rank = group.rank()
         self.router_topk = router_topk
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         self.invalid_token_expert_id = (
             -1
             if (
-                runner_backend.is_deep_gemm()
-                or runner_backend.is_flashinfer_trtllm()
-                or runner_backend.is_flashinfer_trtllm_routed()
+                runner_backend is not None
+                and (
+                    runner_backend.is_deep_gemm()
+                    or runner_backend.is_flashinfer_trtllm()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
             )
             else self.num_experts
         )
         # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.payload_in_workspace = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_cutlass()
+        )
         self.dispatch_type = get_flashinfer_a2a_dispatch_type()
         if moe_runner_config is None:
             from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -171,22 +205,10 @@ class FlashinferDispatcher(BaseDispatcher):
         # which reserves ep_size * max_num_tokens * payload bytes, and the C++
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
         #
-        # The workspace must fit both:
-        #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
-        #  (b) the largest decode batch (bounded by max_running_requests, which
-        #      resolve_max_num_reqs caps at 4096 per DP worker).
-        # max_running_requests is not yet resolved at model-construction time,
-        # so we use 4096 as a floor to cover decode batches and _dummy_run
-        # (which warms up at batch_size = req_to_token_pool.size).
-        cps = get_schedule().chunked_prefill_size
-        default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
-        configured_max_tokens = (
-            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-        self.max_num_tokens = (
-            configured_max_tokens
-            if configured_max_tokens is not None
-            else default_max_tokens
+        # Cover both the largest eager prefill chunk (including PP dynamic
+        # chunking) and the largest decode batch using upstream's shared bound.
+        self.max_num_tokens = flashinfer_a2a_max_dispatch_tokens_per_rank(
+            max_prefill_buffer_tokens()
         )
         speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -244,12 +266,10 @@ class FlashinferDispatcher(BaseDispatcher):
         mnnvl_config = MnnvlConfig(comm_backend=TorchDistributedCommBackend(group))
         is_speculative_model = get_flags().moe.speculative_context
 
-        def make_moe_a2a() -> MoeAlltoAll:
-            # Target and draft decode graphs can coexist; prefill/mixed extend use
-            # AG+RS and do not lease MNNVL A2A workspaces.
+        def make_moe_a2a(namespace: _WorkspaceNamespace) -> MoeAlltoAll:
             workspace_size = _workspace_size_for_namespace(
                 self.workspace_size,
-                speculative=is_speculative_model,
+                namespace=namespace,
             )
             return MoeAlltoAll(
                 mapping=self.mapping,
@@ -260,7 +280,42 @@ class FlashinferDispatcher(BaseDispatcher):
                 mnnvl_config=mnnvl_config,
             )
 
-        self.moe_a2a = make_moe_a2a()
+        decode_namespace = (
+            _WorkspaceNamespace.SPECULATIVE
+            if is_speculative_model
+            else _WorkspaceNamespace.DECODE
+        )
+        self.decode_a2a_namespace = decode_namespace
+        self.moe_a2a = make_moe_a2a(decode_namespace)
+        self.sp_prefill_moe_a2a = (
+            make_moe_a2a(_WorkspaceNamespace.SP_PREFILL)
+            if enable_sp_prefill_a2a
+            else None
+        )
+
+    def _start_a2a(self, *, sp_prefill: bool) -> None:
+        if hasattr(self, "active_moe_a2a"):
+            raise RuntimeError(
+                "FlashInfer A2A dispatch is already active; combine or abort it "
+                "before starting another dispatch."
+            )
+        if sp_prefill and self.sp_prefill_moe_a2a is None:
+            raise RuntimeError(
+                "FlashInfer SP-prefill A2A is not enabled for this dispatcher."
+            )
+        self.active_moe_a2a = self.sp_prefill_moe_a2a if sp_prefill else self.moe_a2a
+        self.active_a2a_namespace = (
+            _WorkspaceNamespace.SP_PREFILL if sp_prefill else self.decode_a2a_namespace
+        )
+
+    def _clear_active_a2a(self) -> None:
+        for attr in (
+            "runtime_max_tokens_per_rank",
+            "active_moe_a2a",
+            "active_a2a_namespace",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def set_quant_config(self, quant_config: dict) -> None:
         super().set_quant_config(quant_config)
@@ -331,20 +386,29 @@ class FlashinferDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput | StandardDispatchOutput:
-        if get_is_extend_in_batch():
+        is_extend = get_is_extend_in_batch()
+        is_sp_prefill = is_extend and get_forward().sp_active
+        if is_extend and not is_sp_prefill:
             return self._dispatch_prefill_allgather(hidden_states, topk_output)
-        self.active_moe_a2a = self.moe_a2a
+        if is_sp_prefill and hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer SP prefill A2A requires BF16 hidden states, got "
+                f"{hidden_states.dtype}."
+            )
         # Block-wise FP8 runners quantize before GEMM, so keep dispatch/combine BF16;
         # FP4 retains its packed wire path keyed by input_global_scale.
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         weight_dtype = self.quant_config.get("weight_dtype")
         uses_bf16_fp8_payload = weight_dtype in (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ) and (
-            runner_backend.is_deep_gemm()
-            or runner_backend.is_flashinfer_trtllm()
-            or runner_backend.is_flashinfer_trtllm_routed()
+            runner_backend is not None
+            and (
+                runner_backend.is_deep_gemm()
+                or runner_backend.is_flashinfer_trtllm()
+                or runner_backend.is_flashinfer_trtllm_routed()
+            )
         )
         if uses_bf16_fp8_payload and hidden_states.dtype != torch.bfloat16:
             raise TypeError(
@@ -426,7 +490,7 @@ class FlashinferDispatcher(BaseDispatcher):
         if dp_global is not None and len(dp_global) > 1:
             # Case 1
             attn_tp_size = get_parallel().attn_tp_size
-            self.runtime_max_tokens_per_rank = _max_tokens_per_scattered_source(
+            runtime_max_tokens_per_rank = _max_tokens_per_scattered_source(
                 dp_global, attn_tp_size
             )
         else:
@@ -441,13 +505,13 @@ class FlashinferDispatcher(BaseDispatcher):
                 f"with ep_size={self.ep_size} > 1 (dp_global={dp_global}); "
                 "runtime_max_tokens_per_rank would not be rank-invariant."
             )
-            self.runtime_max_tokens_per_rank = x.shape[0]
+            runtime_max_tokens_per_rank = x.shape[0]
 
         # MoeAlltoAll does not resize its max_num_tokens workspace; reject larger
         # runtime geometry here before it becomes an illegal memory access.
-        assert self.runtime_max_tokens_per_rank <= self.max_num_tokens, (
+        assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
-            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} > "
+            f"runtime_max_tokens_per_rank={runtime_max_tokens_per_rank} > "
             f"max_num_tokens={self.max_num_tokens}. Increase "
             "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK to cover the "
             "largest mixed prefill and speculative-verify batch."
@@ -459,8 +523,8 @@ class FlashinferDispatcher(BaseDispatcher):
         # shard; Case 2: exactly x.shape[0]),
         # so a violation signals a sizing/plumbing bug (e.g. an un-adjusted spec
         # count) rather than a benign case.
-        assert self.runtime_max_tokens_per_rank >= x.shape[0], (
-            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} < "
+        assert runtime_max_tokens_per_rank >= x.shape[0], (
+            f"runtime_max_tokens_per_rank={runtime_max_tokens_per_rank} < "
             f"x.shape[0]={x.shape[0]}: MoeAlltoAll recv buffer would overflow."
         )
 
@@ -470,43 +534,51 @@ class FlashinferDispatcher(BaseDispatcher):
         # padding slots whose expert_id would otherwise route to a real expert
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
-        recv_tensors = self.active_moe_a2a.dispatch(
-            topk_ids,
-            payloads,
-            self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=self.invalid_token_expert_id,
-            expert_id_payload_index=expert_id_payload_index,
-        )
-        if x_sf is not None:
-            x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
-            x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: Fuse interleave into cutlass moe when FlashInfer supports it.
-            if (
-                dispatch_type == FlashinferA2ADispatchType.NVFP4
-                and get_moe_runner_backend().is_flashinfer_cutlass()
-            ):
-                x_sf = nvfp4_block_scale_interleave(x_sf)
-        else:
-            x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
-        x = x_recv.view(-1, x_recv.shape[-1])
-        if dispatch_type == FlashinferA2ADispatchType.MXFP8:
-            x = x.view(torch.float8_e4m3fn)
-        topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
-        topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
+        self.runtime_max_tokens_per_rank = runtime_max_tokens_per_rank
+        self._start_a2a(sp_prefill=is_sp_prefill)
+        try:
+            recv_tensors = self.active_moe_a2a.dispatch(
+                topk_ids,
+                payloads,
+                runtime_max_tokens_per_rank,
+                invalid_token_expert_id=self.invalid_token_expert_id,
+                expert_id_payload_index=expert_id_payload_index,
+            )
+            if x_sf is not None:
+                x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
+                x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+                # TODO: fuse interleave into cutlass moe
+                if dispatch_type == FlashinferA2ADispatchType.NVFP4 and (
+                    self.runner_backend is not None
+                    and self.runner_backend.is_flashinfer_cutlass()
+                ):
+                    x_sf = nvfp4_block_scale_interleave(x_sf)
+            else:
+                x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
+            x = x_recv.view(-1, x_recv.shape[-1])
+            if dispatch_type == FlashinferA2ADispatchType.MXFP8:
+                x = x.view(torch.float8_e4m3fn)
+            topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
+            topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
 
-        # Provide an output tensor to fused_moe so it writes directly to our buffer
-        moe_output = None
-        if self.payload_in_workspace:
-            moe_output = self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
-                self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
-            ).view(-1, self.hidden_size)
-        return FlashinferDispatchOutput(
-            x,
-            x_sf,
-            StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
-            moe_output,
-            output_dtype,
-        )
+            # Provide an output tensor to fused_moe so it writes directly to our buffer
+            moe_output = None
+            if self.payload_in_workspace:
+                moe_output = (
+                    self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
+                        runtime_max_tokens_per_rank, self.hidden_size, output_dtype
+                    ).view(-1, self.hidden_size)
+                )
+            return FlashinferDispatchOutput(
+                x,
+                x_sf,
+                StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
+                moe_output,
+                output_dtype,
+            )
+        except Exception:
+            self._clear_active_a2a()
+            raise
 
     @debug_kernel_api
     def combine(
@@ -526,14 +598,22 @@ class FlashinferDispatcher(BaseDispatcher):
             del self.prefill_source_sizes
             return hidden_states
 
+        if not hasattr(self, "active_moe_a2a"):
+            raise RuntimeError(
+                "FlashInfer A2A combine requires a matching active dispatch."
+            )
+
         weight_dtype = self.quant_config.get("weight_dtype")
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         if (
             weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and (
-                runner_backend.is_deep_gemm()
-                or runner_backend.is_flashinfer_trtllm()
-                or runner_backend.is_flashinfer_trtllm_routed()
+                runner_backend is not None
+                and (
+                    runner_backend.is_deep_gemm()
+                    or runner_backend.is_flashinfer_trtllm()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
             )
             and hidden_states.dtype != torch.bfloat16
         ):
@@ -542,14 +622,15 @@ class FlashinferDispatcher(BaseDispatcher):
                 f"received {hidden_states.dtype}."
             )
         output_hidden_size = hidden_states.shape[-1]
-        hidden_states = self.active_moe_a2a.combine(
-            hidden_states.view(
-                self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
-            ),
-            self.runtime_max_tokens_per_rank,
-            payload_in_workspace=self.payload_in_workspace,
-        )
-
-        del self.runtime_max_tokens_per_rank
-        del self.active_moe_a2a
-        return hidden_states
+        try:
+            return self.active_moe_a2a.combine(
+                hidden_states.view(
+                    self.ep_size,
+                    self.runtime_max_tokens_per_rank,
+                    output_hidden_size,
+                ),
+                self.runtime_max_tokens_per_rank,
+                payload_in_workspace=self.payload_in_workspace,
+            )
+        finally:
+            self._clear_active_a2a()
