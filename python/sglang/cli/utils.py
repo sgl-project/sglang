@@ -7,6 +7,7 @@ from functools import lru_cache
 from huggingface_hub.errors import GatedRepoError
 
 from sglang.srt.environ import envs
+from sglang.srt.model_hub import parse_model_hub_reference
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
     load_diffusion_overlay_registry_from_env,
@@ -99,6 +100,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
+    reference = parse_model_hub_reference(model_path)
+    if reference is not None:
+        _, model_path = reference
     if _is_overlay_diffusion_model(model_path):
         # short-circuit, if applicable for the overlay mechanism (diffusion-only)
         return True
@@ -108,10 +112,14 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if _is_diffusion_model_from_registry(model_path):
         return True
 
-    if os.path.isdir(model_path):
+    if reference is None and os.path.isdir(model_path):
         return _is_diffusers_model_dir(model_path)
 
-    use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
+    use_modelscope = (
+        reference[0] == "modelscope"
+        if reference is not None
+        else envs.SGLANG_USE_MODELSCOPE.get()
+    )
 
     try:
         if use_modelscope:

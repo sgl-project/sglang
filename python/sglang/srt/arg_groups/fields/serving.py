@@ -29,7 +29,11 @@ class Serving(msgspec.Struct):
         "requests. Disabled by default; unsupported with prefill-decode "
         "disaggregation. Storage has no TTL or size limit.",
     ] = False
-    tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
+    tokenizer_path: A[
+        Optional[str],
+        "The path of the tokenizer: a local folder, repo ID, hf://owner/repo, "
+        "or modelscope://owner/repo. Defaults to the model path.",
+    ] = None
     tokenizer_mode: A[
         str,
         Arg(

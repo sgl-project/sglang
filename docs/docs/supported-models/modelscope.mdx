@@ -27,3 +27,31 @@ docker run --gpus all \
 ```
 
 Note that modelscope uses a different cache directory than huggingface. You may need to set it manually to avoid running out of disk space.
+
+## Select a source for each model
+
+You can use `hf://owner/repo` or `modelscope://owner/repo` with
+`--model-path`, `--tokenizer-path`, and `--speculative-draft-model-path`.
+Each prefix selects that repository's source independently of
+`SGLANG_USE_MODELSCOPE`, so the target and draft can come from different Hubs:
+
+```bash
+sglang serve \
+    --model-path modelscope://LLM-Research/Meta-Llama-3.1-8B-Instruct \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path hf://lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B
+```
+
+Use the repository ID published by the selected Hub; the same weights can have
+different IDs on Hugging Face and ModelScope.
+
+The prefixes also work with `python -m sglang.launch_server` and Python `Engine`
+arguments. Omitted tokenizers use the target checkpoint; the default served
+model name is the target's `owner/repo`.
+
+Only repository roots are supported. Select versions with `--revision` or
+`--speculative-draft-model-revision`, not within the prefixed path. Each SDK
+handles authentication and caching (`--download-dir`); failed downloads do not
+switch Hubs. ModelScope sources require the `modelscope` package.
+
+Unprefixed IDs, local paths, and existing remote-storage URLs are unchanged.
