@@ -452,6 +452,19 @@ class KVCacheConfigurator:
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 
+        disagg = get_disagg()
+        if (
+            self.draft_mla_rows_are_physical
+            and disagg.disaggregation_mode != "null"
+            and disagg.disaggregation_transfer_backend == "mori"
+        ):
+            # MoRI still maps draft rows into the widened layout, which overruns
+            # a collapsed pool; Mooncake and NIXL carry the collapsed mapping.
+            raise ValueError(
+                "PD transfer of an MLA draft under DCP is not supported with "
+                "--disaggregation-transfer-backend mori; use mooncake or nixl."
+            )
+
         sizes = self._derive_pool_sizes(config=config)
 
         pools = self._init_pools(

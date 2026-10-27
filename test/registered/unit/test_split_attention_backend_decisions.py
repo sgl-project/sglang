@@ -235,11 +235,10 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mha")
 
     def test_cutedsl_draft_extend_stamps_the_effective_kernel(self):
-        # cutedsl_mla only supports decode; the draft-extend map builds the
-        # trtllm-mla backend, and the *constructor* answers the effective
-        # name, so the stamp says what actually runs with no rename table --
-        # and the conv-sidecar wrapper that enters the ForwardContext must
-        # answer with the wrapped backend's stamp.
+        # The *constructor* answers the effective name, so the stamp says what
+        # actually runs with no rename table -- and the conv-sidecar wrapper
+        # that enters the ForwardContext must answer with the wrapped
+        # backend's stamp.
         from types import SimpleNamespace
         from unittest import mock
 
@@ -248,7 +247,7 @@ class TestDraftFactoryStamping(CustomTestCase):
         self._publish(attention_backend="triton")
         factory = self._factory(draft_backend="cutedsl_mla")
         built = SimpleNamespace()
-        factory._create_trtllm_mla_prefill_backend = lambda: ("trtllm_mla", built)
+        factory._create_cutedsl_mla_prefill_backend = lambda: ("cutedsl_mla", built)
         wrapper = SimpleNamespace()
         with mock.patch.object(
             attention_registry,
@@ -257,9 +256,9 @@ class TestDraftFactoryStamping(CustomTestCase):
         ):
             product = factory.create_draft_extend_backend()
         self.assertIs(product, wrapper)
-        self.assertEqual(built.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.decode_attention_backend_str, "trtllm_mla")
+        self.assertEqual(built.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.decode_attention_backend_str, "cutedsl_mla")
 
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
         # `hybrid_linear_attn` picks fa3/intel_amx/triton by host inside its
