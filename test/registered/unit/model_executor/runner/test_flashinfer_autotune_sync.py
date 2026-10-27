@@ -197,6 +197,8 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
+                    max_prefill_buffer_tokens=lambda: 4096,
+                    get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
                 ),
                 patch.object(autotune.datetime, "datetime") as clock,
                 patch.object(
@@ -414,6 +416,13 @@ class TestAutotuneCachePhases(CustomTestCase):
                         moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
                     ),
                 ),
+                patch.object(autotune, "max_prefill_buffer_tokens", return_value=4096),
+                patch.object(
+                    autotune,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode="null"),
+                ),
+                patch("sglang.srt.layers.dp_attention.dp_gather_width", return_value=1),
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
                 get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
             ):
@@ -423,6 +432,7 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 # No profiling: this models a restart that loads tactics from disk.
                 self.assertFalse(tuner.profiling_cache)
+                runner.is_draft_worker = True
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
                     pass
                 saved = json.loads(draft.read_text())
