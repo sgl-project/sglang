@@ -306,38 +306,38 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc = self._build(ps=ps)
             v = alloc.alloc(3 * ps)
             self.assertIsNotNone(v)
-            v2p = alloc.virtual_to_physical
+            v2p = alloc.ids.virtual_to_physical
             want = v2p[v // ps] * ps + v % ps
-            self.assertTrue(torch.equal(alloc.translate_kv_loc(v), want), f"ps={ps}")
+            self.assertTrue(torch.equal(alloc.ids.translate(v), want), f"ps={ps}")
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
         # never-allocated virtual ids -> v2p == -1 -> id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        self.assertTrue(torch.all(alloc.translate_kv_loc(virt) == 0))
+        self.assertTrue(torch.all(alloc.ids.translate(virt) == 0))
 
     def test_out_matches_and_aliases(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(2 * ps)
             self.assertIsNotNone(v)
-            no_out = alloc.translate_kv_loc(v)
+            no_out = alloc.ids.translate(v)
             out = torch.empty_like(v)
-            ret = alloc.translate_kv_loc(v, out=out)
+            ret = alloc.ids.translate(v, out=out)
             self.assertIs(ret, out)
             self.assertTrue(torch.all(out == no_out))
             # canonical in-place aliasing: translate(x, out=x)
             x = v.clone()
-            alloc.translate_kv_loc(x, out=x)
+            alloc.ids.translate(x, out=x)
             self.assertTrue(torch.all(x == no_out))
 
     def test_padding_loc_lands_on_the_sink(self):
         """A padded read table carries -1 in the slots a shorter sequence does
-        not use; `translate_kv_loc` resolves it to 0, the sink."""
+        not use; `UnitIds.translate` resolves it to 0, the sink."""
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            got = alloc.translate_kv_loc(torch.tensor([-1], dtype=torch.int64))
+            got = alloc.ids.translate(torch.tensor([-1], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_a_loc_past_the_sentinel_lands_on_the_sink(self):
@@ -347,8 +347,8 @@ class TestTranslateKvLoc(unittest.TestCase):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            alloc.virtual_to_physical[-2] = 7  # bind the last real page
-            got = alloc.translate_kv_loc(torch.tensor([-(ps + 1)], dtype=torch.int64))
+            alloc.ids.virtual_to_physical[-2] = 7  # bind the last real page
+            got = alloc.ids.translate(torch.tensor([-(ps + 1)], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_an_out_of_range_loc_lands_on_the_sink(self):
@@ -357,8 +357,8 @@ class TestTranslateKvLoc(unittest.TestCase):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            past = int(alloc.virtual_to_physical.numel()) * ps * 4
-            got = alloc.translate_kv_loc(torch.tensor([past], dtype=torch.int64))
+            past = int(alloc.ids.virtual_to_physical.numel()) * ps * 4
+            got = alloc.ids.translate(torch.tensor([past], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_translate_accepts_a_strided_page_table(self):
@@ -368,12 +368,12 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc = self._build(ps=ps)
             v = alloc.alloc(4 * ps)
             self.assertIsNotNone(v)
-            want = alloc.translate_kv_loc(v)
+            want = alloc.ids.translate(v)
             backing = torch.full((2, 2 * v.numel()), -1, dtype=torch.int64)
             view = backing[:, : v.numel() // 2]
             view.copy_(v.view(2, -1))
             self.assertFalse(view.is_contiguous())
-            got = alloc.translate_kv_loc(view)
+            got = alloc.ids.translate(view)
             self.assertEqual(got.shape, view.shape)
             self.assertTrue(torch.equal(got.reshape(-1), want))
 
@@ -417,7 +417,7 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         virtual = alloc.alloc(4)
         self.assertIsNotNone(virtual)
         virtual = virtual.to(torch.int64)
-        physical = alloc.full_attn_allocator.translate_kv_loc(virtual)
+        physical = alloc.full_attn_allocator.ids.translate(virtual)
         # Not identity here, so a delegate that passed the virtual ids straight
         # through would read and restore other tokens' rows.
         self.assertFalse(torch.equal(physical, virtual))

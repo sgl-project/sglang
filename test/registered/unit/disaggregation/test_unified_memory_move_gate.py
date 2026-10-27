@@ -238,7 +238,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         with get_parallel().override(attn_dcp_size=1):
             alloc = object.__new__(ChainAllocator)
             alloc.full_attn_allocator = SimpleNamespace(
-                translate_kv_loc=lambda ids: ids + 16, shards_under_dcp=True
+                ids=SimpleNamespace(translate=lambda ids: ids + 16),
+                shards_under_dcp=True,
             )
             physical = alloc.translate_kv_indices_for_transfer(virtual)
         self.assertEqual(physical.dtype, torch.int64)
@@ -377,10 +378,10 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         with get_parallel().override(attn_dcp_size=1):
             alloc = object.__new__(ChainAllocator)
             alloc.full_attn_allocator = SimpleNamespace(
-                translate_kv_loc=lambda ids: ids + 16
+                ids=SimpleNamespace(translate=lambda ids: ids + 16)
             )
             alloc.swa_attn_allocator = SimpleNamespace(
-                translate_kv_loc=lambda ids: ids + 32,
+                ids=SimpleNamespace(translate=lambda ids: ids + 32),
             )
             physical = alloc.translate_swa_indices_for_transfer(virtual)
         self.assertEqual(physical.dtype, torch.int64)

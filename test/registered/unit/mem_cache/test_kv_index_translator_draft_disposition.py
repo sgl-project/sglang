@@ -187,7 +187,9 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         src.bind_own_plan(fb)
         self.assertIsNot(fb.out_cache_loc, v)
         fa = allocator.full_attn_allocator
-        expected = torch.clamp_min(fa.virtual_to_physical[v // _PS] * _PS + v % _PS, 0)
+        expected = torch.clamp_min(
+            fa.ids.virtual_to_physical[v // _PS] * _PS + v % _PS, 0
+        )
         torch.testing.assert_close(fb.out_cache_loc, expected, rtol=0, atol=0)
         self.assertTrue(torch.equal(fb.out_cache_loc, allocator.translate_kv_loc(v)))
         # A dense draft pool routes no window layers: no swa write loc.

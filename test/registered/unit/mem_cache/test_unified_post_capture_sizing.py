@@ -85,7 +85,7 @@ def _capacities(bundle) -> dict:
         out[f"{name}.max_slots"] = shared.num_entries(name)
         out[f"{name}.sub.max_slots"] = sub.max_slots
         out[f"{name}.sub.num_pages"] = sub.num_pages
-        out[f"{name}.sub.num_virtual_ids"] = sub.num_virtual_ids
+        out[f"{name}.sub.ids.num_virtual_ids"] = sub.ids.num_virtual_ids
         out[f"{name}.sub.available_size"] = sub.available_size()
         out[f"{name}.pool.size"] = pool.size
         out[f"{name}.pool.host_capacity_tokens"] = pool.host_capacity_tokens
@@ -119,7 +119,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         tables = [
             table
             for sub in (allocator.full_attn_allocator, allocator.swa_attn_allocator)
-            for table in (sub.virtual_to_physical, sub.physical_to_virtual)
+            for table in (sub.ids.virtual_to_physical, sub.ids.physical_to_virtual)
         ]
         table_ptrs = [table.data_ptr() for table in tables]
 

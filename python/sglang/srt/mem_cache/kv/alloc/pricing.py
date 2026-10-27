@@ -131,7 +131,7 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band._byte_high_frontier(),
         # Only the id owner mints virtual pages; a window binds the owner's.
         0 if free_virtual_ids is None else free_virtual_ids.numel(),
-        band.num_virtual_ids,
+        band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
     )

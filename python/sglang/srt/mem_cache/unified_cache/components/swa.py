@@ -290,7 +290,7 @@ class SWAComponent(TreeComponent):
         """
         swa = allocator.swa_attn_allocator
         kept_pages, incoming_pages = self._page_pairs(full_value, incoming_full_value)
-        physical = swa.virtual_to_physical[incoming_pages]
+        physical = swa.ids.virtual_to_physical[incoming_pages]
         # `> 0` strict: -1 = tombstoned, 0 = the padding sink. The incoming ids
         # were just allocated by the in-flight request, so every page must be
         # live; a violation means we would hand the node the sink and serve
@@ -298,8 +298,8 @@ class SWAComponent(TreeComponent):
         assert bool((physical > 0).all()), (
             f"incoming swa pages must all be live, got {physical.tolist()}"
         )
-        swa.bind(kept_pages, physical)
-        swa.virtual_to_physical.index_fill_(0, incoming_pages, -1)
+        swa.ids.bind(kept_pages, physical)
+        swa.ids.virtual_to_physical.index_fill_(0, incoming_pages, -1)
         swa.clear_inverse_history()
 
     def _set_swa(

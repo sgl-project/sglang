@@ -224,7 +224,7 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         )
 
     def _phys_pages(self, allocator, virt_tokens):
-        return (allocator.translate_kv_loc(virt_tokens) // allocator.page_size).unique()
+        return (allocator.ids.translate(virt_tokens) // allocator.page_size).unique()
 
     def test_fresh_and_recycled_pages_zeroed(self):
         buf, kvcache, allocator = self.build("cuda")
@@ -289,7 +289,7 @@ class TestTriPoolSWAHandoutZeroing(unittest.TestCase):
             buf.raw.view(torch.int16).fill_(BF16_NAN)
             out = allocator.alloc(16)
             self.assertIsNotNone(out)
-            pages = (sa.translate_kv_loc(out) // sa.page_size).unique()
+            pages = (sa.ids.translate(out) // sa.page_size).unique()
             self.assertTrue((env[pages] == 0).all().item())
             allocator.free(out)
 
@@ -320,7 +320,7 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
             req_to_token=ids.to(torch.int32).view(1, -1),
             req_pool_indices=torch.tensor([0], device=dev),
             seq_lens=torch.tensor([4 * ps], device=dev),
-            v2p=alloc.swa_attn_allocator.virtual_to_physical,
+            v2p=alloc.swa_attn_allocator.ids.virtual_to_physical,
             page_size=ps,
             max_pages=4,
             out=table,

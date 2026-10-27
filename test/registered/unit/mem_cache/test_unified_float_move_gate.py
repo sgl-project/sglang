@@ -59,9 +59,9 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         (a.full_attn_allocator, kv.full_kv_pool.buf),
         (a.swa_attn_allocator, kv.swa_kv_pool.buf),
     ]:
-        ids = member.translate_kv_loc(slots)
+        ids = member.ids.translate(slots)
         buf[ids] = slots
-    mk.buf[a.mamba_allocator.virtual_to_physical[states]] = states + 1000
+    mk.buf[a.mamba_allocator.ids.virtual_to_physical[states]] = states + 1000
     victims = {
         "none": [],
         "paired": [0, 4, 25],
@@ -96,8 +96,8 @@ def snapshot(a):
             x._byte_low_frontier(),
             x._byte_high_frontier(),
             x._free_phys_pages.tolist(),
-            x.virtual_to_physical.tolist(),
-            x.physical_to_virtual.tolist(),
+            x.ids.virtual_to_physical.tolist(),
+            x.ids.physical_to_virtual.tolist(),
             x.live_page_count,
             [(id(e), v[0]) for e, v in x._pending_reuse.items()],
         )
@@ -112,13 +112,13 @@ def payload(a, kv, mk):
         (a.swa_attn_allocator, kv.swa_kv_pool.buf, 0),
         (a.mamba_allocator, mk.buf, 1000),
     ]:
-        ids = torch.where(member.virtual_to_physical >= member.min_page_index)[0]
+        ids = torch.where(member.ids.virtual_to_physical >= member.min_page_index)[0]
         ids = ids[ids >= member.min_page_index]
         tokens = (
             ids[:, None] * member.page_size + torch.arange(member.page_size)[None, :]
         ).flatten()
         result.append(
-            (member, buf, tokens.clone(), buf[member.translate_kv_loc(tokens)].clone())
+            (member, buf, tokens.clone(), buf[member.ids.translate(tokens)].clone())
         )
     return result
 
@@ -128,11 +128,11 @@ class TestFloatMovementGate(CustomTestCase):
         for member, buf, ids, values in saved:
             self.assertTrue(
                 torch.all(
-                    member.virtual_to_physical[ids // member.page_size]
+                    member.ids.virtual_to_physical[ids // member.page_size]
                     >= member.min_page_index
                 )
             )
-            torch.testing.assert_close(buf[member.translate_kv_loc(ids)], values)
+            torch.testing.assert_close(buf[member.ids.translate(ids)], values)
         self.assertFalse(a.verify_byte_accounting())
 
     def test_float_movement_owners_respect_gate(self):

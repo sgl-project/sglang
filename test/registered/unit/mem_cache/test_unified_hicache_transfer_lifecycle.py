@@ -124,7 +124,7 @@ class _Rows:
         self.swa = bundle.token_to_kv_pool.layer_router.view("swa").get_key_buffer(0)
 
     def full_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.full_attn_allocator.translate_kv_loc(ids.to(torch.int64))
+        return self.allocator.full_attn_allocator.ids.translate(ids.to(torch.int64))
 
     def swa_rows(self, ids: torch.Tensor) -> torch.Tensor:
         return self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(ids)

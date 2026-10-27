@@ -574,10 +574,10 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         )
         # Move the cached prefix: rebind its virtual ids to other physical
         # units, as compaction does.
-        band = allocator.full_attn_allocator
-        physical = band.translate_kv_loc(prefix)
-        band.bind(prefix, physical.flip(0))
-        moved = band.translate_kv_loc(prefix)
+        ids = allocator.full_attn_allocator.ids
+        physical = ids.translate(prefix)
+        ids.bind(prefix, physical.flip(0))
+        moved = ids.translate(prefix)
         self.assertFalse(torch.equal(moved, req.req_to_token[0]))
 
         draft_pool = bound.token_to_kv_pool

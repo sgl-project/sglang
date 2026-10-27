@@ -15,10 +15,11 @@
 
 A band places its sub-pool's units in its stretch of the arena's bytes: an end
 grows from one end of the arena toward the other, a float holds a span between
-two neighbours. It takes and frees physical units, binds them to the virtual
-units its sub-pool names (the owner mints those; a window binds the owner's),
-and moves units to compact or make room, lazily behind the forward that may
-still read them. Counts are in the sub-pool's tokens (`page_size` per unit).
+two neighbours. It takes and frees physical units, records which virtual unit
+each holds in its `UnitIds` (the owner mints the virtual units; a window binds
+the owner's), and moves units to compact or make room, lazily behind the
+forward that may still read them. Counts are in the sub-pool's tokens
+(`page_size` per unit).
 
 Requests are not a band's concern: the chain allocator turns a request's token
 positions into new units and hands them to its bands.
@@ -47,11 +48,10 @@ from torch.profiler import record_function
 
 from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
-    bind_inplace,
     free_unbind_inplace,
-    translate_token_ids,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 
@@ -305,7 +305,7 @@ class Band:
         # `page_size` is VIRTUAL (the scheduler, the tree cache and the alloc/free
         # surface), `pool_page_size` is the PHYSICAL rows one page occupies here.
         # `KVIndexTranslator.translate_dcp_read_ids` collapses `loc // dcp_size`
-        # before reaching `translate_kv_loc*`, so everything at or below the v2p
+        # before reaching `UnitIds.translate`, so everything at or below the v2p
         # table -- byte budget, compaction moves, translate -- stays on
         # `pool_page_size`.
         self.pool_page_size = page_size
@@ -327,21 +327,13 @@ class Band:
         assert virtual_num_pages is None or not is_id_owner, (
             "only a non-owner allocator may use another pool's virtual-id space"
         )
-        self.num_virtual_ids = (
-            self.num_pages if virtual_num_pages is None else virtual_num_pages
-        )
-        assert self.num_virtual_ids > 0, "virtual page count must be positive"
-        # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
-        self.virtual_to_physical = torch.full(
-            (self.num_virtual_ids + 1,),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.physical_to_virtual = torch.full(
-            (self.num_pages + 1,),
-            -1,
-            dtype=torch.int64,
+        self.ids = UnitIds(
+            num_virtual_ids=(
+                self.num_pages if virtual_num_pages is None else virtual_num_pages
+            ),
+            num_physical_units=self.num_pages,
+            unit_tokens=self.pool_page_size,
+            shards_under_dcp=shards_under_dcp,
             device=device,
         )
 
@@ -498,13 +490,7 @@ class Band:
     def clear(self) -> None:
         """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
         self._reset_watermarks()
-        self.virtual_to_physical.fill_(-1)
-        # Virtual page 0 <-> physical page 0 (padding sink).
-        self.virtual_to_physical[0] = 0
-        self.virtual_to_physical[-1] = -1  # trailing sentinel
-        self.physical_to_virtual.fill_(-1)
-        self.physical_to_virtual[0] = 0
-        self.physical_to_virtual[-1] = -1
+        self.ids.reset()
         if self.is_id_owner:
             self.free_virtual_ids = torch.arange(
                 self.min_page_index,
@@ -551,10 +537,7 @@ class Band:
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
-        virt_page = slot // self.page_size
-        if virt_page < 0 or virt_page >= self.num_virtual_ids:
-            return False
-        return int(self.virtual_to_physical[virt_page].item()) != -1
+        return self.ids.is_bound(slot // self.page_size)
 
     def allocator_state_str(self) -> str:
         return (
@@ -562,7 +545,7 @@ class Band:
             f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
             f"min_page_index={self.min_page_index}, "
             f"num_pages={self.num_pages}, "
-            f"num_virtual_ids={self.num_virtual_ids}, "
+            f"num_virtual_ids={self.ids.num_virtual_ids}, "
             f"watermark_physical={self.watermark_physical}, "
             f"allocated_pages={self._allocated_pages()}"
         )
@@ -956,16 +939,6 @@ class Band:
         self._free_phys_sorted = rest
         return taken
 
-    def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
-        """Bind page-granular virtual ids to physical ids."""
-        with record_function("Band.bind"):
-            bind_inplace(
-                virtual_ids,
-                physical_ids,
-                self.virtual_to_physical,
-                self.physical_to_virtual,
-            )
-
     # -- fused take_physical_pages + bind --
 
     def place_pages(self, v_pages: torch.Tensor, N: int) -> Optional[torch.Tensor]:
@@ -1007,8 +980,8 @@ class Band:
 
                 phys_pages = alloc_bind_inplace(
                     v_pages,
-                    self.virtual_to_physical,
-                    self.physical_to_virtual,
+                    self.ids.virtual_to_physical,
+                    self.ids.physical_to_virtual,
                     start_phys,
                 )
 
@@ -1021,7 +994,7 @@ class Band:
             phys_pages = self.take_physical_pages(N)
             if phys_pages is None:
                 return None
-            self.bind(v_pages, phys_pages)
+            self.ids.bind(v_pages, phys_pages)
             self._maybe_zero_pages(phys_pages)
             return phys_pages
 
@@ -1036,77 +1009,6 @@ class Band:
             return
         with record_function("Band._maybe_zero_pages"):
             self.arena.zero_units(self.sub_pool_name, phys_pages)
-
-    # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
-
-    def translate_kv_loc(
-        self,
-        virt_tokens: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Virtual token ids -> physical token ids, the ids kernels index the
-        per-layer views with:
-
-            physical(t) = v2p[t // ps] * ps + t % ps
-
-        Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
-        `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
-        `pool_page_size`. An unmapped, out-of-range or negative id resolves to
-        0, the page-0 sink every kernel skips. ``out=`` writes in-place into a
-        caller-owned buffer, required under cuda-graph capture: the captured
-        graph records the gather against a fixed ``data_ptr``. int64 out; a
-        consumer whose kernel ABI wants int32 narrows where it fills that
-        buffer.
-        """
-        with record_function("Band.translate_kv_loc"):
-            return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
-
-    def _translate_loc_fused(
-        self,
-        loc: torch.Tensor,
-        *,
-        dcp_size: int,
-        dcp_rank: int = 0,
-        out: Optional[torch.Tensor] = None,
-        out_width: Optional[int] = None,
-    ) -> torch.Tensor:
-        """One launch for the read and write conversions alike; see
-        `translate_token_ids`, which owns the `out=` dtype and shape
-        contract for both."""
-        return translate_token_ids(
-            loc=loc,
-            v2p=self.virtual_to_physical,
-            page_size=self.pool_page_size,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
-            out=out,
-            out_width=out_width,
-        )
-
-    def translate_write_loc(
-        self,
-        widened_loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-        out_width: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Widened virtual WRITE loc (`out_cache_loc`) -> physical id.
-
-        Reads arrive already DCP-collapsed, but `out_cache_loc` does not: it still
-        carries the owner rule in `loc % dcp_size`. Ids this rank does not own go
-        to id 0, the padding sink every write kernel skips.
-        """
-        parallel = get_parallel()
-        dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
-        with record_function("Band.translate_write_loc"):
-            return self._translate_loc_fused(
-                widened_loc,
-                dcp_size=dcp_size,
-                dcp_rank=parallel.attn_dcp_rank,
-                out=out,
-                out_width=out_width,
-            )
 
     # -- alloc --
 
@@ -1198,14 +1100,14 @@ class Band:
                         free_index.detach().to(torch.int64) // self.page_size
                     )
                 )
-                freed_p_pages = self.virtual_to_physical[free_v_pages]
+                freed_p_pages = self.ids.virtual_to_physical[free_v_pages]
             with record_function("Band.free.sync_check"):
                 # `.item()` forces a CPU/GPU sync -- own trace region to measure it.
                 if bool((freed_p_pages < 0).any().item()):
                     self._raise_stale_slot_assertion(
                         free_v=free_v_pages, freed_p=freed_p_pages
                     )
-            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
+            self.ids.virtual_to_physical.index_fill_(0, free_v_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
@@ -1261,7 +1163,7 @@ class Band:
             # scalar `t[idx] = -1` form: it materialises -1 on the CPU and blocks
             # the scheduler on a pageable H2D copy (~16 ms per 8192-token free).
             freed_p_pages = free_unbind_inplace(
-                free_v_pages, self.virtual_to_physical, self.physical_to_virtual
+                free_v_pages, self.ids.virtual_to_physical, self.ids.physical_to_virtual
             )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
@@ -1348,9 +1250,9 @@ class Band:
             # `dst` holes are outside the vacated band by construction, so
             # rebinding them before the band wipe is order-equivalent.
             self._move_pages_and_rebind(src_pages, dst_pages)
-            self.physical_to_virtual[vacated_lo:vacated_hi] = -1
+            self.ids.physical_to_virtual[vacated_lo:vacated_hi] = -1
         else:
-            self.physical_to_virtual[vacated_lo:vacated_hi] = -1
+            self.ids.physical_to_virtual[vacated_lo:vacated_hi] = -1
 
     def _move_pages_and_rebind(
         self, src_pages: torch.Tensor, dst_pages: torch.Tensor
@@ -1362,10 +1264,10 @@ class Band:
         assert not self.moves_blocked(), (
             f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
-        v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
+        v_moved = self.ids.physical_to_virtual[src_pages].clone()  # read pre-wipe
         self._move_pages(src_pages, dst_pages)
-        self.virtual_to_physical[v_moved] = dst_pages
-        self.physical_to_virtual[dst_pages] = v_moved
+        self.ids.virtual_to_physical[v_moved] = dst_pages
+        self.ids.physical_to_virtual[dst_pages] = v_moved
         self._inverse_history.append((src_pages, dst_pages, v_moved))
         return v_moved
 
@@ -1466,7 +1368,7 @@ class Band:
             dcp_size = get_parallel().attn_dcp_size if self.shards_under_dcp else 1
             if dcp_size > 1:
                 oclv = oclv // dcp_size
-            phys_tokens = self.translate_kv_loc(oclv)
+            phys_tokens = self.ids.translate(oclv)
             if self.pool_page_size > 1:
                 phys_pages = (phys_tokens // self.pool_page_size).unique()
             else:
@@ -1845,7 +1747,7 @@ class Band:
         with record_function("Band._commit_move_batch"):
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
             dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
-            v_moveds_t = self.physical_to_virtual[src_pages_t]
+            v_moveds_t = self.ids.physical_to_virtual[src_pages_t]
             torch._assert_async(
                 (v_moveds_t >= 0).all(),
                 "invalid p2v mapping in Band._flush",
@@ -1853,9 +1755,9 @@ class Band:
             self._move_pages(src_pages_t, dst_pages_t)
             # ONE bulk remap (single-writer on schedule_stream), issued after the
             # copies on the same stream: work ordered after it sees moved pages.
-            self.virtual_to_physical[v_moveds_t] = dst_pages_t
-            self.physical_to_virtual[dst_pages_t] = v_moveds_t
-            self.physical_to_virtual.index_fill_(0, src_pages_t, -1)
+            self.ids.virtual_to_physical[v_moveds_t] = dst_pages_t
+            self.ids.physical_to_virtual[dst_pages_t] = v_moveds_t
+            self.ids.physical_to_virtual.index_fill_(0, src_pages_t, -1)
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
             # Src disposition. `src_pages_t` is reused as the `_pending_reuse` GPU
             # tensor (no second H2D at drain).
@@ -1925,7 +1827,7 @@ class Band:
             num_pages if virtual_num_pages is None else int(virtual_num_pages)
         )
         self.num_pages = num_pages
-        self.num_virtual_ids = num_virtual_ids
+        self.ids.num_virtual_ids = num_virtual_ids
         self.max_slots = num_pages * self.page_size
         self.size = self.max_slots
         self.clear()
@@ -2006,10 +1908,10 @@ class Band:
         self._wait_hicache_transfers()
         if self.forward_stream is not None and not self.lazy_compaction:
             torch.cuda.current_stream().wait_stream(self.forward_stream)
-        virtual_pages = self.physical_to_virtual[physical_pages]
+        virtual_pages = self.ids.physical_to_virtual[physical_pages]
         bound_mask = virtual_pages >= 0
-        self.virtual_to_physical.index_fill_(0, virtual_pages[bound_mask], -1)
-        self.physical_to_virtual.index_fill_(0, physical_pages, -1)
+        self.ids.virtual_to_physical.index_fill_(0, virtual_pages[bound_mask], -1)
+        self.ids.physical_to_virtual.index_fill_(0, physical_pages, -1)
         if self.lazy_compaction:
             self._free_phys_pages = torch.cat([self._free_phys_pages, physical_pages])
             self.live_page_count -= int(physical_pages.shape[0])
@@ -2283,7 +2185,7 @@ class FloatBand(Band):
         phys_pages = self.take_physical_pages(N)
         if phys_pages is None:
             return None
-        self.bind(v_pages, phys_pages)
+        self.ids.bind(v_pages, phys_pages)
         self._maybe_zero_pages(phys_pages)
         return phys_pages
 
@@ -2320,8 +2222,8 @@ class FloatBand(Band):
             # three separate launches on each sliding-window retirement.
             freed_p_pages = free_unbind_inplace(
                 free_v_pages.contiguous(),
-                self.virtual_to_physical,
-                self.physical_to_virtual,
+                self.ids.virtual_to_physical,
+                self.ids.physical_to_virtual,
             )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
@@ -2340,10 +2242,10 @@ class FloatBand(Band):
             free_index.detach().to(torch.int64)[:: self.page_size] // self.page_size
         )
         self._wait_hicache_transfers()
-        virtual_pages = self.physical_to_virtual[physical_pages]
+        virtual_pages = self.ids.physical_to_virtual[physical_pages]
         bound_pages = virtual_pages[virtual_pages >= 0]
-        self.virtual_to_physical.index_fill_(0, bound_pages, -1)
-        self.physical_to_virtual.index_fill_(0, physical_pages, -1)
+        self.ids.virtual_to_physical.index_fill_(0, bound_pages, -1)
+        self.ids.physical_to_virtual.index_fill_(0, physical_pages, -1)
         self._free_phys_pages = torch.cat([self._free_phys_pages, physical_pages])
         self._holes_dirty = True
         self._park_if_empty()
@@ -2481,7 +2383,7 @@ class FloatBand(Band):
                 torch.tensor(srcs, dtype=torch.int64, device=self.device),
                 torch.tensor(dsts, dtype=torch.int64, device=self.device),
             )
-            self.physical_to_virtual.index_fill_(
+            self.ids.physical_to_virtual.index_fill_(
                 0, torch.tensor(srcs, dtype=torch.int64, device=self.device), -1
             )
 
@@ -2524,7 +2426,7 @@ class FloatBand(Band):
                     [d for _, d in pairs], dtype=torch.int64, device=self.device
                 )
                 self._move_pages_and_rebind(src_t, dst_t)
-                self.physical_to_virtual.index_fill_(0, src_t, -1)
+                self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
             else:
                 # Overlapping shift: process toward the move direction so each
                 # destination is free by the time it is written.
@@ -2540,7 +2442,7 @@ class FloatBand(Band):
                 for i in range(len(ordered)):
                     s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
                     self._move_pages_and_rebind(s_t, d_t)
-                    self.physical_to_virtual.index_fill_(0, s_t, -1)
+                    self.ids.physical_to_virtual.index_fill_(0, s_t, -1)
         if final:
             self.low_wm_page = final[0]
             self.high_wm_page = final[-1] + 1
@@ -2562,7 +2464,10 @@ class FloatBand(Band):
         # as span - holes, so checking against it would be circular.
         if self._span_pages() > 0:
             bound = int(
-                (self.physical_to_virtual[self.low_wm_page : self.high_wm_page] != -1)
+                (
+                    self.ids.physical_to_virtual[self.low_wm_page : self.high_wm_page]
+                    != -1
+                )
                 .sum()
                 .item()
             )

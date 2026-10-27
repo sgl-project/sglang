@@ -114,8 +114,8 @@ class TestUnifiedTriPool(unittest.TestCase):
     def _stamp(self, allocator, kvcache, v):
         fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
-        kvcache.full_kv_pool.buf[fa.virtual_to_physical[v]] = v
-        kvcache.swa_kv_pool.buf[sa.virtual_to_physical[v]] = v
+        kvcache.full_kv_pool.buf[fa.ids.virtual_to_physical[v]] = v
+        kvcache.swa_kv_pool.buf[sa.ids.virtual_to_physical[v]] = v
 
     # -- construction --
 
@@ -243,7 +243,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         `free_swa` on it holes; a boundary block would be absorbed instead."""
         sa = allocator.swa_attn_allocator
         for v in blocks:
-            pages = set(int(x) for x in sa.virtual_to_physical[v].tolist())
+            pages = set(int(x) for x in sa.ids.virtual_to_physical[v].tolist())
             if sa.low_wm_page not in pages and (sa.high_wm_page - 1) not in pages:
                 return v
         raise AssertionError("no interior block in layout")
@@ -262,8 +262,8 @@ class TestUnifiedTriPool(unittest.TestCase):
         v_mid = self._swa_interior_block(allocator, blocks)
         allocator.free_swa(v_mid)
         # The full side keeps the token; the swa side tombstoned it.
-        self.assertTrue(bool((fa.virtual_to_physical[v_mid] >= 0).all()))
-        self.assertTrue(bool((sa.virtual_to_physical[v_mid] == -1).all()))
+        self.assertTrue(bool((fa.ids.virtual_to_physical[v_mid] >= 0).all()))
+        self.assertTrue(bool((sa.ids.virtual_to_physical[v_mid] == -1).all()))
         self.assertEqual(sa._hole_pages(), 4)
         self.assertEqual((sa.low_wm_page, sa.high_wm_page), span_before)
 
@@ -288,7 +288,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         # Pick a block holding a span-boundary page.
         boundary = None
         for v in blocks:
-            pages = set(int(x) for x in sa.virtual_to_physical[v].tolist())
+            pages = set(int(x) for x in sa.ids.virtual_to_physical[v].tolist())
             if sa.low_wm_page in pages or (sa.high_wm_page - 1) in pages:
                 boundary = v
                 break
@@ -307,8 +307,8 @@ class TestUnifiedTriPool(unittest.TestCase):
         allocator.free(va)  # then the request finishes
         fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
-        self.assertTrue(bool((fa.virtual_to_physical[va] == -1).all()))
-        self.assertTrue(bool((sa.virtual_to_physical[va] == -1).all()))
+        self.assertTrue(bool((fa.ids.virtual_to_physical[va] == -1).all()))
+        self.assertTrue(bool((sa.ids.virtual_to_physical[va] == -1).all()))
         # Fully-freed float parks and is transparent again.
         self.assertTrue(sa._is_frontier_transparent())
 
@@ -578,8 +578,8 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         a2.free_swa(v2[: 4 * self.PS])
         self.assertTrue(
             torch.equal(
-                a1.swa_attn_allocator.virtual_to_physical,
-                a2.swa_attn_allocator.virtual_to_physical,
+                a1.swa_attn_allocator.ids.virtual_to_physical,
+                a2.swa_attn_allocator.ids.virtual_to_physical,
             )
         )
         self.assertEqual(a1.available_size(), a2.available_size())
@@ -1551,10 +1551,10 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
                             fa = alloc.full_attn_allocator
                             sa = alloc.swa_attn_allocator
                             self.assertTrue(
-                                bool((fa.virtual_to_physical[out] >= 0).all())
+                                bool((fa.ids.virtual_to_physical[out] >= 0).all())
                             )
                             self.assertTrue(
-                                bool((sa.virtual_to_physical[out] >= 0).all())
+                                bool((sa.ids.virtual_to_physical[out] >= 0).all())
                             )
 
     def test_available_size_never_exceeds_the_float_page_grid(self):

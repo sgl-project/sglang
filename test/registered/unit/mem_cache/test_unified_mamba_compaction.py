@@ -51,10 +51,10 @@ class TestMambaCompaction(CustomTestCase):
         alloc.bind_peer(full)
         full.bind_peer(alloc)
         full_ids = full.alloc(4).clone()
-        full_pages = full.virtual_to_physical[full_ids].cpu().tolist()
+        full_pages = full.ids.virtual_to_physical[full_ids].cpu().tolist()
         ids = alloc.alloc(count).clone()
-        ids = ids[torch.argsort(alloc.virtual_to_physical[ids])]
-        original_pages = alloc.virtual_to_physical[ids].cpu().tolist()
+        ids = ids[torch.argsort(alloc.ids.virtual_to_physical[ids])]
+        original_pages = alloc.ids.virtual_to_physical[ids].cpu().tolist()
         # Independent, byte-varying reference. Keep floating values finite for COW.
         gen = torch.Generator().manual_seed(42137)
         raw = torch.randint(0, 64, pool.raw.shape, dtype=torch.uint8, generator=gen)
@@ -85,7 +85,7 @@ class TestMambaCompaction(CustomTestCase):
 
     def _verify(self, f, freed):
         raw = f.pool.raw.cpu()
-        current = f.alloc.virtual_to_physical[f.ids].cpu().tolist()
+        current = f.alloc.ids.virtual_to_physical[f.ids].cpu().tolist()
         expected_pairs = set()
         for i, (v, old, new) in enumerate(
             zip(f.ids.cpu().tolist(), f.original_pages, current)
@@ -101,7 +101,7 @@ class TestMambaCompaction(CustomTestCase):
                     raw[new * n : (new + 1) * n], f.raw[old * n : (old + 1) * n]
                 )
             )
-            self.assertEqual(int(f.alloc.physical_to_virtual[new]), v)
+            self.assertEqual(int(f.alloc.ids.physical_to_virtual[new]), v)
         self.assertTrue(
             torch.equal(raw[: f.spec.entry_bytes()], f.raw[: f.spec.entry_bytes()])
         )
@@ -142,8 +142,8 @@ class TestMambaCompaction(CustomTestCase):
         self.assertEqual(f.alloc.flush_for_allocation(), 0)
         # Ordinary COW copies whole entries after relocation.
         cow_id = f.alloc.alloc(1).clone()
-        dst = f.alloc.virtual_to_physical[cow_id]
-        src = f.alloc.virtual_to_physical[f.ids[-1:]]
+        dst = f.alloc.ids.virtual_to_physical[cow_id]
+        src = f.alloc.ids.virtual_to_physical[f.ids[-1:]]
         f.kv.copy_from(src, dst)
         state_tensors = [*f.kv.mamba_cache.conv, f.kv.mamba_cache.temporal]
         for tensor in state_tensors:
@@ -258,7 +258,7 @@ class TestMambaCompaction(CustomTestCase):
         self.assertEqual(f.move.call_count, calls)
         self._verify(f, set(range(8, 16)))
         reused = f.alloc.alloc(1).clone()
-        physical = int(f.alloc.virtual_to_physical[reused][0])
+        physical = int(f.alloc.ids.virtual_to_physical[reused][0])
         self.assertIn(physical, old_sources)
         f.pool.raw[physical * n : (physical + 1) * n].fill_(77)
         # The recycled virtual ID can be one of the freed IDs; verify only the
@@ -266,7 +266,7 @@ class TestMambaCompaction(CustomTestCase):
         for i, old in enumerate(f.original_pages):
             if 8 <= i < 16:
                 continue
-            current = int(f.alloc.virtual_to_physical[f.ids[i]])
+            current = int(f.alloc.ids.virtual_to_physical[f.ids[i]])
             self.assertTrue(
                 torch.equal(
                     f.pool.raw[current * n : (current + 1) * n].cpu(),
@@ -282,10 +282,10 @@ class TestMambaCompaction(CustomTestCase):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             observed.copy_(
-                f.kv.mamba_cache.temporal[:, f.alloc.virtual_to_physical[f.ids]]
+                f.kv.mamba_cache.temporal[:, f.alloc.ids.virtual_to_physical[f.ids]]
             )
         expected = f.kv.mamba_cache.temporal[
-            :, f.alloc.virtual_to_physical[f.ids]
+            :, f.alloc.ids.virtual_to_physical[f.ids]
         ].clone()
         f.alloc.free(f.ids[8:16])
         self.assertEqual(f.alloc.flush_for_allocation(), 8)

@@ -165,7 +165,7 @@ class KVStorage:
         stream; pins keep the rows in place until the copy is acknowledged."""
         roles = self._allocator.roles
         if sub_pool == roles.owner:
-            return self._allocator.full_attn_allocator.translate_kv_loc
+            return self._allocator.full_attn_allocator.ids.translate
         if sub_pool == roles.state:
             return self._allocator.state.slots.translate
         return None

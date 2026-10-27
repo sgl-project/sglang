@@ -71,8 +71,8 @@ def _virtual_tokens_to_physical(virtual_tokens: torch.Tensor, band) -> torch.Ten
     the band does not bind yields a negative id."""
     page_size = band.page_size
     if page_size == 1:
-        return band.virtual_to_physical[virtual_tokens]
-    physical_pages = band.virtual_to_physical[virtual_tokens // page_size]
+        return band.ids.virtual_to_physical[virtual_tokens]
+    physical_pages = band.ids.virtual_to_physical[virtual_tokens // page_size]
     return physical_pages * page_size + virtual_tokens % page_size
 
 
@@ -214,7 +214,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
     ):
         owner = c.views[c.roles.owner]
         kv_cpu = owner.get_cpu_copy(
-            c.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
             req_pool_index=req_pool_index,
         )
         state_cpu = None
@@ -230,7 +230,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         kv_cpu, state_cpu = cpu_copy
         c.views[c.roles.owner].load_cpu_copy(
             kv_cpu,
-            c.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
             req_pool_index=req_pool_index,
         )
         if state_cpu is not None and mamba_indices is not None:
@@ -689,7 +689,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
         sa._set_capacity(
             c.arena.num_entries(sa.sub_pool_name),
-            virtual_num_pages=fa.num_virtual_ids,
+            virtual_num_pages=fa.ids.num_virtual_ids,
         )
         self._empty_shared_gap_bytes = fa._current_gap_bytes()
         self._size_full = fa.available_size()

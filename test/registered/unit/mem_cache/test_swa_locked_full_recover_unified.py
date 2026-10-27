@@ -193,21 +193,21 @@ class TestOwnershipTransfer(_RecoverTestBase):
         probe, allocator = self._probe()
         swa = allocator.swa_attn_allocator
         kept, incoming = self._two_ranges(allocator)
-        donated = swa.virtual_to_physical[incoming.to(torch.int64)].clone()
+        donated = swa.ids.virtual_to_physical[incoming.to(torch.int64)].clone()
 
         probe._transfer_swa_pages(allocator, kept, incoming)
 
         self.assertEqual(
-            swa.virtual_to_physical[kept.to(torch.int64)].tolist(),
+            swa.ids.virtual_to_physical[kept.to(torch.int64)].tolist(),
             donated.tolist(),
             "the node's ids must now resolve to the donated physical pages",
         )
         self.assertTrue(
-            bool((swa.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
+            bool((swa.ids.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
             "the incoming ids' swa side must be tombstoned",
         )
         self.assertEqual(
-            swa.physical_to_virtual[donated].tolist(),
+            swa.ids.physical_to_virtual[donated].tolist(),
             kept.to(torch.int64).tolist(),
             "the inverse map must follow, or a later free credits the wrong id",
         )
@@ -330,7 +330,7 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(
-            bool((swa.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
+            bool((swa.ids.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
             "the incoming ids' swa side must be tombstoned",
         )
         self.assertEqual(swa.allocated_count(), swa_live, "ownership only moved")

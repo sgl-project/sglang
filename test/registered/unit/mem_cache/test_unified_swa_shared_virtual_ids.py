@@ -88,13 +88,13 @@ class TestSharedVirtualIdSpace(unittest.TestCase):
                 owner = alloc.full_attn_allocator
                 swa = alloc.swa_attn_allocator
                 self.assertGreaterEqual(
-                    int(swa.virtual_to_physical.shape[0]),
-                    owner.num_virtual_ids + 1,
+                    int(swa.ids.virtual_to_physical.shape[0]),
+                    owner.ids.num_virtual_ids + 1,
                     "swa v2p cannot address every id the owner can mint",
                 )
                 # p2v stays this pool's own business: it is indexed by physical id.
                 self.assertEqual(
-                    int(swa.physical_to_virtual.shape[0]), swa.num_pages + 1
+                    int(swa.ids.physical_to_virtual.shape[0]), swa.num_pages + 1
                 )
 
     def test_churn_past_the_swa_page_count_binds_cleanly(self):

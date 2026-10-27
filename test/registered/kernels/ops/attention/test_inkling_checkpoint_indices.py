@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.kv.alloc.band import Band
-from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -96,7 +95,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         backend._state_ids = (
             IdSpace(key=("mamba", None))
             if static
-            else slot_id_space(allocator, owner=None)
+            else allocator.ids.slot_space((allocator.sub_pool_name, None))
         )
         backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(

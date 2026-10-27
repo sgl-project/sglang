@@ -751,7 +751,7 @@ def _member_summary(member) -> tuple:
         member.grow_direction,
         member.num_pages,
         member.min_page_index,
-        member.num_virtual_ids,
+        member.ids.num_virtual_ids,
         member.entry_bytes_per_page,
     )
 

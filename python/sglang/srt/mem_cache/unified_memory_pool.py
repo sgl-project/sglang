@@ -402,11 +402,11 @@ class UnifiedMambaSlotAllocator:
 
     def translate(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         # VIRTUAL -> PHYSICAL slot ids; page_size==1, so a direct v2p gather.
-        return self._multi_ended_allocator.virtual_to_physical[virtual_ids]
+        return self._multi_ended_allocator.ids.virtual_to_physical[virtual_ids]
 
     @property
     def virtual_to_physical(self) -> torch.Tensor:
-        return self._multi_ended_allocator.virtual_to_physical
+        return self._multi_ended_allocator.ids.virtual_to_physical
 
     # -- sizing / free-list --
 

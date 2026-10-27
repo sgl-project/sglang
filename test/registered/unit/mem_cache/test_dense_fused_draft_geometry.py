@@ -546,7 +546,7 @@ class TestFusedMLAHost(unittest.TestCase):
         )
         self.assertTrue(translator.is_translating)
         self.assertIs(
-            translator.full_v2p_table, alloc.full_attn_allocator.virtual_to_physical
+            translator.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
         )
 
     def test_draft_pool_binds_over_the_mla_host(self):

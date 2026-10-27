@@ -88,7 +88,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     for member, buf, ids, tag in _views(
                         bundle, allocator, slots, states
                     ):
-                        buf[member.translate_kv_loc(ids)] = _payload(ids, buf, tag)
+                        buf[member.ids.translate(ids)] = _payload(ids, buf, tag)
                     member = (
                         allocator.full_attn_allocator
                         if owner == "full"
@@ -117,7 +117,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         ):
                             self.assertTrue(
                                 torch.equal(
-                                    buf[current.translate_kv_loc(ids)],
+                                    buf[current.ids.translate(ids)],
                                     _payload(ids, buf, tag),
                                 ),
                                 (current.sub_pool_name, tag),
@@ -146,9 +146,9 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                             retained_states = retained_states[
                                 ~torch.isin(retained_states, drop)
                             ]
-                        before = member.virtual_to_physical.clone()
+                        before = member.ids.virtual_to_physical.clone()
                         self.assertGreater(member._flush(urgent=False), 0)
-                        after = member.virtual_to_physical
+                        after = member.ids.virtual_to_physical
                         moved = (
                             (before >= member.min_page_index)
                             & (after >= member.min_page_index)
@@ -191,14 +191,14 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         self.assertIsNotNone(fresh)
                         self.assertEqual(
                             set(
-                                member.virtual_to_physical[
+                                member.ids.virtual_to_physical[
                                     fresh // member.pool_page_size
                                 ].tolist()
                             ),
                             all_sources,
                         )
                         for current, buf, ids, tag in fresh_views:
-                            buf[current.translate_kv_loc(ids)] = _payload(
+                            buf[current.ids.translate(ids)] = _payload(
                                 ids, buf, tag, generation=1
                             )
                         assert_payload()

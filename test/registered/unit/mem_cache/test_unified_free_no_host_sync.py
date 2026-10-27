@@ -195,7 +195,7 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
         # Self-check first: a scan whose AST matching has drifted reports
         # clean on every method below.
         def _offender(self):
-            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
+            self.ids.virtual_to_physical[free_v_pages] = -1  # noqa: F821
 
         self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
 
@@ -514,8 +514,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                 a2.free_swa(v2[: 4 * self.PS])  # fallback (radix shape)
                 self.assertTrue(
                     torch.equal(
-                        a1.swa_attn_allocator.virtual_to_physical,
-                        a2.swa_attn_allocator.virtual_to_physical,
+                        a1.swa_attn_allocator.ids.virtual_to_physical,
+                        a2.swa_attn_allocator.ids.virtual_to_physical,
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())

@@ -75,19 +75,6 @@ def _wire_chain(chain: Sequence[Band]) -> None:
         high.bind_low_peer(low)
 
 
-def slot_id_space(band: Band, *, owner: Hashable) -> IdSpace:
-    """How a state band's slots are named: a request's slot id is virtual and
-    maps to its physical slot through the band's table, one slot per entry, so
-    the write is exactly a gather through ``read_v2p``, which a fused index
-    kernel can reproduce in its own launch."""
-    return IdSpace(
-        key=(band.sub_pool_name, owner),
-        write=lambda ids: band.virtual_to_physical[ids].to(torch.int32),
-        read_v2p=band.virtual_to_physical,
-        table=band.virtual_to_physical,
-    )
-
-
 def take_new_pages(
     owner: Band,
     num_new_pages: int,
@@ -199,7 +186,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 is_id_owner=False,  # binds the virtual pages the owner mints
                 page_size=page_size,
                 lazy_compaction=lazy_compaction and not floats,
-                virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
+                virtual_num_pages=self.full_attn_allocator.ids.num_virtual_ids,
                 **band,
             )
         self.mamba_allocator: Optional[Band] = None
@@ -468,54 +455,52 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Owner read path: virtual TOKEN ids -> physical TOKEN ids; an unmapped
         or negative id lands on 0, the sink. ``out=`` writes in place, for
         cuda-graph buffer stability."""
-        return self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        return self.full_attn_allocator.ids.translate(loc, out=out)
 
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the owner; kernels that build a
         block table straight from req_to_token gather through it."""
-        return self.full_attn_allocator.virtual_to_physical
+        return self.full_attn_allocator.ids.virtual_to_physical
 
     @property
     def full_p2v_page_table(self) -> torch.Tensor:
         """Page-level physical->virtual table of the owner."""
-        return self.full_attn_allocator.physical_to_virtual
+        return self.full_attn_allocator.ids.physical_to_virtual
 
     @property
     def swa_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the window."""
-        return self.swa_attn_allocator.virtual_to_physical
+        return self.swa_attn_allocator.ids.virtual_to_physical
 
     def id_spaces(self, *, defer_reads: bool = False) -> Dict[str, IdSpace]:
         """Every token sub-pool's id space, keyed by sub-pool name, in chain
         order: the owner's and each window's virtual ids map through that
-        band's page table. ``defer_reads`` keeps reads virtual (DCP selects a
-        rank's share where it builds them); writes always translate."""
+        band's unit record. ``defer_reads`` keeps reads virtual (DCP selects a
+        rank's share where it builds them); writes always translate, and only
+        the owner's write window arrives DCP-widened."""
         owner = self.full_attn_allocator
         spaces = {
-            owner.sub_pool_name: IdSpace(
-                key=(owner.sub_pool_name, id(self)),
-                # The WRITE loc is the one id that arrives DCP-widened.
-                write=self.translate_write_loc,
-                read_v2p=None if defer_reads else owner.virtual_to_physical,
-                table=owner.virtual_to_physical,
+            owner.sub_pool_name: owner.ids.token_space(
+                (owner.sub_pool_name, id(self)),
+                widened_writes=True,
+                defer_reads=defer_reads,
             )
         }
         for window in self._windows:
-            spaces[window.sub_pool_name] = IdSpace(
-                key=(window.sub_pool_name, id(self)),
-                write=window.translate_kv_loc,
-                read_v2p=None if defer_reads else window.virtual_to_physical,
-                table=window.virtual_to_physical,
+            spaces[window.sub_pool_name] = window.ids.token_space(
+                (window.sub_pool_name, id(self)),
+                widened_writes=False,
+                defer_reads=defer_reads,
             )
         return spaces
 
     def state_id_spaces(self) -> Dict[str, IdSpace]:
-        """The state band's id space (`slot_id_space`)."""
+        """The state band's id space: its slots."""
         band = self.mamba_allocator
         if band is None:
             return {}
-        return {band.sub_pool_name: slot_id_space(band, owner=id(self))}
+        return {band.sub_pool_name: band.ids.slot_space((band.sub_pool_name, id(self)))}
 
     def translate_write_loc(
         self,
@@ -524,8 +509,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> physical id; see the band's copy."""
-        return self.full_attn_allocator.translate_write_loc(
+        """Widened virtual WRITE loc -> physical id; see `UnitIds.translate_write`."""
+        return self.full_attn_allocator.ids.translate_write(
             loc, out=out, out_width=out_width
         )
 
@@ -545,14 +530,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             "support decode context parallelism: the transfer ships whole page "
             "envelopes, which hold only this rank's shard of each widened page."
         )
-        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+        return self.full_attn_allocator.ids.translate(kv_indices.to(torch.int64))
 
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> window PHYSICAL token ids for the PD transfer
         engine: the window read translate, on int64 ids."""
-        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+        return self.swa_attn_allocator.ids.translate(kv_indices.to(torch.int64))
 
     @property
     def cpu_copy_carries_mamba(self) -> bool:
@@ -904,7 +889,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # window needs the tombstone filter; the owner's ids are all bound.
             v = free_index.detach().to(torch.int64)
             for window in self._windows:
-                window_v2p_pages = window.virtual_to_physical[v // self.page_size]
+                window_v2p_pages = window.ids.virtual_to_physical[v // self.page_size]
                 # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
                 live_tokens = v[window_v2p_pages > 0]
                 if live_tokens.numel() > 0:
@@ -921,7 +906,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ps = self.page_size
         for window in self._windows:
             # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-            live = v[window.virtual_to_physical[v // ps] > 0]
+            live = v[window.ids.virtual_to_physical[v // ps] > 0]
             if live.numel() == 0:
                 continue
             if ps == 1:
@@ -949,7 +934,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
                 UNIFIED_SWA_SEGMENT_BOUND,
-                window.virtual_to_physical[v_pages] > 0,
+                window.ids.virtual_to_physical[v_pages] > 0,
                 msg="caller wants free_full_segment",
             )
         window.free(reps, _pages=v_pages)
@@ -987,7 +972,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             for window in self._windows:
                 expect(
                     UNIFIED_SWA_SEGMENT_RELEASED,
-                    window.virtual_to_physical[reps // self.page_size] <= 0,
+                    window.ids.virtual_to_physical[reps // self.page_size] <= 0,
                     msg="caller wants free_segment",
                 )
         if self.free_page_reps_group is None:
@@ -1003,7 +988,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         assert full_indices.numel() == swa_indices.numel()
         full_pages = full_indices.to(torch.int64) // self.page_size
         swa_pages = swa_indices.to(torch.int64) // self.page_size
-        self.swa_attn_allocator.bind(full_pages, swa_pages)
+        self.swa_attn_allocator.ids.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: a shared id space has no mapping tensor.

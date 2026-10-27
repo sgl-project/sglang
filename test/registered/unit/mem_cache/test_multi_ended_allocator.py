@@ -249,11 +249,11 @@ class TestBand(unittest.TestCase):
         return pool, full_alloc, mamba_alloc, full_kv, mamba_kv
 
     def _check_invariants(self, alloc: Band, kv: _FakeKVCache):
-        v2p = alloc.virtual_to_physical
-        p2v = alloc.physical_to_virtual
+        v2p = alloc.ids.virtual_to_physical
+        p2v = alloc.ids.physical_to_virtual
         # live virtual ids = those with v2p != -1, excluding the reserved id 0.
         live_v = [
-            v for v in range(1, alloc.num_virtual_ids) if int(v2p[v].item()) != -1
+            v for v in range(1, alloc.ids.num_virtual_ids) if int(v2p[v].item()) != -1
         ]
         # mutual-inverse on the live set
         for v in live_v:
@@ -286,12 +286,12 @@ class TestBand(unittest.TestCase):
         self.assertIsNotNone(v)
         self.assertEqual(int(v.numel()), n)
         # stamp the data marker at each new physical slot
-        p = alloc.virtual_to_physical[v]
+        p = alloc.ids.virtual_to_physical[v]
         kv.buf[p] = v
         return v
 
     def _free(self, alloc: Band, kv: _FakeKVCache, v: torch.Tensor):
-        p = alloc.virtual_to_physical[v]
+        p = alloc.ids.virtual_to_physical[v]
         kv.buf[p] = -1  # the freed virtual id's data is gone
         alloc.free(v)
 
@@ -307,7 +307,7 @@ class TestBand(unittest.TestCase):
         self._check_invariants(full_alloc, full_kv)
         # `a` and `c` virtual ids unchanged; their physical slots may have moved.
         for v in a.tolist() + c.tolist():
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v].item()), -1)
+            self.assertNotEqual(int(full_alloc.ids.virtual_to_physical[v].item()), -1)
         # free the boundary batch (no relocation needed)
         self._free(full_alloc, full_kv, c)
         self._check_invariants(full_alloc, full_kv)
@@ -436,13 +436,13 @@ class TestBand(unittest.TestCase):
         v = self._alloc(full_alloc, full_kv, 5)
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf, "must return the `out=` buffer, not a fresh tensor")
         self.assertEqual(
             buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
         )
         # Result matches v2p directly (page_size == 1 here)
-        expected = full_alloc.virtual_to_physical[v]
+        expected = full_alloc.ids.virtual_to_physical[v]
         self.assertTrue(bool((buf == expected).all().item()))
 
     def test_translate_kv_loc_out_guards(self):
@@ -453,11 +453,11 @@ class TestBand(unittest.TestCase):
         with self.subTest(guard="dtype"):
             wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
             with self.assertRaises(AssertionError):
-                full_alloc.translate_kv_loc(v, out=wrong_dtype)
+                full_alloc.ids.translate(v, out=wrong_dtype)
         with self.subTest(guard="shape"):
             wrong_shape = torch.empty((v.numel() + 1,), dtype=torch.int64, device=_DEV)
             with self.assertRaises(AssertionError):
-                full_alloc.translate_kv_loc(v, out=wrong_shape)
+                full_alloc.ids.translate(v, out=wrong_shape)
 
     # `index_select(v2p, 0, virt, out=out)` rejects aliasing between `index`
     # and `out`, so the in-place form must gather into a temporary first.
@@ -467,11 +467,11 @@ class TestBand(unittest.TestCase):
         _, full_alloc, _, full_kv, _ = self._build_pair()
         v_orig = self._alloc(full_alloc, full_kv, 5).clone()
         # Save the expected output (no-out form) before mutating `buf`.
-        expected = full_alloc.translate_kv_loc(v_orig)
+        expected = full_alloc.ids.translate(v_orig)
         # Now exercise the aliasing form: buf serves as BOTH input and out.
         buf = v_orig.clone()
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        ret = full_alloc.ids.translate(buf, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(
             buf.data_ptr(),
@@ -493,9 +493,9 @@ class TestBand(unittest.TestCase):
         # Inject a tombstone directly, not through `free` (which would also
         # touch p2v and run compaction).
         v_tombstoned = int(v[2].item())
-        full_alloc.virtual_to_physical[v_tombstoned] = -1
+        full_alloc.ids.virtual_to_physical[v_tombstoned] = -1
         # No-out form: result must clamp.
-        out = full_alloc.translate_kv_loc(v)
+        out = full_alloc.ids.translate(v)
         self.assertTrue(
             bool((out >= 0).all().item()),
             f"translate_kv_loc must clamp tombstoned entries to >=0, got {out.tolist()}",
@@ -507,7 +507,7 @@ class TestBand(unittest.TestCase):
         )
         # out= form (the captured-graph path) must clamp in place too.
         buf = torch.empty_like(v)
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(
             bool((buf >= 0).all().item()),
@@ -522,8 +522,8 @@ class TestBand(unittest.TestCase):
         _, full_alloc, _, full_kv, _ = self._build_pair()
         zeros = torch.zeros(4, dtype=torch.int64)
 
-        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
-        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+        self.assertEqual(int(full_alloc.ids.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.ids.translate(zeros), zeros))
 
         # Churn: allocate, free interior (forces compaction moves), re-allocate.
         a = self._alloc(full_alloc, full_kv, 6)
@@ -533,8 +533,8 @@ class TestBand(unittest.TestCase):
         self._free(full_alloc, full_kv, b)
         self._free(full_alloc, full_kv, c)
 
-        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
-        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+        self.assertEqual(int(full_alloc.ids.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.ids.translate(zeros), zeros))
 
     def test_set_capacity_keeps_tables_and_shrinks_the_active_range(self):
         """Post-capture sizing shrinks a captured allocator in place: the
@@ -543,14 +543,14 @@ class TestBand(unittest.TestCase):
         pool, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
         for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
             with self.subTest(sub_pool=alloc.sub_pool_name):
-                v2p, p2v = alloc.virtual_to_physical, alloc.physical_to_virtual
+                v2p, p2v = alloc.ids.virtual_to_physical, alloc.ids.physical_to_virtual
                 new_slots = pool.num_entries(alloc.sub_pool_name) // 2
                 alloc._set_capacity(new_slots)
-                self.assertIs(alloc.virtual_to_physical, v2p)
-                self.assertIs(alloc.physical_to_virtual, p2v)
+                self.assertIs(alloc.ids.virtual_to_physical, v2p)
+                self.assertIs(alloc.ids.physical_to_virtual, p2v)
                 self.assertEqual(alloc.max_slots, new_slots)
                 self.assertEqual(alloc.num_pages, new_slots)
-                self.assertEqual(alloc.num_virtual_ids, new_slots)
+                self.assertEqual(alloc.ids.num_virtual_ids, new_slots)
                 self.assertEqual(
                     alloc.free_virtual_ids.tolist(),
                     list(range(alloc.min_page_index, new_slots)),
@@ -561,7 +561,7 @@ class TestBand(unittest.TestCase):
                 n = alloc.available_size()
                 self.assertGreater(n, 0)
                 v = self._alloc(alloc, kv, n)
-                p = alloc.virtual_to_physical[v]
+                p = alloc.ids.virtual_to_physical[v]
                 self.assertGreaterEqual(int(p.min()), alloc.min_slot_index)
                 self.assertLess(int(p.max()), alloc.max_slots)
                 self.assertIsNone(alloc.alloc(1))
@@ -779,7 +779,7 @@ class TestWindowChainAllocator(unittest.TestCase):
             )
         )
         self.assertTrue(
-            bool((allocator.swa_attn_allocator.translate_kv_loc(indices) > 0).all())
+            bool((allocator.swa_attn_allocator.ids.translate(indices) > 0).all())
         )
 
     def test_empty_pool_reservation_matches_packed_byte_boundary(self):
@@ -881,8 +881,8 @@ class TestWindowChainAllocator(unittest.TestCase):
         v = allocator.alloc(n)
         if v is None:
             return None
-        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
-        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        full_phys = allocator.full_attn_allocator.ids.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
         kvcache.full_kv_pool.buf[full_phys] = v
         kvcache.swa_kv_pool.buf[swa_phys] = v
         return v
@@ -890,8 +890,8 @@ class TestWindowChainAllocator(unittest.TestCase):
     def _free(self, allocator, kvcache, v):
         """Erase markers on both sub-pools (mirroring compaction's
         no-data-at-a-freed-slot invariant), then call the composite's free."""
-        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
-        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        full_phys = allocator.full_attn_allocator.ids.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
         # erase only the LIVE swa entries (`free_swa` may have already
         # tombstoned some of `v`).
         valid_swa = swa_phys[swa_phys >= 0]
@@ -902,9 +902,11 @@ class TestWindowChainAllocator(unittest.TestCase):
     def _check_sub_pool_invariants(self, sub, kv):
         """Per-sub-pool: v2p/p2v mutual inverse on the live set, hole-free
         allocated band, data followed relocations."""
-        v2p = sub.virtual_to_physical
-        p2v = sub.physical_to_virtual
-        live_v = [v for v in range(1, sub.num_virtual_ids) if int(v2p[v].item()) != -1]
+        v2p = sub.ids.virtual_to_physical
+        p2v = sub.ids.physical_to_virtual
+        live_v = [
+            v for v in range(1, sub.ids.num_virtual_ids) if int(v2p[v].item()) != -1
+        ]
         for v in live_v:
             p = int(v2p[v].item())
             self.assertEqual(int(p2v[p].item()), v)
@@ -924,8 +926,8 @@ class TestWindowChainAllocator(unittest.TestCase):
         v = allocator.alloc(3)
         self.assertIsNotNone(v)
         self.assertEqual(int(v.numel()), 3)
-        full_v2p = allocator.full_attn_allocator.virtual_to_physical
-        swa_v2p = allocator.swa_attn_allocator.virtual_to_physical
+        full_v2p = allocator.full_attn_allocator.ids.virtual_to_physical
+        swa_v2p = allocator.swa_attn_allocator.ids.virtual_to_physical
         for vi in v.tolist():
             self.assertGreaterEqual(int(full_v2p[vi].item()), 0)
             self.assertGreaterEqual(int(swa_v2p[vi].item()), 0)
@@ -944,10 +946,11 @@ class TestWindowChainAllocator(unittest.TestCase):
         self._free(allocator, kvcache, v)
         for vi in v.tolist():
             self.assertEqual(
-                int(allocator.full_attn_allocator.virtual_to_physical[vi].item()), -1
+                int(allocator.full_attn_allocator.ids.virtual_to_physical[vi].item()),
+                -1,
             )
             self.assertEqual(
-                int(allocator.swa_attn_allocator.virtual_to_physical[vi].item()), -1
+                int(allocator.swa_attn_allocator.ids.virtual_to_physical[vi].item()), -1
             )
         free_full = set(
             int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
@@ -961,17 +964,17 @@ class TestWindowChainAllocator(unittest.TestCase):
         # Tombstone the middle one. Erase its swa marker first (compaction
         # will run inside `free_swa`).
         target = v[1:2]
-        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        target_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
         allocator.free_swa(target)
         tgt = int(target.item())
         # full side still bound:
         self.assertGreaterEqual(
-            int(allocator.full_attn_allocator.virtual_to_physical[tgt].item()), 0
+            int(allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()), 0
         )
         # swa side tombstoned:
         self.assertEqual(
-            int(allocator.swa_attn_allocator.virtual_to_physical[tgt].item()), -1
+            int(allocator.swa_attn_allocator.ids.virtual_to_physical[tgt].item()), -1
         )
         # NOT recycled to the id-owner's free list yet:
         free_full = set(
@@ -980,7 +983,9 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertNotIn(tgt, free_full)
         # composite `free` of the same virtual still works (filters out
         # already-tombstoned on the swa side).
-        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        full_phys = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()
+        )
         kvcache.full_kv_pool.buf[full_phys] = -1
         allocator.free(target)
         # now in free list:
@@ -997,10 +1002,12 @@ class TestWindowChainAllocator(unittest.TestCase):
         tgt = int(target.item())
         # Tombstone the swa side, erasing each marker before its release
         # (compaction runs inside both).
-        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        target_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
         allocator.free_swa(target)
-        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        full_phys = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()
+        )
         kvcache.full_kv_pool.buf[full_phys] = -1
 
         allocator.free_group_begin()
@@ -1023,20 +1030,26 @@ class TestWindowChainAllocator(unittest.TestCase):
         b = self._alloc(allocator, kvcache, 1)
         c = self._alloc(allocator, kvcache, 1)
         # Snapshot swa-side physical for c BEFORE we free_swa(b).
-        c_swa_before = int(allocator.swa_attn_allocator.virtual_to_physical[c].item())
-        c_full_before = int(allocator.full_attn_allocator.virtual_to_physical[c].item())
+        c_swa_before = int(
+            allocator.swa_attn_allocator.ids.virtual_to_physical[c].item()
+        )
+        c_full_before = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[c].item()
+        )
         # Tombstone b on swa only.
-        b_swa = allocator.swa_attn_allocator.virtual_to_physical[b]
+        b_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[b]
         kvcache.swa_kv_pool.buf[b_swa] = -1
         allocator.free_swa(b)
         # c's full-physical UNCHANGED (full side did not compact):
         self.assertEqual(
-            int(allocator.full_attn_allocator.virtual_to_physical[c].item()),
+            int(allocator.full_attn_allocator.ids.virtual_to_physical[c].item()),
             c_full_before,
         )
         # c's swa-physical MUST have moved: b is interior to swa's allocated
         # band, so freeing it relocates c into b's slot.
-        c_swa_after = int(allocator.swa_attn_allocator.virtual_to_physical[c].item())
+        c_swa_after = int(
+            allocator.swa_attn_allocator.ids.virtual_to_physical[c].item()
+        )
         self.assertNotEqual(c_swa_after, c_swa_before)
         # Per-sub-pool invariants still hold.
         self._check_sub_pool_invariants(
@@ -1080,7 +1093,7 @@ class TestWindowChainAllocator(unittest.TestCase):
                 if kind != "live":
                     continue
                 # Tombstone all of v on swa only.
-                swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+                swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
                 kvcache.swa_kv_pool.buf[swa_phys] = -1
                 allocator.free_swa(v)
                 live[idx] = ("swa_tomb", v)
@@ -1143,7 +1156,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertIsNotNone(v)
         # Inject a tombstone on the swa side at one of the live virtual ids.
         v_tomb = int(v[1].item())
-        allocator.swa_attn_allocator.virtual_to_physical[v_tomb] = -1
+        allocator.swa_attn_allocator.ids.virtual_to_physical[v_tomb] = -1
         # No-out form: result must be int64 AND every entry >= 0.
         out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(out.dtype, torch.int64)
@@ -1261,13 +1274,13 @@ class TestPagedBand(unittest.TestCase):
         ps = alloc.page_size
         virt_pages = v_tokens // ps
         offsets = v_tokens % ps
-        phys_pages = alloc.virtual_to_physical[virt_pages]
+        phys_pages = alloc.ids.virtual_to_physical[virt_pages]
         phys_tokens = phys_pages * ps + offsets
         kv.buf[phys_tokens] = v_tokens
 
     def _check_invariants(self, alloc: Band, kv: _FakeKVCache, stamped_tokens: dict):
-        v2p = alloc.virtual_to_physical
-        p2v = alloc.physical_to_virtual
+        v2p = alloc.ids.virtual_to_physical
+        p2v = alloc.ids.physical_to_virtual
         ps = alloc.page_size
         # Live virtual pages (excluding the reserved padding page 0).
         live_v_pages = [
@@ -1363,10 +1376,14 @@ class TestPagedBand(unittest.TestCase):
         # `a` and `c` pages must still be live.
         for t in a.tolist():
             v_page = t // self.PAGE_SIZE
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
+            self.assertNotEqual(
+                int(full_alloc.ids.virtual_to_physical[v_page].item()), -1
+            )
         for t in c.tolist():
             v_page = t // self.PAGE_SIZE
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
+            self.assertNotEqual(
+                int(full_alloc.ids.virtual_to_physical[v_page].item()), -1
+            )
 
     # 5. Regression: `allocated_count()` reports TOKENS, not pages; the leak
     # invariant `available + evictable + ... == total` is all in tokens.
@@ -1484,7 +1501,7 @@ class TestPagedBand(unittest.TestCase):
 
         self.assertIsNotNone(out)
         consumed_pages = free_before[:2]
-        v2p_values = full_alloc.virtual_to_physical[consumed_pages]
+        v2p_values = full_alloc.ids.virtual_to_physical[consumed_pages]
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertNotEqual(
                 p_page,
@@ -1494,7 +1511,9 @@ class TestPagedBand(unittest.TestCase):
             )
         # And p2v_page must round-trip.
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
-            self.assertEqual(int(full_alloc.physical_to_virtual[p_page].item()), v_page)
+            self.assertEqual(
+                int(full_alloc.ids.physical_to_virtual[p_page].item()), v_page
+            )
         # `allocated_count()` is in TOKENS (advances by 2 * PAGE_SIZE);
         # `_allocated_pages()` is the page count.
         self.assertEqual(
@@ -1555,7 +1574,7 @@ class TestPagedBand(unittest.TestCase):
         # 1 virtual page consumed from the head of free_virtual_ids.
         consumed_page = int(free_before[0].item())
         # v2p_page must now map to a valid physical page (not -1).
-        p_page = int(full_alloc.virtual_to_physical[consumed_page].item())
+        p_page = int(full_alloc.ids.virtual_to_physical[consumed_page].item())
         self.assertNotEqual(
             p_page,
             -1,
@@ -1564,7 +1583,7 @@ class TestPagedBand(unittest.TestCase):
         )
         # p2v round-trip.
         self.assertEqual(
-            int(full_alloc.physical_to_virtual[p_page].item()), consumed_page
+            int(full_alloc.ids.physical_to_virtual[p_page].item()), consumed_page
         )
         # `allocated_count()` is in TOKENS (advances by PAGE_SIZE);
         # `_allocated_pages()` is the page count.
@@ -1638,8 +1657,8 @@ class TestPagedBand(unittest.TestCase):
         # Compare with-out vs no-out.
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        with_out = full_alloc.translate_kv_loc(v, out=buf)
-        no_out = full_alloc.translate_kv_loc(v)
+        with_out = full_alloc.ids.translate(v, out=buf)
+        no_out = full_alloc.ids.translate(v)
         self.assertIs(with_out, buf, "must return the out= buffer")
         self.assertEqual(
             buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
@@ -1648,7 +1667,7 @@ class TestPagedBand(unittest.TestCase):
         # against the real v2p table.
         virt_pages = v // ps
         offsets = v % ps
-        phys_pages = full_alloc.virtual_to_physical[virt_pages]
+        phys_pages = full_alloc.ids.virtual_to_physical[virt_pages]
         expected = phys_pages * ps + offsets
         self.assertTrue(bool((buf == expected).all().item()))
         self.assertTrue(bool((with_out == no_out).all().item()))
@@ -1661,11 +1680,11 @@ class TestPagedBand(unittest.TestCase):
         v_orig = full_alloc.alloc(2 * ps)
         self.assertIsNotNone(v_orig)
         # Expected (no-out form) computed BEFORE mutating buf.
-        expected = full_alloc.translate_kv_loc(v_orig)
+        expected = full_alloc.ids.translate(v_orig)
         # In-place form: buf serves as both input and out.
         buf = v_orig.clone()
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        ret = full_alloc.ids.translate(buf, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(buf.data_ptr(), ptr_before)
         self.assertTrue(
@@ -1683,9 +1702,9 @@ class TestPagedBand(unittest.TestCase):
         # Tombstone one page (any v2p_page entry) -> all ps tokens in that
         # page should clamp to 0 in the translate output.
         tomb_page = int((v[0] // ps).item())
-        full_alloc.virtual_to_physical[tomb_page] = -1
+        full_alloc.ids.virtual_to_physical[tomb_page] = -1
         # No-out form.
-        out = full_alloc.translate_kv_loc(v)
+        out = full_alloc.ids.translate(v)
         self.assertTrue(
             bool((out >= 0).all().item()),
             f"paged translate_kv_loc must clamp tombstoned to >=0; got {out.tolist()}",
@@ -1702,7 +1721,7 @@ class TestPagedBand(unittest.TestCase):
         )
         # out= form must also clamp.
         buf = torch.empty_like(v)
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(
             bool((buf >= 0).all().item()),
@@ -1942,7 +1961,7 @@ class TestPagedBand(unittest.TestCase):
         )
         virt_pages_in = v_tokens // PS
         offsets_in = v_tokens % PS
-        swa_phys_pages_direct = allocator.swa_attn_allocator.virtual_to_physical[
+        swa_phys_pages_direct = allocator.swa_attn_allocator.ids.virtual_to_physical[
             virt_pages_in
         ]
         expected = swa_phys_pages_direct * PS + offsets_in
@@ -2008,7 +2027,7 @@ class TestLazyCompaction(unittest.TestCase):
         token id, so we can later check the data followed any relocation.
         """
         for v in tokens.tolist():
-            p = int(alloc.virtual_to_physical[v].item())
+            p = int(alloc.ids.virtual_to_physical[v].item())
             kv.buf[p] = int(v)
 
     def test_lazy_free_inward_walk(self):
@@ -2094,18 +2113,18 @@ class TestLazyCompaction(unittest.TestCase):
         self._stamp_kv(kv, fa, values)
         fa.free(values[1:5].clone())
 
-        physical_to_virtual = fa.physical_to_virtual
-        fa.physical_to_virtual = _RejectScalarIndexTensor(physical_to_virtual)
+        physical_to_virtual = fa.ids.physical_to_virtual
+        fa.ids.physical_to_virtual = _RejectScalarIndexTensor(physical_to_virtual)
         try:
             self.assertEqual(fa._flush(urgent=True), 4)
         finally:
-            fa.physical_to_virtual = physical_to_virtual
+            fa.ids.physical_to_virtual = physical_to_virtual
 
         for virtual in values.tolist():
-            physical = int(fa.virtual_to_physical[virtual].item())
+            physical = int(fa.ids.virtual_to_physical[virtual].item())
             if physical == -1:
                 continue
-            self.assertEqual(int(fa.physical_to_virtual[physical].item()), virtual)
+            self.assertEqual(int(fa.ids.physical_to_virtual[physical].item()), virtual)
             self.assertEqual(int(kv.buf[physical].item()), virtual)
 
     def _replay_sequence(self, ops, lazy: bool):
@@ -2121,7 +2140,7 @@ class TestLazyCompaction(unittest.TestCase):
                 if tokens is None:
                     continue
                 for v in tokens.tolist():
-                    p = int(fa.virtual_to_physical[v].item())
+                    p = int(fa.ids.virtual_to_physical[v].item())
                     kv.buf[p] = next_stamp
                     kv_stamps[v] = next_stamp
                     live.add(v)
@@ -2139,7 +2158,7 @@ class TestLazyCompaction(unittest.TestCase):
         # Read back the data for each live id.
         live_data = {}
         for v in live:
-            p = int(fa.virtual_to_physical[v].item())
+            p = int(fa.ids.virtual_to_physical[v].item())
             live_data[v] = int(kv.buf[p].item())
         return live, live_data, kv_stamps
 
@@ -2187,7 +2206,7 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._free_phys_pages), 1)
         # `set_inflight_forward` takes the virtual `out_cache_loc` tensor, not a
         # materialized physical set; `_flush` translates it when it classifies.
-        topmost_phys = int(fa.virtual_to_physical[int(a[-1].item())].item())
+        topmost_phys = int(fa.ids.virtual_to_physical[int(a[-1].item())].item())
         oclv = a[-1:].clone()  # virtual id that translates to topmost_phys
         fa.set_inflight_forward(ev, oclv)
         # Non-urgent flush -> case A blocker at the top -> STOP.
@@ -2325,14 +2344,18 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # Slow path on fa_b: directly call take_physical_pages + bind
         # (the unfused reference implementation).
         phys_b = fa_b.take_physical_pages(5)
-        fa_b.bind(v_pages, phys_b)
+        fa_b.ids.bind(v_pages, phys_b)
         # take_physical_pages already advances live_page_count (matching the
         # fused fast path), so no manual bump here.
         # Identical return tensors.
         self.assertTrue(torch.equal(phys_a, phys_b))
         # Identical v2p / p2v after the operation.
-        self.assertTrue(torch.equal(fa_a.virtual_to_physical, fa_b.virtual_to_physical))
-        self.assertTrue(torch.equal(fa_a.physical_to_virtual, fa_b.physical_to_virtual))
+        self.assertTrue(
+            torch.equal(fa_a.ids.virtual_to_physical, fa_b.ids.virtual_to_physical)
+        )
+        self.assertTrue(
+            torch.equal(fa_a.ids.physical_to_virtual, fa_b.ids.physical_to_virtual)
+        )
         # Identical watermark + live_page_count.
         self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
         self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
@@ -2396,14 +2419,18 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
 
     def test_composite_exposes_raw_v2p_tables(self):
         a = self._build()
-        self.assertIs(a.full_v2p_page_table, a.full_attn_allocator.virtual_to_physical)
-        self.assertIs(a.swa_v2p_page_table, a.swa_attn_allocator.virtual_to_physical)
+        self.assertIs(
+            a.full_v2p_page_table, a.full_attn_allocator.ids.virtual_to_physical
+        )
+        self.assertIs(
+            a.swa_v2p_page_table, a.swa_attn_allocator.ids.virtual_to_physical
+        )
 
     def test_full_translate_matches_formula(self):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
-        v2p = a.full_attn_allocator.virtual_to_physical
+        v2p = a.full_attn_allocator.ids.virtual_to_physical
         expected = v2p[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
@@ -2418,7 +2445,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
                 a = self._build()
                 v = a.alloc(4 * ps)
                 self.assertIsNotNone(v)
-                v2p = a.full_attn_allocator.virtual_to_physical
+                v2p = a.full_attn_allocator.ids.virtual_to_physical
                 expected = v2p[v // ps] * ps + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
                 got = a.translate_kv_loc(page_table)
@@ -2433,7 +2460,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
-        v2p_swa = a.swa_attn_allocator.virtual_to_physical
+        v2p_swa = a.swa_attn_allocator.ids.virtual_to_physical
         expected = v2p_swa[v // self.PS] * self.PS + v % self.PS
         self.assertTrue(
             torch.equal(a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v), expected)
@@ -2444,10 +2471,10 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
 
-        physical_pages = a.swa_attn_allocator.virtual_to_physical[
+        physical_pages = a.swa_attn_allocator.ids.virtual_to_physical[
             v[:: self.PS] // self.PS
         ]
-        physical_tokens = a.swa_attn_allocator.translate_kv_loc(v)
+        physical_tokens = a.swa_attn_allocator.ids.translate(v)
         transfer_tokens = a.translate_swa_indices_for_transfer(v)
         self.assertTrue(torch.equal(transfer_tokens, physical_tokens))
         self.assertEqual(
@@ -2470,7 +2497,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v)
         tomb_page = int(v[0].item()) // self.PS
-        a.swa_attn_allocator.virtual_to_physical[tomb_page] = -1
+        a.swa_attn_allocator.ids.virtual_to_physical[tomb_page] = -1
         got = a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertTrue(bool((got >= 0).all().item()))
         in_tomb = v // self.PS == tomb_page
@@ -2769,13 +2796,13 @@ class TestFloatBand(CustomTestCase):
         return pool, sa, fla, da, fkv
 
     def _stamp(self, alloc, kv, v):
-        kv.buf[alloc.virtual_to_physical[v]] = v
+        kv.buf[alloc.ids.virtual_to_physical[v]] = v
 
     def _interior_block(self, fla, blocks):
         """The allocated block whose physical pages touch neither span
         boundary (robust to the extend-direction policy)."""
         for v in blocks:
-            pages = set(int(x) for x in fla.virtual_to_physical[v].tolist())
+            pages = set(int(x) for x in fla.ids.virtual_to_physical[v].tolist())
             if fla.low_wm_page not in pages and (fla.high_wm_page - 1) not in pages:
                 return v
         raise AssertionError("no interior block in layout")
@@ -2788,9 +2815,9 @@ class TestFloatBand(CustomTestCase):
         for h in holes:
             self.assertTrue(fla.low_wm_page < h < fla.high_wm_page - 1)
         for p in live:
-            v = int(fla.physical_to_virtual[p].item())
+            v = int(fla.ids.physical_to_virtual[p].item())
             self.assertNotEqual(v, -1, f"live page {p} unbound")
-            self.assertEqual(int(fla.virtual_to_physical[v].item()), p)
+            self.assertEqual(int(fla.ids.virtual_to_physical[v].item()), p)
             self.assertEqual(int(kv.buf[p].item()), v, f"data lost at {p}")
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA tombstone kernel")
@@ -2801,15 +2828,15 @@ class TestFloatBand(CustomTestCase):
         self.assertIsNotNone(pages)
         freed = pages[::2]
         self.assertFalse(freed.is_contiguous())
-        physical = allocator.virtual_to_physical[freed].clone()
-        expected_v2p = allocator.virtual_to_physical.clone()
-        expected_p2v = allocator.physical_to_virtual.clone()
+        physical = allocator.ids.virtual_to_physical[freed].clone()
+        expected_v2p = allocator.ids.virtual_to_physical.clone()
+        expected_p2v = allocator.ids.physical_to_virtual.clone()
         expected_v2p[freed] = -1
         expected_p2v[physical] = -1
 
         allocator.free(freed)
-        torch.testing.assert_close(allocator.virtual_to_physical, expected_v2p)
-        torch.testing.assert_close(allocator.physical_to_virtual, expected_p2v)
+        torch.testing.assert_close(allocator.ids.virtual_to_physical, expected_v2p)
+        torch.testing.assert_close(allocator.ids.physical_to_virtual, expected_p2v)
         torch.testing.assert_close(
             allocator._free_phys_pages.sort().values, physical.sort().values
         )
@@ -3181,7 +3208,7 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 owned = (i % dcp_size) == rank
                 self.assertEqual(int(owned.sum()), i.numel() // dcp_size)
-                phys = a.translate_kv_loc(i[owned] // dcp_size)
+                phys = a.ids.translate(i[owned] // dcp_size)
                 # Collapsed ids land inside this rank's physical rows,
                 # contiguously within each page, never on the reserved sink.
                 self.assertTrue(bool((phys > 0).all()))
@@ -3194,13 +3221,13 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 a = self._build(page_size=2)
                 ids = a.alloc(2 * dcp_size * 3)
-                written = a.translate_write_loc(ids)
+                written = a.ids.translate_write(ids)
                 owned = (ids % dcp_size) == rank
                 # Owned ids agree with the read translate of the collapsed id...
                 self.assertTrue(
                     torch.equal(
                         written[owned],
-                        a.translate_kv_loc(ids[owned] // dcp_size),
+                        a.ids.translate(ids[owned] // dcp_size),
                     )
                 )
                 # ...and the rest go to the sink the write kernels skip.
