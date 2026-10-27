@@ -396,27 +396,26 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # The live DFlash metadata already includes the verify block.
                 seq_lens = list(_meta_list)
             else:
-                using_cpu_mirror = forward_batch.seq_lens_cpu is not None
-                if using_cpu_mirror:
+                if forward_batch.seq_lens_cpu is not None:
                     global_host_kv_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
+                    # DCP's DFlash/DSPARK Host lengths already include verify KV.
+                    if is_target_verify and not (
+                        mla_dcp_graph
+                        and self.model_runner.spec_algorithm.is_dflash_family()
+                    ):
+                        global_host_kv_lens_cpu = (
+                            global_host_kv_lens_cpu + self.captured_req_width
+                        )
                 else:
                     device_prefix_lens = forward_batch.seq_lens
                     if mla_dcp_graph:
                         device_prefix_lens = device_prefix_lens[: self.raw_bs]
                     global_host_kv_lens_cpu = device_prefix_lens.cpu()
-
-                # DCP's DFlash/DSPARK CPU mirrors already include verify KV.
-                # Keep the existing non-DCP fallback compensation unchanged.
-                host_includes_verify = (
-                    is_target_verify
-                    and mla_dcp_graph
-                    and using_cpu_mirror
-                    and self.model_runner.spec_algorithm.is_dflash_family()
-                )
-                if is_target_verify and not host_includes_verify:
-                    global_host_kv_lens_cpu = (
-                        global_host_kv_lens_cpu + self.captured_req_width
-                    )
+                    # Device lengths are prefixes; verify always adds its width.
+                    if is_target_verify:
+                        global_host_kv_lens_cpu = (
+                            global_host_kv_lens_cpu + self.captured_req_width
+                        )
 
                 host_kv_lens_cpu = global_host_kv_lens_cpu
                 if mla_dcp_graph:
