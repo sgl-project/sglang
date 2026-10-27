@@ -27,8 +27,9 @@ from sglang_simulator.simulation.utils import (
     calc_iteration_metrics,
     calc_metrics,
 )
-from sglang_simulator.time_predictor import InferTimePredictor, ScheduleRequest
+from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
+from sglang_simulator.time_predictor import ScheduleRequest
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
