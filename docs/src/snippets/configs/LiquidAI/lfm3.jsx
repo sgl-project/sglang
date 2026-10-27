@@ -83,7 +83,7 @@ sgl-eval run gsm8k \\
   },
 
   runModes: (s) => (["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw)
-    ? ["python"] : ["docker"]),
+    ? ["python"] : ["python", "docker"]),
 
   // Prefills the issue template's `model` field on "Submit verified cell".
   github: {
