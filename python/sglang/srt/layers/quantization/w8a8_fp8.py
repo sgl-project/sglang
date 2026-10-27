@@ -10,6 +10,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
@@ -25,7 +26,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+# The unfused fallback GEMM and the Triton per-channel MoE are far slower on gfx942.
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -116,6 +119,11 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
+            if _use_aiter:
+                # gemm_a8w8_bpreshuffle reads B in the MFMA-preshuffled layout.
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
@@ -190,6 +198,8 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            # aiter's gemm_a8w8_bpreshuffle takes per-token activation scales.
+            use_per_token_if_dynamic=_use_aiter,
         )
 
 
@@ -218,13 +228,21 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # As in the linear method: copying OCP e4m3fn into e4m3fnuz would saturate
+        # values above 240, so load bit-faithfully and normalize after loading.
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else fp8_dtype
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -236,7 +254,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -270,20 +288,32 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        w13, w13_scale = layer.w13_weight.data, layer.w13_weight_scale.data
+        w2, w2_scale = layer.w2_weight.data, layer.w2_weight_scale.data
+        if _is_fp8_fnuz and w13.dtype == torch.float8_e4m3fn:
+            w13, w13_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w13, weight_scale=w13_scale
+            )
+            w2, w2_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w2, weight_scale=w2_scale
+            )
+        if _use_aiter:
+            # aiter's asm fused MoE takes MFMA-shuffled expert weights.
+            from aiter.ops.shuffle import shuffle_weight
+
+            w13 = shuffle_weight(w13.contiguous(), (16, 16))
+            w2 = shuffle_weight(w2.contiguous(), (16, 16))
+        layer.w13_weight = Parameter(w13, requires_grad=False)
+        layer.w2_weight = Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = MoeRunnerBackend.AITER if _use_aiter else MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -302,6 +332,21 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        if _use_aiter:
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                AiterMoeQuantInfo,
+                AiterQuantType,
+            )
+
+            quant_info = AiterMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                quant_type=AiterQuantType.PER_TOKEN,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

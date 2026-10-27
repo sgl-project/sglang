@@ -5521,8 +5521,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and ".engram." not in name
                                 and (
                                     name.endswith(".wq_a.weight")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wkv.weight_scale_inv")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
@@ -5530,6 +5532,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     or name.endswith(".wkv.qweight_type")
                                 )
                             ):
+                                # Per-channel .weight_scale fuses by the weight's row concat.
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
                                     ".wq_a." if is_q else ".wkv.", ".wqkv_a."
