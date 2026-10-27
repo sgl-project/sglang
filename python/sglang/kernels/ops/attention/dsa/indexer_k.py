@@ -8,7 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import index_k_scale_fmt
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 
 _CUDA_FILE = "deepseek_v32/indexer_k.cuh"
 
@@ -75,18 +75,15 @@ def fused_k_indexer_norm_rope_store(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     page_size: int,
-    round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
 ) -> None:
     """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims + fp8
-    act-quant + paged index-k cache write, in one launch. CUDA only.
-
-    ``round_scale`` rounds each token's scale to a power of two; ``ue8m0_scale``
-    stores it as packed UE8M0 (MXFP8, implies ``round_scale``) instead of FP32."""
+    act-quant + paged index-k cache write, in one launch. CUDA only. Each token's
+    scale is stored in ``k_scale_fmt``."""
     if not out_cache_loc.is_contiguous():
         out_cache_loc = out_cache_loc.contiguous()
     module = _jit_k_indexer_norm_rope_store_module(
-        k_input.dtype, page_size, index_k_scale_fmt(round_scale, ue8m0_scale)
+        k_input.dtype, page_size, int(k_scale_fmt)
     )
     module.forward(
         k_input,

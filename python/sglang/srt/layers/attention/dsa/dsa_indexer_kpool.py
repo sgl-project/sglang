@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     fp8_paged_mqa_logits,
     mx_kv_scale,
@@ -201,7 +202,7 @@ class IndexerKPool(MultiPlatformOp):
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
         self.mx_mqa_logits = uses_mx_mqa_logits(get_device().device)
-        # Other paged backends read the FP32 scales, which are repacked per call
+        # Other paged backends read the FP32 scales, which the ragged path repacks
         self.ue8m0_index_cache = (
             self.mx_mqa_logits and self.paged_mqa_logits_backend.is_deepgemm()
         )
@@ -257,7 +258,13 @@ class IndexerKPool(MultiPlatformOp):
             )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
-        self.round_index_scale = scale_fmt is not None or self.mx_mqa_logits
+        self.index_k_cache_fmt = (
+            IndexKScaleFmt.UE8M0
+            if self.ue8m0_index_cache
+            else IndexKScaleFmt.POW2
+            if scale_fmt is not None or self.mx_mqa_logits
+            else IndexKScaleFmt.FP32
+        )
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
@@ -344,8 +351,7 @@ class IndexerKPool(MultiPlatformOp):
             ape=self.index_kpool_compress_ape,
             loc=write_locs.contiguous(),
             write_mask=write_mask.contiguous() if write_mask is not None else None,
-            round_scale=self.round_index_scale,
-            ue8m0_scale=self.ue8m0_index_cache,
+            k_scale_fmt=self.index_k_cache_fmt,
             return_compressed=return_compressed,
             write_cache=write_cache,
         )
@@ -390,8 +396,7 @@ class IndexerKPool(MultiPlatformOp):
             positions=positions[:batch],
             seq_lens=metadata.get_seqlens_int32()[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
-            round_scale=self.round_index_scale,
-            ue8m0_scale=self.ue8m0_index_cache,
+            k_scale_fmt=self.index_k_cache_fmt,
         )
 
     def _compress_write_extend(
@@ -503,8 +508,7 @@ class IndexerKPool(MultiPlatformOp):
                     tail_logical_base=writes.tail_logical_base,
                     ape=self.index_kpool_compress_ape,
                     loc=writes.write_loc,
-                    round_scale=self.round_index_scale,
-                    ue8m0_scale=self.ue8m0_index_cache,
+                    k_scale_fmt=self.index_k_cache_fmt,
                 )
 
             if not tails.is_empty:
@@ -1181,6 +1185,14 @@ class IndexerKPool(MultiPlatformOp):
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
         single_chunk = len(row_chunks) == 1
+        if kv_fp8 is not None and self.mx_mqa_logits:
+            k_fp8, k_scale = kv_fp8
+            kv_fp8 = (
+                k_fp8,
+                mx_kv_scale(
+                    k_scale.view(torch.int32) if self.ue8m0_index_cache else k_scale
+                ),
+            )
         topk_result = None
         for rows in row_chunks:
             if kv_fp8 is None:
@@ -1701,8 +1713,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_loc=plan.write_loc,
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
-                round_scale=self.round_index_scale,
-                ue8m0_scale=self.ue8m0_index_cache,
+                k_scale_fmt=self.index_k_cache_fmt,
                 effective_n_per_batch=plan.effective_n_per_batch,
             )
 

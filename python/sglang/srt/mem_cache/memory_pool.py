@@ -45,6 +45,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
@@ -4709,8 +4710,7 @@ class HybridLinearKVPool(KVCache):
         positions: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        round_scale: bool = False,
-        ue8m0_scale: bool = False,
+        k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
     ) -> None:
         assert self.use_dsa, (
             "kpool_decode_update_index_cache called when use_dsa is False"
@@ -4726,8 +4726,7 @@ class HybridLinearKVPool(KVCache):
             positions=positions,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
-            round_scale=round_scale,
-            ue8m0_scale=ue8m0_scale,
+            k_scale_fmt=k_scale_fmt,
         )
 
     def set_compress_tail_for_request(
@@ -5497,8 +5496,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         positions: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        round_scale: bool = False,
-        ue8m0_scale: bool = False,
+        k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
     ) -> None:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             kpool_decode_update_and_maybe_write_cache,
@@ -5522,8 +5520,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             positions=positions,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
-            round_scale=round_scale,
-            ue8m0_scale=ue8m0_scale,
+            k_scale_fmt=k_scale_fmt,
         )
 
     def set_compress_tail_for_request(

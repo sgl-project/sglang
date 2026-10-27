@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     dsv4_fp8_index_cache_is_ue8m0,
@@ -143,8 +144,13 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
-            round_scale=fp8_indexer and uses_mx_mqa_logits(kv_cache.device),
-            ue8m0_scale=fp8_indexer and dsv4_fp8_index_cache_is_ue8m0(),
+            k_scale_fmt=(
+                IndexKScaleFmt.FP32
+                if not (fp8_indexer and uses_mx_mqa_logits(kv_cache.device))
+                else IndexKScaleFmt.UE8M0
+                if dsv4_fp8_index_cache_is_ue8m0()
+                else IndexKScaleFmt.POW2
+            ),
             kvcache_scale=kv_scale_cache,
             rope_cache=rope_cache,
             layout=kv_layout,

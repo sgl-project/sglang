@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import pack_ue8m0_x4
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
@@ -74,15 +75,14 @@ class TestDsaKpoolDeepGemmLogits(CustomTestCase):
         loc = torch.randperm(2 * PAGE_SIZE, device="cuda")[:num_slots]
 
         caches, compressed = [], []
-        for ue8m0_scale in (False, True):
+        for k_scale_fmt in (IndexKScaleFmt.POW2, IndexKScaleFmt.UE8M0):
             kwargs = dict(
                 pool=pool,
                 slot_k=slot_k,
                 slot_score=slot_score,
                 ape=ape,
                 loc=loc,
-                round_scale=True,
-                ue8m0_scale=ue8m0_scale,
+                k_scale_fmt=k_scale_fmt,
             )
             cache = torch.zeros(2, PAGE_NBYTES, dtype=torch.uint8, device="cuda")
             kpool_softmax_rotate_write_cache(buf=cache, **kwargs)

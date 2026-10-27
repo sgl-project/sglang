@@ -35,10 +35,24 @@ def uses_mx_mqa_logits(device: Optional[torch.device]) -> bool:
     )
 
 
+@triton.jit
+def _pack_ue8m0_x4_kernel(scale_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    bits = tl.load(scale_ptr + offs, mask=mask).to(tl.uint32, bitcast=True)
+    packed = ((bits >> 23) & 0xFF) * 0x01010101
+    tl.store(out_ptr + offs, packed.to(tl.int32, bitcast=True), mask=mask)
+
+
 def pack_ue8m0_x4(scale: torch.Tensor) -> torch.Tensor:
     """Power-of-two FP32 scales as their exponent byte replicated into an int32."""
-    exponent = (scale.view(torch.int32) >> 23) & 0xFF
-    return (exponent.to(torch.int64) * 0x01010101).to(torch.int32)
+    scale = scale.contiguous()
+    out = torch.empty(scale.shape, dtype=torch.int32, device=scale.device)
+    n = scale.numel()
+    if n:
+        block = 1024
+        _pack_ue8m0_x4_kernel[(triton.cdiv(n, block),)](scale, out, n, BLOCK=block)
+    return out
 
 
 def mx_q_and_weights(q: Any, weights: torch.Tensor) -> Tuple[Any, torch.Tensor]:

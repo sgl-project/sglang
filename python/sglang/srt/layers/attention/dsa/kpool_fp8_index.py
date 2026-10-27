@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
@@ -924,8 +925,7 @@ def kpool_softmax_rotate_write_cache(
     ape: torch.Tensor,
     loc: torch.Tensor,
     write_mask: torch.Tensor | None = None,
-    round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
     return_compressed: bool = False,
     write_cache: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1002,8 +1002,8 @@ def kpool_softmax_rotate_write_cache(
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale or ue8m0_scale,
-        UE8M0_SCALE=ue8m0_scale,
+        ROUND_SCALE=k_scale_fmt != IndexKScaleFmt.FP32,
+        UE8M0_SCALE=k_scale_fmt == IndexKScaleFmt.UE8M0,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
@@ -1027,8 +1027,7 @@ def kpool_decode_update_and_maybe_write_cache(
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
 ) -> None:
     assert tail_k.ndim == 3
     assert tail_score.shape == tail_k.shape
@@ -1100,8 +1099,8 @@ def kpool_decode_update_and_maybe_write_cache(
         HEAD_DIM=tail_k.shape[2],
         BLOCK_TABLE_COLS=block_tables.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale or ue8m0_scale,
-        UE8M0_SCALE=ue8m0_scale,
+        ROUND_SCALE=k_scale_fmt != IndexKScaleFmt.FP32,
+        UE8M0_SCALE=k_scale_fmt == IndexKScaleFmt.UE8M0,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         INDEX_PAGE_SIZE=pool.index_page_size,
     )
@@ -1555,8 +1554,7 @@ def kpool_assemble_softmax_rotate_write_cache(
     ape: torch.Tensor,
     loc: torch.Tensor,
     write_mask: torch.Tensor | None = None,
-    round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
 ) -> None:
     kpool = pool.index_kpool
     n_pools = req_pool_idx.shape[0]
@@ -1602,8 +1600,8 @@ def kpool_assemble_softmax_rotate_write_cache(
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * INDEX_HEAD_DIM,
-        ROUND_SCALE=round_scale or ue8m0_scale,
-        UE8M0_SCALE=ue8m0_scale,
+        ROUND_SCALE=k_scale_fmt != IndexKScaleFmt.FP32,
+        UE8M0_SCALE=k_scale_fmt == IndexKScaleFmt.UE8M0,
         HAS_WRITE_MASK=has_write_mask,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
         INDEX_PAGE_SIZE=index_page_size,
@@ -1943,8 +1941,7 @@ def kpool_write_tail_and_maybe_compress(
     write_loc: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
-    round_scale: bool,
-    ue8m0_scale: bool = False,
+    k_scale_fmt: IndexKScaleFmt,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
     assert num_draft_tokens > 0
@@ -2011,8 +2008,8 @@ def kpool_write_tail_and_maybe_compress(
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         PRESHUFFLE_TILE=_preshuffle_tile(),
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale or ue8m0_scale,
-        UE8M0_SCALE=ue8m0_scale,
+        ROUND_SCALE=k_scale_fmt != IndexKScaleFmt.FP32,
+        UE8M0_SCALE=k_scale_fmt == IndexKScaleFmt.UE8M0,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
     )

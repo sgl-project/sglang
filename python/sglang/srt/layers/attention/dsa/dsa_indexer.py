@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     prepare_aiter_rope_caches,
 )
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
+    IndexKScaleFmt,
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
@@ -22,6 +23,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    mx_kv_scale,
     pack_ue8m0_x4,
     uses_mx_mqa_logits,
 )
@@ -435,6 +437,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         self.index_k_scale_fmt = self.scale_fmt or (
             "ue8m0" if self.mx_mqa_logits else None
+        )
+        self.index_k_cache_fmt = (
+            IndexKScaleFmt.UE8M0
+            if self.ue8m0_index_cache
+            else IndexKScaleFmt.POW2
+            if self.mx_mqa_logits
+            else IndexKScaleFmt.FP32
         )
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
@@ -1062,8 +1071,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self._indexer_cos_sin_cache,
                     positions if rows is None else positions.index_select(0, rows),
                     page_size,
-                    round_scale=self.mx_mqa_logits,
-                    ue8m0_scale=self.ue8m0_index_cache,
+                    k_scale_fmt=self.index_k_cache_fmt,
                 )
             return
 
@@ -1584,6 +1592,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         k_scale = k_scale.view(
             torch.int32 if self.ue8m0_index_cache else torch.float32
         ).squeeze(-1)
+        if self.mx_mqa_logits and not _use_torch_mqa_logits():
+            k_scale = mx_kv_scale(k_scale)
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
@@ -1874,8 +1884,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     buf,
                     loc,
                     pool.index_page_size,
-                    round_scale=self.mx_mqa_logits,
-                    ue8m0_scale=self.ue8m0_index_cache,
+                    k_scale_fmt=self.index_k_cache_fmt,
                 )
             return
 

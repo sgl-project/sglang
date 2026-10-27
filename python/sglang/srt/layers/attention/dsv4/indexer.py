@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     dsv4_fp8_index_cache_is_ue8m0,
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
+    mx_kv_scale,
     uses_mx_mqa_logits,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
@@ -759,7 +760,10 @@ class C4IndexerBackendMixin:
             max_seq_len=plan.max_seq_len,
         )
         scale_dtype = torch.int32 if dsv4_fp8_index_cache_is_ue8m0() else torch.float32
-        return k_u8.view(FP8_DTYPE), scale_u8.view(scale_dtype).squeeze(-1)
+        scale = scale_u8.view(scale_dtype).squeeze(-1)
+        if uses_mx_mqa_logits(scale.device):
+            scale = mx_kv_scale(scale)
+        return k_u8.view(FP8_DTYPE), scale
 
     @staticmethod
     def _nonpaged_mqa_logits(
