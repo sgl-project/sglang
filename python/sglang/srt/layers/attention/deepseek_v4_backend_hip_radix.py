@@ -95,6 +95,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
 )
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
 from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
@@ -3861,7 +3862,7 @@ class DeepseekV4HipRadixBackend(
                 block_size=dspark_block_size,
             )
         elif swa_replay_start is None:
-            if self.token_to_kv_pool._unified_kv:
+            if is_unified_kv_triton():
                 # Only the paged readers take these; unified_kv addresses its own
                 # SWA ring (decode streams / prefill indices), so a shape-only
                 # stand-in saves the gather + translate launches every step.
@@ -3877,7 +3878,7 @@ class DeepseekV4HipRadixBackend(
                     swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
                 )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
-        elif self.token_to_kv_pool._unified_kv:
+        elif is_unified_kv_triton():
             # decoder SWA bounded replay under unified_kv: the floor reaches the
             # ring through pf_swa_floor; only the (floored) lengths matter here
             swa_page_indices = seq_lens_casual.new_zeros(
