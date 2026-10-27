@@ -1903,7 +1903,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
                     mxfp4 += sum(
-                        hasattr(getattr(module, name), "mxfp4_preshuffle_tuned")
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
                         for name in _gdn_online_mxfp4
                     )
                     module.finalize_fused_in_proj()
