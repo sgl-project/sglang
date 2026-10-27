@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -580,6 +581,32 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(q._deferred_releases, [])
             device_release.assert_not_called()
 
+    def test_cpu_buffer_keeps_aux_slot_past_timeout_until_all_ranks_drain(self):
+        mgr = _make_manager()
+        q = _make_queue(timeout=-1)
+        q.enable_cpu_buffer = True
+        q.gloo_group = object()
+        entry = _make_decode_req(7, 3, mgr)
+        generation = mgr.register_deferred_abort_room(7)
+        q._defer_release(entry)
+        with (
+            patch.object(decode_mod, "release_kv_cache") as release,
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            q.resolve_deferred_releases()
+            release.assert_not_called()
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+            mgr.note_abort_ack(7, 0, generation)
+            reduce.side_effect = lambda ready, **_: ready.zero_()
+            q.resolve_deferred_releases()
+            release.assert_not_called()
+            reduce.side_effect = None
+            q.resolve_deferred_releases()
+            release.assert_called_once()
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
+            self.assertEqual(q._deferred_releases, [])
+
     def test_holds_until_drained_then_releases(self):
         mgr = _make_manager()
         room, idx = 200, 7
@@ -722,10 +749,13 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             ("mixed", False, rank == 0, 31.0, [0, 1]),
             ("host_ack", True, rank == 0, 10.0, [1]),
             ("host_timeout", True, False, 31.0, [1]),
+            ("cpu_ack", False, rank == 0, 10.0, [1]),
+            ("cpu_timeout", False, False, 31.0, [1]),
         ):
             mgr = _make_manager()
             q = _make_queue()
             q.enable_host_receive = host
+            q.enable_cpu_buffer = scenario.startswith("cpu_")
             dreq = _make_decode_req(42, 0, mgr)
             dreq.host_staged = host
             dreq.kv_receiver.is_abort_release_safe = lambda: drained
@@ -874,6 +904,23 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         with patch.object(decode_mod, "prepare_abort"):
             q.pop_transferred()
         return released
+
+    def test_cpu_buffer_failed_fake_receiver_releases_without_drain(self):
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        q.enable_cpu_buffer = True
+        entry = _make_failed_req(mgr, 7, 3, False)
+        receiver = FakeKVReceiver(mgr, "unused", 7)
+        receiver.abort()
+        entry.kv_receiver = receiver
+        q.queue = [entry]
+        self.assertEqual(self._pop(q), [entry])
+        self.assertEqual(q.queue, [])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
+        self.assertEqual(q.metadata_buffers.bootstrap_room[3], 0)
+        self.assertFalse(receiver.abort_notified)
 
     def test_non_abort_failure_notifies_and_defers(self):
         mgr = _make_manager()

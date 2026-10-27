@@ -126,6 +126,15 @@ class Disagg(msgspec.Struct):
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
 
+    nixl_use_cpu_buffer: A[
+        bool,
+        "Stage NIXL KV transfers through pageable CPU memory (TDX/CC). "
+        "Requires matching TP layouts, PP=CP=DCP=1, and no extra model state.",
+    ] = False
+    nixl_cpu_buffer_size_gb: A[
+        float, "Per-rank pageable NIXL staging pool size in GiB."
+    ] = 16.0
+
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
     # -------------------------------------------------------------------------

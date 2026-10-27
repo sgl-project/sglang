@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MiniMaxSparseKVPool,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 NestedInts = Sequence[int] | Sequence[Sequence[int]]
@@ -53,10 +54,10 @@ def page_indices_for_request(
 
 def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
-) -> Optional[torch.Tensor]:
+) -> Optional[torch.Tensor | list[torch.Tensor]]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if isinstance(pool, HybridLinearKVPool):
-        return (
+        mamba = (
             scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.kv.req_pool_idx
             ]
@@ -64,6 +65,19 @@ def state_indices_for_request(
             .contiguous()
             .reshape(-1)
         )
+        if isinstance(pool, QSATokenToKVPool):
+            pending = torch.tensor(
+                [req.kv.req_pool_idx], dtype=torch.int64, device=mamba.device
+            )
+            compressed = page_indices_for_request(scheduler, req, seq_len, start_idx)
+            # Match the registered MAMBA, QSA_PENDING, QSA_COMPRESSED order.
+            # Each component uses a different physical address space.
+            return (
+                [mamba] * len(pool.get_state_buf_infos()[0])
+                + [pending] * len(pool.get_qsa_pending_state_buf_infos()[0])
+                + [compressed] * len(pool.get_qsa_compressed_state_buf_infos()[0])
+            )
+        return mamba
     if isinstance(pool, SWAKVPool):
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size
@@ -108,7 +122,7 @@ class KvChecksumComputer:
     def compute(
         self,
         kv_page_indices_gpu: torch.Tensor,
-        state_indices_gpu: Optional[torch.Tensor] = None,
+        state_indices_gpu: Optional[torch.Tensor | Sequence[torch.Tensor]] = None,
     ) -> int:
         assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
         all_ptrs = list(self._kv_data_ptrs)
@@ -118,8 +132,14 @@ class KvChecksumComputer:
         )
         if self._state_data_ptrs:
             assert state_indices_gpu is not None
-            assert state_indices_gpu.is_cuda and state_indices_gpu.is_contiguous()
+            indices = (
+                [state_indices_gpu] * len(self._state_data_ptrs)
+                if isinstance(state_indices_gpu, torch.Tensor)
+                else list(state_indices_gpu)
+            )
+            assert len(indices) == len(self._state_data_ptrs)
+            assert all(idx.is_cuda and idx.is_contiguous() for idx in indices)
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
-            all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
+            all_indices += indices
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)
