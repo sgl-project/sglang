@@ -1600,6 +1600,11 @@ class Envs:
     # ===================================================================
     # Mamba state and cache
     # ===================================================================
+    # FlashKDA (--linear-attn-prefill-backend flashkda) hands batches whose
+    # longest request exceeds this many tokens to the Triton chunk_kda kernel
+    # (the branch-measured crossover). Raise it to keep long prefills on the
+    # fused CUTLASS kernel.
+    SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
@@ -2057,6 +2062,15 @@ class Envs:
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
     # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
+
+    # ===================================================================
+    # Context parallel (zigzag prefill)
+    # ===================================================================
+    # Run the two zigzag query blocks (prev/next) of a CP rank as ONE
+    # flash-attention varlen launch (2 sequences per request sharing the same
+    # K/V rows through per-sequence base offsets + seqused_k) instead of two
+    # launches. Expanded-MHA (contiguous K/V) path only.
+    SGLANG_CP_ZIGZAG_SINGLE_LAUNCH = EnvBool(False)
 
     # ===================================================================
     # Kimi K3

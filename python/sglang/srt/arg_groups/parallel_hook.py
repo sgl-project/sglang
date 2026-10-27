@@ -153,6 +153,8 @@ def handle_context_parallelism(server_args: Any):
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
         )
 
+    resolve_linear_attn_cp(server_args)
+
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size

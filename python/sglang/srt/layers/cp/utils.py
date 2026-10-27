@@ -145,7 +145,7 @@ def is_mla_cp_active(forward_batch) -> bool:
     return is_mla_cp_enabled() and is_cp_active(forward_batch)
 
 
-def prepare_cp_forward(forward_batch) -> None:
+def prepare_cp_forward(forward_batch, *, full_sequence: bool = False) -> None:
     """Build CP metadata for an active context-parallel prefill batch."""
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
