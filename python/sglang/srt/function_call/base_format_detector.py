@@ -367,6 +367,15 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
+    @classmethod
+    def parses_without_tools(cls) -> bool:
+        """Return True if tool-call markup is parsed even when a request
+        declares no tools, so a call to an undeclared tool is not left in content."""
+        return False
+
+    def get_required_tool_parser(self, tool_choice):
+        return None
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

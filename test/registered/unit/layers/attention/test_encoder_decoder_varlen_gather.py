@@ -22,7 +22,7 @@ with patch.dict(
     from sglang.srt.layers.attention import xpu_backend
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestEncoderDecoderForward(unittest.TestCase):
@@ -185,6 +185,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         backend.use_sliding_window_kv_pool = False
         backend.attention_chunk_size = None
         backend.topk = 0
+        backend.dcp_size = 1
         # req_to_token[i, j] = 100*i + j, so gathered values reveal (row, col).
         req_to_token = torch.arange(16).unsqueeze(0) + torch.tensor([[0], [100]])
         backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)

@@ -9,6 +9,7 @@ when you register a parser.
 
 TOOL_CALL_PARSER_NAMES = [
     "apertus2509",
+    "beam",
     "cohere_command4",
     "deepseekv3",
     "deepseekv31",
@@ -49,4 +50,6 @@ TOOL_CALL_PARSER_NAMES = [
     "gigachat35",
     "gemma4",
     "inkling",
+    "iquest_q1",
+    "response_template",
 ]

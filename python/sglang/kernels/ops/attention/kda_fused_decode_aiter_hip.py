@@ -15,7 +15,7 @@ _WARMED: set[tuple[int, float, float]] = set()
 
 
 def enabled() -> bool:
-    return os.environ.get("SGLANG_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
+    return os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
 
 
 def _ops():

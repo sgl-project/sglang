@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -21,7 +22,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 PHYSICAL = 690240
 CONTEXT = 1048576
@@ -78,6 +79,7 @@ def make_worker(dcp_size):
     runner.max_total_num_tokens = PHYSICAL
     runner.max_running_requests = 64
     runner.token_to_kv_pool = kv
+    runner.token_to_kv_pool_allocator = None
     runner.req_to_token_pool = ReqToTokenPool.__new__(ReqToTokenPool)
     runner.req_to_token_pool.size = 96
     runner.req_to_token_pool.max_context_len = CONTEXT
@@ -107,6 +109,20 @@ class TestDcpLogicalCapacity(CustomTestCase):
             config.start()
             self.addCleanup(config.stop)
 
+    def test_sharded_worker_request_limits(self):
+        worker = self.make_worker(1)
+        runner = worker.model_runner
+        runner.max_total_num_tokens = 64
+        allocator = PageInterleavePoolAllocator.__new__(PageInterleavePoolAllocator)
+        allocator.shard_size = 3
+        runner.token_to_kv_pool_allocator = allocator
+
+        info = TpModelWorker.get_worker_info(worker)
+
+        self.assertEqual(info[0], 64)
+        self.assertEqual(info[4], 64 * 3 - 1)
+        self.assertEqual(info[5], 64 * 3 - 6)
+
     def test_logical_capacity(self):
         for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):
@@ -133,6 +149,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.swa_max_total_num_tokens = 16
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
+
+    def test_short_pool_warning_uses_served_capacity(self):
+        # dcp1 serves 690K < 1M and warns; dcp2 widens the same rows to 1.38M.
+        with self.assertLogs("sglang.srt.managers.tp_worker", "WARNING") as cm:
+            TpModelWorker.get_worker_info(self.make_worker(1))
+        self.assertIn(f"{PHYSICAL} tokens", cm.output[0])
+        with self.assertNoLogs("sglang.srt.managers.tp_worker", "WARNING"):
+            TpModelWorker.get_worker_info(self.make_worker(2))
 
 
 if __name__ == "__main__":
