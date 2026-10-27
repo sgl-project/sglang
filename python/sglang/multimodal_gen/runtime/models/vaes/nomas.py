@@ -649,6 +649,26 @@ class NomasStreamingDecoder:
 
 
 class NomasPixelUMMDecoder(nn.Module):
+    def fp8_quantized_layer_names(self) -> tuple[str, ...]:
+        """Decoder projections serialized as FP8 by the official checkpoint."""
+        projections = (
+            "attn.q_proj",
+            "attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+        return tuple(
+            f"decoder.layers.{i}.{projection}"
+            for i in range(len(self.decoder.layers))
+            for projection in projections
+        )
+
+    @staticmethod
+    def checkpoint_key_filter(name: str) -> bool:
+        """Official VAE checkpoints also contain a DCAE encoder unused by decode."""
+        return not name.startswith("encoder.")
+
     def __init__(self, config: NomasVAEConfig):
         super().__init__()
         self.config = config

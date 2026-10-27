@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import os
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -439,6 +440,7 @@ def _assign_direct_gpu_vae_state(
     component_name: str,
     device: torch.device,
     vae_config: VAEConfig,
+    key_filter: Callable[[str], bool] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
     num_deparameterized = adopt_plain_weight_norm_state(
@@ -450,7 +452,7 @@ def _assign_direct_gpu_vae_state(
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu"
+            weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
         ):
             name = raw_name
             if name in metadata_names:
@@ -662,17 +664,6 @@ class VAELoader(WeightOverrideComponentLoader):
             vae = current_platform.optimize_vae(vae)
             return vae
 
-        # Load from ModelRegistry (standard VAE classes)
-        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        vae = initialize_model(
-            vae_cls,
-            {"config": vae_config},
-            vae_dtype,
-            torch.device("meta") if direct_gpu_weight_loading else None,
-        )
-        if not direct_gpu_weight_loading:
-            vae = vae.to(target_device)
-
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
                 raise ValueError(
@@ -700,13 +691,40 @@ class VAELoader(WeightOverrideComponentLoader):
         assert len(safetensors_list) >= 1, (
             f"Found no safetensors files in {component_weights_path}"
         )
-        if direct_gpu_weight_loading:
+        # Load from ModelRegistry (standard VAE classes)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        fp8_shapes = None
+        if vae_cls.__name__ == "NomasPixelUMMDecoder":
+            from sglang.multimodal_gen.runtime.layers.quantization.configs.nomas_fp8_config import (
+                configure_nomas_fp8,
+                inspect_nomas_fp8_checkpoint,
+            )
+
+            fp8_shapes = inspect_nomas_fp8_checkpoint(safetensors_list)
+            if fp8_shapes is not None and vae_dtype != torch.bfloat16:
+                raise ValueError("PixelUMM FP8 requires BF16 VAE compute precision")
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta")
+            if direct_gpu_weight_loading or fp8_shapes is not None
+            else None,
+        )
+        if fp8_shapes is not None:
+            configure_nomas_fp8(vae, fp8_shapes)
+        if not direct_gpu_weight_loading and fp8_shapes is None:
+            vae = vae.to(target_device)
+
+        checkpoint_key_filter = getattr(vae, "checkpoint_key_filter", None)
+        if direct_gpu_weight_loading or fp8_shapes is not None:
             adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
                 component_name=component_name,
                 device=target_device,
                 vae_config=vae_config,
+                key_filter=checkpoint_key_filter,
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
@@ -722,7 +740,14 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(_load_safetensors_file(sf_path))
+            state = _load_safetensors_file(sf_path)
+            if checkpoint_key_filter is not None:
+                state = {
+                    name: tensor
+                    for name, tensor in state.items()
+                    if checkpoint_key_filter(name)
+                }
+            loaded.update(state)
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()

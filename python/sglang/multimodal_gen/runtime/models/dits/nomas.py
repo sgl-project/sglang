@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nomas_int8_config import (
+    NomasInt8Config,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -276,10 +279,15 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config=None,
         attention_backend="auto",
     ):
-        if quant_config is not None:
-            raise ValueError("Nomas does not support quantized weights yet")
-        if config.quant_config is not None:
-            raise NotImplementedError("Nomas v1 does not implement quantized loading")
+        if (
+            quant_config is not None
+            and config.quant_config is not None
+            and quant_config is not config.quant_config
+        ):
+            raise ValueError("Conflicting Nomas quantization configs")
+        quant_config = quant_config or config.quant_config
+        if quant_config is not None and not isinstance(quant_config, NomasInt8Config):
+            raise ValueError("Nomas supports only its official INT8 checkpoint format")
         if attention_backend == "auto":
             # FA3 + log-sum-exp merge is about 2x FlexAttention on Hopper.
             attention_backend = "fa3" if current_platform.is_hopper() else "flex"
@@ -316,6 +324,9 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.extrinsics_embedding_camctrl = nn.Linear(64, 64)
         self.c2ws_hidden_states_layer1 = nn.Linear(64, 64)
         self.c2ws_hidden_states_layer2 = nn.Linear(64, 64)
+        if quant_config is not None:
+            quant_config.remap_checkpoint_prefixes(self.param_names_mapping)
+            quant_config.configure_model(self)
 
     def post_load_weights(self):
         # Meta initialization / to_empty() does not restore nonpersistent buffers

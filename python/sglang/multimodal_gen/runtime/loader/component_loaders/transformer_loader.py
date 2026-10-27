@@ -17,6 +17,10 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nomas_int8_config import (
+    NomasInt8Config,
+    inspect_nomas_int8_checkpoint,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
 )
@@ -315,6 +319,15 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             )
 
         checkpoint_quant_config = None
+        if model_cls.__name__ == "NomasTransformer3DModel":
+            for path in safetensors_list:
+                nomas_quant_config = inspect_nomas_int8_checkpoint(path)
+                if nomas_quant_config is not None:
+                    if len(safetensors_list) != 1:
+                        raise ValueError(
+                            "Nomas INT8 requires one complete safetensors file"
+                        )
+                    checkpoint_quant_config = nomas_quant_config
         if is_minimax_h3:
             selected_variant = str(component_server_args.model_variant or "fl2va")
             if gguf_file is not None:
@@ -379,6 +392,10 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if use_fsdp and isinstance(quant_spec.quant_config, NomasInt8Config):
+            raise ValueError(
+                "Nomas INT8 does not support FSDP; use TP and/or Ulysses SP"
+            )
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
@@ -499,6 +516,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
+                    or isinstance(quant_spec.quant_config, NomasInt8Config)
                     or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),
