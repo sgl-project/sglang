@@ -58,6 +58,20 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if let Some(error) = error {
         tracing::warn!(%error, "OpenAI chat completions disabled");
     }
+    // recipe parses a DeepSeek model's output in place of the server's parsers;
+    // Python refuses to start where it cannot.
+    let deepseek = formatter.as_ref().map(|formatter| {
+        sglang_processor::openai::ChatModel::for_formatter(formatter)
+            .deepseek_output(
+                server_args.reasoning_parser.as_deref(),
+                server_args.tool_call_parser.as_deref(),
+            )
+            .map(|_| ())
+    });
+    if let Some(Err(error)) = deepseek {
+        tracing::warn!(%error, "OpenAI chat completions disabled");
+        return None;
+    }
     formatter
 }
 

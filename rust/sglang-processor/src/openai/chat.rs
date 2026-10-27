@@ -26,13 +26,52 @@ use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
 use crate::think::{ReasoningDefault, ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
+
 #[cfg(feature = "render")]
-use crate::{
-    DeepSeekDelta, DeepSeekFinish, DeepSeekOutput, DeepSeekOutputParser, DeepSeekRequestOutput,
-    StopMatch, select_new_output_ids,
-};
-#[cfg(feature = "render")]
-use sglang_api_types::api::v1::{FinishReason, matched};
+mod deepseek;
+/// Without `render` there is no recipe: requests whose output it would parse
+/// fall back.
+#[cfg(not(feature = "render"))]
+mod deepseek {
+    use serde_json::Value;
+    use sglang_api_types::api::v1::{GenerateMetaInfo, GenerateResponse};
+
+    use super::{ChatModel, OpenAiSettings, ToolCallItem, Unsupported};
+
+    pub(super) enum DeepSeekParsing {}
+
+    pub(super) fn parsing(
+        model: &ChatModel,
+        settings: &OpenAiSettings,
+        _request: &Value,
+        _has_tools: bool,
+    ) -> Result<Option<DeepSeekParsing>, Unsupported> {
+        match model.recipe_parses_output(
+            settings.reasoning_parser.as_deref(),
+            settings.tool_call_parser.as_deref(),
+        )? {
+            true => Err(Unsupported("reasoning_parser")),
+            false => Ok(None),
+        }
+    }
+
+    impl DeepSeekParsing {
+        pub(super) fn unary(&self, _: &GenerateResponse) -> (String, String, Vec<ToolCallItem>) {
+            match *self {}
+        }
+
+        pub(super) fn stream(
+            &mut self,
+            _: u64,
+            _: &GenerateResponse,
+            _: &GenerateMetaInfo,
+            _: Option<&str>,
+            _: bool,
+        ) -> ((String, String, Vec<ToolCallItem>), bool) {
+            match *self {}
+        }
+    }
+}
 
 /// Facts about the served model that Python's chat layer reads.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -54,10 +93,30 @@ pub struct ChatModel {
     /// `"dsv41"` output.
     #[serde(default)]
     pub chat_encoding_spec: Option<String>,
-    /// The checkpoint tokenizer DeepSeek-V4 / V4.1 output is parsed with.
+    /// The served DeepSeek-V4 / V4.1 checkpoint, whose output recipe parses
+    /// with its tokenizer.
     #[cfg(feature = "render")]
     #[serde(skip)]
-    pub deepseek_tokenizer: Option<Arc<crate::DeepSeekTokenizer>>,
+    pub deepseek: Option<crate::DeepSeekOutput>,
+}
+
+/// Why recipe cannot parse a DeepSeek model's output under the server's parsers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DeepSeekOutputError {
+    /// Python rejects this at startup.
+    #[error("a DeepSeek reasoning or tool-call parser is mixed with another model's parser")]
+    MixedParsers,
+    #[error("DeepSeek output parsing needs the checkpoint's tokenizer.json")]
+    NoTokenizer,
+}
+
+impl From<DeepSeekOutputError> for Unsupported {
+    fn from(error: DeepSeekOutputError) -> Self {
+        match error {
+            DeepSeekOutputError::MixedParsers => Unsupported("reasoning_parser"),
+            DeepSeekOutputError::NoTokenizer => Unsupported("no_tokenizer"),
+        }
+    }
 }
 
 impl ChatModel {
@@ -65,11 +124,16 @@ impl ChatModel {
     /// `formatter`; the host fills in the rest.
     #[cfg(feature = "render")]
     pub fn for_formatter(formatter: &crate::ChatFormatter) -> Self {
-        use crate::ChatFormatter;
-        let (chat_encoding_spec, deepseek_tokenizer) = match formatter {
+        use crate::{ChatFormatter, DeepSeekOutput};
+        let deepseek = |v41, tokenizer: &Option<Arc<crate::DeepSeekTokenizer>>| {
+            tokenizer
+                .clone()
+                .map(|tokenizer| DeepSeekOutput::new(v41, tokenizer))
+        };
+        let (chat_encoding_spec, deepseek) = match formatter {
             ChatFormatter::KimiK3 => (Some("kimi_k3"), None),
-            ChatFormatter::DeepSeekV4(tokenizer) => (Some("dsv4"), tokenizer.clone()),
-            ChatFormatter::DeepSeekV41(tokenizer) => (Some("dsv41"), tokenizer.clone()),
+            ChatFormatter::DeepSeekV4(tokenizer) => (Some("dsv4"), deepseek(false, tokenizer)),
+            ChatFormatter::DeepSeekV41(tokenizer) => (Some("dsv41"), deepseek(true, tokenizer)),
             _ => (None, None),
         };
         Self {
@@ -81,41 +145,50 @@ impl ChatModel {
                 }
             }),
             chat_encoding_spec: chat_encoding_spec.map(str::to_owned),
-            deepseek_tokenizer,
+            deepseek,
             ..Self::default()
         }
     }
 
-    /// Whether recipe parses the output under the server's parsers, in their place.
+    /// `ADAPTER_OUTPUT_PARSERS`: whether recipe parses the output in place of
+    /// the server's parsers, once one of the model's DeepSeek parsers is set.
     fn recipe_parses_output(
         &self,
         reasoning_parser: Option<&str>,
         tool_call_parser: Option<&str>,
-    ) -> Result<bool, Unsupported> {
-        recipe_parses_output(
-            self.chat_encoding_spec.as_deref(),
-            reasoning_parser,
-            tool_call_parser,
-        )
-        .map_err(|_| Unsupported("reasoning_parser"))
+    ) -> Result<bool, DeepSeekOutputError> {
+        let (reasoning, tool) = match self.chat_encoding_spec.as_deref() {
+            Some("dsv4") => ("deepseek-v4", "deepseekv4"),
+            Some("dsv41") => ("deepseek-v41", "deepseekv41"),
+            _ => return Ok(false),
+        };
+        if reasoning_parser != Some(reasoning) && tool_call_parser != Some(tool) {
+            return Ok(false);
+        }
+        match reasoning_parser.is_none_or(|name| name == reasoning)
+            && tool_call_parser.is_none_or(|name| name == tool)
+        {
+            true => Ok(true),
+            false => Err(DeepSeekOutputError::MixedParsers),
+        }
     }
 
-    /// The DeepSeek output recipe parses under the server's parsers
+    /// The checkpoint whose output recipe parses under the server's parsers
     /// (`DeepSeekRecipeChatEncodingAdapter.output`).
     #[cfg(feature = "render")]
     pub fn deepseek_output(
         &self,
         reasoning_parser: Option<&str>,
         tool_call_parser: Option<&str>,
-    ) -> Result<Option<DeepSeekOutput>, Unsupported> {
-        if !self.recipe_parses_output(reasoning_parser, tool_call_parser)? {
-            return Ok(None);
+    ) -> Result<Option<&crate::DeepSeekOutput>, DeepSeekOutputError> {
+        match self.recipe_parses_output(reasoning_parser, tool_call_parser)? {
+            true => self
+                .deepseek
+                .as_ref()
+                .map(Some)
+                .ok_or(DeepSeekOutputError::NoTokenizer),
+            false => Ok(None),
         }
-        let (Some(spec), Some(tokenizer)) = (&self.chat_encoding_spec, &self.deepseek_tokenizer)
-        else {
-            return Err(Unsupported("no_tokenizer"));
-        };
-        Ok(Some(DeepSeekOutput::new(spec, tokenizer.clone())))
     }
 
     fn is_kimi_k3(&self) -> bool {
@@ -197,30 +270,6 @@ fn template_kwargs<'a>(
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
     kwargs
-}
-
-/// `ADAPTER_OUTPUT_PARSERS`: whether recipe parses a `spec` model's output
-/// under the server's parsers, once one of the spec's parsers is configured.
-/// `Err` for a DeepSeek parser mixed with another, which Python rejects at startup.
-fn recipe_parses_output(
-    spec: Option<&str>,
-    reasoning_parser: Option<&str>,
-    tool_call_parser: Option<&str>,
-) -> Result<bool, ()> {
-    let (reasoning, tool) = match spec {
-        Some("dsv4") => ("deepseek-v4", "deepseekv4"),
-        Some("dsv41") => ("deepseek-v41", "deepseekv41"),
-        _ => return Ok(false),
-    };
-    if reasoning_parser != Some(reasoning) && tool_call_parser != Some(tool) {
-        return Ok(false);
-    }
-    match reasoning_parser.is_none_or(|name| name == reasoning)
-        && tool_call_parser.is_none_or(|name| name == tool)
-    {
-        true => Ok(true),
-        false => Err(()),
-    }
 }
 
 /// A chat template's reasoning toggle (`ReasoningToggleConfig`).
@@ -392,13 +441,9 @@ pub fn lower_chat(
     let reasoning_parser = settings.reasoning_parser.as_deref();
     let tool_call_parser = settings.tool_call_parser.as_deref();
     // recipe parses DeepSeek output from its token ids in place of both parsers.
-    let recipe_output = model.recipe_parses_output(reasoning_parser, tool_call_parser)?;
-    #[cfg(not(feature = "render"))]
-    if recipe_output {
-        return Err(Unsupported("reasoning_parser"));
-    }
+    let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
     let parser = match reasoning_parser {
-        Some(name) if !recipe_output => {
+        Some(name) if deepseek.is_none() => {
             Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
         }
         _ => None,
@@ -418,7 +463,7 @@ pub fn lower_chat(
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
     let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
-        (Some(parser), Some(_), Some(definitions)) if !recipe_output => {
+        (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
             tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
             Some((parser.to_owned(), definitions.clone()))
         }
@@ -447,31 +492,6 @@ pub fn lower_chat(
         return Err(Unsupported("no_tokenizer"));
     }
     let prompt_ids = render(&original).ok_or(Unsupported("render"))?;
-    #[cfg(feature = "render")]
-    let deepseek = match model.deepseek_output(reasoning_parser, tool_call_parser)? {
-        Some(output) => {
-            let defaults = settings
-                .default_chat_template_kwargs
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let parse_tool_calls = tool_call_parser.is_some() && tools.is_some();
-            let request = output
-                .for_request(
-                    &original,
-                    &defaults,
-                    reasoning_parser.is_some(),
-                    parse_tool_calls,
-                )
-                .map_err(|_| Unsupported("invalid_request"))?;
-            Some(DeepSeekParsing {
-                request,
-                parsers: HashMap::new(),
-            })
-        }
-        None => None,
-    };
 
     let kwargs = template_kwargs(
         request.chat_template_kwargs.take().unwrap_or_default(),
@@ -582,10 +602,13 @@ pub fn lower_chat(
         history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
-        reasoning,
-        tools: tool_parsing,
-        #[cfg(feature = "render")]
-        deepseek,
+        parsing: match deepseek {
+            Some(deepseek) => OutputParsing::DeepSeek(deepseek),
+            None => OutputParsing::Text {
+                reasoning,
+                tools: tool_parsing,
+            },
+        },
         include_usage,
         continuous_usage_stats,
         settings: settings.clone(),
@@ -1014,11 +1037,27 @@ struct ReasoningConfig {
     options: ReasoningOptions,
 }
 
-/// recipe's parse of DeepSeek output (`DeepSeekRecipeChatEncodingAdapter`).
-#[cfg(feature = "render")]
-struct DeepSeekParsing {
-    request: DeepSeekRequestOutput,
-    parsers: HashMap<u64, DeepSeekOutputParser>,
+/// How the responder parses the output.
+enum OutputParsing {
+    /// The reasoning parser, and the tool parser with the request's tools,
+    /// over the output text.
+    Text {
+        reasoning: Option<ReasoningConfig>,
+        tools: Option<(String, Vec<Value>)>,
+    },
+    /// recipe over the output token ids, in place of both parsers.
+    DeepSeek(deepseek::DeepSeekParsing),
+}
+
+impl OutputParsing {
+    /// The reasoning config and the tool parser with its tools; none when
+    /// recipe parses.
+    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&(String, Vec<Value>)>) {
+        match self {
+            OutputParsing::Text { reasoning, tools } => (reasoning.as_ref(), tools.as_ref()),
+            OutputParsing::DeepSeek(_) => (None, None),
+        }
+    }
 }
 
 /// Builds the OpenAI chat response from the engine's `/generate` output.
@@ -1030,12 +1069,7 @@ pub struct ChatResponder {
     history_tool_calls: i64,
     n: usize,
     logprobs: bool,
-    reasoning: Option<ReasoningConfig>,
-    /// The tool parser and request tools when the output is parsed for tool calls.
-    tools: Option<(String, Vec<Value>)>,
-    /// Set in place of `reasoning` and `tools` when recipe parses the output.
-    #[cfg(feature = "render")]
-    deepseek: Option<DeepSeekParsing>,
+    parsing: OutputParsing,
     include_usage: bool,
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
@@ -1106,36 +1140,20 @@ impl ChatResponder {
         )
     }
 
-    /// One choice's whole output as `(reasoning, content, tool calls)`, the
-    /// calls as `_process_tool_calls` parses them.
+    /// One choice's whole output as `(reasoning, content, tool calls)`; the
+    /// text parsers' calls as `_process_tool_calls` parses them.
     fn parse_output(&self, item: &GenerateResponse) -> (String, String, Vec<ToolCallItem>) {
-        #[cfg(feature = "render")]
-        if let Some(deepseek) = &self.deepseek {
-            let finish = item
-                .meta_info
-                .as_ref()
-                .and_then(|m| m.finish_reason.as_ref());
-            let delta = deepseek
-                .request
-                .parser()
-                .finish(output_ids(item), deepseek_finish(finish));
-            let calls = delta
-                .whole_tool_calls()
-                .into_iter()
-                .map(|call| ToolCallItem {
-                    tool_index: call.index as i64,
-                    name: call.name,
-                    parameters: call.arguments,
-                });
-            return (delta.reasoning, delta.content, calls.collect());
+        if let OutputParsing::DeepSeek(deepseek) = &self.parsing {
+            return deepseek.unary(item);
         }
+        let (reasoning_config, tools) = self.parsing.text_parsers();
         let mut text = item.text.clone();
         let mut reasoning = String::new();
-        if let Some(config) = &self.reasoning {
+        if let Some(config) = reasoning_config {
             (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
         }
         let mut calls = Vec::new();
-        if let Some((parser, tools)) = &self.tools
+        if let Some((parser, tools)) = tools
             && let Some(detector) = tool_detector(parser, tools)
             && detector.has_tool_call(&text)
         {
@@ -1215,12 +1233,17 @@ impl ChatResponder {
             ));
         }
 
-        #[cfg(feature = "render")]
-        if self.deepseek.is_some() {
-            let delta = self.deepseek_step(index, content, &meta, finish_type.as_deref());
+        if let OutputParsing::DeepSeek(deepseek) = &mut self.parsing {
+            let incremental = self.settings.incremental_streaming_output;
+            let (delta, called) =
+                deepseek.stream(index, content, &meta, finish_type.as_deref(), incremental);
+            if called {
+                self.has_tool_calls.insert(index);
+            }
             events.extend(self.token_output_chunks(index, delta, logprobs));
             return events;
         }
+        let (reasoning_config, tools) = self.parsing.text_parsers();
         // `_generate_stream_content`.
         let text = content.text.as_str();
         let mut delta = match self.settings.incremental_streaming_output {
@@ -1235,7 +1258,7 @@ impl ChatResponder {
             }
         };
         let mut remaining_logprobs = logprobs;
-        if let Some(config) = &self.reasoning {
+        if let Some(config) = reasoning_config {
             let detector = self
                 .detectors
                 .entry(index)
@@ -1257,10 +1280,9 @@ impl ChatResponder {
                 ));
             }
         }
-        if self.tools.is_some() {
+        if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
-            let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
                 tool_detector(&tools.0, &tools.1).expect("checked when lowering")
             });
@@ -1316,67 +1338,37 @@ impl ChatResponder {
         events
     }
 
-    /// `stream_chat_chunks`: what one frame's new ids add to the choice's parse.
-    #[cfg(feature = "render")]
-    fn deepseek_step(
-        &mut self,
-        index: u64,
-        content: &GenerateResponse,
-        meta: &GenerateMetaInfo,
-        finish_type: Option<&str>,
-    ) -> DeepSeekDelta {
-        let deepseek = self.deepseek.as_mut().expect("recipe parses the output");
-        let parser = deepseek
-            .parsers
-            .entry(index)
-            .or_insert_with(|| deepseek.request.parser());
-        let ids = select_new_output_ids(
-            output_ids(content),
-            parser.num_consumed_tokens(),
-            meta.completion_tokens as usize,
-            finish_type == Some("abort"),
-            self.settings.incremental_streaming_output,
-        );
-        let finish = finish_type.map(|_| deepseek_finish(meta.finish_reason.as_ref()));
-        let delta = parser.step(ids, finish);
-        if parser.has_tool_calls() {
-            self.has_tool_calls.insert(index);
-        }
-        delta
-    }
-
     /// `token_output_sse_chunks`: a reasoning chunk, a content chunk, then one
-    /// chunk per tool call; the step's logprobs ride on the first.
-    #[cfg(feature = "render")]
+    /// chunk per tool-call piece. The step's logprobs ride on the reasoning or
+    /// content chunk, else on a chunk of their own.
     fn token_output_chunks(
         &self,
         index: u64,
-        delta: DeepSeekDelta,
+        (reasoning, content, pieces): (String, String, Vec<ToolCallItem>),
         mut logprobs: Option<Value>,
     ) -> Vec<String> {
         let usage = self.chunk_usage(index);
         let mut events = Vec::new();
-        if !delta.reasoning.is_empty() {
-            let delta = json!({"reasoning_content": delta.reasoning});
+        if !reasoning.is_empty() {
+            let delta = json!({"reasoning_content": reasoning});
             events.push(self.chunk(index, delta, logprobs.take(), usage.clone()));
         }
-        if !delta.content.is_empty() {
-            let delta = json!({"reasoning_content": null, "content": delta.content});
+        if !content.is_empty() {
+            let delta = json!({"reasoning_content": null, "content": content});
             events.push(self.chunk(index, delta, logprobs.take(), usage.clone()));
         }
-        for call in delta.tool_calls {
-            let named = call.name.is_some();
-            let item = ToolCallItem {
-                tool_index: call.index as i64,
-                name: call.name.unwrap_or_default(),
-                parameters: call.arguments,
-            };
-            let mut tool_call = self.tool_call(item.tool_index, &item);
+        for piece in pieces {
             // The first piece of a call names it; later pieces extend its arguments.
-            if !named {
-                tool_call["id"] = Value::Null;
-                tool_call["function"]["name"] = Value::Null;
-            }
+            let named = !piece.name.is_empty();
+            let tool_call = json!({
+                "id": named.then(tool_call_id),
+                "index": piece.tool_index,
+                "type": "function",
+                "function": {
+                    "name": named.then_some(piece.name),
+                    "arguments": piece.parameters,
+                },
+            });
             let delta = json!({
                 "role": null,
                 "content": null,
@@ -1436,7 +1428,12 @@ impl ChatResponder {
 
     /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
     fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
-        let id = match self.tools.as_ref().map(|(parser, _)| parser.as_str()) {
+        let id = match self
+            .parsing
+            .text_parsers()
+            .1
+            .map(|(parser, _)| parser.as_str())
+        {
             Some("kimi_k3") => format!(
                 "{}:{}",
                 call.name,
@@ -1527,29 +1524,6 @@ impl ChatResponder {
             .ok()
             .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id))
             .unwrap_or_else(|| text.as_bytes().to_vec())
-    }
-}
-
-#[cfg(feature = "render")]
-fn output_ids(item: &GenerateResponse) -> &[i64] {
-    item.output_ids.as_ref().map_or(&[], |ids| &ids.ids)
-}
-
-/// The engine's finish reason as recipe's parser takes it; a type other than
-/// `stop` and `length` ends the parse without a backend finish.
-#[cfg(feature = "render")]
-fn deepseek_finish(reason: Option<&FinishReason>) -> DeepSeekFinish<'_> {
-    let Some(reason) = reason else {
-        return DeepSeekFinish::Abort;
-    };
-    match reason.kind_name().as_deref() {
-        Some("stop") => DeepSeekFinish::Stop(match reason.matched() {
-            Some(matched::Value::Token(id)) => Some(StopMatch::Token(*id)),
-            Some(matched::Value::Str(stop)) => Some(StopMatch::Text(stop)),
-            _ => None,
-        }),
-        Some("length") => DeepSeekFinish::Length,
-        _ => DeepSeekFinish::Abort,
     }
 }
 

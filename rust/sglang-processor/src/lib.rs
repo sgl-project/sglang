@@ -5,7 +5,7 @@
 //! `dynamo-renderer`, `dynamo-tokenizers`, and `dynamo-parsers`. Hosts own
 //! request types, sampling, validation, transport, and runtime.
 
-#[cfg(feature = "render")]
+#[cfg(all(feature = "render", feature = "openai"))]
 mod deepseek_output;
 mod error;
 #[cfg(any(feature = "parser", feature = "openai"))]
@@ -27,10 +27,10 @@ mod tokenizer;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod tool_call;
 
-#[cfg(feature = "render")]
+#[cfg(all(feature = "render", feature = "openai"))]
 pub use deepseek_output::{
-    DeepSeekDelta, DeepSeekFinish, DeepSeekOutput, DeepSeekOutputParser, DeepSeekRequestOutput,
-    DeepSeekToolCall, DeepSeekToolCallDelta, StopMatch, select_new_output_ids,
+    DeepSeekDelta, DeepSeekFinish, DeepSeekOutput, DeepSeekOutputOptions, DeepSeekOutputParser,
+    DeepSeekStopMatch, DeepSeekToolCall, DeepSeekToolCallDelta,
 };
 pub use error::ProcessorError;
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};

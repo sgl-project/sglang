@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use deepseek_recipe::openai::ChatCompletionRequest;
 use deepseek_recipe::request::{ConversationRequest, ConversionOptions, ProtocolRequest};
-use deepseek_recipe::stream::ThinkingInitialStage;
 use deepseek_recipe_core::special_tokens::SpecialTokensMap;
 use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
@@ -16,7 +15,7 @@ use dynamo_renderer::{RenderedPrompt, RenderedSegment};
 use serde_json::{Map, Value, json};
 use tokenizers::{AddedVocabulary, Tokenizer};
 
-use super::pydantic_dump::{function_dump, pydantic_bool};
+use super::pydantic_dump::{continues_final_message, function_dump, pydantic_bool};
 use crate::py::python_json_compact;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -62,6 +61,7 @@ impl DeepSeekTokenizer {
     }
 
     /// The tokenizer with its added vocabulary, which output parsing decodes with.
+    #[cfg(feature = "openai")]
     pub(crate) fn full(&self) -> &Arc<Tokenizer> {
         &self.full
     }
@@ -100,29 +100,14 @@ pub(crate) fn render(
 ) -> Result<RenderedPrompt, String> {
     let thinking = thinking(&request, defaults);
     let (effort, budget) = effort(v41, &request, defaults)?;
-    let task = request
-        .get("task")
-        .filter(|task| !task.is_null())
-        .map(|task| task.as_str().ok_or("task must be a string"))
-        .transpose()?;
-    let mut continue_final = request
-        .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?;
+    let task = task(&request)?;
+    let mut continue_final = continues_final_message(&request)?;
 
     let mut messages = match &request["messages"] {
         Value::Array(messages) => messages.clone(),
         _ => return Err("messages must be an array".into()),
     };
-    for message in &mut messages {
-        // Pydantic lowercases message roles.
-        if let Some(role) = message["role"].as_str() {
-            message["role"] = role.to_lowercase().into();
-        }
-        // `_process_messages` renders a null content as "".
-        if message.get("content").is_none_or(Value::is_null) {
-            message["content"] = "".into();
-        }
-    }
+    messages.iter_mut().for_each(normalize_message);
     // SGLang's trailing-assistant rule, as `_handle_last_assistant_message`; the
     // turn's tool calls are discarded.
     let mut task_prefix = None;
@@ -194,12 +179,15 @@ pub(crate) fn render(
 /// `DeepSeekRecipe.parse_start`: where output parsing begins after the prompt
 /// `render` builds for these settings, `None` when the output is answer only.
 /// `continued` is the final assistant message the prompt continues.
+#[cfg(feature = "openai")]
 pub(crate) fn parse_start(
     v41: bool,
     thinking: bool,
     task: Option<&str>,
     continued: Option<&Value>,
-) -> Result<Option<ThinkingInitialStage>, String> {
+) -> Result<Option<deepseek_recipe::stream::ThinkingInitialStage>, String> {
+    use deepseek_recipe::stream::ThinkingInitialStage;
+
     if !thinking || task.is_some_and(|task| !TASKS_AFTER_HEADER.contains(&task)) {
         return Ok(None);
     }
@@ -221,31 +209,51 @@ pub(crate) fn parse_start(
 }
 
 /// `_trailing_assistant_turn` under `continue_final_message`: the final
-/// assistant message with text content that the prompt continues, a null
-/// content as "" and without its tool calls.
+/// assistant message with text content that the prompt continues, without its
+/// tool calls.
+#[cfg(feature = "openai")]
 pub(crate) fn continued_message(request: &Value) -> Result<Option<Value>, String> {
-    let continue_final = request
-        .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?;
-    let last = request["messages"].as_array().and_then(|m| m.last());
-    Ok(last
-        .filter(|_| continue_final)
-        .filter(|last| {
-            last["role"]
-                .as_str()
-                .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
-                && (last["content"].is_string() || last["content"].is_null())
-        })
-        .and_then(Value::as_object)
-        .map(|last| {
-            let mut last = last.clone();
-            last.remove("tool_calls");
-            last.insert("role".into(), "assistant".into());
-            if last.get("content").is_none_or(Value::is_null) {
-                last.insert("content".into(), "".into());
-            }
-            Value::Object(last)
-        }))
+    if !continues_final_message(request)? {
+        return Ok(None);
+    }
+    let Some(mut last) = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .filter(|last| last.is_object())
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    normalize_message(&mut last);
+    if last["role"] != "assistant" || !last["content"].is_string() {
+        return Ok(None);
+    }
+    if let Some(last) = last.as_object_mut() {
+        last.remove("tool_calls");
+    }
+    Ok(Some(last))
+}
+
+/// A message as `_process_messages` renders it: Pydantic lowercases the role,
+/// and a null content is "".
+fn normalize_message(message: &mut Value) {
+    if let Some(role) = message["role"].as_str() {
+        message["role"] = role.to_lowercase().into();
+    }
+    if message.get("content").is_none_or(Value::is_null) {
+        message["content"] = "".into();
+    }
+}
+
+/// The request's `task`, when it names one.
+pub(crate) fn task(request: &Value) -> Result<Option<&str>, String> {
+    match request.get("task") {
+        None | Some(Value::Null) => Ok(None),
+        Some(task) => task
+            .as_str()
+            .map(Some)
+            .ok_or("task must be a string".into()),
+    }
 }
 
 fn model_name(v41: bool) -> &'static str {

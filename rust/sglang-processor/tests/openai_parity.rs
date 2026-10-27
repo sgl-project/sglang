@@ -106,9 +106,7 @@ fn fixtures_match_sglang() {
         let mut chat_model: ChatModel =
             serde_json::from_value(fixture["chat_model"].clone()).unwrap();
         if let Some(checkpoint) = &checkpoint {
-            // The checkpoint tokenizer recipe parses DeepSeek output with.
-            chat_model.deepseek_tokenizer =
-                ChatModel::for_formatter(&checkpoint.formatter).deepseek_tokenizer;
+            chat_model.deepseek = ChatModel::for_formatter(&checkpoint.formatter).deepseek;
         }
         let mut skipped = 0;
         for case in fixture["cases"].as_array().unwrap() {
