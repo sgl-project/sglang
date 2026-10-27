@@ -311,7 +311,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if _use_aiter and self._channel_experts_on_aiter():
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -338,17 +338,23 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
+    def _channel_experts_on_aiter(self) -> bool:
+        """Whether channel-wise experts run through AITER's fused MoE, which needs the
+        weights preshuffled; the Triton runner reads them unshuffled."""
+        if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
+            return False
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            return _use_aiter and get_moe_a2a_backend().supports_aiter()
+        return moe_runner_backend.is_aiter()
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            if (
-                _use_aiter
-                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().supports_aiter()
-            ):
+            if self._channel_experts_on_aiter():
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
