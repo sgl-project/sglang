@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -1456,7 +1457,9 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, allow_send: bool = True
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1466,7 +1469,9 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_staging and req.early_send_prefix_end is None:
             req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
-        if req.pending_bootstrap:
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them (#44070).
+        if req.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
@@ -1612,6 +1617,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _minimax_payload():
+                return minimax_index_transfer_pages(
+                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
+                    page_size=page_size,
+                    prefix_len=req.disagg_decode_prefix_len,
+                )
+
             def _dsa_pages_payload():
                 # Decode already holds the indexer rows of the prefix it cached
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
@@ -1669,7 +1681,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,

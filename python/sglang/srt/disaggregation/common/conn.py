@@ -516,13 +516,16 @@ class CommonKVManager(BaseKVManager):
         Prefill CP materializes global token order before writing state pools, so
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
-        exception because each CP rank owns different state layers.
+        exception because each CP rank owns different state layers. Page-sharded
+        DSA indexer state likewise needs every owner; Mooncake filters its page
+        lists before transfer instead of suppressing whole ranks.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
+            and getattr(self, "kv_shard_size", 1) <= 1
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -1329,6 +1332,17 @@ class CommonKVManager(BaseKVManager):
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
                 f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
                 f"Both servers must use the same --kv-cache-dtype value."
+            )
+
+        if (
+            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            and info.attn_tp_size != self.attn_tp_size
+        ):
+            # MiniMax main KV pages are head-major page rows and its index state
+            # is replicated per rank; neither can be resliced by attention head.
+            raise RuntimeError(
+                "MiniMax sparse PD requires matching attention TP sizes: "
+                f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
         if (

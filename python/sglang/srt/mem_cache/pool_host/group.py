@@ -178,13 +178,16 @@ class HostPoolGroup:
         *,
         pool: PoolName | None = None,
         reclaim: Callable[[int], Any] | None = None,
+        start_owner: int | None = None,
     ) -> torch.Tensor | None:
         """Allocate from one pool, optionally reclaiming once before retrying."""
         host_pool = self.get_entry(pool).host_pool
-        indices = host_pool.alloc(need_size)
+        # Only KV-sharded host pools take start_owner.
+        kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        indices = host_pool.alloc(need_size, **kwargs)
         if indices is None and reclaim is not None:
             reclaim(need_size)
-            indices = host_pool.alloc(need_size)
+            indices = host_pool.alloc(need_size, **kwargs)
         return indices
 
     def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:
