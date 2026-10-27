@@ -168,8 +168,11 @@ def prepare_cp_forward(forward_batch, *, full_sequence: bool = False) -> None:
 
     # Under CP-TP group sharing the model owns the CP row layout and gathers
     # full rows for its MLPs, so their buffers keep the full-batch length.
+    # Hybrid full-sequence CP models likewise keep full rows between layers
+    # and slice only for MLA.
     if (
         not get_parallel().enable_cp_tp_group_sharing
+        and not full_sequence
         and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
     ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len

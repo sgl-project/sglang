@@ -10,6 +10,7 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.linear_attn_cp_hook import resolve_linear_attn_cp
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,

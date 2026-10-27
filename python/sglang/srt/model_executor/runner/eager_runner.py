@@ -354,11 +354,16 @@ class EagerRunner(BaseRunner):
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
             if cp_active and (
-                not get_parallel().enable_cp_tp_group_sharing
+                (
+                    not get_parallel().enable_cp_tp_group_sharing
+                    and not cp_full_sequence
+                )
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
                 # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
                 # Other group-sharing models keep owning the layout in forward().
+                # Full-sequence CP models (Kimi K3) own it in forward() too and
+                # slice only around their MLA layers.
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
