@@ -29,7 +29,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -84,11 +83,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
-
-    @staticmethod
-    def cuda_graph_disabled() -> bool:
-        """Preserve the legacy multi-layer NPU graph initialization guard."""
-        return cuda_graph_fully_disabled()
 
     @property
     def supports_shared_read_events(self) -> bool:
