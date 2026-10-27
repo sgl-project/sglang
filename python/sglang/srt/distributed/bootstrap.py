@@ -141,6 +141,8 @@ def init_parallel_runtime(
         )
         raise
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
+    if device == "xpu":
+        _set_xpu_ccl_defaults()
 
     parallel = get_parallel()
     if device == "cpu":
@@ -259,6 +261,14 @@ def _set_all_reduce_flags() -> None:
         # cutedsl has no legacy workspace for tagged groups to reduce over.
         and not uses_cutedsl_ar_fusion()
     )
+
+
+def _set_xpu_ccl_defaults() -> None:
+    # oneCCL reads this when the first communicator is created. On Arc Pro B70 (TP4,
+    # PCIe) it cuts graph-mode decode-size all-reduces from 17-26 us to 15-16 us
+    # and leaves prefill-size ones unchanged; a user-set value wins.
+    if "Arc" in torch.xpu.get_device_name():
+        os.environ.setdefault("CCL_SYCL_ALLREDUCE_ARC", "1")
 
 
 def _set_shm_master_env(dist_init_method: Optional[str]) -> None:
