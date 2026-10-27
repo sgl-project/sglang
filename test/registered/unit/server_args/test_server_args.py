@@ -4110,6 +4110,23 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ]
         return args
 
+    def test_sharding_defaults_to_python_when_backend_is_unset(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertEqual(
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
+            )
+
+    def test_unsharded_launch_keeps_the_general_backend_default(self):
+        args = self._args(enable_kv_cache_sharding=False)
+        with patch.dict(os.environ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
+            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
+
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
 
@@ -4195,6 +4212,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         args = self._args(enable_hisparse=True)
 
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
+            handle_kv_cache_sharding(args)
+
+    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        args = self._args(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):
