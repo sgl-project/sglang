@@ -22,14 +22,16 @@ use sglang_processor::dynamo_parsers::tool_calling::jail::Annotated;
 use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType,
+    ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use sglang_processor::openai::ChatModel;
 use sglang_processor::{
-    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
+    DeepSeekDelta, DeepSeekFinish, DeepSeekRequestOutput, ReasoningOptions,
+    ReasoningStreamSplitter, StopMatch, dynamo_tool_choice, split_reasoning, tool_call_id,
     tool_call_stream,
 };
 
@@ -44,6 +46,7 @@ use super::{
 };
 use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
@@ -198,6 +201,29 @@ async fn chat_completions(
         })
         .and_then(|message| message["content"].as_str())
         .map(str::to_owned);
+    // recipe parses DeepSeek output from its token ids, in place of both parsers.
+    let deepseek = match chat_model.deepseek_output(
+        reasoning_parser.as_deref(),
+        state.server_args.tool_call_parser.as_deref(),
+    ) {
+        Ok(None) => None,
+        Ok(Some(output)) => match output.for_request(
+            &raw,
+            &state.server_args.default_chat_template_kwargs,
+            reasoning_parser.is_some(),
+            parser.is_some(),
+        ) {
+            Ok(request) => Some(request),
+            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+        },
+        Err(reason) => {
+            let message = match reason.0 {
+                "no_tokenizer" => "DeepSeek output parsing needs the checkpoint's tokenizer.json",
+                _ => "a DeepSeek reasoning or tool-call parser is mixed with another parser",
+            };
+            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, message, false);
+        }
+    };
     let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -302,6 +328,7 @@ async fn chat_completions(
             parser,
             reasoning_parser,
             reasoning_options,
+            deepseek,
             prompt_stub_tokens,
             tools,
             stream_tool_choice,
@@ -321,6 +348,7 @@ async fn chat_completions(
             parser,
             reasoning_parser,
             reasoning_options,
+            deepseek,
             prompt_stub_tokens,
             tools,
             parallel_tool_calls,
@@ -519,6 +547,7 @@ pub(super) async fn unary_chat(
     parser: Option<String>,
     reasoning_parser: Option<String>,
     reasoning_options: ReasoningOptions,
+    deepseek: Option<DeepSeekRequestOutput>,
     prompt_stub_tokens: u32,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
@@ -542,22 +571,49 @@ pub(super) async fn unary_chat(
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
-        // Split reasoning markers out of the content first (Python splits
-        // before tool-call parsing too), then parse tool calls on the clean
-        // normal text.
-        let (reasoning_text, text) = split_reasoning(
-            reasoning_parser.as_deref(),
-            &reasoning_options,
-            &output.text,
-            output.stop_trimmed_token_ids(),
-        );
-        let (content, tool_calls) = parse_chat_tool_calls(
-            text,
-            parser.as_deref(),
-            tools.as_deref(),
-            parallel_tool_calls,
-        )
-        .await;
+        let (reasoning_text, content, tool_calls) = match &deepseek {
+            Some(deepseek) => {
+                let delta = deepseek.parser().finish(
+                    &u32_ids(&output.token_ids),
+                    deepseek_finish(output.finish_reason.as_ref()),
+                );
+                let calls = delta.whole_tool_calls().into_iter().map(|call| {
+                    ChatCompletionMessageToolCall {
+                        id: tool_call_id(),
+                        r#type: FunctionType::Function,
+                        function: FunctionCall {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                    }
+                });
+                let calls: Vec<_> = calls.collect();
+                (
+                    delta.reasoning,
+                    delta.content,
+                    (!calls.is_empty()).then_some(calls),
+                )
+            }
+            None => {
+                // Split reasoning markers out of the content first (Python splits
+                // before tool-call parsing too), then parse tool calls on the clean
+                // normal text.
+                let (reasoning_text, text) = split_reasoning(
+                    reasoning_parser.as_deref(),
+                    &reasoning_options,
+                    &output.text,
+                    output.stop_trimmed_token_ids(),
+                );
+                let (content, tool_calls) = parse_chat_tool_calls(
+                    text,
+                    parser.as_deref(),
+                    tools.as_deref(),
+                    parallel_tool_calls,
+                )
+                .await;
+                (reasoning_text, content, tool_calls)
+            }
+        };
         let finish_reason = if tool_calls.is_some() {
             Some(OpenAIFinishReason::ToolCalls)
         } else {
@@ -609,6 +665,7 @@ pub(super) fn chat_event_stream(
     parser: Option<String>,
     reasoning_parser: Option<String>,
     reasoning_options: ReasoningOptions,
+    deepseek: Option<DeepSeekRequestOutput>,
     prompt_stub_tokens: u32,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
@@ -617,6 +674,7 @@ pub(super) fn chat_event_stream(
     service_tier: Option<ChatServiceTier>,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
+    let recipe_parses = deepseek.is_some();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
@@ -625,7 +683,7 @@ pub(super) fn chat_event_stream(
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
-            if reasoning_parser.is_some() {
+            if reasoning_parser.is_some() && deepseek.is_none() {
                 (0..count)
                     .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), reasoning_options.clone()))
                     .collect()
@@ -633,6 +691,11 @@ pub(super) fn chat_event_stream(
                 vec![]
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
+        // One recipe parser per choice, and whether it parsed a tool call.
+        let mut deepseek_parsers: Vec<_> = (0..count)
+            .map(|_| deepseek.as_ref().map(DeepSeekRequestOutput::parser))
+            .collect();
+        let mut has_tool_calls = vec![false; count];
 
         for (index, call) in submitted {
             streams.push(indexed_decode_stream(index, call));
@@ -678,12 +741,24 @@ pub(super) fn chat_event_stream(
                 prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-            let finish_reason = chat_finish_reason(&output);
+            let mut finish_reason = chat_finish_reason(&output);
             // Split the step's text into (reasoning, normal) deltas when
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
             // reasoning chunk first (logprobs ride it), then the content chunk.
             let mut emitted = Vec::with_capacity(2);
-            if reasoning_enabled {
+            if let Some(parser) = deepseek_parsers[index].as_mut() {
+                let ids = u32_ids(&output.token_ids);
+                let delta = match finish_reason {
+                    None => parser.feed(&ids),
+                    Some(_) => parser.finish(&ids, deepseek_finish(output.finish_reason.as_ref())),
+                };
+                has_tool_calls[index] |= !delta.tool_calls.is_empty();
+                let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+                emitted = deepseek_choices(index, delta, logprobs);
+                if has_tool_calls[index] && finish_reason == Some(OpenAIFinishReason::Stop) {
+                    finish_reason = Some(OpenAIFinishReason::ToolCalls);
+                }
+            } else if reasoning_enabled {
                 let (reasoning_text, normal_text) =
                     reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
@@ -798,7 +873,7 @@ pub(super) fn chat_event_stream(
 
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
-    > = if let Some(parser) = parser {
+    > = if let Some(parser) = parser.filter(|_| !recipe_parses) {
         tool_call_stream(
             &parser,
             tool_choice,
@@ -842,6 +917,76 @@ pub(super) fn chat_event_stream(
         }
         yield "[DONE]".to_string();
     }
+}
+
+/// `token_output_sse_chunks`: a reasoning chunk, a content chunk, then one
+/// chunk per tool-call piece; the step's logprobs ride on the first.
+fn deepseek_choices(
+    index: usize,
+    delta: DeepSeekDelta,
+    mut logprobs: Option<ChatChoiceLogprobs>,
+) -> Vec<ChatChoiceStream> {
+    let index = u32::try_from(index).unwrap_or(u32::MAX);
+    let mut choices = Vec::new();
+    let mut choice = |delta, logprobs| {
+        choices.push(ChatChoiceStream {
+            index,
+            delta,
+            finish_reason: None,
+            logprobs,
+        })
+    };
+    if !delta.reasoning.is_empty() {
+        choice(
+            chat_delta(None, None, None, Some(delta.reasoning)),
+            logprobs.take(),
+        );
+    }
+    if !delta.content.is_empty() {
+        choice(
+            chat_delta(Some(delta.content), None, None, None),
+            logprobs.take(),
+        );
+    }
+    for call in delta.tool_calls {
+        // The first piece of a call names it; later pieces extend its arguments.
+        let call = ChatCompletionMessageToolCallChunk {
+            index: u32::try_from(call.index).unwrap_or(u32::MAX),
+            id: call.name.is_some().then(tool_call_id),
+            r#type: Some(FunctionType::Function),
+            function: Some(FunctionCallStream {
+                name: call.name,
+                arguments: Some(call.arguments),
+            }),
+        };
+        choice(chat_delta(None, None, Some(vec![call]), None), None);
+    }
+    if logprobs.is_some() {
+        choice(chat_delta(None, None, None, None), logprobs);
+    }
+    choices
+}
+
+/// The scheduler's finish reason as recipe's parser takes it; a type other than
+/// `stop` and `length` ends the parse without a backend finish.
+fn deepseek_finish(reason: Option<&FinishReason>) -> DeepSeekFinish<'_> {
+    match reason {
+        Some(FinishReason::Known(FinishKind::Stop { matched })) => {
+            DeepSeekFinish::Stop(match matched {
+                Some(Matched::Token(id)) => Some(StopMatch::Token(*id)),
+                Some(Matched::Str(stop)) => Some(StopMatch::Text(stop)),
+                _ => None,
+            })
+        }
+        Some(FinishReason::Known(FinishKind::Length { .. })) => DeepSeekFinish::Length,
+        _ => DeepSeekFinish::Abort,
+    }
+}
+
+fn u32_ids(ids: &[i64]) -> Vec<u32> {
+    ids.iter()
+        .filter_map(|&id| u32::try_from(id).ok())
+        .collect()
 }
 
 fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
@@ -1099,6 +1244,7 @@ mod tests {
             None,
             None,
             ReasoningOptions::default(),
+            None,
             3, // Kimi K3's generation stub
             None,
             true,
@@ -1195,6 +1341,7 @@ mod tests {
             None,
             Some("deepseek-r1".into()),
             ReasoningOptions::default(),
+            None,
             0,
             None,
             true,
@@ -1235,6 +1382,7 @@ mod tests {
             None,
             Some("deepseek-r1".into()),
             ReasoningOptions::default(),
+            None,
             0,
             None,
             None,
@@ -1282,6 +1430,7 @@ mod tests {
             None,
             None,
             ReasoningOptions::default(),
+            None,
             0,
             None,
             None,

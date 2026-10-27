@@ -103,7 +103,13 @@ fn fixtures_match_sglang() {
         let checkpoint = resolve_model_file(model, fixture["revision"].as_str(), "tokenizer.json")
             .map(|path| Checkpoint::load(&path));
         let settings: OpenAiSettings = serde_json::from_value(fixture["settings"].clone()).unwrap();
-        let chat_model: ChatModel = serde_json::from_value(fixture["chat_model"].clone()).unwrap();
+        let mut chat_model: ChatModel =
+            serde_json::from_value(fixture["chat_model"].clone()).unwrap();
+        if let Some(checkpoint) = &checkpoint {
+            // The checkpoint tokenizer recipe parses DeepSeek output with.
+            chat_model.deepseek_tokenizer =
+                ChatModel::for_formatter(&checkpoint.formatter).deepseek_tokenizer;
+        }
         let mut skipped = 0;
         for case in fixture["cases"].as_array().unwrap() {
             match check_case(case, &fixture, &settings, &chat_model, checkpoint.as_ref()) {

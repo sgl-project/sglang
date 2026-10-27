@@ -23,6 +23,7 @@ src/
     models/        model-specific SGLang code
     legacy/        conversation.py templates
   parser/          engine output -> chat events
+  deepseek_output.rs  DeepSeek-V4 / V4.1 output ids -> reasoning, content, tool calls
   openai/          OpenAI requests over /generate
 ```
 
@@ -195,6 +196,19 @@ exactly is `Unsupported`, and the host sends it to the engine's own route.
 `/generate` output of a live engine, or on hand-written (`synthetic`) output.
 Chat splits reasoning with `think/`, and serves only the parser names
 `think/models/` ports.
+
+```rust
+chat_model.deepseek_output(reasoning_parser, tool_call_parser)? // Option<DeepSeekOutput>
+    .for_request(&body, &default_kwargs, separate_reasoning, parse_tool_calls)? // DeepSeekRequestOutput
+    .parser() // one per choice: .feed(ids) -> DeepSeekDelta, .finish(ids, finish) -> DeepSeekDelta
+```
+
+DeepSeek-V4 and V4.1 output is parsed by `deepseek_output.rs` instead, once a
+DeepSeek parser is configured, as `serving_deepseek_recipe.py` does: the
+engine's `output_ids` go through deepseek-recipe's `StreamProcessor`, which
+recognizes `</think>` and the DSML tags by token id. It decodes with the
+checkpoint tokenizer, so a host sets `ChatModel::deepseek_tokenizer`
+(`ChatModel::for_formatter` does); without it the chat is `Unsupported`.
 
 ## Host example
 

@@ -5,6 +5,8 @@
 //! `dynamo-renderer`, `dynamo-tokenizers`, and `dynamo-parsers`. Hosts own
 //! request types, sampling, validation, transport, and runtime.
 
+#[cfg(feature = "render")]
+mod deepseek_output;
 mod error;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod kimi_k3_format;
@@ -25,6 +27,11 @@ mod tokenizer;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod tool_call;
 
+#[cfg(feature = "render")]
+pub use deepseek_output::{
+    DeepSeekDelta, DeepSeekFinish, DeepSeekOutput, DeepSeekOutputParser, DeepSeekRequestOutput,
+    DeepSeekToolCall, DeepSeekToolCallDelta, StopMatch, select_new_output_ids,
+};
 pub use error::ProcessorError;
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
@@ -43,6 +50,8 @@ pub use render::{
 pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+#[cfg(any(feature = "parser", feature = "openai"))]
+pub use tool_call::tool_call_id;
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.

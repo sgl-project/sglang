@@ -3,9 +3,11 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use deepseek_recipe::openai::ChatCompletionRequest;
-use deepseek_recipe::request::{ConversionOptions, ProtocolRequest};
+use deepseek_recipe::request::{ConversationRequest, ConversionOptions, ProtocolRequest};
+use deepseek_recipe::stream::ThinkingInitialStage;
 use deepseek_recipe_core::special_tokens::SpecialTokensMap;
 use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
@@ -42,7 +44,7 @@ const BUDGET_TIER_LINE: &str = "Reasoning Effort: 75";
 /// segments with the added vocabulary, plain text without it (recipe's
 /// `PromptTokenizer`), and a task's continuation prefix with it (`encode_text`).
 pub struct DeepSeekTokenizer {
-    full: Tokenizer,
+    full: Arc<Tokenizer>,
     plain: Tokenizer,
 }
 
@@ -53,7 +55,15 @@ impl DeepSeekTokenizer {
             .map_err(|error| format!("invalid tokenizer.json: {error}"))?;
         let mut plain = full.clone();
         plain.with_added_vocabulary(AddedVocabulary::new());
-        Ok(Self { full, plain })
+        Ok(Self {
+            full: Arc::new(full),
+            plain,
+        })
+    }
+
+    /// The tokenizer with its added vocabulary, which output parsing decodes with.
+    pub(crate) fn full(&self) -> &Arc<Tokenizer> {
+        &self.full
     }
 
     pub(crate) fn encode(&self, prompt: &RenderedPrompt) -> Result<Vec<u32>, String> {
@@ -63,7 +73,7 @@ impl DeepSeekTokenizer {
         let mut ids = Vec::new();
         for segment in segments {
             let tokenizer = if segment.allow_special {
-                &self.full
+                &*self.full
             } else {
                 &self.plain
             };
@@ -146,37 +156,21 @@ pub(crate) fn render(
         }
     }
     pre_normalize(&mut body, thinking, continue_final)?;
-    body.insert(
-        "model".into(),
-        if v41 {
-            "DeepSeek-V4.1-Flash"
-        } else {
-            "DeepSeek-V4-Pro"
-        }
-        .into(),
-    );
+    body.insert("model".into(), model_name(v41).into());
     if budget.is_some() {
         body.insert("reasoning_effort".into(), BUDGET_TIER.into());
     } else if let Some(effort) = effort {
         body.insert("reasoning_effort".into(), effort.into());
     }
 
-    let request: ChatCompletionRequest = serde_json::from_value(Value::Object(body))
-        .map_err(|error| format!("invalid request body: {error}"))?;
-    let tokens = || SpecialTokensMap {
-        image: IMAGE_TOKEN.into(),
-        ..SpecialTokensMap::default()
-    };
-    let converted = request
-        .convert(ConversionOptions::default().with_special_tokens(tokens()))
-        .map_err(|error| error.to_string())?;
+    let converted = convert(body)?;
     let rendered = if v41 {
         DeepseekV41Encoding::new()
-            .with_special_tokens(tokens())
+            .with_special_tokens(special_tokens())
             .render_conversation(&converted.conversation)
     } else {
         DeepseekV4Encoding::new()
-            .with_special_tokens(tokens())
+            .with_special_tokens(special_tokens())
             .render_conversation(&converted.conversation)
     };
     // The processor serves text only; SGLang rejects images on a text-only server.
@@ -195,6 +189,87 @@ pub(crate) fn render(
         segments.push(RenderedSegment::new(prefix, true));
     }
     Ok(RenderedPrompt::segmented(segments))
+}
+
+/// `DeepSeekRecipe.parse_start`: where output parsing begins after the prompt
+/// `render` builds for these settings, `None` when the output is answer only.
+/// `continued` is the final assistant message the prompt continues.
+pub(crate) fn parse_start(
+    v41: bool,
+    thinking: bool,
+    task: Option<&str>,
+    continued: Option<&Value>,
+) -> Result<Option<ThinkingInitialStage>, String> {
+    if !thinking || task.is_some_and(|task| !TASKS_AFTER_HEADER.contains(&task)) {
+        return Ok(None);
+    }
+    let Some(continued) = continued else {
+        return Ok(Some(ThinkingInitialStage::ReasoningStart));
+    };
+    if task.is_some() {
+        // The continued prefix follows the task token.
+        return Ok(Some(ThinkingInitialStage::ContentContinuation));
+    }
+    let mut body = Map::new();
+    body.insert(
+        "messages".into(),
+        json!([{"role": "user", "content": ""}, continued]),
+    );
+    pre_normalize(&mut body, true, true)?;
+    body.insert("model".into(), model_name(v41).into());
+    Ok(convert(body)?.parsing_options.thinking_initial_stage)
+}
+
+/// `_trailing_assistant_turn` under `continue_final_message`: the final
+/// assistant message with text content that the prompt continues, a null
+/// content as "" and without its tool calls.
+pub(crate) fn continued_message(request: &Value) -> Result<Option<Value>, String> {
+    let continue_final = request
+        .get("continue_final_message")
+        .map_or(Ok(false), pydantic_bool)?;
+    let last = request["messages"].as_array().and_then(|m| m.last());
+    Ok(last
+        .filter(|_| continue_final)
+        .filter(|last| {
+            last["role"]
+                .as_str()
+                .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
+                && (last["content"].is_string() || last["content"].is_null())
+        })
+        .and_then(Value::as_object)
+        .map(|last| {
+            let mut last = last.clone();
+            last.remove("tool_calls");
+            last.insert("role".into(), "assistant".into());
+            if last.get("content").is_none_or(Value::is_null) {
+                last.insert("content".into(), "".into());
+            }
+            Value::Object(last)
+        }))
+}
+
+fn model_name(v41: bool) -> &'static str {
+    if v41 {
+        "DeepSeek-V4.1-Flash"
+    } else {
+        "DeepSeek-V4-Pro"
+    }
+}
+
+pub(crate) fn special_tokens() -> SpecialTokensMap {
+    SpecialTokensMap {
+        image: IMAGE_TOKEN.into(),
+        ..SpecialTokensMap::default()
+    }
+}
+
+/// recipe's conversion of a pre-normalized Chat Completions body.
+fn convert(body: Map<String, Value>) -> Result<ConversationRequest, String> {
+    let request: ChatCompletionRequest = serde_json::from_value(Value::Object(body))
+        .map_err(|error| format!("invalid request body: {error}"))?;
+    request
+        .convert(ConversionOptions::default().with_special_tokens(special_tokens()))
+        .map_err(|error| error.to_string())
 }
 
 /// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the

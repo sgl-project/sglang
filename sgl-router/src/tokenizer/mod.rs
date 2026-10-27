@@ -156,6 +156,7 @@ impl TokenizerRegistry {
             always_thinks: false,
             reasoning_toggle: None,
             chat_encoding_spec: None,
+            deepseek_tokenizer: None,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -177,8 +178,11 @@ impl TokenizerRegistry {
                             toggle_param: toggle_param.into(),
                             default_enabled,
                         });
-                if formatter.is_kimi_k3() {
-                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
+                // Kimi-K3's encoding spec, or DeepSeek's with the tokenizer its output is parsed with.
+                if let Some(processor) = formatter.processor() {
+                    let model = ChatModel::for_formatter(processor);
+                    me.chat_model.chat_encoding_spec = model.chat_encoding_spec;
+                    me.chat_model.deepseek_tokenizer = model.deepseek_tokenizer;
                 }
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
