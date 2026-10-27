@@ -237,7 +237,6 @@ class TestPagedForward(CustomTestCase):
         resident = dict(method.policy.resident)
         capture = SimpleNamespace(
             _end_current_segment=lambda: None,
-            _barrier_fn=None,
             cuda_graph=SimpleNamespace(_break_fns=[]),
             _begin_new_segment=lambda: None,
         )

@@ -913,7 +913,6 @@ def test_prefix_pad_replay_writes_the_captured_output():
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: None,
         _begin_new_segment=lambda: None,
     )
