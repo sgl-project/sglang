@@ -18,6 +18,7 @@ from sglang.srt.utils import is_gfx95_supported
 from ..common.nvfp4 import Nvfp4Cache
 from ..common.utils import check_sparse_kv_fp8, unit_scale
 from .flash_with_topk_idx import decode_topk_uses_jit, select_decode_topk
+from .nvfp4_decode import verify_topk_idx_nvfp4
 
 
 @triton.jit
@@ -213,8 +214,6 @@ def verify_topk_idx(
             out=topk_idx_out,
         )
     if is_nvfp4:
-        from .nvfp4_decode import verify_topk_idx_nvfp4
-
         return verify_topk_idx_nvfp4(
             q=q,
             k_cache=k_cache,

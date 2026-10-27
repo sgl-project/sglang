@@ -17,6 +17,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 from ..common.nvfp4 import Nvfp4Cache, nvfp4_load_even_odd, nvfp4_slot_offsets
 from ..common.utils import unit_scale
+from .flash_with_topk_idx import decode_topk_uses_jit, select_decode_topk
 
 
 @triton.jit
@@ -140,8 +141,6 @@ def verify_topk_idx_nvfp4(
     topk_idx_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """`verify_topk_idx` over an NVFP4 index-K cache."""
-    from .flash_with_topk_idx import decode_topk_uses_jit, select_decode_topk
-
     rows, num_q_heads, head_dim = q.shape
     page_size = k_cache.page_size
     assert head_dim == 128 and page_size % block_size == 0
