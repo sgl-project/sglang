@@ -2813,6 +2813,16 @@ class KVCacheConfigurator:
                 )
             token_capacity = min(token_capacity, user_limit)
 
+        int32_cap = self._int32_kv_index_cap()
+        if int32_cap is not None and token_capacity > int32_cap:
+            logger.info(
+                "KV pool capped at %d tokens (was %d): the Muse Spark ROCm attention "
+                "kernels index a layer's K/V buffer with 32 bits",
+                int32_cap,
+                token_capacity,
+            )
+            token_capacity = int32_cap
+
         # Sync across PP ranks (each may have different layer counts)
         if get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
@@ -2824,6 +2834,26 @@ class KVCacheConfigurator:
             token_capacity = tensor.item()
 
         return token_capacity
+
+    def _int32_kv_index_cap(self) -> Optional[int]:
+        """Largest full-attention pool whose per-layer K/V buffer stays below 2**31
+        elements for the Muse Spark target on ROCm. Its verify / extend kernels
+        (FlyDSL verify asserts, the Triton paths offset pages in int32) index that
+        buffer with 32 bits; one page of margin covers the padded slot."""
+        architectures = self.model_config.hf_config.architectures or []
+        if (
+            not _is_hip
+            or self.is_draft_worker
+            or not any("MuseSpark" in arch for arch in architectures)
+        ):
+            return None
+        head_num = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        per_token = head_num * self.model_config.head_dim
+        if per_token <= 0:
+            return None
+        return (2**31 - 1) // per_token - self.page_size
 
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
