@@ -208,9 +208,7 @@ def http_client(monkeypatch, tmp_path, request):
 
     async def generate(client, req, **kwargs):
         admitted.append(req)
-        path = req.output_file_path()
-        Image.new("RGB", (64, 64)).save(path)
-        return [path], OutputBatch()
+        return [req.output_file_path()], OutputBatch(output_image_bytes=[png_bytes()])
 
     async def upload(paths):
         return [None] * len(paths)
