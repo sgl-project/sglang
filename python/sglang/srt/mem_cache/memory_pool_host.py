@@ -68,6 +68,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -78,6 +79,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
@@ -249,6 +251,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
     ):
+        if envs.SGLANG_HICACHE_PAGEABLE.get() and not page_aligned_only:
+            raise ValueError(
+                "Pageable HiCache requires whole-page host transfers; "
+                "token-granular DSV4 transfers access mapped host memory."
+            )
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
@@ -273,7 +280,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
@@ -795,7 +802,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.swa_page_size = swa_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size

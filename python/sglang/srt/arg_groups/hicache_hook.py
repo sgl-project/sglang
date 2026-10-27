@@ -23,6 +23,10 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_HICACHE_PAGEABLE.get() and cfg.enable_hisparse:
+        raise ValueError("Pageable HiCache does not support HiSparse host transfers.")
     config = cfg.unified_cache_external_linker_config
     if config is not None and not isinstance(config, dict):
         raise ValueError(
@@ -42,6 +46,10 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if envs.SGLANG_HICACHE_PAGEABLE.get():
+            raise ValueError(
+                "Pageable HiCache does not support external cache linkers."
+            )
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
                 "--enable-unified-cache-external-linker requires the default "
@@ -95,6 +103,7 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+    validate_pageable_hicache(server_args)
 
 
 def handle_hicache_ratio_default(server_args: Any):
@@ -293,4 +302,26 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "bypass the buffer-mode pipeline, fetching without its prefix "
             "context and never consuming its staged holds. Prefill "
             "instances share the standard scheduler path and are supported."
+        )
+
+
+def validate_pageable_hicache(server_args: Any):
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_HICACHE_PAGEABLE.get():
+        return
+    cfg = resolving_view(server_args)
+    if cfg.device != "cuda":
+        raise ValueError("Pageable HiCache currently requires CUDA.")
+    if (
+        cfg.hicache_io_backend != "direct"
+        or cfg.hicache_mem_layout != "page_first_direct"
+    ):
+        raise ValueError(
+            "SGLANG_HICACHE_PAGEABLE requires --hicache-io-backend direct "
+            "and --hicache-mem-layout page_first_direct."
+        )
+    if cfg.hicache_storage_backend is not None or cfg.enable_unified_memory:
+        raise ValueError(
+            "Pageable HiCache supports L2 host caching without unified memory or L3 storage."
         )

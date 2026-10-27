@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -282,6 +283,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self._native_buffers is None:
             self._init_device_row_stride(self.device_kv_buffers)
         self._init_write_back_staging_buffers()
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -773,6 +776,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                if self.can_use_staged_direct:
+                    from sglang.srt.mem_cache.pool_host.staged_direct import (
+                        StagedDirectLoad,
+                    )
+
+                    if self._staged_direct_load is None:
+                        self._staged_direct_load = StagedDirectLoad(
+                            self.kv_buffer, self.page_size, device_buffer.device
+                        )
+                    self._staged_direct_load.load(
+                        device_buffer, host_indices, device_indices, host_layer_id
+                    )
+                    return
                 self._require_packed_device_rows("transfer_kv_per_layer_direct_pf_lf")
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
@@ -993,6 +1009,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         return False
 
+    @property
+    def can_use_staged_direct(self) -> bool:
+        return (
+            _is_cuda
+            and envs.SGLANG_HICACHE_PAGEABLE.get()
+            and not self.pin_memory
+            and not getattr(self, "_is_dummy", False)
+            and self.layout == "page_first_direct"
+            and self.device_rows_packed
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -1095,6 +1122,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                if self.can_use_staged_direct:
+                    from sglang.srt.mem_cache.pool_host.staged_direct import (
+                        StagedDirectBackup,
+                    )
+
+                    if self._staged_direct_backup is None:
+                        self._staged_direct_backup = StagedDirectBackup(
+                            self.kv_buffer, self.page_size, device_kv_buffers[0].device
+                        )
+                    self._staged_direct_backup.backup(
+                        device_data_ptrs, host_indices, device_indices
+                    )
+                    return
                 self._require_packed_device_rows("transfer_kv_all_layer_direct_lf_pf")
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_kv_buffers,

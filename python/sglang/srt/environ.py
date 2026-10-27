@@ -816,6 +816,7 @@ class Envs:
     # HiCache storage backends and mmap allocation
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
+    SGLANG_HICACHE_PAGEABLE = EnvBool(False)
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.

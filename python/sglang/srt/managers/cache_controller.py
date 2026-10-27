@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -546,6 +547,8 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        if envs.SGLANG_HICACHE_PAGEABLE.get():
+            raise ValueError("Pageable HiCache does not support L3 storage attachment.")
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:

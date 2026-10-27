@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    resolve_host_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
@@ -115,7 +116,7 @@ class MambaPoolHost(HostKVCache):
             )
 
         self.layout = layout
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = buffer_info.temporal.shape[0] + len(

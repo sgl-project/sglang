@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
+    resolve_host_pin_memory,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
@@ -201,7 +202,7 @@ class HostKVCache(abc.ABC):
         )
         self.page_size = page_size // dcp_size
         self.layout = layout
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
