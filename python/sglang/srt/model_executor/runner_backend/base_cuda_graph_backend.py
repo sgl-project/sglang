@@ -63,6 +63,9 @@ class BaseCudaGraphBackend(ABC):
     def cache_loc_dtype(self) -> torch.dtype:
         return torch.int64
 
+    def bind_decode_runner(self, runner) -> None:
+        pass
+
     def prepare_replay(self, forward_batch: ForwardBatch) -> bool:
         """Whether device-specific replay input preparation is complete."""
         return False
