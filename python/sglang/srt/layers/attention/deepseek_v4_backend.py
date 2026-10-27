@@ -2211,13 +2211,13 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
-            seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu_list,
+            seq_lens_cpu=(
+                None
+                if seq_lens_cpu is None
+                else [int(x) for x in seq_lens_cpu.tolist()]
+            ),
             extend_len=block_size,
         )
         extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
