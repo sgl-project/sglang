@@ -12,11 +12,13 @@ from typing import Callable, ContextManager, Iterator, Optional, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )

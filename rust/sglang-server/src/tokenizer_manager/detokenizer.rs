@@ -35,11 +35,6 @@ use crate::utils::{
     fsm::{Event, RequestState},
 };
 
-/// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
-/// per-request value isn't available on the response yet; see the note in
-/// `DetokenizerBackend::new_decoder`.
-const SKIP_SPECIAL_TOKENS: bool = true;
-
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens). `finish` marks
@@ -50,7 +45,7 @@ pub trait StreamDecoder: Send {
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
 struct DynamoDecoder {
-    stream: dynamo_tokenizers::DecodeStream,
+    stream: sglang_processor::dynamo_tokenizers::DecodeStream,
 }
 
 impl StreamDecoder for DynamoDecoder {
@@ -81,7 +76,7 @@ impl StreamDecoder for DynamoDecoder {
 /// on each `Register`.
 #[derive(Clone)]
 pub enum DetokenizerBackend {
-    Dynamo(dynamo_tokenizers::Tokenizer),
+    Dynamo(sglang_processor::dynamo_tokenizers::Tokenizer),
     /// No decoding at all — the shard emits each chunk's raw output token ids as
     /// `output_ids` (no `DecodeStream`, no accumulation). Used for
     /// `skip_tokenizer_init` and when no tokenizer is configured.
@@ -91,14 +86,14 @@ pub enum DetokenizerBackend {
 impl DetokenizerBackend {
     /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
     /// token ids through untouched instead of decoding text).
-    fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+    fn new_decoder(&self, skip_special_tokens: bool) -> Option<Box<dyn StreamDecoder>> {
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
             // tokens (for perfect first-token spacing) would require Register to
             // carry input_ids — deferred.
             DetokenizerBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
-                stream: t.decode_stream(&[], SKIP_SPECIAL_TOKENS),
+                stream: t.decode_stream(&[], skip_special_tokens),
             })),
             DetokenizerBackend::Skip => None,
         }
@@ -107,14 +102,14 @@ impl DetokenizerBackend {
     /// Decode one complete sequence without creating request-scoped streaming
     /// state. This runs on a pinned detokenizer worker, never on an API runtime
     /// thread.
-    fn decode_once(&self, token_ids: &[u32]) -> Result<String, Error> {
+    fn decode_once(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
         match self {
             DetokenizerBackend::Dynamo(tokenizer) => tokenizer
-                .decode(token_ids, true)
+                .decode(token_ids, skip_special_tokens)
                 .map(String::from)
                 .map_err(|error| Error::Detokenize(error.to_string())),
             DetokenizerBackend::Skip => Err(Error::Validation(
-                "echo for token-ID prompts is unavailable when skip_tokenizer_init=True".into(),
+                "detokenization is unavailable when skip_tokenizer_init=True".into(),
             )),
         }
     }
@@ -201,6 +196,7 @@ impl Runnable for DetokenizerWorker {
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
+                    skip_special_tokens,
                 } => {
                     table.insert(
                         rid.clone(),
@@ -208,7 +204,7 @@ impl Runnable for DetokenizerWorker {
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(),
+                            decoder: self.backend.new_decoder(skip_special_tokens),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
@@ -220,9 +216,17 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
-                DetokMsg::Decode { rid, token_ids } => {
-                    handle_decode(&mut table, &rid, &token_ids, &self.backend)
-                }
+                DetokMsg::Decode {
+                    rid,
+                    token_ids,
+                    skip_special_tokens,
+                } => handle_decode(
+                    &mut table,
+                    &rid,
+                    &token_ids,
+                    skip_special_tokens,
+                    &self.backend,
+                ),
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
                     handle_fail(&mut table, &rid, message, &self.abort)
@@ -244,10 +248,11 @@ fn handle_decode(
     table: &mut HashMap<Rid, DetokState>,
     rid: &Rid,
     token_ids: &[u32],
+    skip_special_tokens: bool,
     backend: &DetokenizerBackend,
 ) {
     if let Some(mut st) = table.remove(rid) {
-        let item = match backend.decode_once(token_ids) {
+        let item = match backend.decode_once(token_ids, skip_special_tokens) {
             Ok(text) => ResponseItem::Data(text.into()),
             Err(e) => ResponseItem::Error(e),
         };
@@ -515,7 +520,9 @@ mod tests {
 
     #[test]
     fn decode_once_rejects_skip_mode() {
-        let error = DetokenizerBackend::Skip.decode_once(&[1]).unwrap_err();
+        let error = DetokenizerBackend::Skip
+            .decode_once(&[1], true /* skip_special_tokens */)
+            .unwrap_err();
         assert!(matches!(error, Error::Validation(_)));
         assert!(error.to_string().contains("skip_tokenizer_init=True"));
     }
@@ -541,6 +548,7 @@ mod tests {
             &mut table,
             &Rid::from("d1"),
             &[1],
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
 
@@ -556,6 +564,7 @@ mod tests {
             &mut table,
             &Rid::from("d2"),
             &[1],
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
         assert!(rx.try_recv().is_err());

@@ -46,6 +46,6 @@ Integrated mode currently supports:
 | Qwen-Image edit | `qwen_image_edit` | `QwenImageEditPlusPipeline` | `Qwen-Image-Edit-2511` (experimental) |
 | MiniMax-H3 | `minimax_h3` | `MiniMaxH3Pipeline` | `minimax_h3_fl2va_*.safetensors`, `minimax_h3_ref2va_*.safetensors` |
 
-MiniMax-H3 example graphs: `minimax_h3_t2v_sgld.json` (T2V / I2VA / FL2VA on the FL2VA DiT), `minimax_h3_r2v_sgld.json` (reference-to-video; use a `ref2va` file), `minimax_h3_t2v_sgld_upscaler.json` (two-pass 3D ×2). Set `SGLDOptions.model_type` to `minimax_h3`. On 24 GB, keep the 32B CLIP on CPU and prefer pruned BF16, GGUF, or `kitchen_int8` with DiT layerwise offload. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#comfyui-integrated-mode).
+MiniMax-H3 example graphs: `minimax_h3_t2v_sgld.json` (T2V / I2VA / FL2VA on the FL2VA DiT), `minimax_h3_r2v_sgld.json` (reference-to-video; use a `ref2va` file), `minimax_h3_t2v_sgld_upscaler.json` (two-pass 3D ×2). Set `SGLDOptions.model_type` to `minimax_h3`. On 24 GB, keep the 32B CLIP on CPU and prefer pruned BF16, GGUF, or `convrot_int8` with DiT layerwise offload. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#comfyui-integrated-mode).
 
 To add a model, register a checkpoint spec under `runtime/loader/comfyui_checkpoints/` and a `ComfyUIModelAdapter`. Do not add another ComfyUI pipeline class.

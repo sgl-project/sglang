@@ -1,3 +1,4 @@
+import functools
 from typing import Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
@@ -6,8 +7,9 @@ import cutlass.cute as cute
 import torch
 
 from sglang.kernels.ops.diffusion.norm.cutedsl_common.norm_fusion import (
-    apply_norm_cta,
     broadcast_tensor_for_bsfd,
+    normalize_chunk,
+    row_norm_stats,
     tensor_slice_for_bsfd,
 )
 from sglang.kernels.ops.diffusion.norm.cutedsl_utils import (
@@ -18,6 +20,10 @@ from sglang.kernels.ops.diffusion.norm.cutedsl_utils import (
 _COMPILE_CACHE = {}
 
 
+# columns one warp covers per 128-bit load: 32 lanes x 8 elements
+CHUNK = WARP_SIZE * 8
+
+
 class ScaleResidualNormScaleShift:
     @classmethod
     def make_hash_key(cls, *inputs):
@@ -25,6 +31,7 @@ class ScaleResidualNormScaleShift:
         Compile-time values:
           - D: hidden dimension (size of the last dimension)
           - norm_type: layer norm or RMS norm
+          - chunks per warp
           - tensor dtype
           - tensor rank (i.e., tensor.ndim)
 
@@ -42,11 +49,14 @@ class ScaleResidualNormScaleShift:
 
         return tuple(_sig(val) for val in inputs)
 
-    def __init__(self, D: int, norm_type: str):
+    def __init__(self, D: int, norm_type: str, chunks_per_warp: int):
         self.D = D
         self.norm_type = norm_type  # "layer" or "rms"
-        self.num_warps = self.D // 256  # num of warps per cta
-        self.num_threads = self.num_warps * WARP_SIZE  # num of threads per cta
+        # a row is D // CHUNK chunks; each warp walks chunks_per_warp of them, so the
+        # reduction order is fixed by D alone
+        self.num_chunks = D // CHUNK
+        self.chunks_per_warp = chunks_per_warp
+        self.num_threads = self.num_chunks // chunks_per_warp * WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -63,19 +73,16 @@ class ScaleResidualNormScaleShift:
         eps: cutlass.Float32 = cutlass.Float32(1e-5),
         stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
     ):
-        # Tensor shapes
         B, S, _ = mX.shape  # (batch, seq_len, hidden_dim)
-        # Vectorized copy configuration
-        num_vectorized = 8  # maximum num of elem per copy
         atom_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
             num_bits_per_copy=128,
         )
-        # Thread/value layouts for tiled copy
-        t_layout = cute.make_layout(self.num_threads)  # thread layout within a CTA
-        v_layout = cute.make_layout(num_vectorized)  # per-thread vector layout
-        tiled_copy = cute.make_tiled_copy_tv(atom_copy, t_layout, v_layout)
+        # one warp per chunk: 8 consecutive elements per lane (LDG.128)
+        tiled_copy = cute.make_tiled_copy_tv(
+            atom_copy, cute.make_layout(WARP_SIZE), cute.make_layout(8)
+        )
 
         self.kernel(
             mY,
@@ -111,82 +118,100 @@ class ScaleResidualNormScaleShift:
         eps: cutlass.Float32,
     ):
         _, S, _ = mX.shape
+        D = self.D
         tidx, _, _ = cute.arch.thread_idx()  # thread index
         bid, _, _ = cute.arch.block_idx()  # cta index
         bidx = cutlass.Int32(bid // S)  # batch index
         bidy = cutlass.Int32(bid % S)  # seq_len index
-        thr_copy = tiled_copy.get_slice(tidx)
-
-        @cute.jit
-        def slice_if(mV):
-            if cutlass.const_expr(isinstance(mV, cute.Tensor)):
-                return tensor_slice_for_bsfd(mV, thr_copy, bidx, bidy, S, self.D)
-            return mV, mV
-
-        @cute.jit
-        def copy_if(src, dst):
-            if cutlass.const_expr(
-                isinstance(src, cute.Tensor) and isinstance(dst, cute.Tensor)
-            ):
-                cute.autovec_copy(src, dst)  # LDG.128
-
-        @cute.jit
-        def norm(x, weight, bias):
-            return apply_norm_cta(
-                self.norm_type, self.num_warps, tidx, x, weight, bias, self.D, eps
-            )
-
-        # Slice: retrieve the per-thread data slices for both global memory (gmem)
-        # and register memory (rmem). The layouts are:
-        # - ((4,2),(1)):((1,4),(0)) for fp32
-        # - ((8,1),(1)):((1,0),(0)) for fp16/bf16
-        tRgR, tRrR = slice_if(mRes)  # residual
-        tXgX, tXrX = slice_if(mX)  # x
-        tGgG, tGrG = slice_if(mGate)  # gate
-        tROgRO, tROrRO = slice_if(mResOut)  # residual_out
-        tWgW, tWrW = slice_if(mWeight)  # weight
-        tBgB, tBrB = slice_if(mBias)  # bias
-        tSCgSC, tSCrSC = slice_if(mScale)  # scale
-        tSHgSH, tSHrSH = slice_if(mShift)  # shift
-        tYgY, tYrY = slice_if(mY)  # y
-        # Load: load tensor from global memory to registers
-        copy_if(tRgR, tRrR)  # gmem -> rmem
-        copy_if(tXgX, tXrX)  # gmem -> rmem
-        copy_if(tGgG, tGrG)  # gmem -> rmem
-        copy_if(tWgW, tWrW)  # gmem -> rmem
-        copy_if(tBgB, tBrB)  # gmem -> rmem
+        lane_id = tidx & (WARP_SIZE - 1)
+        warp_id = tidx // WARP_SIZE
+        thr_copy = tiled_copy.get_slice(lane_id)
+        chunk0 = warp_id * self.chunks_per_warp
 
         # For norm_scale_shift, output:
         # - y = norm(x, weight, bias) * (1 + scale) + shift
         # For scale_residual_norm_scale_shift, output:
         # - residual_out = residual + gate * x
         # - y = norm(residual_out, weight, bias) * (1 + scale) + shift
-        # Compute: value = <gate> * x
-        value = tXrX.load()
-        if cutlass.const_expr(isinstance(tGrG, cute.Tensor)):
-            value = tGrG.load() * value
-        # Compute: value = value + <residual>
-        if cutlass.const_expr(isinstance(tRrR, cute.Tensor)):
-            value = value + tRrR.load()
-        # Store: residual_out
-        if cutlass.const_expr(isinstance(tROrRO, cute.Tensor)):
-            tROrRO.store(value.to(tROrRO.element_type))
-            copy_if(tROrRO, tROgRO)  # rmem -> gmem
-        # Compute: value = norm(value) * <weight> + <bias>
-        tNrN = cute.make_rmem_tensor_like(tXrX, tXrX.element_type)
-        tNrN.store(value.to(tNrN.element_type))
-        tNrN = norm(tNrN, tWrW, tBrB)
-        # Compute: value = value * (1 + <scale>) + <shift>
-        value = tNrN.load()
-        copy_if(tSCgSC, tSCrSC)  # gmem -> rmem
-        copy_if(tSHgSH, tSHrSH)  # gmem -> rmem
-        if cutlass.const_expr(isinstance(tSCrSC, cute.Tensor)):
-            value = value * (1 + tSCrSC.load())
-        if cutlass.const_expr(isinstance(tSHrSH, cute.Tensor)):
-            value = value + tSHrSH.load()
-        # Store: y
-        tYrY.store(value.to(tYrY.element_type))
-        copy_if(tYrY, tYgY)  # rmem -> gmem
+        # 1. load every chunk of this warp: residual, x, gate
+        tXrXs, tRrRs, tGrGs = [], [], []
+        for j in cutlass.range_constexpr(self.chunks_per_warp):
+            tRgR, tRrR = _slice(mRes, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            tXgX, tXrX = _slice(mX, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            tGgG, tGrG = _slice(mGate, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            _copy(tRgR, tRrR)  # gmem -> rmem
+            _copy(tXgX, tXrX)
+            _copy(tGgG, tGrG)
+            tXrXs.append(tXrX)
+            tRrRs.append(tRrR)
+            tGrGs.append(tGrG)
+        # 2. value = <gate> * x + <residual>; store residual_out
+        tNrNs = []
+        for j in cutlass.range_constexpr(self.chunks_per_warp):
+            value = tXrXs[j].load()
+            if cutlass.const_expr(isinstance(tGrGs[j], cute.Tensor)):
+                value = tGrGs[j].load() * value
+            if cutlass.const_expr(isinstance(tRrRs[j], cute.Tensor)):
+                value = value + tRrRs[j].load()
+            tROgRO, tROrRO = _slice(mResOut, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            if cutlass.const_expr(isinstance(tROrRO, cute.Tensor)):
+                tROrRO.store(value.to(tROrRO.element_type))
+                _copy(tROrRO, tROgRO)  # rmem -> gmem
+            tNrN = cute.make_rmem_tensor_like(tXrXs[j], tXrXs[j].element_type)
+            tNrN.store(value.to(tNrN.element_type))
+            tNrNs.append(tNrN)
+        # 3. row statistics over every chunk
+        mean, factor = row_norm_stats(
+            self.norm_type, tNrNs, self.num_chunks, warp_id, lane_id, D, eps
+        )
+        # 4. y = norm(value) * <weight> + <bias>, then * (1 + <scale>) + <shift>
+        for j in cutlass.range_constexpr(self.chunks_per_warp):
+            tWgW, tWrW = _slice(mWeight, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            tBgB, tBrB = _slice(mBias, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            _copy(tWgW, tWrW)
+            _copy(tBgB, tBrB)
+            tNrN = normalize_chunk(self.norm_type, tNrNs[j], tWrW, tBrB, mean, factor)
+            value = tNrN.load()
+            tSCgSC, tSCrSC = _slice(mScale, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            tSHgSH, tSHrSH = _slice(mShift, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            _copy(tSCgSC, tSCrSC)
+            _copy(tSHgSH, tSHrSH)
+            if cutlass.const_expr(isinstance(tSCrSC, cute.Tensor)):
+                value = value * (1 + tSCrSC.load())
+            if cutlass.const_expr(isinstance(tSHrSH, cute.Tensor)):
+                value = value + tSHrSH.load()
+            tYgY, tYrY = _slice(mY, thr_copy, bidx, bidy, chunk0 + j, S, D)
+            tYrY.store(value.to(tYrY.element_type))
+            _copy(tYrY, tYgY)  # rmem -> gmem
+
+
+@cute.jit
+def _slice(mV, thr_copy, bidx, bidy, chunk_id, S, D: cutlass.Constexpr):
+    # per-thread gmem/rmem slice of one chunk of row (bidx, bidy); scalars pass through
+    if cutlass.const_expr(isinstance(mV, cute.Tensor)):
+        return tensor_slice_for_bsfd(mV, thr_copy, bidx, bidy, chunk_id, S, D, CHUNK)
+    return mV, mV
+
+
+@cute.jit
+def _copy(src, dst):
+    if cutlass.const_expr(
+        isinstance(src, cute.Tensor) and isinstance(dst, cute.Tensor)
+    ):
+        cute.autovec_copy(src, dst)  # LDG.128 / STG.128
+
+
+@functools.lru_cache
+def _chunks_per_warp(D: int, gated_affine: bool) -> int:
+    """Chunks each warp walks: ~5 warps per row (B300 at Wan's 5120 is fastest there), 10 when
+    the row also streams a gate and an affine weight, whose registers then cap occupancy."""
+    num_chunks = D // CHUNK
+    min_warps = 10 if gated_affine else 5
+    per_warp = 1
+    for c in range(1, num_chunks + 1):
+        if num_chunks % c == 0 and num_chunks // c >= min_warps:
+            per_warp = c
+    return per_warp
 
 
 def validate_x(t: torch.Tensor, B: int, S: int, D: int):
@@ -297,11 +322,14 @@ def fused_norm_scale_shift(
         bias = 0 if bias is None else bias
         ResOut, Residual, Gate = 0, 0, 1
         torch_tensors = [y, ResOut, Residual, x, Gate, weight, bias, scale, shift]
+        chunks_per_warp = _chunks_per_warp(D, gated_affine=False)
         # Compile cache
-        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, chunks_per_warp, *torch_tensors
+        )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            kernel = ScaleResidualNormScaleShift(D, norm_type, chunks_per_warp)
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
                 kernel, *fake_sig_args, options="--enable-tvm-ffi"
@@ -383,15 +411,23 @@ def fused_scale_residual_norm_scale_shift(
         # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
         # TVM-FFI backend does not support None parameters. scalar values do not result
         # in code generation and have no impact on runtime performance.
+        chunks_per_warp = _chunks_per_warp(
+            D,
+            gated_affine=isinstance(gate, torch.Tensor)
+            and gate.numel() > 1
+            and weight is not None,
+        )
         gate = 1 if gate is None else gate
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
         # Compile cache
-        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(
+            norm_type, chunks_per_warp, *torch_tensors
+        )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            kernel = ScaleResidualNormScaleShift(D, norm_type, chunks_per_warp)
             fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
             compiled_fn = cute.compile(
                 kernel, *fake_sig_args, options="--enable-tvm-ffi"
