@@ -41,16 +41,18 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
     get_parallel,
-    get_spec,
     max_prefill_buffer_tokens,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
-    from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
-    from flashinfer.comm.mapping import Mapping
-    from flashinfer.comm.mnnvl import MnnvlConfig
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpCommParams,
+        NVLinkOneSidedAlltoAll,
+        NVLinkOneSidedConfig,
+        create_communication,
+    )
 
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
@@ -60,11 +62,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
-# concurrently live paths distinct persistent workspaces without extra token work.
-_WORKSPACE_NAMESPACE_ALIGNMENT = 128
 
-
+# FlashInfer shares one workspace among communication instances with the same
+# geometry, and those instances must not interleave dispatch/combine rounds.
+# Padding the token capacity by the namespace gives concurrently live paths
+# distinct persistent workspaces without extra token work.
 class _WorkspaceNamespace(enum.IntEnum):
     DECODE = 0
     SPECULATIVE = 1
@@ -92,8 +94,8 @@ def _scattered_source_token_counts(
     return counts
 
 
-def _workspace_size_for_namespace(
-    workspace_size: int,
+def _max_tokens_for_namespace(
+    max_num_tokens: int,
     *,
     namespace: Optional[_WorkspaceNamespace] = None,
     speculative: Optional[bool] = None,
@@ -106,7 +108,7 @@ def _workspace_size_for_namespace(
             if speculative
             else _WorkspaceNamespace.DECODE
         )
-    return workspace_size + int(namespace) * _WORKSPACE_NAMESPACE_ALIGNMENT
+    return max_num_tokens + int(namespace)
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -195,90 +197,45 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_runner_config = MoeRunnerConfig(
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
+                num_fused_shared_experts=0,
                 hidden_size=hidden_size,
                 top_k=router_topk,
             )
         self.prefill_dispatcher = StandardDispatcher(moe_runner_config)
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
-        # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
-        # which reserves ep_size * max_num_tokens * payload bytes, and the C++
-        # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
+        # EP rank: its dispatch receive buffer is ep_size * max_tokens_per_rank rows.
         #
         # Cover both the largest eager prefill chunk (including PP dynamic
         # chunking) and the largest decode batch using upstream's shared bound.
         self.max_num_tokens = flashinfer_a2a_max_dispatch_tokens_per_rank(
             max_prefill_buffer_tokens()
         )
-        speculative_algo = SpeculativeAlgorithm.from_string(
-            get_spec().speculative_algorithm
+        bootstrap = BootstrapConfig(
+            world_size=self.ep_size, rank=self.ep_rank, process_group=group
         )
-        can_use_quantized_dispatch = not speculative_algo.is_eagle()
-        topk_id_and_weight_bytes = self.router_topk * 4 + self.router_topk * 4
-        bf16_dispatch_payload_size_per_token = (
-            hidden_size * 2 + topk_id_and_weight_bytes  # bf16 hidden states
+        a2a_config = NVLinkOneSidedConfig(
+            comm_backend=TorchDistributedCommBackend(group)
         )
-        if (
-            self.dispatch_type == FlashinferA2ADispatchType.NVFP4
-            and can_use_quantized_dispatch
-        ):
-            quantized_dispatch_payload_size_per_token = (
-                hidden_size // 2  # nvfp4 hidden states
-                + hidden_size // 16  # uint8 scaling factors
-                + topk_id_and_weight_bytes
-            )
-            total_dispatch_payload_size_per_token = max(
-                quantized_dispatch_payload_size_per_token,
-                bf16_dispatch_payload_size_per_token,
-            )
-        elif (
-            self.dispatch_type == FlashinferA2ADispatchType.MXFP8
-            and can_use_quantized_dispatch
-        ):
-            quantized_dispatch_payload_size_per_token = (
-                hidden_size  # fp8 hidden states
-                + hidden_size // 32  # ue8m0 scaling factors
-                + topk_id_and_weight_bytes
-            )
-            total_dispatch_payload_size_per_token = max(
-                quantized_dispatch_payload_size_per_token,
-                bf16_dispatch_payload_size_per_token,
-            )
-        else:
-            total_dispatch_payload_size_per_token = bf16_dispatch_payload_size_per_token
-        combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
-        self.workspace_size = moe_a2a_get_workspace_size_per_rank(
-            ep_size=self.ep_size,
-            max_num_tokens=self.max_num_tokens,
-            total_dispatch_payload_size_per_token=total_dispatch_payload_size_per_token,
-            combine_payload_size_per_token=combine_payload_size_per_token,
-        )
-
-        self.mapping = Mapping(
-            rank=self.ep_rank,
-            tp_size=self.ep_size,
-            moe_ep_size=self.ep_size,
-            world_size=self.ep_size,
-            gpus_per_node=torch.cuda.device_count(),
-            pp_size=1,
-            cp_size=1,
-        )
-        mnnvl_config = MnnvlConfig(comm_backend=TorchDistributedCommBackend(group))
         is_speculative_model = get_flags().moe.speculative_context
 
-        def make_moe_a2a(namespace: _WorkspaceNamespace) -> MoeAlltoAll:
-            workspace_size = _workspace_size_for_namespace(
-                self.workspace_size,
-                namespace=namespace,
-            )
-            return MoeAlltoAll(
-                mapping=self.mapping,
-                max_num_tokens=self.max_num_tokens,
-                top_k=self.router_topk,
+        def make_moe_a2a(namespace: _WorkspaceNamespace) -> NVLinkOneSidedAlltoAll:
+            params = MoEEpCommParams(
                 num_experts=self.num_experts,
-                workspace_size_per_rank=workspace_size,
-                mnnvl_config=mnnvl_config,
+                top_k=self.router_topk,
+                max_tokens_per_rank=_max_tokens_for_namespace(
+                    self.max_num_tokens, namespace=namespace
+                ),
+                hidden_size=self.hidden_size,
+                # No dispatch_format: BF16 rows bound every quantized format and
+                # cover layers whose dispatch falls back to BF16 (draft, EAGLE).
+                dtype=torch.bfloat16,
+                invalid_expert_id=self.invalid_token_expert_id,
             )
+            # FlashInfer's host-side workspace metadata must stay on the CPU even
+            # when layers are built under a CUDA default-device context.
+            with torch.device("cpu"):
+                return create_communication(bootstrap, params, backend=a2a_config)
 
         decode_namespace = (
             _WorkspaceNamespace.SPECULATIVE
@@ -309,11 +266,7 @@ class FlashinferDispatcher(BaseDispatcher):
         )
 
     def _clear_active_a2a(self) -> None:
-        for attr in (
-            "runtime_max_tokens_per_rank",
-            "active_moe_a2a",
-            "active_a2a_namespace",
-        ):
+        for attr in ("active_moe_a2a", "active_a2a_namespace"):
             if hasattr(self, attr):
                 delattr(self, attr)
 
@@ -424,8 +377,8 @@ class FlashinferDispatcher(BaseDispatcher):
         # FlashInfer dispatch requires materialized top-k IDs and weights.
         if TopKOutputChecker.format_is_bypassed(topk_output):
             topk_output = topk_output.to_standard()
-        # FlashInfer MoeAlltoAll's expert-ID ABI is int32. This dispatcher is
-        # only selected for moe_a2a_backend="flashinfer".
+        # FlashInfer NVLinkOneSidedAlltoAll's expert-ID ABI is int32. This
+        # dispatcher is only selected for moe_a2a_backend="flashinfer".
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
@@ -460,19 +413,9 @@ class FlashinferDispatcher(BaseDispatcher):
                     0, self.hidden_size // 32, dtype=torch.uint8, device=x.device
                 )
 
-        payloads = []
-        payloads.append(x)
-        if x_sf is not None:
-            payloads.append(x_sf)
-            expert_id_payload_index = 2
-        else:
-            expert_id_payload_index = 1
-        payloads.append(topk_ids)
-        payloads.append(topk_weights)
-
         # runtime_max_tokens_per_rank selection
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # MoeAlltoAll uses fixed-geometry buffers shaped
+        # NVLinkOneSidedAlltoAll uses fixed-geometry buffers shaped
         # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank must pass
         # the SAME value. This code (Python) runs during eager forwards and during
         # CUDA-graph *capture*; on *replay* dispatch() is not re-executed and the
@@ -507,8 +450,8 @@ class FlashinferDispatcher(BaseDispatcher):
             )
             runtime_max_tokens_per_rank = x.shape[0]
 
-        # MoeAlltoAll does not resize its max_num_tokens workspace; reject larger
-        # runtime geometry here before it becomes an illegal memory access.
+        # The FlashInfer workspace is sized once for max_num_tokens; reject larger
+        # runtime geometry here with a sizing hint rather than FlashInfer's error.
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
             f"runtime_max_tokens_per_rank={runtime_max_tokens_per_rank} > "
@@ -525,54 +468,42 @@ class FlashinferDispatcher(BaseDispatcher):
         # count) rather than a benign case.
         assert runtime_max_tokens_per_rank >= x.shape[0], (
             f"runtime_max_tokens_per_rank={runtime_max_tokens_per_rank} < "
-            f"x.shape[0]={x.shape[0]}: MoeAlltoAll recv buffer would overflow."
+            f"x.shape[0]={x.shape[0]}: A2A recv buffer would overflow."
         )
 
-        # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
-        # inside moe_a2a. The recv buffer has shape
-        # [ep_size, max_tokens_per_rank, ...], so any rank below max leaves
-        # padding slots whose expert_id would otherwise route to a real expert
-        # and waste downstream MoE compute. Sanitizing the padding to a
-        # sentinel id is structural, not optional.
-        self.runtime_max_tokens_per_rank = runtime_max_tokens_per_rank
+        # The recv buffer has shape [ep_size * runtime_max_tokens_per_rank, ...],
+        # so any rank below max leaves padding slots; FlashInfer sanitizes their
+        # expert ids to MoEEpCommParams.invalid_expert_id so that downstream MoE
+        # compute skips them.
         self._start_a2a(sp_prefill=is_sp_prefill)
         try:
-            recv_tensors = self.active_moe_a2a.dispatch(
+            received = self.active_moe_a2a.dispatch(
+                x,
                 topk_ids,
-                payloads,
-                runtime_max_tokens_per_rank,
-                invalid_token_expert_id=self.invalid_token_expert_id,
-                expert_id_payload_index=expert_id_payload_index,
+                topk_weights,
+                hidden_states_scale=x_sf,
+                max_tokens_per_rank=runtime_max_tokens_per_rank,
             )
-            if x_sf is not None:
-                x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
-                x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-                # TODO: fuse interleave into cutlass moe
-                if dispatch_type == FlashinferA2ADispatchType.NVFP4 and (
-                    self.runner_backend is not None
-                    and self.runner_backend.is_flashinfer_cutlass()
-                ):
-                    x_sf = nvfp4_block_scale_interleave(x_sf)
-            else:
-                x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
-            x = x_recv.view(-1, x_recv.shape[-1])
-            if dispatch_type == FlashinferA2ADispatchType.MXFP8:
-                x = x.view(torch.float8_e4m3fn)
-            topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
-            topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
+            x = received.hidden_states
+            x_sf = received.hidden_states_scale
+            # TODO: fuse interleave into cutlass moe
+            if (
+                dispatch_type == FlashinferA2ADispatchType.NVFP4
+                and self.runner_backend is not None
+                and self.runner_backend.is_flashinfer_cutlass()
+            ):
+                x_sf = nvfp4_block_scale_interleave(x_sf)
 
             # Provide an output tensor to fused_moe so it writes directly to our buffer
             moe_output = None
             if self.payload_in_workspace:
-                moe_output = (
-                    self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
-                        runtime_max_tokens_per_rank, self.hidden_size, output_dtype
-                    ).view(-1, self.hidden_size)
-                )
+                moe_output = self.active_moe_a2a.get_combine_input_buffer(output_dtype)
             return FlashinferDispatchOutput(
                 x,
                 x_sf,
-                StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
+                StandardTopKOutput(
+                    received.topk_weights, received.topk_ids, topk_output.router_logits
+                ),
                 moe_output,
                 output_dtype,
             )
@@ -621,16 +552,8 @@ class FlashinferDispatcher(BaseDispatcher):
                 "FlashInfer A2A FP8 MoE combine payload must be BF16, but "
                 f"received {hidden_states.dtype}."
             )
-        output_hidden_size = hidden_states.shape[-1]
         try:
-            return self.active_moe_a2a.combine(
-                hidden_states.view(
-                    self.ep_size,
-                    self.runtime_max_tokens_per_rank,
-                    output_hidden_size,
-                ),
-                self.runtime_max_tokens_per_rank,
-                payload_in_workspace=self.payload_in_workspace,
-            )
+            # FlashInfer detects a payload already in its combine input buffer.
+            return self.active_moe_a2a.combine(hidden_states)
         finally:
             self._clear_active_a2a()
