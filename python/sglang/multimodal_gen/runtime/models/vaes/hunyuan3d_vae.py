@@ -633,18 +633,21 @@ class VanillaVolumeDecoder:
             bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
-        xyz_samples, grid_size, length = generate_dense_grid_points(
-            bbox_min=bbox_min,
-            bbox_max=bbox_max,
-            octree_resolution=octree_resolution,
-            indexing="ij",
+        grid_size = [int(octree_resolution) + 1] * 3
+        x = np.linspace(
+            bbox_min[0], bbox_max[0], grid_size[0], dtype=np.float32
         )
-        xyz_samples = (
-            torch.from_numpy(xyz_samples)
-            .to(device, dtype=dtype)
-            .contiguous()
-            .reshape(-1, 3)
+        y = np.linspace(
+            bbox_min[1], bbox_max[1], grid_size[1], dtype=np.float32
         )
+        z = np.linspace(
+            bbox_min[2], bbox_max[2], grid_size[2], dtype=np.float32
+        )
+        x = torch.from_numpy(x).to(device, dtype=dtype)
+        y = torch.from_numpy(y).to(device, dtype=dtype)
+        z = torch.from_numpy(z).to(device, dtype=dtype)
+        xs, ys, zs = torch.meshgrid(x, y, z, indexing="ij")
+        xyz_samples = torch.stack((xs, ys, zs), dim=-1).reshape(-1, 3)
 
         batch_logits = []
         for start in tqdm(
