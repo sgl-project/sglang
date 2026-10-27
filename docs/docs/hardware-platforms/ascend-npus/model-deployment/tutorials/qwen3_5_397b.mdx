@@ -159,7 +159,8 @@ curl http://${HOST}:${PORT}/generate \
 
 Expected result: an HTTP 200 response with the generated text containing "Paris".
 
-For multimodal requests (text + image):
+For multimodal requests (text + image). The example image URL is fetched by the server at request time, so the server
+needs internet access; otherwise, replace it with a local image path or any URL reachable from the server:
 
 ```shell
 # ============================================================
