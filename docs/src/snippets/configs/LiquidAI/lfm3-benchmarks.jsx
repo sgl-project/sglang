@@ -4,6 +4,11 @@
 // 0 truncated, 1319/1319 completions.
 
 export const benchmarks = [
+  {
+    match: { hw: "gb300", variant: "1.7b", quant: "bf16", strategy: "default", nodes: "single" },
+    accuracy: { gsm8k_pct: 94.47 },
+    sglang_version: "main@80ca262b3e (pre-release)",
+  },
   // ====================================================================
   // H200
   // ====================================================================

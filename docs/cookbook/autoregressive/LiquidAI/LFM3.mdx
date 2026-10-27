@@ -1,6 +1,6 @@
 ---
 title: LFM3
-description: "Deploy Liquid AI's LFM3 with SGLang — hybrid gated short conv + attention models: LFM3-1.7B text with 256K context and LFM3-VL-1.9B with native-resolution image and video input, on a single GPU."
+description: "Deploy Liquid AI's LFM3 with SGLang — hybrid gated short conv + attention models: LFM3-1.7B text with 256K context and LFM3-VL-2B with native-resolution image and video input, on a single GPU."
 tag: NEW
 ---
 
@@ -88,7 +88,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-LFM3 is [Liquid AI](https://www.liquid.ai/)'s family of hybrid models for on-device deployment, released under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LICENSE). Two preview checkpoints are available: the text-only **LFM3-1.7B** and the vision-language **LFM3-VL-1.9B**.
+LFM3 is [Liquid AI](https://www.liquid.ai/)'s family of hybrid models for on-device deployment, released under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LICENSE). Two checkpoints are covered here: the text-only **LFM3-1.7B** and the vision-language **LFM3-VL-2B**.
 
 The backbone interleaves **gated short convolution blocks** (kernel size 7) with **grouped query attention (GQA) blocks** split between sliding-window attention (256-token window) and full attention. Each convolution block applies input-dependent multiplicative gating around a depthwise short convolution for fast local mixing at low compute and memory cost; the attention blocks handle long-range retrieval. With 24 layers, hidden size 2048, 16 query / 4 key-value heads, head dim 128, tied embeddings, and a 128,000-token vocabulary, the language model totals 1.73B parameters in BF16.
 
@@ -125,7 +125,7 @@ The backbone interleaves **gated short convolution blocks** (kernel size 7) with
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Text, reasoning, tool use</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM3-VL-1.9B">LFM3-VL-1.9B</a></strong></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/LiquidAI/LFM3-VL-2B">LFM3-VL-2B</a></strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.73B LM + 164M vision + 25M projector</td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>128K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Vision-language (image + video, native resolution)</td>
@@ -137,7 +137,7 @@ The backbone interleaves **gated short convolution blocks** (kernel size 7) with
 
 **License:** [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LICENSE).
 
-**Resources:** [LFM3-1.7B on HuggingFace](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM3-VL-1.9B on HuggingFace](https://huggingface.co/LiquidAI/LFM3-VL-1.9B), [LFM docs](https://docs.liquid.ai/lfm/getting-started/welcome).
+**Resources:** [LFM3-1.7B on HuggingFace](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM3-VL-2B on HuggingFace](https://huggingface.co/LiquidAI/LFM3-VL-2B), [LFM docs](https://docs.liquid.ai/lfm/getting-started/welcome).
 
 ## 2. Configuration Tips
 
@@ -149,7 +149,7 @@ Only the **H200** cells are verified end-to-end (2026-10-26, BF16, TP=1, flashin
 - **Reasoning parser (`--reasoning-parser auto`)**: LFM3 wraps its chain-of-thought in `<think>...</think>` tags. The generated command passes `--reasoning-parser auto`, which resolves the `qwen3` parser for this checkpoint and splits thinking into `reasoning_content`. Without a reasoning parser the thinking stays inline in `content`.
 - **Tool-call parser (`--tool-call-parser auto`)**: LFM3's `<tool_call><function=...><parameter=...>` format matches the `qwen3_coder` parser's sentinels. The generated command passes `--tool-call-parser auto`, which resolves `qwen3_coder` for this checkpoint (the server log prints the resolved parser), and calls surface as standard `message.tool_calls`. If the log names a different parser, pass `--tool-call-parser qwen3_coder` explicitly.
 - **Thinking by default**: the chat template enables thinking (`enable_thinking=true`) unless you opt out, and long thinking traces are normal — a mean of ~1100 reasoning tokens per GSM8K answer was measured, so request-level token budgets must accommodate the chain-of-thought, not just the final answer. Pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` to answer directly (the generation prompt then ends with an empty `<think></think>` block).
-- **Hardware requirements**: both LFM3 preview checkpoints run on a single GPU (TP=1); the BF16 weights take under 4 GB, leaving most of GPU memory for KV cache and multimodal features. TP=2 is verified on the text model (Playground override) but not required.
+- **Hardware requirements**: both LFM3 checkpoints run on a single GPU (TP=1); the BF16 weights take under 4 GB, leaving most of GPU memory for KV cache and multimodal features. TP=2 is verified on the text model (Playground override) but not required.
 - **No speculative decoding**: the server rejects speculative-decoding configurations for this architecture at startup.
 - **Precision**: BF16 (or FP16) checkpoints only — there is no packed-quantization (FP8/FP4) variant.
 - **Video input (VL)**: LFM3-VL samples videos at 2 fps, pairs consecutive frames, and prefixes each frame with its timestamp. Pass videos as `video_url` content blocks the same way as images (see [§3.4](#3-4-vision-and-video-input)).
@@ -252,7 +252,7 @@ Tool-call deltas are also streamed incrementally when `stream=True`.
 
 ### 3.4 Vision and Video Input
 
-LFM3-VL-1.9B accepts images and videos at native resolution via standard OpenAI multimodal content blocks. URLs and base64 data URIs both work.
+LFM3-VL-2B accepts images and videos at native resolution via standard OpenAI multimodal content blocks. URLs and base64 data URIs both work.
 
 <Accordion title="Image example (Python)">
 
@@ -263,7 +263,7 @@ with open("test_pattern.png", "rb") as f:
     data_uri = "data:image/png;base64," + base64.b64encode(f.read()).decode()
 
 resp = client.chat.completions.create(
-    model="LiquidAI/LFM3-VL-1.9B",
+    model="LiquidAI/LFM3-VL-2B",
     messages=[{
         "role": "user",
         "content": [
@@ -298,7 +298,7 @@ with open("test_clip.mp4", "rb") as f:
     data_uri = "data:video/mp4;base64," + base64.b64encode(f.read()).decode()
 
 resp = client.chat.completions.create(
-    model="LiquidAI/LFM3-VL-1.9B",
+    model="LiquidAI/LFM3-VL-2B",
     messages=[{
         "role": "user",
         "content": [

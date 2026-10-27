@@ -20,7 +20,7 @@ export const config = {
 
   variants: [
     { id: "1.7b", label: "1.7B",      subtitle: "dense hybrid · text" },
-    { id: "vl",   label: "VL 1.9B",   subtitle: "vision-language · image + video" },
+    { id: "vl",   label: "VL 2B",   subtitle: "vision-language · image + video" },
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
@@ -34,7 +34,7 @@ export const config = {
 
   modelNames: {
     "1.7b|bf16": "LiquidAI/LFM3-1.7B",
-    "vl|bf16":   "LiquidAI/LFM3-VL-1.9B",
+    "vl|bf16":   "LiquidAI/LFM3-VL-2B",
   },
 
   placeholders: {
@@ -290,7 +290,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "1.7b", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -303,7 +303,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "vl", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
