@@ -12,6 +12,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
@@ -170,6 +171,7 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
         None | Some(0) => vec![args.load_snapshot_dp_rank],
         Some(_) => Vec::new(),
     };
+    let started = Instant::now();
     let loads: Vec<Map<String, Value>> =
         read_snapshots(Path::new(path), args.load_snapshot_dp_size, &ranks)
             .iter()
@@ -179,6 +181,9 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
                 load
             })
             .collect();
+    if let Some(metrics) = state.core.metrics() {
+        metrics.observe_get_loads(started.elapsed());
+    }
 
     if query.format.as_deref() == Some("prometheus") {
         return (
@@ -474,11 +479,14 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: crate::api_server::core::CoreMetadata::default(),
+                    metrics: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
         });
         let query = Query::try_from_uri(&format!("/v1/loads?{query}").parse().unwrap()).unwrap();
         let response = loads(State(state), query).await;

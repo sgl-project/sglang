@@ -775,6 +775,7 @@ class TboForwardBatchPreparer:
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
+            "contains_last_prefill_chunk",
             "spec_algorithm",
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches

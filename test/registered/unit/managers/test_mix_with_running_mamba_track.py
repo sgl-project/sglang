@@ -151,7 +151,11 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         # The assembly at the end of prepare_for_extend.
         extend.mamba_prefill_track_mask_cpu = [e.track_mask for e in entries]
         extend.mamba_track_seqlens_cpu = [e.track_seqlen for e in entries]
-        extend.mamba_track_indices = torch.tensor([e.track_index for e in entries])
+        extend.mamba_track_indices = sb._gather_mamba_track_indices(
+            torch.stack([r.kv.mamba_ping_pong_track_buffer for r in extend.reqs]),
+            extend.req_pool_indices,
+            torch.tensor([e.track_position for e in entries]),
+        )
         extend.mamba_track_mask = torch.tensor([e.track_mask for e in entries])
         extend.mamba_track_seqlens = torch.tensor([e.track_seqlen for e in entries])
 
