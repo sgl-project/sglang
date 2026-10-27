@@ -183,8 +183,6 @@ class DSparkMiniMaxDraftModel(DSparkDraftMixin, MiniMaxDraftBackbone):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._ctx_kv_writer = _hip.ctx_kv_writer(self) if _is_hip else None
-        if _is_hip:
-            self.markov_head = _hip.markov_head(self.markov_head)
 
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None

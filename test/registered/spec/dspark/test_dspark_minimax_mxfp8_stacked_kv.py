@@ -436,37 +436,5 @@ class TestMiniMaxBlockFp8CtxKv(CustomTestCase):
                     )
 
 
-@unittest.skipUnless(is_gfx95_supported(), "the fused markov step bias is gfx950-only")
-class TestMiniMaxFusedStepBiasMarkov(CustomTestCase):
-    def test_minimax_head_keeps_the_greedy_kernel_and_the_bias(self):
-        """The MiniMax draft's gfx950 head computes the bias VanillaMarkov does, and still
-        hands upstream's one-row greedy kernel its w2: overriding step_bias alone would
-        turn that kernel off."""
-        from sglang.srt.models.dspark import VanillaMarkov
-        from sglang.srt.models.minimax_common.amd import dspark_minimax_hip
-        from sglang.srt.speculative.dspark_components.dspark_hip import (
-            FusedStepBiasMarkov,
-        )
-
-        torch.manual_seed(0)
-        plain = VanillaMarkov(vocab_size=5003, markov_rank=256).to(
-            device="cuda", dtype=torch.bfloat16
-        )
-        head = dspark_minimax_hip.markov_head(plain)
-        self.assertIs(type(head), FusedStepBiasMarkov)
-        head.load_state_dict(plain.state_dict())
-        self.assertIs(head.greedy_w2_weight(), head.markov_w2.weight)
-        tokens = torch.randint(0, 5003, (3, 7), device="cuda")
-        got, state = head.step_bias(tokens, hidden_states=None, state=None)
-        ref, _ = plain.step_bias(tokens, hidden_states=None, state=None)
-        self.assertIsNone(state)
-        torch.testing.assert_close(got.float(), ref.float(), rtol=2**-7, atol=1e-6)
-        # ranks the kernel cannot tile keep VanillaMarkov
-        odd = VanillaMarkov(vocab_size=5003, markov_rank=96).to(
-            device="cuda", dtype=torch.bfloat16
-        )
-        self.assertIs(dspark_minimax_hip.markov_head(odd), odd)
-
-
 if __name__ == "__main__":
     unittest.main()

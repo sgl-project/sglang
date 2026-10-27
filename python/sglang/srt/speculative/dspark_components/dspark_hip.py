@@ -1,48 +1,22 @@
 """ROCm glue of DSparkWorkerV2 on gfx950: with the MiniMax draft, the target verify reduces
 its logits to their row argmax without their TP gather, and only the steps that read the
 logits gather them; a decode step queues its draft before its host seq lens land
-(overlap_utils_hip); FusedStepBiasMarkov is the MiniMax draft's markov head.
-dspark_worker_v2 binds it under _is_hip."""
+(overlap_utils_hip). dspark_worker_v2 binds it under _is_hip."""
 
 from __future__ import annotations
 
 import functools
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import MarkovStepBias
 from sglang.srt.environ import envs
 from sglang.srt.layers import logits_processor_hip
-from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.utils import is_gfx95_supported
-
-
-class FusedStepBiasMarkov(VanillaMarkov):
-    """VanillaMarkov gathering w1 and running the w2 GEMV of each step bias in one kernel."""
-
-    def step_bias(
-        self,
-        prev_tokens: torch.Tensor,
-        *,
-        hidden_states: Optional[torch.Tensor],
-        state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        del hidden_states
-        bias = MarkovStepBias.execute(
-            token_ids=prev_tokens,
-            w1_weight=self.markov_w1.weight,
-            w2_weight=self.markov_w2.weight,
-        )
-        return bias, state
-
-    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
-        # the bias is still the w2 GEMV, so a one-row greedy step keeps the fused kernel
-        return self.markov_w2.weight
 
 
 def defers_seq_lens_cpu(worker) -> bool:
