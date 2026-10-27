@@ -16,8 +16,8 @@ a proper :class:`torch.nn.Module` and covers **two independent dimensions**:
   backend name.
 - **Platform / device** — device-specific composite paths inherited from
   ``MultiPlatformOp``: ``forward_cuda``, ``forward_hip``, ``forward_npu``,
-  ``forward_xpu``, ``forward_musa``, ``forward_cpu``, plus ``forward_<key>``
-  for out-of-tree (OOT) platform plugins. CUDA / HIP are **not** kernel
+  ``forward_xpu``, ``forward_musa``, ``forward_cpu``, ``forward_mps``, plus
+  ``forward_<key>`` for out-of-tree (OOT) platform plugins. CUDA / HIP are **not** kernel
   backends.
 
 Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
@@ -40,7 +40,7 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
 5. **Platform-specific forward** — ``forward_cuda`` on CUDA, ``forward_hip``
    (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` on MUSA,
    ``forward_npu`` / ``forward_xpu`` on Ascend / XPU, ``forward_cpu`` on
-   AMX-capable CPUs.
+   AMX-capable CPUs, ``forward_mps`` on Apple Silicon.
 6. **Native fallback** — ``forward_native``.
 
 Steps 3-6 are static per process, so their outcome is resolved once (lazily,
@@ -159,6 +159,7 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
     "cpu": ("forward_cpu",),
+    "mps": ("forward_mps",),
 }
 
 
@@ -175,6 +176,7 @@ def _platform_key() -> str:
         is_cpu,
         is_cuda,
         is_hip,
+        is_mps,
         is_musa,
         is_npu,
         is_xpu,
@@ -192,6 +194,8 @@ def _platform_key() -> str:
         return "xpu"
     if is_musa():
         return "musa"
+    if is_mps():
+        return "mps"
     return ""
 
 
@@ -454,9 +458,9 @@ class BaseFusedOp(nn.Module, ABC):
         return self.op or type(self).__name__
 
     # --- platform forwards (forward_cuda / forward_hip / forward_npu /
-    # forward_xpu / forward_musa / forward_cpu) are *not* defined here: a
-    # platform path exists exactly when a subclass defines it, and dispatch
-    # falls back to forward_native otherwise. ---
+    # forward_xpu / forward_musa / forward_cpu / forward_mps) are *not*
+    # defined here: a platform path exists exactly when a subclass defines it,
+    # and dispatch falls back to forward_native otherwise. ---
 
     # --- selection ---
 
