@@ -79,7 +79,7 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
                 self.assertIs(backend._decode_runner, runner)
                 return backend
             # No graph capture runs in this fixture; exercise the inherited
-            # dtype property and no-op binding without creating a CUDA graph.
+            # dtype property without creating a CUDA graph.
             return FullCudaGraphBackend.__new__(FullCudaGraphBackend)
 
         with contextlib.ExitStack() as stack:
