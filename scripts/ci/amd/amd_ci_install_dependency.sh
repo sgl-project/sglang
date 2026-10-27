@@ -153,13 +153,47 @@ else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
   docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
-  # Clear Python cache to ensure latest code is used
-  docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
-  docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
-  # Also clear cache in sglang-checkout
+  # Clear Python cache in the checkout so the latest code is used. The uninstalls
+  # above already removed the old sglang files from /opt/venv, so walking all of
+  # site-packages there (~6 s) only made every job recompile torch's bytecode.
   docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
   docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
-  docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+
+  # The AOT kernels depend only on python/sglang/kernels/aot, the image and the
+  # GPU arch, yet rebuilding them took ~30 s in every job. Cache the wheel on the
+  # persistent /sgl-data volume, keyed by the source tree hash and the image ID.
+  # A dirty tree (local runs) or a missing key always builds without caching.
+  AOT_KEY=""
+  if git diff --quiet HEAD -- python/sglang/kernels/aot 2>/dev/null; then
+    AOT_TREE=$(git rev-parse --short=16 HEAD:python/sglang/kernels/aot 2>/dev/null || true)
+    AOT_IMAGE=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
+    AOT_IMAGE="${AOT_IMAGE#sha256:}"
+    if [[ -n "${AOT_TREE}" && -n "${AOT_IMAGE}" ]]; then
+      AOT_KEY="${AOT_TREE}-${AOT_IMAGE:0:16}-${IMAGE_GFX}"
+    fi
+  fi
+  AOT_CACHE_ROOT=/sgl-data/sgl-kernel-wheels
+  AOT_CACHE="${AOT_CACHE_ROOT}/${AOT_KEY}"
+  if [[ -n "${AOT_KEY}" ]] && docker exec ci_sglang bash -c "ls ${AOT_CACHE}/*.whl" >/dev/null 2>&1; then
+    echo "[AOT] Reusing cached sglang-kernel wheel ${AOT_KEY}"
+    docker exec ci_sglang touch "${AOT_CACHE}" || true
+    AOT_WHEEL_DIR="${AOT_CACHE}"
+  else
+    echo "[AOT] Building sglang-kernel (cache key: ${AOT_KEY:-none})"
+    docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && rm -rf dist && python3 setup_rocm.py bdist_wheel"
+    AOT_WHEEL_DIR=/sglang-checkout/python/sglang/kernels/aot/dist
+    if [[ -n "${AOT_KEY}" ]]; then
+      # Publish atomically: concurrent jobs on the same host may build the same key.
+      docker exec ci_sglang bash -c "
+        mkdir -p ${AOT_CACHE_ROOT} &&
+        tmp=\$(mktemp -d ${AOT_CACHE_ROOT}/.tmp.XXXXXX) &&
+        cp ${AOT_WHEEL_DIR}/*.whl \"\$tmp\"/ &&
+        { mv -T \"\$tmp\" ${AOT_CACHE} 2>/dev/null || rm -rf \"\$tmp\"; }
+        find ${AOT_CACHE_ROOT} -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+      " || echo "[AOT] Warning: could not store the wheel in ${AOT_CACHE}" >&2
+    fi
+  fi
+  docker exec ci_sglang bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
