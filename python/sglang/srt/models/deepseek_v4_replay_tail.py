@@ -60,8 +60,6 @@ from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
-    gather_late_layer_ids,
-    late_layer_dp_rows,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
@@ -194,7 +192,7 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         num_tokens: int,
         tail_in_graph: bool,
-        late_dp_rows: Optional[List[int]],
+        late_dp_counts: Optional[List[int]],
     ) -> Tuple[bool, Optional[List[int]]]:
         """Whether this step uses a tail graph and, under DP attention, every rank's
         tail rows; also feeds the warm gate."""
@@ -220,31 +218,24 @@ class DecoderReplayTail:
             tail_in_graph
             or get_is_capture_mode()
             or is_unified_kv_triton()
+            or get_global_expert_distribution_recorder().recording
+            or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
+            or not self._can_capture_moe_bound(forward_batch)
         ):
             return False, None
         if not dp:
             return (
                 tail is not None
-                and self._can_use_graph(forward_batch, tail.positions.shape[0]),
+                and self.runner.bucket_rows(tail.positions.shape[0]) is not None,
                 None,
             )
         dp_rows = scattered[1] if scattered is not None else None
-        if dp_rows is None and get_moe_a2a_backend().is_none():
-            dp_rows = late_dp_rows
-        if dp_rows is None or not self._can_use_graph(forward_batch, max(dp_rows)):
+        if dp_rows is None:
+            dp_rows = self._gathered_dp_rows(late_dp_counts, forward_batch)
+        if dp_rows is None or self.runner.bucket_rows(max(dp_rows)) is None:
             return False, None
         return True, dp_rows
-
-    def _can_use_graph(self, forward_batch: ForwardBatch, num_rows: int) -> bool:
-        """Whether a tail graph can run a step whose largest tail, over every DP
-        rank, has ``num_rows`` rows."""
-        return (
-            not get_global_expert_distribution_recorder().recording
-            and self.runner.warm
-            and self._can_capture_moe_bound(forward_batch)
-            and self.runner.bucket_rows(num_rows) is not None
-        )
 
     def _scattered_dp(
         self,
@@ -270,6 +261,26 @@ class DecoderReplayTail:
             num_tokens, 0 if tail is None else tail.positions.shape[0]
         )
 
+    @staticmethod
+    def _gathered_dp_rows(
+        late_dp_counts: Optional[List[int]], forward_batch: ForwardBatch
+    ) -> Optional[List[int]]:
+        """Every rank's tail rows for a TP MoE, or None without a uniform layout."""
+        if not get_moe_a2a_backend().is_none() or not forward_batch.is_extend_in_batch:
+            return None
+        # Exchanged before the forward (ForwardBatch.prepare_mlp_sync_batch).
+        if forward_batch.global_late_layer_num_tokens_cpu is not None:
+            return list(forward_batch.global_late_layer_num_tokens_cpu)
+        if late_dp_counts is not None:
+            return late_dp_counts
+        # No re-layout was needed: every rank's tail is its whole extend.
+        early = forward_batch.global_num_tokens_padded_cpu
+        if early is None:
+            early = forward_batch.global_num_tokens_cpu
+        if early is None or len(early) != get_parallel().attn_dp_size:
+            return None
+        return list(early)
+
     def breaks_out_of_prefill_graph(
         self, tail: LateLayerTail, *, num_tokens: int
     ) -> bool:
@@ -283,35 +294,6 @@ class DecoderReplayTail:
             and not is_unified_kv_triton()
             # Encoder replay's folded rows are not checked against the exact tail.
             and get_attn_backend().token_to_kv_pool.request_window is None
-        )
-
-    def run_on_batch(
-        self,
-        tail: LateLayerTail,
-        *,
-        state: HcState,
-        input_ids: torch.Tensor,
-        input_ids_global: torch.Tensor,
-        forward_batch: ForwardBatch,
-        capture_dspark: bool,
-        dp_rows: Optional[List[int]],
-        use_graph: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """Runs ``tail``'s rows of the whole-extend inputs through the tail layers,
-        from a graph or eagerly."""
-        # A TP MoE under DP gathers every rank's IDs inside the tail layers.
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
-            input_ids_global = None
-        else:
-            input_ids_global = tail.rows(input_ids_global)
-        return (self.run if use_graph else self._run_layers_eagerly)(
-            state=state.take_rows(tail.rows),
-            positions=tail.positions,
-            input_ids=tail.rows(input_ids),
-            input_ids_global=input_ids_global,
-            forward_batch=forward_batch,
-            capture_dspark=capture_dspark,
-            dp_rows=dp_rows,
         )
 
     def run(
@@ -448,6 +430,9 @@ class DecoderReplayTail:
         dp_rows: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
         """For a prefill-graph step whose tail has no graph to replay."""
+        if forward_batch.forward_mode.is_idle():
+            forward_batch = copy.copy(forward_batch)
+            forward_batch.forward_mode = ForwardMode.EXTEND
         tail_batch = copy.copy(forward_batch)
         tail_batch.global_num_token_non_padded_cpu = positions.shape[0]
         gather = dp_rows is not None and get_moe_a2a_backend().is_none()
@@ -458,7 +443,9 @@ class DecoderReplayTail:
             saved_dp = enter_late_layer_dp(tail_batch, dp_rows)
         try:
             if gather and self._model.late_layer_vl_routing:
-                input_ids_global = gather_late_layer_ids(input_ids, dp_rows, tail_batch)
+                gathered = input_ids.new_empty((sum(dp_rows), 1))
+                dp_gather_replicate(gathered, input_ids[:, None].clone(), tail_batch)
+                input_ids_global = gathered.squeeze(-1)
             with (
                 (
                     forward_context(get_forward_context(), forward_batch=tail_batch)
@@ -483,6 +470,7 @@ class DecoderReplayTail:
         self,
         *,
         state: HcState,
+        positions: torch.Tensor,
         input_ids: torch.Tensor,
         input_ids_global: Optional[torch.Tensor],
         capture_dspark: bool,
@@ -508,6 +496,7 @@ class DecoderReplayTail:
             bridge_key,
             bridge,
             leaves,
+            positions,
             input_ids,
             input_ids if input_ids_global is None else input_ids_global,
         )
@@ -678,14 +667,9 @@ def _enter_eager_tail_in_prefill_graph(
     """Switches onto exact-row tail metadata; returns the exit state and the
     batch the tail runs on (the capture batch while the graph captures)."""
     forward_batch = _unpadded_batch(backend.prefill_graph_replay_batch or graph_batch)
-    held = backend.tail_forward_metadata
-    backend.tail_forward_metadata = backend._build_late_layer_tail_metadata(
-        forward_batch
+    saved = backend.enter_late_layer_tail(
+        forward_batch, metadata=backend._build_late_layer_tail_metadata(forward_batch)
     )
-    try:
-        saved = backend.enter_late_layer_tail(forward_batch)
-    finally:
-        backend.tail_forward_metadata = held
     backend.tail_source_kv_layer_id = source_kv_layer_id
     return saved, forward_batch
 
@@ -700,6 +684,7 @@ def _tail_layers_in_prefill_graph(
     bridge_key: Tuple[bool, bool],
     bridge: Optional[List[Optional[torch.Tensor]]],
     leaves: List[torch.Tensor],
+    positions: torch.Tensor,
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> None:
@@ -716,31 +701,54 @@ def _tail_layers_in_prefill_graph(
         tail = backend.forward_metadata.late_layer_tail
         # The graph's rows are padded to its shape; the tail indexes live rows.
         num_tokens = forward_batch.input_ids.shape[0]
+
+        def rows(t: torch.Tensor) -> torch.Tensor:
+            return tail.rows(t[:num_tokens])
+
         num_rows = tail.positions.shape[0]
         dp_rows = None
         if dp:
-            dp_rows = late_layer_dp_rows(forward_batch, num_rows, in_graph=False)
-        # Under DP every rank must replay one bucket (its first use captures behind
-        # TP-group barriers), which local rows alone cannot pick.
-        shared_bucket = not dp or (dp_rows is not None and len(dp_rows) > 1)
-        # Capture stream and pool are busy while the prefill graphs capture.
-        use_graph = (
-            shared_bucket
-            and not get_flags().dp.capturing_prefill_graph
-            and tail_layers._can_use_graph(
-                forward_batch, max(dp_rows) if dp else num_rows
+            # Exchanged before the forward, except while the prefill graphs capture
+            # (every rank together), when it gathers here.
+            dp_rows = forward_batch.global_late_layer_num_tokens_cpu
+            if dp_rows is None:
+                counts = torch.empty(get_parallel().tp_size, dtype=torch.int64)
+                all_gather_single(
+                    counts,
+                    torch.tensor([num_rows], dtype=torch.int64),
+                    group=get_parallel().tp_group.cpu_group,
+                )
+                dp_rows = counts.tolist()
+            assert dp_rows[get_parallel().attn_dp_rank] == num_rows, (
+                dp_rows,
+                num_rows,
             )
-        )
-        residual, pre, aux = tail_layers.run_on_batch(
-            tail,
-            state=rebuild([t[:num_tokens] for t in leaves]),
-            input_ids=input_ids[:num_tokens],
-            input_ids_global=input_ids_global[:num_tokens],
+        tail_ids = rows(input_ids)
+        # A TP MoE under DP gathers every rank's IDs inside the tail layers.
+        if dp and get_moe_a2a_backend().is_none():
+            ids_global = None
+        else:
+            ids_global = rows(input_ids_global)
+        kwargs = dict(
+            state=rebuild([rows(t) for t in leaves]),
+            positions=tail.positions,
+            input_ids=tail_ids,
+            input_ids_global=ids_global,
             forward_batch=forward_batch,
             capture_dspark=capture_dspark,
             dp_rows=dp_rows,
-            use_graph=use_graph,
         )
+        # Capture stream and pool are busy while the prefill graphs capture.
+        runner = tail_layers.runner
+        if (
+            not get_flags().dp.capturing_prefill_graph
+            and runner.warm
+            and tail_layers._can_capture_moe_bound(forward_batch)
+            and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
+        ):
+            residual, pre, aux = tail_layers.run(**kwargs)
+        else:
+            residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
         tail_layers._write_bridge(
             bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
         )

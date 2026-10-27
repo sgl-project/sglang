@@ -2306,14 +2306,17 @@ class DeepseekV4HipRadixBackend(
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
 
-    def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
+    def enter_late_layer_tail(
+        self, forward_batch: ForwardBatch, metadata: Optional[DSV4Metadata] = None
+    ) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
-        return value. The source layer runs inside the tail and publishes its top-k and
-        candidates on the tail rows, so nothing is carried over from the full rows."""
+        return value. `metadata` defaults to tail_forward_metadata. The source layer runs
+        inside the tail and publishes its top-k and candidates on the tail rows, so
+        nothing is carried over from the full rows."""
         assert self.tail_source_kv_layer_id is not None, (
             "write_tail_source_kv must run before enter_late_layer_tail"
         )
-        tail_metadata = self.tail_forward_metadata
+        tail_metadata = self.tail_forward_metadata if metadata is None else metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)
         self.forward_metadata = tail_metadata

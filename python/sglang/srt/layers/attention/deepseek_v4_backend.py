@@ -2085,10 +2085,12 @@ class DeepseekV4AttnBackend(
             )
         self.tail_source_kv_layer_id = layer.layer_id
 
-    def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
+    def enter_late_layer_tail(
+        self, forward_batch: ForwardBatch, metadata: Optional[DSV4Metadata] = None
+    ) -> tuple:
         """Switch the late layers onto the tail; the return value goes back to
-        exit_late_layer_tail."""
-        tail_metadata = self.tail_forward_metadata
+        exit_late_layer_tail. `metadata` defaults to tail_forward_metadata."""
+        tail_metadata = self.tail_forward_metadata if metadata is None else metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (
             self.forward_metadata,
