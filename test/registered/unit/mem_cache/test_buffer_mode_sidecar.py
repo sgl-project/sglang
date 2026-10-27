@@ -49,6 +49,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
+def _controller_for_sync(storage_backend, reduce):
+    """Keep production confirmation methods while replacing only the collective."""
+    controller = object.__new__(HybridCacheController)
+    controller.storage_backend = storage_backend
+    controller.page_size = 2
+    controller.prefetch_hits_sync_groups = []
+    controller._all_reduce = reduce
+    return controller
+
+
 class TestBufferModeSidecar(unittest.TestCase):
     def test_cancelled_query_distinguishes_skipped_query_from_miss(self):
         for peer_kv_pages in (-1, 0):
@@ -58,13 +68,15 @@ class TestBufferModeSidecar(unittest.TestCase):
                     peer = torch.full_like(values, -1)
                     peer[0] = 0
                     peer[1 + list(PoolName).index(PoolName.KV)] = peer_kv_pages
+                    peer[-4:] = values[-4:]  # same boundary/confirmation contract
                     values.copy_(torch.minimum(values, peer))
 
-                controller = SimpleNamespace(
-                    page_size=2,
-                    storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
-                    prefetch_hits_sync_groups=[],
-                    _all_reduce=reduce,
+                controller = _controller_for_sync(
+                    SimpleNamespace(
+                        batch_exists=lambda *_: 2,
+                        requires_lookup_confirmation=False,
+                    ),
+                    reduce,
                 )
                 operation = PrefetchOperation(
                     CacheRequestHandle("cancelled", 0), list(range(4))
@@ -154,12 +166,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     operation = PrefetchOperation(
                         CacheRequestHandle("repair", 0), token_ids, pool_transfers=[swa]
                     )
-                    controller = SimpleNamespace(
-                        storage_backend=backend,
-                        page_size=2,
-                        prefetch_hits_sync_groups=[],
-                        _all_reduce=capture,
-                    )
+                    controller = _controller_for_sync(backend, capture)
                     _, hit_tokens = HybridCacheController._storage_hit_query(
                         controller, operation
                     )
@@ -235,12 +242,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             pool_transfers=[swa],
             assume_stored=True,
         )
-        controller = SimpleNamespace(
-            storage_backend=None,
-            page_size=2,
-            prefetch_hits_sync_groups=[],
-            _all_reduce=lambda values, *_: None,
-        )
+        controller = _controller_for_sync(None, lambda values, *_: None)
         _, hit_tokens = HybridCacheController._storage_hit_query(controller, operation)
         operation.storage_hit_count = HybridCacheController._sync_prefetch_hit_query(
             controller, operation, hit_tokens
@@ -622,10 +624,9 @@ class TestResumeBoundarySync(CustomTestCase):
                     else:
                         values[0] = min(values[0], max(peer_boundaries) * 2)
 
-                controller = SimpleNamespace(
-                    page_size=2,
-                    prefetch_hits_sync_groups=[],
-                    _all_reduce=reduce_with_peer,
+                controller = _controller_for_sync(
+                    SimpleNamespace(requires_lookup_confirmation=False),
+                    reduce_with_peer,
                 )
                 hit = HybridCacheController._sync_prefetch_hit_query(
                     controller, operation, max(local_boundaries) * 2
@@ -634,7 +635,7 @@ class TestResumeBoundarySync(CustomTestCase):
                 self.assertEqual(
                     operation.pool_storage_result.restorable_prefix_pages, [1]
                 )
-                self.assertEqual(calls, [len(PoolName) + 3, 4])
+                self.assertEqual(calls, [len(PoolName) + 5, 4])
 
     def test_mixed_legacy_reply_never_enters_a_rank_only_collective(self):
         """An explicit/absent-set mix must reject the hit, not hang one rank."""
@@ -646,16 +647,16 @@ class TestResumeBoundarySync(CustomTestCase):
 
         def reduce_with_legacy(values, *_):
             calls.append(values.numel())
-            values[-2:] = 0  # collective MIN of (1,0) and (0,1)
+            values[-4:-2] = 0  # explicit/absent MIN of (1,0) and (0,1)
 
-        controller = SimpleNamespace(
-            page_size=2, prefetch_hits_sync_groups=[], _all_reduce=reduce_with_legacy
+        controller = _controller_for_sync(
+            SimpleNamespace(requires_lookup_confirmation=False), reduce_with_legacy
         )
         self.assertEqual(
             HybridCacheController._sync_prefetch_hit_query(controller, operation, 8), 0
         )
         self.assertEqual(operation.pool_storage_result.restorable_prefix_pages, [])
-        self.assertEqual(calls, [len(PoolName) + 3])
+        self.assertEqual(calls, [len(PoolName) + 5])
 
 
 if __name__ == "__main__":

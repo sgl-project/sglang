@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -35,7 +36,7 @@ from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import get_event_hash_str, get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +63,37 @@ class TestPPPrefetchTicket(CustomTestCase):
             cache.query_storage_hit_length(0, list(range(8)), kv_hints=hint), 8
         )
         self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
+
+    def test_salted_decode_probe_binds_the_complete_prefix(self):
+        key = RadixKey(array("q", range(16)), cache_salt="tenant-a")
+        storage = get_storage_hash_str(key, page_size=4)
+        events = get_event_hash_str(key, page_size=4)
+        expected = dict(zip(storage[2:], (int(h[:16], 16) for h in events[2:])))
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False,
+            _storage_hit_query=lambda operation: (
+                [],
+                8 if operation.storage_key_to_event_hash == expected else 0,
+            ),
+        )
+        cache._all_reduce_attn_groups = Mock()
+        arguments = dict(
+            last_hash=storage[1],
+            cache_salt="tenant-a",
+            kv_hints={"message_id": "probe"},
+        )
+        self.assertEqual(
+            cache.query_storage_hit_length(
+                0, list(range(8, 16)), matched_prefix_tokens=list(range(8)), **arguments
+            ),
+            8,
+        )
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8, 16)), **arguments), 0
+        )
 
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
@@ -615,6 +647,31 @@ class TestPPPrefetchTicket(CustomTestCase):
         self.assertIs(c.prefetch_queue.get_nowait(), result.operation)
         c._storage_hit_query.assert_not_called()
 
+    def test_salted_peer_binding_survives_pp_ticket_and_receiver(self):
+        key = RadixKey(array("q", range(16)), cache_salt="tenant-a")
+        hashes = get_storage_hash_str(key, page_size=4)
+        events = get_event_hash_str(key, page_size=4)
+        hint = {"message_id": "salted-peer"}
+        result = self.c.submit_prefetch(
+            CacheRequestHandle("salted", 0),
+            key[8:],
+            hashes[1],
+            hashes[:2],
+            list(range(8)),
+            None,
+            kv_hints=hint,
+        )
+        expected = dict(zip(hashes[2:], (int(h[:16], 16) for h in events[2:])))
+        self.assertEqual(result.operation.storage_key_to_event_hash, expected)
+        ticket = pickle.loads(pickle.dumps(self.c.pp_prefetch_states["salted"].ticket))
+        self.assertEqual(ticket.storage_key_to_event_hash, expected)
+        self.c.storage_config.pp_rank = 1
+        self.c.pp_prefetch_states.clear()
+        self.run_commands(ticket)
+        received = self.c.prefetch_buffer.get_nowait()
+        self.assertEqual(received.storage_key_to_event_hash, expected)
+        self.assertEqual(received.kv_hints, hint)
+
     def test_downstream_request_and_ticket_order_preserves_pp0_admission(self):
         c, cache = self.c, self.cache
         self.submit(attempt_id=3)
@@ -887,6 +944,61 @@ class TestPPPrefetchTicket(CustomTestCase):
                 self.submit(rid)
             with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
                 c.is_pp_prefetch_ready(rid)
+
+    def test_command_abort_releases_confirmed_unqueued_mamba_claim(self):
+        """A failure after checkpoint confirmation must not strand the source
+        claim when PP preparation aborts before host delivery is enqueued.
+        """
+        c = self.c
+        c.storage_backend.requires_lookup_confirmation = True
+        claims = set()
+        confirmed = []
+
+        def query_with_boundary(operation):
+            hashes, hit_count = self.query_hits(operation)
+            operation.pool_storage_result.restorable_prefix_pages = [1, 2]
+            return hashes, hit_count
+
+        def confirm(_keys, _transfers, _pages, _extra_info, scope):
+            confirmed.append(scope)
+            claims.add(scope)
+            return True
+
+        def allocate(_ticket, operation):
+            operation.host_indices = torch.arange(8)
+            return True
+
+        c._storage_hit_query.side_effect = query_with_boundary
+        c.storage_backend.confirm_lookup.side_effect = confirm
+        c.storage_backend.release_lookup.side_effect = claims.discard
+        with (
+            patch.object(c, "_allocate_pp_prefetch_buffers", side_effect=allocate),
+            patch.object(
+                c,
+                "_resolve_sidecar_kv_derived_pool_transfers",
+                side_effect=RuntimeError("pre-enqueue preparation failed"),
+            ),
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
+                side_effect=lambda objects, *args, **kwargs: objects,
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            operation = self.submit(
+                pools=[
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=["checkpoint"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+            ).operation
+            c.pp_prefetch_command_thread_func()
+
+        self.assertEqual(confirmed, [operation.storage_lookup_scope])
+        self.assertFalse(claims)
+        self.assertFalse(operation.storage_transfer_enqueued)
+        self.assertTrue(c.prefetch_buffer.empty())
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c

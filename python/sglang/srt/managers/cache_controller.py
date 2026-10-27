@@ -43,6 +43,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.storage_key_binding import (
+    storage_key_to_event_hashes,
+    storage_operation_extra_info,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -236,6 +240,7 @@ class StorageOperation:
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -244,6 +249,7 @@ class StorageOperation:
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         self.kv_hints = kv_hints
+        self.storage_key_to_event_hash = storage_key_to_event_hash
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -276,6 +282,8 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         self.request_id = request_id
 
@@ -284,7 +292,14 @@ class PrefetchOperation(StorageOperation):
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            None,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            kv_hints=kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
+        )
 
     def mark_terminate(self):
         with self._lock:
@@ -777,6 +792,9 @@ class HiCacheController:
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
 
+        if self.enable_storage:
+            self.storage_backend.release_all_lookup_claims()
+
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
@@ -1038,12 +1056,25 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        kv_hints=None,
+        matched_prefix_tokens: Optional[List[int]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            kv_hints=kv_hints,
+            storage_key_to_event_hash=(
+                storage_key_to_event_hashes(
+                    new_input_tokens, self.page_size, matched_prefix_tokens, last_hash
+                )
+                if kv_hints is not None
+                else None
+            ),
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1135,7 +1166,7 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(
                     prefix_keys=prefix_keys,
-                    extra_info={"kv_hints": operation.kv_hints},
+                    extra_info=storage_operation_extra_info(operation),
                 )
 
                 try:
@@ -1276,6 +1307,12 @@ class HiCacheController:
                     )
                 )
 
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation) -> None:
+        self.prefetch_buffer.put(operation)
+
+    def release_unqueued_prefetch_claims(self, operation: PrefetchOperation) -> None:
+        """Backends without lookup claims have nothing to release on a drop."""
+
     def prefetch_rate_limited(self) -> bool:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
@@ -1315,6 +1352,16 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if (
+            operation.kv_hints is not None
+            and getattr(operation, "storage_key_to_event_hash", None) is None
+        ):
+            # Probe-only callers may not have the complete matched prefix.
+            # Root spans can bind here; incomplete namespaced spans decline
+            # peer access rather than forwarding IDs from the wrong domain.
+            operation.storage_key_to_event_hash = storage_key_to_event_hashes(
+                operation.token_ids, self.page_size, last_hash=operation.last_hash
+            )
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys
@@ -1329,7 +1376,8 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(
-                prefix_keys=prefix_keys, extra_info={"kv_hints": operation.kv_hints}
+                prefix_keys=prefix_keys,
+                extra_info=storage_operation_extra_info(operation),
             )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])

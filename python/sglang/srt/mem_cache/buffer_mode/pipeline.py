@@ -1324,7 +1324,7 @@ class BufferModePipeline:
             host_indices, operation.pool_transfers
         )
         cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-        cc.prefetch_buffer.put(operation)
+        cc.enqueue_prefetch_transfer(operation)
 
     def try_lock_anchor(
         self, request: CacheRequestHandle, remaining_full_tokens: int
