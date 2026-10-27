@@ -25,7 +25,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class TestPixtralProcessor(CustomTestCase):
     def _make_processor(self):
         processor = object.__new__(PixtralProcessor)
-        processor.use_cuda_ipc = True
         processor._feature_transport = MultimodalFeatureTransport(
             "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
         )

@@ -264,7 +264,6 @@ def _processed_input_processor():
         video_token_id=18,
     )
     processor.mm_processor_executor = None
-    processor.use_cuda_ipc = False
     processor._feature_transport = MultimodalFeatureTransport(
         "cpu", base_gpu_id=0, skip_mm_pool=True
     )

@@ -12,6 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -124,7 +127,9 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
     def _processor(self, *, transport="cpu", precompute_hash=False):
         processor = _make(base_gpu_id=0)
-        processor.mm_feature_transport = transport
+        processor._feature_transport = MultimodalFeatureTransport(
+            transport, base_gpu_id=0, skip_mm_pool=True
+        )
         processor.precompute_hash_before_cpu_transfer = precompute_hash
         return processor
 
@@ -139,7 +144,10 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
         )
         for processor, device, expected in cases:
             with (
-                self.subTest(device=device, transport=processor.mm_feature_transport),
+                self.subTest(
+                    device=device,
+                    transport=processor._feature_transport.mm_feature_transport,
+                ),
                 patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
                 patch(f"{BASE}.torch.cuda.MemPool", return_value="pool") as mem_pool,
                 patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
