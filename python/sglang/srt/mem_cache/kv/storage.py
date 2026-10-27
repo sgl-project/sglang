@@ -208,6 +208,15 @@ class KVStorage:
         """Give back the request's row; its ids went back before."""
         self.requests.free(req)
 
+    def take_rows(self, num_rows: int) -> Optional[List[int]]:
+        """Rows bound to no request (beam search members); None when too few
+        are free."""
+        return self.requests.alloc_rows(num_rows)
+
+    def release_rows(self, rows: List[int]) -> None:
+        """Give back rows `take_rows` handed out; their ids went back before."""
+        self.requests.free_rows(rows)
+
     @property
     def plan(self) -> KVStoragePlan:
         """The plan this storage was built from (read-only)."""
