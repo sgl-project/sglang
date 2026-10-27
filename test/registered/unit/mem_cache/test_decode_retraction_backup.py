@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -400,16 +401,21 @@ class TestDecodeRetractionBackup(CustomTestCase):
             queue.kv_manager = queue._init_kv_manager()
         queue.scheduler.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=env.cache,
+            storage=kv_storage_of(
+                env.req_to_token_pool,
+                env.allocator,
+                shape=StaticPoolShape(
+                    has_window=hybrid_swa,
+                    has_state=False,
+                    token_capacity=self.pool_size,
+                    full_tokens_per_layer=self.pool_size,
+                    swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
+                ),
+            ),
             token_to_kv_pool_allocator=env.allocator,
-            req_to_token_pool=env.req_to_token_pool,
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=hybrid_swa,
-            is_hybrid_ssm=False,
             enable_hisparse=False,
-            full_tokens_per_layer=self.pool_size,
-            swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
-            max_total_num_tokens=self.pool_size,
         )
         return queue, queue.kv_manager.kv_args
 

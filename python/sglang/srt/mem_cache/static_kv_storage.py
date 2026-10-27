@@ -9,12 +9,14 @@ bases of KV page interleave. Both go when those pools do.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
+from sglang.srt.mem_cache.kv.storage import SubPoolUsage
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -25,16 +27,30 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
+class StaticPoolShape(msgspec.Struct, frozen=True, kw_only=True):
+    """What the static pools' usage needs and only the scheduler knows: which
+    pools the model has, and the token capacities they were sized to."""
+
+    has_window: bool
+    has_state: bool
+    # The token pool's capacity without a window, in the allocator's units.
+    token_capacity: int
+    full_tokens_per_layer: Optional[int] = None
+    swa_tokens_per_layer: Optional[int] = None
+
+
 def kv_storage_of(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     *,
     tree_cache: Optional[BasePrefixCache] = None,
     batch: Optional[ScheduleBatch] = None,
+    shape: Optional[StaticPoolShape] = None,
 ) -> KVStorage | StaticKVStorage:
-    """What a request's lifecycle goes through: a unified pool's own storage,
-    else the static pools behind `StaticKVStorage` (``tree_cache`` and
-    ``batch`` feed only what the static pools need)."""
+    """What a request's lifecycle and the pool observers go through: a unified
+    pool's own storage, else the static pools behind `StaticKVStorage`
+    (``tree_cache``, ``batch`` and ``shape`` feed only what the static pools
+    need)."""
     storage = token_to_kv_pool_allocator.storage
     if storage is not None:
         return storage
@@ -43,6 +59,7 @@ def kv_storage_of(
         token_to_kv_pool_allocator,
         tree_cache=tree_cache,
         batch=batch,
+        shape=shape,
     )
 
 
@@ -79,11 +96,13 @@ class StaticKVStorage:
         *,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
+        shape: Optional[StaticPoolShape] = None,
     ):
         self.requests = req_to_token_pool
         self._allocator = token_to_kv_pool_allocator
         self._tree_cache = tree_cache
         self._batch = batch
+        self._shape = shape
 
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
         return acquire_rows(self.requests, self._allocator.state, reqs)
@@ -223,6 +242,58 @@ class StaticKVStorage:
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)
+
+    def accounting_violations(self) -> List[str]:
+        return self._allocator.verify_byte_accounting()
+
+    def usage(self) -> Tuple[SubPoolUsage, ...]:
+        shape, allocator = self._shape, self._allocator
+        if shape.has_window:
+            (full_capacity, full_available), (swa_capacity, swa_available) = (
+                allocator.swa_capacity_and_available(
+                    full_capacity=shape.full_tokens_per_layer,
+                    swa_capacity=shape.swa_tokens_per_layer,
+                )
+            )
+            usage = [
+                SubPoolUsage(
+                    name="full",
+                    metrics="full",
+                    capacity=full_capacity,
+                    available=full_available,
+                ),
+                SubPoolUsage(
+                    name="swa",
+                    metrics="swa",
+                    capacity=swa_capacity,
+                    available=swa_available,
+                ),
+            ]
+        else:
+            # A state model's token capacity is what its requests can schedule.
+            capacity = (
+                self.requests.schedulable_token_capacity(allocator.size)
+                if shape.has_state
+                else shape.token_capacity
+            )
+            usage = [
+                SubPoolUsage(
+                    name="full",
+                    metrics="full",
+                    capacity=capacity,
+                    available=allocator.available_size(),
+                )
+            ]
+        if shape.has_state:
+            usage.append(
+                SubPoolUsage(
+                    name="mamba",
+                    metrics="mamba",
+                    capacity=allocator.state.pool.size,
+                    available=allocator.state_slots.available_size(),
+                )
+            )
+        return tuple(usage)
 
 
 def _kv_shard_rotation_bases(

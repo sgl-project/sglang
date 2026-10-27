@@ -34,6 +34,17 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
     holds_state: bool
 
 
+class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
+    """A sub-pool's occupancy as observers report it, in its own units: tokens,
+    or slots for a sub-pool that holds state. ``metrics`` is the family its
+    numbers are published under."""
+
+    name: str
+    metrics: str
+    capacity: int
+    available: int
+
+
 class Region(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's device memory as a PD peer registers it: one entry per
     buffer, and per entry the slices a peer of another TP size reads. A whole
@@ -219,6 +230,25 @@ class KVStorage:
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
+
+    def accounting_violations(self) -> List[str]:
+        """What the idle leak check reports beyond the per-sub-pool counts: the
+        bytes the chain's bands account for that do not add up. Empty when
+        healthy."""
+        return self._allocator.verify_byte_accounting()
+
+    def usage(self) -> Tuple[SubPoolUsage, ...]:
+        """Every sub-pool's capacity and free units now, owner first."""
+        units = self._allocator.usage()
+        return tuple(
+            SubPoolUsage(
+                name=s.name,
+                metrics=s.external.metrics,
+                capacity=units[s.name][0],
+                available=units[s.name][1],
+            )
+            for s in self._sub_pools
+        )
 
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:
         """The two sub-pools whose host pools may share one page-envelope

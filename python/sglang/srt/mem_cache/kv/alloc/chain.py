@@ -384,6 +384,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
 
+    def usage(self) -> Dict[str, Tuple[int, int]]:
+        """Each sub-pool's (capacity, available units), by sub-pool name."""
+        return self._policy.usage(self)
+
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
         return self._policy.swa_capacity_and_available(
             self, full_capacity=full_capacity, swa_capacity=swa_capacity
