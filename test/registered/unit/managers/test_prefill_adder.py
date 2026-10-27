@@ -121,7 +121,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
-        req.kv = SimpleNamespace(req_pool_idx=None)
+        req.kv = ReqKvInfo()
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -314,7 +314,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 allocator.configure_spec_scratch(1024, device_buffer_size=4160)
                 adder = self.create_adder(
-                    self.create_running_batch(),
+                    self.create_running_reqs(),
                     page_size=64,
                     rem_chunk_tokens=chunk,
                     token_to_kv_pool_allocator=allocator,
@@ -326,7 +326,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.full_untruncated_fill_ids = list(range(100))
                     req.origin_input_ids = req.full_untruncated_fill_ids
                     req.prefix_len = prefix
-                    req.kv = SimpleNamespace(req_pool_idx=i if prefix else None)
+                    req.kv = ReqKvInfo(req_pool_idx=i if prefix else None)
                     reqs.append(req)
                     if prefix:
                         adder.add_chunked_req(req)
