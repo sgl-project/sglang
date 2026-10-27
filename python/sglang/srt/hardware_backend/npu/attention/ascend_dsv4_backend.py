@@ -1790,6 +1790,66 @@ class LowRatioCompressAscendBackendMixin:
             return cached
         return attn_sink.reshape(-1).to(torch.float32)
 
+    def _dsv41_audit_smla(self, layer, q, forward_batch, kw, ratio: int) -> None:
+        """Report every SMLA argument range a healthy step keeps legal.
+
+        The aicore fault is asynchronous, so the Python stack names whoever synced
+        next; these checks name the buffer that actually broke.  Snapshot lines
+        print once per (layer, phase); violations print on every step they occur.
+        """
+        phase = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        problems = []
+        rows = int(q.shape[0])
+        tokens = int(forward_batch.input_ids.numel())
+        if rows != tokens:
+            problems.append(f"q rows {rows} != tokens {tokens}")
+        cu = kw.get("cu_seqlens_q")
+        if cu is not None and int(cu[-1]) - int(cu[0]) != rows:
+            problems.append(
+                f"cu_seqlens_q span {int(cu[-1]) - int(cu[0])} != q rows {rows}"
+            )
+        for prefix in ("ori", "cmp"):
+            kv = kw.get(f"{prefix}_kv")
+            bt = kw.get(f"{prefix}_block_table")
+            idx = kw.get(f"{prefix}_sparse_indices")
+            lens = kw.get(f"{prefix}_topk_length")
+            if kv is None or bt is None or idx is None or lens is None:
+                continue
+            if int(bt.max()) >= kv.shape[0]:
+                problems.append(
+                    f"{prefix}: page {int(bt.max())} >= kv pages {kv.shape[0]}"
+                )
+            if int(idx.max()) >= int(lens.max()):
+                problems.append(
+                    f"{prefix}: index {int(idx.max())} >= len {int(lens.max())}"
+                )
+            if int(lens.max()) > idx.shape[-1]:
+                problems.append(
+                    f"{prefix}: len {int(lens.max())} > topk {idx.shape[-1]}"
+                )
+            if int(idx.min()) < -1:
+                problems.append(f"{prefix}: index min {int(idx.min())} < -1")
+        key = (layer.layer_id, phase)
+        if problems:
+            print(
+                f"[dsv41] AUDIT FAIL layer={layer.layer_id} ratio={ratio} "
+                f"phase={phase} bs={forward_batch.batch_size}: " + "; ".join(problems),
+                flush=True,
+            )
+        elif key not in self._dsv41_debugged:
+            self._dsv41_debugged.add(key)
+            shapes = {n: tuple(v.shape) for n, v in kw.items() if torch.is_tensor(v)}
+            print(
+                f"[dsv41] AUDIT ok layer={layer.layer_id} ratio={ratio} "
+                f"phase={phase} bs={forward_batch.batch_size} q={tuple(q.shape)}\n"
+                f"[dsv41]   {shapes}\n"
+                f"[dsv41]   ori_len={int(kw['ori_topk_length'].max())} "
+                f"ori_idx_max={int(kw['ori_sparse_indices'].max())} "
+                f"ori_bt_max={int(kw['ori_block_table'].max())} "
+                f"ori_pages={kw['ori_kv'].shape[0]}",
+                flush=True,
+            )
+
     def _forward_low_ratio_attention(
         self,
         q: torch.Tensor,
@@ -1893,24 +1953,10 @@ class LowRatioCompressAscendBackendMixin:
                     forward_batch, compress_ratio
                 ),
             )
-            # MQSMLA takes q, weights and the top-k indices as independent tensors,
-            # each with its own leading dim. A buffer left over from a larger batch
-            # therefore shows up here as a row-count disagreement, long before the
-            # kernel turns it into a wild address. SGLANG_DSV41_DEBUG_SMLA=1.
             if os.environ.get("SGLANG_DSV41_DEBUG_SMLA"):
-                rows = {"q": int(q.shape[0])}
-                for name, value in attn_kwargs.items():
-                    if torch.is_tensor(value) and value.dim() > 0:
-                        rows[name] = int(value.shape[0])
-                expected = int(forward_batch.input_ids.numel())
-                stray = {k: v for k, v in rows.items() if v not in (expected, 1)}
-                if stray:
-                    print(
-                        f"[dsv41] SMLA rows layer={layer.layer_id} "
-                        f"ratio={compress_ratio} expected={expected} "
-                        f"stray={stray}",
-                        flush=True,
-                    )
+                self._dsv41_audit_smla(
+                    layer, q, forward_batch, attn_kwargs, compress_ratio
+                )
         attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
         return attn_out
 
