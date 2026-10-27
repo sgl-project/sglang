@@ -115,6 +115,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     cfg = resolving_view(server_args)
+    if cfg.enable_cp_decode_attn_tp and cfg.enable_lora:
+        # decode attention TP slices the raw attention linears, not a LoRA wrapper or its A/B
+        raise ValueError(
+            "DeepSeekV4 --enable-cp-decode-attn-tp does not support LoRA yet."
+        )
     if not cfg.enable_prefill_cp:
         return
 

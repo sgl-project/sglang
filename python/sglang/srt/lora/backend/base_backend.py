@@ -33,6 +33,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     supports_prefill_cuda_graph: bool = False
     # Supporting backends must handle both eager execution and decode CUDA graphs.
     supports_dp_attention: bool = False
+    # Supporting backends implement grouped_sgemm_batch_infos().
+    supports_grouped_lora: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -132,6 +134,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             output: modified output tensor
         """
         raise NotImplementedError
+
+    def grouped_sgemm_batch_infos(
+        self, num_groups: int, num_tokens: int
+    ) -> Tuple[LoRABatchInfo, LoRABatchInfo]:
+        """A/B segment routing for a grouped projection; see ``TritonLoRABackend``."""
+        raise NotImplementedError(
+            f"grouped LoRA projections (DeepSeek-V4 wo_a) need --lora-backend triton, not {self.name!r}"
+        )
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
