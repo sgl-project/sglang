@@ -2187,8 +2187,14 @@ async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """SageMaker health check: 200 when is_healthy(), else 503.
+
+    Unlike /ready, a paused server still reports 200, so an intentional pause
+    (e.g. a weight sync) does not get the instance replaced. Stays a flag check
+    because SageMaker times out /ping after 2 seconds.
+    """
+    status_code = 200 if _global_state.tokenizer_manager.is_healthy() else 503
+    return Response(status_code=status_code)
 
 
 @app.post("/invocations")
