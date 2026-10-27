@@ -528,8 +528,8 @@ int sgd_nixl_make_xfer(sgd_nixl_agent_t agent, uint64_t local_dlist,
     std::vector<int> lidx(local_idx, local_idx + n_local);
     std::vector<int> ridx(remote_idx, remote_idx + n_remote);
     nixlXferReqH *req = nullptr;
-    nixl_status_t st = agent->agent->makeXferReq(NIXL_WRITE, *local, lidx,
-                                                 *remote, ridx, req, nullptr);
+    nixl_status_t st = agent->agent->makeXferReq(NIXL_WRITE, local, lidx,
+                                                 remote, ridx, req, nullptr);
     if (st != NIXL_SUCCESS) {
       return static_cast<int>(st);
     }

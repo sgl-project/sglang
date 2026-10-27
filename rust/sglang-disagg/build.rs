@@ -19,9 +19,10 @@ fn main() {
         );
     }
 
+    // nixl.h >= 1.5 declares std::span overloads, so C++20 is required.
     cc::Build::new()
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .include(&include)
         .file("csrc/nixl_shim.cc")
         .compile("sgd_nixl_shim");
