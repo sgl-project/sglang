@@ -88,6 +88,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            decode_num_partitions=None,
         )
         backend._mla_decode_fwd_with_head_pad = mock.Mock(
             return_value=torch.empty(

@@ -153,6 +153,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
         backend.forward_metadata = SimpleNamespace(
             kv_indptr=torch.tensor(offsets, dtype=torch.int32, device=_DEVICE),
             kv_indices=torch.arange(offsets[-1], dtype=torch.int32, device=_DEVICE),
+            decode_num_partitions=None,
         )
 
         out = backend.forward_decode(
