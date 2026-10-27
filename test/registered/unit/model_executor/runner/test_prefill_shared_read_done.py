@@ -17,7 +17,7 @@ from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -129,7 +129,11 @@ class _TargetOnlyPrefillAlgo(CustomSpecAlgo):
 
 class TestPrefillReadDoneCapability(CustomTestCase):
     def test_builtin_allowlist_is_unchanged(self):
-        allowed = {SpeculativeAlgorithm.NONE, SpeculativeAlgorithm.DFLASH}
+        allowed = {
+            SpeculativeAlgorithm.NONE,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        }
         for algorithm in SpeculativeAlgorithm:
             with self.subTest(algorithm=algorithm):
                 runner = _model_runner(spec_algorithm=algorithm)

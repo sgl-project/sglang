@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -624,8 +624,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
-            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            and (
+                isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+                or getattr(
+                    self.kernel_dispatcher.extend_kernel,
+                    "prefill_graph_wrapper_cls",
+                    None,
+                )
+                is not None
+            )
             # Fused-accept staging (flashinfer verify) writes per extend.
             and self.accept_lens_pool is None
         )
@@ -638,13 +645,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> KDAPrefillGraphMetadata:
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
-            num_tokens=forward_batch.positions.shape[0],
+            # KDA sees global sequence order, even when CP positions are local.
+            num_tokens=forward_batch.extend_num_tokens,
             max_seqs_cap=self.prefill_graph_max_seqs,
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer_wrapper_cls=getattr(
+                self.kernel_dispatcher.extend_kernel, "prefill_graph_wrapper_cls", None
+            ),
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -787,6 +798,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if fused_static is not None and onorm_gate is not None:
                 f_b_weight, norm_weight, norm_eps, a_log = fused_static
@@ -797,7 +809,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 out = mixed_qkv.new_empty(
                     (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
                 )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                if fused_ops is not None and fused_ops.covered(
                     a,
                     f_b_weight,
                     mixed_qkv,
@@ -808,7 +820,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     output_gate,
                     norm_weight,
                 ):
-                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                    core_attn_out = fused_ops.run(
                         f_a=a,
                         f_b_weight=f_b_weight,
                         mixed_qkv=mixed_qkv,
