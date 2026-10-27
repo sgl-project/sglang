@@ -513,6 +513,7 @@ def test_deep_select_spec_matches_wrapper_architectures():
 @pytest.mark.parametrize(
     "op,backend",
     [
+        ("attention.expand_causal_seqlens", KernelBackend.TRITON),
         (
             "attention.expand_pool_topk_and_append_tail_batched_npu",
             KernelBackend.TRITON,

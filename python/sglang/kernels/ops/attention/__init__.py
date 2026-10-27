@@ -564,6 +564,14 @@ register_kernel(
 # import torch_npu or compile Triton kernels.
 register_kernel(
     KernelSpec(
+        op="attention.expand_causal_seqlens",
+        backend=KernelBackend.TRITON,
+        target="sgl_kernel_npu.operators.indexer:expand_causal_seqlens",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.expand_pool_topk_and_append_tail_batched_npu",
         backend=KernelBackend.TRITON,
         target="sgl_kernel_npu.operators.indexer:expand_pool_topk_and_append_tail_batched_npu",
