@@ -150,6 +150,11 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
+# Template kwargs that switch a reasoning model to "no thinking" for one retry.
+_THINKING_OFF_TEMPLATE_KWARGS = {"enable_thinking": False}
+# A terminal turn with fewer visible characters than this is treated as empty.
+_EMPTY_TURN_MIN_VISIBLE_CHARS = 1
+
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
@@ -2827,7 +2832,98 @@ class OpenAIServingChat(OpenAIServingBase):
             int(time.time()),
         )
 
+        if (
+            self._empty_turn_repair_enabled()
+            and getattr(request, "n", 1) == 1
+            and self._response_is_empty_turn(response, ret[0])
+        ):
+            repaired = await self._repair_empty_terminal_turn(request, raw_request)
+            if repaired is not None and not self._response_is_empty_turn(repaired):
+                logger.warning(
+                    "Empty terminal turn (no visible text, no tool calls); "
+                    "retried once with thinking disabled."
+                )
+                return repaired
+
         return response
+
+    # ---- empty terminal turn repair -------------------------------------
+    #
+    # A reasoning model can spend its whole turn inside the thinking block and
+    # then stop without emitting any visible text or tool call, e.g. reasoning
+    # models with a very long chain of thought. Clients see an empty assistant
+    # message and often treat it as a transport error. When that happens, retry
+    # the request exactly once with thinking disabled; the retry is bounded so a
+    # genuinely silent model still returns its (empty) answer instead of looping.
+
+    def _empty_turn_repair_enabled(self) -> bool:
+        return not envs.SGLANG_DISABLE_EMPTY_TURN_REPAIR.get()
+
+    def _is_empty_terminal_turn(
+        self,
+        finish_reason: str,
+        content: Optional[str],
+        tool_call_count: int,
+        reasoning_tokens: int,
+        reasoning_text: Optional[str] = None,
+    ) -> bool:
+        if finish_reason != "stop" or tool_call_count:
+            return False
+        if len((content or "").strip()) >= _EMPTY_TURN_MIN_VISIBLE_CHARS:
+            return False
+        # Only repair turns that actually reasoned: a plain model answering with
+        # nothing is not the failure mode this guards against.
+        return bool(reasoning_tokens) or bool((reasoning_text or "").strip())
+
+    def _response_is_empty_turn(
+        self,
+        response: ChatCompletionResponse,
+        ret_item: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return False
+        message = choices[0].message
+        finish_reason = "stop"
+        if ret_item is not None:
+            finish_info = (ret_item.get("meta_info") or {}).get("finish_reason") or {}
+            if isinstance(finish_info, dict):
+                finish_reason = finish_info.get("type", "stop")
+        usage = getattr(response, "usage", None)
+        reasoning_tokens = int(getattr(usage, "reasoning_tokens", 0) or 0) if usage else 0
+        return self._is_empty_terminal_turn(
+            finish_reason=finish_reason,
+            content=message.content,
+            tool_call_count=len(message.tool_calls or []),
+            reasoning_tokens=reasoning_tokens,
+            reasoning_text=message.reasoning_content,
+        )
+
+    async def _repair_empty_terminal_turn(
+        self, request: ChatCompletionRequest, raw_request: Request
+    ) -> Optional[ChatCompletionResponse | ORJSONResponse]:
+        """Retry an empty terminal turn once with thinking switched off."""
+        repair_request = request.model_copy(deep=True)
+        repair_request.stream = False
+        repair_request.stream_options = None
+        template_kwargs = dict(repair_request.chat_template_kwargs or {})
+        template_kwargs.update(_THINKING_OFF_TEMPLATE_KWARGS)
+        repair_request.chat_template_kwargs = template_kwargs
+        if getattr(repair_request, "reasoning_effort", None) is not None:
+            repair_request.reasoning_effort = "none"
+        try:
+            adapted_request, repair_request = self._convert_to_internal_request(
+                repair_request, raw_request
+            )
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+            if not isinstance(ret, list):
+                ret = [ret]
+            return self._build_chat_response(repair_request, ret, int(time.time()))
+        except Exception:
+            logger.warning("Empty-turn repair failed", exc_info=True)
+            return None
 
     def _build_chat_response(
         self,
