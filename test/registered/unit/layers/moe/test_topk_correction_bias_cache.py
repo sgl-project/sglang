@@ -3,49 +3,64 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.moe import moe_route_radix4
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _dtypes_reaching_aiter(bias_dtype, device):
-    """(logits, bias) dtypes the aiter router receives from select_experts."""
+def _routing_inputs(bias_dtype, device, *, num_tokens=4, radix4=False):
     seen = {}
 
-    def fake_aiter_biased_grouped_topk(gating_output, correction_bias, w, ids, *args):
-        seen["dtypes"] = (gating_output.dtype, correction_bias.dtype)
-        w.zero_()
+    def aiter_kernel(logits, bias, weights, ids, *args):
+        seen.update(route="aiter", dtypes=(logits.dtype, bias.dtype))
+        weights.zero_()
         ids.zero_()
 
+    def radix4_kernel(logits, bias, topk, *args):
+        seen.update(route="radix4", dtypes=(logits.dtype, bias.dtype))
+        return (
+            torch.zeros((num_tokens, topk), device=device),
+            torch.zeros((num_tokens, topk), dtype=torch.int32, device=device),
+        )
+
+    num_experts, topk = (896, 16) if radix4 else (16, 2)
     config = TopKConfig(
-        top_k=2,
+        top_k=topk,
         use_grouped_topk=True,
         topk_group=1,
         num_expert_group=1,
-        correction_bias=torch.randn(16, dtype=bias_dtype, device=device),
+        correction_bias=torch.randn(num_experts, dtype=bias_dtype, device=device),
     )
     with (
+        get_context().override_server_args(),
+        topk_module.envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+        topk_module.envs.SGLANG_K3_RADIX4_TOPK.override(radix4),
         patch.object(topk_module, "_use_aiter", True),
         patch.object(topk_module, "_is_cuda", False),
         patch.object(
             topk_module, "biased_grouped_topk", topk_module.biased_grouped_topk_gpu
         ),
         patch.object(
-            topk_module,
-            "aiter_biased_grouped_topk",
-            fake_aiter_biased_grouped_topk,
-            create=True,
+            topk_module, "aiter_biased_grouped_topk", aiter_kernel, create=True
         ),
+        patch.object(moe_route_radix4, "available", return_value=True),
+        patch.object(moe_route_radix4, "route_radix4", radix4_kernel),
     ):
         select_experts(
-            hidden_states=torch.randn(4, 8, dtype=torch.bfloat16, device=device),
-            router_logits=torch.randn(4, 16, dtype=torch.bfloat16, device=device),
+            hidden_states=torch.zeros(
+                num_tokens, 8, dtype=torch.bfloat16, device=device
+            ),
+            router_logits=torch.zeros(
+                num_tokens, num_experts, dtype=torch.bfloat16, device=device
+            ),
             topk_config=config,
         )
-    return seen["dtypes"]
+    return seen
 
 
 class CorrectionBiasCacheTestMixin:
@@ -86,15 +101,25 @@ class CorrectionBiasCacheTestMixin:
     def test_fp32_bias_routes_in_fp32_on_aiter(self):
         """bf16 logits must not drag an fp32 bias down to bf16 before aiter."""
         self.assertEqual(
-            _dtypes_reaching_aiter(torch.float32, self.device),
+            _routing_inputs(torch.float32, self.device)["dtypes"],
             (torch.float32, torch.float32),
         )
 
     def test_other_bias_routes_in_logits_dtype_on_aiter(self):
         self.assertEqual(
-            _dtypes_reaching_aiter(torch.float16, self.device),
+            _routing_inputs(torch.float16, self.device)["dtypes"],
             (torch.bfloat16, torch.bfloat16),
         )
+
+    def test_fp32_precision_survives_radix4_batch_cutoff(self):
+        """Crossing the radix4 batch limit must preserve the router input precision."""
+        for num_tokens, route in ((1024, "radix4"), (1025, "aiter")):
+            with self.subTest(num_tokens=num_tokens, route=route):
+                seen = _routing_inputs(
+                    torch.float32, self.device, num_tokens=num_tokens, radix4=True
+                )
+                self.assertEqual(seen["route"], route)
+                self.assertEqual(seen["dtypes"], (torch.float32, torch.float32))
 
 
 class TestCorrectionBiasCacheCPU(CorrectionBiasCacheTestMixin, CustomTestCase):

@@ -2110,9 +2110,8 @@ def biased_grouped_topk_gpu(
             f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         )
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
-        # An offset bias loses too many levels in bf16 and reorders top-k, so an
-        # fp32 bias routes in fp32, logits cast up. Radix4 and aiter take the same
-        # pair, so a token's routing does not depend on its batch size.
+        # Preserve fp32 bias precision on both routers; dispatch must not change
+        # a token's routing when its batch crosses the radix4 size limit.
         if correction_bias.dtype == torch.float32:
             route_logits = gating_output.to(torch.float32)
             route_bias = correction_bias
