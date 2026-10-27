@@ -109,6 +109,17 @@ def _needs_fp8_byte_view() -> bool:
     return is_npu_arch35()
 
 
+def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
+    """e8m0 bytes -> fp32 as 2**(e - 127), the arithmetic of torch's own cast.
+
+    A5 implements no cast for this dtype either, so the float bits are assembled
+    from the exponent byte -- the same shift the GPU gather kernel applies.
+    """
+    exps = raw.to(torch.int32)
+    # E == 0 is 2**-127, a subnormal, not what zero exponent bits bitcast to.
+    return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
+
+
 def _is_prime(n: int) -> bool:
     """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
@@ -1325,18 +1336,18 @@ class EngramEmbedding(nn.Module):
             local = local.masked_fill(~owned, 0)
             weight, scale = self.weight, self.scale
             if _needs_fp8_byte_view():
-                # Same payload, gathered through a view the A5 index kernel accepts.
+                # A5 has neither an fp8 index nor an e8m0 cast, so both tables are
+                # read as bytes and the scale's float bits are built directly.
                 weight = weight.view(torch.uint8)[local]
                 if not self.mxfp4:
                     weight = weight.view(torch.float8_e4m3fn)
-                scale = scale.view(torch.uint8)[local].view(torch.float8_e8m0fnu)
+                scale = _e8m0_to_float(scale.view(torch.uint8)[local])
             else:
-                weight, scale = weight[local], scale[local]
+                weight, scale = weight[local], scale[local].float()
             if self.mxfp4:
                 weight = unpack_mxfp4_rows(weight)
             values = (
-                weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-                * scale.float().unsqueeze(-1)
+                weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE)) * scale.unsqueeze(-1)
             ).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self.new_rows(indices)
