@@ -847,6 +847,8 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
+    SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 
