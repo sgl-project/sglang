@@ -948,7 +948,16 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     )
 
 
-bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(deepseek_v4_write_tail_source_kv)
+def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
+    get_attn_backend().tail_source_kv_layer_id = layer.layer_id
+
+
+# The capture pass sets only the layer id by which the tail's source layer skips
+# its compressor; the KV the break writes would come from uncomputed inputs.
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
+    deepseek_v4_write_tail_source_kv,
+    capture_stub=_write_tail_source_kv_capture_stub,
+)
 
 
 def deepseek_v4_engram_hash_ids(
