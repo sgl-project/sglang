@@ -1613,7 +1613,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # True only when decode splits work across ranks; DecodingStage runs a
+        # single-rank decode on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            should_use_spatial_shard_parallel_decode(config)
+            or config.parallel_decode_mode == "tiled"
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(

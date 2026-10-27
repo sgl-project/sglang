@@ -158,7 +158,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
         self.assertFalse(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(LTXVideoVAEConfig()))
-        self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
+        with patch(
+            "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported",
+            return_value=False,
+        ):
+            self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
 
         ltx23_config = LTXVideoVAEConfig()
         ltx23_config.arch_config.video_decoder_variant = "ltx_2_3"
@@ -187,6 +191,22 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 hunyuan_config, torch.empty(1, 16, 9, 96, 96), 2
             )
         )
+
+    def test_wan_auto_parallel_decode_keeps_gfx1250_fast_path(self):
+        # gfx1250's single-rank Wan VAE fast path beats spatial-shard decode;
+        # auto must not shard there, while an explicit spatial_shard still does.
+        with patch(
+            "sglang.multimodal_gen.configs.models.vaes.wanvae.is_gfx1250_supported",
+            return_value=True,
+        ):
+            config = WanVAEConfig()
+            self.assertFalse(
+                should_use_spatial_shard_parallel_decode(
+                    config, torch.empty(1, 16, 25, 90, 160), 2
+                )
+            )
+            config.parallel_decode_mode = "spatial_shard"
+            self.assertTrue(should_use_spatial_shard_parallel_decode(config))
 
     def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
         configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
