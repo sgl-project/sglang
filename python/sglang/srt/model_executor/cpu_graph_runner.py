@@ -609,6 +609,10 @@ def register_fake_ops(tp_size: int):
     def _(q, k, *args, **kwargs):
         return torch.empty_like(q), torch.empty_like(k)
 
+    @register_cpu_compile_fake("fused_dual_residual_rmsnorm_cpu")
+    def _(x, residual, w1, w2, eps):
+        return torch.empty_like(x), torch.empty_like(x)
+
     @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
     def _(q, k, q_weight, k_weight, eps, head_dim):
         return torch.empty_like(q), torch.empty_like(k)
@@ -823,6 +827,21 @@ def register_fake_ops(tp_size: int):
         return (
             torch.empty(shape, device=hidden_states.device, dtype=torch.float),
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+        )
+
+    @register_cpu_compile_fake("fused_moe_router_cpu")
+    def _(
+        moe_softcapping,
+        hidden_states,
+        gating_output,
+        topk,
+        renormalize,
+        correction_bias=None,
+    ):
+        shape = (hidden_states.shape[0], topk)
+        return (
+            torch.empty(shape, device=hidden_states.device, dtype=torch.float32),
+            torch.empty(shape, device=hidden_states.device, dtype=torch.int32),
         )
 
     @register_cpu_compile_fake("topk_softmax_cpu")
@@ -1787,6 +1806,11 @@ class CPUGraphRunner:
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if getattr(output, "last_hidden_states", None) is not None
                     else None
                 ),
             )
