@@ -14,6 +14,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -23,10 +24,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -64,12 +67,95 @@ class TestAllPPLoras(CustomTestCase):
         """A launched prefill not yet merged into its decode batch still counts;
         requests that finished before their micro-batch's next turn do not."""
         scheduler = Scheduler.__new__(Scheduler)
+        decoding, base, launched = _req("decoding"), _req(None), _req("launched")
         scheduler.running_mbs = [
-            _batch(_req("decoding"), _req("done", finished=True)),
-            _batch(_req(None)),
+            _batch(decoding, _req("done", finished=True)),
+            _batch(base),
         ]
-        scheduler.mbs = [_batch(_req("launched")), None]
-        self.assertEqual(scheduler._get_all_pp_loras(), {"decoding", None, "launched"})
+        scheduler.mbs = [_batch(launched), None]
+        self.assertCountEqual(
+            map(id, scheduler._get_all_pp_reqs()), map(id, [decoding, base, launched])
+        )
+
+    @mock.patch("time.monotonic", return_value=100.0)
+    def test_draining_uses_all_micro_batches(self, _clock):
+        def request(lora_id, max_new_tokens):
+            req = _req(lora_id)
+            req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+            req.output_ids = []
+            req.is_retracted = False
+            req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
+            return req
+
+        short, long = request("short", 5), request("long", 100)
+        waiting = request("waiting", 100)
+        first, second = _batch(short), _batch(long)
+        for batch in (first, second):
+            batch.batch_is_full = False
+            batch.is_empty = lambda: False
+
+        # Stop after LoRA admission setup, before allocating or running a prefill.
+        adder = SimpleNamespace(
+            can_run_list=[], preempt_list=[], budget_state=lambda: AddReqResult.OTHER
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.__dict__.update(
+            running_mbs=[first, second],
+            mbs=[first, second],
+            waiting_queue=[waiting],
+            lora_drainer=LoRADrainer(max_loras_per_batch=2, max_wait_time_secs=3),
+            enable_lora=True,
+            enable_lora_overlap_loading=False,
+            enable_priority_preemption=False,
+            is_hybrid_swa=False,
+            chunked_req=None,
+            min_free_slots_delayer=None,
+            is_mixed_chunk=False,
+            dllm_config=None,
+            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+            policy=mock.Mock(),
+            processed_tokens_counter=0,
+            disagg_prefill_bootstrap_queue=None,
+            get_num_allocatable_reqs=lambda *args, **kwargs: 1,
+            get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
+            page_size=1,
+            tree_cache=SimpleNamespace(buffer_pipeline=None),
+            token_to_kv_pool_allocator=None,
+            req_to_token_pool=SimpleNamespace(),
+            new_token_ratio_tracker=SimpleNamespace(current=1),
+            max_prefill_tokens=1,
+            chunked_prefill_size=1,
+            priority_scheduling_preemption_threshold=0,
+            max_prefill_bs=1,
+            max_running_requests=2,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    attn_backend=SimpleNamespace(), lora_manager=_lora_manager(slots=2)
+                )
+            ),
+        )
+
+        with get_context().override_server_args(pp_size=2):
+            # Neither microbatch alone fills the pool. Alternating them must
+            # keep the shorter adapter draining for the waiting third adapter.
+            for running_batch in (first, second, first):
+                scheduler._get_new_batch_prefill_raw(None, running_batch)
+                self.assertFalse(
+                    scheduler.lora_drainer.can_schedule(request("short", 100))
+                )
+                self.assertFalse(
+                    scheduler.can_schedule_lora_req(
+                        waiting, {req.lora_id for req in scheduler._get_all_pp_reqs()}
+                    )
+                )
+
+            short.finished = lambda: True
+            scheduler._get_new_batch_prefill_raw(None, second)
+            self.assertTrue(
+                scheduler.can_schedule_lora_req(
+                    waiting, {req.lora_id for req in scheduler._get_all_pp_reqs()}
+                )
+            )
 
 
 class TestFetchKeepsLiveAdapters(CustomTestCase):

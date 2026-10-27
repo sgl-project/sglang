@@ -4265,11 +4265,10 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
+            running_reqs = running_batch.reqs
             if get_parallel().pp_size > 1:
-                running_loras |= self._get_all_pp_loras()
+                running_reqs = [*running_reqs, *self._get_all_pp_reqs()]
+            running_loras = {req.lora_id for req in running_reqs if not req.finished()}
 
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
@@ -4277,7 +4276,7 @@ class Scheduler(
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
-                    running_batch.reqs,
+                    running_reqs,
                 )
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
@@ -4524,14 +4523,14 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _get_all_pp_loras(self) -> set[Optional[str]]:
-        return {
-            req.lora_id
+    def _get_all_pp_reqs(self) -> List[Req]:
+        return [
+            req
             for batch in (*self.running_mbs, *self.mbs)
             if batch is not None
             for req in batch.reqs
             if not req.finished()
-        }
+        ]
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -4957,7 +4956,9 @@ class Scheduler(
                     else {}
                 )
                 if self.enable_lora and get_parallel().pp_size > 1:
-                    kwargs["pp_loras"] = self._get_all_pp_loras()
+                    kwargs["pp_loras"] = {
+                        req.lora_id for req in self._get_all_pp_reqs()
+                    }
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
