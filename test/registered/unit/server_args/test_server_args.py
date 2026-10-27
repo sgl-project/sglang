@@ -2453,6 +2453,25 @@ class TestHiCacheArgs(CustomTestCase):
                     ):
                         handle_hicache(args)
 
+    def test_dcp_decode_offload_takes_the_hicache_dcp_checks(self):
+        """A decode that offloads its KV builds the HiCache host stack without
+        --enable-hierarchical-cache, so the DCP checks must apply to it too."""
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            dcp_size=2,
+            tp_size=2,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(NotImplementedError, "only supported for MLA"),
+        ):
+            handle_hicache(args)
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through
@@ -2669,6 +2688,17 @@ class TestHiCacheArgs(CustomTestCase):
             disaggregation_decode_enable_offload_kvcache=True,
             hicache_storage_backend="file",
             disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            handle_cache_compatibility(args)
+
+    def test_decode_offload_rejects_decode_radix_cache(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_enable_radix_cache=True,
         )
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):

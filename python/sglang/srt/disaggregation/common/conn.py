@@ -344,6 +344,9 @@ class CommonKVManager(BaseKVManager):
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.decode_offload_kvcache = (
+            get_disagg().disaggregation_decode_enable_offload_kvcache
+        )
         self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
@@ -1407,6 +1410,18 @@ class CommonKVManager(BaseKVManager):
                     f"{info.attn_tp_size}, decode attn_tp_size={self.attn_tp_size}, "
                     f"state types {[st.value for st in block_scale_states]}."
                 )
+
+        if (
+            self.decode_offload_kvcache
+            and not (self.is_mla_backend or self.is_hybrid_mla_backend)
+            and (info.attn_tp_size != self.attn_tp_size or info.attn_cp_size != 1)
+        ):
+            raise RuntimeError(
+                "Decode KV offload requires the prefill's attention TP size and "
+                f"no prefill attention CP: prefill attn_tp_size={info.attn_tp_size}, "
+                f"attn_cp_size={info.attn_cp_size}, decode attn_tp_size="
+                f"{self.attn_tp_size}."
+            )
 
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):

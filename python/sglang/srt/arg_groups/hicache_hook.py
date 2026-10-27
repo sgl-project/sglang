@@ -129,7 +129,10 @@ def handle_hicache_ratio_default(server_args: Any):
 def resolve_hicache_dcp_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
-    if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
+    if cfg.dcp_size <= 1 or not (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
         return
     if (
         cfg.hicache_storage_backend is not None

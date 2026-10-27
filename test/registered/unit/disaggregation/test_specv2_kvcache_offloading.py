@@ -8,26 +8,31 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,13 +106,15 @@ def _make_manager(pool_size: int, page_size: int = 1):
     tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
         tree_cache, owner, ranges
     )
+    tree_cache.claim_kv_row.return_value = False
+    tree_cache._build_sidecar_transfers.return_value = []
 
     # Bypass __init__ entirely and set attributes directly
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
-    manager.kv_cache = MagicMock()
     manager.page_size = page_size
+    manager.writes_swa = manager.writes_mamba = False
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
@@ -122,8 +129,18 @@ class _FinishedEvent:
         pass
 
 
+def _publish_config(test: unittest.TestCase) -> None:
+    # Finished requests release through release_kv_cache, which reads the config.
+    override = get_context().override_server_args()
+    override.install()
+    test.addCleanup(override.restore)
+
+
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def setUp(self):
+        _publish_config(self)
 
     def test_decode_offload_hash_chain_matches_prefill(self):
         """Decode pages must keep the prefill namespace across offload chunks."""
@@ -153,7 +170,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.cache_controller.write.return_value = torch.arange(
             4, 8, dtype=torch.int64
         )
-        manager.decode_host_mem_pool = MagicMock()
         manager.request_counter = 0
         manager.offload_stride = 4
 
@@ -257,6 +273,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
 
 class TestSamplingMaskAbortOffload(CustomTestCase):
+    def setUp(self):
+        _publish_config(self)
+
     def test_abort_waits_for_existing_offload_before_reusing_slots(self):
         """An abort must not recycle slots while a previous D2H copy reads them."""
         for inflight in (False, True):
@@ -295,6 +314,73 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 self.assertIsNone(req.kv.req_pool_idx)
                 manager.finalize_release_on_finish(req)
                 self.assertEqual(len(freed), 1)
+
+
+class TestMambaStateAcrossFailedHostWrite(CustomTestCase):
+    """A chunk whose host write fails keeps the request's tracked Mamba state,
+    so the retried chunk still carries it."""
+
+    def setUp(self):
+        _publish_config(self)
+
+    def test_retry_carries_the_tracked_state(self):
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=64,
+            n_groups=1,
+            num_heads=2,
+            head_dim=32,
+            state_size=16,
+            conv_kernel=4,
+        )
+        pool = HybridReqToTokenPool(
+            size=2,
+            mamba_size=8,
+            mamba_spec_state_size=2,
+            max_context_len=32,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=Mamba2CacheParams(shape=shape, layers=[0]),
+            mamba_layer_ids=[0],
+            enable_mamba_extra_buffer=True,
+            speculative_num_draft_tokens=None,
+        )
+        req = Req(
+            rid="r",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
+        pool.alloc([req])
+        req.output_ids.extend([5, 6, 7, 8, 9])
+        # The decode tracked its state where the chunk [4, 8) ends.
+        req.kv.mamba_last_track_seqlen = 8
+        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
+        tracked = int(req.kv.mamba_ping_pong_track_buffer[keep_idx])
+
+        manager, _ = _make_manager(pool_size=32, page_size=4)
+        manager.req_to_token_pool = pool
+        manager.offload_stride = 4
+        manager.request_counter = 0
+        manager.writes_mamba = True
+        manager.chunks_without_mamba_state = 0
+        manager.cache_controller = MagicMock(get_hash_str=get_hash_str)
+        manager.cache_controller.write.side_effect = [None, torch.arange(4)]
+        free_slots = pool.mamba_allocator.available_size()
+
+        self.assertFalse(manager.offload_kv_cache(req))
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
+        self.assertEqual(int(req.kv.mamba_ping_pong_track_buffer[keep_idx]), tracked)
+
+        self.assertTrue(manager.offload_kv_cache(req))
+        (transfer,) = next(iter(manager.ongoing_offload.values()))[4]
+        self.assertEqual(transfer.name, PoolName.MAMBA)
+        self.assertEqual(transfer.device_indices.tolist(), [tracked])
+        # The request now tracks into a fresh slot; the copy owns the old one.
+        self.assertNotIn(tracked, req.kv.mamba_ping_pong_track_buffer.tolist())
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots - 1)
 
 
 if __name__ == "__main__":

@@ -1,40 +1,34 @@
 from __future__ import annotations
 
-import json
 import logging
-import threading
+import math
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_hybrid_swa_stack,
-    build_kv_host_pool,
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.components import (
+    CacheTransferPhase,
+    ComponentType,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    ReqToTokenPool,
-)
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
-    get_memory,
+    get_exec,
     get_schedule,
-    get_serving,
+    mamba_track_grid,
+    max_speculative_num_draft_tokens,
 )
 
 if TYPE_CHECKING:
@@ -51,13 +45,27 @@ class DecodeKVCacheOffloadManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
-        tree_cache: BasePrefixCache,
+        tree_cache: UnifiedRadixCache,
     ) -> None:
+        if (
+            not isinstance(tree_cache, UnifiedRadixCache)
+            or tree_cache.cache_controller is None
+        ):
+            raise ValueError(
+                "Decode KV offload writes through the tree cache's HiCache host "
+                f"stack, which {type(tree_cache).__name__} does not attach (a "
+                "pure-SWA model's prefill has no L3 path to read it from either)."
+            )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = get_schedule().page_size
         self.request_counter = 0
         self.tree_cache = tree_cache
+        self.cache_controller = tree_cache.cache_controller
+        self.host_pool_group = tree_cache.host_pool_group
+        self.writes_swa = PoolName.SWA in self.host_pool_group.entry_map
+        self.writes_mamba = PoolName.MAMBA in self.host_pool_group.entry_map
+
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
         if env_stride is None or env_stride <= 0:
             self.offload_stride = self.page_size
@@ -65,70 +73,19 @@ class DecodeKVCacheOffloadManager:
             self.offload_stride = max(
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
+        if self.writes_mamba:
+            assert get_exec().mamba.enable_mamba_extra_buffer, (
+                "Decode KV offload of a Mamba model needs Mamba state tracking"
+            )
+            track_grid = mamba_track_grid(self.page_size)
+            self.offload_stride = math.lcm(self.offload_stride, track_grid)
+            num_draft_tokens = max_speculative_num_draft_tokens() or 1
+            assert track_grid > num_draft_tokens, (
+                f"Mamba track grid {track_grid} must exceed the "
+                f"{num_draft_tokens} tokens one decode step can commit"
+            )
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-
-        hicache_storage_backend_extra_config = {}
-        if get_memory().hicache_storage_backend_extra_config:
-            try:
-                hicache_storage_backend_extra_config = json.loads(
-                    get_memory().hicache_storage_backend_extra_config
-                )
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid hicache storage backend extra config JSON: {e}"
-                )
-
-        self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, UnifiedSWAKVPool):
-            full_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if not is_swa
-            }
-            swa_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if is_swa
-            }
-            params = CacheInitParams(
-                disable=False,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-                tp_cache_group=tp_group,
-            )
-            self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
-                params=params,
-                full_kv_pool=self.kv_cache.full_kv_pool,
-                swa_kv_pool=self.kv_cache.swa_kv_pool,
-                full_layer_mapping=full_mapping,
-                swa_layer_mapping=swa_mapping,
-                load_cache_event=threading.Event(),
-                storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=hicache_storage_backend_extra_config,
-            )
-        else:
-            if not isinstance(self.kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
-                raise ValueError("Unsupported KV cache type for decode offload")
-            self.decode_host_mem_pool = build_kv_host_pool(
-                kv_pool=self.kv_cache,
-                page_size=self.page_size,
-                use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
-            )
-            self.cache_controller = HiCacheController(
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                mem_pool_host=self.decode_host_mem_pool,
-                page_size=self.page_size,
-                tp_group=tp_group,
-                io_backend=get_memory().hicache_io_backend,
-                load_cache_event=threading.Event(),
-                storage_backend=get_memory().hicache_storage_backend,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=hicache_storage_backend_extra_config,
-            )
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
@@ -136,10 +93,11 @@ class DecodeKVCacheOffloadManager:
         # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
         self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
-        logger.info("Enable offload kv cache for decode side")
-
-    def release_host_resources(self) -> None:
-        self.decode_host_mem_pool.destroy()
+        self.chunks_without_mamba_state = 0
+        logger.info(
+            "Enable offload kv cache for decode side (stride %d tokens)",
+            self.offload_stride,
+        )
 
     def _mark_offload_started(self, req: Req):
         self.offload_inflight[req] = self.offload_inflight.get(req, 0) + 1
@@ -162,33 +120,87 @@ class DecodeKVCacheOffloadManager:
         """Whether a device-to-host copy may still read unified KV pages."""
         return bool(self.ongoing_offload)
 
-    def _resolve_offload_transfers(
-        self, virtual_indices: torch.Tensor
-    ) -> tuple[torch.Tensor, list[PoolTransfer]]:
-        full_indices = virtual_indices
-        if not isinstance(self.kv_cache, UnifiedSWAKVPool):
-            return full_indices, []
-
-        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            virtual_indices
-        )
-        # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
-        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
-        if live_swa_indices.numel() == 0:
-            return full_indices, []
-        return full_indices, [
-            PoolTransfer(
-                name=PoolName.SWA,
-                device_indices=live_swa_indices,
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    def _chunk_transfers(
+        self, req: Req, device_indices: torch.Tensor, end: int
+    ) -> tuple[list[PoolTransfer], Optional[torch.Tensor]]:
+        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
+        if self.writes_swa:
+            swa_indices = (
+                self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                    device_indices
+                )
             )
-        ]
+            # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
+            live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
+            assert live_swa_indices.numel() % self.page_size == 0
+            if live_swa_indices.numel() > 0:
+                component_transfers[ComponentType.SWA] = [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        device_indices=live_swa_indices,
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+        new_mamba_slot = None
+        if self.writes_mamba:
+            mamba_slots = self._reserve_mamba_state(req, end)
+            if mamba_slots is not None:
+                tracked_slot, new_mamba_slot = mamba_slots
+                component_transfers[ComponentType.MAMBA] = [
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        device_indices=tracked_slot,
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+        transfers = [t for ts in component_transfers.values() for t in ts]
+        transfers.extend(
+            self.tree_cache._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_HOST,
+                PoolTransfer(name=PoolName.KV, device_indices=device_indices),
+                component_transfers,
+            )
+        )
+        return transfers, new_mamba_slot
+
+    def _reserve_mamba_state(
+        self, req: Req, end: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if req.kv.mamba_last_track_seqlen != end:
+            self._log_chunk_without_mamba_state(
+                f"tracked at {req.kv.mamba_last_track_seqlen}, chunk ends at {end}"
+            )
+            return None
+        pool = self.req_to_token_pool
+        new_slot = pool.mamba_allocator.alloc(1)
+        if new_slot is None:
+            self._log_chunk_without_mamba_state("no free Mamba slot")
+            return None
+        # A copy: donation overwrites this buffer entry with new_slot.
+        tracked_slot = (
+            req.kv.mamba_ping_pong_track_buffer[pool.get_mamba_ping_pong_keep_idx(req)]
+            .unsqueeze(-1)
+            .clone()
+        )
+        return tracked_slot, new_slot
+
+    def _donate_mamba_state(self, req: Req, new_slot: torch.Tensor) -> None:
+        self.req_to_token_pool.donate_mamba_ping_pong_slot(req, new_slot)
+        req.kv.mamba_last_track_seqlen = None
+        req.kv.mamba_prev_track_seqlen = None
+
+    def _log_chunk_without_mamba_state(self, reason: str) -> None:
+        self.chunks_without_mamba_state += 1
+        count = self.chunks_without_mamba_state
+        if count & (count - 1) == 0:
+            logger.warning(
+                "Decode KV offload wrote %d chunk(s) without a Mamba state (%s)",
+                count,
+                reason,
+            )
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
-
-        if self.cache_controller is None or self.decode_host_mem_pool is None:
-            return False
 
         if req.kv.req_pool_idx == -1 or len(req.output_ids) == 0:
             return False
@@ -210,23 +222,14 @@ class DecodeKVCacheOffloadManager:
             )
             state = OffloadedState(last_hash=last_prefill_hash)
             self.offloaded_state[req] = state
-        incremental_total = len(all_tokens) - prefill_offloaded_len
-        incremental_new = incremental_total - state.inc_len
-        incremental_aligned_len = (
-            incremental_new // self.offload_stride * self.offload_stride
-        )
-
-        if incremental_aligned_len == 0:
+        start = prefill_offloaded_len + state.inc_len
+        end = len(all_tokens) // self.offload_stride * self.offload_stride
+        if end <= start:
             return False
 
-        # Extract incremental tokens and indices for the newly available chunk
-        start = prefill_offloaded_len + state.inc_len
-        end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
-        incremental_indices = token_indices[start:end].to(torch.int64)
-        device_indices, pool_transfers = self._resolve_offload_transfers(
-            incremental_indices
-        )
+        device_indices = token_indices[start:end].to(torch.int64)
+        pool_transfers, new_mamba_slot = self._chunk_transfers(req, device_indices, end)
 
         # Prefill-aligned GPU slots are freed at request finish in
         # _release_finished_req, NOT here. The decoding request
@@ -244,7 +247,11 @@ class DecodeKVCacheOffloadManager:
         )
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
+            if new_mamba_slot is not None:
+                self.req_to_token_pool.mamba_allocator.free(new_mamba_slot)
             return False
+        if new_mamba_slot is not None:
+            self._donate_mamba_state(req, new_mamba_slot)
 
         self._mark_offload_started(req)
         self.ongoing_offload[ack_id] = (
@@ -254,7 +261,7 @@ class DecodeKVCacheOffloadManager:
             time.time(),
             pool_transfers,
         )
-        state.inc_len += incremental_aligned_len
+        state.inc_len = end - prefill_offloaded_len
         return True
 
     def check_offload_progress(self):
@@ -314,6 +321,7 @@ class DecodeKVCacheOffloadManager:
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._mark_offload_finished(req)
+                self._free_mamba_states(pool_transfers)
                 prior_hash = (
                     self.offloaded_state[req].last_hash
                     if req in self.offloaded_state
@@ -334,23 +342,21 @@ class DecodeKVCacheOffloadManager:
                     self._release_finished_req(req)
             finish_count -= 1
 
+    def _free_mamba_states(self, pool_transfers: list[PoolTransfer]) -> None:
+        for transfer in pool_transfers:
+            if transfer.name == PoolName.MAMBA:
+                self.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (double free, double unlock).
-        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
+        if not req.kv.holds_kv:
             return
 
         # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. The prefix the prealloc match
-        # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        self.req_to_token_pool.free(req)
-        req.kv.mark_kv_released()
+        # concurrent admission over live slots.
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):
@@ -362,12 +368,15 @@ class DecodeKVCacheOffloadManager:
                 ack_id
             )
 
-            # Release host memory
+            # Release host memory; a sidecar shares its source pool's indices.
             for transfer in pool_transfers:
-                self.decode_host_mem_pool.get_pool(transfer.name).free(
-                    transfer.host_indices
+                if transfer.indices_from_pool is None:
+                    self.host_pool_group.free(transfer.host_indices, pool=transfer.name)
+            self.host_pool_group.free(host_indices)
+            if self.tree_cache.storage_metrics_collector is not None:
+                self.tree_cache.storage_metrics_collector.log_backuped_tokens(
+                    storage_operation.completed_tokens
                 )
-            self.decode_host_mem_pool.free(host_indices)
 
             logger.debug(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
@@ -384,9 +393,19 @@ class DecodeKVCacheOffloadManager:
     ):
         """Trigger async backup from host to storage."""
         page_hashes = self._compute_prefix_hash(req, incremental_tokens, prior_hash)
+        keys_by_pool = {PoolName.KV: page_hashes}
         for transfer in pool_transfers:
-            page_count = transfer.device_indices.numel() // self.page_size
-            transfer.keys = page_hashes[-page_count:]
+            if transfer.indices_from_pool is not None:
+                continue
+            if transfer.name == PoolName.MAMBA:
+                transfer.keys = page_hashes[-1:]
+            else:
+                page_count = transfer.device_indices.numel() // self.page_size
+                transfer.keys = page_hashes[-page_count:]
+            keys_by_pool[transfer.name] = transfer.keys
+        for transfer in pool_transfers:
+            if transfer.indices_from_pool is not None:
+                transfer.keys = keys_by_pool[transfer.indices_from_pool]
         ack_id = self.cache_controller.write_storage(
             host_indices,
             incremental_tokens,

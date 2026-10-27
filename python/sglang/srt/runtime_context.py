@@ -1972,6 +1972,17 @@ def mamba_checkpoint_grid(tree_page: int) -> int:
     return math.lcm(mamba_cache_chunk_size(), tree_page)
 
 
+def decode_attaches_hicache_host_stack() -> bool:
+    """Whether a decode's tree cache gets a HiCache host stack without a host
+    tier of its own: for retraction backups, or to offload its KV to storage as
+    the objects a prefill reads back."""
+    disagg = get_disagg()
+    return (
+        disagg.disaggregation_decode_retraction_backup == "host_pool"
+        or disagg.disaggregation_decode_enable_offload_kvcache
+    )
+
+
 def mamba_track_grid(tree_page: int) -> int:
     """The same granularity for a decode-donated checkpoint, which additionally
     has to land on the requested ``mamba_track_interval``."""

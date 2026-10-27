@@ -411,6 +411,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "disaggregation-decode-retraction-backup=host_pool are mutually exclusive: "
                 "both build a decode host pool."
             )
+        if cfg.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "The arguments disaggregation-decode-enable-offload-kvcache and "
+                "disaggregation-decode-enable-radix-cache are mutually exclusive: "
+                "the offload drives the decode tree cache's HiCache controller, "
+                "which a caching decode tree would share."
+            )
 
     if cfg._swa_full_tokens_ratio_explicitly_set is None:
         declare_resolution(

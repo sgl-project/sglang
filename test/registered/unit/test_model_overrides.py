@@ -2906,6 +2906,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 hf.layer_types = layer_types
             defaults = dict(
                 disable_radix_cache=False,
+                disaggregation_mode="null",
+                disaggregation_decode_enable_offload_kvcache=False,
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
@@ -2926,6 +2928,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+        # a decode that offloads its KV keeps Mamba checkpoints without a radix
+        # cache, in the extra buffer even with neither overlap nor paging
+        offload = dict(
+            disable_radix_cache=True,
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            disable_overlap_schedule=True,
+            page_size=1,
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **offload)),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "extra_buffer"):
+            _mamba_radix_cache_resolution(_view("Lfm2ForCausalLM", **offload))
         # auto + overlap wanted + extra-buffer support -> extra_buffer
         self.assertEqual(
             _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM")),

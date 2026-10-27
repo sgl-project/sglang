@@ -186,8 +186,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         controller.write.side_effect = write
 
         manager = object.__new__(DecodeKVCacheOffloadManager)
-        # Not a UnifiedSWAKVPool, so offloads carry no extra SWA pool transfers.
-        manager.kv_cache = None
+        # No SWA or Mamba host pool, so offloads carry no side-pool transfers.
+        manager.writes_swa = manager.writes_mamba = False
+        manager.tree_cache = scheduler.tree_cache
+        scheduler.tree_cache._build_sidecar_transfers.return_value = []
         manager.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(8).unsqueeze(0)
         )
@@ -197,7 +199,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         manager.tp_world_size = tp_world_size
         manager.tp_group = None
         manager.cache_controller = controller
-        manager.decode_host_mem_pool = MagicMock()
         manager.ongoing_offload = {}
         manager.ongoing_backup = {}
         manager.offloaded_state = WeakKeyDictionary()

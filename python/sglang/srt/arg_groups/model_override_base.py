@@ -257,9 +257,19 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def keeps_mamba_checkpoints_of(cfg: Any) -> bool:
+    """Whether the server keeps Mamba state at track boundaries: a radix cache
+    caches it, and a decode that offloads its KV writes it at each written
+    chunk's end, where a prefill restore resumes."""
+    return not cfg.disable_radix_cache or (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_offload_kvcache
+    )
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
-    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
+    return keeps_mamba_checkpoints_of(cfg) and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
     )

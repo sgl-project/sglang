@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
+    decode_attaches_hicache_host_stack,
     get_context,
     get_disagg,
     get_memory,
@@ -77,8 +78,7 @@ def prepare_hicache_staging(
     memory = get_memory()
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
-        memory.enable_hierarchical_cache
-        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        memory.enable_hierarchical_cache or decode_attaches_hicache_host_stack()
     ):
         return
 
@@ -453,16 +453,13 @@ def build_kv_cache(
         tp_rank=parallel.tp_rank,
         tp_group=parallel.tp_group,
     )
-    with auto_size_hicache(
-        params,
-        hicache_draft_plan,
-        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
-    ):
+    attaches_host_stack = (
+        enable_hierarchical_cache or decode_attaches_hicache_host_stack()
+    )
+    with auto_size_hicache(params, hicache_draft_plan, enabled=attaches_host_stack):
         tree_cache = create_tree_cache(tree_context)
 
-        if (
-            enable_hierarchical_cache or retraction_backup == "host_pool"
-        ) and hicache_draft_plan is not None:
+        if attaches_host_stack and hicache_draft_plan is not None:
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,

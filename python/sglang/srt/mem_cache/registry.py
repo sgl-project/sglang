@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
+    decode_attaches_hicache_host_stack,
     get_disagg,
     get_memory,
     get_serving,
@@ -189,10 +190,7 @@ def create_unified_radix_cache(
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
     cache = (cache_class or UnifiedRadixCache)(params)
-    if (
-        ctx.enable_hierarchical_cache
-        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-    ):
+    if ctx.enable_hierarchical_cache or decode_attaches_hicache_host_stack():
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter

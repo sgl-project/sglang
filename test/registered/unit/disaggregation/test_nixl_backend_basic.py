@@ -1141,5 +1141,48 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
 
+class TestDecodeOffloadRegistrationAcrossAttnTp(CustomTestCase):
+    """A decode that offloads its KV to storage writes objects keyed by its
+    attention-TP rank, which only a prefill of the same layout reads."""
+
+    def _register(self, prefill_tp: int, decode_tp: int, prefill_cp: int = 1):
+        mgr = NixlKVManager.__new__(NixlKVManager)
+        mgr.prefill_info_table = {}
+        mgr.kv_args = SimpleNamespace(page_size=64, state_types=[])
+        mgr.kv_cache_dtype_str = "bfloat16"
+        mgr.kv_layout = None
+        mgr.dsv41_spec_layout = None
+        mgr.is_mla_backend = mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = decode_tp
+        mgr.dcp_size = 1
+        mgr.decode_offload_kvcache = True
+        mgr._resolve_rank_mapping = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = dict(
+            attn_tp_size=prefill_tp,
+            attn_cp_size=prefill_cp,
+            dp_size=1,
+            pp_size=1,
+            page_size=64,
+            kv_cache_dtype="bfloat16",
+            follow_bootstrap_room=True,
+        )
+        with patch.object(requests, "get", return_value=response):
+            return mgr.try_ensure_parallel_info("127.0.0.1:8998")
+
+    def test_registers_a_prefill_of_its_attention_tp(self):
+        self.assertTrue(self._register(prefill_tp=2, decode_tp=2))
+
+    def test_refuses_a_prefill_of_another_attention_layout(self):
+        for prefill_tp, decode_tp, prefill_cp in ((2, 1, 1), (1, 2, 1), (1, 1, 2)):
+            with (
+                self.subTest(
+                    prefill_tp=prefill_tp, decode_tp=decode_tp, prefill_cp=prefill_cp
+                ),
+                self.assertRaisesRegex(RuntimeError, "Decode KV offload requires"),
+            ):
+                self._register(prefill_tp, decode_tp, prefill_cp)
+
+
 if __name__ == "__main__":
     unittest.main()

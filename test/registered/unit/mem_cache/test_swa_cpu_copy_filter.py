@@ -78,9 +78,12 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
                 manager = object.__new__(DecodeKVCacheOffloadManager)
                 manager.token_to_kv_pool_allocator = allocator
-                manager.kv_cache = bundle.token_to_kv_pool
-                full, transfers = manager._resolve_offload_transfers(indices)
-                self.assertTrue(torch.equal(full, indices))
+                manager.page_size = 4
+                manager.writes_swa, manager.writes_mamba = True, False
+                manager.tree_cache = SimpleNamespace(
+                    _build_sidecar_transfers=lambda *args: []
+                )
+                transfers, _ = manager._chunk_transfers(None, indices, len(indices))
                 if tombstone_tokens == len(indices):
                     self.assertEqual(transfers, [])
                     continue
@@ -88,7 +91,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
                     indices[tombstone_tokens::4] // 4
                 ]
                 pages = transfers[0].device_indices[::4] // 4
-                buffer = manager.kv_cache.swa_kv_pool.get_page_envelope_buffer()
+                buffer = bundle.token_to_kv_pool.swa_kv_pool.get_page_envelope_buffer()
                 self.assertTrue(
                     torch.equal(buffer[pages].clone(), buffer[expected_pages])
                 )

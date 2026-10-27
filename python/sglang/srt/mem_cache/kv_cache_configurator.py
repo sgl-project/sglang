@@ -1152,7 +1152,7 @@ class KVCacheConfigurator:
             )
         # DFLASH's dense full-attention rows can ride in the target's L2
         # page envelopes. Other HiCache paths still build a separate draft
-        # host pool, as does host-pool decode retraction.
+        # host pool, as do host-pool decode retraction and decode KV offload.
         fused_hicache = get_memory().enable_hierarchical_cache
         if fused_hicache:
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -1165,6 +1165,8 @@ class KVCacheConfigurator:
                 return FusedDraftDecision(declined=str(exc))
         if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
             host_pool_flag = "--disaggregation-decode-retraction-backup=host_pool"
+        elif get_disagg().disaggregation_decode_enable_offload_kvcache:
+            host_pool_flag = "--disaggregation-decode-enable-offload-kvcache"
         else:
             host_pool_flag = None
         if host_pool_flag is not None:

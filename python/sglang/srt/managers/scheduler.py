@@ -1968,8 +1968,6 @@ class Scheduler(
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
-        if self.decode_offload_manager is not None:
-            self.decode_offload_manager.release_host_resources()
         destroy_global_experts_capturer()
         destroy_global_indexer_capturer()
 

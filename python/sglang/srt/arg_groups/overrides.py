@@ -47,6 +47,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
+    keeps_mamba_checkpoints_of,
     mamba_extra_buffer_of,
     model_config_of,
     record_of,
@@ -269,7 +270,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        keeps_mamba_checkpoints_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
@@ -470,16 +471,22 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
         return {}
 
-    if view.disable_radix_cache:
+    if not keeps_mamba_checkpoints_of(view):
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
-        if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, hf_config
-        ):
+        # Without a radix cache, the decode tracks Mamba state only to offload it.
+        offloads = view.disable_radix_cache
+        supported = supports_mamba_cache_extra_buffer(view, hf_config)
+        if offloads and not supported:
+            raise ValueError(
+                f"Decode KV offload of {model_arch} needs the extra_buffer Mamba "
+                "strategy, which its linear-attention backend does not support."
+            )
+        if (wants_overlap or wants_paging or offloads) and supported:
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
