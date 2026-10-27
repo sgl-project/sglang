@@ -30,7 +30,6 @@ def fused_experts_fp8_sgl(
     from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         is_allocation_symmetric,
-        next_power_of_2,
         per_token_group_quant_fp8,
         scaled_fp8_quant,
         trtllm_fp8_per_tensor_scale_moe_wrapper,
@@ -46,6 +45,7 @@ def fused_experts_fp8_sgl(
         sgl_trtllm_fp8_block_scale_routed_moe_wrapper as trtllm_fp8_block_scale_routed_moe_wrapper,
     )
     from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils.common import next_power_of_2
 
     _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
     assert runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
