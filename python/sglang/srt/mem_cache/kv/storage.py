@@ -237,6 +237,11 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
+    def tree_components(self) -> Tuple[str, ...]:
+        """The prefix tree's component per sub-pool, in the order the tree
+        drives their eviction."""
+        return tuple(s.external.tree_component for s in self._plan.drive_order())
+
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
 

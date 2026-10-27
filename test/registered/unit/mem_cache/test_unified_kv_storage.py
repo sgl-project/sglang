@@ -92,6 +92,45 @@ class TestPlanNames(CustomTestCase):
                 )
                 self.assertEqual(storage.page_envelope_pair(), envelopes[name])
 
+    def test_tree_components_in_drive_order(self):
+        # What the prefix tree builds for a unified plan: today's components, in
+        # the order it drives their eviction (owner, window, state).
+        expected = {
+            "swa": ("FULL", "SWA"),
+            "mamba": ("FULL", "MAMBA"),
+            "tri": ("FULL", "SWA", "MAMBA"),
+        }
+        for name, components in expected.items():
+            with self.subTest(chain=name):
+                storage = _bundle(name).token_to_kv_pool_allocator.storage
+                self.assertEqual(storage.tree_components(), components)
+                self.assertEqual(
+                    {ComponentType[c] for c in components}, _COMPONENTS[name]
+                )
+
+    def test_static_tree_components_follow_the_pool_shape(self):
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        cases = {
+            (False, False): ("FULL",),
+            (True, False): ("FULL", "SWA"),
+            (False, True): ("FULL", "MAMBA"),
+            (True, True): ("FULL", "SWA", "MAMBA"),
+        }
+        for (has_window, has_state), components in cases.items():
+            with self.subTest(has_window=has_window, has_state=has_state):
+                storage = StaticKVStorage(
+                    None,
+                    None,
+                    shape=StaticPoolShape(
+                        has_window=has_window, has_state=has_state, token_capacity=1
+                    ),
+                )
+                self.assertEqual(storage.tree_components(), components)
+
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:
             with self.subTest(chain=name):

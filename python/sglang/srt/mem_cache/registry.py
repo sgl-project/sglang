@@ -159,14 +159,21 @@ def create_unified_radix_cache(
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
             raise ValueError("Host-pool retraction does not support pure-SWA models.")
 
+    from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa:
-        tree_components.append(ComponentType.SWA)
-    if ctx.is_hybrid_ssm:
-        tree_components.append(ComponentType.MAMBA)
+    allocator = params.token_to_kv_pool_allocator
+    storage = kv_storage_of(
+        params.req_to_token_pool,
+        allocator,
+        shape=StaticPoolShape(
+            has_window=ctx.is_hybrid_swa,
+            has_state=ctx.is_hybrid_ssm,
+            token_capacity=allocator.size,
+        ),
+    )
+    tree_components = [ComponentType[name] for name in storage.tree_components()]
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (

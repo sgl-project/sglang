@@ -133,6 +133,21 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         pools and transfers list them in."""
         return tuple(reversed(self.sub_pools))
 
+    def drive_order(self) -> Tuple[PlannedSubPool, ...]:
+        """The sub-pools from the longest retention to the shortest: the owner,
+        then windows from the largest, then state; ties by unit, then name.
+        A prefix tree drives eviction and lists its components in this order."""
+        return tuple(
+            sorted(
+                self.sub_pools,
+                key=lambda s: (
+                    tuple(-r for r in s.lifetime.retention()),
+                    s.unit,
+                    s.name,
+                ),
+            )
+        )
+
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         """The PD state entries, in the order peers list them. The owner's
         token KV is the transfer's KV entries, not a state entry."""
