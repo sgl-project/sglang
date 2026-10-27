@@ -1893,6 +1893,24 @@ class LowRatioCompressAscendBackendMixin:
                     forward_batch, compress_ratio
                 ),
             )
+            # MQSMLA takes q, weights and the top-k indices as independent tensors,
+            # each with its own leading dim. A buffer left over from a larger batch
+            # therefore shows up here as a row-count disagreement, long before the
+            # kernel turns it into a wild address. SGLANG_DSV41_DEBUG_SMLA=1.
+            if os.environ.get("SGLANG_DSV41_DEBUG_SMLA"):
+                rows = {"q": int(q.shape[0])}
+                for name, value in attn_kwargs.items():
+                    if torch.is_tensor(value) and value.dim() > 0:
+                        rows[name] = int(value.shape[0])
+                expected = int(forward_batch.input_ids.numel())
+                stray = {k: v for k, v in rows.items() if v not in (expected, 1)}
+                if stray:
+                    print(
+                        f"[dsv41] SMLA rows layer={layer.layer_id} "
+                        f"ratio={compress_ratio} expected={expected} "
+                        f"stray={stray}",
+                        flush=True,
+                    )
         attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
         return attn_out
 
