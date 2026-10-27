@@ -67,7 +67,7 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_weightbridge_receiver: A[
         bool,
-        "Receive trainer weight updates through WeightBridge (requires the wbridge package): every TP rank "
+        "Receive trainer weight updates through WeightBridge (requires the wbridge package): every TP/PP rank "
         "builds a receiver at startup and polls it from the scheduler loop, so updates need no HTTP request.",
     ] = False
     weightbridge_pause_mode: A[

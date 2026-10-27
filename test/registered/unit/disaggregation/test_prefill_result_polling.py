@@ -209,6 +209,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
+        self.maybe_apply_weightbridge_update = Mock()
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
         pass
@@ -462,6 +463,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         request_receiver=SimpleNamespace(recv_requests=receiver),
                         metrics_reporter=Mock(),
                         process_input_requests=Mock(),
+                        maybe_apply_weightbridge_update=Mock(),
                     )
                     with published_topology():
                         received = [
