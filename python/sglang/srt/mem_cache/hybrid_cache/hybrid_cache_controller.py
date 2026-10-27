@@ -60,6 +60,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+from sglang.srt.mem_cache.storage_key_binding import (
+    storage_key_to_event_hashes,
+    storage_operation_extra_info,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
 
@@ -136,6 +140,7 @@ class PPPrefetchTicket:
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
     kv_hints: Any = None
+    storage_key_to_event_hash: Optional[dict[str, int]] = None
 
 
 class PPPrefetchDecision(Enum):
@@ -193,9 +198,16 @@ class StorageOperation(BaseStorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         super().__init__(
-            host_indices, token_ids, last_hash, hash_value, prefix_keys, kv_hints
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
@@ -211,6 +223,7 @@ class PrefetchOperation(StorageOperation):
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -232,7 +245,12 @@ class PrefetchOperation(StorageOperation):
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
+        # A request can be re-matched while an older prefetch is still draining.
+        # Keep KVCR lookup claims scoped to this operation, not just its RID.
+        self.storage_lookup_scope = f"{self.request_id}:{self.id}"
+        self.storage_transfer_enqueued = False
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
         # pages) up to which the pool is present; rank-reduced with the
@@ -1008,6 +1026,9 @@ class HybridCacheController(BaseHiCacheController):
         evict_host: Callable[[int], int],
         start_owner: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], int]:
+        if self._needs_lookup_confirmation(operation):
+            # A partial allocation cannot move a confirmed trailing checkpoint.
+            allow_partial = False
         # Logical-page KV sharding: the owner class of the first page's slot.
         shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
         host_indices = self.alloc_prefetch_host_buffers(
@@ -1306,6 +1327,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1315,6 +1337,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1344,6 +1367,13 @@ class HybridCacheController(BaseHiCacheController):
         assume_stored: bool = False,
         kv_hints=None,
     ) -> PrefetchSubmission:
+        key_binding = (
+            storage_key_to_event_hashes(
+                prefetch_key, self.page_size, matched_prefix_tokens, last_hash
+            )
+            if kv_hints is not None
+            else None
+        )
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
                 operation=self.prefetch(
@@ -1354,6 +1384,7 @@ class HybridCacheController(BaseHiCacheController):
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
                     kv_hints=kv_hints,
+                    storage_key_to_event_hash=key_binding,
                 )
             )
 
@@ -1363,6 +1394,7 @@ class HybridCacheController(BaseHiCacheController):
         rid = handle.rid
         ticket = PPPrefetchTicket(
             kv_hints=kv_hints,
+            storage_key_to_event_hash=key_binding,
             handle=handle,
             prefetch_key=RadixKey(
                 array("q", prefetch_key.token_ids),
@@ -1385,6 +1417,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=key_binding,
         )
 
         # Every rank queries and allocates in ticket order on the worker.
@@ -1538,6 +1571,7 @@ class HybridCacheController(BaseHiCacheController):
 
         while True:
             objects = []
+            operation = None
             if is_source:
                 try:
                     objects = [self.pp_prefetch_command_queue.get(timeout=60)]
@@ -1560,6 +1594,7 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             kv_hints=ticket.kv_hints,
+                            storage_key_to_event_hash=ticket.storage_key_to_event_hash,
                             prefix_keys=ticket.prefix_keys,
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
@@ -1633,9 +1668,16 @@ class HybridCacheController(BaseHiCacheController):
                     operation.mark_terminate()
                 if operation.pool_transfers:
                     self._resolve_sidecar_kv_derived_pool_transfers(operation)
-                self.prefetch_buffer.put(operation)
+                self.enqueue_prefetch_transfer(operation)
             except Exception:
                 logger.exception("PP HiCache ticket processing failed.")
+                if operation is not None:
+                    try:
+                        self.release_unqueued_prefetch_claims(operation)
+                    except Exception:
+                        logger.exception(
+                            "PP HiCache source checkpoint claim cleanup failed."
+                        )
                 # Query/allocation failures already follow the agreed ACK path.
                 # An unexpected failure cannot safely continue the collectives.
                 return
@@ -1662,12 +1704,19 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if (
+            operation.kv_hints is not None
+            and getattr(operation, "storage_key_to_event_hash", None) is None
+        ):
+            operation.storage_key_to_event_hash = storage_key_to_event_hashes(
+                operation.token_ids, self.page_size, last_hash=operation.last_hash
+            )
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
 
-        if operation.assume_stored:
+        if operation.assume_stored and not self._needs_lookup_confirmation(operation):
             # A prior hit on a suffix of this span proved it stored, and writes
             # are prefix-covered, so re-querying only adds a round trip. Nothing
             # is verified now, so no pool gets a verdict to learn from.
@@ -1680,10 +1729,9 @@ class HybridCacheController(BaseHiCacheController):
         # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={
-                **_storage_trace_extra(operation, include_request_id=True),
-                "kv_hints": operation.kv_hints,
-            },
+            extra_info=storage_operation_extra_info(
+                operation, **_storage_trace_extra(operation, include_request_id=True)
+            ),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1715,6 +1763,45 @@ class HybridCacheController(BaseHiCacheController):
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _needs_lookup_confirmation(self, operation: PrefetchOperation) -> bool:
+        return bool(
+            getattr(self.storage_backend, "requires_lookup_confirmation", False)
+            and any(
+                transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                for transfer in operation.pool_transfers or ()
+            )
+        )
+
+    def _release_lookup_claims(self, operation: PrefetchOperation) -> None:
+        if self._needs_lookup_confirmation(operation):
+            self.storage_backend.release_lookup(operation.storage_lookup_scope)
+
+    def _clamp_confirmed_trailing_hits(
+        self, operation: PrefetchOperation, pages: int
+    ) -> None:
+        # Advisory FETCHABLE is not evidence of a source checkpoint. Buffer
+        # mode must not retain an optimistic trailing-pool existence belief
+        # after physical confirmation rejected a longer boundary.
+        for transfer in operation.pool_transfers or ():
+            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+                continue
+            prior = operation.query_pool_hit_pages.get(transfer.name)
+            if prior is not None:
+                operation.query_pool_hit_pages[transfer.name] = min(prior, pages)
+
+    def release_unqueued_prefetch_claims(self, operation: PrefetchOperation) -> None:
+        if not operation.storage_transfer_enqueued:
+            self._release_lookup_claims(operation)
+
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation) -> None:
+        operation.storage_transfer_enqueued = True
+        try:
+            self.prefetch_buffer.put(operation)
+        except Exception:
+            operation.storage_transfer_enqueued = False
+            self._release_lookup_claims(operation)
+            raise
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """One MIN collective for the folded hit count and every host pool's
@@ -1749,10 +1836,16 @@ class HybridCacheController(BaseHiCacheController):
         local = operation.query_pool_hit_pages
         boundaries = operation.pool_storage_result.restorable_prefix_pages
         explicit = boundaries is not None
+        local_needs_confirmation = self._needs_lookup_confirmation(operation)
         packed = torch.tensor(
             hits
             + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            + ([int(explicit), int(not explicit)] if len(hits) > 1 else []),
+            + [
+                int(explicit),
+                int(not explicit),
+                int(local_needs_confirmation),
+                int(not local_needs_confirmation),
+            ],
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1768,15 +1861,79 @@ class HybridCacheController(BaseHiCacheController):
             )
             if pages != _NO_POOL_VERDICT
         }
-        if len(hits) == 1:
-            result = int(reduced[0])
-        elif not reduced[-2] and not reduced[-1]:
+        if not reduced[-2] and not reduced[-1]:
+            # A rank disagreement about trailing-pool requirements must not
+            # let one rank accept an unconfirmed cache boundary.
+            self._release_lookup_claims(operation)
             operation.pool_storage_result.restorable_prefix_pages = []
-            result = 0
-        else:
-            common = [i for i, ok in enumerate(reduced[: len(hits)]) if i and ok]
-            operation.pool_storage_result.restorable_prefix_pages = common
-            result = max(common, default=0) * self.page_size
+            _finish_op_trace(operation)
+            return 0
+        needs_confirmation = bool(reduced[-2])
+        if len(hits) == 1 and not needs_confirmation:
+            result = int(reduced[0])
+            if result == 0:
+                _finish_op_trace(operation)
+            return result
+        if not reduced[-4] and not reduced[-3] or (needs_confirmation and not reduced[-4]):
+            operation.pool_storage_result.restorable_prefix_pages = []
+            if needs_confirmation:
+                self._release_lookup_claims(operation)
+            _finish_op_trace(operation)
+            return 0
+        common = [page for page, present in enumerate(reduced[: len(hits)]) if page and present]
+        operation.pool_storage_result.restorable_prefix_pages = common
+        if needs_confirmation:
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=(
+                    operation.prefix_keys.copy() if operation.prefix_keys else None
+                ),
+                extra_info=storage_operation_extra_info(operation),
+            )
+            for page in reversed(common):
+                try:
+                    local_ok = self.storage_backend.confirm_lookup(
+                        operation.all_hash_values,
+                        operation.pool_transfers,
+                        page,
+                        extra_info,
+                        operation.storage_lookup_scope,
+                    )
+                    local_error = False
+                except Exception:
+                    logger.exception(
+                        "HiCache source checkpoint confirmation failed for %s",
+                        operation.request_id,
+                    )
+                    local_ok, local_error = False, True
+                accepted = torch.tensor(
+                    [
+                        int(local_ok and not operation.is_terminated()),
+                        int(not local_error),
+                    ]
+                )
+                try:
+                    self._all_reduce(
+                        accepted,
+                        torch.distributed.ReduceOp.MIN,
+                        self.prefetch_hits_sync_groups,
+                    )
+                except Exception:
+                    # This boundary was not safely agreed across ranks. A
+                    # local fetch may already hold a checkpoint claim.
+                    self._release_lookup_claims(operation)
+                    raise
+                if not accepted[1].item():
+                    break
+                if accepted[0].item():
+                    operation.pool_storage_result.restorable_prefix_pages = [page]
+                    self._clamp_confirmed_trailing_hits(operation, page)
+                    return page * self.page_size
+            self._release_lookup_claims(operation)
+            operation.pool_storage_result.restorable_prefix_pages = []
+            self._clamp_confirmed_trailing_hits(operation, 0)
+            _finish_op_trace(operation)
+            return 0
+        result = max(common, default=0) * self.page_size
         if result == 0:
             _finish_op_trace(operation)
         return result
@@ -1875,6 +2032,7 @@ class HybridCacheController(BaseHiCacheController):
             with self.mem_pool_host.layout_lease():
                 return self._page_transfer_with_stable_layout(operation)
         finally:
+            self._release_lookup_claims(operation)
             _finish_op_trace(operation)
 
     def _page_transfer_kv_batch(
@@ -1946,10 +2104,9 @@ class HybridCacheController(BaseHiCacheController):
                     extra_info=_storage_trace_extra(operation, include_request_id=True)
                     or None,
                 ):
-                    extra_info.extra_info = {
-                        **(extra_info.extra_info or {}),
-                        "kv_hints": operation.kv_hints,
-                    }
+                    extra_info.extra_info = storage_operation_extra_info(
+                        operation, **(extra_info.extra_info or {})
+                    )
                     results.update(
                         self.storage_backend.batch_get_v2(
                             transfers, extra_info=extra_info

@@ -79,6 +79,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             extra_key="model",
             cache_salt="tenant-a",
             kv_hints=hint,
+            matched_prefix_tokens=[0, 1, 2, 3],
         )
 
         DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
@@ -95,6 +96,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             cache_salt="tenant-a",
             storage_hit_end=6,
             kv_hints=hint,
+            matched_prefix_tokens=[0, 1, 2, 3],
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):

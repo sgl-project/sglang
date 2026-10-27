@@ -8,11 +8,36 @@ import msgspec
 from sglang.srt.mem_cache.storage.kvcr.endpoints import rank_endpoint
 
 
-def peer_hint(extra_info, offset: int) -> dict | None:
+def _storage_hashes(hashes: list[int], mapping: dict, keys) -> list[int]:
+    """Authorize only requested full storage keys bound to advertised event IDs."""
+    if not isinstance(mapping, dict) or not keys:
+        return []
+    advertised = set(hashes)
+    translated = []
+    for key in keys:
+        if isinstance(key, bytes):
+            try:
+                key = key.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+        if not isinstance(key, str):
+            continue
+        page_key = key.split("#", 1)[0]
+        if len(page_key) != 64 or any(c not in "0123456789abcdef" for c in page_key):
+            continue
+        event_hash = mapping.get(page_key)
+        if type(event_hash) is int and event_hash in advertised:
+            translated.append(int(page_key[:16], 16))
+    return list(dict.fromkeys(translated))
+
+
+def peer_hint(extra_info, offset: int, keys=None) -> dict | None:
     """Validate the supported action and select this rank's source endpoint.
 
     Dynamo advertises the TP/CP/PP-zero endpoint of the chosen DP replica.
     Neighbor ports represent the other shards in that same replica.
+    Namespaced storage pages use a different hash seed from router events;
+    translate only through the framework's request-local full-key binding.
     """
     if extra_info is None or not extra_info.extra_info:
         return None
@@ -44,6 +69,11 @@ def peer_hint(extra_info, offset: int) -> dict | None:
         selected_endpoint = rank_endpoint(endpoint, offset)
         if selected_endpoint is None:
             continue
+        mapping = extra_info.extra_info.get("storage_key_to_event_hash")
+        if mapping is not None:
+            hashes = _storage_hashes(hashes, mapping, keys)
+            if not hashes:
+                continue
         return {
             "protocol_version": "0.1",
             "message_id": envelope.get("message_id", ""),
