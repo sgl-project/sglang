@@ -84,7 +84,19 @@ inline void fill_stub(scalar_t* __restrict__ out, float val) {
 template <typename scalar_t, int D, bool has_scale>
 struct l2norm_kernel {
   static inline void apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float eps) {
-    TORCH_CHECK(false, "l2norm_kernel: scalar path not implemented!");
+    float sum = 0.f;
+    for (int d = 0; d < D; ++d) {
+      const float value = static_cast<float>(input[d]);
+      sum += value * value;
+    }
+    const float inv_norm = 1.f / std::sqrt(sum + eps);
+    for (int d = 0; d < D; ++d) {
+      float value = static_cast<float>(input[d]) * inv_norm;
+      if constexpr (has_scale) {
+        value *= 1.f / std::sqrt(D);
+      }
+      out[d] = scalar_t(value);
+    }
   }
 };
 
@@ -311,6 +323,29 @@ struct solve_tril_kernel {
   }
 };
 
+template <int CHUNK_SIZE>
+struct solve_tril_kernel<float, CHUNK_SIZE> {
+  static inline void apply(float* matrix, int size) {
+    using Vec = at::vec::Vectorized<float>;
+    constexpr int width = Vec::size();
+    for (int row = 0; row < size; ++row) {
+      float* current = matrix + row * CHUNK_SIZE;
+      for (int previous = 1; previous < row; ++previous) {
+        const float coefficient = current[previous];
+        const float* inverse_row = matrix + previous * CHUNK_SIZE;
+        int col = 0;
+        for (; col + width <= previous; col += width) {
+          (Vec::loadu(current + col) + Vec(coefficient) * Vec::loadu(inverse_row + col)).store(current + col);
+        }
+        for (; col < previous; ++col) {
+          current[col] += coefficient * inverse_row[col];
+        }
+      }
+      current[row] = 1.f;
+    }
+  }
+};
+
 #if defined(CPU_CAPABILITY_AVX512)
 template <int CHUNK_SIZE>
 struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
@@ -447,7 +482,9 @@ template <typename scalar_t, int D>
 struct update_kernel {
   static inline void
   apply(scalar_t* __restrict__ out, const float* __restrict__ input, int size, int ld_src, int ld_dst) {
-    TORCH_CHECK(false, "update_kernel: scalar path not implemented!");
+    for (int row = 0; row < size; ++row) {
+      at::vec::convert(input + row * ld_src, out + row * ld_dst, D);
+    }
   }
 };
 
@@ -600,7 +637,7 @@ struct update_key_kernel<at::BFloat16, CHUNK_SIZE, D> {
 //   * keep input data in register:
 //     - reduce: 1R
 //     - scale: 1W
-template <typename scalar_t, int D>
+template <typename scalar_t, int D, bool SCALE_QUERY = true>
 void l2norm_fwd_kernel_impl(
     scalar_t* __restrict__ query_norm,
     scalar_t* __restrict__ key_norm,
@@ -628,7 +665,7 @@ void l2norm_fwd_kernel_impl(
       scalar_t* __restrict__ qn_ptr = query_norm + i * qn_strideH;
       scalar_t* __restrict__ kn_ptr = key_norm + i * kn_strideH;
 
-      l2norm_kernel<scalar_t, D, true>::apply(qn_ptr, q_ptr, eps);
+      l2norm_kernel<scalar_t, D, SCALE_QUERY>::apply(qn_ptr, q_ptr, eps);
       l2norm_kernel<scalar_t, D, false>::apply(kn_ptr, k_ptr, eps);
 
       // move to the next index
@@ -682,6 +719,42 @@ void chunk_local_cumsum_kernel_impl(
 
 // w : [B, T, Hv, D]
 // u : [B, T, Hv, Dv]
+template <typename scalar_t>
+void chunk_brgemm(
+    int M,
+    int N,
+    int K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool add,
+    const scalar_t* a,
+    const scalar_t* packed_b,
+    float* c) {
+  if (at::native::cpublas::could_pack(c10::CppTypeToScalarType<scalar_t>::value)) {
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add, a, packed_b, c);
+  } else {
+    // FP16 VNNI requires AMX-FP16; unpack for CPUs without that capability.
+    std::vector<scalar_t> b(K * N);
+    for (int k = 0; k < K; ++k) {
+      for (int n = 0; n < N; ++n) {
+        b[k * N + n] = packed_b[(k / 2) * ldb * 2 + n * 2 + k % 2];
+      }
+    }
+    at::native::cpublas::brgemm(M, N, K, lda, N, ldc, add, a, b.data(), c, false);
+  }
+}
+
+template <typename scalar_t, int COLUMNS, int CHUNK_SIZE>
+void apply_chunk_transform(
+    scalar_t* out, const scalar_t* transform, const scalar_t* values, int tokens, int input_stride, int output_stride) {
+  alignas(64) scalar_t packed[CHUNK_SIZE * COLUMNS];
+  alignas(64) float result[CHUNK_SIZE * COLUMNS];
+  pack_vnni2(packed, values, CHUNK_SIZE, COLUMNS, input_stride, COLUMNS);
+  chunk_brgemm(tokens, COLUMNS, CHUNK_SIZE, CHUNK_SIZE, COLUMNS, COLUMNS, false, transform, packed, result);
+  update_kernel<scalar_t, COLUMNS>::apply(out, result, tokens, COLUMNS, output_stride);
+}
+
 // d : [B, NT, Hv, C, C]
 // k : [B, T, H, D]
 // v : [B, T, Hv, Dv]
@@ -727,19 +800,13 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
 
     // thread local temp buffer
     DECL_ZERO_BUF(scalar_t, tmp, CHUNK_SIZE * D);
-    DECL_ZERO_BUF(scalar_t, tmp2, CHUNK_SIZE * D);
     DECL_ZERO_BUF(float, attn, CHUNK_SIZE* CHUNK_SIZE);
     DECL_ZERO_BUF(scalar_t, attn2, CHUNK_SIZE * CHUNK_SIZE);
-    DECL_ZERO_BUF(float, tmp3, CHUNK_SIZE* D);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
     scalar_t* __restrict__ k_beta = tmp;
     scalar_t* __restrict__ v_beta = tmp;
-    scalar_t* __restrict__ k_beta_packed = tmp2;
-    scalar_t* __restrict__ v_beta_packed = tmp2;
-    float* __restrict__ k_updated = tmp3;
-    float* __restrict__ v_updated = tmp3;
 
     for (int64_t i = begin; i < end; ++i) {
       int32_t bs = chunk_indices[nt * 2 + 0];
@@ -747,9 +814,6 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
       int32_t seqlen = cu_seqlens[bs + 1] - cu_seqlens[bs];
       int64_t mb_start = chunk_indices[nt * 2 + 1] * CHUNK_SIZE;
       int64_t mb_size = std::min(seqlen - mb_start, int64_t(CHUNK_SIZE));
-
-      // mb_size` is K in 5.c, 5.g, pad to TILE_K;
-      const int64_t padded_mb_size = div_up((int)mb_size, TILE_K) * TILE_K;
 
       // step 1: decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
       for (int64_t hv = h * HG; hv < h * HG + HG; ++hv) {
@@ -801,61 +865,15 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
         apply_beta_kernel<scalar_t, CHUNK_SIZE, D, true, true>::apply(
             k_beta, k_ptr, beta_ptr, g_ptr, mb_size, k_strideT, D, Hv);
 
-        //  5.b pack key
-        pack_vnni2<scalar_t>(
-            /*    dst */ k_beta_packed,
-            /*    src */ k_beta,
-            /*     K  */ mb_size,
-            /*     N  */ D,
-            /* ld_src */ D,
-            /* ld_dst */ D);
-
-        // 5.c w = attn2 @ k_beta
-        at::native::cpublas::brgemm(
-            /*     M */ mb_size,
-            /*     N */ D,
-            /*     K */ padded_mb_size,  // mb_size
-            /*   lda */ CHUNK_SIZE,
-            /*   ldb */ D,
-            /*   ldc */ D,
-            /* add_C */ false,
-            /*     A */ attn2,
-            /*     B */ k_beta_packed,
-            /*     C */ k_updated);
-
-        // 5.d k_updated -> w
         scalar_t* __restrict__ w_ptr = w + (batch_offset + mb_start) * w_strideT + hv * w_strideH;
-        update_kernel<scalar_t, D>::apply(w_ptr, k_updated, mb_size, D, w_strideT);
+        apply_chunk_transform<scalar_t, D, CHUNK_SIZE>(w_ptr, attn2, k_beta, mb_size, D, w_strideT);
 
         // 5.e value = value * beta
         apply_beta_kernel<scalar_t, CHUNK_SIZE, D, true, false>::apply(
             v_beta, v_ptr, beta_ptr, nullptr, mb_size, v_strideT, D, Hv);
 
-        // 5.f pack value
-        pack_vnni2<scalar_t>(
-            /*    dst */ v_beta_packed,
-            /*    src */ v_beta,
-            /*     K  */ mb_size,
-            /*     N  */ D,
-            /* ld_src */ D,
-            /* ld_dst */ D);
-
-        // 5.g u = attn2 @ v_beta
-        at::native::cpublas::brgemm(
-            /*     M */ mb_size,
-            /*     N */ D,
-            /*     K */ padded_mb_size,  // mb_size
-            /*   lda */ CHUNK_SIZE,
-            /*   ldb */ D,
-            /*   ldc */ D,
-            /* add_C */ false,
-            /*     A */ attn2,
-            /*     B */ v_beta_packed,
-            /*     C */ v_updated);
-
-        // 5.h v_updated -> u
         scalar_t* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
-        update_kernel<scalar_t, D>::apply(u_ptr, v_updated, mb_size, D, u_strideT);
+        apply_chunk_transform<scalar_t, D, CHUNK_SIZE>(u_ptr, attn2, v_beta, mb_size, D, u_strideT);
       }
 
       // move to the next index
@@ -1372,28 +1390,29 @@ std::tuple<at::Tensor, at::Tensor> prepare_chunk_indices(const at::Tensor& cu_se
       TORCH_CHECK(false, "Unexpected head dim size, ", dim); \
   }
 
-#define LAUNCH_L2NORM_KERNEL(HD)        \
-  l2norm_fwd_kernel_impl<scalar_t, HD>( \
-      query_norm.data_ptr<scalar_t>(),  \
-      key_norm.data_ptr<scalar_t>(),    \
-      query.data_ptr<scalar_t>(),       \
-      key.data_ptr<scalar_t>(),         \
-      eps,                              \
-      T,                                \
-      H,                                \
-      query.stride(1),                  \
-      query.stride(2),                  \
-      key.stride(1),                    \
+#define LAUNCH_L2NORM_KERNEL(HD)                     \
+  l2norm_fwd_kernel_impl<scalar_t, HD, SCALE_QUERY>( \
+      query_norm.data_ptr<scalar_t>(),               \
+      key_norm.data_ptr<scalar_t>(),                 \
+      query.data_ptr<scalar_t>(),                    \
+      key.data_ptr<scalar_t>(),                      \
+      eps,                                           \
+      T,                                             \
+      H,                                             \
+      query.stride(1),                               \
+      query.stride(2),                               \
+      key.stride(1),                                 \
       key.stride(2));
 
+template <bool SCALE_QUERY = true>
 std::tuple<at::Tensor, at::Tensor> l2norm_fwd(const at::Tensor& query, const at::Tensor& key, double eps) {
   int64_t B = query.size(0);
   int64_t T = query.size(1);
   int64_t H = query.size(2);
   int64_t D = query.size(3);
 
-  at::Tensor query_norm = at::empty_like(query);
-  at::Tensor key_norm = at::empty_like(key);
+  at::Tensor query_norm = at::empty(query.sizes(), query.options());
+  at::Tensor key_norm = at::empty(key.sizes(), key.options());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       query.scalar_type(), "l2norm_fwd", [&] { DISPATCH_HEAD_DIM(D, LAUNCH_L2NORM_KERNEL); });
@@ -1600,14 +1619,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 namespace {
 
 constexpr int KDA_CHUNK_SIZE = 64;
-inline float sigmoid_fp32(float x) {
-  if (x >= 0.f) {
-    float z = std::exp(-x);
-    return 1.f / (1.f + z);
-  }
-  float z = std::exp(x);
-  return z / (1.f + z);
-}
 
 template <int D>
 inline void scale_state_columns(float* state_ptr, const float* decay, int64_t num_rows, int64_t row_stride) {
@@ -1622,71 +1633,6 @@ inline void scale_state_columns(float* state_ptr, const float* decay, int64_t nu
       (row_vec * decay_vec).store(row_ptr + d);
     }
   }
-}
-
-template <typename scalar_t, int D>
-void prepare_qk_tensors(
-    scalar_t* q_out,
-    scalar_t* k_out,
-    const scalar_t* query,
-    const scalar_t* key,
-    int64_t T,
-    int64_t H,
-    int64_t q_strideT,
-    int64_t q_strideH,
-    int64_t k_strideT,
-    int64_t k_strideH,
-    bool use_qk_l2norm_in_kernel,
-    float eps) {
-  at::parallel_for(0, T * H, 0, [&](int64_t begin, int64_t end) {
-    int64_t t{0}, h{0};
-    data_index_init(begin, t, T, h, H);
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const scalar_t* q_ptr = query + t * q_strideT + h * q_strideH;
-      const scalar_t* k_ptr = key + t * k_strideT + h * k_strideH;
-      scalar_t* q_dst = q_out + idx * D;
-      scalar_t* k_dst = k_out + idx * D;
-      float q_norm = 0.f;
-      float k_norm = 0.f;
-      if (use_qk_l2norm_in_kernel) {
-        for (int d = 0; d < D; ++d) {
-          float qv = static_cast<float>(q_ptr[d]);
-          float kv = static_cast<float>(k_ptr[d]);
-          q_norm += qv * qv;
-          k_norm += kv * kv;
-        }
-        q_norm = 1.f / std::sqrt(q_norm + eps);
-        k_norm = 1.f / std::sqrt(k_norm + eps);
-      }
-      for (int d = 0; d < D; ++d) {
-        float qv = static_cast<float>(q_ptr[d]);
-        float kv = static_cast<float>(k_ptr[d]);
-        q_dst[d] = use_qk_l2norm_in_kernel ? qv * q_norm : qv;
-        k_dst[d] = use_qk_l2norm_in_kernel ? kv * k_norm : kv;
-      }
-      data_index_step(t, T, h, H);
-    }
-  });
-}
-
-template <typename scalar_t>
-void prepare_beta_tensor(
-    float* beta_out,
-    const scalar_t* beta,
-    int64_t T,
-    int64_t Hv,
-    int64_t beta_strideT,
-    int64_t beta_strideH,
-    bool beta_is_raw) {
-  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
-    int64_t t{0}, hv{0};
-    data_index_init(begin, t, T, hv, Hv);
-    for (int64_t idx = begin; idx < end; ++idx) {
-      float val = static_cast<float>(beta[t * beta_strideT + hv * beta_strideH]);
-      beta_out[idx] = beta_is_raw ? sigmoid_fp32(val) : val;
-      data_index_step(t, T, hv, Hv);
-    }
-  });
 }
 
 template <typename scalar_t, int D>
@@ -1791,55 +1737,6 @@ inline float kda_reduce_sum(at::vec::Vectorized<float> value) {
   return sum;
 }
 
-inline void kda_solve_tril(float* matrix, int tokens) {
-  using Vec = at::vec::Vectorized<float>;
-  constexpr int width = Vec::size();
-  for (int row = 0; row < tokens; ++row) {
-    float* current = matrix + row * KDA_CHUNK_SIZE;
-    for (int col = 0; col < row; ++col) {
-      current[col] = -current[col];
-    }
-    for (int previous = 1; previous < row; ++previous) {
-      const float coefficient = current[previous];
-      const float* inverse_row = matrix + previous * KDA_CHUNK_SIZE;
-      int col = 0;
-      for (; col + width <= previous; col += width) {
-        (Vec::loadu(current + col) + Vec(coefficient) * Vec::loadu(inverse_row + col)).store(current + col);
-      }
-      for (; col < previous; ++col) {
-        current[col] += coefficient * inverse_row[col];
-      }
-    }
-    current[row] = 1.f;
-  }
-}
-
-template <typename scalar_t>
-void kda_brgemm(
-    int M,
-    int N,
-    int K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool add,
-    const scalar_t* a,
-    const scalar_t* packed_b,
-    float* c) {
-  if (at::native::cpublas::could_pack(c10::CppTypeToScalarType<scalar_t>::value)) {
-    at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add, a, packed_b, c);
-  } else {
-    // FP16 VNNI BRGEMM requires AMX-FP16; preserve the chunk path on other CPUs.
-    std::vector<scalar_t> b(K * N);
-    for (int k = 0; k < K; ++k) {
-      for (int n = 0; n < N; ++n) {
-        b[k * N + n] = packed_b[(k / 2) * ldb * 2 + n * 2 + k % 2];
-      }
-    }
-    at::native::cpublas::brgemm(M, N, K, lda, N, ldc, add, a, b.data(), c, false);
-  }
-}
-
 template <typename scalar_t, int D>
 void chunk_kda_cpu_intra(
     scalar_t* w,
@@ -1866,8 +1763,7 @@ void chunk_kda_cpu_intra(
   at::parallel_for(0, NT * Hv, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float qf[C * D], kf[C * D], lower[C * C], scaled[2 * BC * D], scores[2 * BC * BC];
     alignas(64) at::BFloat16 left[2 * BC * D], right[BC * D], right_packed[BC * D];
-    alignas(64) scalar_t inverse[C * C], rhs[C * 2 * D], rhs_packed[C * 2 * D];
-    alignas(64) float result[C * 2 * D];
+    alignas(64) scalar_t inverse[C * C], rhs[C * 2 * D], result[C * 2 * D];
     for (int64_t idx = begin; idx < end; ++idx) {
       const int64_t nt = idx / Hv, hv = idx % Hv, h = hv / (Hv / H);
       const int32_t seq = chunk_indices[nt * 2];
@@ -1899,7 +1795,7 @@ void chunk_kda_cpu_intra(
             }
             aqk[((start + i) * Hv + hv) * C + j] = scalar_t(kda_reduce_sum(qsum) * scale);
             if (j < i) {
-              lower[i * C + j] = kda_reduce_sum(ksum) * betas[i * Hv];
+              lower[i * C + j] = -kda_reduce_sum(ksum) * betas[i * Hv];
             }
           }
         }
@@ -1927,17 +1823,17 @@ void chunk_kda_cpu_intra(
           }
           kda_convert(right, scaled, BC * D);
           pack_vnni(right_packed, right, BC, D, D, BC);
-          kda_brgemm(2 * BC, BC, D, D, BC, BC, false, left, right_packed, scores);
+          chunk_brgemm(2 * BC, BC, D, D, BC, BC, false, left, right_packed, scores);
           for (int i = 0; i < rows; ++i) {
             for (int j = 0; j < BC; ++j) {
               aqk[((start + row + i) * Hv + hv) * C + col + j] = scalar_t(scores[i * BC + j] * scale);
-              lower[(row + i) * C + col + j] = scores[(BC + i) * BC + j] * betas[(row + i) * Hv];
+              lower[(row + i) * C + col + j] = -scores[(BC + i) * BC + j] * betas[(row + i) * Hv];
             }
           }
         }
       }
       if (tokens > 1) {
-        kda_solve_tril(lower, tokens);
+        solve_tril_kernel<float, C>::apply(lower, tokens);
         kda_convert(inverse, lower, C * C);
       }
       for (int i = 0; i < tokens; ++i) {
@@ -1959,11 +1855,10 @@ void chunk_kda_cpu_intra(
         std::copy_n(rhs, D, w + (start * Hv + hv) * D);
         std::copy_n(rhs + D, D, u + (start * Hv + hv) * D);
       } else {
-        pack_vnni2(rhs_packed, rhs, C, 2 * D, 2 * D, 2 * D);
-        kda_brgemm(tokens, 2 * D, C, C, 2 * D, 2 * D, false, inverse, rhs_packed, result);
+        apply_chunk_transform<scalar_t, 2 * D, C>(result, inverse, rhs, tokens, 2 * D, 2 * D);
         for (int i = 0; i < tokens; ++i) {
-          kda_convert(w + ((start + i) * Hv + hv) * D, result + i * 2 * D, D);
-          kda_convert(u + ((start + i) * Hv + hv) * D, result + i * 2 * D + D, D);
+          std::copy_n(result + i * 2 * D, D, w + ((start + i) * Hv + hv) * D);
+          std::copy_n(result + i * 2 * D + D, D, u + ((start + i) * Hv + hv) * D);
         }
       }
     }
@@ -2079,7 +1974,7 @@ void chunk_kda_cpu_inter(
           continue;
         }
         pack_vnni(state_packed, state_low, D, D, D, D);
-        kda_brgemm(2 * tokens, D, D, D, D, D, false, wq, state_packed, products);
+        chunk_brgemm(2 * tokens, D, D, D, D, D, false, wq, state_packed, products);
         std::fill_n(residual, C * D, scalar_t(0));
         for (int i = 0; i < tokens; ++i) {
           const scalar_t* u_ptr = u + ((chunk_start + i) * Hv + hv) * D;
@@ -2090,7 +1985,7 @@ void chunk_kda_cpu_inter(
         }
         pack_vnni2(residual_packed, residual, C, D, D, D);
         float* out = products + tokens * D;
-        kda_brgemm(tokens, D, C, Hv * C, D, D, true, aqk + (chunk_start * Hv + hv) * C, residual_packed, out);
+        chunk_brgemm(tokens, D, C, Hv * C, D, D, true, aqk + (chunk_start * Hv + hv) * C, residual_packed, out);
         for (int i = 0; i < tokens; ++i) {
           kda_convert(output + (chunk_start + i) * output_strideT + hv * output_strideH, out + i * D, D);
         }
@@ -2105,7 +2000,7 @@ void chunk_kda_cpu_inter(
         }
         std::fill_n(kg_packed, C * D, scalar_t(0));
         pack_vnni2(kg_packed, kg + (chunk_start * Hv + hv) * D, tokens, D, Hv * D, D);
-        kda_brgemm(D, D, C, C, D, state_stride2, true, residual_transposed, kg_packed, state_ptr);
+        chunk_brgemm(D, D, C, C, D, state_stride2, true, residual_transposed, kg_packed, state_ptr);
       }
       data_index_step(seq_idx, num_seqs, hv, Hv);
     }
@@ -2138,31 +2033,23 @@ void run_chunk_kda_cpu(
     float scale) {
   const int64_t T = query.size(1), H = query.size(2), Hv = value.size(2);
   const int64_t NT = chunk_indices.size(0);
-  const int64_t qk_size = T * H * D, value_size = T * Hv * D;
-  auto workspace = at::empty({2 * qk_size + 3 * value_size + T * Hv * KDA_CHUNK_SIZE}, query.options());
-  auto gate_beta = at::empty({value_size + T * Hv}, query.options().dtype(at::kFloat));
-  scalar_t* q = workspace.data_ptr<scalar_t>();
-  scalar_t* k = q + qk_size;
-  scalar_t* w = k + qk_size;
+  const int64_t value_size = T * Hv * D;
+  auto workspace = at::empty({3 * value_size + T * Hv * KDA_CHUNK_SIZE}, query.options());
+  auto gate_buffer = at::empty({value_size}, query.options().dtype(at::kFloat));
+  auto beta_float = beta.to(at::kFloat).contiguous();
+  if (beta_is_raw) {
+    beta_float = beta_float.sigmoid();
+  }
+  auto [query_norm, key_norm] =
+      normalize_qk ? l2norm_fwd<false>(query, key, eps) : std::make_tuple(query.contiguous(), key.contiguous());
+  const scalar_t* q = query_norm.data_ptr<scalar_t>();
+  const scalar_t* k = key_norm.data_ptr<scalar_t>();
+  scalar_t* w = workspace.data_ptr<scalar_t>();
   scalar_t* u = w + value_size;
   scalar_t* kg = u + value_size;
   scalar_t* aqk = kg + value_size;
-  float* g = gate_beta.data_ptr<float>();
-  float* b = g + value_size;
-  prepare_qk_tensors<scalar_t, D>(
-      q,
-      k,
-      query.data_ptr<scalar_t>(),
-      key.data_ptr<scalar_t>(),
-      T,
-      H,
-      query.stride(1),
-      query.stride(2),
-      key.stride(1),
-      key.stride(2),
-      normalize_qk,
-      eps);
-  prepare_beta_tensor(b, beta.data_ptr<scalar_t>(), T, Hv, beta.stride(1), beta.stride(2), beta_is_raw);
+  float* g = gate_buffer.data_ptr<float>();
+  const float* b = beta_float.data_ptr<float>();
   prepare_kda_gate<scalar_t, D>(
       g,
       gate.data_ptr<scalar_t>(),
@@ -2364,52 +2251,34 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
   const float q_scale = scale.has_value() ? static_cast<float>(scale.value()) : 1.f / std::sqrt(static_cast<float>(D));
   at::Tensor intermediate = intermediate_states.has_value() ? *intermediate_states : at::Tensor();
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "chunk_kda_cpu_prepare", [&] {
+    const auto run = [&]<int HEAD_DIM>() {
+      run_chunk_kda_cpu<scalar_t, HEAD_DIM>(
+          output,
+          intermediate,
+          query,
+          key,
+          value,
+          g,
+          beta,
+          initial_state,
+          cu_seqlens,
+          initial_state_indices,
+          chunk_indices,
+          chunk_offsets,
+          track_state_tensor,
+          track_chunk_idx_tensor,
+          A_log_ptr,
+          dt_bias_ptr,
+          lower_bound,
+          beta_is_raw,
+          use_qk_l2norm_in_kernel,
+          static_cast<float>(eps),
+          q_scale);
+    };
     if (D == 64) {
-      run_chunk_kda_cpu<scalar_t, 64>(
-          output,
-          intermediate,
-          query,
-          key,
-          value,
-          g,
-          beta,
-          initial_state,
-          cu_seqlens,
-          initial_state_indices,
-          chunk_indices,
-          chunk_offsets,
-          track_state_tensor,
-          track_chunk_idx_tensor,
-          A_log_ptr,
-          dt_bias_ptr,
-          lower_bound,
-          beta_is_raw,
-          use_qk_l2norm_in_kernel,
-          static_cast<float>(eps),
-          q_scale);
+      run.template operator()<64>();
     } else {
-      run_chunk_kda_cpu<scalar_t, 128>(
-          output,
-          intermediate,
-          query,
-          key,
-          value,
-          g,
-          beta,
-          initial_state,
-          cu_seqlens,
-          initial_state_indices,
-          chunk_indices,
-          chunk_offsets,
-          track_state_tensor,
-          track_chunk_idx_tensor,
-          A_log_ptr,
-          dt_bias_ptr,
-          lower_bound,
-          beta_is_raw,
-          use_qk_l2norm_in_kernel,
-          static_cast<float>(eps),
-          q_scale);
+      run.template operator()<128>();
     }
   });
 

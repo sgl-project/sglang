@@ -53,7 +53,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_pp_layers
+from sglang.srt.utils import is_cpu, is_xpu, make_pp_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -183,6 +183,9 @@ class KimiMoE(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
+        # CPU expert kernels do not apply the runner's routed scaling factor.
+        if is_cpu() and not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -397,7 +400,7 @@ class KimiDeltaAttention(nn.Module):
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=config.dtype if is_cpu() else torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
             parallel_group=parallel_group,
         )
@@ -670,7 +673,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = None if is_xpu() else get_stream("alt")
+        self.alt_stream = None if is_cpu() or is_xpu() else get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,

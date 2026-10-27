@@ -140,6 +140,21 @@ class TritonKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if is_cpu():
+            return self.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a.reshape(1, q.shape[1], v.shape[2], k.shape[-1]),
+                beta=b.reshape(1, q.shape[1], v.shape[2]),
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                lower_bound=lower_bound,
+                beta_is_raw=True,
+            )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

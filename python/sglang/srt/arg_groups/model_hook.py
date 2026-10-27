@@ -166,6 +166,19 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
+    if cfg.device == "cpu" and model_arch == "KimiLinearForCausalLM":
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            disable_overlap_schedule=True,
+        )
+        if cfg.mamba_radix_cache_strategy == "auto":
+            declare_resolution(
+                server_args,
+                "_handle_model_specific_adjustments",
+                mamba_radix_cache_strategy="no_buffer",
+            )
+
     if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "

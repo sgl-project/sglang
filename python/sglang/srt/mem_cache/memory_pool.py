@@ -739,10 +739,11 @@ class MambaPool:
                         is_kda=cache_params.is_kda,
                     )
 
-                if _is_cpu and _cpu_has_amx_support:
+                if _is_cpu and _cpu_has_amx_support and not cache_params.is_kda:
                     from sglang.srt.layers.amx_utils import _init_amx_conv_state
 
                     # CPU uses a different layout of conv_state for kernel optimization
+                    # KDA is already window-major; only GDN needs the AMX stride conversion.
                     conv_state = _init_amx_conv_state(conv_state)
 
                 temporal_state = torch.zeros(

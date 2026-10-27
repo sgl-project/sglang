@@ -441,6 +441,22 @@ class FusedRMSNormGated(nn.Module):
         residual_in_fp32: bool = False,
     ) -> torch.Tensor:
         if _use_cpu:
+            if self.activation == "sigmoid":
+                residual_dtype = (
+                    residual.dtype
+                    if residual is not None
+                    else (torch.float32 if residual_in_fp32 else x.dtype)
+                )
+                residual_out = x.float()
+                if residual is not None:
+                    residual_out = residual_out + residual.float()
+                y = residual_out * torch.rsqrt(
+                    residual_out.square().mean(dim=-1, keepdim=True) + self.eps
+                )
+                if self.weight is not None:
+                    y = y * self.weight.float()
+                y = (y * g.float().sigmoid()).to(x.dtype)
+                return (y, residual_out.to(residual_dtype)) if prenorm else y
             assert self.activation == "silu", (
                 "CPU rmsnorm_gated currently only supports activation silu"
             )

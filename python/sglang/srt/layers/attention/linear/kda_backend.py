@@ -36,8 +36,9 @@ if is_npu():
 
     causal_conv1d_update = causal_conv1d_update_npu
 elif is_cpu():
-    from sgl_kernel.mamba import causal_conv1d_update_cpu
+    from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
+    causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
@@ -952,7 +953,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     )
 
         qkv = causal_conv1d_update(
-            mixed_qkv,
+            mixed_qkv.contiguous() if is_cpu() else mixed_qkv,
             conv_states.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
@@ -1027,6 +1028,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
+        if is_cpu():
+            # Canonicalize the row stride even for a one-token projection slice.
+            mixed_qkv = mixed_qkv.contiguous().view_as(mixed_qkv)
         return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
