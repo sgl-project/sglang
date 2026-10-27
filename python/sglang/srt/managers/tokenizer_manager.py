@@ -29,6 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -115,7 +116,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
@@ -209,6 +210,39 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+
+_SHM_WRAP_POOL: Optional[ThreadPoolExecutor] = None
+
+
+def _shm_wrap_pool() -> ThreadPoolExecutor:
+    """Threads for wrap_shm_features (SGLANG_SHM_WRAP_OFF_LOOP)."""
+    global _SHM_WRAP_POOL
+    if _SHM_WRAP_POOL is None:
+        _SHM_WRAP_POOL = ThreadPoolExecutor(
+            max_workers=envs.SGLANG_SHM_WRAP_THREADS.get(),
+            thread_name_prefix="shm-wrap",
+        )
+    return _SHM_WRAP_POOL
+
+
+def _discard_wrapped_features(future: asyncio.Future) -> None:
+    if not future.cancelled() and future.exception() is None:
+        discard_shm_features(future.result())
+
+
+async def _wrap_shm_features_off_loop(obj):
+    """wrap_shm_features on the SHM wrap pool. If the caller is cancelled while
+    the copy runs, the segments it creates are released once it finishes,
+    since the request will not be dispatched."""
+    future = asyncio.get_running_loop().run_in_executor(
+        _shm_wrap_pool(), wrap_shm_features, obj
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        future.add_done_callback(_discard_wrapped_features)
+        raise
+
 
 logger = logging.getLogger(__name__)
 
@@ -1810,7 +1844,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            if envs.SGLANG_SHM_WRAP_OFF_LOOP.get():
+                tokenized_obj = await _wrap_shm_features_off_loop(tokenized_obj)
+            else:
+                tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)

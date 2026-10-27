@@ -1770,6 +1770,11 @@ class Envs:
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Run wrap_shm_features (shared-memory create, fallocate and the pixel copy)
+    # on a pool of SGLANG_SHM_WRAP_THREADS threads instead of the tokenizer event
+    # loop, so large multimodal features do not stall request intake.
+    SGLANG_SHM_WRAP_OFF_LOOP = EnvBool(False)
+    SGLANG_SHM_WRAP_THREADS = EnvInt(4)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
