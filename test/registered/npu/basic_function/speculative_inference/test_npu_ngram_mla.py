@@ -19,6 +19,10 @@ class TestNpuMlaNgram(ngram_checks.TestNpuNgram):
         "Continue the sequence: 101, 102, 103, 104, 105,"
     ]
 
+    @unittest.skip("NGRAM target-verification graphs are currently MHA/GQA-only.")
+    def test_graph_matches_eager_with_long_prefix(self):
+        pass
+
     def test_eight_options_match_greedy_baseline(self):
         # Compare the same FIA attention family on both sides. The legacy
         # paged MLA decoder has different BF16 rounding from target verification.

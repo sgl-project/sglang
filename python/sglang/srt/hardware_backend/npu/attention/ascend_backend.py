@@ -1738,19 +1738,6 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            if _is_ngram_verify(forward_batch.spec_info):
-                return self.forward_ngram(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
-                    q_rope=q_rope,
-                    k_rope=k_rope,
-                    sinks=sinks,
-                    slopes=slopes,
-                )
             return self.forward_mtp(
                 q,
                 k,
@@ -1761,6 +1748,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                slopes=slopes,
             )
 
         if not self.use_mla:
@@ -2527,129 +2515,6 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
-    def forward_ngram(
-        self,
-        q,
-        k,
-        v,
-        layer,
-        forward_batch,
-        save_kv_cache,
-        q_rope=None,
-        k_rope=None,
-        sinks=None,
-        slopes=None,
-    ):
-        """Verify irregular trees with paged FIA and explicit ancestor masks.
-
-        Dense MHA uses BSH, avoiding TND split-fuse's causal-mask restriction.
-        MLA's latent+RoPE TND kernel supports the full mask for ND and NZ caches.
-        """
-        if (
-            layer.sliding_window_size != -1
-            or layer.attn_type != AttentionType.DECODER
-            or layer.logit_cap != 0
-            or sinks is not None
-            or slopes is not None
-        ):
-            raise ValueError(
-                "NGRAM on Ascend requires full decoder attention without "
-                "attention sinks, ALiBi, or logit capping."
-            )
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer,
-                KVWriteLoc(forward_batch.out_cache_loc),
-                k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-                if self.use_mla
-                else k,
-                k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-                if self.use_mla
-                else v,
-            )
-        bs = forward_batch.batch_size
-        d = int(forward_batch.spec_info.draft_token_num)
-        actual_seq_lengths_kv = (
-            self.forward_metadata.seq_lens_cpu_list
-            if self.forward_metadata.seq_lens_cpu_int is None
-            else self.forward_metadata.seq_lens_cpu_int.tolist()
-        )
-        if self.use_mla:
-            c_kv, rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if is_fia_nz():
-                k_cache = _reshape_kv_for_fia_nz(
-                    c_kv, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
-                )
-                rope_cache = _reshape_kv_for_fia_nz(
-                    rope_cache,
-                    layer.tp_k_head_num,
-                    self.qk_rope_head_dim,
-                    self.page_size,
-                )
-            else:
-                k_cache = c_kv.view(
-                    -1, layer.tp_k_head_num, self.page_size, self.kv_lora_rank
-                )
-                rope_cache = rope_cache.view(
-                    -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
-                )
-            query = q[: bs * d].reshape(-1, layer.tp_q_head_num, self.kv_lora_rank)
-            query_rope = q_rope[: bs * d].reshape(
-                -1, layer.tp_q_head_num, self.qk_rope_head_dim
-            )
-            padded_heads = self.q_head_num_padding or layer.tp_q_head_num
-            padding = padded_heads - layer.tp_q_head_num
-            if padding:
-                query = torch.nn.functional.pad(query, (0, 0, 0, padding))
-                query_rope = torch.nn.functional.pad(query_rope, (0, 0, 0, padding))
-            output, _ = torch_npu.npu_fused_infer_attention_score(
-                query.contiguous(),
-                k_cache,
-                k_cache,
-                query_rope=query_rope.contiguous(),
-                key_rope=rope_cache,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                num_heads=padded_heads,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                atten_mask=self.forward_metadata.ngram_attn_mask,
-                scale=layer.scaling,
-                actual_seq_lengths=[(b + 1) * d for b in range(bs)],
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=0,
-                pre_tokens=FULL_ATTENTION_WINDOW,
-                next_tokens=FULL_ATTENTION_WINDOW,
-            )
-            return output[:, : layer.tp_q_head_num].reshape(
-                bs * d, layer.tp_q_head_num * self.kv_lora_rank
-            )
-        query = q[: bs * d].reshape(bs, d, layer.tp_q_head_num * layer.qk_head_dim)
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-        )
-        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
-        output, _ = torch_npu.npu_fused_infer_attention_score(
-            query.contiguous(),
-            k_cache,
-            v_cache,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="BSH",
-            atten_mask=self.forward_metadata.ngram_attn_mask,
-            scale=layer.scaling,
-            actual_seq_lengths=[d] * bs,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            sparse_mode=0,
-            pre_tokens=FULL_ATTENTION_WINDOW,
-            next_tokens=FULL_ATTENTION_WINDOW,
-        )
-        return output.reshape(bs * d, layer.tp_q_head_num * layer.v_head_dim)
-
     def forward_mtp(
         self,
         q,
@@ -2661,7 +2526,26 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
+        """Share KV preparation and FIA dispatch for MTP and NGRAM verification."""
+        is_ngram = _is_ngram_verify(forward_batch.spec_info)
+        if is_ngram and (
+            layer.sliding_window_size != -1
+            or layer.attn_type != AttentionType.DECODER
+            or layer.logit_cap != 0
+            or sinks is not None
+            or slopes is not None
+        ):
+            raise ValueError(
+                "NGRAM on Ascend requires full decoder attention without "
+                "attention sinks, ALiBi, or logit capping."
+            )
+        draft_tokens = (
+            int(forward_batch.spec_info.draft_token_num)
+            if is_ngram
+            else self.speculative_num_draft_tokens
+        )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -2696,7 +2580,7 @@ class AscendAttnBackend(AttentionBackend):
                 # operator's batchSize (TND layout); only target_verify has a
                 # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
+                    real_bs = query.shape[0] // draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph mode: bind the Python list, which graph.update can
@@ -2723,9 +2607,9 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + query.shape[0],
-                    self.speculative_num_draft_tokens,
+                    draft_tokens,
+                    draft_tokens + query.shape[0],
+                    draft_tokens,
                 )
 
             if not self.graph_mode:
@@ -2749,7 +2633,17 @@ class AscendAttnBackend(AttentionBackend):
                 # Drop DP padding rows (see real_bs comment above).
                 block_table = block_table[:real_bs]
 
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
+            input_layout = "TND"
+            if is_ngram:
+                # The paged MHA TND split-fuse path only accepts causal masks.
+                input_layout = "BSH"
+                query = query.reshape(
+                    -1, draft_tokens, layer.tp_q_head_num * layer.qk_head_dim
+                )
+                actual_seq_lengths = [draft_tokens] * query.shape[0]
+                mask = self.forward_metadata.ngram_attn_mask
+                sparse_mode = 0
+            elif layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
                 sparse_mode = 0
             else:
@@ -2765,7 +2659,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_query_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     softmax_scale=layer.scaling,
                     actual_seq_qlen=actual_seq_lengths,
@@ -2788,7 +2682,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     scale=layer.scaling,
                     actual_seq_lengths=actual_seq_lengths,
@@ -2843,9 +2737,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             actual_seq_lengths = np.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens + q_nope.shape[0],
-                self.speculative_num_draft_tokens,
+                draft_tokens,
+                draft_tokens + q_nope.shape[0],
+                draft_tokens,
             )
 
             # When not in graph_mode, query is sliced to num_token_non_padded
@@ -2859,6 +2753,14 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables
 
             if (
+                is_ngram
+                and self.q_head_num_padding is not None
+                and self.q_head_num_padding > self.tp_q_head_num
+            ):
+                padding = self.q_head_num_padding - self.tp_q_head_num
+                q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding))
+                q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding))
+            elif (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
             ):
@@ -2891,12 +2793,14 @@ class AscendAttnBackend(AttentionBackend):
                 q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
                 q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
+            mask = self.forward_metadata.ngram_attn_mask if is_ngram else self.mtp_mask
+            sparse_mode = 0 if is_ngram else 3
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
-                query_seq_len = self.speculative_num_draft_tokens
+                query_seq_len = draft_tokens
                 assert q_nope.shape[0] == batch_size * query_seq_len, (
                     "FIAS V2 target verify requires one fixed draft block per request"
                 )
@@ -2935,8 +2839,8 @@ class AscendAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_qlen=[query_seq_len] * batch_size,
                         actual_seq_kvlen=actual_seq_lengths_kv,
                         pre_tokens=FULL_ATTENTION_WINDOW,
@@ -2963,8 +2867,8 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
                     )
@@ -2985,8 +2889,8 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=sparse_mode,
+                    atten_mask=mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     workspace=workspace,
@@ -2996,6 +2900,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
+                and forward_batch.global_num_token_non_padded_cpu is not None
                 and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(

@@ -51,6 +51,11 @@ class TestNgramAttention(unittest.TestCase):
             )
 
     def test_mla_forward_matches_cpu_ancestor_attention(self):
+        for is_ngram in (False, True):
+            with self.subTest(is_ngram=is_ngram):
+                self._check_mla_verify_forward(is_ngram)
+
+    def _check_mla_verify_forward(self, is_ngram):
         torch.manual_seed(42)
         bs, d, page, latent, rope = 2, 4, 128, 512, 64
         prefixes = [3, 127]
@@ -60,6 +65,8 @@ class TestNgramAttention(unittest.TestCase):
             [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
             dtype=torch.bool,
         ).repeat(bs, 1, 1)
+        if not is_ngram:
+            tree = torch.ones_like(tree).tril()
         blocked = torch.ones(bs, 1, d, 2 * page, dtype=torch.bool)
         for b, prefix in enumerate(prefixes):
             blocked[b, 0, :, :prefix] = False
@@ -71,6 +78,7 @@ class TestNgramAttention(unittest.TestCase):
         layer = SimpleNamespace(
             layer_id=1,
             tp_k_head_num=1,
+            tp_v_head_num=1,
             v_head_dim=latent,
             sliding_window_size=-1,
             attn_type=AttentionType.DECODER,
@@ -98,6 +106,14 @@ class TestNgramAttention(unittest.TestCase):
                             layer.tp_q_head_num = heads
                             backend = object.__new__(AscendAttnBackend)
                             backend.use_mla = True
+                            backend.graph_mode = False
+                            backend.speculative_num_draft_tokens = d
+                            backend.use_fias_v2_bsnd = False
+                            backend.tp_q_head_num = heads
+                            backend.model_dtype = dtype
+                            backend.mtp_mask = torch.ones(
+                                2048, 2048, dtype=torch.bool, device="npu"
+                            ).triu(1)
                             backend.kv_lora_rank, backend.qk_rope_head_dim = (
                                 latent,
                                 rope,
@@ -116,11 +132,20 @@ class TestNgramAttention(unittest.TestCase):
                             )
                             batch = SimpleNamespace(
                                 batch_size=bs,
-                                spec_info=SimpleNamespace(draft_token_num=d),
+                                spec_info=SimpleNamespace(
+                                    spec_input_type=(
+                                        SpecInputType.NGRAM_VERIFY
+                                        if is_ngram
+                                        else SpecInputType.EAGLE_VERIFY
+                                    ),
+                                    draft_token_num=d,
+                                ),
+                                forward_mode=ForwardMode.TARGET_VERIFY,
+                                global_num_token_non_padded_cpu=bs * d,
                                 out_cache_loc=draft_slots.npu(),
                             )
                             actual = (
-                                backend.forward_ngram(
+                                backend.forward_mtp(
                                     q.flatten(0, 1).npu(),
                                     draft_c.npu(),
                                     None,
@@ -399,6 +424,95 @@ class TestNgramAttention(unittest.TestCase):
         )
         self.assertFalse(mask[:4].any())
         self.assertTrue(mask[4:].all())
+
+    def test_shared_verify_forward_preserves_mtp_and_ngram_masks(self):
+        torch.manual_seed(42)
+        bs, d, nq, nk, hd, page = 2, 4, 4, 2, 128, 128
+        prefixes = [125, 129]
+        lengths = [p + d for p in prefixes]
+        table = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32)
+        q = torch.randn(bs, d, nq, hd, dtype=torch.bfloat16)
+        k = torch.randn(4, page, nk, hd, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        k_npu, v_npu = k.npu(), v.npu()
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=nq,
+            tp_k_head_num=nk,
+            tp_v_head_num=nk,
+            qk_head_dim=hd,
+            v_head_dim=hd,
+            scaling=hd**-0.5,
+            sliding_window_size=-1,
+            attn_type=AttentionType.DECODER,
+            logit_cap=0,
+        )
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.is_hybrid_swa = False
+        backend.speculative_num_draft_tokens = d
+        backend.page_size = page
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: k_npu,
+            get_value_buffer=lambda _: v_npu,
+        )
+        backend.mtp_mask = torch.ones(2048, 2048, dtype=torch.bool, device="npu").triu(
+            1
+        )
+        for is_ngram in (False, True):
+            tree = torch.ones(d, d, dtype=torch.bool).tril()
+            if is_ngram:
+                tree = torch.tensor(
+                    [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
+                    dtype=torch.bool,
+                )
+            blocked = torch.ones(bs, 1, d, 2 * page, dtype=torch.bool)
+            for b, prefix in enumerate(prefixes):
+                blocked[b, 0, :, :prefix] = False
+                blocked[b, 0, :, prefix : prefix + d] = ~tree
+            expected = []
+            for b in range(bs):
+                keys = k[table[b].long()].flatten(0, 1)[: lengths[b]].float()
+                values = v[table[b].long()].flatten(0, 1)[: lengths[b]].float()
+                keys = keys.repeat_interleave(nq // nk, dim=1)
+                values = values.repeat_interleave(nq // nk, dim=1)
+                scores = (
+                    torch.einsum("qhd,khd->hqk", q[b].float(), keys) * layer.scaling
+                )
+                scores.masked_fill_(blocked[b, 0, :, : lengths[b]], float("-inf"))
+                expected.append(
+                    torch.einsum("hqk,khd->qhd", scores.softmax(-1), values)
+                )
+            for graph_mode in (False, True):
+                with self.subTest(is_ngram=is_ngram, graph_mode=graph_mode):
+                    backend.graph_mode = graph_mode
+                    backend.forward_metadata = SimpleNamespace(
+                        block_tables=table.npu(),
+                        ngram_attn_mask=blocked.npu(),
+                        seq_lens_cpu_int=None if graph_mode else torch.tensor(lengths),
+                        seq_lens_cpu_list=lengths,
+                    )
+                    batch = SimpleNamespace(
+                        spec_info=SimpleNamespace(
+                            spec_input_type=(
+                                SpecInputType.NGRAM_VERIFY
+                                if is_ngram
+                                else SpecInputType.EAGLE_VERIFY
+                            ),
+                            draft_token_num=d,
+                        ),
+                        forward_mode=ForwardMode.TARGET_VERIFY,
+                        global_num_token_non_padded_cpu=bs * d,
+                    )
+                    actual = backend.forward_mtp(
+                        q.flatten(0, 1).npu(), None, None, layer, batch, False
+                    )
+                    torch.testing.assert_close(
+                        actual.cpu().float().reshape(bs, d, nq, hd),
+                        torch.stack(expected),
+                        atol=0.03,
+                        rtol=0.03,
+                    )
 
     def test_kv_compaction_snapshots_overlapping_sources(self):
         # Test both NPU buffer envelopes and asymmetric K/V head dimensions.
