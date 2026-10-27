@@ -4,8 +4,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-
 try:
     import triton
     import triton.language as tl
@@ -96,23 +94,13 @@ def _launch_map_record_hist(
     )
 
 
-def eplb_map_and_record_fused(
+def eplb_map_and_record(
     topk_ids: torch.Tensor,
-    dispatch_info: Optional[ExpertLocationDispatchInfo],
+    dispatch: Optional[torch.Tensor],
     load_buffer: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
     if not _HAS_TRITON or not topk_ids.is_cuda or topk_ids.numel() == 0:
-        return None
-    if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm != "static":
-        return None
-
-    dispatch = (
-        dispatch_info.partial_logical_to_rank_dispatch_physical_map
-        if dispatch_info is not None
-        else None
-    )
-    if dispatch_info is not None and dispatch is None:
         return None
     topk_ids = topk_ids.contiguous()
     output = torch.empty(topk_ids.shape, dtype=topk_ids.dtype, device=topk_ids.device)
@@ -126,13 +114,11 @@ def eplb_map_and_record_fused(
     return output
 
 
-def record_physical_counts_fused(
-    topk_ids: torch.Tensor, load_buffer: torch.Tensor
-) -> bool:
+def record_physical_counts(topk_ids: torch.Tensor, load_buffer: torch.Tensor) -> bool:
     if not _HAS_TRITON or not topk_ids.is_cuda or topk_ids.numel() == 0:
         return False
     _launch_map_record_hist(topk_ids.contiguous(), load_buffer)
     return True
 
 
-__all__ = ["eplb_map_and_record_fused", "record_physical_counts_fused"]
+__all__ = ["eplb_map_and_record", "record_physical_counts"]

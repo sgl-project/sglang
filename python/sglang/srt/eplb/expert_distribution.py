@@ -57,7 +57,7 @@ from sglang.srt.utils import Withable, get_device, get_int_env_var, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.srt.eplb.eplb_map_record_fused import record_physical_counts_fused
+    from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -630,7 +630,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
             _is_cuda
             and layer_idx is not None
             and not torch.compiler.is_compiling()
-            and record_physical_counts_fused(
+            and record_physical_counts(
                 topk_ids=topk_ids, load_buffer=self._data[layer_idx]
             )
         ):
