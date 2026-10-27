@@ -19,8 +19,6 @@ Usage::
 import hashlib
 import math
 import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import requests
@@ -55,7 +53,7 @@ def _sha256_of(path):
 
 
 def honor_local_sgl_eval_archive():
-    """Serve sgl_eval archives from a prefetched directory when possible."""
+    """Point sgl_eval's archive-backed prepare at a prefetched local copy."""
     archive_dir = Path(
         os.environ.get(_SGL_EVAL_ARCHIVE_DIR_ENV) or _SGL_EVAL_ARCHIVE_DIR_DEFAULT
     )
@@ -65,32 +63,36 @@ def honor_local_sgl_eval_archive():
         from sgl_eval.evals import _loader
     except ImportError:
         return
-    original = getattr(_loader, "_download_verified_archive", None)
+    original = getattr(_loader, "_save_data_from_verified_archive", None)
     if original is None or getattr(original, "_sglang_local_archive_shim", False):
         return
 
-    def _download_verified_archive(url, expected_sha256, directory):
-        local = archive_dir / url.rsplit("/", 1)[-1]
-        expected = (expected_sha256 or "").lower()
-        if expected and local.is_file() and _sha256_of(local) == expected:
-            directory = Path(directory)
-            directory.mkdir(parents=True, exist_ok=True)
-            # The staged copy must not reuse the archive's own name: a vendored
-            # prepare script copies it onto <work_dir>/<archive name>, and
-            # urlretrieve() truncates its target first, so an identically named
-            # staged file would be emptied before it is read. sgl_eval unlinks
-            # the path it gets back, so a temp name leaves nothing behind.
-            fd, staged_name = tempfile.mkstemp(
-                prefix=".sgl-eval-archive-", suffix=".tmp", dir=directory
+    def _save_data_from_verified_archive(
+        mod, save_args, save_kwargs, archive_url, archive_sha256, work_dir
+    ):
+        local = archive_dir / archive_url.rsplit("/", 1)[-1]
+        expected = (archive_sha256 or "").lower()
+        if not (
+            expected
+            and hasattr(mod, "URL")
+            and local.is_file()
+            and _sha256_of(local) == expected
+        ):
+            return original(
+                mod, save_args, save_kwargs, archive_url, archive_sha256, work_dir
             )
-            os.close(fd)
-            staged = Path(staged_name)
-            shutil.copyfile(local, staged)
-            return staged
-        return original(url, expected_sha256, directory)
+        # prepare.save_data() writes <work_dir>/<archive name>, while the
+        # prefetched archive lives in its own directory: pointing URL at it
+        # cannot make urlretrieve() truncate the source it is reading.
+        original_url = mod.URL
+        try:
+            mod.URL = local.as_uri()
+            mod.save_data(*save_args, **save_kwargs)
+        finally:
+            mod.URL = original_url
 
-    _download_verified_archive._sglang_local_archive_shim = True
-    _loader._download_verified_archive = _download_verified_archive
+    _save_data_from_verified_archive._sglang_local_archive_shim = True
+    _loader._save_data_from_verified_archive = _save_data_from_verified_archive
 
 
 # Applied on import so every NPU accuracy case benefits; a no-op without the dir.
