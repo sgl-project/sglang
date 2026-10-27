@@ -924,14 +924,14 @@ class TokenizerControlMixin:
                 await self.continue_generation(ContinueGenerationReqInput())
             return out
 
-    async def checkpoint_resume(self: TokenizerManager) -> CheckpointReqOutput:
+    async def checkpoint_restore(self: TokenizerManager) -> CheckpointReqOutput:
         """Bring the KV cache back and continue generation."""
         self.auto_create_handle_loop()
         async with self.checkpoint_lock:
             before = await self._call_checkpoint(CheckpointReqType.STATE)
-            out = await self._call_checkpoint(CheckpointReqType.RESUME)
+            out = await self._call_checkpoint(CheckpointReqType.RESTORE)
             # Continue only the pause this cycle started, not a later user pause.
-            # With DP ranks resumed by an earlier call, `before` is mixed.
+            # With DP ranks restored by an earlier call, `before` is mixed.
             if (
                 before.state != CheckpointState.RUNNING
                 and out.state == CheckpointState.RUNNING

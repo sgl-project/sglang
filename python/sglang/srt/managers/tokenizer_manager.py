@@ -775,7 +775,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
-        # Serializes checkpoint prepare and resume within this process.
+        # Serializes checkpoint prepare and restore within this process.
         self.checkpoint_lock = asyncio.Lock()
 
     def init_lora(self):

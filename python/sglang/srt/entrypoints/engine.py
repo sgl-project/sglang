@@ -1840,10 +1840,10 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.checkpoint_prepare(mode)
         )
 
-    def checkpoint_resume(self) -> CheckpointReqOutput:
-        """Bring back what preparing released and continue generation, after a
-        restore or in place."""
-        return self.loop.run_until_complete(self.tokenizer_manager.checkpoint_resume())
+    def checkpoint_restore(self) -> CheckpointReqOutput:
+        """Bring back what preparing released and continue generation, in a
+        process started from the capture or in place."""
+        return self.loop.run_until_complete(self.tokenizer_manager.checkpoint_restore())
 
     def checkpoint_state(self) -> CheckpointReqOutput:
         """The lifecycle state of every DP rank, with the error if FAILED."""

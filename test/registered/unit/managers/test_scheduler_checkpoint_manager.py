@@ -88,8 +88,8 @@ def _prepare(tokenizer, mode="abort"):
     return asyncio.run(TokenizerControlMixin.checkpoint_prepare(tokenizer, mode))
 
 
-def _resume(tokenizer):
-    return asyncio.run(TokenizerControlMixin.checkpoint_resume(tokenizer))
+def _restore(tokenizer):
+    return asyncio.run(TokenizerControlMixin.checkpoint_restore(tokenizer))
 
 
 class TestCheckpointManager(unittest.TestCase):
@@ -122,27 +122,27 @@ class TestCheckpointManager(unittest.TestCase):
         self.assertEqual(calls, ["pause", "continue"])
         self.assertEqual([r.state for r in ranks], [CheckpointState.RUNNING] * 2)
 
-    def test_resume_continues_only_the_pause_of_its_cycle(self):
-        """Orchestrators redeliver resume. A repeat must not lift a pause a user
+    def test_restore_continues_only_the_pause_of_its_cycle(self):
+        """Orchestrators redeliver restore. A repeat must not lift a pause a user
         started after the cycle ended."""
         tokenizer, ranks, calls = _server(True, True)
         _prepare(tokenizer)
         calls.clear()
 
-        self.assertEqual(_resume(tokenizer).state, CheckpointState.RUNNING)
+        self.assertEqual(_restore(tokenizer).state, CheckpointState.RUNNING)
         self.assertEqual(calls, ["resume_kv", "resume_kv", "continue"])
-        self.assertEqual(_resume(tokenizer).state, CheckpointState.RUNNING)
+        self.assertEqual(_restore(tokenizer).state, CheckpointState.RUNNING)
         self.assertEqual(calls, ["resume_kv", "resume_kv", "continue"])
 
     def test_failed_release_latches(self):
-        """Resuming a half-released server would serve without a KV cache, so a
+        """Restoring a half-released server would serve without a KV cache, so a
         failure stops it for good and generation stays paused."""
         tokenizer, ranks, calls = _server(True, release_error=RuntimeError("oom"))
 
         out = _prepare(tokenizer)
         self.assertEqual(out.state, CheckpointState.FAILED)
         self.assertIn("oom", out.message)
-        out = _resume(tokenizer)
+        out = _restore(tokenizer)
         self.assertFalse(out.success)
         self.assertEqual(calls, ["pause"])
 

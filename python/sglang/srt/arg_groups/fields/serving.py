@@ -120,7 +120,7 @@ class Serving(msgspec.Struct):
         bool,
         "After warmup and before serving, prepare for an external process "
         "checkpoint as /checkpoint/prepare does. The server serves only after "
-        "/checkpoint/resume. Requires --enable-memory-saver.",
+        "/checkpoint/restore. Requires --enable-memory-saver.",
     ] = False
     enable_http2: A[
         bool,

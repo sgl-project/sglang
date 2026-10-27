@@ -19,7 +19,7 @@ ADMIN_PATHS = [
     "/set_trace_level",
     "/freeze_gc",
     "/checkpoint/prepare",
-    "/checkpoint/resume",
+    "/checkpoint/restore",
 ]
 
 

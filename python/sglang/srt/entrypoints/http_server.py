@@ -1812,12 +1812,13 @@ async def checkpoint_prepare(mode: Literal["abort", "retract"] = "abort"):
     return _checkpoint_response(out)
 
 
-@app.post("/checkpoint/resume")
+@app.post("/checkpoint/restore")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def checkpoint_resume():
-    """Bring the KV cache back and continue generation, after a restore or in
-    place. Orchestrators redeliver it, so a resume already done returns 200."""
-    out = await _global_state.tokenizer_manager.checkpoint_resume()
+async def checkpoint_restore():
+    """Bring the KV cache back and continue generation, in a process started
+    from the capture or in place. Orchestrators redeliver it, so a restore
+    already done returns 200."""
+    out = await _global_state.tokenizer_manager.checkpoint_restore()
     return _checkpoint_response(out)
 
 

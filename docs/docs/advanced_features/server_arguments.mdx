@@ -266,7 +266,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--checkpoint-prepare-on-startup`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>After warmup and before serving, prepare for an external process checkpoint as `/checkpoint/prepare` does. The server serves only after `/checkpoint/resume`. Requires `--enable-memory-saver`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>After warmup and before serving, prepare for an external process checkpoint as `/checkpoint/prepare` does. The server serves only after `/checkpoint/restore`. Requires `--enable-memory-saver`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
