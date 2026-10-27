@@ -4511,7 +4511,8 @@ class DeepseekV4Model(nn.Module):
             forward_batch,
             hidden_states,
             input_ids,
-            eligible=not (run_tbo or capture_dspark),
+            eligible=not run_tbo
+            and (not capture_dspark or envs.SGLANG_DSV4_TOKEN_PARALLEL_DSPARK.get()),
         )
         if tp_state is not None:
             hidden_states = tp_state.scatter(hidden_states)
@@ -4587,9 +4588,16 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    mhc_stream_mean(
-                        completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
-                    )
+                    if tp_state is not None:
+                        # The draft reads every token's capture: gather this rank's rows.
+                        local = completed.new_empty(completed[:, 0].shape)
+                        mhc_stream_mean(completed, out=local)
+                        dspark_aux_hidden_states.append(tp_state.all_gather(local))
+                    else:
+                        mhc_stream_mean(
+                            completed,
+                            out=dspark_aux_hidden_states.slot(completed[:, 0]),
+                        )
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
