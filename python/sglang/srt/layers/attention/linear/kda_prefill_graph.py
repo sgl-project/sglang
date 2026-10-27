@@ -352,6 +352,10 @@ def kda_extend_in_graph(
         seq_lens_cpu=None,
         block_table=meta.conv_block_table,
     ).transpose(0, 1)
+    # Rows past the batch's tokens belong to no conv block, so the conv kernel
+    # leaves them uninitialized; the KDA extend kernels still load them inside
+    # their tiles, and a stale NaN there leaks into the real rows.
+    qkv.masked_fill_((meta.token_index >= meta.num_logical_tokens).view(-1, 1), 0)
     q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
     q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
     k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
