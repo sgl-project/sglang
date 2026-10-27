@@ -848,6 +848,8 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
+    SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 
@@ -1081,7 +1083,7 @@ class Envs:
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
-    SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
+    SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(True)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
