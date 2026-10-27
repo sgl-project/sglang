@@ -118,6 +118,40 @@ def _to_logits_dtype(logits: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 @triton.jit
+def _widen_logits_prefix_kernel(
+    src_ptr, dst_ptr, lens_ptr, src_stride, dst_stride, num_cols, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    n = tl.minimum(tl.load(lens_ptr + row), num_cols)
+    src = src_ptr + row.to(tl.int64) * src_stride
+    dst = dst_ptr + row.to(tl.int64) * dst_stride
+    for start in range(0, n, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < n
+        values = tl.load(src + cols, mask=mask)
+        tl.store(dst + cols, values.to(tl.float32), mask=mask)
+
+
+def widen_logits_prefix(logits: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """FP32 copy of ``logits`` holding only each row's first ``lengths[i]`` columns,
+    garbage past them, so the cost follows the context, not the logits width."""
+    if logits.dtype == torch.float32:
+        return logits
+    out = _empty_logits(logits.shape[0], logits.shape[1], logits.device)
+    if logits.shape[0] and logits.shape[1]:
+        _widen_logits_prefix_kernel[(logits.shape[0],)](
+            logits,
+            out,
+            lengths,
+            logits.stride(0),
+            out.stride(0),
+            logits.shape[1],
+            BLOCK=1024,
+        )
+    return out
+
+
+@triton.jit
 def _expand_compressed_logits_kernel(
     src_ptr,
     dst_ptr,
@@ -231,7 +265,9 @@ def fp8_paged_mqa_logits(
         max_seq_len,
         indices=paged_mqa_logits_indices(batch_size * next_n, kv_cache.device, next_n),
     )
-    return _to_logits_dtype(logits, logits_dtype)
+    if logits_dtype == torch.float32:
+        return widen_logits_prefix(logits, context_lens.reshape(-1))
+    return logits.to(logits_dtype)
 
 
 def get_paged_mqa_logits_metadata(
