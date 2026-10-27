@@ -1371,6 +1371,7 @@
                   {
                     "group": "LiquidAI",
                     "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM3",
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },

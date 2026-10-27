@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -161,14 +162,16 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
-    # Prefix before trailing one-token requests in an extend-shaped batch.
-    mixed_prefill_reqs: int = 0
+    # Prefix before trailing one-token requests; -1 means there is no decode tail.
+    mixed_prefill_reqs: int = -1
     mixed_prefill_tokens: int = 0
     # fmha_v2 prefill: the (row, column) of each page-table entry the batch
     # reads, in copy order, and the block table over that copy.
     fmha_v2_copy_rows: torch.Tensor = None
     fmha_v2_copy_cols: torch.Tensor = None
     fmha_v2_block_table: torch.Tensor = None
+    # Per-forward memoization of pre-expanded [B, 2, M] fmha_v2 block tables
+    fmha_v2_block_tables: Optional[dict] = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -268,6 +271,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.is_draft_runner = model_runner.is_draft_worker
+        self._verify_mask: Optional[VerifyMask] = None
 
         self._nvfp4_fp8_output = None
         if self.uses_trtllm_gen_native_fp4:
@@ -423,6 +428,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+
+    def _fmha_v2_paged_inputs(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+    ):
+        """Build (qkv, block_tables) for trtllm_fmha_v2_prefill.
+
+        The kernel addresses K and V blocks from k_cache's base pointer via
+        int32 block offsets. When K and V are contiguous and V sits at a
+        block-aligned offset from K (the fused pool halves), pass them with
+        pre-expanded [B, 2, M] offsets, avoiding an expensive copy of KV caches.
+        """
+        block_bytes = k_cache.stride(0) * k_cache.element_size()
+        delta, rem = divmod(v_cache.data_ptr() - k_cache.data_ptr(), block_bytes)
+        if (
+            rem != 0
+            or not 0 < delta < torch.iinfo(torch.int32).max // 2
+            or not (k_cache.is_contiguous() and v_cache.is_contiguous())
+        ):
+            logger.warning_once(
+                "fmha_v2 prefill: K/V caches are not contiguous block-aligned halves "
+                "of one allocation, so every prefill copies the batch's KV pages (slow)."
+            )
+            paged_kv, block_tables = self._fmha_v2_paged_kv(
+                k_cache, v_cache, page_table
+            )
+            return (q, paged_kv), block_tables
+
+        tables = self.forward_metadata.fmha_v2_block_tables
+        if tables is None:
+            tables = self.forward_metadata.fmha_v2_block_tables = {}
+        key = (page_table.data_ptr(), tuple(page_table.shape), delta)
+        expanded = tables.get(key)
+        if expanded is None:
+            expanded = tables[key] = torch.stack(
+                [page_table, page_table + delta], dim=1
+            )
+        return (q, (k_cache, v_cache)), expanded
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -765,6 +811,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+        self._verify_mask = self._unread_verify_mask(max_bs)
+
+    def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
+        # Target verify runs the decode kernel, causal within each request's rows; a
+        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
+        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+            return None
+        return maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _build_cuda_graph_metadata(
         self,
@@ -1279,7 +1345,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 prefix = len(lengths)
                 while prefix and lengths[prefix - 1] == 1:
                     prefix -= 1
-                if 0 < prefix < len(lengths):
+                if prefix < len(lengths):
                     metadata.mixed_prefill_reqs = prefix
                     metadata.mixed_prefill_tokens = sum(lengths[:prefix])
             if (
@@ -1722,12 +1788,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
+        kv_pool_is_hnd = False
         if uses_native_fp4:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
             k_cache, v_cache = kv_cache
         else:
-            # Native pool format is NHD:
-            # [num_pages, page_size, num_kv_heads, head_dim].
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
@@ -1736,6 +1801,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
+            elif k_cache_raw.dim() == 4:
+                # Same test as paged_kv_view: SGLANG_USE_HND_KVCACHE pools are
+                # [pages, heads, page, dim]; NHD pools are per-slot rows.
+                # fmha_v2 reads HND pool buffers as-is; they are already contiguous.
+                kv_pool_is_hnd = True
+                hnd_shape = (layer.tp_k_head_num, self.page_size, layer.head_dim)
+                assert k_cache_raw.shape[1:] == v_cache_raw.shape[1:] == hnd_shape, (
+                    f"expected HND buffers [pages, *{hnd_shape}], got "
+                    f"{tuple(k_cache_raw.shape)} / {tuple(v_cache_raw.shape)}"
+                )
+                k_cache, v_cache = k_cache_raw, v_cache_raw
             else:
                 k_cache = paged_kv_view(
                     k_cache_raw, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -1837,13 +1913,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv, block_tables = self._fmha_v2_paged_kv(
-                k_cache, v_cache, page_table
+            qkv, fmha_v2_block_tables = self._fmha_v2_paged_inputs(
+                q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table
             )
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
-                (q, paged_kv),
-                input_layout="Q_PAGED_KV_NHD",
+                qkv,
+                input_layout="Q_PAGED_KV_HND" if kv_pool_is_hnd else "Q_PAGED_KV_NHD",
                 workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
@@ -1853,7 +1929,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=block_tables,
+                block_tables=fmha_v2_block_tables,
                 out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
                 mask_mode=(
@@ -1927,24 +2003,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out = out.view_as(q)
                 prefix_reqs = self.forward_metadata.mixed_prefill_reqs
                 prefix_tokens = self.forward_metadata.mixed_prefill_tokens
+                # FMHA-v2 platforms (SM90/SM120) never get here, so the FP8 tail
+                # runs on trtllm-gen only and never hands an FP8 Q to XQA.
                 if (
-                    prefix_reqs
-                    and self.data_type in (torch.float16, torch.bfloat16)
+                    prefix_reqs >= 0
+                    and self.data_type
+                    in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
                     and q.dtype == self.data_type
                     and layer.attn_type == AttentionType.DECODER
                 ):
-                    out = torch.empty_like(q) if out is None else out
-                    _trtllm_context_attn(
-                        q[:prefix_tokens],
-                        self.forward_metadata.cu_seqlens_q[: prefix_reqs + 1],
-                        self.forward_metadata.cache_seqlens_int32[:prefix_reqs],
-                        self.forward_metadata.max_seq_len_q,
-                        cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
-                            : prefix_reqs + 1
-                        ],
-                        out=out[:prefix_tokens],
-                        page_table_override=page_table[:prefix_reqs],
-                    )
+                    if out is None:
+                        # FP8 Q/KV still produces attention output in model dtype.
+                        out = torch.empty_like(q, dtype=self.q_data_type)
+                    if prefix_reqs:
+                        _trtllm_context_attn(
+                            q[:prefix_tokens],
+                            self.forward_metadata.cu_seqlens_q[: prefix_reqs + 1],
+                            self.forward_metadata.cache_seqlens_int32[:prefix_reqs],
+                            self.forward_metadata.max_seq_len_q,
+                            cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
+                                : prefix_reqs + 1
+                            ],
+                            out=out[:prefix_tokens],
+                            page_table_override=page_table[:prefix_reqs],
+                        )
                     # Eager DP batches can pad Q without adding requests.
                     tail_end = prefix_tokens + (
                         self.forward_metadata.cache_seqlens_int32.shape[0] - prefix_reqs
