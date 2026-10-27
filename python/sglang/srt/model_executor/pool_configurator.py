@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
     get_draft_swa_ring_size,
     get_dsv4_indexer_bytes_per_token,
+    get_dsv41_request_window_workspace_rows,
     get_swa_ring_size,
     resolve_compress_state_ring_size,
     uses_draft_swa_ring,
@@ -698,29 +699,40 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 model_config.swa_kv_lora_rank + model_config.swa_qk_rope_head_dim
             ) * kv_size
         else:
-            # Full layer per-token memory (bytes)
-            self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size)
-                * (model_config.head_dim + model_config.v_head_dim)
-                * kv_size
+            # Match _build_hybrid_swa_kv_pool: the full pool replicates heads
+            # across DCP ranks; uncompressed SWA uses that same head count.
+            full_heads = model_config.get_num_kv_heads(
+                tp_size, get_parallel().attn_dcp_size
             )
-
-            # SWA layer per-token memory (bytes)
-            self._swa_per_token = (
+            swa_heads = (
                 model_config.get_swa_num_kv_heads(tp_size)
+                if kvc.is_hybrid_swa_compress
+                else full_heads
+            )
+            self._full_per_token = (
+                full_heads * (model_config.head_dim + model_config.v_head_dim) * kv_size
+            )
+            self._swa_per_token = (
+                swa_heads
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
 
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
+            full_heads = model_config.get_num_kv_heads(
+                tp_size, get_parallel().attn_dcp_size
+            )
+            swa_heads = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                if kvc.is_hybrid_swa_compress
+                else full_heads
+            )
             self._full_per_token += (
-                model_config.get_num_kv_heads(tp_size)
-                * (model_config.head_dim + model_config.v_head_dim)
+                full_heads * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size)
-                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                swa_heads * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
@@ -1103,11 +1115,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
-        # HIP takes the FP4-accurate byte count here. The NVIDIA FP4 path
-        # keeps the FP8 estimate.
+        # Match the packed indexer layout on CUDA and HIP. Keep the NPU
+        # backend accounting unchanged.
         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
-            _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
+            not _is_npu and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
@@ -1221,14 +1233,31 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + slots * 128
                 + self.page_size
             )
+            # Keep the existing scratch allowance, but cover a graph bucket
+            # larger than the per-rank chunk, including the pool's padding page.
+            workspace_rows = get_dsv41_request_window_workspace_rows(
+                slots, self.sliding_window_size, self.online_c128_mtp_max_draft_tokens
+            )
+            scratch_rows = max(
+                4 * scratch, ceil_align(workspace_rows, self.page_size) + self.page_size
+            )
             draft_ring_size = get_draft_swa_ring_size(
                 self.sliding_window_size,
                 self.online_c128_mtp_max_draft_tokens,
                 self.page_size,
             )
+            # RequestWindow asks for an extra zero/sink page, and the KV pool
+            # reserves its own padding page. Tags cover only the requested rows.
+            window_rows = slots * capacity + self.page_size
+            window_bytes = (
+                (window_rows + self.page_size)
+                * layers
+                * self._get_paged_kv_bytes_per_token()
+                + window_rows * layers * torch.int64.itemsize
+            )
             self.request_window_bytes = (
-                (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
-                + 4 * scratch * (self.kv_bytes + 16)
+                max(window_rows * layers * (self.kv_bytes + 16), window_bytes)
+                + scratch_rows * (self.kv_bytes + 16)
                 + slots * 3 * 16 * self.attn_head_dim * 8
                 + (slots * draft_ring_size + self.page_size)
                 * draft_ring_layers

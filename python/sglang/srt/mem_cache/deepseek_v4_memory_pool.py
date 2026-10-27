@@ -50,6 +50,26 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv41_request_window_workspace_rows(
+    num_slots: int, sliding_window: int, num_draft_tokens: int
+) -> int:
+    """Rows required by eager and graph-padded encoder replay layouts."""
+    from sglang.srt.runtime_context import get_schedule
+
+    graph_config = get_exec().graph.cuda_graph_config
+    prefill = graph_config.prefill if graph_config is not None else None
+    graph_rows = (
+        get_cuda_graph_max_batch_size(max(prefill.bs))
+        if prefill is not None and prefill.backend == Backend.BREAKABLE and prefill.bs
+        else 0
+    )
+    return (num_slots + 1) * sliding_window + max(
+        get_schedule().chunked_prefill_size or 0,
+        graph_rows,
+        (num_slots + 1) * (1 + num_draft_tokens),
+    )
+
+
 def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
     """Return payload and quant-scale bytes for one compressed indexer token."""
     if use_fp4_indexer:
@@ -1151,31 +1171,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             self.swa_kv_pool = None
             self.unified_kv_pool = None
-            from sglang.srt.runtime_context import get_schedule
-
-            chunk = get_schedule().chunked_prefill_size or 0
-            # A prefill graph pads its layouts to the captured bucket, which can
-            # exceed this rank's chunk (DP attention divides the chunk budget).
-            graph_config = get_exec().graph.cuda_graph_config
-            prefill_graph = graph_config.prefill if graph_config is not None else None
-            graph_rows = (
-                get_cuda_graph_max_batch_size(max(prefill_graph.bs))
-                if prefill_graph is not None
-                and prefill_graph.backend == Backend.BREAKABLE
-                and prefill_graph.bs
-                else 0
-            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
                 layers=stage_layer_num,
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
-                workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(
-                    chunk,
-                    graph_rows,
-                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
+                workspace_rows=get_dsv41_request_window_workspace_rows(
+                    self.num_req_slots,
+                    self.sliding_window,
+                    online_mtp_max_draft_tokens or 0,
                 ),
             )
         elif uses_draft_swa_ring():

@@ -434,6 +434,47 @@ class TestHybridSWAConfigurator(CustomTestCase):
             config = cfg.calculate_pool_sizes(available_bytes, get_schedule().page_size)
         return mr, cfg, config
 
+    def test_dcp_budget_matches_hybrid_pool_geometry(self):
+        """DCP replication must not admit twice the physical full/SWA KV budget."""
+        import torch
+
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        for compressed, dtype in ((False, "bfloat16"), (True, "mxfp8")):
+            with self.subTest(compressed=compressed, dtype=dtype):
+                mr = self._make_swa_runner(full_layers=1, swa_layers=1, page_size=1)
+                mr.is_hybrid_swa_compress = compressed
+                mr.kv_cache_dtype_str = dtype
+                mc = mr.model_config
+                mc.get_total_num_kv_heads = lambda: 8
+                mc.get_num_kv_heads = lambda tp, dcp_size=1: (
+                    ModelConfig.get_num_kv_heads(mc, tp, dcp_size)
+                )
+                mc.get_swa_num_kv_heads = lambda tp: 2
+                itemsize = 2 if dtype == "bfloat16" else 1
+                with (
+                    mock_cpu_env(kv_size=itemsize, tp_size=4),
+                    get_parallel().override(attn_dcp_size=2),
+                ):
+                    planner = HybridSWAPoolConfigurator(mr)
+                    config = planner.calculate_pool_sizes(1 << 20, 1)
+
+                # CPU tensors follow the full and SWA builders' head geometry.
+                def allocated(rows, heads):
+                    data = torch.empty(rows, heads, 128, dtype=torch.uint8)
+                    return data.nbytes * itemsize + (
+                        data.numel() // 32 if dtype == "mxfp8" else 0
+                    )
+
+                used = allocated(config.full_max_total_num_tokens, 4) + allocated(
+                    config.swa_max_total_num_tokens, 2 if compressed else 4
+                )
+                self.assertLessEqual(used, 1 << 20)
+                self.assertGreater(used, (1 << 20) * 0.99)
+
     def test_memory_utilization(self):
         """Memory used should be <= available and within 1% of available."""
         available = 10_000_000
@@ -1640,7 +1681,7 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
-    def _dspark_replay_planner(self, *, draft_ring):
+    def _dspark_replay_planner(self, *, draft_ring, graph_config=None, chunk=256):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         _publish_config(
@@ -1651,7 +1692,8 @@ class TestSWAPoolFloor(CustomTestCase):
             speculative_dspark_block_size=5,
             page_size=256,
             max_running_requests=2,
-            chunked_prefill_size=256,
+            chunked_prefill_size=chunk,
+            cuda_graph_config=graph_config,
         )
         cfg = SimpleNamespace(
             qk_nope_head_dim=448,
@@ -1722,6 +1764,76 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(cfg._resolve_swa_prefix_tails(), 256 * 14)
         _publish_config(self, swa_prefix_tails=1024)
         self.assertEqual(cfg._resolve_swa_prefix_tails(), 1024)
+
+    def test_cuda_fp4_indexer_budget_matches_pool(self):
+        """FP4 index storage must release the FP8-only half of its token budget."""
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4IndexerPool
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                kvc = _make_model_runner(self, num_layers=1, page_size=256)
+                _publish_config(self, enable_deepseek_v4_fp4_indexer=fp4)
+                kvc.kv_cache_dtype_str = "fp8_e4m3"
+                cfg = kvc.model_config
+                cfg.qk_nope_head_dim = 448
+                cfg.index_head_dim = 128
+                cfg.compress_ratios = [4]
+                cfg.window_size = 128
+                cfg.hf_config.kv_source_layer_ids = []
+                with (
+                    patch("sglang.srt.model_executor.pool_configurator._is_hip", False),
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", False),
+                ):
+                    planner = DSV4PoolConfigurator(kvc)
+                pools = [
+                    DeepSeekV4IndexerPool(
+                        n, 64, torch.uint8, 128, 1, "cpu", False, use_fp4_indexer=fp4
+                    )
+                    for n in (256, 512)
+                ]
+                growth = [
+                    sum(x.nbytes for x in p.index_k_with_scale_buffer) for p in pools
+                ]
+                self.assertEqual(
+                    growth[1] - growth[0], 256 * planner.indexer_bytes_per_token
+                )
+
+    def test_encoder_window_budget_covers_graph_bucket(self):
+        """A graph bucket larger than the chunk must fit the fixed window budget."""
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4SingleKVPool
+        from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        graph = SimpleNamespace(
+            prefill=SimpleNamespace(backend=Backend.BREAKABLE, bs=[65536])
+        )
+        planner = self._dspark_replay_planner(
+            draft_ring=True, graph_config=graph, chunk=512
+        )
+
+        def factory(size, layers):
+            return DeepSeekV4SingleKVPool(
+                size, 256, torch.uint8, 448, 64, layers, "cpu", False
+            )
+
+        # The production window includes four history groups and the padded graph rows.
+        window = RequestWindow(
+            factory,
+            num_slots=3,
+            layers=40,
+            page_size=256,
+            capacity=134,
+            workspace_rows=4 * 128 + 65536,
+        )
+        actual = window.tags.nbytes + sum(
+            x.nbytes for p in (window.state, window.workspace) for x in p.kv_buffer
+        )
+        self.assertGreaterEqual(planner.request_window_bytes, actual)
 
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
