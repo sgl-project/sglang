@@ -19,6 +19,7 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     FPS_MAX_FRAMES,
     QWEN_VIDEO_PREPROCESS_CONFIG_KEYS,
     VIDEO_MAX_PIXELS,
+    VIDEO_MIN_PIXELS,
     VIDEO_TOTAL_PIXELS,
     preprocess_qwen3_vl_video_sync,
     preprocess_video_sync,
@@ -229,35 +230,44 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         """Let per-item options lower, never raise, the configured frame and pixel
         limits: in serving they come from the client's video_url.
 
-        ``pixel_limits`` replaces the default max_pixels and total_pixels the
-        configuration falls back to; the Qwen3-VL route passes its own.
+        ``pixel_limits`` replaces the default min_pixels, max_pixels and total_pixels
+        the configuration falls back to; the Qwen3-VL route passes its own.
         """
         if pixel_limits is None:
             pixel_limits = {
+                "min_pixels": VIDEO_MIN_PIXELS,
                 "max_pixels": VIDEO_MAX_PIXELS,
                 "total_pixels": VIDEO_TOTAL_PIXELS,
             }
         frame_cap = self.video_config.get("max_frames", FPS_MAX_FRAMES)
-        pixel_cap = self.video_config.get("max_pixels", pixel_limits["max_pixels"])
+        min_pixel_cap = self.video_config.get("min_pixels", pixel_limits["min_pixels"])
+        max_pixel_cap = self.video_config.get("max_pixels", pixel_limits["max_pixels"])
+        total_pixel_cap = self.video_config.get(
+            "total_pixels", pixel_limits["total_pixels"]
+        )
         caps = {
             "nframes": frame_cap,
             "max_frames": frame_cap,
-            "max_pixels": pixel_cap,
-            "total_pixels": self.video_config.get(
-                "total_pixels", pixel_limits["total_pixels"]
-            ),
+            "min_pixels": min_pixel_cap,
+            "max_pixels": max_pixel_cap,
+            "total_pixels": total_pixel_cap,
         }
         options = {
             key: min(value, caps[key]) if key in caps else value
             for key, value in preprocess_kwargs.items()
         }
+        # smart_nframes takes fps or nframes, not both; the configured one wins.
+        if "nframes" in self.video_config:
+            options.pop("fps", None)
+        elif "fps" in self.video_config:
+            options.pop("nframes", None)
         # smart_resize applies no pixel limit to an explicit size.
         if (
             options.get("resized_height", 0) * options.get("resized_width", 0)
-            > pixel_cap
+            > max_pixel_cap
         ):
             raise ValueError(
-                f"resized_height * resized_width exceeds the video max_pixels {pixel_cap}"
+                f"resized_height * resized_width exceeds the video max_pixels {max_pixel_cap}"
             )
         return options
 
