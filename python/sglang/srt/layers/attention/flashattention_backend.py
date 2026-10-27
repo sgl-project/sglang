@@ -212,10 +212,8 @@ class FlashAttentionBackend(AttentionBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        self.use_sliding_window_kv_pool = (
-            model_runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
+        self.use_sliding_window_kv_pool = self.kv_layers.routes_to(
+            IdSpaceKind.SLIDING_WINDOW
         )
 
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
@@ -468,7 +466,7 @@ class FlashAttentionBackend(AttentionBackend):
         # qk_sf_vec_size / v_sf_vec_size default to 32 inside the FA4 interface
         # when sf tensors are given, so they don't need to be passed here (the
         # flash_attn_with_kvcache / varlen wrappers don't forward them anyway).
-        k_sf, v_sf = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+        k_sf, v_sf = self.kv_layers.read(layer.layer_id).kv_scales()
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
     def _capture_unified_verify_metadata(self, forward_batch: ForwardBatch) -> bool:
@@ -1385,7 +1383,7 @@ class FlashAttentionBackend(AttentionBackend):
         *,
         head_group_num: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
         key_cache = paged_kv_view(
             key_cache, self.page_size, layer.tp_k_head_num, layer.head_dim
         )
@@ -1472,7 +1470,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         if locations is None:
             return None
-        buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        buffers = self.kv_layers.read(layer.layer_id).kv()
         shapes = (
             (layer.tp_k_head_num, layer.head_dim),
             (layer.tp_v_head_num, layer.v_head_dim),
@@ -1522,7 +1520,7 @@ class FlashAttentionBackend(AttentionBackend):
                             forward_batch, layer, k, k_rope
                         )
                     else:
-                        self.token_to_kv_pool.set_mla_kv_buffer(
+                        self.kv_layers.layer(layer.layer_id).store_mla(
                             layer,
                             KVWriteLoc.for_layer(forward_batch, layer),
                             k,
@@ -1544,7 +1542,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -1947,9 +1945,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
-                )
+                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = paged_view(k_rope, self.page_size)
@@ -2103,7 +2099,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -2116,7 +2112,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_scale,
                     )
                 else:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         KVWriteLoc.for_layer(forward_batch, layer),
                         k,
@@ -2344,7 +2340,7 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = paged_view(k_rope, self.page_size)

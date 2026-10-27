@@ -60,6 +60,9 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     def kv(self):
         return self.view.get_kv_buffer(self.view_layer_id)
 
+    def kv_scales(self):
+        return self.view.get_kv_scale_buffer(self.view_layer_id)
+
     def store(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
         """Writes the layer's K and V at the ids of its sub-pool: the owner's
         (`full_loc`, else `loc`) or the window's (`swa_loc`), as the attention
