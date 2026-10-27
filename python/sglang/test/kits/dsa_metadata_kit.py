@@ -27,14 +27,20 @@ def inputs(lengths, requests):
     )
 
 
-def make_backend(mode, seq, req, *, fusion=True):
+def make_backend(
+    mode, seq, req, *, fusion=True, index_kpool=POOL, hisparse_v2_cache=None
+):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = torch.device("cuda")
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
     backend.physical_page_size = 64
     backend.dsa_index_topk = TOPK
-    backend.dsa_index_kpool = POOL
+    backend.dsa_index_kpool = index_kpool
+    backend.dsa_kv_cache_store_fp8 = False
+    backend.hisparse_v2_cache = hisparse_v2_cache
+    backend.hisparse_coordinator = hisparse_v2_cache
+    backend.use_fused_topk = True
     backend.speculative_num_draft_tokens = NEXT_N
     backend.dsa_drop_wide_page_table = False
     backend.dsa_decode_impl = "fa3"
@@ -47,14 +53,19 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend._get_device_sm = lambda: backend.device_sm_major * 10
     backend._is_blackwell = lambda: backend.device_sm_major == 10
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
-    backend.req_to_token = torch.arange(
-        8 * WIDTH, device="cuda", dtype=torch.int32
-    ).view(8, WIDTH)
+    backend.req_to_token = (
+        torch.arange(8 * WIDTH, device="cuda", dtype=torch.int32).view(8, WIDTH)
+        if hisparse_v2_cache is None
+        else hisparse_v2_cache.req_to_token
+    )
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
     backend._arange_buf = torch.arange(
         BS * NEXT_N + 1, device="cuda", dtype=torch.int32
     )
     backend.decode_cuda_graph_metadata = {
-        "page_table": torch.zeros(BS * NEXT_N, WIDTH, device="cuda", dtype=torch.int32),
+        "page_table": torch.zeros(
+            BS * NEXT_N, backend.req_to_token.shape[1], device="cuda", dtype=torch.int32
+        ),
         "cu_seqlens_q": backend._arange_buf,
     }
     with envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.override(fusion):

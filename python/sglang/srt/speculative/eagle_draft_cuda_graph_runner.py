@@ -39,6 +39,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_memory,
     get_parallel,
     get_spec,
 )
@@ -569,6 +570,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        if get_memory().enable_hisparse_v2:
+            self.model_runner.hisparse_v2_cache.prepare_forward(forward_batch)
         self.deepep_adapter.replay()
         buffers = self.buffers
 

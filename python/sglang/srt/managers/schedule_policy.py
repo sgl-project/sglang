@@ -623,6 +623,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        hisparse_v2_coordinator=None,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -631,6 +632,7 @@ class PrefillAdder:
         # rounding would only shorten the chunk.
         self.mamba_chunk_grid = mamba_prefill_chunk_grid()
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.hisparse_v2_coordinator = hisparse_v2_coordinator
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -1409,7 +1411,19 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
+        hisparse_temp = (
+            self.hisparse_v2_coordinator.temp_tokens_required(
+                req, max_new_tokens=max_new
+            )
+            if self.hisparse_v2_coordinator is not None
+            else 0
+        )
+        total_tokens = (
+            cand_extend_input_len
+            + max_new
+            + self.per_req_token_overhead
+            + hisparse_temp
+        )
         # Reserve request and load-back state slots before init_load_back binds
         # the request slot. Reuse this reservation when committing admission.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)
@@ -1503,6 +1517,7 @@ class PrefillAdder:
                             + load_max_new
                             + self.page_size
                             + mamba_gap_reserve
+                            + hisparse_temp
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
@@ -1584,6 +1599,13 @@ class PrefillAdder:
                 ):
                     return AddReqResult.OTHER
 
+            if (
+                self.hisparse_v2_coordinator is not None
+                and not self.hisparse_v2_coordinator.reserve_prefill(
+                    req, max_new_tokens=max_new
+                )
+            ):
+                return AddReqResult.NO_TOKEN
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
         # This verdict controls the next candidate, not the committed request.

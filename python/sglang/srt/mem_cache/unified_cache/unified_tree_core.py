@@ -432,6 +432,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
+        self.hisparse_v2_coordinator = None
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -1500,6 +1501,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.on_node_split(new_parent=new_node, child=child)
 
         # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
@@ -1833,6 +1836,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
+        if (
+            self.hisparse_v2_coordinator is not None
+            and self.hisparse_v2_coordinator.node_is_active(node)
+        ):
+            return result
         if node.load_back_pending_id is not None or any(
             cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
         ):
@@ -2096,6 +2104,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert not node.evicted and node.backuped
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.on_node_evicted(node)
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,

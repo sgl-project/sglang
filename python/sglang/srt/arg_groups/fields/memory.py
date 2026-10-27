@@ -242,6 +242,9 @@ class Memory(msgspec.Struct):
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
     enable_hisparse: A[bool, "Enable hierarchical sparse attention"] = False
+    enable_hisparse_v2: A[
+        bool, "Enable DSA HiSparse with the shared HiCache host tier"
+    ] = False
     hisparse_config: A[
         Optional[str],
         Arg(
