@@ -140,6 +140,50 @@ class TestPlatformLifecycleHooks(unittest.TestCase):
         apply_defaults.assert_called_once_with(server_args)
 
 
+class TestExplicitCliArgs(unittest.TestCase):
+    def test_prepare_uses_its_argv_not_process_flags(self):
+        argv = [
+            "--model-path",
+            "test/model",
+            "--mode=manual",
+            "--dit-cpu-offload",
+            "false",
+        ]
+        with (
+            patch.object(sys, "argv", ["host-program", "--port", "12345"]),
+            patch.object(ServerArgs, "from_dict", side_effect=lambda kwargs: kwargs),
+        ):
+            kwargs = server_args_module.prepare_server_args(argv)
+        self.assertEqual(kwargs["model_path"], "test/model")
+        self.assertEqual(kwargs["performance_mode"], "manual")
+        self.assertIs(kwargs["dit_cpu_offload"], False)
+        self.assertNotIn("port", kwargs)
+        self.assertEqual(
+            kwargs["_explicit_arg_names"],
+            {"model_path", "performance_mode", "dit_cpu_offload"},
+        )
+
+    def test_registered_aliases_use_their_destination(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--pipeline", "CustomPipeline"], "pipeline_class_name", "CustomPipeline"),
+            (["--mode=manual"], "performance_mode", "manual"),
+            (["--cfg-parallel-size", "1"], "cfg_parallel_degree", 1),
+            (["--dp", "2"], "dp_size", 2),
+            (
+                ["--layerwise-offload-modules", "transformer"],
+                "layerwise_offload_components",
+                ["transformer"],
+            ),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+
 class _CudaPlatformTestCase(unittest.TestCase):
     def setUp(self):
         super().setUp()
