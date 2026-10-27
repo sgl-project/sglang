@@ -368,13 +368,13 @@ class SchedulePolicy:
             # tokens with a queued long one waits as long as SPF defers the long one.
             candidates.sort(key=lambda c: SchedulePolicy._shortest_prefill_work(c[0]))
 
-        for r, prefix_ids in candidates:
+        for r, key_ids in candidates:
             extra_key = r.extra_key
             cache_salt = r.cache_salt
             match_result = self.waiting_queue_radix_tree.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids=prefix_ids,
+                        token_ids=key_ids,
                         extra_key=extra_key,
                         cache_salt=cache_salt,
                     )
@@ -394,11 +394,11 @@ class SchedulePolicy:
                 self.waiting_queue_radix_tree.insert(
                     InsertParams(
                         key=RadixKey(
-                            token_ids=prefix_ids,
+                            token_ids=key_ids,
                             extra_key=extra_key,
                             cache_salt=cache_salt,
                         ),
-                        value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                        value=torch.empty(len(key_ids), dtype=torch.bool),
                     )
                 )
         return temporary_deprioritized
