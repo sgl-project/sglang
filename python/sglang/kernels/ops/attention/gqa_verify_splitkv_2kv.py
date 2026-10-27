@@ -56,7 +56,8 @@ def _vv2_tile(
     positions = tile * BN + nr
     if MASKED:
         valid = positions < kvlen
-    kb = blocks * kv_s0 + (nr % PAGE) * kv_s1
+    # 64-bit page offsets: a layer's pool can exceed 2^31 bytes
+    kb = blocks.to(tl.int64) * kv_s0 + (nr % PAGE) * kv_s1
     if MASKED:
         k0 = tl.load(K + kb[None, :] + d[:, None], mask=valid[None, :], other=0.0)
         k1 = tl.load(K + kb[None, :] + 64 + d[:, None], mask=valid[None, :], other=0.0)
