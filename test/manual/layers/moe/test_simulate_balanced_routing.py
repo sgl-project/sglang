@@ -33,21 +33,16 @@ def _make_round_robin_expert_ids(
     dtype: torch.dtype,
     layer_id: Optional[int] = None,
 ) -> torch.Tensor:
-    # Deterministic, perfectly balanced expert assignment: each token's top-k is
-    # spread by num_experts//topk. Returns global expert ids of shape
-    # [num_tokens, topk].
+    # Deterministic, perfectly balanced expert assignment: the slots
+    # ``t * topk + j`` are dealt over the experts in order (single EP rank).
+    # Returns global expert ids of shape [num_tokens, topk].
     if topk == 0:
         return torch.empty((num_tokens, 0), device=device, dtype=dtype)
 
-    step = max(num_experts // topk, 1)
     layer_offset = 0 if layer_id is None else layer_id
-    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(
-        1
-    )  # [num_tokens, 1]
-    steps = (
-        torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
-    )  # [1, topk]
-    return (offsets + layer_offset + steps) % num_experts  # [num_tokens, topk]
+    tokens = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
+    slots = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0)
+    return (tokens * topk + slots + layer_offset) % num_experts
 
 
 def _alloc(
@@ -107,21 +102,17 @@ class TestSimulateBalancedRouting(CustomTestCase):
         for row in ids[:64]:
             self.assertEqual(row.unique().numel(), K)
 
-    @parameterized.expand(
-        [
-            ("round_robin_dp2", False, 2),
-            ("round_robin_dp4", False, 4),
-            ("uniform_dp2", True, 2),
-            ("uniform_dp4", True, 4),
-        ]
-    )
-    def test_interleaved_dp_assignments_match_dp1(
-        self, _name: str, random: bool, dp_size: int
+    @parameterized.expand([("dp2", 2), ("dp4", 4)])
+    def test_uniform_interleaved_dp_assignments_match_dp1(
+        self, _name: str, dp_size: int
     ) -> None:
-        # Interleaving the DP-local outputs must exactly reproduce the expert
-        # assignments for the equivalent DP=1 input. The fixed seed models
-        # independent processes entering the same uniform-routing call with
-        # the same initial seed.
+        random = True
+        # Interleaving the DP-local uniform outputs must exactly reproduce the
+        # expert assignments for the equivalent DP=1 input. The fixed seed
+        # models independent processes entering the same uniform-routing call
+        # with the same initial seed. (Round-robin deals each shard its own
+        # rotated stream instead; its DP behaviour is covered by
+        # test/registered/kernels/ops/moe/test_round_robin_ep_balance.py.)
         T = 16
         seed = 17
         layer_id = 3

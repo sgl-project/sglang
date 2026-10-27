@@ -162,6 +162,7 @@ class MiniMaxIndexerCP:
         sm_scale=None,
         q_scale=None,
         k_scale=None,
+        packed_queries=1,
     ):
         from sglang.kernels.ops.attention.minimax_sparse.decode.indexer_cp import (
             merge_candidates,
@@ -189,6 +190,7 @@ class MiniMaxIndexerCP:
             local_blocks,
             sm_scale,
             1.0 if k_scale is None else k_scale,
+            packed_queries=packed_queries,
         )
         keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
         received = torch.empty((4, 4, batch, 16), dtype=torch.int64, device=q.device)

@@ -15,7 +15,8 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
+from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
@@ -41,7 +42,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ExtendMode:
@@ -129,6 +130,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
         return runner
@@ -157,11 +159,39 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             cp_strategy="zigzag",
         )
 
+    def test_interleave_replay_uses_total_tokens_across_requests(self):
+        """A captured token shape remains reusable when request boundaries change."""
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = InterleaveCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576},
+        )
+        batch = self._make_forward_batch()
+        init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
+        for rank in range(4):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+            ):
+                # Uneven request boundaries must not round each request up
+                # independently: interleave shards their concatenation.
+                self.assertEqual(
+                    runner.prefill_cp_bcg_input.required_local_tokens(
+                        batch.extend_seq_lens_cpu
+                    ),
+                    512,
+                )
+                self.assertTrue(runner.can_run_graph(batch))
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            batch.extend_prefix_lens_cpu = [0, 1, 0]
+            self.assertTrue(runner.can_run_graph(batch))
+
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
         runner.capture_num_tokens.append(2560)
         runner.max_num_tokens = 2560
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576, 2560: 640},
@@ -171,7 +201,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -193,7 +223,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_preserves_two_x_padding_limit(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -210,7 +240,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_falls_back_when_no_capture_has_capacity(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 516},
@@ -221,7 +251,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -239,7 +269,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 raise StopAfterRecordingFill
 
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -251,7 +281,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
             self.assertRaises(StopAfterRecordingFill),
@@ -903,7 +933,9 @@ class TestCPInterleaveStrategy(CustomTestCase):
         )
 
         with (
-            get_parallel().override(attn_cp_rank=2, attn_cp_size=4),
+            get_parallel().override(
+                attn_cp_rank=2, attn_cp_size=4, enable_cp_tp_group_sharing=False
+            ),
             patch(
                 "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=4,

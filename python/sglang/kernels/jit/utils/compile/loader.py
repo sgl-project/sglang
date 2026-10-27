@@ -14,13 +14,14 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_default_target_flags
-from sglang.kernels.jit.utils.common import is_hip_runtime
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
     DEFAULT_INCLUDE,
     DEFAULT_LDFLAGS,
 )
+from sglang.kernels.jit.utils.compile.sailify import convert_cuda_sources
 from sglang.kernels.jit.utils.compile.spec import BuildSpec, resolve_sources
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
 from sglang.srt.environ import envs
@@ -95,10 +96,20 @@ def load_jit(
         )
 
     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
+    if is_sail_runtime():
+        includes = toolchain.base_include_paths() + includes
     for dep in sorted(set(extra_dependencies or [])):
         if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
         includes += REGISTERED_DEPENDENCIES[dep]()
+
+    if is_sail_runtime() and cuda_files:
+        resolved_cuda = list(resolve_sources(cuda_files))
+        converted, sailify_flags = convert_cuda_sources(resolved_cuda, includes)
+        cuda_files = converted  # absolute paths pass through resolve_sources below
+        extra_cuda_cflags = (
+            _filter_hgcc_cuda_flags(extra_cuda_cflags or []) + sailify_flags
+        )
 
     module_args = tuple(str(arg) for arg in args)
     spec = BuildSpec(
@@ -200,6 +211,37 @@ def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | No
     if envs.SGLANG_JIT_FORCE_RECOMPILE.get():
         return None
     return cache.find_prebuilt(scope=scope, module_name=spec.module_name)
+
+
+# Verified against hgcc 2.2: it is an nvcc-style driver and accepts
+# -Xcompiler, --use_fast_math, --expt-relaxed-constexpr and
+# --expt-extended-lambda; the genuinely unsupported options are the
+# nvcc-specific code-generation and ptxas ones below.
+_HGCC_DROP_WITH_ARG = frozenset({"-Xptxas"})
+_HGCC_DROP_PREFIX = ("-gencode", "--generate-code")
+
+
+def _filter_hgcc_cuda_flags(flags: List[str]) -> List[str]:
+    """Drop nvcc-only flags hgcc would not understand; keep everything else."""
+    kept: List[str] = []
+    dropped: List[str] = []
+    skip_next = False
+    for flag in flags:
+        if skip_next:
+            skip_next = False
+            dropped.append(flag)
+            continue
+        if flag in _HGCC_DROP_WITH_ARG:
+            skip_next = True
+            dropped.append(flag)
+            continue
+        if flag.startswith(_HGCC_DROP_PREFIX):
+            dropped.append(flag)
+            continue
+        kept.append(flag)
+    if dropped:
+        logger.warning("Dropping nvcc-only flags hgcc does not accept: %s", dropped)
+    return kept
 
 
 @contextlib.contextmanager

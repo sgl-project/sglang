@@ -3,8 +3,8 @@
 SGLang runtime code and tests should import callable kernels from
 ``sglang.kernels.ops.<group>``, e.g.::
 
-    from sglang.kernels.ops.layernorm import rmsnorm
     from sglang.kernels.ops.activation import silu_and_mul
+    from sglang.kernels.ops.gemm import fp8_scaled_mm
     from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 
 Implementations still live in ``sglang.kernels.jit`` (JIT CUDA), the
@@ -39,7 +39,6 @@ from sglang.kernels.selector import get_kernel, select_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
     DeviceType,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
     PlatformInfo,
@@ -57,7 +56,6 @@ __all__ = [
     "CapabilityRequirement",
     "DeviceType",
     "capabilities_satisfied",
-    "FormatSignature",
     "FusedOpTraceRecord",
     "KernelBackend",
     "KernelRegistry",

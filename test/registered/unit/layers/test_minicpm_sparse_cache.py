@@ -23,7 +23,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class RecordingAllocator(BaseTokenToKVPoolAllocator):
@@ -247,6 +247,7 @@ def test_streaming_session_release_frees_compressed_slots():
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         page_size=1,
+        unlock=lambda lock: None,
     )
     cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
     session = StreamingSession(cache)

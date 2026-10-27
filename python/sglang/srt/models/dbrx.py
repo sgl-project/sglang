@@ -38,7 +38,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -103,6 +103,7 @@ class DbrxExperts(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
         self.num_total_experts = config.ffn_config.moe_num_experts
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
@@ -117,6 +118,7 @@ class DbrxExperts(nn.Module):
             self.top_k,
             layer_id=layer_id,
             renormalize=True,
+            output_format=TopKOutputFormat.STANDARD,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
         self.ws = nn.Parameter(
@@ -155,10 +157,9 @@ class DbrxExperts(nn.Module):
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
     ):
-        tp_rank = get_parallel().tp_rank
         param_data = param.data
         shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         # DBRX uses GLU for each experts.
         # GLU has 3 linear layers: w1, v1 and w2.
         if weight_name.endswith("w1"):

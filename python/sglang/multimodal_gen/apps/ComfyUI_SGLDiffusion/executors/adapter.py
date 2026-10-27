@@ -30,6 +30,8 @@ class PackedForward:
     prompt_seq_lens: list[list[int]] | None = None
     pooled_embeds: list[torch.Tensor] | None = None
     extra_req: dict[str, Any] = field(default_factory=dict)
+    # Per-step residual tensors (ComfyUI ControlNet); never cached on the worker.
+    control: dict[str, list] | None = None
     unpack_ctx: dict[str, Any] = field(default_factory=dict)
 
 
@@ -38,6 +40,12 @@ class ComfyUIModelAdapter:
 
     model_types: tuple[str, ...] = ()
     pipeline_class_name: str = ""
+    # extra_req fields the worker caches per cond. Dropped on a cache hit and
+    # hashed into the cond key, so the two lists cannot drift apart.
+    cached_extra_keys: tuple[str, ...] = ("image_latent",)
+    # Conditioning apply_model kwargs this adapter forwards to the worker;
+    # the executor rejects the other content kwargs instead of dropping them.
+    applied_conditioning: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -71,7 +79,8 @@ class ComfyUIModelAdapter:
         packed.prompt_embeds = []
         packed.prompt_seq_lens = None
         packed.pooled_embeds = None
-        packed.extra_req.pop("image_latent", None)
+        for key in self.cached_extra_keys:
+            packed.extra_req.pop(key, None)
 
 
 def get_adapter_class(model_type: str) -> type[ComfyUIModelAdapter]:

@@ -9,13 +9,12 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    HUNYUAN_QKNORM,
     BitExactFusionGate,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
     hunyuan_qkv_rope_pack,
-    mark_fused_gelu_site,
-    mark_hunyuan_qknorm_site,
     tensors_equal,
     try_hunyuan_qknorm,
 )
@@ -106,10 +105,10 @@ class HunyuanMLP(MLP):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_gelu_site(self, "fc_in")
+        FUSED_LINEAR_GELU.mark(self, "fc_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.fc_in, x):
             x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
         else:
             x, _ = self.fc_in(x)
@@ -173,9 +172,6 @@ def _hunyuan_pack_qkv(
         sig=sig,
         equal=tensors_equal,
         logger=logger,
-        mismatch_msg=(
-            "HunyuanVideo fused QKV RoPE pack is not bit-exact on this platform"
-        ),
     )
 
 
@@ -200,33 +196,6 @@ def _hunyuan_pack_qkv_reference(
         ),
         torch.cat((img_v, txt_v), dim=1),
     )
-
-
-class MixedRowParallelLinear(RowParallelLinear):
-    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
-        self.input_sizes = input_sizes
-        super().__init__(sum(input_sizes), output_size, **kwargs)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim is not None:
-            shards = []
-            offset = 0
-            for input_size in self.input_sizes:
-                loaded_shard = loaded_weight.narrow(input_dim, offset, input_size)
-                shard_size = input_size // self.tp_size
-                loaded_shard = loaded_shard.narrow(
-                    input_dim, self.tp_rank * shard_size, shard_size
-                )
-                shards.append(loaded_shard)
-                offset += input_size
-            loaded_weight = torch.cat(shards, dim=input_dim)
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-        param.data.copy_(loaded_weight)
-
-    def weight_loader_v2(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        self.weight_loader(param, loaded_weight)
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -364,7 +333,7 @@ class MMDoubleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
-        mark_hunyuan_qknorm_site(self)
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -520,9 +489,10 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # Combined projection and MLP output
-        self.linear2 = MixedRowParallelLinear(
-            [hidden_size, mlp_hidden_dim],
+        self.linear2 = RowParallelLinear(
+            hidden_size + mlp_hidden_dim,
             hidden_size,
+            input_sizes=[hidden_size, mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
             params_dtype=dtype,
@@ -562,7 +532,7 @@ class MMSingleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
-        mark_hunyuan_qknorm_site(self)
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -669,7 +639,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         self.out_channels = (
             config.in_channels if config.out_channels is None else config.out_channels
         )
-        self.unpatchify_channels = self.out_channels
         self.guidance_embeds = config.guidance_embeds
         self.rope_dim_list = list(config.rope_axes_dim)
         self.rope_theta = config.rope_theta
@@ -837,16 +806,23 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             ow // self.patch_size[2],
         )
 
-        # Get rotary embeddings
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (tt * get_sp_world_size(), th, tw),
-            self.hidden_size,
-            self.num_attention_heads,
-            self.rope_dim_list,
-            self.rope_theta,
+        # Get rotary embeddings, built on the host and uploaded once per request
+        rope_cache = (
+            {}
+            if forward_batch is None
+            else forward_batch.extra.setdefault("_hunyuanvideo_rope", {})
         )
-        freqs_cos = freqs_cos.to(x.device)
-        freqs_sin = freqs_sin.to(x.device)
+        rope_key = (tt, th, tw, x.device)
+        if rope_key not in rope_cache:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (tt * get_sp_world_size(), th, tw),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                self.rope_theta,
+            )
+            rope_cache[rope_key] = (freqs_cos.to(x.device), freqs_sin.to(x.device))
+        freqs_cos, freqs_sin = rope_cache[rope_key]
         # Prepare modulation vectors
         vec = self.time_in(t)
 

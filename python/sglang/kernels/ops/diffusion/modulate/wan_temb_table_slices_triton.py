@@ -27,7 +27,7 @@ import triton.language as tl  # type: ignore
 from sglang.srt.utils.custom_op import register_custom_op
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _temb_table_slices_kernel(
     out_ptr,
     temb_ptr,
