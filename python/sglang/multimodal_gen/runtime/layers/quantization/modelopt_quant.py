@@ -101,7 +101,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
     weight: torch.Tensor,
     scales: torch.Tensor,
 ) -> None:
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         interleave_linear_and_gate,
         swizzle_blockscale_2d,
     )
@@ -972,7 +972,7 @@ def apply_nvfp4_gemm_swiglu_quant(
     if fp4_quantize is None:
         raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
 
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
 

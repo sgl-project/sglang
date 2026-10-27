@@ -12,9 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention import (
-    dsv4_attn_metadata_kernels as attn_metadata_kernels,
-)
+from sglang.kernels.ops.attention.dsv4 import attn_metadata_kernels
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,
@@ -31,7 +29,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = get_device()
 VOCAB = 129280
