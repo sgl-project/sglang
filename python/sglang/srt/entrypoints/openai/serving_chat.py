@@ -108,6 +108,8 @@ from sglang.srt.parser.hunyuan_reasoning import (
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
+    template_reads_reasoning,
+    template_reads_thinking,
 )
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
@@ -1702,6 +1704,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_msg["content"] = normalize_tool_content(
                     processed_msg["role"], processed_msg.get("content")
                 )
+                if (
+                    processed_msg.get("role") == "assistant"
+                    and processed_msg.get("reasoning_content") is not None
+                    and "thinking" not in processed_msg
+                    and self._populates_thinking_field()
+                ):
+                    processed_msg["thinking"] = processed_msg["reasoning_content"]
+                    if (
+                        self.is_gpt_oss
+                        and processed_msg.get("tool_calls")
+                        and processed_msg.get("content")
+                    ):
+                        processed_msg["thinking"] = (
+                            f"{processed_msg['thinking']}\n{processed_msg['content']}"
+                        )
+                        processed_msg["content"] = ""
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -2804,6 +2822,14 @@ class OpenAIServingChat(OpenAIServingBase):
             if end_normal_text:
                 normal_text = (normal_text or "") + end_normal_text
         return reasoning_text, normal_text
+
+    def _populates_thinking_field(self) -> bool:
+        chat_template = self.default_chat_template_kwargs.get("chat_template")
+        if chat_template is None and self.tokenizer_manager.tokenizer is not None:
+            chat_template = self.tokenizer_manager.tokenizer.chat_template
+        return template_reads_thinking(chat_template) and not template_reads_reasoning(
+            chat_template
+        )
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
