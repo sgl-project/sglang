@@ -19,6 +19,10 @@ _LOG2_E = math.log2(math.e)
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
+    # The NPU extend kernel never builds FlashInfer-style state checkpoints
+    # (see LinearAttnKernelBase for the base-class contract).
+    uses_state_checkpoints = False
+
     def extend(
         self,
         q: torch.Tensor,

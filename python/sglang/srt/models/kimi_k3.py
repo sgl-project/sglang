@@ -502,7 +502,7 @@ def _sp_cp_all_gather(x: torch.Tensor) -> torch.Tensor:
     group = get_parallel().attn_cp_group
     x = x.contiguous()
     with use_symmetric_memory(
-        group, disabled=not is_allocation_symmetric()
+        group, disabled=not is_allocation_symmetric() or not x.is_cuda
     ):
         out = torch.empty(
             (x.shape[0] * group.world_size, *x.shape[1:]),
@@ -554,7 +554,7 @@ def _sp_cp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     group = get_parallel().attn_cp_group
     x = x.contiguous()
     with use_symmetric_memory(
-        group, disabled=not is_allocation_symmetric()
+        group, disabled=not is_allocation_symmetric() or not x.is_cuda
     ):
         out = torch.empty(
             (x.shape[0] // group.world_size, *x.shape[1:]),

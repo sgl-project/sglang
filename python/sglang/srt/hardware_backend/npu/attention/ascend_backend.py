@@ -1421,6 +1421,108 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def do_cp_mla_attn_fia(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """CP-aware attention for MLA models in MHA mode using FIA on Ascend NPU.
+
+        Follows do_cp_attn_fia's two-segment TND structure, but consumes the
+        continuous full-sequence K/V expanded from the all-gathered latent
+        cache by the model side (the MLA FIA form, like its non-CP branch,
+        takes continuous keys instead of a paged cache). The full K/V list
+        every sequence in original order, so each segment's causal kv lengths
+        address it through cumulative offsets.
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+
+        # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
+        # total_q_prev_tokens rather than the midpoint to support bs > 1.
+        split = cp_meta.total_q_prev_tokens
+        q_nope_prev, q_rope_prev = q[:split].split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_nope_next, q_rope_next = q[split:].split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_nope = k_nope.contiguous()
+        k_rope = k_rope.contiguous()
+        v = v.contiguous()
+
+        # TND requires cumsum(actual_seq_lengths_kv) to end at exactly T(kv),
+        # so each segment cannot address the full-sequence K/V through the
+        # truncated causal lengths alone. Stack each sequence's causal prefix
+        # (the first kv_len[i] rows of its [prefix; extend] block in original
+        # order) instead; on radix-cache hits kv_len_*_list already carry the
+        # prefix offsets, and the block starts accumulate prefix + extend.
+        seg_num = len(cp_meta.split_list) // cp_meta.bs
+        prefix_lens = forward_batch.extend_prefix_lens_cpu or [0] * cp_meta.bs
+        starts = [0]
+        for i in range(cp_meta.bs):
+            starts.append(
+                starts[-1]
+                + int(prefix_lens[i])
+                + sum(cp_meta.split_list[i * seg_num : (i + 1) * seg_num])
+            )
+
+        def causal_prefix(t: torch.Tensor, lens: list) -> torch.Tensor:
+            return torch.cat(
+                [t[starts[i] : starts[i] + lens[i]] for i in range(len(lens))],
+                dim=0,
+            )
+
+        k_nope_prev = causal_prefix(k_nope, cp_meta.kv_len_prev_list)
+        k_rope_prev = causal_prefix(k_rope, cp_meta.kv_len_prev_list)
+        v_prev = causal_prefix(v, cp_meta.kv_len_prev_list)
+        k_nope_next = causal_prefix(k_nope, cp_meta.kv_len_next_list)
+        k_rope_next = causal_prefix(k_rope, cp_meta.kv_len_next_list)
+        v_next = causal_prefix(v, cp_meta.kv_len_next_list)
+
+        # Segments sit mid-sequence: each query chunk ends at its kv slice's
+        # end, so the causal triangle must anchor bottom-right (sparse_mode=4).
+        # sparse_mode=3's top-left anchoring only matches the trivial
+        # kv_len == q_len case and hides every later kv position otherwise.
+        attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope_prev,
+            k_nope_prev,
+            v_prev,
+            query_rope=q_rope_prev,
+            key_rope=k_rope_prev,
+            num_heads=layer.tp_q_head_num,
+            input_layout="TND",
+            atten_mask=self.fia_mask,
+            sparse_mode=4,
+            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list).tolist(),
+            actual_seq_lengths_kv=np.cumsum(cp_meta.kv_len_prev_list).tolist(),
+            scale=layer.scaling,
+            next_tokens=0,
+        )
+
+        attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope_next,
+            k_nope_next,
+            v_next,
+            query_rope=q_rope_next,
+            key_rope=k_rope_next,
+            num_heads=layer.tp_q_head_num,
+            input_layout="TND",
+            atten_mask=self.fia_mask,
+            sparse_mode=4,
+            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list).tolist(),
+            actual_seq_lengths_kv=np.cumsum(cp_meta.kv_len_next_list).tolist(),
+            scale=layer.scaling,
+            next_tokens=0,
+        )
+
+        return torch.cat([attn_out_prev, attn_out_next], dim=0).reshape(
+            -1, layer.tp_q_head_num, layer.v_head_dim
+        )
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -2062,6 +2164,33 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        ):
+            # Full-sequence CP for MLA (Kimi-K3): q covers this rank's zigzag
+            # chunks while k/v expand the full [prefix; extend] latent cache
+            # assembled by the model side before this call (prefix rows come
+            # from the pool on radix-cache hits).
+            cp_meta = forward_batch.attn_cp_metadata
+            num_token_padding = q.shape[0]
+            logical_tokens = cp_meta.total_q_prev_tokens + cp_meta.total_q_next_tokens
+            attn_output = self.do_cp_mla_attn_fia(
+                q[:logical_tokens], k, v, layer, forward_batch
+            )
+            if num_token_padding != logical_tokens:
+                attn_output = torch.cat(
+                    [
+                        attn_output,
+                        attn_output.new_zeros(
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
+                        ),
+                    ],
+                    dim=0,
+                )
+            return attn_output
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
