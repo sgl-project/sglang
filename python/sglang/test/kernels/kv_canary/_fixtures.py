@@ -10,9 +10,10 @@ from sglang.kernels.ops.kv_canary.verify import (
     VerifyPlan,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.utils.common import get_device
 from sglang.test.kernels.kv_canary._constants import DEFAULT_NUM_SLOTS
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 
 LutKind = Literal["identity", "shift", "permutation", "with_oob"]
