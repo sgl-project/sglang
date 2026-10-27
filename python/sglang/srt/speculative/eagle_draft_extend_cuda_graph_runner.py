@@ -298,8 +298,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
 
-        self.backend.bind_decode_runner(self)
-
         try:
             with model_capture_mode():
                 self.capture()
