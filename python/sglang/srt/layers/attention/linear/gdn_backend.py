@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import is_pin_memory_available, rank0_log
 
@@ -245,6 +246,26 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "FlashInfer GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
+        )
+
+
+def _validate_gdn_target_verify_layout(
+    model_runner: ModelRunner, use_replayssm_spec_verify: bool
+) -> None:
+    """Compact verify packs per-request verify lengths into one token list.
+    The ReplaySSM spec verify reads those rows by query_start_loc; the snapshot
+    verify kernels view a dense [batch, draft tokens] window from the conv on.
+    Cap-accept verifies the dense window and only trims acceptance."""
+    if use_replayssm_spec_verify or model_runner.is_draft_worker:
+        return
+    if not model_runner.spec_algorithm.supports_ragged_verify():
+        return
+    if ragged_verify_compact_enabled():
+        raise ValueError(
+            "SGLANG_RAGGED_VERIFY_MODE=compact on GDN models requires "
+            "--enable-linear-replayssm-spec: the snapshot target verify views a "
+            "dense [batch, draft tokens] window. Enable it or use "
+            "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
         )
 
 
@@ -521,12 +542,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
+        mamba_pool = model_runner.req_to_token_pool.mamba_pool
+        self.use_replayssm_spec_verify = (
+            mamba_pool.mamba_cache.replayssm_d is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        )
+        _validate_gdn_target_verify_layout(model_runner, self.use_replayssm_spec_verify)
+        # Compact verify packs a variable number of tokens per request. The
+        # conv and the ReplaySSM spec verify then read every target verify by
+        # query_start_loc, so a CUDA graph captured with one layout replays any
+        # other; a uniform layout gives the dense result bit for bit.
+        self.packed_target_verify = (
+            self.use_replayssm_spec_verify
+            and model_runner.spec_algorithm.supports_ragged_verify()
+            and ragged_verify_compact_enabled()
+        )
+        self.supports_ragged_verify_graph = self.packed_target_verify
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = mamba_pool.mamba_cache.conv[0].shape
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -629,21 +665,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         metadata = self.forward_metadata
         mamba_pool = self.req_to_token_pool.mamba_pool
         mamba_cache = mamba_pool.mamba_cache
-        is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
         use_replayssm_fold = (
             mamba_cache.replayssm_rawv is not None
             and getattr(mamba_pool, "replayssm_spec_fold", False)
-            and is_gdn_replayssm
-        )
-        use_replayssm_spec = (
-            mamba_cache.replayssm_d is not None
-            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-            and is_gdn_replayssm
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
         )
         self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
             retrieve_parent_token=metadata.retrieve_parent_token,
             use_replayssm_fold=use_replayssm_fold,
-            use_replayssm_spec=use_replayssm_spec,
+            use_replayssm_spec=self.use_replayssm_spec_verify,
             ssm_dtype=mamba_cache.temporal.dtype,
             draft_token_num=forward_batch.spec_info.draft_token_num,
         )
@@ -1002,11 +1032,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_spec_fold", False)
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
-            use_replayssm_spec = (
-                mamba_cache_params.replayssm_d is not None
-                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
-            )
+            use_replayssm_spec = self.use_replayssm_spec_verify
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -1038,7 +1064,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
-        if is_target_verify:
+        if is_target_verify and self.packed_target_verify:
+            # Request i owns the packed rows [query_start_loc[i],
+            # query_start_loc[i + 1]). The conv and the ReplaySSM verify read
+            # them in place.
+            batch_size = query_start_loc.shape[0] - 1
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                query_start_loc=query_start_loc,
+                max_seqlen=forward_batch.spec_info.draft_token_num,
+            )
+        elif is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
