@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4SWAPageLayout(CustomTestCase):
@@ -369,6 +369,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         # The layout comes from the published configuration.
@@ -417,6 +418,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         from sglang.srt.runtime_context import publish, reset_context

@@ -611,6 +611,25 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
+    def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
+        """Aux (metadata) buffers pair up positionally, so a peer that
+        registered a different number of them gets only the leading ones, and
+        those line up only if the missing buffer is the last. Say so once per
+        registration; the senders stop at the shorter list."""
+        num_local = len(self.kv_args.aux_data_ptrs)
+        if num_remote != num_local:
+            logger.error(
+                "Decode %s registered %d metadata buffers but this prefill has %d; "
+                "only the first %d are transferred, and misaligned if the extra "
+                "buffer is not the last. An optional metadata buffer is enabled on "
+                "one engine only: --disaggregation-enable-kv-checksum, "
+                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK, or the DSA top-k buffer.",
+                peer,
+                num_remote,
+                num_local,
+                min(num_remote, num_local),
+            )
+
     def build_receiver_registration_message(self) -> List[bytes]:
         raise NotImplementedError
 
@@ -1310,6 +1329,17 @@ class CommonKVManager(BaseKVManager):
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
                 f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
                 f"Both servers must use the same --kv-cache-dtype value."
+            )
+
+        if (
+            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            and info.attn_tp_size != self.attn_tp_size
+        ):
+            # MiniMax main KV pages are head-major page rows and its index state
+            # is replicated per rank; neither can be resliced by attention head.
+            raise RuntimeError(
+                "MiniMax sparse PD requires matching attention TP sizes: "
+                f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
         if (

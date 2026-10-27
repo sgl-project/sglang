@@ -1197,6 +1197,25 @@ async def hicache_storage_backend_status():
     }
 
 
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.hicache_storage import (
+        disabled_l3_layout,
+        merge_l3_layouts,
+    )
+
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
@@ -2168,8 +2187,14 @@ async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """SageMaker health check: 200 when is_healthy(), else 503.
+
+    Unlike /ready, a paused server still reports 200, so an intentional pause
+    (e.g. a weight sync) does not get the instance replaced. Stays a flag check
+    because SageMaker times out /ping after 2 seconds.
+    """
+    status_code = 200 if _global_state.tokenizer_manager.is_healthy() else 503
+    return Response(status_code=status_code)
 
 
 @app.post("/invocations")
