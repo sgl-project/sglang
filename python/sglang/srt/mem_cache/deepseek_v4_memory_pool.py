@@ -891,7 +891,7 @@ class DeepSeekV4UnifiedKVPool:
             group_of = [None] * len(stage_ratios)
         assert len(group_of) == len(stage_ratios)
         # members of each kv_source group, source first (it is the lowest layer)
-        groups: dict = {}
+        groups: dict[int, List[int]] = {}
         for i, src in enumerate(group_of):
             if src is not None:
                 assert (

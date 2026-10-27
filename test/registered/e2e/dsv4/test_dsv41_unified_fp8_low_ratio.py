@@ -318,47 +318,22 @@ class TestPool(CustomTestCase):
         self.assertEqual(len(pool.groups), 4)
 
 
+def _swa_prefix_stream(state_slot, positions, swa_len, compress_len, ring):
+    """Per-layer decode stream with only its SWA-ring prefix filled; the compressed
+    tail is left for fill_compress_tail."""
+    lengths = (swa_len + compress_len).to(torch.int64)
+    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=DEV)
+    indptr[1:] = torch.cumsum(lengths, 0)
+    indices = torch.full((int(indptr[-1]),), -1, dtype=torch.int32, device=DEV)
+    for t in range(lengths.shape[0]):
+        a, n, pos = int(indptr[t]), int(swa_len[t]), int(positions[t])
+        rows = torch.arange(pos - n + 1, pos + 1, device=DEV) % ring
+        indices[a : a + n] = (int(state_slot[t]) * ring + rows).int()
+    return indices, indptr
+
+
 @_needs_gfx950
 class TestDecodeStream(CustomTestCase):
-    def test_low_ratio_stream(self):
-        torch.manual_seed(3)
-        win, ring, topk, base = 128, 128, 16, 5000
-        N = 4
-        state_slot = torch.tensor([3, 0, 7, 1], device=DEV, dtype=torch.int32)
-        positions = torch.tensor([0, 5, 300, 129], device=DEV, dtype=torch.int32)
-        swa_len = torch.clamp(positions + 1, max=win)
-        ratio = 2
-        low_len = torch.clamp((positions + 1) // ratio, max=topk)
-        page_idx = torch.full((N, topk), -1, dtype=torch.int32, device=DEV)
-        for t in range(N):
-            k = int(low_len[t])
-            page_idx[t, :k] = torch.randperm(1000, device=DEV)[:k].int()
-        idx, indptr = runtime.build_low_ratio_decode_stream(
-            state_slot=state_slot,
-            positions=positions,
-            swa_len=swa_len,
-            compress_len=low_len,
-            width=topk,
-            win=win,
-            ring_stride=ring,
-        )
-        runtime.fill_compress_tail(
-            indices=idx,
-            indptr=indptr,
-            prefix_len=swa_len,
-            page_indices=page_idx,
-            valid_len=low_len,
-            swa_pages=base,
-        )
-        for t in range(N):
-            a, b = int(indptr[t]), int(indptr[t + 1])
-            pos, n = int(positions[t]), int(swa_len[t])
-            want = [
-                int(state_slot[t]) * ring + (pos - n + 1 + i) % ring for i in range(n)
-            ]
-            want += [int(x) + base for x in page_idx[t, : int(low_len[t])].tolist()]
-            self.assertEqual(idx[a:b].tolist(), want)
-
     def test_group_streams_match_per_layer(self):
         torch.manual_seed(7)
         win, ring, topk, swa_pages = 128, 128, 512, 4096
@@ -391,14 +366,8 @@ class TestDecodeStream(CustomTestCase):
                     ring_stride=ring,
                 )
                 for g in range(G):
-                    ref, ref_p = runtime.build_low_ratio_decode_stream(
-                        state_slot=state_slot,
-                        positions=positions,
-                        swa_len=swa_len,
-                        compress_len=low_len,
-                        width=topk,
-                        win=win,
-                        ring_stride=ring,
+                    ref, ref_p = _swa_prefix_stream(
+                        state_slot, positions, swa_len, low_len, ring
                     )
                     runtime.fill_compress_tail(
                         indices=ref,

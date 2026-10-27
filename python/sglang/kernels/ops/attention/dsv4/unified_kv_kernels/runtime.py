@@ -918,61 +918,6 @@ def build_decode_streams(
 
 
 @triton.jit
-def _swa_prefix_kernel(
-    state_slot_ptr,  # [N] int32
-    positions_ptr,  # [N] int32
-    indptr_ptr,  # [N+1] int32
-    indices_ptr,  # [*] int32 (out)
-    ring_stride,
-    win: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """Per token: the SWA-ring prefix ``slot*ring + (pos-n+1+i)%ring``, i < n,
-    n = min(pos+1, win), at indptr[t] -- the prefix every decode stream starts with."""
-    t = tl.program_id(0)
-    slot = tl.load(state_slot_ptr + t)
-    pos = tl.load(positions_ptr + t)
-    n = tl.minimum(pos + 1, win)
-    base = tl.load(indptr_ptr + t)
-    i = tl.arange(0, BLOCK_N)
-    abs_pos = pos - n + 1 + i
-    tl.store(
-        indices_ptr + base + i, slot * ring_stride + abs_pos % ring_stride, mask=i < n
-    )
-
-
-def build_low_ratio_decode_stream(
-    *,
-    state_slot: torch.Tensor,  # [N] int
-    positions: torch.Tensor,  # [N] int
-    swa_len: torch.Tensor,  # [N] int, == min(pos+1, win)
-    compress_len: torch.Tensor,  # [N] int, valid front-packed top-k entries
-    width: int,  # top-k columns of the ratio's sparse page indices
-    win: int,
-    ring_stride: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Decode stream of a ratio-1/2 (DeepSeek-V4.1) layer: the SWA-ring prefix,
-    written here once per step, then ``compress_len`` compressed rows that
-    ``fill_compress_tail`` writes per layer (the indexer rewrites the top-k and
-    each kv_source group member has its own compressed-row base)."""
-    device = state_slot.device
-    N = state_slot.shape[0]
-    indptr = _lengths_to_indptr(swa_len + compress_len)
-    indices = torch.empty(N * (win + width), dtype=torch.int32, device=device)
-    if N > 0:
-        _swa_prefix_kernel[(N,)](
-            state_slot.to(torch.int32),
-            positions.to(torch.int32),
-            indptr,
-            indices,
-            ring_stride,
-            win=win,
-            BLOCK_N=triton.next_power_of_2(win),
-        )
-    return indices, indptr
-
-
-@triton.jit
 def _dspark_block_stream_kernel(
     state_slot_ptr,  # [N] int
     positions_ptr,  # [N] int
@@ -1086,8 +1031,8 @@ def _v41_decode_swa_kernel(
     win: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Per token: _swa_prefix_kernel's SWA-ring prefix, and the ring row this
-    step's K goes to, slot*ring + pos%ring."""
+    """Per token: the SWA-ring prefix ``slot*ring + (pos-n+1+i)%ring``, i < n,
+    n = min(pos+1, win), and the ring row this step's K goes to, slot*ring + pos%ring."""
     t = tl.program_id(0)
     slot = tl.load(state_slot_ptr + t).to(tl.int64)
     pos = tl.load(positions_ptr + t).to(tl.int64)
@@ -1188,7 +1133,7 @@ def _low_ratio_group_stream_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Per (token t, layer g): _swa_prefix_kernel's SWA-ring prefix, then
+    """Per (token t, layer g): _v41_decode_swa_kernel's SWA-ring prefix, then
     _fill_compress_tail_kernel's tail at compressed-row base base0 + g*base_step."""
     t = tl.program_id(0)
     g = tl.program_id(1)
@@ -1231,8 +1176,8 @@ def build_low_ratio_group_streams(
     ring_stride: int,
 ) -> torch.Tensor:
     """The decode streams of ``num_layers`` ratio-1/2 layers that read the same
-    top-k, in one launch: row g is what build_low_ratio_decode_stream followed by
-    fill_compress_tail(swa_pages=base0 + g*base_step) leaves for layer g. The
+    top-k, in one launch: row g is the SWA-ring prefix followed by what
+    fill_compress_tail(swa_pages=base0 + g*base_step) writes for layer g. The
     layers differ only in their compressed-row base (kv_source group position)."""
     N, Wc = page_indices.shape
     stride_g = N * (win + Wc)

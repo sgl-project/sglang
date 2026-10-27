@@ -2661,9 +2661,7 @@ class MQALayer(MqaAttentionBase):
 
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
-        )
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_triton as _is_unified_kv_triton,
+            is_unified_kv_triton,
         )
 
         low_ratio_multi_stream = (
@@ -2672,7 +2670,7 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             # its unified_kv arm is fp8 decode only (packed Q + SWA ring store)
             and (
-                not _is_unified_kv_triton()
+                not is_unified_kv_triton()
                 or (is_unified_kv_fp8() and forward_batch.forward_mode.is_decode())
             )
             and (
@@ -2687,10 +2685,6 @@ class MQALayer(MqaAttentionBase):
                     )
                 )
             )
-        )
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_fp8,
-            is_unified_kv_triton,
         )
 
         unified = is_unified_kv_triton()

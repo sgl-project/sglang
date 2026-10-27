@@ -832,7 +832,7 @@ def _dsv4_low_ratio_regions(
         layer_mapping = {
             source - kvcache.start_layer: index for index, source in enumerate(sources)
         }
-        if getattr(kvcache, "_unified_kv", False):
+        if kvcache._unified_kv:
             # The group's region inside its kv_source's unified view (no device pool),
             # plus under fp8 its bf16 rope half: mirroring the nope half alone is wrong.
             regions.append(
@@ -1979,11 +1979,9 @@ class _DeepSeekV4Strategy(StackStrategy):
         # them out everywhere else.
         _sidecar_srcs = [
             (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
-            (PoolName.DEEPSEEK_V4_C1_ROPE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
-            (PoolName.DEEPSEEK_V4_C2_ROPE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C4, PoolName.KV),

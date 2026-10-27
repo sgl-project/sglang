@@ -3676,7 +3676,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
-        if getattr(pool, "_unified_kv", False):
+        if pool._unified_kv:
             # fp8 two-pool unified_kv: this kv_source layer's view starts at its own
             # SWA ring; its group's compressed region starts at row_base.
             assert pool._unified_kv_fp8, "ratio 1 / 2 need the fp8 unified_kv layout"
@@ -3778,7 +3778,7 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress_torch(
         self, layer, x, req, pos, projected=None, *, fuse_index_store=False
     ) -> None:
-        if getattr(self.token_to_kv_pool, "_unified_kv", False):
+        if self.token_to_kv_pool._unified_kv:
             # this path stores into the paged ratio-1/2 pools, which unified_kv lacks
             raise NotImplementedError(
                 "the torch ratio-1/2 compressor has no unified_kv store; only the "

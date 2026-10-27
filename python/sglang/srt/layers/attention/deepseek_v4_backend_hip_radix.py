@@ -259,8 +259,8 @@ def _low_ratio_topk_readers(cfg) -> Dict[int, Tuple[int, ...]]:
     """DeepSeek-V4.1: first layer of each run of ratio-1/2 layers that read one
     index source's top-k -> the whole run (the index source and the same-ratio
     layers after it, up to the next source)."""
-    ratios = list(getattr(cfg, "compress_ratios", None) or [])
-    sources = set(getattr(cfg, "index_source_layer_ids", None) or [])
+    ratios = list(cfg.compress_ratios)
+    sources = set(cfg.index_source_layer_ids)
     runs: Dict[int, List[int]] = {}
     lead = None
     for layer_id, ratio in enumerate(ratios):
@@ -1044,8 +1044,10 @@ class DeepseekV4HipRadixBackend(
             getattr(model_runner.model_config.hf_text_config, "model_type", None)
             == "deepseek_v41"
         )
-        self._low_ratio_topk_readers = _low_ratio_topk_readers(
-            model_runner.model_config.hf_text_config
+        self._low_ratio_topk_readers = (
+            _low_ratio_topk_readers(model_runner.model_config.hf_text_config)
+            if self.is_dsv41
+            else {}
         )
         # Decode and speculative metadata can be rebuilt from device lengths.
         # The online c128 planner still consumes CPU lengths.
@@ -3164,7 +3166,11 @@ class DeepseekV4HipRadixBackend(
         swa_floor = core_attn_metadata.unified.pf_swa_floor
         # Decoder SWA bounded replay: the late layers run the extend's tail rows,
         # so the positions are the tail's, not forward_batch's.
-        tail = getattr(self.forward_metadata, "late_layer_tail", None)
+        tail = (
+            self.forward_metadata.late_layer_tail
+            if isinstance(self.forward_metadata, DSV4Metadata)
+            else None
+        )
         if tail is not None:
             positions = tail.positions.to(torch.int64)[:T]
 
@@ -3181,7 +3187,16 @@ class DeepseekV4HipRadixBackend(
             # by the CP layout's local_index when it has one (the late-layer tail
             # gives each row to the rank that owns it in the full extend, which is
             # not every cp_size-th tail row), else by stride (plain interleave).
-            _local_index = getattr(forward_batch.attn_cp_metadata, "local_index", None)
+            from sglang.srt.layers.cp.interleave import (
+                InterleaveContextParallelMetadata,
+            )
+
+            _cp_metadata = forward_batch.attn_cp_metadata
+            _local_index = (
+                _cp_metadata.local_index
+                if isinstance(_cp_metadata, InterleaveContextParallelMetadata)
+                else None
+            )
             _sl = (
                 _local_index
                 if _local_index is not None
@@ -3309,8 +3324,12 @@ class DeepseekV4HipRadixBackend(
 
     def get_unified_swa_loc_i64(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """get_unified_swa_loc as int64, cast once per step where it can be."""
-        core = getattr(self.forward_metadata, "core_attn_metadata", None)
-        unified = getattr(core, "unified", None) if core is not None else None
+        metadata = self.forward_metadata
+        unified = (
+            metadata.core_attn_metadata.unified
+            if isinstance(metadata, DSV4Metadata)
+            else None
+        )
         cached = unified.swa_loc_i64 if unified is not None else None
         positions = forward_batch.positions
         if (
@@ -3842,7 +3861,7 @@ class DeepseekV4HipRadixBackend(
                 block_size=dspark_block_size,
             )
         elif swa_replay_start is None:
-            if getattr(self.token_to_kv_pool, "_unified_kv", False):
+            if self.token_to_kv_pool._unified_kv:
                 # Only the paged readers take these; unified_kv addresses its own
                 # SWA ring (decode streams / prefill indices), so a shape-only
                 # stand-in saves the gather + translate launches every step.
@@ -3858,7 +3877,7 @@ class DeepseekV4HipRadixBackend(
                     swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
                 )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
-        elif getattr(self.token_to_kv_pool, "_unified_kv", False):
+        elif self.token_to_kv_pool._unified_kv:
             # decoder SWA bounded replay under unified_kv: the floor reaches the
             # ring through pf_swa_floor; only the (floored) lengths matter here
             swa_page_indices = seq_lens_casual.new_zeros(
