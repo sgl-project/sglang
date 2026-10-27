@@ -120,8 +120,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
     eager_on_graph,
-    is_capturing,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -319,10 +319,10 @@ def _low_ratio_source_projections(
         put("w", indexer.head_weights(x[:real]))
 
 
-def _prefill_graph_full_topk(layer, x, q_lora, pos):
+def _prefill_graph_full_topk(layer, x, q_lora, pos, table):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return get_attn_backend()._prefill_graph_full_topk_break(
-        layer, x, q_lora, pos, forward_batch
+    get_attn_backend()._prefill_graph_full_topk_break(
+        layer, x, q_lora, pos, forward_batch, table
     )
 
 
@@ -2211,13 +2211,13 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
-            seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu_list,
+            seq_lens_cpu=(
+                None
+                if seq_lens_cpu is None
+                else [int(x) for x in seq_lens_cpu.tolist()]
+            ),
             extend_len=block_size,
         )
         extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
@@ -3485,11 +3485,23 @@ class DeepseekV4AttnBackend(
                     self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
                 else:
                     # Eager break: dense scoring over the live context; the
-                    # candidate source hands its block table to the consumers.
-                    out = _bcg_prefill_graph_full_topk(layer, x, q_lora, pos)
-                    if layer.indexer.is_candidate_source:
+                    # candidate source writes its block table for the consumers.
+                    if not layer.indexer.is_candidate_source:
+                        _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, None)
+                    else:
+                        candidates = self.prefill_candidates
+                        rows = x.shape[0]
+                        table = candidates.prefill_graph_table(layer.layer_id, rows)
+                        # A capture records the table it is given; the warmup
+                        # before it allocates one.
+                        assert (
+                            table is not None or _current_capture_var.get() is None
+                        ), "candidate table not allocated before capture"
+                        _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
+                        if table is None:  # first run: the break allocated the buffers
+                            table = candidates.prefill_graph_table(layer.layer_id, rows)
                         self.forward_metadata.candidate_metadata = (
-                            self.prefill_candidates.bind_prefill_graph_table(out)
+                            candidates.bind_prefill_graph_table(table)
                         )
             return
         if run_compressor and layer.compressor is not None:
@@ -4044,10 +4056,12 @@ class DeepseekV4AttnBackend(
             return max_seq_len
         return self.prefill_cuda_graph_default_max_seq_len
 
-    def _prefill_graph_full_topk_break(self, layer, x, q_lora, pos, forward_batch):
+    def _prefill_graph_full_topk_break(
+        self, layer, x, q_lora, pos, forward_batch, table
+    ):
         """One full top-k layer at an eager break of the prefill graph, over the live
         batch at any context length: writes the sparse indices the attention break
-        reads, and the candidate source returns its table for the captured consumers."""
+        reads and, for the candidate source, the table the captured consumers read."""
         indexer = layer.indexer
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
@@ -4070,10 +4084,8 @@ class DeepseekV4AttnBackend(
         )
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)
-            return ()
-        return self.prefill_candidates.publish_prefill_graph(
-            inputs, x.shape[0], shared=is_capturing()
-        )
+            return
+        self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0], table)
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle never trusts its metadata, which may be stale or unset: it writes

@@ -226,7 +226,9 @@ class Memory(msgspec.Struct):
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "
                 "supplied while the linker is disabled. For built-in backends, "
-                "replaces --hicache-storage-backend-extra-config when provided."
+                "replaces --hicache-storage-backend-extra-config when provided. "
+                "The fallback to that flag for external linkers is deprecated; "
+                "ordinary HiCache use of that flag is unaffected."
             ),
             type_parser=json.loads,
         ),
