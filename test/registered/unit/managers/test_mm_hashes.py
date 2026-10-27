@@ -14,6 +14,7 @@ relies on.
 """
 
 import asyncio
+import hashlib
 import pickle
 import threading
 import unittest
@@ -31,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
 )
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.utils import flatten_nested_list
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -111,6 +113,58 @@ class TestMmHashesContract(CustomTestCase):
                 b.set_hash(value)
                 self.assertEqual(a.hash, b.hash)
                 self.assertEqual(a.padding_values(), b.padding_values())
+
+
+class TestMmHashAlgorithm(CustomTestCase):
+    FEATURES = (
+        torch.arange(24, dtype=torch.float32).reshape(4, 6).t(),
+        np.arange(24, dtype=np.int64).reshape(4, 6)[:, ::2],
+        [torch.arange(3), [torch.arange(7), torch.arange(2)]],
+    )
+
+    @staticmethod
+    def _expected(hasher, feature):
+        if isinstance(feature, np.ndarray):
+            chunks = [np.ascontiguousarray(feature).tobytes()]
+        else:
+            tensors = feature if isinstance(feature, list) else [feature]
+            chunks = [
+                t.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+                for t in flatten_nested_list(tensors)
+            ]
+        for chunk in chunks:
+            hasher.update(chunk)
+        return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+    def test_default_is_sha256(self):
+        with envs.SGLANG_MM_HASH_ALGORITHM.override("sha256"):
+            for feature in self.FEATURES:
+                with self.subTest(type=type(feature)):
+                    self.assertEqual(
+                        hash_feature(feature),
+                        self._expected(hashlib.sha256(), feature),
+                    )
+        self.assertEqual(envs.SGLANG_MM_HASH_ALGORITHM.get(), "sha256")
+
+    def test_blake3_matches_reference_and_differs_from_sha256(self):
+        try:
+            from blake3 import blake3
+        except ImportError:
+            self.skipTest("blake3 is not installed")
+        for feature in self.FEATURES:
+            with self.subTest(type=type(feature)):
+                sha = hash_feature(feature)
+                with envs.SGLANG_MM_HASH_ALGORITHM.override("blake3"):
+                    first = hash_feature(feature)
+                    second = hash_feature(feature)
+                self.assertEqual(first, second)
+                self.assertEqual(first, self._expected(blake3(), feature))
+                self.assertNotEqual(first, sha)
+
+    def test_unknown_algorithm_raises(self):
+        with envs.SGLANG_MM_HASH_ALGORITHM.override("md5"):
+            with self.assertRaisesRegex(ValueError, "SGLANG_MM_HASH_ALGORITHM"):
+                hash_feature(torch.ones(4))
 
 
 class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCase):

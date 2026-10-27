@@ -891,6 +891,24 @@ def general_mm_embed_routine(
     return hidden_states
 
 
+def _new_mm_hasher():
+    algorithm = envs.SGLANG_MM_HASH_ALGORITHM.get().lower()
+    if algorithm == "sha256":
+        return hashlib.sha256()
+    if algorithm == "blake3":
+        from blake3 import blake3
+
+        return blake3(max_threads=blake3.AUTO)
+    raise ValueError(
+        f"Unsupported SGLANG_MM_HASH_ALGORITHM={algorithm!r}; "
+        "expected 'sha256' or 'blake3'"
+    )
+
+
+def _digest_to_int(hasher) -> int:
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
 def data_hash(data) -> int:
     hash_bytes = hashlib.sha256(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -911,21 +929,19 @@ def tensor_hash(tensor_list) -> int:
             tensor = torch.concat(tensors)
             return gpu_tensor_hash(tensor.cuda())
         # CPU path: hash each tensor incrementally without concat
-        hasher = hashlib.sha256()
+        hasher = _new_mm_hasher()
         for t in tensors:
             t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+        return _digest_to_int(hasher)
 
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().cpu().contiguous()
-    hasher = hashlib.sha256()
+    hasher = _new_mm_hasher()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    return _digest_to_int(hasher)
 
 
 def hash_feature(f):
@@ -941,10 +957,9 @@ def hash_feature(f):
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
-        hasher = hashlib.sha256()
-        hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+        hasher = _new_mm_hasher()
+        hasher.update(memoryview(arr.reshape(-1).view(np.uint8)))
+        return _digest_to_int(hasher)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
