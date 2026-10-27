@@ -34,8 +34,8 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
   --engram-config '{"placement": "cpu"}'
 
 # Rows in GPU memory, read from the owning GPU without a collective.
-sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 --dp-size 8 \
-  --enable-dp-attention --engram-config '{"lookup": "peer_read"}'
+sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 --attn-dp-size 8 \
+  --engram-config '{"lookup": "peer_read"}'
 ```
 
 ## Choosing a configuration
