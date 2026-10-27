@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     get_recommended_splits = None
 
 from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+    launch_gather_shuffle_5d_dequant,
     launch_gather_shuffle_5d_to_linear,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
@@ -42,6 +43,64 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _resolve_5d_slots_and_buffers(
+    backend: AiterAttnBackend, layer: RadixAttention, forward_batch: ForwardBatch
+):
+    """(request-major per-token slot ids, 5D K buffer, 5D V buffer, sub-pool) for this layer."""
+    is_swa_layer = (
+        layer.sliding_window_size is not None
+        and layer.sliding_window_size > -1
+        and backend.forward_metadata.swa_page_table is not None
+    )
+    total_kv = int(forward_batch.seq_lens_sum)
+    if is_swa_layer:
+        slot_ids = backend.forward_metadata.swa_page_table[:total_kv]
+    else:
+        slot_ids = backend.forward_metadata.kv_indices[:total_kv]
+
+    # Resolve the raw 5D K/V buffer for this layer (going through the
+    # SWA→sub-pool mapping when applicable).
+    pool = backend.token_to_kv_pool
+    if hasattr(pool, "layers_mapping"):
+        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
+        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+    else:
+        sub_pool = pool
+        sub_layer_id = layer.layer_id
+    k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
+    v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
+
+    return slot_ids, k_buf, v_buf, sub_pool
+
+
+def _gather_5d_kv_linear(
+    backend: AiterAttnBackend,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    token_index: torch.Tensor | None = None,
+):
+    """Per-token K/V of every request (prefix + extend) gathered from the SHUFFLE 5D pool as (T, H, D).
+
+    ``token_index`` selects a subset of the request-major token list (e.g. only the sliding window).
+    """
+    slot_ids, k_buf, v_buf, sub_pool = _resolve_5d_slots_and_buffers(
+        backend, layer, forward_batch
+    )
+    total_kv = int(forward_batch.seq_lens_sum)
+    if token_index is not None:
+        slot_ids = slot_ids[token_index]
+    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
+    # k_lin / v_lin come out in ``store_dtype`` (uint8 for fp8 pools
+    # because ``Tensor.index_put`` isn't implemented for fp8 — see
+    # ``MHATokenToKVPool`` ctor). Reinterpret them back to the compute
+    # dtype so aiter sees matching q/k/v dtypes. The bytes are
+    # identical; this is a zero-copy view.
+    if sub_pool.store_dtype != sub_pool.dtype:
+        k_lin = k_lin.view(sub_pool.dtype)
+        v_lin = v_lin.view(sub_pool.dtype)
+    return k_lin, v_lin, sub_pool, total_kv
 
 
 def forward_extend_vectorized_5d(
@@ -126,38 +185,7 @@ def forward_extend_vectorized_5d(
     # of either tensor are exactly the per-token absolute pool slot ids
     # in request-major order — no per-token gather metadata to build on
     # host.
-    is_swa_layer = (
-        layer.sliding_window_size is not None
-        and layer.sliding_window_size > -1
-        and backend.forward_metadata.swa_page_table is not None
-    )
-    total_kv = int(forward_batch.seq_lens_sum)
-    if is_swa_layer:
-        slot_ids = backend.forward_metadata.swa_page_table[:total_kv]
-    else:
-        slot_ids = backend.forward_metadata.kv_indices[:total_kv]
-
-    # Resolve the raw 5D K/V buffer for this layer (going through the
-    # SWA→sub-pool mapping when applicable).
-    pool = backend.token_to_kv_pool
-    if hasattr(pool, "layers_mapping"):
-        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-    else:
-        sub_pool = pool
-        sub_layer_id = layer.layer_id
-    k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
-    v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
-
-    k_lin, v_lin = launch_gather_shuffle_5d_to_linear(k_buf, v_buf, slot_ids)
-    # k_lin / v_lin come out in ``store_dtype`` (uint8 for fp8 pools
-    # because ``Tensor.index_put`` isn't implemented for fp8 — see
-    # ``MHATokenToKVPool`` ctor). Reinterpret them back to the compute
-    # dtype so aiter sees matching q/k/v dtypes. The bytes are
-    # identical; this is a zero-copy view.
-    if sub_pool.store_dtype != sub_pool.dtype:
-        k_lin = k_lin.view(sub_pool.dtype)
-        v_lin = v_lin.view(sub_pool.dtype)
+    k_lin, v_lin, sub_pool, total_kv = _gather_5d_kv_linear(backend, layer, forward_batch)
 
     # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
     # descales straight to aiter.
@@ -309,3 +337,165 @@ def forward_decode_vectorized_5d(
         sliding_window=sliding_window_arg,
         ps=True,
     )
+
+
+def forward_decode_vectorized_5d_flydsl(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    sinks,
+) -> None:
+    """``forward_decode_vectorized_5d`` with FlyDSL ``pa_decode`` (gfx1250 FP8/BF16, sliding window)."""
+    from aiter.ops.flydsl.pa_decode import pa_decode
+
+    bs = forward_batch.batch_size
+    is_swa_layer = (
+        layer.sliding_window_size is not None and layer.sliding_window_size > -1
+    )
+    if is_swa_layer:
+        block_tables = (
+            backend.forward_metadata.swa_page_table
+            if backend.forward_metadata.swa_page_table is not None
+            else backend.forward_metadata.kv_indices
+        )
+        # FlyDSL windows count the query itself; sglang keeps key j for query i when i - j <= sws.
+        window = int(layer.sliding_window_size) + 1
+    else:
+        block_tables = backend.forward_metadata.kv_indices
+        window = 0
+    # int32 lens and the plan were refreshed for this step by _refresh_flydsl_pa_metadata.
+    context_lengths = backend.flydsl_ctx_lens[bs]
+    plan = backend.flydsl_pa_plans[(bs, window)]
+    key_scale = None
+    value_scale = None
+    if backend.kv_cache_dtype == fp8_dtype:
+        key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+    pa_decode(
+        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        k_cache,
+        v_cache,
+        context_lengths,
+        block_tables[:bs],
+        layer.scaling,
+        1,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        sinks=sinks,
+        sliding_window=window,
+        work_plan=plan,
+    )
+
+
+def _swa_window_token_index(
+    backend: AiterAttnBackend, forward_batch: ForwardBatch, sliding_window_size: int
+):
+    """(token_index, cu_seqlens_k, max_seqlen_k) keeping, per request, only the keys an SWA query can see:
+    [max(0, prefix - sws), seq_len). None when host seq lens are unavailable (sync-free path)."""
+    if forward_batch.seq_lens_cpu is None or forward_batch.extend_seq_lens_cpu is None:
+        return None
+    cached = backend.flydsl_swa_window_cache
+    if (
+        cached is not None
+        and cached[0] is backend.forward_metadata
+        and cached[1] == sliding_window_size
+    ):
+        return cached[2]
+    seq = forward_batch.seq_lens_cpu[: forward_batch.batch_size].to(torch.int64)
+    ext = torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int64)
+    start = (seq - ext - sliding_window_size).clamp_(min=0)
+    n = seq - start
+    kv_off = torch.cumsum(seq, 0) - seq
+    cu_k = torch.zeros(n.numel() + 1, dtype=torch.int64)
+    torch.cumsum(n, 0, out=cu_k[1:])
+    idx = torch.repeat_interleave(kv_off + start - cu_k[:-1], n) + torch.arange(int(cu_k[-1]))
+    device = backend.forward_metadata.qo_indptr.device
+    result = (
+        idx.to(device, non_blocking=True),
+        cu_k.to(torch.int32).to(device, non_blocking=True),
+        int(n.max()),
+    )
+    backend.flydsl_swa_window_cache = (backend.forward_metadata, sliding_window_size, result)
+    return result
+
+
+def forward_extend_vectorized_5d_flydsl(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    bs0: int,
+):
+    """Prefix extend on the SHUFFLE 5D pool via FlyDSL varlen (bf16); None when FlyDSL declines."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+
+    sws = layer.sliding_window_size
+    is_swa = sws is not None and sws > -1
+    window_index = (
+        _swa_window_token_index(backend, forward_batch, sws)
+        if is_swa and backend.forward_metadata.swa_page_table is not None
+        else None
+    )
+    if window_index is not None:
+        token_index, cu_seqlens_k, max_seqlen_k = window_index
+    else:
+        token_index = None
+        cu_seqlens_k = backend.forward_metadata.kv_indptr[:bs0].to(torch.int32)
+        max_seqlen_k = int(backend.forward_metadata.max_kv_len)
+    slot_ids, k_buf, v_buf, sub_pool = _resolve_5d_slots_and_buffers(
+        backend, layer, forward_batch
+    )
+    if (
+        sub_pool.dtype == fp8_dtype
+        and backend.use_flydsl_extend_fp8
+        and layer.k_scale_float == 1.0
+        and layer.v_scale_float == 1.0
+    ):
+        # a8w8 FlyDSL takes no descales, so raw fp8 bytes are only valid at unit scale.
+        k_lin, v_lin = launch_gather_shuffle_5d_dequant(
+            k_buf.view(fp8_dtype),
+            v_buf.view(fp8_dtype),
+            slot_ids,
+            layer.k_scale if layer.k_scale is not None else backend.k_scale,
+            layer.v_scale if layer.v_scale is not None else backend.v_scale,
+            token_index=token_index,
+            out_dtype=fp8_dtype,
+        )
+        q = q.to(fp8_dtype)
+    elif sub_pool.dtype == fp8_dtype:
+        # One kernel: window index lookup + 5D gather + fp8 -> bf16 dequant + NaN -> 0
+        # (freed SWA slots may hold fp8 NaN bytes; a masked key must still contribute 0).
+        k_lin, v_lin = launch_gather_shuffle_5d_dequant(
+            k_buf.view(fp8_dtype),
+            v_buf.view(fp8_dtype),
+            slot_ids,
+            layer.k_scale if layer.k_scale is not None else backend.k_scale,
+            layer.v_scale if layer.v_scale is not None else backend.v_scale,
+            token_index=token_index,
+        )
+    else:
+        k_lin, v_lin, _, _ = _gather_5d_kv_linear(
+            backend, layer, forward_batch, token_index
+        )
+        k_lin = k_lin.to(torch.bfloat16)
+        v_lin = v_lin.to(torch.bfloat16)
+    window = (sws, 0) if is_swa else (-1, -1)
+    o = flydsl_flash_attn_varlen_fwd(
+        q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        k_lin,
+        v_lin,
+        backend.forward_metadata.qo_indptr[:bs0].to(torch.int32),
+        cu_seqlens_k,
+        int(backend.forward_metadata.max_q_len),
+        max_seqlen_k,
+        softmax_scale=layer.scaling,
+        causal=True,
+        window_size=window,
+    )
+    return None if o is None else o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+

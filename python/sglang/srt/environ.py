@@ -1028,6 +1028,14 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # 5D prefix extend: FlyDSL a8w8 (fp8 Q/K/V, bf16 out) instead of bf16; used only when the layer K/V scales are 1.0.
+    SGLANG_OPT_FLYDSL_EXTEND_FP8 = EnvBool(False)
+    # aiter backend SHUFFLE 5D decode via FlyDSL pa_decode instead of pa_decode_gluon (gfx1250, sliding window aware).
+    SGLANG_OPT_FLYDSL_PA_DECODE = EnvBool(False)
+    # gfx1250 aiter backend: prefix-free causal extend attention via FlyDSL FMHA (sliding window aware).
+    SGLANG_OPT_FLYDSL_EXTEND_ATTN = EnvBool(False)
+    # bf16 lm_head via aiter tgemm (Triton a16w16 on gfx1250) instead of torch.matmul / hipBLASLt.
+    SGLANG_OPT_AITER_LM_HEAD = EnvBool(False)
     # gfx1250 only: Laguna fp32 router logits via FlyDSL GEMV/WMMA for M <= 64 (F.linear otherwise).
     SGLANG_OPT_LAGUNA_ROUTER_FLYDSL = EnvBool(False)
     # M>64 router logits: split the fp32 weight into 3 bf16 residuals and run

@@ -89,6 +89,8 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
 )
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
+    forward_decode_vectorized_5d_flydsl,
+    forward_extend_vectorized_5d_flydsl,
     forward_extend_vectorized_5d,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -499,6 +501,10 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.use_flydsl_extend = (
+            envs.SGLANG_OPT_FLYDSL_EXTEND_ATTN.get()
+            and torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250")
+        )
         self.kv_index_translator = model_runner.kv_index_translator
 
         # sliding window attention. Resolve the SWA pool rather than reading it
@@ -525,6 +531,34 @@ class AiterAttnBackend(AttentionBackend):
             return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
+        self.use_flydsl_pa_decode = (
+            self.kv_cache_is_vectorized_5d and envs.SGLANG_OPT_FLYDSL_PA_DECODE.get()
+        )
+        # FlyDSL pa_decode state, refreshed once per decode step outside the graph:
+        # int32 seq_lens buffers and work plans keyed by batch size / (batch size, window).
+        self.use_flydsl_extend_fp8 = (
+            self.use_flydsl_extend and envs.SGLANG_OPT_FLYDSL_EXTEND_FP8.get()
+        )
+        self.flydsl_pa_plans = {}
+        self.flydsl_ctx_lens = {}
+        # (forward_metadata, sws, (token_index, cu_seqlens_k, max_seqlen_k)) for the 5D FlyDSL prefix extend.
+        self.flydsl_swa_window_cache = None
+        # Windows come from the layers themselves (model_runner.sliding_window_size can differ by one,
+        # e.g. Laguna sets sliding_window - 1 on its layers); FlyDSL windows count the query, hence + 1.
+        from sglang.srt.layers.radix_attention import RadixAttention as _RadixAttention
+
+        self.flydsl_pa_windows = tuple(
+            sorted(
+                {0}
+                | {
+                    m.sliding_window_size + 1
+                    for m in model_runner.model.modules()
+                    if isinstance(m, _RadixAttention)
+                    and m.sliding_window_size is not None
+                    and m.sliding_window_size > -1
+                }
+            )
+        )
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
@@ -1968,11 +2002,36 @@ class AiterAttnBackend(AttentionBackend):
             context_len=self.max_context_len,
         )
 
+    def _refresh_flydsl_pa_metadata(self, forward_batch: ForwardBatch) -> None:
+        # Runs outside graph capture, so first-sight allocations and plan builds are safe here.
+        if not self.use_flydsl_pa_decode or not forward_batch.forward_mode.is_decode():
+            return
+        from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+
+        bs = forward_batch.batch_size
+        ctx = self.flydsl_ctx_lens.get(bs)
+        if ctx is None:
+            ctx = torch.empty(bs, dtype=torch.int32, device=self.device)
+            self.flydsl_ctx_lens[bs] = ctx
+        ctx.copy_(forward_batch.seq_lens[:bs])
+        for window in self.flydsl_pa_windows:
+            plan = self.flydsl_pa_plans.get((bs, window))
+            if plan is None:
+                self.flydsl_pa_plans[(bs, window)] = plan_pa_decode(
+                    ctx,
+                    self.num_kv_head,
+                    max_partitions=1 if window else None,
+                    sliding_window=window,
+                )
+            else:
+                plan_pa_decode(ctx, self.num_kv_head, sliding_window=window, plan=plan)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._refresh_flydsl_pa_metadata(forward_batch)
         reset_verify_attn_plan_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
@@ -2012,6 +2071,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        self._refresh_flydsl_pa_metadata(forward_batch)
         reset_verify_attn_plan_cache()
 
         bs = forward_batch.batch_size
@@ -3675,6 +3735,49 @@ class AiterAttnBackend(AttentionBackend):
                 "different attention backend."
             )
 
+    def _can_run_flydsl_extend(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch, sinks
+    ) -> bool:
+        # FlyDSL reads only the fresh q/k/v (no block table), so every request must be prefix-free.
+        return (
+            self.use_flydsl_extend
+            and forward_batch.forward_mode.is_extend()
+            and not layer.is_cross_attention
+            and k is not None
+            and v is not None
+            and q.dtype == torch.bfloat16
+            and k.dtype == torch.bfloat16
+            and v.dtype == torch.bfloat16
+            and sinks is None
+            and self.logits_soft_cap == 0.0
+            and layer.logit_cap <= 0
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and not any(forward_batch.extend_prefix_lens_cpu)
+        )
+
+    def _forward_flydsl_extend(
+        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch, bs0: int
+    ):
+        from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+
+        sws = layer.sliding_window_size
+        # Same window as the triton backend: key j is kept for query i when i - j <= sliding_window_size.
+        window = (sws, 0) if sws is not None and sws > -1 else (-1, -1)
+        cu = self.forward_metadata.qo_indptr[:bs0].to(torch.int32)
+        o = flydsl_flash_attn_varlen_fwd(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+            v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+            cu,
+            cu,
+            self.forward_metadata.max_q_len,
+            self.forward_metadata.max_q_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=window,
+        )
+        return None if o is None else o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -4371,6 +4474,10 @@ class AiterAttnBackend(AttentionBackend):
                     layer.tp_q_head_num, layer.tp_k_head_num
                 )
             )
+            if self._can_run_flydsl_extend(q, k, v, layer, forward_batch, sinks):
+                o = self._forward_flydsl_extend(q, k, v, layer, forward_batch, bs0)
+                if o is not None:
+                    return o
 
             if (
                 envs.SGLANG_AITER_ASM_PREFILL_HD128.get()
@@ -4541,6 +4648,12 @@ class AiterAttnBackend(AttentionBackend):
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            if self.kv_cache_is_vectorized_5d and self.use_flydsl_extend:
+                o = forward_extend_vectorized_5d_flydsl(
+                    self, q, layer, forward_batch, bs0
+                )
+                if o is not None:
+                    return o
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
                     self,
@@ -4764,9 +4877,14 @@ class AiterAttnBackend(AttentionBackend):
                 # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
                 # (see :func:`aiter_utils.forward_decode_vectorized_5d`
                 # for the dispatch rationale).
-                forward_decode_vectorized_5d(
-                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
-                )
+                if self.use_flydsl_pa_decode:
+                    forward_decode_vectorized_5d_flydsl(
+                        self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                    )
+                else:
+                    forward_decode_vectorized_5d(
+                        self, q, layer, forward_batch, k_cache, v_cache, o, sinks
+                    )
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
