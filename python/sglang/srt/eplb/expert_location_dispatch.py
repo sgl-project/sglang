@@ -112,13 +112,11 @@ def topk_ids_logical_to_physical_and_record(
     load_buffer: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    dispatch = None
-    if info is not None:
-        if info.ep_dispatch_algorithm != "static":
-            return None
-        dispatch = info.partial_logical_to_rank_dispatch_physical_map
-        if dispatch is None:
-            return None
+    if info is not None and info.ep_dispatch_algorithm != "static":
+        return None
+    dispatch = (
+        info.partial_logical_to_rank_dispatch_physical_map if info is not None else None
+    )
     return eplb_map_and_record(topk_ids, dispatch, load_buffer, num_token_non_padded)
 
 
