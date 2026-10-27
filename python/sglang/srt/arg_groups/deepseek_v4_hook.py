@@ -5,6 +5,12 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     context_parallel_attn_dp_size,
@@ -18,12 +24,6 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.engram_config import (
-    EngramConfig,
-    EngramLookup,
-    EngramPlacement,
-    EngramReplication,
-)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,

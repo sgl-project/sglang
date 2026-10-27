@@ -37,6 +37,12 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -50,12 +56,6 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
-)
-from sglang.srt.layers.engram_config import (
-    EngramConfig,
-    EngramLookup,
-    EngramPlacement,
-    EngramReplication,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
