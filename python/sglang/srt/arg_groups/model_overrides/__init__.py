@@ -9,6 +9,7 @@ the order of the imports below. Keep each field owned by one family module.
 """
 
 from sglang.srt.arg_groups.model_overrides import bailing_moe_v3  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import beam  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v4  # noqa: F401

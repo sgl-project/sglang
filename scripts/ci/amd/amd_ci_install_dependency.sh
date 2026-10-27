@@ -56,12 +56,13 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000|-rocm1010)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
         *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
+        *-rocm1010) IMAGE_BASE_ARG_SUFFIX="_ROCM1010"; IMAGE_STAGE_SUFFIX="-rocm1010" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -93,11 +94,16 @@ unset IMAGE_GPU_ARCH
 # srt_hip pins compressed-tensors below the version required by torch 2.11.
 if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
+elif [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm1010" ]]; then
+  # ROCm 10.1 ships torch 2.12.
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm101}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
-# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files.
+# pip running as root disables the cache unless the cache dir itself is owned by root; it
+# never checks the entries beneath it. Simply changing folder permissions reduces chown runtime.
+docker exec ci_sglang chown root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
@@ -229,20 +235,20 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
+# When the image's checkout is already at the pin the reinstall is redundant.
+MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
+IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
+if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
+  echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
+elif docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
-  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
   if [[ -z "${MORI_COMMIT}" ]]; then
     echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
     exit 1
   fi
 
-  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    MORI_GPU_ARCHS="gfx950"
-  else
-    MORI_GPU_ARCHS="gfx942"
-  fi
+  MORI_GPU_ARCHS="${IMAGE_GFX}"
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
   # Only the rocm724 and rocm1000 (noble) bases attempt to install

@@ -20,15 +20,18 @@ here in the new region-spec shape and asserted against the same expected
 output dicts. Any divergence indicates a regression in the new executor."""
 
 import copy
+import json
 import random
 import unittest
+from unittest import mock
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 cohere_template = {
@@ -953,7 +956,7 @@ def _chunk_random(text: str, rng: random.Random):
     yield text[prev:]
 
 
-class ResponseEventStreamTest(unittest.TestCase):
+class ResponseEventStreamTest(CustomTestCase):
     def test_stream_matches_whole_string_all_templates_fixed_chunking(self):
         """For every fixed chunking step we try, the streamed finalize()
         output must equal the whole-string parse. Regression coverage for
@@ -1066,16 +1069,17 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertIn("tool_calls", per_field_close_value)
 
     def test_dirty_flag_marks_structured_regions(self):
-        """A template with one text field and one structured field per parser
-        family: text/int/float/bool stream chunks with `dirty=False`, while
-        json/xml-inline/kv-lines stream chunks with `dirty=True`, and those
-        dirty chunks concatenate to the raw region body before parsing."""
+        """Only plain text without a `transform` streams `dirty=False` chunks; int/float/bool,
+        structured parsers and transforms stream dirty chunks of the raw region body."""
         spec = {
             "defaults": {"role": "assistant"},
             "start_anchor": "<|assistant|>",
             "fields": {
                 "thinking": {"open": "<t>", "close": "</t>", "content": "text"},
                 "score": {"open": "<n>", "close": "</n>", "content": "int"},
+                "ratio": {"open": "<f>", "close": "</f>", "content": "float"},
+                "flag": {"open": "<b>", "close": "</b>", "content": "bool"},
+                "labeled": {"open": "<l>", "close": "</l>", "transform": {"label": "{content}"}},
                 "json_call": {"open": "<j>", "close": "</j>", "content": "json"},
                 "xml_call": {
                     "open": "<x>",
@@ -1090,7 +1094,10 @@ class ResponseEventStreamTest(unittest.TestCase):
                 },
             },
         }
-        text = '<t>hello world</t><n>42</n><j>{"a": 1, "b": 2}</j><x><name=foo><age=10></x><kv>k1: v1\nk2: v2</kv>'
+        text = (
+            "<t> hello world </t><n>42</n><f>0.5</f><b>true</b><l>tag</l>"
+            '<j>{"a": 1, "b": 2}</j><x><name=foo><age=10></x><kv>k1: v1\nk2: v2</kv>'
+        )
         # Drive byte-by-byte to maximise chunk count.
         streamer = ResponseParser(spec, prefix="")
         events: list[dict] = []
@@ -1101,22 +1108,24 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         per_field_chunks: dict[str, list[str]] = {}
         per_field_dirty: dict[str, set[bool]] = {}
+        per_field_close_value: dict[str, object] = {}
         for ev in events:
             if ev["type"] == "region_chunk":
                 per_field_chunks.setdefault(ev["field"], []).append(ev["text"])
                 per_field_dirty.setdefault(ev["field"], set()).add(ev["dirty"])
+            elif ev["type"] == "region_close":
+                per_field_close_value[ev["field"]] = ev["value"]
 
-        # Clean (streamable) regions.
-        for field in ("thinking", "score"):
-            self.assertEqual(per_field_dirty[field], {False}, f"{field} should be clean")
-        # Dirty (structured) regions.
-        for field in ("json_call", "xml_call", "kv_call"):
+        self.assertEqual(per_field_dirty["thinking"], {False}, "thinking should be clean")
+        for field in ("score", "ratio", "flag", "labeled", "json_call", "xml_call", "kv_call"):
             self.assertEqual(per_field_dirty[field], {True}, f"{field} should be dirty")
 
         # Dirty chunks reconstruct the raw region body (un-parsed). Clean
         # chunks reconstruct the verbatim body too: stripping happens at close.
-        self.assertEqual("".join(per_field_chunks["thinking"]), "hello world")
+        self.assertEqual("".join(per_field_chunks["thinking"]), " hello world ")
+        self.assertEqual(per_field_close_value["thinking"], "hello world")
         self.assertEqual("".join(per_field_chunks["score"]), "42")
+        self.assertEqual(per_field_close_value["labeled"], {"label": "tag"})
         self.assertEqual("".join(per_field_chunks["json_call"]), '{"a": 1, "b": 2}')
         self.assertEqual("".join(per_field_chunks["xml_call"]), "<name=foo><age=10>")
         self.assertEqual("".join(per_field_chunks["kv_call"]), "k1: v1\nk2: v2")
@@ -1158,6 +1167,137 @@ class ResponseEventStreamTest(unittest.TestCase):
         # Only the default fields should remain; nothing else is required.
         self.assertEqual(result, {"role": "assistant"})
         self.assertEqual(final_events, [])
+
+    def test_region_events_expose_delimiter_offsets(self):
+        spec = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content_args": {"strip": False}},
+                "tag": {"open_pattern": r"<tag id=\d+>", "close": "</tag>"},
+            },
+        }
+        text = "plain<tag id=7>body</tag>tail"
+        expected = [
+            {"type": "region_open", "field": "content", "start": 0, "end": 0},
+            {"type": "region_close", "field": "content", "start": 5, "end": 5, "value": "plain"},
+            {"type": "region_open", "field": "tag", "start": 5, "end": 15, "captures": {}},
+            {"type": "region_close", "field": "tag", "start": 19, "end": 25, "value": "body"},
+            {"type": "region_open", "field": "content", "start": 25, "end": 25},
+            {"type": "region_close", "field": "content", "start": 29, "end": 29, "value": "tail"},
+        ]
+        for prefix_len in (0, len("plain<tag")):
+            generated = text[prefix_len:]
+            chunkings = [[generated], list(generated)]
+            chunkings += [[generated[:i], generated[i:]] for i in range(1, len(generated))]
+            for chunks in chunkings:
+                with self.subTest(prefix=text[:prefix_len], chunks=chunks):
+                    parser = ResponseParser(spec, prefix="<assistant>" + text[:prefix_len])
+                    events = parser.initial_events + [event for chunk in chunks for event in parser.feed(chunk)]
+                    events += parser.finalize()[1]
+                    self.assertEqual(parser.input_text, text)
+                    self.assertEqual([event for event in events if event["type"] != "region_chunk"], expected)
+
+    def test_open_captures_and_prefix_boundary(self):
+        spec = {
+            "start_anchor": "[BEGIN]",
+            "fields": {
+                "tool_calls": {
+                    "open_pattern": r"<call:(?P<name>\w+)>",
+                    "close": "</call>",
+                    "content": "json",
+                    "transform": {"name": "{name}", "arguments": "{content}"},
+                }
+            },
+        }
+        parser = ResponseParser(spec, prefix="history[BEGIN]<call:get_")
+        prefix_end = len(parser.input_text)
+        opening = parser.feed('weather>{"city":"Paris"}')[0]
+
+        self.assertEqual(prefix_end, len("<call:get_"))
+        self.assertEqual((opening["type"], opening["start"], opening["end"]), ("region_open", 0, len("<call:get_weather>")))
+        self.assertEqual(opening["captures"], {"name": "get_weather"})
+        opening["captures"]["name"] = "edited"
+        self.assertEqual(parser.feed("</call>")[-1]["value"]["name"], "get_weather")
+
+    def test_held_prefix_bytes_are_not_rechunked(self):
+        spec = {"start_anchor": "[BEGIN]", "fields": {"content": {}, "tag": {"open": "<tag>", "close": "</tag>"}}}
+        parser = ResponseParser(spec, prefix="[BEGIN]Existing <")
+        chunks = [event["text"] for event in parser.feed("b> tail") if event["type"] == "region_chunk"]
+        message, _ = parser.finalize()
+
+        self.assertEqual(chunks, ["b> tail"])
+        self.assertEqual(message["content"], "Existing <b> tail")
+
+    def test_malformed_region_events_recover_and_continue(self):
+        spec = {
+            "start_anchor": "[BEGIN]",
+            "fields": {
+                "tool_calls": {
+                    "open_pattern": r"<call:(?P<name>\w+)>",
+                    "close": "</call>",
+                    "content": "json",
+                    "repeats": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {"name": "{name}", "arguments": "{content}"},
+                    },
+                }
+            },
+        }
+        parser = ResponseParser(spec, prefix="")
+        events = parser.feed('<call:bad>{"x":</call><call:good>{"x":1}</call>')
+        message, _ = parser.finalize()
+        opening, malformed = events[0], events[2]
+
+        self.assertEqual(malformed["type"], "region_malformed")
+        self.assertIsInstance(malformed["error"], ValueError)
+        self.assertEqual(parser.input_text[opening["end"] : malformed["start"]], '{"x":')
+        self.assertEqual(parser.input_text[malformed["start"] : malformed["end"]], "</call>")
+        self.assertEqual(
+            message["tool_calls"],
+            [{"type": "function", "function": {"name": "good", "arguments": {"x": 1}}}],
+        )
+
+        parser = ResponseParser(spec, prefix="")
+        parser.feed('<call:bad>{"x":')
+        _, events = parser.finalize()
+        self.assertEqual(events[-1]["type"], "region_malformed")
+        self.assertEqual(events[-1]["start"], len(parser.input_text))
+
+        deep = "[" * 20000
+        tools = [{"type": "function", "function": {"name": "good", "parameters": {"properties": {"x": {"type": "array"}}}}}]
+        parser = ResponseParser(spec, prefix="", tools=tools)
+        events = parser.feed(f'<call:bad>{deep}</call><call:good>{{"x": "{deep}"}}</call>')
+        message, _ = parser.finalize()
+        self.assertEqual(events[2]["type"], "region_malformed")
+        self.assertIsInstance(events[2]["error"], ValueError)
+        self.assertEqual(message["tool_calls"], [{"type": "function", "function": {"name": "good", "arguments": {"x": deep}}}])
+
+    def test_parse_response_raises_for_malformed_region(self):
+        spec = {
+            "start_anchor": "<|assistant|>",
+            "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json"}},
+        }
+        with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+            parse_response('<x>{"name":', spec, prefix="")
+        with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+            parse_response("", spec, prefix='<|assistant|><x>{"name":</x>')
+
+        required = {
+            "start_anchor": "<|assistant|>",
+            "fields": {
+                "x": {"open": "<x>", "close": "</x>", "content": "json", "optional": False},
+                "y": {"open": "<y>", "close": "</y>", "optional": False},
+                "n": {"open": "<n>", "close": "</n>", "content": "int"},
+            },
+        }
+        for prefix, text in [("", "<x>{</x>"), ("<|assistant|><x>{</x>", ""), ("", "<x>{"), ("", "<x>{</x><n>a</n>")]:
+            with self.subTest(prefix=prefix, text=text), self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+                parse_response(text, required, prefix=prefix)
+        parser = ResponseParser(required, prefix="")
+        parser.feed("<x>{</x>")
+        with self.assertRaisesRegex(ValueError, r"missing from parsed output: \['y'\]"):
+            parser.finalize()
 
 
 class PrefixAndTruncationTest(unittest.TestCase):
@@ -1323,7 +1463,7 @@ class PrefixAndTruncationTest(unittest.TestCase):
         """Post-truncation prefix ends mid-delimiter. The first feed completes
         the match; initial_events is empty (no region opened within the
         prefix yet) and the open fires from `feed()`."""
-        prefix = "<|im_start|>assistant\n<thi"  # incomplete `<think>`
+        prefix = "<|im_start|>assistant\n<thi"  # incomplete `<think>`  # codespell:ignore
         stream = ResponseParser(qwen3_template, prefix=prefix)
         self.assertEqual(stream.initial_events, [])
         events = stream.feed("nk>real body</think>")
@@ -1446,6 +1586,14 @@ class ToolArgCoercionTest(unittest.TestCase):
     def test_coerce_falls_back_to_raw_on_failure(self):
         self.assertEqual(_coerce("not-a-number", ("integer",)), "not-a-number")
 
+    def test_coerce_integer_accepts_whole_number_floats(self):
+        self.assertEqual(_coerce("3.0", ("integer",)), 3)
+        self.assertIsInstance(_coerce("3.0", ("integer",)), int)
+        self.assertEqual(_coerce("3.5", ("integer",)), "3.5")
+        self.assertEqual(_coerce("3.5", ("integer", "number")), 3.5)
+        self.assertEqual(_coerce("inf", ("integer",)), "inf")
+        self.assertEqual(_coerce("NaN", ("integer",)), "NaN")
+
     def test_coerce_handles_any_of_and_null(self):
         self.assertEqual(_coerce("5", ("integer", "null")), 5)
         self.assertIsNone(_coerce("null", ("integer", "null")))
@@ -1456,6 +1604,26 @@ class ToolArgCoercionTest(unittest.TestCase):
             self.assertEqual(_coerce(raw, ("boolean",)), expected)
         # Non-boolean text stays a string rather than silently becoming False.
         self.assertEqual(_coerce("maybe", ("boolean",)), "maybe")
+
+    def test_coerce_number_keeps_large_integers_exact(self):
+        for raw in ("9007199254740993", "-9007199254740993"):
+            self.assertEqual(_coerce(raw, ("number",)), int(raw))
+
+    def test_coerce_string_union_keeps_text_that_is_not_json_of_another_type(self):
+        # Any text is a valid string, so text that only a permissive cast would accept stays a string ...
+        for raw, types in [("007", ("string", "integer")), ("123_456", ("integer", "string")), (" 7", ("string", "integer")),
+                           ("1", ("string", "boolean")), ("True", ("string", "boolean")), ("None", ("string", "null"))]:
+            self.assertEqual(_coerce(raw, types), raw)
+        # ... while exact JSON of another declared type keeps its precedence.
+        self.assertEqual(_coerce("7", ("string", "integer")), 7)
+        self.assertIs(_coerce("true", ("string", "boolean")), True)
+        self.assertIsNone(_coerce("null", ("string", "null")))
+
+    def test_coerce_keeps_text_when_json_decoding_hits_the_recursion_limit(self):
+        # How deeply JSON must nest to exhaust the decoder depends on the Python version.
+        with mock.patch("json.loads", side_effect=RecursionError):
+            for types in [("array",), ("object",)]:
+                self.assertEqual(_coerce("[[1]]", types), "[[1]]")
 
     def test_coerce_object_array_require_matching_json(self):
         # A JSON object body is only accepted for an `object` param, a JSON array only for `array`.
@@ -1636,6 +1804,88 @@ class ToolArgCoercionTest(unittest.TestCase):
         with_tools = parse_response(model_out, cohere_template, prefix="", tools=_SET_ALARM_TOOLS)
         self.assertEqual(without, with_tools)
         self.assertEqual(_first_tool_args(with_tools), {"hour": 7, "enabled": True})
+
+    def test_json_strings_stay_strings_where_the_schema_allows_one(self):
+        # A decoded JSON string is explicit, so a string union keeps it, while other params still cast it ...
+        tools = _set_alarm_tools(label={"type": ["string", "integer"]}, hour={"type": "integer"})
+        json_body = '<tool_call>{"name": "set_alarm", "arguments": {"label": "123", "hour": "7"}}</tool_call>'
+        json_values = (
+            "<tool_call>\n<function=set_alarm>\n"
+            '<parameter=label>\n"123"\n</parameter>\n'
+            '<parameter=hour>\n"7"\n</parameter>\n'
+            "</function>\n</tool_call>"
+        )
+        for model_out, template in [(json_body, smollm_template), (json_values, qwen3_template)]:
+            with self.subTest(model_out=model_out):
+                parsed = parse_response(model_out, template, prefix="", tools=tools)
+                self.assertEqual(_first_tool_args(parsed), {"label": "123", "hour": 7})
+        # ... unlike raw text, which could be either type.
+        raw_text = "<tool_call>\n<function=set_alarm>\n<parameter=label>\n123\n</parameter>\n</tool_call>"
+        parsed = parse_response(raw_text, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=tools)
+        self.assertEqual(_first_tool_args(parsed), {"label": 123})
+
+
+_CALL_TRANSFORM = {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}}
+_JSON_BODY_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {"tool_calls": {"open_pattern": r"<call:(?P<name>\w+)>", "close": "</call>", "repeats": True, "content": "json", "transform": _CALL_TRANSFORM}},
+}
+_XML_BODY_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {"tool_calls": {
+        "open_pattern": r"<call:(?P<name>\w+)>", "close": "</call>", "repeats": True, "content": "xml-inline",
+        "content_args": {"tag_pattern": r'<p name="(?P<key>[^"]+)">(?P<value>.*?)</p>'}, "transform": _CALL_TRANSFORM,
+    }},
+}
+_QUOTED_END_TEMPLATE = copy.deepcopy(_XML_BODY_TEMPLATE)
+_QUOTED_END_TEMPLATE["fields"]["tool_calls"]["content_args"]["tag_pattern"] = r'<arg:(?P<key>\w+)>(?P<value>.*?)"X'
+_OBJECT_TOOLS = [{"type": "function", "function": {"name": "f", "strict": True, "parameters": {"type": "object", "properties": {
+    "obj": {"type": "object"}, "v": {"type": "object"}, "w": {"type": "object"}}}}}]
+
+
+class ConstrainedToolBodyTest(CustomTestCase):
+    """Under a grammar that keeps tool-call bodies well-formed, a closer inside a JSON string, a strict tool's JSON
+    value or a parameter name is part of the call; without it the first closer still ends the call."""
+
+    def _calls(self, template, chunks, constrained, tools=None):
+        parser = ResponseParser(template, prefix="", tools=tools, constrained=constrained)
+        for chunk in chunks:
+            parser.feed(chunk)
+        message, _ = parser.finalize()
+        return [(call["function"]["name"], call["function"]["arguments"]) for call in message.get("tool_calls", [])]
+
+    def test_closers_inside_bodies_are_content_only_under_the_grammar(self):
+        """A quote in a parameter's end must not let a JSON value absorb the parameters
+        after it."""
+        cases = [
+            (_JSON_BODY_TEMPLATE, '<call:f>{"a": "x</call>y"}</call>', None, [("f", {"a": "x</call>y"})], []),
+            (_XML_BODY_TEMPLATE, '<call:f><p name="obj">{"a": "x</p></call>y"}</p></call>', _OBJECT_TOOLS,
+             [("f", {"obj": {"a": "x</p></call>y"}})], [("f", {"obj": '{"a": "x'})]),
+            (_XML_BODY_TEMPLATE, '<call:f><p name="a</call>b">x</p></call>', None, [("f", {"a</call>b": "x"})], [("f", {})]),
+            (_QUOTED_END_TEMPLATE, '<call:f><arg:v>{"x": "a\\"Xb"}"X<arg:w>{"x": "</call>"}"X</call>', _OBJECT_TOOLS,
+             [("f", {"v": {"x": 'a"Xb'}, "w": {"x": "</call>"}})], [("f", {"v": '{"x": "a\\'})]),
+            (_QUOTED_END_TEMPLATE, '<call:f><arg:v>{"x": "Xy"}"X<arg:w>{}"X</call>', _OBJECT_TOOLS,
+             [("f", {"v": {"x": "Xy"}, "w": {}})], [("f", {"v": '{"x": ', "w": {}})]),
+        ]
+        for template, text, tools, constrained, unconstrained in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self._calls(template, [text], False, tools), unconstrained)
+                # Every split of the stream reads the same calls as the whole text.
+                for chunks in [[text[:i], text[i:]] for i in range(len(text))] + [list(text)]:
+                    self.assertEqual(self._calls(template, chunks, True, tools), constrained, chunks)
+
+    def test_body_cut_off_under_the_grammar_yields_no_call(self):
+        # A length cut leaves a well-formed body open, so it yields no call.
+        self.assertEqual(self._calls(_JSON_BODY_TEMPLATE, ['<call:f>{"a": "x</call>'], True), [])
+
+    def test_json_completion_distinguishes_quote_closers(self):
+        template = copy.deepcopy(_JSON_BODY_TEMPLATE)
+        template["fields"]["tool_calls"]["close"] = '"END'
+        for value in ({"x": '"END'}, ['"END'], '"END', 7, True, None):
+            text = '<call:f>' + json.dumps(value) + '"END'
+            for chunks in [[text[:i], text[i:]] for i in range(len(text))] + [list(text)]:
+                with self.subTest(value=value, chunks=chunks):
+                    self.assertEqual(self._calls(template, chunks, True), [("f", value)])
 
 
 if __name__ == "__main__":
