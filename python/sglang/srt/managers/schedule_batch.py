@@ -2456,15 +2456,15 @@ def retract_decode(
         else:
             # No backup exists and the device KV is already freed, so the
             # request cannot resume.
-            if get_disagg().disaggregation_decode_retraction_backup == "none":
+            if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+                message = "Retraction host KV pool exhausted. Aborting the request."
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            else:
                 message = (
                     "Retracted under decode memory pressure without a KV "
                     "backup. Retry later."
                 )
                 status_code = HTTPStatus.SERVICE_UNAVAILABLE
-            else:
-                message = "Retraction host KV pool exhausted. Aborting the request."
-                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
             req.to_finish = FINISH_ABORT(message, status_code=status_code)
             reqs_to_abort.append(req)
             logger.warning("retract_decode: aborted request %s: %s", req.rid, message)
