@@ -1,10 +1,14 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
+    MockMLAModelRunner,
+    TinyMLAModelConfig,
     make_mla_cases,
     run_mla_attention_case,
 )
@@ -110,6 +114,62 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
+
+    def test_ragged_prefill_head_dims_without_cutlass_kernel(self):
+        """GLM-4.7-Flash style MLA (qk 256, vo 256) has no SM100 CUTLASS kernel."""
+        num_heads, num_tokens = 4, 37
+        case = MLAAttentionCase(
+            name="ragged_prefill_qk256_vo256",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=num_heads,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(num_tokens,),
+        )
+        model_config = TinyMLAModelConfig(
+            num_heads=num_heads,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            hidden_size=1024,
+            context_len=128,
+        )
+        model_config.qk_nope_head_dim = 192
+        model_config.v_head_dim = 256
+        runner = MockMLAModelRunner(
+            case=case,
+            model_config=model_config,
+            dtype=torch.bfloat16,
+            device="cuda",
+            max_context_len=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        wrapper = FlashInferMLAAttnBackend(runner).prefill_wrapper_ragged
+
+        qo_indptr = torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda")
+        wrapper.begin_forward(
+            qo_indptr=qo_indptr,
+            kv_indptr=qo_indptr,
+            num_qo_heads=num_heads,
+            num_kv_heads=num_heads,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            q_data_type=torch.bfloat16,
+            causal=True,
+        )
+        q, k, v = (
+            torch.randn(num_tokens, num_heads, 256, dtype=torch.bfloat16, device="cuda")
+            for _ in range(3)
+        )
+        out = wrapper.forward(q, k, v, causal=True, sm_scale=256**-0.5)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(0, 1).float(),
+            k.transpose(0, 1).float(),
+            v.transpose(0, 1).float(),
+            is_causal=True,
+        ).transpose(0, 1)
+        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
 
     # Layout-robustness. See dense/test_triton.py for the full
     # rationale. FlashInfer MLA crashes with
