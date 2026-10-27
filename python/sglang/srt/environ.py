@@ -1147,6 +1147,8 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    # Disable for operators whose internal-format path cannot be graph captured.
+    SGLANG_NPU_ALLOW_INTERNAL_FORMAT = EnvBool(True)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time so arch35 (Atlas A5) dense linears run on the native quantized

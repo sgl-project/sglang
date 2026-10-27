@@ -175,16 +175,27 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         else:
             skip_guard_context = empty_context()
 
-        with (
-            skip_guard_context,
-            torch.npu.graph(
-                graph,
-                pool=pool,
-                stream=stream,
-                auto_dispatch_capture=True,
-            ),
-        ):
-            out = run_once_fn()
+        try:
+            with (
+                skip_guard_context,
+                torch.npu.graph(
+                    graph,
+                    pool=pool,
+                    stream=stream,
+                    auto_dispatch_capture=True,
+                ),
+            ):
+                out = run_once_fn()
+        except RuntimeError as e:
+            if (
+                "Cannot run aclop operators during NPU graph capture" in str(e)
+                and envs.SGLANG_NPU_ALLOW_INTERNAL_FORMAT.get()
+            ):
+                raise RuntimeError(
+                    f"{e}\nTry setting SGLANG_NPU_ALLOW_INTERNAL_FORMAT=0 "
+                    "before starting the server."
+                ) from e
+            raise
         return out
 
     def _get_update_attr_name(self):

@@ -222,7 +222,9 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+        torch_npu.npu.config.allow_internal_format = (
+            envs.SGLANG_NPU_ALLOW_INTERNAL_FORMAT.get()
+        )
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
