@@ -27,6 +27,7 @@ from ..common.nvfp4 import Nvfp4Cache
 from ..common.nvfp4_gfx950 import fits_buffer_offsets
 from ..common.out_quant_gfx950 import store_fp8_out
 from ..common.utils import robust_allocator, sparse_out_dtype
+from .topk_sparse import _merge_topk_attn_out_kernel
 
 _LOG2E = 1.4426950408889634
 _LN2 = gl.constexpr(0.6931471805599453)
@@ -648,8 +649,6 @@ def flash_decode_nvfp4_gfx950(
     back already quantized for the o_proj as ``(fp8 [batch_size, num_q_heads * 128],
     scale)``, the bytes of the separate quant.
     """
-    from .topk_sparse import _merge_topk_attn_out_kernel
-
     triton.set_allocator(robust_allocator)
     batch_size, num_q_heads, head_dim = q.shape
     page_size = k_cache.page_size
