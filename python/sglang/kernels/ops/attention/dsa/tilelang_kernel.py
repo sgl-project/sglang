@@ -72,6 +72,28 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     return 1
 
 
+@lru_cache(maxsize=8)
+def _pick_h_per_block(
+    *,
+    seq: int,
+    num_heads: int,
+    n_groups: int,
+    cu: int,
+    block_per_cu: int,
+) -> int:
+    # Largest tile that still fills the grid. A tile wider than num_heads pads
+    # rows without shrinking the grid, so candidates stop at num_heads.
+    exact = [h for h in (64, 32, 16) if h <= num_heads and num_heads % h == 0]
+    for h in exact:
+        head_blocks = (num_heads + h - 1) // h
+        if seq * head_blocks * n_groups >= cu * block_per_cu:
+            return h
+    if exact:
+        return exact[-1]
+    # No tile-sized divisor; take the smallest tile that covers num_heads.
+    return min((h for h in (16, 32, 64) if num_heads <= h), default=64)
+
+
 @tilelang.jit(
     out_idx=[-1],
     pass_configs={
@@ -911,6 +933,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     block_I=64,
     inner_iter=1,
     threads=256,
+    h_per_block=16,
 ):
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
@@ -940,11 +963,10 @@ def sparse_mla_fwd_decode_partial_fp8(
     else:
         sm_scale = sm_scale * 1.44269504
 
-    h_per_block = 16
-    # Match bf16 partial behavior: keep fixed 16-head tiles and use
-    # sliced T.copy on H0:H1 for tail handling.
+    # KV gather has no head index, so a wider tile reuses one row across heads.
+    # Sliced T.copy on H0:H1 still handles a tail shorter than the tile.
     assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
-        "num_heads must be <=16 or divisible by 16"
+        f"num_heads={num_heads} is not divisible by h_per_block={h_per_block}"
     )
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
@@ -1205,6 +1227,16 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            # Tuned on gfx950 only; other targets keep the fixed 16-head tile.
+            h_per_block = 16
+            if _is_gfx95_supported:
+                h_per_block = _pick_h_per_block(
+                    seq=q.shape[0],
+                    num_heads=num_heads,
+                    n_groups=ni // inner_iter,
+                    cu=cu,
+                    block_per_cu=block_per_cu,
+                )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1214,6 +1246,7 @@ def tilelang_sparse_fwd(
                 block_I=block_I,
                 inner_iter=inner_iter,
                 threads=threads,
+                h_per_block=h_per_block,
             )
         else:
             if _is_gfx95_supported:

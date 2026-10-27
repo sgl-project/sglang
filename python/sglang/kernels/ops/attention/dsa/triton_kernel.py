@@ -10,6 +10,7 @@ def _get_valid_kv_indices_kernel(
     kv_indices_ptr,  # [bs * topk] output buffer
     bs: tl.constexpr,
     topk: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
     """
     Extract valid indices (non -1) from page_table into kv_indices.
@@ -20,10 +21,13 @@ def _get_valid_kv_indices_kernel(
     # Get the start position for this batch in kv_indices
     dst_start = tl.load(kv_indptr_ptr + batch_id)
 
-    # Load all topk indices for this batch
+    # tl.arange needs a power-of-2 extent. topk is 1 only at index_kpool == 1,
+    # so pad to BLOCK_TOPK and treat the overhang as the -1 compaction drops.
     src_offset = batch_id * topk
-    offsets = tl.arange(0, topk)
-    indices = tl.load(page_table_ptr + src_offset + offsets)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    indices = tl.load(
+        page_table_ptr + src_offset + offsets, mask=offsets < topk, other=-1
+    )
 
     # Count valid indices and compact them
     mask = indices != -1
@@ -60,4 +64,5 @@ def get_valid_kv_indices(
         kv_indices,
         bs,
         topk,
+        BLOCK_TOPK=triton.next_power_of_2(topk),
     )

@@ -356,13 +356,16 @@ class TestGlm5NextGate(_FusionGateCase):
                 tp_size=tp_size,
             )
 
-    def test_exact_tp4_and_tp8_contract_is_admitted(self):
-        for tp_size in (4, 8):
+    def test_exact_tp1_tp4_and_tp8_contract_is_admitted(self):
+        # TP1 is unsharded, so the shared expert already matches one routed expert.
+        for tp_size in (1, 4, 8):
             with self.subTest(tp_size=tp_size):
                 self.assertIsNone(self._reason_on_gfx950(tp_size=tp_size))
 
     def test_unvalidated_tp_and_expert_geometry_are_rejected(self):
-        self.assertIn("TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+        # "TP4 and TP8" is a substring of "TP1, TP4 and TP8", so match the whole set.
+        self.assertIn("TP1, TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+        self.assertIsNotNone(self._reason_on_gfx950(tp_size=3))
         self.assertIn(
             "E=288/topk=8",
             self._reason_on_gfx950(config=self._config(n_routed_experts=256)),

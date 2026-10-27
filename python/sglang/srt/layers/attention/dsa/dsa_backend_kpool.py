@@ -51,6 +51,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
+            # Deliberately omits aiter: its extend is dense over the full page
+            # table, so a kpool tail OOMs there.
             or dsa_impl in ("fa3", "tilelang", "trtllm")
         ):
             return

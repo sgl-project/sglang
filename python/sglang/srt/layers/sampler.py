@@ -61,6 +61,10 @@ if is_musa() or is_xpu():
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+# Descending prefix the torch top-p path sorts on ROCm. Arbitrary; wide enough
+# to hold the nucleus at usual top_p on a 150K vocabulary.
+_TOP_P_SORT_PREFIX = 2048
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
@@ -805,20 +809,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     max_top_k, when given, must be >= every value in top_ks.
     """
-    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
-    # leading columns carry all the mass that survives and sorting only those is
-    # exact. The seeded path keeps the full sort because the order of tied
-    # probabilities may depend on k, which is a batch-wide value, and
-    # deterministic inference must not depend on the batch composition.
-    if (
-        max_top_k is not None
-        and max_top_k < probs.shape[-1]
-        and sampling_seed is None
-        and not return_filtered_probs
-    ):
-        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
-    else:
-        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # Seeded sampling and return_filtered_probs keep the full sort: tie order
+    # can depend on the batch-wide top-k, and the returned permutation is full width.
+    width = None
+    if sampling_seed is None and not return_filtered_probs:
+        width = _descending_prefix_width(
+            vocab_size=probs.shape[-1], max_top_k=max_top_k
+        )
+    probs_sort, probs_idx = _sort_descending_prefix(probs=probs, width=width)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
         torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
@@ -1004,16 +1002,42 @@ def sampling_from_probs_torch(
     return batch_next_token_ids
 
 
+def _descending_prefix_width(
+    vocab_size: int, max_top_k: Optional[int] = None
+) -> Optional[int]:
+    """Columns to keep before a full sort. None sorts the vocabulary.
+
+    max_top_k is exact. Otherwise the ROCm prefix applies when it is shorter.
+    """
+    if max_top_k is not None and 0 < max_top_k < vocab_size:
+        return max_top_k
+    # The prefix is exact only while it covers top_p, so it stays on the ROCm
+    # path it was measured on; every other target keeps the full sort.
+    if _is_hip and 0 < _TOP_P_SORT_PREFIX < vocab_size:
+        return _TOP_P_SORT_PREFIX
+    return None
+
+
+def _sort_descending_prefix(
+    probs: torch.Tensor, width: Optional[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if width is None:
+        return probs.sort(dim=-1, descending=True)
+    return torch.topk(probs, k=width, dim=-1, sorted=True)
+
+
 def top_p_normalize_probs_torch(
     probs: torch.Tensor,
     top_ps: torch.Tensor,
 ):
-    # See also top_k_top_p_min_p_sampling_from_probs_torch
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # See also top_k_top_p_min_p_sampling_from_probs_torch.
+    # Scatter into a full-vocab row; probs_sort may be only the prefix.
+    width = _descending_prefix_width(vocab_size=probs.shape[-1])
+    probs_sort, probs_idx = _sort_descending_prefix(probs=probs, width=width)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
 
 
 def apply_custom_logit_processor(
