@@ -100,6 +100,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+    topk_ids_logical_to_physical_and_record,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -2627,17 +2628,32 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
-            # A remap table indexed by -1 aliases its last entry, so only the
-            # identity-remap branch may drop the padded-row mask.
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids,
-                expert_location_dispatch_info,
-                (
-                    None
-                    if padded_rows_masked and expert_location_dispatch_info is None
-                    else num_token_non_padded
-                ),
-            )
+            fused_topk_ids = None
+            recorder = get_global_expert_distribution_recorder()
+            load_buffer = recorder.get_current_pass_count_buffer()
+            if load_buffer is not None:
+                fused_topk_ids = topk_ids_logical_to_physical_and_record(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    load_buffer,
+                    num_token_non_padded,
+                )
+            if fused_topk_ids is not None:
+                topk_ids = fused_topk_ids
+                _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+                recorder_was_fused = True
+            else:
+                # A remap table indexed by -1 aliases its last entry, so only the
+                # identity-remap branch may drop the padded-row mask.
+                topk_ids = _biased_grouped_topk_postprocess(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    (
+                        None
+                        if padded_rows_masked and expert_location_dispatch_info is None
+                        else num_token_non_padded
+                    ),
+                )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded
@@ -2663,17 +2679,12 @@ def _post_process_topk_ids(
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-            and layer_id is not None
         ):
-            from sglang.srt.eplb.eplb_map_record_fused import (
-                eplb_map_and_record_fused,
-            )
-
             if get_moe_a2a_backend().is_megamoe():
                 recorder = get_global_expert_distribution_recorder()
-                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                load_buffer = recorder.get_current_pass_count_buffer()
                 if load_buffer is not None:
-                    fused_topk_ids = eplb_map_and_record_fused(
+                    fused_topk_ids = topk_ids_logical_to_physical_and_record(
                         topk_ids,
                         expert_location_dispatch_info,
                         load_buffer,
