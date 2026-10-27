@@ -3,8 +3,6 @@ name: CI Pipeline
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
-  pull_request_review:
-    types: [submitted]
 
 permissions:
   contents: read
@@ -16,28 +14,24 @@ permissions:
 
 concurrency:
   # Metadata events never preempt active CI. A run-ci grant queues in the PR
-  # group; other label events and reviews are isolated and do not run PPU work.
+  # group; other label events are isolated and do not run PPU work. Human
+  # Review has a separate workflow and cannot hold this group while waiting.
   group: >-
     ci-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{
-    ((github.event_name == 'pull_request_review' &&
-    (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
-    (github.event_name == 'pull_request' &&
-    (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-    !(github.event.action == 'labeled' && github.event.label.name == 'run-ci'))) && github.run_id || 'active' }}
+    ((github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+    !(github.event.action == 'labeled' && github.event.label.name == 'run-ci')) && github.run_id || 'active' }}
   # Only code-affecting events preempt active CI; metadata transitions such as
   # ready_for_review/converted_to_draft must not cancel running jobs.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened') && github.run_attempt == 1 }}
+  cancel-in-progress: ${{ (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened') && github.run_attempt == 1 }}
 
 jobs:
   # Stage 1: 密钥扫描预检（组织级 reusable workflow）
   precheck:
     name: Pre-check
     if: >-
-      (github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request' &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci'))) ||
-      (github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved' && github.event.review.user.type != 'Bot')
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci'))
     uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
 
   # Stage 2: 注册完整性校验与 AI 评审并行
@@ -113,14 +107,7 @@ jobs:
     uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
     secrets: inherit
 
-  # Stage 3: 人工审批门禁
-  human-review:
-    name: Human Review Gate
-    needs: [registration-validation, ai-code-review]
-    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
-    secrets: inherit
-
-  # Stage 4: Full PPU CI. The run-ci label authorizes PPU consumption;
+  # Stage 3: Full PPU CI. The run-ci label authorizes PPU consumption;
   # Registration Validation remains the technical prerequisite. Human Review
   # is an independent merge gate and does not delay PPU feedback.
   # For labeled events, only adding run-ci starts Full CI; adding another label
@@ -167,3 +154,77 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python3 scripts/ci/ppu/pr_e2e_report.py outer --plan selection.json
+
+  ci-finish:
+    name: >-
+      ${{ github.event_name == 'pull_request' &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')) &&
+      'CI Result' || 'CI Ignored Event' }}
+    needs:
+      [
+        precheck,
+        registration-validation,
+        e2e-selection,
+        cpu-precheck,
+        ai-code-review,
+        ci,
+        e2e-gate,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a complete CI Pipeline
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          event_name = os.environ["EVENT_NAME"]
+          action = os.environ["EVENT_ACTION"]
+          label = os.environ["LABEL_NAME"]
+          relevant = event_name == "pull_request" and (
+              action not in ("labeled", "unlabeled")
+              or (action == "labeled" and label == "run-ci")
+          )
+          if not relevant:
+              print("Ignored metadata event; no CI Result is published.")
+              raise SystemExit(0)
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          errors = []
+          required = (
+              "precheck",
+              "registration-validation",
+              "e2e-selection",
+              "cpu-precheck",
+              "ai-code-review",
+              "e2e-gate",
+          )
+          for job in required:
+              result = needs.get(job, {}).get("result", "missing")
+              if result != "success":
+                  errors.append(f"{job}: expected success, got {result}")
+
+          selection = needs.get("e2e-selection", {})
+          authorized = selection.get("outputs", {}).get("authorized") == "true"
+          full_ci = needs.get("ci", {}).get("result", "missing")
+          if not authorized:
+              errors.append(
+                  "Full CI is not authorized; a maintainer must apply run-ci "
+                  "and rerun CI"
+              )
+          elif full_ci != "success":
+              errors.append(f"ci: expected success, got {full_ci}")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              raise SystemExit(1)
+          print("CI Pipeline and required PPU evidence completed successfully.")
+          PY

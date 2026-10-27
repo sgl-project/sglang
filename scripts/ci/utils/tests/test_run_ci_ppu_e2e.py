@@ -953,6 +953,7 @@ class E2EWorkflowTest(unittest.TestCase):
             ci["jobs"]["e2e-selection"]["if"],
             ci["jobs"]["e2e-gate"]["name"],
             ci["jobs"]["e2e-gate"]["if"],
+            ci["jobs"]["ci-finish"]["name"],
         ]
         for expression in expressions:
             self.assertIn("github.event.label.name == 'run-ci'", expression)
@@ -962,6 +963,9 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertIn("PPU E2E Ignored Event", gate["name"])
         self.assertIn("always()", gate["if"])
         self.assertIn("ci", gate["needs"])
+        finish = ci["jobs"]["ci-finish"]
+        self.assertIn("CI Ignored Event", finish["name"])
+        self.assertEqual(finish["if"], "always()")
 
     def test_ignored_events_cannot_publish_the_required_e2e_check_name(self):
         template = self.workflow("ci.yaml")["jobs"]["e2e-gate"]["name"]
@@ -1010,6 +1014,50 @@ class E2EWorkflowTest(unittest.TestCase):
             p.name
             for p in (ROOT / ".github/workflows").iterdir()
             if p.suffix in {".yml", ".yaml"} and "PPU E2E Gate" in p.read_text()
+        ]
+        self.assertEqual(owners, ["ci.yaml"])
+
+    def test_ignored_events_cannot_publish_the_required_ci_result_name(self):
+        template = self.workflow("ci.yaml")["jobs"]["ci-finish"]["name"]
+        script = r"""
+            const {template, events} = JSON.parse(process.argv[1]);
+            console.log(JSON.stringify(events.map(github => template.replace(/\$\{\{([\s\S]*?)\}\}/g,
+                (_, expression) => Function('github', `return (${expression});`)(github)).trim())));
+        """
+        cases = [
+            ("pull_request", "synchronize", "", True),
+            ("pull_request", "labeled", "run-ci", True),
+            ("pull_request", "labeled", "documentation", False),
+            ("pull_request", "unlabeled", "run-ci", False),
+            ("pull_request_review", "submitted", "", False),
+        ]
+        events = [
+            {"event_name": event, "event": {"action": action, "label": {"name": label}}}
+            for event, action, label, _ in cases
+        ]
+        completed = subprocess.run(
+            [
+                "node",
+                "-e",
+                script,
+                json.dumps({"template": template, "events": events}),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            [
+                "CI Result" if active else "CI Ignored Event"
+                for _, _, _, active in cases
+            ],
+        )
+        owners = [
+            path.name
+            for path in (ROOT / ".github/workflows").iterdir()
+            if path.suffix in {".yml", ".yaml"} and "CI Result" in path.read_text()
         ]
         self.assertEqual(owners, ["ci.yaml"])
 

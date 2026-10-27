@@ -116,6 +116,8 @@ skipped successes.
   old, follow the bot's reply and push a new commit to start fresh PR CI.
 - For manual retries, use **Re-run all jobs**, not **Re-run failed jobs**. CPU
   evidence and selection plans must match the run, attempt, revision, and plan hash.
+  `/rerun-failed-ci` and `/tag-and-rerun-ci` enforce the same full-rerun rule for
+  **CI Pipeline**; ordinary workflows may restart only unsuccessful jobs.
 - Do not edit or delete accepted commands or bot receipts. Validation rechecks
   their identity; post a new run/clear command to change selection.
 
@@ -124,7 +126,10 @@ and **PPU E2E Gate**. Selected cases execute in ordered phases: default,
 extended, then distributed, with one entry at a time per phase. Later phases
 require earlier selected phases to succeed. The gate requires verified completion
 of every selected ID; a saved command or successful worker launch alone is not a
-passing result.
+passing result. **CI Result** additionally requires the complete authorized
+pipeline to succeed; a few successful prechecks with Full CI skipped do not pass.
+**Human Review Gate** runs in an independent workflow, so waiting for approval
+does not hold the CI Pipeline concurrency slot or delay a later authorized run.
 
 Run artifacts include:
 

@@ -58,7 +58,7 @@ ppu-ci:
   - changed-files:
     - all-globs-to-any-file:
       # One include union, AND each exclusion, for the same changed file.
-      - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+      - '{.github/workflows/{ci.yaml,human-review.yml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
       - '!**/*.[mM][dD]'
       - '!**/*.[mM][dD][xX]'
       - '!**/*.[rR][sS][tT]'

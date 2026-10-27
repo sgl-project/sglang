@@ -141,7 +141,7 @@ jobs:
           predicate-quantifier: every
           filters: |
             ppu_ci:
-              - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+              - '{.github/workflows/{ci.yaml,human-review.yml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
               - '!**/*.[mM][dD]'
               - '!**/*.[mM][dD][xX]'
               - '!**/*.[rR][sS][tT]'
@@ -150,7 +150,7 @@ jobs:
             # One positive union per group; exemptions bind to each changed file.
             # paths-filter v3 expands renames into old-path deletions/new additions.
             cpu:
-              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,human-review.yml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
               - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
               - '!test/{srt/models/diffusion,registered/diffusion}/**'
               - '!**/*.[mM][dD]'
@@ -158,7 +158,7 @@ jobs:
               - '!**/*.[rR][sS][tT]'
               - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
             ppu_single:
-              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,human-review.yml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
               - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
               - '!test/{srt/models/diffusion,registered/diffusion}/**'
               - '!test/registered/ppu/{test_ppu_constraints.py,test_ppu_environment_fingerprint_unit.py,accuracy_eval/test_ppu_accuracy_eval_unit.py,pd_perf_eval/test_ppu_pd_perf_eval_unit.py,pr/test_cpu_eval.py}'

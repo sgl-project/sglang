@@ -49,26 +49,48 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             jobs["e2e-gate"]["needs"],
             ["precheck", "e2e-selection", "cpu-precheck", "ci"],
         )
+        self.assertNotIn("human-review", jobs)
+        self.assertEqual(
+            set(jobs["ci-finish"]["needs"]),
+            {
+                "precheck",
+                "registration-validation",
+                "e2e-selection",
+                "cpu-precheck",
+                "ai-code-review",
+                "ci",
+                "e2e-gate",
+            },
+        )
+        self.assertEqual(jobs["ci-finish"]["if"], "always()")
 
-    def test_review_events_cannot_cancel_pr_execution(self):
-        concurrency = yaml.safe_load(self.read_workflow("ci.yaml"))["concurrency"]
+    def test_human_review_is_outside_ci_concurrency(self):
+        ci = yaml.load(self.read_workflow("ci.yaml"), Loader=yaml.BaseLoader)
+        concurrency = ci["concurrency"]
         self.assertIn("github.run_attempt == 1", concurrency["cancel-in-progress"])
+        self.assertEqual(set(ci["on"]), {"pull_request"})
+        self.assertNotIn("human-review", ci["jobs"])
+
+        review = yaml.load(
+            self.read_workflow("human-review.yml"), Loader=yaml.BaseLoader
+        )
+        self.assertEqual(set(review["on"]), {"pull_request", "pull_request_review"})
+        self.assertEqual(review["concurrency"]["cancel-in-progress"], "true")
+        self.assertIn("human-review-", review["concurrency"]["group"])
+        self.assertNotIn("ci-", review["concurrency"]["group"])
+        self.assertEqual(
+            review["jobs"]["human-review"]["uses"],
+            "flytiger-eco/.github/.github/workflows/human-review.yml@main",
+        )
+
         script = r"""
             const {template, github} = JSON.parse(process.argv[1]);
             const group = template.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expr) =>
-                Function('github', 'contains', 'fromJSON', `return (${expr});`)(
-                    github, (items, value) => items.includes(value), JSON.parse));
+                Function('github', `return (${expr});`)(github));
             process.stdout.write(group.trim());
         """
 
-        def group(
-            event,
-            run_id,
-            action="synchronize",
-            label="",
-            state="approved",
-            actor="User",
-        ):
+        def group(run_id, action="synchronize", label=""):
             result = subprocess.run(
                 [
                     "node",
@@ -78,13 +100,12 @@ class RunCiWorkflowContractTest(unittest.TestCase):
                         {
                             "template": concurrency["group"],
                             "github": {
-                                "event_name": event,
+                                "event_name": "pull_request",
                                 "run_id": run_id,
                                 "event": {
                                     "pull_request": {"number": 129},
                                     "action": action,
                                     "label": {"name": label},
-                                    "review": {"state": state, "user": {"type": actor}},
                                 },
                             },
                         }
@@ -97,21 +118,78 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             )
             return result.stdout
 
-        active = group("pull_request", 1)
-        self.assertEqual(active, group("pull_request", 2))
-        self.assertEqual(active, group("pull_request", 3, "labeled", "run-ci"))
-        self.assertNotEqual(
-            active, group("pull_request", 4, "labeled", "documentation")
+        active = group(1)
+        self.assertEqual(active, group(2))
+        self.assertEqual(active, group(3, "labeled", "run-ci"))
+        self.assertNotEqual(active, group(4, "labeled", "documentation"))
+
+    def test_ci_finish_fails_closed_for_incomplete_or_unauthorized_ci(self):
+        finish = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]["ci-finish"]
+        script = finish["steps"][0]["run"]
+        required = (
+            "precheck",
+            "registration-validation",
+            "e2e-selection",
+            "cpu-precheck",
+            "ai-code-review",
+            "e2e-gate",
         )
-        for state, actor in (
-            ("approved", "User"),
-            ("commented", "User"),
-            ("approved", "Bot"),
+
+        def needs():
+            records = {job: {"result": "success", "outputs": {}} for job in required}
+            records["e2e-selection"]["outputs"]["authorized"] = "true"
+            records["ci"] = {"result": "success", "outputs": {}}
+            return records
+
+        def execute(records, event="pull_request", action="synchronize", label=""):
+            return subprocess.run(
+                ["bash", "-e", "-c", script],
+                env={
+                    **os.environ,
+                    "EVENT_NAME": event,
+                    "EVENT_ACTION": action,
+                    "LABEL_NAME": label,
+                    "NEEDS_JSON": json.dumps(records),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(execute(needs()).returncode, 0)
+        self.assertEqual(
+            execute(needs(), action="labeled", label="run-ci").returncode, 0
+        )
+
+        unauthorized = needs()
+        unauthorized["e2e-selection"]["outputs"]["authorized"] = "false"
+        unauthorized["ci"]["result"] = "skipped"
+        completed = execute(unauthorized)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("maintainer must apply run-ci", completed.stdout)
+
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(job="ci", result=result):
+                records = needs()
+                records["ci"]["result"] = result
+                self.assertNotEqual(execute(records).returncode, 0)
+        for job in required:
+            for result in ("failure", "cancelled", "skipped"):
+                with self.subTest(job=job, result=result):
+                    records = needs()
+                    records[job]["result"] = result
+                    self.assertNotEqual(execute(records).returncode, 0)
+
+        ignored = needs()
+        for record in ignored.values():
+            record["result"] = "skipped"
+        for event, action, label in (
+            ("pull_request", "labeled", "documentation"),
+            ("pull_request", "unlabeled", "run-ci"),
+            ("pull_request_review", "submitted", ""),
         ):
-            with self.subTest(state=state, actor=actor):
-                self.assertNotEqual(
-                    active, group("pull_request_review", 5, state=state, actor=actor)
-                )
+            with self.subTest(event=event, action=action, label=label):
+                self.assertEqual(execute(ignored, event, action, label).returncode, 0)
 
     def test_cpu_precheck_runs_before_label_authorization(self):
         jobs = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]
@@ -419,6 +497,7 @@ class PpuPathSelectionTest(unittest.TestCase):
                 multi,
                 (
                     ".github/workflows/ci.yaml",
+                    ".github/workflows/human-review.yml",
                     ".github/workflows/pr-test-ppu.yml",
                     ".github/workflows/pr-test-ppu-e2e.yml",
                     ".github/workflows/pr-test-ppu-e2e-entry.yml",

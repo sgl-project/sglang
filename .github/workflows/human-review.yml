@@ -1,0 +1,23 @@
+name: Human Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # Review waiting is independent of CI Pipeline's hardware-protection group.
+  # A newer PR/review event replaces only the obsolete review waiter.
+  group: human-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  human-review:
+    name: Human Review Gate
+    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+    secrets: inherit

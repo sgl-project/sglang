@@ -340,15 +340,11 @@ def handle_tag_run_ci(
     we always add `run-ci` alongside `run-ci-extra`. Reuses the same
     `can_tag_run_ci_label` permission.
 
-    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
-    include `labeled` in `on.pull_request.types`, so adding a label fires a
-    new `pull_request.labeled` event with the up-to-date label set in its
-    payload, which spawns a fresh workflow run that satisfies the
-    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
-    label-gated run — `run.rerun()` on a previously-skipped pull_request run
-    reuses the original event payload (frozen labels), so it would skip
-    again. handle_rerun_failed_ci can't recover label-skipped runs; the
-    labeled event is the recovery mechanism.
+    The combined /tag-and-rerun-ci command follows this with an explicit
+    workflow rerun. Although a rerun reuses the original event payload, the
+    runtime gate fetches the latest PR labels through the API, so it observes
+    the labels added here. This does not rely on a GITHUB_TOKEN-generated
+    label event starting another workflow.
 
     Returns True if action was taken, False otherwise.
     """
@@ -372,17 +368,44 @@ def handle_tag_run_ci(
     return True
 
 
+def _is_noop_ci_run(run):
+    """Return whether a run only handled an unrelated metadata event."""
+    if run.path == ".github/workflows/ci.yaml":
+        return any(
+            job.name in ("CI Ignored Event", "PPU E2E Ignored Event")
+            for job in run.jobs()
+        )
+    if run.path == ".github/workflows/pr-test-extra.yml":
+        return run.conclusion == "success" and any(
+            job.name.startswith("check-changes") and job.conclusion == "skipped"
+            for job in run.jobs()
+        )
+    return False
+
+
+def _latest_run_per_workflow(runs):
+    """Keep only the newest meaningful run for each workflow at a PR head SHA."""
+    latest = {}
+    for run in runs:
+        if _is_noop_ci_run(run):
+            continue
+        current = latest.get(run.workflow_id)
+        if current is None or run.id > current.id:
+            latest[run.workflow_id] = run
+    return list(latest.values())
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows that ended in failure, skipped, cancelled, or timed_out.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print("Permission granted. Triggering rerun of unsuccessful workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -428,45 +451,48 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # Rerun workflows with conclusion=failure or conclusion=skipped.
-    #
-    # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
-    #   dependent jobs* (GitHub API). Fast-fail cascades call
-    #   core.setFailed(...) so their conclusion is "failure" and are covered.
-    # - skipped: the entire run was skipped (no jobs ran), so there are no
-    #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
-    #
-    #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
-    #   reruns of `pull_request`-event runs that were skipped because their
-    #   `if` evaluated to false (e.g. missing label) will skip again — the
-    #   label set in the frozen payload doesn't update. To un-skip a
-    #   label-gated workflow, add the missing label (the `labeled` event
-    #   dispatches a fresh run with the current label set); this function
-    #   cannot recover those by rerun alone.
-    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
-    #   builds are success yet, full-rerun failure runs too — Build Wheel
-    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
-    #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
+    # Ordinary workflows restart only unsuccessful jobs where possible. The
+    # PPU CI Pipeline is always a full rerun: its CPU evidence and immutable
+    # E2E plan are bound to one run attempt and cannot survive a partial rerun.
+    # Live PR label lookup allows a rerun to observe a newly granted run-ci.
+    # A kernel wheel failure also requires a full rerun across workflow
+    # boundaries. If GitHub cannot target any unsuccessful jobs, fall back to
+    # a full rerun for the ordinary workflow as well.
+    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
+            # A newer attempt is still in flight; do not interrupt it.
             continue
-        if run.conclusion not in ("failure", "skipped"):
+        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+            # action_required needs platform approval, not a rerun.
             continue
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if run.conclusion == "skipped" or (
-                sgl_kernel_changes and not kernel_wheel_built
+            ppu_pipeline = run.path == ".github/workflows/ci.yaml"
+            rerun_accepted = False
+            if (
+                ppu_pipeline
+                or run.conclusion == "skipped"
+                or (sgl_kernel_changes and not kernel_wheel_built)
             ):
                 print("  Full rerun")
-                run.rerun()
+                rerun_accepted = run.rerun()
             else:
-                print("  rerun_failed_jobs")
-                run.rerun_failed_jobs()
-            rerun_count += 1
+                try:
+                    print("  rerun_failed_jobs")
+                    rerun_accepted = run.rerun_failed_jobs()
+                except Exception as e:
+                    print(f"  rerun_failed_jobs rejected ({e}) - full rerun")
+                if not rerun_accepted:
+                    print("  Full rerun")
+                    rerun_accepted = run.rerun()
+            if rerun_accepted:
+                rerun_count += 1
+            else:
+                print(f"Rerun request for workflow {run.id} was not accepted")
         except Exception as e:
             print(f"Failed to rerun workflow {run.id}: {e}")
 
@@ -476,7 +502,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
         return False
 
 
