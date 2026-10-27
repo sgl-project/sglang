@@ -578,7 +578,7 @@ SGLANG_PLUGINS=none python -m sglang.launch_server \
     --trust-remote-code
 ```
 
-`--speculative-num-draft-tokens` selects 32 or 49 target verification nodes, including the root, and must fit the exported tree budget. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting for UBTree and does not tune proposal breadth.
+`--speculative-num-draft-tokens` sets a fixed number of target verification nodes, including the root. Choose any integer from 2 through the exported `tree_budget + 1`. The default is 49, capped by that budget. The 32- and 49-node configurations have specialized kernel paths; other sizes use general paths. Throughput depends on acceptance length, tree size, model, and hardware, so benchmark your workload when choosing a size. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting for UBTree and does not tune proposal breadth.
 
 Send requests with `temperature=0` or `top_k=1`. Sampling, grammar constraints, logprobs, custom logits processors, sampling penalties, `min_new_tokens>0`, logit bias, watermarking, and hidden-state or sampling-mask outputs are rejected. Strict thinking, PD disaggregation/role switching, unified memory, PP>1, DP>1, and DP attention are unsupported.
 

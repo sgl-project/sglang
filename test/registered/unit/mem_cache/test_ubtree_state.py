@@ -63,7 +63,7 @@ class TestUBTreeState(CustomTestCase):
 
     def test_pd_constructor_and_draft_clone_keep_regular_state(self):
         with get_context().override_server_args():
-            for width in (None, 32, 49):
+            for width in (None, 2, 17, 32, 49, 65):
                 with self.subTest(width=width):
                     pool = HybridMambaDecodeReqToTokenPool(
                         size=1,
@@ -128,7 +128,7 @@ class TestUBTreeState(CustomTestCase):
             self.assertIsNotNone(clone.mamba_pool.mamba_cache.intermediate_ssm)
 
     def test_factorized_scratch_budget_matches_allocated_tensors(self):
-        for width in (32, 49):
+        for width in (2, 17, 32, 33, 49, 65):
             for enabled, requests in ((True, 1), (False, 1), (True, 2)):
                 with self.subTest(width=width, enabled=enabled, requests=requests):
                     pool = MambaPool(
@@ -155,7 +155,7 @@ class TestUBTreeState(CustomTestCase):
 
     def test_capacity_solver_charges_actual_compact_scratch_in_all_modes(self):
         total_bytes = 64 << 20
-        for width in (32, 49):
+        for width in (2, 17, 32, 33, 49, 65):
             for mode in ("fixed", "no_radix", "auto"):
                 with self.subTest(width=width, mode=mode):
                     config = SimpleNamespace(

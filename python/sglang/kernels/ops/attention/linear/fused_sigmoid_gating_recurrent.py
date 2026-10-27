@@ -1054,8 +1054,8 @@ def fused_sigmoid_gating_delta_rule_update(
         # post-sampling tree commit folds only the accept path.
         tree_width = retrieve_parent_token.shape[1]
         assert N == 1, f"factorized tree verify supports only BS=1, got {N}"
-        assert tree_width in (32, 49), (
-            f"factorized tree verify supports only widths 32 and 49, got {tree_width}"
+        assert tree_width >= 2, (
+            f"factorized tree verify requires >= 2 nodes, got {tree_width}"
         )
         assert retrieve_parent_token.shape == (N, tree_width)
         assert tree_query_factors.shape == (N, HV, tree_width, K)
@@ -1152,8 +1152,8 @@ def fused_sigmoid_gating_delta_rule_update(
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
-        # Use the validated fixed-width schedules: one 32-row CTA for width 32
-        # and one 64-row CTA for width 49.
+        # Keep the tuned 32-node schedule. The general schedule tiles the node
+        # dimension in 64-row CTAs, including partial tiles and trees > 64 nodes.
         if factor_verify_bm is None:
             factor_verify_bm = 32 if tree_width == 32 else 64
         assert factor_verify_bm in (16, 32, 64)
@@ -1180,7 +1180,8 @@ def fused_sigmoid_gating_delta_rule_update(
             V=V,
             BK=BK,
             BV=factor_verify_bv,
-            BT=triton.next_power_of_2(tree_width),
+            # tl.dot needs a reduction tile of at least 16, even for tiny trees.
+            BT=max(16, triton.next_power_of_2(tree_width)),
             BM=factor_verify_bm,
             NM=factor_verify_nm,
             FACTORS_LOW_PRECISION=tree_query_factors.dtype != torch.float32,

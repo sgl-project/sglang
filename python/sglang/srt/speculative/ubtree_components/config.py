@@ -112,13 +112,15 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
 
 def resolve_verify_width(config: UBTreeConfig, requested: int | None) -> int:
     """Select one fixed KDA verification shape for the process lifetime."""
-    supported = tuple(width for width in (32, 49) if width <= config.verify_node_count)
-    if not supported or (requested is not None and requested not in supported):
+    # Keep the existing default for larger exports without restricting explicit
+    # widths to the shapes with tuned kernels.
+    width = min(49, config.verify_node_count) if requested is None else requested
+    if not 2 <= width <= config.verify_node_count:
         raise ValueError(
-            "UBTREE --speculative-num-draft-tokens must be 32 or 49 and fit "
-            f"the checkpoint tree budget ({config.verify_node_count} nodes), got {requested}"
+            "UBTREE --speculative-num-draft-tokens must be at least 2 and fit "
+            f"the checkpoint tree budget ({config.verify_node_count} nodes), got {width}"
         )
-    return supported[-1] if requested is None else requested
+    return width
 
 
 def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:

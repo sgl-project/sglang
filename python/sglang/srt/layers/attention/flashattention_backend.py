@@ -444,7 +444,8 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.skip_prefill
             and self.fa_impl_ver == 3
             and self.topk > 1
-            and self.speculative_num_draft_tokens in (32, 49)
+            and self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens >= 2
             and self.page_size == 1
             and not self.use_mla
             and not self.has_swa

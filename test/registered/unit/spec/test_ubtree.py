@@ -359,11 +359,16 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
     def test_verify_width_is_fixed_and_within_checkpoint(self):
         config = replace(parse_ubtree_config(_config()), tree_budget=64)
         self.assertEqual(resolve_verify_width(config, None), 49)
-        self.assertEqual(resolve_verify_width(config, 32), 32)
-        self.assertEqual(
-            resolve_verify_width(replace(config, tree_budget=31), None), 32
-        )
-        for width in (0, 17, 31, 33, 65):
+        for width in (2, 17, 31, 32, 33, 48, 49, 64, 65):
+            with self.subTest(width=width):
+                self.assertEqual(resolve_verify_width(config, width), width)
+        for budget in (1, 16, 31, 39):
+            with self.subTest(budget=budget):
+                self.assertEqual(
+                    resolve_verify_width(replace(config, tree_budget=budget), None),
+                    budget + 1,
+                )
+        for width in (-1, 0, 1, 66):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 resolve_verify_width(config, width)
         with self.assertRaises(ValueError):

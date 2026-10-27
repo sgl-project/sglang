@@ -224,7 +224,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     ) -> torch.Tensor:
         factorized_tree = (
             retrieve_parent_token is not None
-            and cache_steps in (32, 49)
+            and cache_steps >= 2
             and tree_max_depth > 0
             and cache_ring
             and kwargs.get("factor_cache_indices") is not None

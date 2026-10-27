@@ -63,14 +63,14 @@ def _make_fa3_verify_backend(width, algorithm, enabled):
     from sglang.srt.runtime_context import get_context, get_parallel
 
     pool = SimpleNamespace(
-        req_to_token=torch.arange(3 * 256, device="cuda").reshape(3, 256)
+        req_to_token=torch.arange(3 * 512, device="cuda").reshape(3, 512)
     )
     kv_pool = SimpleNamespace()
     runner = SimpleNamespace(
         sliding_window_size=None,
         model_config=SimpleNamespace(
             is_encoder_decoder=False,
-            context_len=256,
+            context_len=512,
             attention_arch=AttentionArch.MHA,
             is_local_attention_model=False,
             head_dim=64,
@@ -107,7 +107,7 @@ def _make_fa3_verify_backend(width, algorithm, enabled):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 requires CUDA")
-@pytest.mark.parametrize("width", [32, 49])
+@pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 @pytest.mark.parametrize(
     "algorithm,enabled", [("UBTREE", True), ("UBTREE", False), ("EAGLE", True)]
 )
@@ -121,7 +121,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
     optimized = algorithm == "UBTREE" and enabled
     assert backend._ubtree_verify_metadata_in_graph == optimized
     q = torch.randn(width, 4, 64, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(3 * 256, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(3 * 512, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
     mode = TreeMaskMode.QLEN_ONLY if algorithm == "UBTREE" else TreeMaskMode.FULL_MASK
     spec = SimpleNamespace(

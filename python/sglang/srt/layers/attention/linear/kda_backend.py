@@ -1265,7 +1265,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             tree_rawv is not None
             and verify_batch_size == 1
             and retrieve_parent_token is not None
-            and retrieve_parent_token.shape[1] in (32, 49)
+            and retrieve_parent_token.shape[1] >= 2
             and fm.tree_max_depth > 0
         )
         if (
@@ -1431,6 +1431,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tree_transforms = None
         use_fused_tree_conv = (
             tree_factorized_on
+            # Other widths use the general conv and factor-transform path.
             and draft_token_num in (32, 49)
             and fm.has_direct_parent
             and isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)

@@ -21,7 +21,8 @@ def use_ubtree_factorized_kda(
         and cache_params.is_kda
         and speculative_eagle_topk is not None
         and speculative_eagle_topk > 1
-        and speculative_num_draft_tokens in (32, 49)
+        and speculative_num_draft_tokens is not None
+        and speculative_num_draft_tokens >= 2
     )
 
 

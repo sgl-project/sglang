@@ -14,11 +14,11 @@ try:
 except ImportError:
     KERNEL_AVAILABLE = False
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
-@pytest.mark.parametrize("width", [32, 49])
+@pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 @pytest.mark.parametrize("factor_dtype", [torch.float32, torch.bfloat16])
 def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_dtype):
@@ -122,7 +122,9 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
-@pytest.mark.parametrize("width,cache_width", [(32, 32), (49, 49)])
+@pytest.mark.parametrize(
+    "width,cache_width", [(2, 2), (17, 17), (32, 32), (33, 33), (49, 49), (65, 65)]
+)
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     width, cache_width, lower_bound
@@ -277,14 +279,17 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
             assert torch.isnan(tree_g[factor_slot, :, width:]).all()
             assert torch.isnan(tree_beta[factor_slot, :, width:]).all()
 
-    last_node = 1 + 3 * wave_width
-    track_node = 1 + wave_width
+    path = [0] + [
+        1 + depth * wave_width for depth in range(4) if 1 + depth * wave_width < width
+    ]
+    last_node = path[-1]
+    track_node = path[len(path) // 2]
     accept_index = torch.tensor(
-        [[0, 1, 1 + wave_width, 1 + 2 * wave_width, last_node]],
+        [path],
         dtype=torch.int32,
         device=device,
     )
-    accept_lens = torch.tensor([5], dtype=torch.int32, device=device)
+    accept_lens = torch.tensor([len(path)], dtype=torch.int32, device=device)
     track_indices = torch.tensor([4], dtype=torch.int32, device=device)
     track_nodes = torch.tensor([track_node], dtype=torch.int32, device=device)
     committed_state = state.clone().unsqueeze(0)
@@ -441,7 +446,7 @@ def test_tree_conv_raw_commit_matches_full_window(
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
-@pytest.mark.parametrize("width", [32, 49])
+@pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     """Factorized tree paths must remain address-stable and replay-safe."""
     from types import SimpleNamespace

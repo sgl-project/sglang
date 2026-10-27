@@ -53,7 +53,8 @@ class TestUBTreeMetadataGraphCapability(CustomTestCase):
                     ("skip_prefill", True),
                     ("fa_impl_ver", 4),
                     ("topk", 1),
-                    ("speculative_num_draft_tokens", 17),
+                    ("speculative_num_draft_tokens", None),
+                    ("speculative_num_draft_tokens", 1),
                     ("page_size", 128),
                     ("use_mla", True),
                     ("has_swa", True),
@@ -69,11 +70,13 @@ class TestUBTreeMetadataGraphCapability(CustomTestCase):
                                 **{field: value}
                             )._can_enable_ubtree_verify_metadata_graph()
                         )
-                self.assertTrue(
-                    self._backend(
-                        speculative_num_draft_tokens=49
-                    )._can_enable_ubtree_verify_metadata_graph()
-                )
+                for width in (2, 17, 32, 33, 49, 65):
+                    with self.subTest(width=width):
+                        self.assertTrue(
+                            self._backend(
+                                speculative_num_draft_tokens=width
+                            )._can_enable_ubtree_verify_metadata_graph()
+                        )
 
     def test_flag_is_required_and_only_verify_uses_the_frozen_capability(self):
         with get_context().override_server_args(speculative_algorithm="UBTREE"):
