@@ -374,6 +374,20 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def gemm_nt_bf16bf16bf16(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+):
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16BF16
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
 def tf32_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,

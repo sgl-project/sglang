@@ -351,6 +351,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
+            is_ppu()
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and (bias is None or bias.dtype == torch.bfloat16)
+        ):
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            weight = layer.weight.contiguous()
+            output = torch.empty(
+                (x_2d.shape[0], weight.shape[0]),
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+            deep_gemm_wrapper.gemm_nt_bf16bf16bf16(x_2d, weight, output)
+            if bias is not None:
+                output.add_(bias)
+            return output.view(*x.shape[:-1], weight.shape[0])
+
+        elif (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
             and x.dtype == torch.bfloat16

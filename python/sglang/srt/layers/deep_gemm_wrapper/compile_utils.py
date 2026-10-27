@@ -153,6 +153,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
+    GEMM_NT_BF16BF16BF16 = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -317,6 +318,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_BF16BF16BF16: _BF16WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
             # <NOTE>
@@ -408,6 +410,8 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16BF16:
+            return (max_m * k * 2 + n * k * 2 + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
             return (
                 num_groups * max_m * k * 2
@@ -701,6 +705,16 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
         self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
+
+    def execute(self, m):
+        deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+
+
+class _BF16WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
