@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -270,6 +271,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.is_draft_runner = model_runner.is_draft_worker
+        self._verify_mask: Optional[VerifyMask] = None
 
         self._nvfp4_fp8_output = None
         if self.uses_trtllm_gen_native_fp4:
@@ -808,6 +811,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+        self._verify_mask = self._unread_verify_mask(max_bs)
+
+    def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
+        # Target verify runs the decode kernel, causal within each request's rows; a
+        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
+        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+            return None
+        return maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _build_cuda_graph_metadata(
         self,
