@@ -1,3 +1,5 @@
+import ast
+import inspect
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest import mock
@@ -105,6 +107,35 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
 
         draft_model.project_target_hidden.assert_not_called()
         self.assertIs(attention.input, projected_hidden)
+
+    def test_target_hidden_projections_run_in_draft_context(self) -> None:
+        """Under attention DP the draft projects target hidden on its own TP group."""
+        projections = {"inject_prefill", "commit_hidden"}
+        source, first_line = inspect.getsourcelines(DSparkWorkerV2)
+        found, unscoped = set(), []
+
+        def visit(node, in_draft_context):
+            if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                in_draft_context = False
+            elif isinstance(node, ast.With):
+                in_draft_context = in_draft_context or any(
+                    ast.unparse(item.context_expr) == "self._draft_context()"
+                    for item in node.items
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in projections
+            ):
+                found.add(node.func.attr)
+                if not in_draft_context:
+                    unscoped.append(first_line + node.lineno - 1)
+            for child in ast.iter_child_nodes(node):
+                visit(child, in_draft_context)
+
+        visit(ast.parse("".join(source)), False)
+        self.assertEqual(found, projections)
+        self.assertEqual(unscoped, [])
 
 
 if __name__ == "__main__":
