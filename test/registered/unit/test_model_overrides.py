@@ -2480,6 +2480,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                dcp_size=1,
+                enable_prefill_cp=False,
+                attn_cp_size=1,
+                enable_dsa_cache_layer_split=False,
+                enable_hierarchical_cache=False,
+                enable_unified_memory=False,
+                enable_unified_cache_external_linker=False,
+                enable_lmcache=False,
+                enable_flexkv=False,
+                disaggregation_mode="null",
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2548,6 +2558,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
             )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 3)),
+        ):
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="nvfp4")),
+                {
+                    "dsa_prefill_backend": "trtllm",
+                    "dsa_decode_backend": "trtllm",
+                },
+            )
+            for field, value in (
+                ("dcp_size", 2),
+                ("enable_prefill_cp", True),
+                ("attn_cp_size", 2),
+                ("enable_hisparse", True),
+                ("enable_dsa_cache_layer_split", True),
+                ("enable_hierarchical_cache", True),
+                ("enable_unified_memory", True),
+                ("enable_unified_cache_external_linker", True),
+                ("enable_lmcache", True),
+                ("enable_flexkv", True),
+                ("disaggregation_mode", "decode"),
+            ):
+                with self.subTest(nvfp4_unsupported=field):
+                    with self.assertRaisesRegex(ValueError, "does not yet support"):
+                        _dsa_split_backend_resolution(
+                            _view(kv_cache_dtype="nvfp4", **{field: value})
+                        )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
@@ -2782,9 +2824,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
                     {"kv_cache_dtype": "bfloat16"},
                 )
-                # explicit value survives (no declaration)
+                # explicit values survive (no declaration)
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="fp8_e4m3")), {}
+                )
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="nvfp4")), {}
                 )
                 # unsupported dtype rejected
                 with self.assertRaises(AssertionError):
@@ -3919,6 +3964,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {"swa_full_tokens_ratio": 1.0, "disable_hybrid_swa_memory": True},
         )
         self.assertEqual(_step3p_overrides(_args(), None), {})
+
+
+class TestNVFP4DSABackendConstraints(CustomTestCase):
+    def test_nvfp4_validation_runs_before_tilelang_fp8_early_return(self):
+        from sglang.srt.arg_groups.overrides import _check_dsa_backend_constraints
+
+        _check_dsa_backend_constraints("nvfp4", "trtllm", "trtllm", hip=False)
+        for prefill, decode, hip in (
+            ("flashmla_kv", "trtllm", False),
+            ("trtllm", "flashmla_sparse", False),
+            ("trtllm", "trtllm", True),
+        ):
+            with (
+                self.subTest(prefill=prefill, decode=decode, hip=hip),
+                self.assertRaisesRegex(ValueError, "requires CUDA"),
+            ):
+                _check_dsa_backend_constraints("nvfp4", prefill, decode, hip=hip)
 
 
 class TestDeclarationValidation(CustomTestCase):

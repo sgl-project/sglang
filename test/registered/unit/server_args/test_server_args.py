@@ -3014,6 +3014,110 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                     finalize_cuda_graph_prefill_max_context(args)
 
 
+class TestNVFP4DSACudaGraphPolicy(CustomTestCase):
+    @staticmethod
+    def _make_args(*, locked: bool):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=8, bs=[1, 8]),
+                prefill=PhaseConfig(backend=Backend.BREAKABLE),
+            ),
+        )
+        from sglang.srt.configs.model_config import AttentionArch
+
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"]),
+            attention_arch=AttentionArch.MLA,
+        )
+        args._cuda_graph_config_locked = (
+            {(Phase.PREFILL, "backend")} if locked else set()
+        )
+        return args
+
+    def test_implicit_prefill_graph_is_disabled_but_decode_remains_enabled(self):
+        args = self._make_args(locked=False)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            apply_cuda_graph_compatibility(args)
+        resolved = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.decode.backend, Backend.FULL)
+
+    def test_explicit_prefill_graph_is_rejected(self):
+        args = self._make_args(locked=True)
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            self.assertRaisesRegex(ValueError, "prefill CUDA Graphs"),
+        ):
+            apply_cuda_graph_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True)
+    def test_generic_kv4_matrix_defers_to_dsa_validation(self):
+        args = self._make_args(locked=False)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True)
+    def test_mha_prefill_selector_leaves_dsa_route_unchanged(self):
+        args = self._make_args(locked=False)
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        ):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertIsNone(resolution_result(args, "prefill_attention_backend"))
+        self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+        self.assertEqual(
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "auto"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True)
+    def test_mha_prefill_selector_rejects_explicit_dtype_for_dsa(self):
+        args = self._make_args(locked=False)
+        args.prefill_kv_cache_dequant_dtype = "nvfp4"
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            self.assertRaisesRegex(ValueError, "MHA option"),
+        ):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    def test_dsa_kv_hooks_reject_unsupported_platforms(self):
+        cases = (
+            ("npu", False, False, True, False, False),
+            ("xpu", False, False, False, True, False),
+            ("hip", False, False, False, False, True),
+            ("cpu", False, False, False, False, False),
+            ("leaked_sm100", False, True, True, False, False),
+            ("sm120", True, False, False, False, False),
+        )
+        for name, cuda, sm100, npu, xpu, hip in cases:
+            for hook in (
+                handle_nvfp4_prefill_kv_dequant_dtype,
+                handle_kv4_compatibility,
+            ):
+                args = self._make_args(locked=False)
+                with (
+                    self.subTest(platform=name, hook=hook.__name__),
+                    override_platform(
+                        is_cuda=cuda,
+                        is_sm100=sm100,
+                        is_npu=npu,
+                        is_xpu=xpu,
+                        is_hip=hip,
+                    ),
+                    patch(
+                        "sglang.srt.configs.model_config.is_deepseek_dsa",
+                        return_value=True,
+                    ),
+                    self.assertRaisesRegex(ValueError, "CUDA SM100/SM103"),
+                ):
+                    hook(args)
+
+
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
         cases = (
