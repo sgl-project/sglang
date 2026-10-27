@@ -763,6 +763,25 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
+                if enable_linear_replayssm_spec and not cache_params.is_kda:
+                    # The GDN verify writes its window at ring positions
+                    # [write_pos, write_pos + T) and drops stores past L; the
+                    # commit folds early enough to keep the window inside the
+                    # ring only if a whole window fits. The compact commit
+                    # reduces over the whole ring with tl.dot, which needs at
+                    # least 16 positions.
+                    if L & (L - 1) != 0:
+                        raise ValueError(
+                            "spec-verify ring length --linear-replayssm-cache-len "
+                            f"must be a power of two, got {L}"
+                        )
+                    min_len = max(16, speculative_num_draft_tokens or 0)
+                    if L < min_len:
+                        raise ValueError(
+                            "spec-verify ring too small: --linear-replayssm-cache-len "
+                            f"{L} < {min_len} (at least 16 and the draft tokens, "
+                            f"{speculative_num_draft_tokens})"
+                        )
                 # GDN speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
                 num_slots = (
