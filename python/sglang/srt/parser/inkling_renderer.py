@@ -40,7 +40,7 @@ def load_tml_renderers() -> SimpleNamespace:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    tokenizer = tokenizers.o200k_base_chat()
+    tokenizer = tokenizers.O200kBaseChatTokenizer()
     return SimpleNamespace(
         chat=chat, v0=v0, tokenizer=tokenizer, renderer=v0.Renderer(tokenizer)
     )
