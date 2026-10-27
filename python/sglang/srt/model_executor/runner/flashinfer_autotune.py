@@ -332,12 +332,20 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         prefill_num_tokens = (
             max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
         )
-        # Standard MoE prefill gathers the per-DP-rank chunk before the kernel.
-        # Extend the kernels' profiling range even when the startup model
-        # forward is DECODE/TARGET_VERIFY. Draft and PD-decode workers retain
-        # their decode-only range.
-        moe_prefill_num_tokens = (
-            prefill_num_tokens * dp_gather_width()
+        decode_num_tokens = 0
+        if not mr.is_draft_worker:
+            decode_num_tokens = max(
+                mr.max_decode_logits_rows(),
+                get_eager_max_batch_size(mr.max_running_requests)
+                * mr.decode_num_tokens_per_req(
+                    num_draft_tokens=max_speculative_num_draft_tokens()
+                ),
+            )
+        # Standard MoE sees gathered tokens; MegaMoE keeps per-rank capacities.
+        # Bound decode independently of the dummy M, then add one exact prefill
+        # shape. Draft and PD-decode workers retain their existing native policy.
+        gather_width = (
+            dp_gather_width()
             if not mr.is_draft_worker and get_disagg().disaggregation_mode != "decode"
             else 0
         )
@@ -347,16 +355,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             and not mr.is_draft_worker
             and "flashinfer_megamoe" not in skip_ops
         ):
-            # The chunk size is already per DP rank. Prepare one prefill profile
-            # independently of the optional full-model EXTEND autotune pass.
             mega_context = megamoe_autotune_context(
-                decode_num_tokens=max(
-                    mr.max_decode_logits_rows(),
-                    get_eager_max_batch_size(mr.max_running_requests)
-                    * mr.decode_num_tokens_per_req(
-                        num_draft_tokens=max_speculative_num_draft_tokens()
-                    ),
-                ),
+                decode_num_tokens=decode_num_tokens,
                 prefill_num_tokens=prefill_num_tokens,
             )
         with (
@@ -367,7 +367,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 skip_ops=skip_ops,
             ),
             autotune_v2(mode="tune", persistent_cache=False),
-            flashinfer_moe_autotune_context(moe_prefill_num_tokens),
+            flashinfer_moe_autotune_context(
+                decode_num_tokens=decode_num_tokens * gather_width,
+                prefill_num_tokens=prefill_num_tokens * gather_width,
+            ),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
@@ -423,7 +426,7 @@ def maybe_flashinfer_autotune_extend(
 ) -> None:
     """Also autotune prefill-only kernel variants and non-MoE operators.
 
-    MoE startup profiles cover prefill token counts without an EXTEND model
+    MoE startup prepares decode profiles plus one prefill shape without an EXTEND model
     forward. A model hook or the opt-in full forward can additionally reach
     operators and dispatch/precision/finalization variants that the decode
     dummy does not execute.

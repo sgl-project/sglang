@@ -12,7 +12,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.flashinfer_autotune import (
-    flashinfer_moe_tune_max_num_tokens,
+    flashinfer_moe_autotune,
 )
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, set_weight_attrs
+from sglang.srt.utils.common import next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -341,28 +342,30 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device
             )
 
-        trtllm_mxint4_block_scale_moe(
-            routing_logits=router_logits,  # float
-            routing_bias=correction_bias,
-            hidden_states=x,
-            gemm1_weights=layer.w13_weight_packed,
-            gemm1_weights_scale=layer.w13_weight_scale,
-            gemm1_alpha=self.moe_runner_config.gemm1_alpha,
-            gemm1_beta=None,
-            gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
-            gemm2_weights=layer.w2_weight_packed,
-            gemm2_weights_scale=layer.w2_weight_scale,
-            num_experts=self.moe_runner_config.num_experts,
-            top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
-            intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
-            local_expert_offset=self.moe_runner_config.moe_ep_rank * local_num_experts,
-            local_num_experts=local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=routing_method_type,
-            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(x.shape[0]),
-            output=symm_output,
-        )
+        with flashinfer_moe_autotune(num_tokens, layer):
+            trtllm_mxint4_block_scale_moe(
+                routing_logits=router_logits,  # float
+                routing_bias=correction_bias,
+                hidden_states=x,
+                gemm1_weights=layer.w13_weight_packed,
+                gemm1_weights_scale=layer.w13_weight_scale,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_beta=None,
+                gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
+                gemm2_weights=layer.w2_weight_packed,
+                gemm2_weights_scale=layer.w2_weight_scale,
+                num_experts=self.moe_runner_config.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
+                local_expert_offset=self.moe_runner_config.moe_ep_rank
+                * local_num_experts,
+                local_num_experts=local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=routing_method_type,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                output=symm_output,
+            )
 
         return StandardCombineInput(hidden_states=symm_output)

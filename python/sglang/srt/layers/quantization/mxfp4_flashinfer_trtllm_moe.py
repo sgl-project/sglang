@@ -13,7 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_autotune import (
-    flashinfer_moe_tune_max_num_tokens,
+    flashinfer_moe_autotune,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
@@ -26,7 +26,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.common import next_power_of_2, print_warning_once
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
@@ -499,32 +499,33 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
 
-        result = moe_call(
-            **routing,
-            hidden_states=x_quant,
-            hidden_states_scale=x_scale,
-            gemm1_weights=w13,
-            gemm1_weights_scale=w13_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=layer.output1_scale_scalar,
-            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
-            output2_scale_scalar=layer.output2_scale_scalar,
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=num_local_experts,
-            do_finalize=not defer_finalize,
-            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(num_tokens),
-            output=symm_output,
-            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
-        )
+        with flashinfer_moe_autotune(num_tokens, layer):
+            result = moe_call(
+                **routing,
+                hidden_states=x_quant,
+                hidden_states_scale=x_scale,
+                gemm1_weights=w13,
+                gemm1_weights_scale=w13_scale,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+                gemm2_weights=w2,
+                gemm2_weights_scale=w2_scale,
+                gemm2_bias=None,
+                output1_scale_scalar=layer.output1_scale_scalar,
+                output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+                output2_scale_scalar=layer.output2_scale_scalar,
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                intermediate_size=intermediate_size,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=num_local_experts,
+                do_finalize=not defer_finalize,
+                tune_max_num_tokens=next_power_of_2(num_tokens),
+                output=symm_output,
+                enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+            )
         if defer_finalize:
             output = _make_deferred_finalize_output(result, top_k=top_k)
         else:

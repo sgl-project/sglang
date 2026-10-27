@@ -24,13 +24,13 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
 )
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.flashinfer_autotune import (
-    flashinfer_moe_tune_max_num_tokens,
+    flashinfer_moe_autotune,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
 )
-from sglang.srt.utils.common import set_weight_attrs
+from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -452,28 +452,29 @@ class MuseSpark1xBf16Experts(nn.Module):
                 topk_scores.to(torch.float32).contiguous(),
             )
 
-        gemm2_out, expert_weights, expanded_idx_to_permuted_idx = (
-            trtllm_bf16_routed_moe(
-                topk_ids=routing,
-                hidden_states=hidden_states,
-                gemm1_weights=self.gate_up_proj,
-                gemm2_weights=self.down_proj,
-                num_experts=self.num_experts,
-                top_k=top_k,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=self.intermediate_size,
-                local_expert_offset=self.local_expert_offset,
-                local_num_experts=self.num_local_experts,
-                # Muse folds its route_scale into the top-k weights, so the
-                # kernel applies none of its own -- but it wants 1.0, not None.
-                routed_scaling_factor=1.0,
-                routing_method_type=_ROUTING_METHOD_UNUSED,
-                do_finalize=False,  # we need the per-expert outputs
-                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(num_tokens),
-                activation_type=_SWIGLU,
-            )[:3]
-        )
+        with flashinfer_moe_autotune(num_tokens, self):
+            gemm2_out, expert_weights, expanded_idx_to_permuted_idx = (
+                trtllm_bf16_routed_moe(
+                    topk_ids=routing,
+                    hidden_states=hidden_states,
+                    gemm1_weights=self.gate_up_proj,
+                    gemm2_weights=self.down_proj,
+                    num_experts=self.num_experts,
+                    top_k=top_k,
+                    n_group=None,
+                    topk_group=None,
+                    intermediate_size=self.intermediate_size,
+                    local_expert_offset=self.local_expert_offset,
+                    local_num_experts=self.num_local_experts,
+                    # Muse folds its route_scale into the top-k weights, so the
+                    # kernel applies none of its own -- but it wants 1.0, not None.
+                    routed_scaling_factor=1.0,
+                    routing_method_type=_ROUTING_METHOD_UNUSED,
+                    do_finalize=False,  # we need the per-expert outputs
+                    tune_max_num_tokens=next_power_of_2(num_tokens),
+                    activation_type=_SWIGLU,
+                )[:3]
+            )
 
         if self._finalize_op is None:
             output = finalize_with_post_expert_norm(

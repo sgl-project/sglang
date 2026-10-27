@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.flashinfer_autotune import (
-    flashinfer_cutedsl_moe_autotune,
+    flashinfer_moe_autotune,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -495,7 +495,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
-    with flashinfer_cutedsl_moe_autotune(hidden_states.shape[0]):
+    with flashinfer_moe_autotune(hidden_states.shape[0], runner_config):
         output = quant_info.wrapper.run(
             x=x_fp4,
             x_sf=x_sf,
@@ -598,7 +598,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
-    with flashinfer_cutedsl_moe_autotune(hidden_states.shape[0]):
+    with flashinfer_moe_autotune(hidden_states.shape[0], runner_config):
         output = quant_info.wrapper.run(
             x=x_fp4,
             x_sf=x_sf,
