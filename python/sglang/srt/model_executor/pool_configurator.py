@@ -251,7 +251,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
-        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(
+            kvc,
+            include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
+        )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
