@@ -67,6 +67,7 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1571,43 +1572,24 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
 
 
 class TestHiSparseStagedSpecRelay(CustomTestCase):
-    def test_builds_lightweight_eagle_relay_handle(self):
-        future_map = object.__new__(FutureMap)
-        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
-        future_map.dsa_topk_indices_buf = None
-        future_indices = torch.tensor([2, 5], device="cpu")
-
-        spec_input = future_map.make_staged_spec_input(future_indices)
-
-        self.assertIs(spec_input.future_indices, future_indices)
-        self.assertFalse(spec_input.future_dsa_topk_indices_available)
-
-    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
-    def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
-        future_map = object.__new__(FutureMap)
-        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
-        future_map.device = torch.device("cpu")
+    def test_staged_relay_restores_rejection_sampling_probs(self):
+        """A staged HiSparse request carries only future_indices; the
+        rejection-sampling probabilities come from the relay buffer."""
+        pool = SimpleNamespace(req_to_token=torch.zeros((4, 1), dtype=torch.int32))
+        future_map = FutureMap(torch.device("cpu"), SpeculativeAlgorithm.EAGLE, pool)
         future_map.need_topk = True
-        future_map.need_hidden_states = False
         future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
         future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
         future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
-        future_map.hidden_states_buf = None
         future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
-        future_map.dsa_topk_indices_buf = None
         future_indices = torch.tensor([2, 3], dtype=torch.int64)
-        spec_input = future_map.make_staged_spec_input(future_indices)
-        gather_spec_extras.return_value = (
-            torch.zeros((2, 1)),
-            torch.zeros((2, 1), dtype=torch.int64),
-            torch.tensor([2, 3]),
-            None,
-        )
+        carried = EagleDraftInput()
+        carried.future_indices = future_indices
 
-        future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+        draft_input = future_map.gather_draft_input(carried, future_indices)
 
         torch.testing.assert_close(
-            spec_input.draft_probs, future_map.draft_probs_buf[future_indices]
+            draft_input.draft_probs, future_map.draft_probs_buf[future_indices]
         )
 
 
