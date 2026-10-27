@@ -290,10 +290,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self, layer_idx: int):
-        if not _is_cuda:
-            if not self._recording or not self._record_current_pass:
-                return None
-        elif not self._hook_enabled() or self._current_layer_idx.value != layer_idx:
+        if not self._hook_enabled() or self._current_layer_idx.value != layer_idx:
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
