@@ -1497,6 +1497,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_only_spec_dec = n_dst > n_src
 
         if peer_info.requires_dcp_relayout:
+            self.reject_sharded_dcp_draft(peer_info.dst_dcp_size, "nixl")
             dst_indices = resolve_dcp_dst_entry_indices(
                 self.kv_args.kv_layer_ids,
                 peer_info.dst_kv_layer_ids,

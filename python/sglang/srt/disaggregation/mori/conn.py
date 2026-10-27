@@ -1119,6 +1119,7 @@ class MoriKVManager(CommonKVManager):
             register_info.dst_dcp_size, register_info.dst_dcp_rank
         )
         if register_info.requires_dcp_relayout:
+            self.reject_sharded_dcp_draft(register_info.dst_dcp_size, "mori")
             num_entries = len(self.kv_args.kv_item_lens)
             num_draft = self.kv_args.num_draft_entries
             # The wire format registers only the target page item length.

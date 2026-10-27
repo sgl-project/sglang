@@ -171,6 +171,8 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    # Set by the prefill: the decode stripes its draft KV like the target.
+    dcp_draft_sharded: bool = False
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
@@ -1413,6 +1415,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        draft_sharded: bool = False,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -1441,7 +1444,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
                     self.kv_args.kv_item_lens, dst_kv_item_lens
                 )
-        num_draft = self.kv_args.num_draft_entries
+        # A sharded draft takes the target's rows and shares its pack.
+        num_draft = 0 if draft_sharded else self.kv_args.num_draft_entries
         num_target = len(src_kv_ptrs) - num_draft
 
         plan = build_dcp_token_transfer_plan(
@@ -2684,6 +2688,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ),
                                 pack_buffer=pack_buffer,
                                 dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
+                                draft_sharded=target_rank_registration_info.dcp_draft_sharded,
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
@@ -2985,13 +2990,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if decode_kv_args.requires_dcp_relayout:
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
+                        draft_sharded = self.dcp_draft_sharded(
+                            decode_kv_args.dst_dcp_size
+                        )
+                        dst_draft_item_lens: List[Optional[int]] = [None] * num_draft
+                        if (
+                            draft_sharded
+                            and len(decode_kv_args.dst_kv_item_lens) == num_entries
+                        ):
+                            dst_draft_item_lens = list(
+                                decode_kv_args.dst_kv_item_lens[
+                                    num_entries - num_draft :
+                                ]
+                            )
                         dst_item_lens: List[Optional[int]] = [
                             decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
+                        ] * (num_entries - num_draft) + dst_draft_item_lens
+                        decode_kv_args.dcp_draft_sharded = draft_sharded
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
                                 dst_item_lens,
                                 decode_kv_args.dst_dcp_size,
+                                draft_sharded=draft_sharded,
                             )
                         )
                         self._init_dcp_pack_buffers_once(

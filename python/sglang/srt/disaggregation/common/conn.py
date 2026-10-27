@@ -100,6 +100,23 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+def _decode_draft_shards_under_dcp(dst_dcp_size: int) -> bool:
+    """Whether a DCP decode of this model stripes its draft KV like the target.
+
+    Both PD peers serve the same model on the same platform, so the prefill can
+    apply the decode's rule locally.
+    """
+    from sglang.srt.configs import model_config
+    from sglang.srt.runtime_context import process_model_config
+
+    # ROCm DCP backend enablement supplies the canonical draft-layout policy.
+    # Preserve today's replicated-draft contract until that backend is available.
+    policy = getattr(model_config, "dsa_draft_shards_under_dcp", None)
+    if policy is None:
+        return False
+    return policy(process_model_config().hf_config, dst_dcp_size)
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -548,8 +565,24 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
+    def dcp_draft_sharded(self, dst_dcp_size: int) -> bool:
+        return self.kv_args.num_draft_entries > 0 and _decode_draft_shards_under_dcp(
+            dst_dcp_size
+        )
+
+    def reject_sharded_dcp_draft(self, dst_dcp_size: int, backend: str) -> None:
+        if self.dcp_draft_sharded(dst_dcp_size):
+            raise NotImplementedError(
+                f"PD DCP on {backend} does not relayout a DCP-sharded draft KV "
+                "(ROCm DSA MTP); use --disaggregation-transfer-backend mooncake."
+            )
+
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        *,
+        draft_sharded: bool = False,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -566,9 +599,9 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
-            dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
-            )
+            # A replicated draft pages over the widened page; a sharded one like the target.
+            is_replicated_draft = i >= num_entries - num_draft and not draft_sharded
+            dst_page_scale = page_size * (dst_dcp_size if is_replicated_draft else 1)
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(
                     "PD DCP source/destination KV geometry differs at entry "
