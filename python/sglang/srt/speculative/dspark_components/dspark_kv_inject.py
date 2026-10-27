@@ -105,7 +105,7 @@ class TargetHiddenKvInjector:
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            swa_loc = self._mla_swa_loc(
+            swa_loc = self.committed_swa_loc(
                 pool=pool,
                 cache_loc=cache_loc.to(torch.int64),
                 positions=positions.to(torch.int64),
@@ -244,7 +244,7 @@ class TargetHiddenKvInjector:
         swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if swa_loc is None:
-            swa_loc = self._mla_swa_loc(
+            swa_loc = self.committed_swa_loc(
                 pool=pool,
                 cache_loc=cache_loc,
                 positions=positions,
@@ -261,7 +261,7 @@ class TargetHiddenKvInjector:
                 pool=pool,
             )
 
-    def _mla_swa_loc(
+    def committed_swa_loc(
         self,
         *,
         pool,
@@ -269,9 +269,10 @@ class TargetHiddenKvInjector:
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor],
         commit_lens: Optional[torch.Tensor],
-        state_slot: Optional[torch.Tensor],
-        final_pos: Optional[torch.Tensor],
+        state_slot: Optional[torch.Tensor] = None,
+        final_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """The draft SWA rows the committed context tokens store into, -1 elsewhere."""
         if pool.swa_req_ring_size is not None:
             swa_loc = self._ring_inject_loc(
                 pool=pool,
