@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused MiniMax-M3 per-head Gemma Q/K RMSNorm + partial RoPE for ROCm."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1249,9 +1249,9 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     v: torch.Tensor,
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    idx_k_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
+    idx_k_cache: Union[torch.Tensor, Nvfp4Cache],
     out_cache_loc: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
