@@ -41,6 +41,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=26, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
@@ -241,7 +242,7 @@ def create_bench_cache(
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,
                 disable=False,
-                tree_components=components,
+                tree_slots=tree_slots_of(components),
                 sliding_window_size=sliding_window_size if has_swa else None,
             )
         )

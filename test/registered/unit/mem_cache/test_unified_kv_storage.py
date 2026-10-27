@@ -92,35 +92,39 @@ class TestPlanNames(CustomTestCase):
                 )
                 self.assertEqual(storage.page_envelope_pair(), envelopes[name])
 
-    def test_tree_components_in_drive_order(self):
-        # What the prefix tree builds for a unified plan: today's components, in
-        # the order it drives their eviction (owner, window, state).
+    def test_tree_slots_in_drive_order(self):
+        # What the prefix tree builds for a unified plan: today's component ids,
+        # each with its sub-pool's family, in the order it drives their eviction
+        # (owner, window, state).
         expected = {
-            "swa": ("FULL", "SWA"),
-            "mamba": ("FULL", "MAMBA"),
-            "tri": ("FULL", "SWA", "MAMBA"),
+            "swa": (("FULL", "token"), ("SWA", "window")),
+            "mamba": (("FULL", "token"), ("MAMBA", "state")),
+            "tri": (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
         }
-        for name, components in expected.items():
+        for name, slots in expected.items():
             with self.subTest(chain=name):
                 storage = _bundle(name).token_to_kv_pool_allocator.storage
-                self.assertEqual(storage.tree_components(), components)
                 self.assertEqual(
-                    {ComponentType[c] for c in components}, _COMPONENTS[name]
+                    tuple((s.component, s.family) for s in storage.tree_slots()),
+                    slots,
+                )
+                self.assertEqual(
+                    {ComponentType[c] for c, _ in slots}, _COMPONENTS[name]
                 )
 
-    def test_static_tree_components_follow_the_pool_shape(self):
+    def test_static_tree_slots_follow_the_pool_shape(self):
         from sglang.srt.mem_cache.static_kv_storage import (
             StaticKVStorage,
             StaticPoolShape,
         )
 
         cases = {
-            (False, False): ("FULL",),
-            (True, False): ("FULL", "SWA"),
-            (False, True): ("FULL", "MAMBA"),
-            (True, True): ("FULL", "SWA", "MAMBA"),
+            (False, False): (("FULL", "token"),),
+            (True, False): (("FULL", "token"), ("SWA", "window")),
+            (False, True): (("FULL", "token"), ("MAMBA", "state")),
+            (True, True): (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
         }
-        for (has_window, has_state), components in cases.items():
+        for (has_window, has_state), slots in cases.items():
             with self.subTest(has_window=has_window, has_state=has_state):
                 storage = StaticKVStorage(
                     None,
@@ -129,7 +133,10 @@ class TestPlanNames(CustomTestCase):
                         has_window=has_window, has_state=has_state, token_capacity=1
                     ),
                 )
-                self.assertEqual(storage.tree_components(), components)
+                self.assertEqual(
+                    tuple((s.component, s.family) for s in storage.tree_slots()),
+                    slots,
+                )
 
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -45,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -378,8 +380,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def __init__(self, params: CacheInitParams):
-        assert params.tree_components is not None
-        self.tree_components = tuple(params.tree_components)
+        assert params.tree_slots is not None
+        self.tree_components = params.tree_components
+        families = {slot.family for slot in params.tree_slots}
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -389,14 +392,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # TODO(Jialin): Port custom component registration from #25754 and
         # C128 support from #33676.
-        unsupported_components = set(self.tree_components) - {
-            ComponentType.FULL,
-            ComponentType.SWA,
-            ComponentType.MAMBA,
-        }
+        unsupported_components = [
+            slot
+            for slot in params.tree_slots
+            if NATIVE_SLOTS.get(slot.component) != slot.family
+        ]
         if unsupported_components:
             names = ", ".join(
-                sorted(component.name for component in unsupported_components)
+                sorted(
+                    f"{slot.component} ({slot.family})"
+                    for slot in unsupported_components
+                )
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
         if params.component_registry_override:
@@ -422,7 +428,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 tlru_float_config = _tlru_float_config(
                     self._bindings, threshold, next_prompt_estimate
                 )
-        if ComponentType.SWA in self.tree_components and (
+        if TREE_WINDOW in families and (
             params.sliding_window_size is None or params.sliding_window_size <= 0
         ):
             raise ValueError(
@@ -434,14 +440,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             Callable[[torch.Tensor], torch.Tensor]
         ] = None
         allocator = params.token_to_kv_pool_allocator
-        if allocator is not None and ComponentType.SWA in self.tree_components:
+        if allocator is not None and TREE_WINDOW in families:
             if allocator.hands_out_virtual_ids:
                 self._swa_backup_index_mapper = (
                     allocator.translate_swa_indices_for_transfer
                 )
-        self.is_eagle = (
-            params.is_eagle and ComponentType.MAMBA not in self.tree_components
-        )
+        self.is_eagle = params.is_eagle and TREE_STATE not in families
 
         # The cache owns allocation; keep its allocator for resolving current
         # unified SWA addresses when building a host backup.
@@ -456,7 +460,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self.device = torch.device("cpu")
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        has_mamba = ComponentType.MAMBA in self.tree_components
+        has_mamba = TREE_STATE in families
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )

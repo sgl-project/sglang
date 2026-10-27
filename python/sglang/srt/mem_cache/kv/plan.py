@@ -74,6 +74,29 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
 # The order PD peers list state entries in: a window's before recurrent state.
 _WIRE_ORDER = ("swa", "mamba")
 
+# How a prefix tree keeps a sub-pool for a cached prefix: every token, the
+# trailing window of tokens, one state checkpoint per grid step, or fixed-size
+# blocks. The tree cores pick a slot's behavior by its family.
+TREE_TOKEN = "token"
+TREE_WINDOW = "window"
+TREE_STATE = "state"
+TREE_BLOCK = "block"
+
+_TREE_FAMILY: Dict[Type, str] = {
+    FullLifetime: TREE_TOKEN,
+    WindowLifetime: TREE_WINDOW,
+    StateLifetime: TREE_STATE,
+}
+
+
+class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
+    """One slot of a prefix tree: the id the tree, its KV events and its host
+    stores know it by (an external name), and the family that decides how a
+    cached prefix keeps it."""
+
+    component: str
+    family: str
+
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
     """One PD state entry: the sub-pool part it carries and its state type."""
@@ -146,6 +169,16 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                     s.name,
                 ),
             )
+        )
+
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+        """The prefix tree's slots, one per sub-pool, in drive order."""
+        return tuple(
+            TreeSlot(
+                component=s.external.tree_component,
+                family=_TREE_FAMILY[type(s.lifetime)],
+            )
+            for s in self.drive_order()
         )
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:

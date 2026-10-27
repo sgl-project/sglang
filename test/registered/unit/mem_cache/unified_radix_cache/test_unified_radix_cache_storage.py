@@ -82,6 +82,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
@@ -1048,7 +1049,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)

@@ -99,6 +99,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
@@ -116,14 +117,18 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=True,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
         )
 
         cache = UnifiedRadixCache(params=params)
 
         self.assertIsInstance(cache.components[ComponentType.FULL], FakeFullComponent)
-        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], FakeFullComponent)
+        self.assertIsNot(
+            COMPONENT_REGISTRY[FAMILY_OF[ComponentType.FULL]], FakeFullComponent
+        )
 
 
 class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
@@ -132,7 +137,9 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
         not len(value), or the ledger drifts from sanity_check's recount."""
         cache, allocator, _ = build_fixture(
             CacheConfig(),
-            component_registry_override={ComponentType.FULL: PagedFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: PagedFullComponent
+            },
             tree_core_backend="python",
         )
         component = cache.components[ComponentType.FULL]
@@ -1867,7 +1874,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
 
 
 def _component_with_cache(component_type, cache):
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component

@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
@@ -414,7 +415,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}

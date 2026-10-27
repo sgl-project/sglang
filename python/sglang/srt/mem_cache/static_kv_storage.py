@@ -17,7 +17,13 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.kv.plan import WireEntry
+from sglang.srt.mem_cache.kv.plan import (
+    TREE_STATE,
+    TREE_TOKEN,
+    TREE_WINDOW,
+    TreeSlot,
+    WireEntry,
+)
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 from sglang.srt.mem_cache.kv.storage import Region, SubPoolUsage
 from sglang.srt.utils import is_npu
@@ -435,12 +441,20 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_components(self) -> Tuple[str, ...]:
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
         shape = self._shape
         return (
-            ("FULL",)
-            + (("SWA",) if shape.has_window else ())
-            + (("MAMBA",) if shape.has_state else ())
+            (TreeSlot(component="FULL", family=TREE_TOKEN),)
+            + (
+                (TreeSlot(component="SWA", family=TREE_WINDOW),)
+                if shape.has_window
+                else ()
+            )
+            + (
+                (TreeSlot(component="MAMBA", family=TREE_STATE),)
+                if shape.has_state
+                else ()
+            )
         )
 
     def add_pin_source(

@@ -17,7 +17,12 @@ import torch
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.host import page_envelope_pair
-from sglang.srt.mem_cache.kv.plan import KVStoragePlan, SubPoolExternal, WireEntry
+from sglang.srt.mem_cache.kv.plan import (
+    KVStoragePlan,
+    SubPoolExternal,
+    TreeSlot,
+    WireEntry,
+)
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 
@@ -355,10 +360,10 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
-    def tree_components(self) -> Tuple[str, ...]:
-        """The prefix tree's component per sub-pool, in the order the tree
-        drives their eviction."""
-        return tuple(s.external.tree_component for s in self._plan.drive_order())
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+        """The prefix tree's slot per sub-pool, in the order the tree drives
+        their eviction."""
+        return self._plan.tree_slots()
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]

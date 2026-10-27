@@ -99,19 +99,31 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return create_unified_radix_cache(ctx)
 
     if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticPoolShape,
+            kv_storage_of,
+        )
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
             LMCacheUnifiedRadixCache,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
-        tree_components = []
-        if not is_pure_swa:
-            tree_components.append(ComponentType.FULL)
-        if ctx.is_hybrid_swa:
-            tree_components.append(ComponentType.SWA)
-        if ctx.is_hybrid_ssm:
-            tree_components.append(ComponentType.MAMBA)
-        params.tree_components = tuple(tree_components)
+        allocator = params.token_to_kv_pool_allocator
+        storage = kv_storage_of(
+            params.req_to_token_pool,
+            allocator,
+            shape=StaticPoolShape(
+                has_window=ctx.is_hybrid_swa,
+                has_state=ctx.is_hybrid_ssm,
+                token_capacity=allocator.size,
+            ),
+        )
+        # A pure-window model keeps no full-attention prefix in LMCache.
+        params.tree_slots = tuple(
+            slot
+            for slot in storage.tree_slots()
+            if not (is_pure_swa and slot.family == TREE_TOKEN)
+        )
         return LMCacheUnifiedRadixCache(
             params,
             model_config=ctx.model_config,
@@ -159,8 +171,8 @@ def create_unified_radix_cache(
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
             raise ValueError("Host-pool retraction does not support pure-SWA models.")
 
+    from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TreeSlot
     from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
-    from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     allocator = params.token_to_kv_pool_allocator
@@ -173,27 +185,27 @@ def create_unified_radix_cache(
             token_capacity=allocator.size,
         ),
     )
-    tree_components = [ComponentType[name] for name in storage.tree_components()]
+    tree_slots = list(storage.tree_slots())
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
         )
 
-        tree_components.append(ComponentType.C128)
+        tree_slots.append(TreeSlot(component="C128", family=TREE_BLOCK))
         params.component_registry_override = {
             **(params.component_registry_override or {}),
-            ComponentType.C128: C128SidecarComponent,
+            TREE_BLOCK: C128SidecarComponent,
         }
 
-    params.tree_components = tuple(tree_components)
+    params.tree_slots = tuple(tree_slots)
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,
         )
 
         params.component_registry_override = {
-            ComponentType.MAMBA: MlxAuxiliaryStateComponent,
+            TREE_STATE: MlxAuxiliaryStateComponent,
         }
     cache = (cache_class or UnifiedRadixCache)(params)
     if (

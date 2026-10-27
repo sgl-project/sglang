@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.tree_slots import tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -326,7 +327,7 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
         )
     )
     slots = allocator.alloc(occupancy * page_size)
@@ -360,10 +361,12 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
-                if state_cache
-                else (ComponentType.FULL, ComponentType.SWA)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+                    if state_cache
+                    else (ComponentType.FULL, ComponentType.SWA)
+                )
             ),
             enable_session_radix_cache=sessions,
         )
@@ -658,7 +661,7 @@ def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             req_to_token_pool=bundle.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
         )
     )
     return bundle, allocator, cache

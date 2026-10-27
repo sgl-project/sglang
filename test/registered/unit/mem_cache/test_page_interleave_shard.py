@@ -124,6 +124,7 @@ from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -1024,7 +1025,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
     )
 
@@ -1205,7 +1206,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=_make_allocator(pages_per_rank=8),
             page_size=PS,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False
@@ -1223,7 +1224,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False

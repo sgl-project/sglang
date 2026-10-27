@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
@@ -142,7 +143,7 @@ class BuilderAdapter:
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=self.page_size,
                 sliding_window_size=32,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
             )
         )
 

@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -158,10 +159,12 @@ def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) 
     return num_pages
 
 
-COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
-    ComponentType.FULL: FullComponent,
-    ComponentType.MAMBA: MambaComponent,
-    ComponentType.SWA: SWAComponent,
+# The component class that keeps each slot family; a slot's family comes from
+# the KV storage that owns its sub-pool.
+COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
+    TREE_TOKEN: FullComponent,
+    TREE_WINDOW: SWAComponent,
+    TREE_STATE: MambaComponent,
 }
 
 
@@ -218,8 +221,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
-        assert params.tree_components is not None
-        self.tree_components = tuple(params.tree_components)
+        assert params.tree_slots is not None
+        self.tree_components = params.tree_components
         self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
@@ -227,16 +230,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 **COMPONENT_REGISTRY,
                 **params.component_registry_override,
             }
-        self.components: dict[ComponentType, TreeComponent] = {
-            ct: component_registry[ct](self, params) for ct in self.tree_components
-        }
+        self.components: dict[ComponentType, TreeComponent] = {}
+        for slot in params.tree_slots:
+            component = component_registry[slot.family](self, params)
+            # The family gives the behavior; the slot gives the id it goes by.
+            component.component_type = ComponentType[slot.component]
+            self.components[component.component_type] = component
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )
-        # Whether SWA is enabled.
-        self.is_swa_enabled = ComponentType.SWA in params.tree_components
-        # Whether Mamba is enabled.
-        self.is_mamba_enabled = ComponentType.MAMBA in params.tree_components
+        families = {slot.family for slot in params.tree_slots}
+        # Whether a slot keeps the trailing window of a prefix.
+        self.is_swa_enabled = TREE_WINDOW in families
+        # Whether a slot keeps a prefix's recurrent state checkpoints.
+        self.is_mamba_enabled = TREE_STATE in families
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False

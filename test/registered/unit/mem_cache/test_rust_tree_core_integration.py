@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
@@ -92,7 +93,7 @@ def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
     params.update(params_overrides)
     params = CacheInitParams(**params)
@@ -228,7 +229,7 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
             tree_core_backend=instance_backend,
         )
     )
@@ -402,7 +403,7 @@ def _tlru_tree_core(backend, config=None, page_size=1, is_eagle=False):
         token_to_kv_pool_allocator=None,
         page_size=page_size,
         is_eagle=is_eagle,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
         eviction_policy="tlru",
         eviction_policy_config=config,
     )
@@ -833,7 +834,7 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
     )
     stale_root = core.root_node_handle()
@@ -1004,7 +1005,7 @@ def test_stale_handles_nested_in_transfer_results_do_not_poison_the_core():
 
 def test_stale_handle_component_access_does_not_poison_the_core():
     core = _tree_core(
-        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
         sliding_window_size=8,
     )
     stale_root = core.root_node_handle()
@@ -1227,7 +1228,7 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
             return tokens + (0 if side_backing is None else side_backing.numel())
 
     params = CacheInitParams(
-        False, None, None, 1, tree_components=(ComponentType.FULL,)
+        False, None, None, 1, tree_slots=tree_slots_of((ComponentType.FULL,))
     )
     cache = SimpleNamespace(enable_session_radix_cache=False)
     driver = SideBackingFullComponent(cache, params)
@@ -1583,11 +1584,11 @@ def test_session_radix_cache_is_rejected():
     ("params", "message"),
     [
         (
-            {"tree_components": (ComponentType.FULL, ComponentType.C128)},
+            {"tree_slots": tree_slots_of((ComponentType.FULL, ComponentType.C128))},
             "components: C128",
         ),
         (
-            {"component_registry_override": {ComponentType.FULL: object}},
+            {"component_registry_override": {FAMILY_OF[ComponentType.FULL]: object}},
             "component_registry_override",
         ),
     ],
@@ -1895,7 +1896,7 @@ def test_full_host_duplicates_preserve_backup_order(backend, backup_again):
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=None,
                 page_size=1,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
             )
         )
     core = cache.tree_core
@@ -2354,7 +2355,7 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
 
 def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
     return _tree_core(
-        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
         sliding_window_size=window,
         **params_overrides,
     )
@@ -2390,8 +2391,10 @@ def _swa_transfer_core(
         token_to_kv_pool_allocator=allocator,
         page_size=page_size,
         is_eagle=is_eagle,
-        tree_components=(ComponentType.FULL, ComponentType.SWA)
-        + ((ComponentType.MAMBA,) if mamba else ()),
+        tree_slots=tree_slots_of(
+            (ComponentType.FULL, ComponentType.SWA)
+            + ((ComponentType.MAMBA,) if mamba else ())
+        ),
         sliding_window_size=window,
         swa_gates_prefix_match=not request_window,
     )
@@ -2852,7 +2855,7 @@ def _swa_cache(
                 disable=False,
                 sliding_window_size=window,
                 swa_gates_prefix_match=not (ring or request_window),
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
                 component_registry_override=component_registry_override,
             )
         )
@@ -2894,10 +2897,12 @@ def _swa_mamba_cache(
                 sliding_window_size=window,
                 enable_session_radix_cache=enable_session,
                 component_registry_override=component_registry_override,
-                tree_components=(
-                    ComponentType.FULL,
-                    ComponentType.SWA,
-                    ComponentType.MAMBA,
+                tree_slots=tree_slots_of(
+                    (
+                        ComponentType.FULL,
+                        ComponentType.SWA,
+                        ComponentType.MAMBA,
+                    )
                 ),
             )
         )
@@ -3279,7 +3284,7 @@ def test_python_component_locks_use_reclaimable_backing(component, early_release
     case = _internal_swa_write_back_case(
         "python",
         with_mamba=component == ComponentType.MAMBA,
-        component_registry_override={component: SideBackingComponent},
+        component_registry_override={FAMILY_OF[component]: SideBackingComponent},
     )
     cache, core = case.cache, case.core
     node_id, leaf = case.nodes
@@ -3336,7 +3341,7 @@ def test_python_zero_accounted_internal_eviction_continues(component):
         "python",
         with_mamba=component == ComponentType.MAMBA,
         prefix_nodes=2,
-        component_registry_override={component: ReleasedBackingComponent},
+        component_registry_override={FAMILY_OF[component]: ReleasedBackingComponent},
     )
     cache, core = case.cache, case.core
     first, second, leaf = case.nodes
@@ -3665,9 +3670,9 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             sliding_window_size=4,
-            tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.AUXILIARY_SWA)),
             component_registry_override={
-                ComponentType.AUXILIARY_SWA: AuxiliarySWAComponent
+                FAMILY_OF[ComponentType.AUXILIARY_SWA]: AuxiliarySWAComponent
             },
             tree_core_backend="python",
         )
@@ -3735,7 +3740,7 @@ def test_aux_host_reclaim_uses_its_own_load_back_sources(
                     req_to_token_pool=Mock(spec=HybridReqToTokenPool),
                     token_to_kv_pool_allocator=None,
                     page_size=1,
-                    tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+                    tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
                 )
             )
         core = cache.tree_core
@@ -3840,7 +3845,7 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
                     req_to_token_pool=request_pool,
                     token_to_kv_pool_allocator=allocator,
                     page_size=1,
-                    tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+                    tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
                 )
             )
     core = cache.tree_core
@@ -4326,7 +4331,7 @@ def _mamba_tree_core(
         mamba_max_states_per_path=mamba_max_states_per_path,
     ):
         return _tree_core(
-            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
             page_size=page_size,
             **params_overrides,
         )
@@ -4342,10 +4347,12 @@ def _hybrid_swa_mamba_tree_core(window: int) -> RustUnifiedTreeCore:
         mamba_max_states_per_path=-1,
     ):
         return _tree_core(
-            tree_components=(
-                ComponentType.FULL,
-                ComponentType.SWA,
-                ComponentType.MAMBA,
+            tree_slots=tree_slots_of(
+                (
+                    ComponentType.FULL,
+                    ComponentType.SWA,
+                    ComponentType.MAMBA,
+                )
             ),
             sliding_window_size=window,
         )
@@ -4524,7 +4531,7 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
         req_to_token_pool=Mock(spec=HybridReqToTokenPool),
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -5318,7 +5325,7 @@ def _bigram_tree_core(**params_overrides) -> RustUnifiedTreeCore:
         token_to_kv_pool_allocator=None,
         page_size=1,
         is_eagle=True,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
     params.update(params_overrides)
     return RustUnifiedTreeCore(CacheInitParams(**params))
@@ -5410,7 +5417,7 @@ def test_stale_inspection_handles_raise_key_error_or_report_absence():
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
     )
     stale_root = core.root_node_handle()
@@ -5582,7 +5589,7 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
             tree_core_backend="rust",
         )
     )

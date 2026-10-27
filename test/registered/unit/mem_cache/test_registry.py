@@ -34,6 +34,10 @@ def _publish(testcase, **fields):
     return get_server_args()
 
 
+def _slots(ctx):
+    return [(slot.component, slot.family) for slot in ctx.params.tree_slots]
+
+
 def _make_ctx(
     testcase,
     *,
@@ -60,9 +64,12 @@ def _make_ctx(
         enable_unified_cache_external_linker=False,
         enable_kv_cache_sharding=enable_kv_cache_sharding,
     )
+    params = MagicMock()
+    # Static pools: the tree's slots follow the pool shape.
+    params.token_to_kv_pool_allocator.storage = None
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=params,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -327,10 +334,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 lmcache_config_file=None,
                 forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
-            self.assertEqual(
-                ctx.params.tree_components,
-                (fake_components.ComponentType.FULL,),
-            )
+            self.assertEqual(_slots(ctx), [("FULL", "token")])
             self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
 
     def test_lmcache_supports_hybrid_swa_components(self):
@@ -346,13 +350,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         ):
             default_radix_cache_factory(ctx)
 
-        self.assertEqual(
-            ctx.params.tree_components,
-            (
-                fake_components.ComponentType.FULL,
-                fake_components.ComponentType.SWA,
-            ),
-        )
+        self.assertEqual(_slots(ctx), [("FULL", "token"), ("SWA", "window")])
 
     def test_lmcache_supports_hybrid_ssm_components(self):
         ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_ssm=True)
@@ -367,13 +365,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         ):
             default_radix_cache_factory(ctx)
 
-        self.assertEqual(
-            ctx.params.tree_components,
-            (
-                fake_components.ComponentType.FULL,
-                fake_components.ComponentType.MAMBA,
-            ),
-        )
+        self.assertEqual(_slots(ctx), [("FULL", "token"), ("MAMBA", "state")])
 
     def test_lmcache_supports_dsa_as_full_sidecar(self):
         ctx = _make_ctx(self, enable_lmcache=True, is_dsa=True)
@@ -388,10 +380,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         ):
             default_radix_cache_factory(ctx)
 
-        self.assertEqual(
-            ctx.params.tree_components,
-            (fake_components.ComponentType.FULL,),
-        )
+        self.assertEqual(_slots(ctx), [("FULL", "token")])
 
 
 if __name__ == "__main__":
