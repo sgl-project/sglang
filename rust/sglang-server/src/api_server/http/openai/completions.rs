@@ -14,12 +14,12 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Deserialize;
+use sglang_processor::dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
-use futures::StreamExt;
-use serde::Deserialize;
 
 use super::pd_routing::PDRoutingFields;
 use super::{
@@ -252,7 +252,11 @@ async fn completions(
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    match state.core.detokenize(token_ids).await {
+    match state
+        .core
+        .detokenize(token_ids, true /* skip_special_tokens */)
+        .await
+    {
         Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
@@ -716,10 +720,10 @@ mod tests {
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{
+    use futures::StreamExt;
+    use sglang_processor::dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
-    use futures::StreamExt;
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {

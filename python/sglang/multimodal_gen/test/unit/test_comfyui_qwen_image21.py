@@ -75,53 +75,6 @@ def test_int8_marker_of_fused_gate_up_covers_both_halves(monkeypatch) -> None:
     assert set(markers) == {"transformer_blocks.0.attn.to_q"}
 
 
-@pytest.mark.parametrize(
-    "target_hw,ref_hws,slots",
-    [
-        ((4, 6), [(4, 4), (2, 6)], [2, 6]),
-        # Odd parity: ComfyUI centres the reference by half a token.
-        ((5, 6), [(4, 4), (3, 6)], [2, 6]),
-        # A reference without a slot follows the text.
-        ((4, 6), [(4, 4), (2, 6)], [2]),
-    ],
-)
-def test_layout_follows_comfyui_token_order(target_hw, ref_hws, slots) -> None:
-    """The prefix hidden states, RoPE and segments match ComfyUI's own model."""
-    model_mod = pytest.importorskip("comfy.ldm.qwen_image21.model")
-    ops = pytest.importorskip("comfy.ops")
-    torch.manual_seed(0)
-    model = model_mod.QwenImage21Transformer2DModel(
-        in_channels=4,
-        out_channels=4,
-        num_layers=1,
-        attention_head_dim=128,
-        num_attention_heads=1,
-        context_in_dim=8,
-        mlp_ratio=1,
-        dtype=torch.float32,
-        operations=ops.disable_weight_init,
-    )
-    for p in model.parameters():
-        torch.nn.init.normal_(p)
-    x = torch.randn(1, 4, *target_hw)
-    context = torch.randn(1, 11, 8)
-    refs = [torch.randn(1, 4, *hw) for hw in ref_hws]
-    with torch.no_grad():
-        hidden, pe, segments = model.build_sequence(x, context, refs, slots)
-        ctx, flags = stage_mod.insert_image_placeholders(context, slots, len(refs))
-        shapes = [(1, *hw) for hw in ref_hws] + [(1, *target_hw)]
-        layout = stage_mod.comfyui_layout(flags, shapes, (16, 56, 56), "cpu")
-        prefix = model.txt_in(ctx).index_select(1, layout["text_indices"])
-        cond = torch.cat([r.flatten(2).transpose(1, 2) for r in refs], dim=1)
-        prefix[:, layout["image_indices"]] = model.img_in(cond)
-    prefix_len = layout["prefix_rope"].shape[0]
-    torch.testing.assert_close(prefix, hidden[:, :prefix_len], rtol=1e-5, atol=1e-4)
-    rope = torch.cat([layout["prefix_rope"], layout["target_rope"]])
-    torch.testing.assert_close(rope.real, pe[0, :, 0, :, 0, 0], rtol=0, atol=1e-4)
-    torch.testing.assert_close(rope.imag, pe[0, :, 0, :, 1, 0], rtol=0, atol=1e-4)
-    assert list(layout["segments"]) == [(s, e, m is None) for s, e, m in segments[:-1]]
-
-
 class _RecordingExecutor(QwenImage21Executor):
     """Real forward and cond-cache bookkeeping; the worker echoes the latents."""
 

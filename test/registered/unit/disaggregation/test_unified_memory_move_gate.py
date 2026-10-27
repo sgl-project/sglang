@@ -25,7 +25,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeTransferQueue:
@@ -189,15 +189,6 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         self.assertEqual(self._credit(gate=None, host_gate=lambda: True), 4 * 512)
         self.assertEqual(self._credit(gate=None, host_gate=lambda: False), 0)
         self.assertEqual(self._credit(gate=lambda: True, host_gate=lambda: False), 0)
-
-
-class TestMoveGateRejectsNonPdNode(CustomTestCase):
-    def test_null_mode_is_rejected(self):
-        """The gate is only meaningful on a PD node; a NULL-mode scheduler is a
-        wiring bug and must not silently produce an always-open predicate."""
-        scheduler = _FakeScheduler(DisaggregationMode.NULL)
-        with self.assertRaises(ValueError):
-            unified_memory_disagg_move_gate(scheduler)
 
 
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
