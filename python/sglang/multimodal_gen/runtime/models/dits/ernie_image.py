@@ -289,7 +289,7 @@ class ErnieImageSelfAttention(nn.Module):
         k = k.view(B, S, self.num_local_heads, self.head_dim)
         v = v.view(B, S, self.num_local_heads, self.head_dim)
 
-        if self.qk_layernorm:
+        if self.qk_layernorm and q.is_cuda:
             q, k = _ernie_qknorm_rope(
                 q,
                 k,
@@ -300,6 +300,15 @@ class ErnieImageSelfAttention(nn.Module):
                 rope_sin,
                 rope_cache,
                 rope_positions,
+            )
+        elif self.qk_layernorm:
+            # The full-width fused QKNorm+RoPE kernel is CUDA/ROCm-only; skip its gate.
+            q, k = _ernie_qknorm_rotary(
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
                 rotary_emb=self.rotary_emb,
                 shared_rope_cos=shared_rope_cos,
                 shared_rope_sin=shared_rope_sin,
@@ -483,20 +492,12 @@ def _ernie_qknorm_rotary(
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     head_dim: int,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
     *,
     rotary_emb: RotaryEmbedding,
     shared_rope_cos: torch.Tensor,
     shared_rope_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Non-fused path: the bit-exact oracle on CUDA/ROCm, the class elsewhere."""
-    # On CUDA the class runs a full-width table as multi-op fp32 eager,
-    # while the oracle is a single bit-exact triton kernel.
-    if q.is_cuda:
-        return _ernie_qknorm_rope_reference(
-            q, k, q_norm, k_norm, head_dim, rope_cos, rope_sin
-        )
+    """QK RMSNorm and RoPE through the class, for devices without the fused kernel."""
     q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
     return rotary_emb(query=q, key=k, cos=shared_rope_cos, sin=shared_rope_sin)
 
@@ -511,10 +512,6 @@ def _ernie_qknorm_rope(
     rope_sin: torch.Tensor,
     rope_cache: torch.Tensor,
     rope_positions: torch.Tensor,
-    *,
-    rotary_emb: RotaryEmbedding,
-    shared_rope_cos: torch.Tensor,
-    shared_rope_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse ERNIE's QK RMSNorm and rotate-half RoPE without changing bits."""
     verified = _ERNIE_QKNORM_ROPE.verified
@@ -538,7 +535,7 @@ def _ernie_qknorm_rope(
             )
         except Exception as exc:
             _ERNIE_QKNORM_ROPE.on_exception(exc, logger=logger)
-            return _ernie_qknorm_rotary(
+            return _ernie_qknorm_rope_reference(
                 q_input,
                 k_input,
                 q_norm,
@@ -546,9 +543,6 @@ def _ernie_qknorm_rope(
                 head_dim,
                 rope_cos,
                 rope_sin,
-                rotary_emb=rotary_emb,
-                shared_rope_cos=shared_rope_cos,
-                shared_rope_sin=shared_rope_sin,
             )
         else:
             if verified:
@@ -569,17 +563,8 @@ def _ernie_qknorm_rope(
                 logger=logger,
             )
 
-    return _ernie_qknorm_rotary(
-        q,
-        k,
-        q_norm,
-        k_norm,
-        head_dim,
-        rope_cos,
-        rope_sin,
-        rotary_emb=rotary_emb,
-        shared_rope_cos=shared_rope_cos,
-        shared_rope_sin=shared_rope_sin,
+    return _ernie_qknorm_rope_reference(
+        q, k, q_norm, k_norm, head_dim, rope_cos, rope_sin
     )
 
 
