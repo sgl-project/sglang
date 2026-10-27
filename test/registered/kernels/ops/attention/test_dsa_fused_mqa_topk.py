@@ -33,7 +33,7 @@ from sglang.test.kernels.dsa_fused_mqa_topk import (
 register_cuda_ci(est_time=200, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_fused_mqa_topk_supported(), reason="requires CUDA SM100"
+    not is_fused_mqa_topk_supported(), reason="requires CUDA SM100 with nvcc >= 12.9"
 )
 
 TOPK = 2048
@@ -56,7 +56,7 @@ def _fused(batch, **kwargs):
         (FUSED_MQA_TOPK_MAX_KEYS, 8),
     ],
 )
-def test_single_request_is_exact_on_every_kernel_path(keys, rows):
+def test_single_request_is_exact_across_the_key_range(keys, rows):
     batch = make_ragged_batch([keys], [rows], seed=keys)
     assert_topk_matches_reference(_fused(batch), batch, reference_scores(batch))
 

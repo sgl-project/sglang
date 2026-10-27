@@ -7,10 +7,10 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
-#include <fused_mqa_topk/launch.cuh>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
+#include "fused_mqa_topk/launch.cuh"
 #include <climits>
 #include <cstdint>
 
@@ -69,7 +69,7 @@ inline void fused_mqa_topk_prefill(
     tvm::ffi::TensorView counts,
     tvm::ffi::TensorView defer) {
   using namespace host;
-  namespace kernel = ::fused_mqa_topk;
+  namespace kernel = fused_mqa_topk;
 
   auto R = SymbolicSize{"rows"};
   auto K = SymbolicSize{"keys"};
@@ -81,7 +81,7 @@ inline void fused_mqa_topk_prefill(
 
   // TMA tensor maps need 16-byte aligned bases and row strides; the output and
   // the offset pass use 16-byte stores.
-  TensorMatcher({R, kernel::kHeads, kernel::kHeadDim})
+  TensorMatcher({R, kernel::kNumHeads, kernel::kHeadDim})
       .with_dtype<fp8_e4m3_t>()
       .with_device<kDLCUDA>(device_)
       .ensure_alignment(16)
@@ -92,7 +92,7 @@ inline void fused_mqa_topk_prefill(
       .ensure_alignment(16)
       .verify(k);
   TensorMatcher({K}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).ensure_alignment(16).verify(k_scale);
-  TensorMatcher({R, kernel::kHeads})
+  TensorMatcher({R, kernel::kNumHeads})
       .with_dtype<fp32_t>()
       .with_device<kDLCUDA>(device_)
       .ensure_alignment(16)
@@ -119,10 +119,19 @@ inline void fused_mqa_topk_prefill(
   }
 
   TensorMatcher({2}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(counter);
-  TensorMatcher({SLOT_ROWS, kernel::kCandidates}).with_dtype<fp16_t>().with_device<kDLCUDA>(device_).verify(values);
-  TensorMatcher({SLOT_ROWS, kernel::kCandidates}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(indices);
-  TensorMatcher({SLOT_ROWS, kernel::kRetained}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(retained);
-  TensorMatcher({SLOT_ROWS, kernel::kRetained})
+  TensorMatcher({SLOT_ROWS, kernel::kCandidatesPerRow})
+      .with_dtype<fp16_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(values);
+  TensorMatcher({SLOT_ROWS, kernel::kCandidatesPerRow})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(indices);
+  TensorMatcher({SLOT_ROWS, kernel::kRetainedPerRow})
+      .with_dtype<fp32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(retained);
+  TensorMatcher({SLOT_ROWS, kernel::kRetainedPerRow})
       .with_dtype<int32_t>()
       .with_device<kDLCUDA>(device_)
       .verify(retained_indices);
@@ -132,25 +141,26 @@ inline void fused_mqa_topk_prefill(
   const int64_t rows = R.unwrap();
   const int64_t keys = K.unwrap();
   const int64_t topk = TOPK.unwrap();
-  const int64_t blocks = div_ceil(rows, int64_t{8});
+  const int64_t blocks = div_ceil(rows, int64_t{kernel::kBlockRows});
   // rows * 32 is the int32 outer extent of the Q tensor map.
-  CHECK_HOST(rows > 0 && rows <= INT32_MAX / kernel::kHeads)
-      << "rows must be in [1, " << INT32_MAX / kernel::kHeads << "]";
-  CHECK_HOST(keys >= ::fused_persist::kMinKeys && keys <= kernel::kMaxKeys)
-      << "keys must be in [" << ::fused_persist::kMinKeys << ", " << kernel::kMaxKeys << "]";
-  CHECK_HOST(topk == ::fused_persist::kTopK) << "topk must be " << ::fused_persist::kTopK << ", got " << topk;
-  CHECK_HOST(SLOT_ROWS.unwrap() > 0 && SLOT_ROWS.unwrap() % 16 == 0)
+  CHECK_HOST(rows > 0 && rows <= INT32_MAX / kernel::kNumHeads)
+      << "rows must be in [1, " << INT32_MAX / kernel::kNumHeads << "]";
+  CHECK_HOST(keys >= kernel::kMinKeys && keys <= kernel::kMaxKeys)
+      << "keys must be in [" << kernel::kMinKeys << ", " << kernel::kMaxKeys << "]";
+  CHECK_HOST(topk == kernel::kTopK) << "topk must be " << kernel::kTopK << ", got " << topk;
+  CHECK_HOST(SLOT_ROWS.unwrap() > 0 && SLOT_ROWS.unwrap() % (kernel::kBlockRows * kernel::kSlotsPerCta) == 0)
       << "candidate slabs must hold an even number of 8-row slots";
-  CHECK_HOST(COUNTS.unwrap() >= blocks * 8 && DEFER.unwrap() >= blocks) << "per-row workspace too small";
+  CHECK_HOST(COUNTS.unwrap() >= blocks * kernel::kBlockRows && DEFER.unwrap() >= blocks)
+      << "per-row workspace too small";
 
   const DLDevice device = device_.unwrap();
-  int current_device = -1;
+  int32_t current_device = -1;
   CHECK_CUDA(cudaGetDevice(&current_device));
   // The launcher sets kernel attributes on the current device.
   CHECK_HOST(current_device == device.device_id)
       << "tensors are on cuda:" << device.device_id << " but the current device is cuda:" << current_device;
 
-  kernel::FusedMqaTopkParams params{};
+  kernel::LaunchParams params{};
   params.q = q.data_ptr();
   params.k = k.data_ptr();
   params.scales = static_cast<const float*>(k_scale.data_ptr());
@@ -173,8 +183,8 @@ inline void fused_mqa_topk_prefill(
   params.retained_indices = static_cast<int32_t*>(retained_indices.data_ptr());
   params.counts = static_cast<int32_t*>(counts.data_ptr());
   params.defer = static_cast<int32_t*>(defer.data_ptr());
-  params.slots = SLOT_ROWS.unwrap() / 8;
-  params.num_sms = static_cast<int>(runtime::get_sm_count(device.device_id));
+  params.slots = SLOT_ROWS.unwrap() / kernel::kBlockRows;
+  params.num_sms = static_cast<int32_t>(runtime::get_sm_count(device.device_id));
   params.stream = LaunchKernel::resolve_device(device);
   CHECK_HOST(kernel::params_supported(params)) << "unsupported fused_mqa_topk_prefill parameters";
   CHECK_CUDA(kernel::launch(params)) << "fused_mqa_topk_prefill launch failed";

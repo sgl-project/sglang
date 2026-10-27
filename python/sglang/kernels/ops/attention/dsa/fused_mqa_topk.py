@@ -8,7 +8,7 @@ FP8 scan a per-row gate set from a sampled quantile of the row's scores
 candidate count falls outside the exact range are rescanned densely, so the
 result is the exact top-k up to ties at the k-th score. The kernel is LiteTopK
 (arXiv:2607.11976) as optimized in vLLM PR #60618, with further changes; see
-``kernels/jit/csrc/fused_mqa_topk/README.md``.
+``kernels/jit/csrc/dsa/fused_mqa_topk/README.md``.
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.kernels.jit.utils import (
-    KERNEL_PATH,
     cache_once,
     load_jit,
     override_jit_cuda_arch,
 )
+from sglang.kernels.jit.utils.arch import _jit_cuda_version
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -31,17 +31,18 @@ if TYPE_CHECKING:
 SUPPORTED_CUDA_ARCHS = ((10, 0),)
 FUSED_MQA_TOPK_NUM_HEADS = 32
 FUSED_MQA_TOPK_HEAD_DIM = 128
-# The only top-k the vendored kernel is instantiated for.
+# Mirror csrc/dsa/fused_mqa_topk/constants.h (the host entry checks them).
+# The only top-k the kernel is compiled for (kTopK).
 FUSED_MQA_TOPK_TOPK = 2048
-# Fewest keys (rows of k_fp8) the kernel takes, fused_persist::kMinKeys: only
-# its global-slab path is vendored, tuned above 20480 keys.
+# Fewest keys (rows of k_fp8) the kernel takes (kMinKeys): its gates are tuned
+# above 20480 keys.
 FUSED_MQA_TOPK_MIN_KEYS = 20481
 FUSED_MQA_TOPK_MAX_KEYS = 1 << 20
 # rows * 32 is the int32 outer extent of the kernel's Q tensor map.
 FUSED_MQA_TOPK_MAX_ROWS = (2**31 - 1) // 32
 
-# Workspace layout of fused_mqa_topk/launch.cuh: one persistent CTA per SM owns
-# two 8-row slots, each row a 16384-candidate slab and a 4096-entry rescan slab.
+# Workspace layout (constants.h): one persistent CTA per SM owns two 8-row
+# slots, each row a 16384-candidate slab and a 4096-entry rescan slab.
 _SLOTS_PER_SM = 2
 _CANDIDATES_PER_ROW = 16384
 _RETAINED_PER_ROW = 4096
@@ -67,24 +68,28 @@ _RETIRED_PER_ROW: List[torch.Tensor] = []
 
 @cache_once
 def is_fused_mqa_topk_supported() -> bool:
-    """Whether the current CUDA device can run the fused kernel."""
+    """Whether the current CUDA device and the JIT's nvcc support the fused kernel."""
     if torch.version.cuda is None or not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability() in SUPPORTED_CUDA_ARCHS
+    return (
+        torch.cuda.get_device_capability() in SUPPORTED_CUDA_ARCHS
+        # The module is built for sm_100f, which needs a CUDA >= 12.9 nvcc.
+        and _jit_cuda_version() >= (12, 9)
+    )
 
 
 @cache_once
 def _jit_fused_mqa_topk_module() -> Module:
     if not is_fused_mqa_topk_supported():
-        raise RuntimeError("fused_mqa_topk_prefill requires CUDA SM100")
-    vendor = (KERNEL_PATH / "csrc" / "fused_mqa_topk" / "vendor").resolve()
+        raise RuntimeError(
+            "fused_mqa_topk_prefill requires CUDA SM100 with nvcc >= 12.9"
+        )
     # sm_100f, not the default sm_100a; see the README.
     with override_jit_cuda_arch(10, 0, suffix="f"):
         return load_jit(
             "fused_mqa_topk",
-            cuda_files=["fused_mqa_topk/entry.cuh"],
+            cuda_files=["dsa/fused_mqa_topk.cuh"],
             cuda_wrappers=[("fused_mqa_topk_prefill", "fused_mqa_topk_prefill")],
-            extra_include_paths=[str(vendor)],
             # CUTLASS, and <deep_gemm/...> from the installed sgl-deep-gemm.
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=["--expt-extended-lambda"],

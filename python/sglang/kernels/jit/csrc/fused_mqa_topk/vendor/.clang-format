@@ -1,5 +1,0 @@
-# Vendored from vllm-project/vllm (PR #60618);
-# keep the sources unformatted so they stay diff-comparable with upstream.
-# See ../README.md.
-DisableFormat: true
-SortIncludes: Never

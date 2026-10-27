@@ -136,7 +136,8 @@ _BOUNDS = {RAGGED: (28672, 192), PAGED: (22528, 96)}
 
 
 @unittest.skipUnless(
-    fused_mqa_topk.is_fused_mqa_topk_supported(), "requires CUDA SM100"
+    fused_mqa_topk.is_fused_mqa_topk_supported(),
+    "requires CUDA SM100 with nvcc >= 12.9",
 )
 @patch.object(dsa_indexer, "_FUSED_MQA_TOPK_MIN_KEYS_RAGGED", _BOUNDS[RAGGED][0])
 @patch.object(dsa_indexer, "_FUSED_MQA_TOPK_MIN_ROWS_RAGGED", _BOUNDS[RAGGED][1])

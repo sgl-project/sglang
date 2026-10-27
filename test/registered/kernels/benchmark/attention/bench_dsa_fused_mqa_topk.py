@@ -105,7 +105,7 @@ def _fused(q_fp8, k_fp8, k_scale, weights, starts, ends, page_table, budget_byte
 @marker.benchmark("impl", ["dense", "fused", "dense_paged", "fused_paged"], unit="ms")
 def benchmark(keys: int, rows: int, impl: str):
     if not is_fused_mqa_topk_supported():
-        marker.skip("requires CUDA SM100")
+        marker.skip("requires CUDA SM100 with nvcc >= 12.9")
     batch = make_ragged_batch([keys], [rows], seed=0)
     args = [
         batch[n] for n in ("q_fp8", "k_fp8", "k_scale", "weights", "starts", "ends")

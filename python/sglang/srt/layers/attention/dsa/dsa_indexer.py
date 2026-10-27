@@ -294,9 +294,9 @@ def _log_fused_mqa_topk_once(enabled: bool) -> None:
     else:
         logger.warning(
             "SGLANG_ENABLE_DSA_FUSED_MQA_TOPK is set but the DSA indexer cannot use "
-            "it: it needs CUDA SM100, 32 index heads of dim 128, index_topk "
-            "2048, no index init/local tokens, no prefill context parallelism and "
-            "no deterministic inference"
+            "it: it needs CUDA SM100 with nvcc >= 12.9, 32 index heads of dim 128, "
+            "index_topk 2048, no index init/local tokens, no prefill context "
+            "parallelism and no deterministic inference"
         )
 
 
