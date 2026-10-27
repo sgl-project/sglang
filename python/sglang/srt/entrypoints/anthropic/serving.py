@@ -382,7 +382,10 @@ class AnthropicServing:
                 return None, None
 
             reasoning_text = "\n".join(thinking_parts)
-            if self.openai_serving_chat.supports_native_reasoning_history():
+            if self.openai_serving_chat.supports_native_reasoning_history() or (
+                hasattr(self.openai_serving_chat, "_populates_thinking_field")
+                and self.openai_serving_chat._populates_thinking_field()
+            ):
                 return reasoning_text, None
 
             try:

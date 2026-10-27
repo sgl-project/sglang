@@ -41,7 +41,17 @@ class _FakeOpenAIServingChat:
         self.supports_inline_system = detect_inline_system_support(chat_template)
 
     def supports_native_reasoning_history(self):
-        return self.native_reasoning_history
+        from sglang.srt.parser.jinja_template_utils import (
+            template_reads_reasoning,
+            template_reads_thinking,
+        )
+
+        chat_template = self.tokenizer_manager.tokenizer.chat_template
+        return (
+            self.native_reasoning_history
+            or template_reads_reasoning(chat_template)
+            or template_reads_thinking(chat_template)
+        )
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
@@ -1111,6 +1121,40 @@ class TestAnthropicServing(unittest.TestCase):
         assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
         self.assertEqual(assistant_msg.reasoning_content, "ponder")
         self.assertEqual(assistant_msg.content, "")
+
+    def test_assistant_thinking_history_uses_reasoning_content_for_gpt_oss_template(
+        self,
+    ):
+        """Templates that inspect ``message.thinking`` (e.g. gpt-oss) receive
+        ``reasoning_content`` instead of splicing ``<|channel|>`` tags into content.
+        """
+        from pathlib import Path
+
+        gpt_oss_template = (
+            Path(__file__).resolve().parent.parent
+            / "openai"
+            / "gpt_oss_20b_chat_template.jinja"
+        ).read_text(encoding="utf-8")
+        serving = self._serving(chat_template=gpt_oss_template)
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "analysis step"},
+                        {"type": "text", "text": "final answer"},
+                    ],
+                },
+                {"role": "user", "content": "follow up"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "analysis step")
+        self.assertEqual(assistant_msg.content, "final answer")
+        self.assertNotIn("<|channel|>", assistant_msg.content)
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""
