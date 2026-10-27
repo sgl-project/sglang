@@ -101,9 +101,7 @@ def _clip_decoded_frames_to_uint8(decoded_frames: torch.Tensor) -> np.ndarray:
     uint8 wraps around instead of saturating.
     """
     return (
-        rearrange(
-            ((decoded_frames.clamp(-1, 1) + 1) * 127.5), "1 c t h w -> t h w c"
-        )
+        rearrange(((decoded_frames.clamp(-1, 1) + 1) * 127.5), "1 c t h w -> t h w c")
         .detach()
         .to(torch.uint8)
         .cpu()

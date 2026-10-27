@@ -55,9 +55,7 @@ class TestLTX2BongmathAnchorRefine(unittest.TestCase):
             for _ in range(100):
                 loop_anchor = x_mid - h * a21 * eps1
                 eps1 = denoised - loop_anchor
-            torch.testing.assert_close(
-                anchor, loop_anchor, rtol=1e-12, atol=1e-12
-            )
+            torch.testing.assert_close(anchor, loop_anchor, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == "__main__":

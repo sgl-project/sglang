@@ -50,12 +50,8 @@ class TestInitRolloutEnv(unittest.TestCase):
         env = batch._rollout_denoising_env_state["env"]
         self.assertIs(env.pos_cond_kwargs, pos)
         self.assertIs(env.neg_cond_kwargs, neg)
-        self.assertIs(
-            batch._rollout_denoising_env_state["pos_cond_kwargs_src"], pos
-        )
-        self.assertIs(
-            batch._rollout_denoising_env_state["neg_cond_kwargs_src"], neg
-        )
+        self.assertIs(batch._rollout_denoising_env_state["pos_cond_kwargs_src"], pos)
+        self.assertIs(batch._rollout_denoising_env_state["neg_cond_kwargs_src"], neg)
 
     def test_empty_neg_cond_kwargs_stay_none(self):
         batch = _rollout_batch(collect_env=True)
