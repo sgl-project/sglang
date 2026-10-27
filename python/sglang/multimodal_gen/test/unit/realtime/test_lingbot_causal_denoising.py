@@ -878,8 +878,7 @@ def _fusable_qkv_block():
     block.to_q = torch.nn.Linear(4, 6, bias=True)
     block.to_k = torch.nn.Linear(4, 6, bias=True)
     block.to_v = torch.nn.Linear(4, 6, bias=True)
-    block._fused_qkv_weight = None
-    block._fused_qkv_bias = None
+    block._qkv_fused = False
     return block
 
 
@@ -890,7 +889,7 @@ def _qkv_reference(block, x):
 def test_lingbot_qkv_fusion_shares_storage_and_sees_weight_updates():
     block = _fusable_qkv_block()
     assert block.fuse_qkv_projection()
-    packed = block._fused_qkv_weight
+    packed, _ = block._packed_qkv_params()
     for layer in (block.to_q, block.to_k, block.to_v):
         assert (
             layer.weight.untyped_storage().data_ptr()
@@ -939,6 +938,54 @@ def test_lingbot_model_refresh_repacks_qkv_after_weight_swap():
     x = torch.randn(3, 4)
     q, k, v = block._project_qkv(x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
+
+
+def test_lingbot_qkv_pack_is_freed_by_layerwise_release(monkeypatch):
+    """release_layer() must drop the packed QKV allocation: the block may not
+    keep its own reference to it, and the fused path must repack after the
+    layer is prefetched again."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers import (
+        layerwise_offload as layerwise_offload_mod,
+    )
+    from sglang.multimodal_gen.test.unit.test_layerwise_offload import (
+        _FakeDeviceModule,
+    )
+
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    block = _fusable_qkv_block()
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([block])
+    manager = layerwise_offload_mod.LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+    x = torch.randn(3, 4)
+    expected = _qkv_reference(block, x)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
+    assert block._packed_qkv_params() is not None
+
+    manager.release_layer(0)
+    assert not [
+        name for name, value in vars(block).items() if isinstance(value, torch.Tensor)
+    ]
+    assert all(
+        getattr(layer, name).numel() <= 1
+        for layer in (block.to_q, block.to_k, block.to_v)
+        for name in ("weight", "bias")
+    )
+
+    manager.prefetch_layer(0, non_blocking=False)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
 
 
 def test_lingbot_causal_attention_without_cache_applies_rope_once(monkeypatch):

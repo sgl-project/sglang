@@ -1091,8 +1091,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             head_start=head_start,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
-        self._fused_qkv_weight = None
-        self._fused_qkv_bias = None
+        self._qkv_fused = False
         self._norm1_modulation_gate = BitExactFusionGate(
             "LingBot norm1 modulation", per_signature=True
         )
@@ -1254,7 +1253,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         return reference()
 
     def _can_fuse_qkv_projection(self) -> bool:
-        if self._fused_qkv_weight is not None:
+        if self._qkv_fused:
             return True
 
         layers = (self.to_q, self.to_k, self.to_v)
@@ -1272,7 +1271,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     def fuse_qkv_projection(self) -> bool:
         if not self._can_fuse_qkv_projection():
             return False
-        if self._fused_qkv_weight is not None:
+        if self._qkv_fused:
             return True
 
         self.repack_qkv_projection()
@@ -1282,37 +1281,46 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         # Share one packed buffer between to_q/to_k/to_v instead of keeping a
         # second copy: each layer's weight/bias becomes a view into it, so
         # in-place LoRA merges and weight copies still reach the fused GEMM.
-        # The packed tensor is a plain attribute, not a Parameter, so it stays
-        # out of state_dict. Re-run after a loader replaces the layers' .data.
+        # No reference to the packed tensor is kept; the layer views own its
+        # storage, so layerwise offload's release_layer() frees it.
         layers = (self.to_q, self.to_k, self.to_v)
         with torch.no_grad():
-            self._fused_qkv_weight = _share_rows_into_packed(layers, "weight")
-            self._fused_qkv_bias = (
+            _share_rows_into_packed(layers, "weight")
+            if all(layer.bias is not None for layer in layers):
                 _share_rows_into_packed(layers, "bias")
-                if all(layer.bias is not None for layer in layers)
-                else None
-            )
+        self._qkv_fused = True
 
-    def _qkv_pack_is_current(self) -> bool:
-        # .to(dtype/device) and offload give each layer a new weight, leaving the
-        # packed buffer on the old storage, dtype or device.
-        layers = (self.to_q, self.to_k, self.to_v)
-        for packed, name in (
-            (self._fused_qkv_weight, "weight"),
-            (self._fused_qkv_bias, "bias"),
-        ):
-            if packed is None:
-                continue
-            storage = packed.untyped_storage().data_ptr()
-            for layer in layers:
-                param = getattr(layer, name)
-                if (
-                    param.untyped_storage().data_ptr() != storage
-                    or param.dtype != packed.dtype
-                    or param.device != packed.device
-                ):
-                    return False
-        return True
+    def _packed_qkv(self, name: str) -> torch.Tensor | None:
+        # Rebuild the packed view from the layers when they are still adjacent
+        # rows of one buffer. .to(dtype/device), loaders and offload prefetch
+        # give each layer a new tensor, which breaks adjacency.
+        params = [getattr(layer, name).data for layer in (self.to_q, self.to_k, self.to_v)]
+        first = params[0]
+        offset = first.storage_offset()
+        storage = first.untyped_storage().data_ptr()
+        for param in params:
+            if (
+                not param.is_contiguous()
+                or param.untyped_storage().data_ptr() != storage
+                or param.storage_offset() != offset
+                or param.dtype != first.dtype
+                or param.shape[1:] != first.shape[1:]
+            ):
+                return None
+            offset += param.numel()
+        rows = sum(param.shape[0] for param in params)
+        return first.as_strided(
+            (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+        )
+
+    def _packed_qkv_params(self) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        weight = self._packed_qkv("weight")
+        if weight is None:
+            return None
+        if self.to_q.bias is None:
+            return weight, None
+        bias = self._packed_qkv("bias")
+        return None if bias is None else (weight, bias)
 
     def _project_qkv(
         self, hidden_states: torch.Tensor
@@ -1325,9 +1333,11 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             for layer in layers
         )
         if not lora_active and self.fuse_qkv_projection():
-            if not self._qkv_pack_is_current():
+            packed = self._packed_qkv_params()
+            if packed is None:
                 self.repack_qkv_projection()
-            qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
+                packed = self._packed_qkv_params()
+            qkv = F.linear(hidden_states, *packed)
             return qkv.chunk(3, dim=-1)
 
         query, _ = self.to_q(hidden_states)
@@ -1516,7 +1526,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
         super().refresh_weight_derived_caches(weights_path=weights_path)
         for block in self.blocks:
-            if block._fused_qkv_weight is not None:
+            if block._qkv_fused:
                 block.repack_qkv_projection()
 
     @lru_cache(maxsize=8)
