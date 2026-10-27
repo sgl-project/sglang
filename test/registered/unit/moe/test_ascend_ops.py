@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner.ascend import _reshape_received_scale
 from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
     AscendOpsDispatcher,
@@ -66,6 +67,14 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "mc2.*fp8"):
             dispatcher._quant_mode("mc2")
+
+    # Protects the empty AllToAllV receive path from ambiguous -1 reshapes.
+    def test_empty_received_scale_uses_explicit_shape(self):
+        scale = torch.empty((0, 8), dtype=torch.uint8)
+
+        reshaped = _reshape_received_scale(scale)
+
+        self.assertEqual(reshaped.shape, (0, 4, 2))
 
     # Protects AllGather row metadata when attention CP/DP creates uneven shards.
     def test_allgather_row_sizes_use_actual_rank_local_rows(self):
