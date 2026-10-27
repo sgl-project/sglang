@@ -8,10 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.dflash import (
-    compute_dflash_correct_drafts_and_bonus,
-)
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda, inputs_on_npu
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -22,10 +19,14 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
+    from sgl_kernel_npu.sample import (
+        chain_speculative_sampling_triton,
+        compute_dflash_correct_drafts_and_bonus,
+    )
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
+        compute_dflash_correct_drafts_and_bonus,
     )
 
 
@@ -278,10 +279,6 @@ except ImportError:
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_npu(*args, **kwargs):
-            from sgl_kernel_npu import sample as npu_sample
-
-            return npu_sample.softmax_temp_triton(*args, **kwargs)
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
@@ -310,6 +307,8 @@ class SoftmaxTemp:
         temperatures: torch.Tensor,
         rows_per_request: int,
     ) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.sample import softmax_temp_triton
         return softmax_temp_triton(
             logits=logits,
             temperatures=temperatures,
@@ -688,25 +687,24 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
-    if logits.dim() != 2 or logits.dtype != torch.float32 or logits.stride(1) != 1:
-        return torch.argmax(logits, dim=-1)
-
-    # NPU preserves torch's NaN selection. CUDA's fused kernel does not,
-    # so keep it opt-in and limited to shapes where it outperforms torch.
-    use_fused = logits.device.type == "npu" or (
+    # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
+    # off the memory the reduction touches. The fused kernel does not reproduce
+    # torch.argmax's NaN selection, hence the opt-in.
+    if (
         fused
         and logits.is_cuda
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
         and (
             logits.shape[0] <= 64
             or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
         )
         and logits.shape[1] >= 4096
-    )
-    if use_fused:
+    ):
         from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
         return row_argmax(logits)
-    return torch.argmax(logits, dim=-1)
 
 
 def accept_greedy_triton(

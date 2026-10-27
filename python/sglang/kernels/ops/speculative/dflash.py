@@ -4,6 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import (
+    is_npu,
+)
+
+_is_npu = is_npu()
+
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
@@ -379,13 +385,6 @@ def compute_dflash_correct_drafts_and_bonus(
         raise ValueError(f"batch size must be positive, got {bs}.")
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
-
-    if candidates.device.type == "npu":
-        from sgl_kernel_npu import sample as npu_sample
-
-        return npu_sample.compute_dflash_correct_drafts_and_bonus(
-            candidates=candidates, target_predict=target_predict
-        )
 
     if candidates.is_cuda:
         num_correct_drafts = torch.empty(
