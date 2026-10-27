@@ -16,10 +16,15 @@ from sglang.srt.speculative.dspark_components import (
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 STRIDE = 6
 GAMMA = STRIDE - 1

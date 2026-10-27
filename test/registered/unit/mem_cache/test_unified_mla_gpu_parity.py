@@ -28,9 +28,10 @@ import torch
 
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
