@@ -158,7 +158,7 @@ def _uninstall_wait_stream_hook():
 
 def _weak_ref_if_tensor(x):
     """Return a weak-ref view for nonempty accelerator tensors; recurse into
-    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
+    tuples/lists and keep CPU and non-tensor values unchanged.
     Weak-ref'ing captured args lets the shared mempool reclaim per-layer
     intermediates between segments — storage stays alive for each segment
     CUDAGraph's lifetime via its pool use_count.
@@ -167,8 +167,17 @@ def _weak_ref_if_tensor(x):
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
     an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
-        if x.numel() == 0 or x.device.type == "cpu":
+        if x.device.type == "cpu":
             return x
+        if x.numel() == 0:
+            # An empty view can still own a large base allocation. For example,
+            # NoPE MLA passes zero-width Q/K RoPE views into eager attention;
+            # keeping those views pins both projection outputs in every layer
+            # and capture bucket. An empty tensor has no data to replay, so
+            # retain its metadata without retaining its backing storage.
+            return torch.empty_strided(
+                x.shape, x.stride(), dtype=x.dtype, device=x.device
+            )
         from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
             weak_ref_tensors,
         )
