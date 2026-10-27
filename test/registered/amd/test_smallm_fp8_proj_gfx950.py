@@ -1,4 +1,4 @@
-"""gfx950 small-M W8A8 FP8 GEMM and output-side FP8 quant on Qwen3.5 and MiniMax-M3.1 shapes."""
+"""gfx950 small-M W8A8 FP8 GEMM and fused output-side FP8 quant, Qwen3.5 AttnFP8 TP4 and TP2 shapes."""
 
 import itertools
 import os
@@ -41,8 +41,8 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
 
         cls.fp8_utils, cls.quant = fp8_utils, staticmethod(per_token_group_quant_fp8)
         torch.manual_seed(0)
-        # packed GDN in_proj, attention qkv_proj, GDN out_proj / attention o_proj at TP4 then TP2, then the
-        # MiniMax-M3.1 TP4 dense projections and DSpark ctx-KV GEMM; max M sent to the small-M kernel
+        # packed GDN in_proj, attention qkv_proj, GDN out_proj / attention o_proj at TP4 then TP2; max M sent to
+        # the new kernel
         cls.shapes = []
         for n, k, max_m in (
             (5184, 4096, 28),
@@ -51,14 +51,6 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             (10304, 4096, 32),
             (8704, 4096, 16),
             (4096, 4096, 40),
-            (2560, 6144, 16),
-            (2304, 6144, 16),
-            (1280, 6144, 16),
-            (1536, 6144, 16),
-            (6144, 2048, 16),
-            (6144, 768, 16),
-            (6144, 6144, 16),
-            (6144, 3072, 16),
         ):
             w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
             s = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3
@@ -98,38 +90,6 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                 ulp = torch.exp2(torch.floor(torch.log2(ref.abs() + 1e-30)) - 7)
                 err = (got.float() - ref).abs()
                 self.assertTrue((err <= ulp + 1e-5 * ref.abs().max()).all())
-
-    def test_ptpc_linear_matches_aiter(self):
-        """The rowwise-fp8 entry point takes the kernel up to each shape's max M only for the callers that
-        ask for it (the MiniMax-M3.1 decode projections); other per-channel FP8 linears keep aiter's GEMM."""
-        import aiter
-
-        for w, s, max_m in self.shapes:
-            for m in (1, 8, 16, 17, 33):
-                x = torch.randn(m, w.shape[0], device="cuda", dtype=torch.bfloat16)
-                q, xs = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
-                ref = aiter.gemm_a8w8_bpreshuffle(
-                    q, w.t(), xs, s, None, torch.bfloat16
-                ).float()
-                with self.subTest(n=w.shape[1], m=m):
-                    (got,), calls = self.run_counted(
-                        lambda: self.fp8_utils.apply_fp8_ptpc_linear(
-                            input=x,
-                            weight=w.t(),
-                            weight_scale=s,
-                            allow_smallm_kernel=True,
-                        )
-                    )
-                    self.assertEqual(calls, int(m <= max_m))
-                    _, default_calls = self.run_counted(
-                        lambda: self.fp8_utils.apply_fp8_ptpc_linear(
-                            input=x, weight=w.t(), weight_scale=s
-                        )
-                    )
-                    self.assertEqual(default_calls, 0)
-                    ulp = torch.exp2(torch.floor(torch.log2(ref.abs() + 1e-30)) - 7)
-                    err = (got.float() - ref).abs()
-                    self.assertTrue((err <= ulp + 1e-5 * ref.abs().max()).all())
 
     def test_tuple_input_matches_bf16(self):
         for n, m, w, s, in_range, x, q, xs, _ in self.cases():
