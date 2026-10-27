@@ -23,7 +23,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 |------|------|
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
 | `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
-| `scripts/ci/opt_in_ci_tiers.json` | Opt-in CI tiers: tier name → `run-ci-<tier>` label + the workflows that gate on it |
+| `scripts/ci/opt_in_ci_tiers.json` | CI selections: name → workflow files and an optional opt-in label |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
@@ -391,7 +391,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Command | Effect |
 |---------|--------|
 | `/tag-run-ci-label` | Adds `run-ci` label to PR |
-| `/tag-run-ci-label <tier> [<tier> ...]` | Also adds each tier's `run-ci-<tier>` label (e.g. `extra`); unknown tiers are rejected |
+| `/tag-run-ci-label <tier> [<tier> ...]` | Also adds each tier's opt-in label (e.g. `run-ci-extra`); unrecognized suffixes are ignored |
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
 | `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
 | `/tag-and-rerun-ci <tier> [<tier> ...]` | Adds `run-ci` and the tier labels + reruns failed |
