@@ -24,6 +24,28 @@ use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
+
+/// The formatter a checkpoint with `config` and Jinja `template` selects.
+pub(super) fn checkpoint_formatter(
+    config: &serde_json::Value,
+    template: &str,
+) -> super::ChatFormatter {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("jinja-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+    std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+    let (formatter, error) =
+        sglang_processor::select_chat_formatter(&sglang_processor::ChatFormatterOptions {
+            tokenizer_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+    std::fs::remove_dir_all(&dir).unwrap();
+    formatter.unwrap_or_else(|| panic!("{error:?}"))
+}
+
 pub(super) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
@@ -35,6 +57,7 @@ pub(super) fn core_handle() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metrics: None,
         },
     )
 }
@@ -112,6 +135,8 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
         chat_formatter: None,
+        generate_hook: None,
+        openai_chat: None,
     })
 }
 
@@ -132,6 +157,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metrics: None,
         },
     )
 }
@@ -139,12 +165,37 @@ pub(super) fn frontend_closed() -> CoreHandle {
 /// App state whose core intake answers every generation with one finished
 /// `ok` chunk, with the ChatML template so chat can render.
 fn answering_app_state() -> Arc<super::AppState> {
+    let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
+    answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
+}
+
+/// App state whose core intake answers every generation with one finished `text` chunk.
+pub(super) fn answering_app_state_with(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    text: &'static str,
+) -> Arc<super::AppState> {
+    answering_app_state_with_item(server_args, formatter, tokenizer, move |rid| {
+        chunk(rid, text, true)
+    })
+}
+
+/// [`answering_app_state_with`], answering each request with `answer(rid)`.
+pub(super) fn answering_app_state_with_item(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
+        // Held open, so an unfinished answer stays unfinished.
+        let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            let done = chunk(request.rid.as_str(), "ok", true);
-            request.sink.try_send(done).unwrap();
+            request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            open.push(request);
         }
     });
     let core = CoreHandle::new(
@@ -156,19 +207,24 @@ fn answering_app_state() -> Arc<super::AppState> {
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metadata: crate::api_server::core::CoreMetadata::from(server_args.as_ref()),
+            metrics: None,
         },
     );
-    let server_args = server_args();
+    // The test tokenizers add no specials, so one handle serves both modes.
+    let tokenizer = tokenizer.map(|tokenizer| {
+        Arc::new(sglang_processor::DynamoTokenizer::new(
+            tokenizer.clone(),
+            tokenizer,
+        ))
+    });
     Arc::new(super::AppState {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        openai_chat: tokenizer.map(|t| super::OpenAiChat::new(&server_args, &formatter, t)),
         server_args,
-        chat_formatter: Some(super::ChatFormatter::Legacy(Box::new(
-            super::template::LegacyFormatter {
-                spec: super::template::builtin_template("chatml").unwrap(),
-            },
-        ))),
+        chat_formatter: Some(formatter),
+        generate_hook: None,
     })
 }
 

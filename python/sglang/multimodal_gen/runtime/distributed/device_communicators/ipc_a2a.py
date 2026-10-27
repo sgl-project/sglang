@@ -36,7 +36,8 @@ def ipc_shareable_zeros(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     Freeing an expandable segment that was exported over IPC breaks the CUDA
     allocator on fabric-handle systems (GB200/GB300): empty_cache raises
     "std::get: wrong index for variant" or "bad optional access" on some ranks,
-    which then diverge and hang the next collective.
+    which then diverge and hang the next collective. Importing an fd-handle
+    segment needs pidfd_getfd, which containers without ptrace rights deny.
     """
     if "expandable_segments:True" not in torch._C._accelerator_getAllocatorSettings():
         return torch.zeros(*shape, dtype=dtype, device="cuda")
