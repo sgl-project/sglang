@@ -696,9 +696,16 @@ class FlashInferAttnBackend(AttentionBackend):
 
             token_pos_in_items_ptr.append(pos_within_item.to(torch.uint16))
 
-            forward_batch.positions[seq_start + first_delim : seq_end] = (
-                prefix_len + pos_within_item - 1
-            )
+            token_slice = slice(seq_start + first_delim, seq_end)
+            forward_batch.positions[token_slice] = prefix_len + pos_within_item - 1
+            if forward_batch.mrope_positions is not None and (
+                forward_batch.mm_inputs is None or forward_batch.mm_inputs[i] is None
+            ):
+                # MRoPE text consumes these axes instead of scalar positions.
+                # Preserve spatial axes and clamp only rotary-cache indices.
+                forward_batch.mrope_positions[:, token_slice] = forward_batch.positions[
+                    token_slice
+                ].clamp_min(0)
 
             seq_start = seq_end
 
