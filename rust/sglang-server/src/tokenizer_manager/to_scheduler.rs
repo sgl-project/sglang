@@ -352,16 +352,18 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
             ),
             RequestKind::Control(_)
             | RequestKind::Detokenize { .. }
             | RequestKind::Tokenize { .. } => (
                 false, /* decode_logprob_text */
                 false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
             ),
         };
         self.senders
@@ -371,6 +373,7 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                skip_special_tokens,
             })
             .is_ok()
     }

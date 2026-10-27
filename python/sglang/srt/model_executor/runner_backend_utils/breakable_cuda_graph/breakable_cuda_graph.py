@@ -67,6 +67,8 @@ _current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVa
 _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
     "current_stream", default=None
 )
+
+
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )

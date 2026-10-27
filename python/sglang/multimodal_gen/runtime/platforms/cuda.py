@@ -599,6 +599,14 @@ class CudaPlatformBase(Platform):
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -771,7 +779,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
@@ -840,11 +852,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
-        MiniMax-H3 VAE decoder fast paths.
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (

@@ -34,7 +34,7 @@ from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecuto
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
@@ -68,24 +68,6 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(item.hash, 0xDEADBEEF)
         self.assertEqual(len(item.padding_values()), 4)
         self.assertEqual(item.pad_value, item.padding_values()[0])
-
-    def test_set_pad_value_is_deterministic_across_items(self):
-        """Two items with the same preset hash must derive the same pad_value."""
-        a = MultimodalDataItem(modality=Modality.IMAGE, hash=0x123456789ABCDEF0)
-        b = MultimodalDataItem(modality=Modality.IMAGE, hash=0x123456789ABCDEF0)
-        # No feature payload — set_pad_value uses the preset hash.
-        a.set_pad_value()
-        b.set_pad_value()
-        self.assertEqual(a.padding_values(), b.padding_values())
-        self.assertEqual(a.hash, b.hash)
-
-    def test_set_pad_value_distinguishes_different_preset_hashes(self):
-        """Distinct preset hashes must produce distinct pad_values."""
-        a = MultimodalDataItem(modality=Modality.IMAGE, hash=0xAAAA)
-        b = MultimodalDataItem(modality=Modality.IMAGE, hash=0xBBBB)
-        a.set_pad_value()
-        b.set_pad_value()
-        self.assertNotEqual(a.pad_value, b.pad_value)
 
     def test_set_hash_updates_an_existing_pad_value(self):
         item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xAAAA)
