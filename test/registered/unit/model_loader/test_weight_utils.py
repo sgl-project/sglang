@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.weight_utils import (
+    _find_local_hf_snapshot_dir_unlocked,
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -156,6 +158,26 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestFindLocalHfSnapshot(CustomTestCase):
+    def test_snapshot_with_shards_in_a_subfolder_is_reused(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            repo_folder = os.path.join(cache_dir, "models--org--model")
+            snapshot = os.path.join(repo_folder, "snapshots", "abc123")
+            os.makedirs(os.path.join(repo_folder, "refs"))
+            with open(os.path.join(repo_folder, "refs", "main"), "w") as f:
+                f.write("abc123")
+            shard = "tensors/model-00001-of-00001.safetensors"
+            _touch(snapshot, shard)
+            _write_index(snapshot, {"w": shard})
+
+            with patch.object(weight_utils, "is_in_ci", return_value=False):
+                found = _find_local_hf_snapshot_dir_unlocked(
+                    "org/model", cache_dir, ["*.safetensors", "*.bin"]
+                )
+
+            self.assertEqual(found, snapshot)
 
 
 class TestMaybeAddMtpSafetensors(CustomTestCase):

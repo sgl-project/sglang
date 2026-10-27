@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -95,6 +96,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
+from sglang.srt.layers.quantization.nvfp4_csf import decode_csf_weight_scales
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -129,6 +134,8 @@ from sglang.srt.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    safetensors_files_holding,
+    safetensors_files_in_index,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -419,6 +426,11 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        weight_name_filter: Optional[Callable[[str], bool]] = None
+        """If defined, only the tensors it keeps are loaded, from the shards holding them.
+
+        Used by a draft model that shares its target's checkpoint."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -430,6 +442,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                weight_name_filter=getattr(
+                    model, "checkpoint_weight_name_filter", None
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -547,6 +562,18 @@ class DefaultModelLoader(BaseModelLoader):
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if not hf_weights_files and pattern.endswith(".safetensors"):
+                # Some checkpoints keep their shards in a subfolder the index names.
+                if not is_local:
+                    download_safetensors_index_file_from_hf(
+                        model_name_or_path,
+                        index_file,
+                        self.load_config.download_dir,
+                        revision,
+                    )
+                hf_weights_files += safetensors_files_in_index(
+                    folder=hf_folder, index_file=index_file, pattern=pattern
+                )
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
@@ -630,6 +657,13 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = resolved_source.hf_folder
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
+        if use_safetensors and source.weight_name_filter is not None:
+            hf_weights_files = safetensors_files_holding(
+                folder=hf_folder,
+                index_file=SAFE_WEIGHTS_INDEX_NAME,
+                weight_files=hf_weights_files,
+                weight_name_filter=source.weight_name_filter,
+            )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -725,6 +759,13 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if source.weight_name_filter is not None:
+            weights_iterator = (
+                (name, tensor)
+                for name, tensor in weights_iterator
+                if source.weight_name_filter(name)
+            )
 
         if self.load_config.draft_model_idx is not None:
             return self._filter_mtp_weights(
@@ -1049,6 +1090,14 @@ class DefaultModelLoader(BaseModelLoader):
             and quant_config.get_name() == "modelopt_fp4"
             and not quant_config.is_checkpoint_nvfp4_serialized
         )
+        # Decode CSF scales before any rename, so they arrive as plain `weight_scale`.
+        if (
+            isinstance(quant_config, ModelOptMixedPrecisionConfig)
+            and quant_config.has_csf_scales
+        ):
+            weights = decode_csf_weight_scales(
+                weights, scale_encoding_of=quant_config.scale_encoding_of
+            )
         is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
         if is_mxfp8:
             weights = (

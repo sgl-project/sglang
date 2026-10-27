@@ -2,13 +2,16 @@
 Utilities to manage the dequantization of weights.
 """
 
-from typing import Optional
+from typing import Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
+)
+from sglang.srt.layers.quantization.mxfp8_block_convert import (
+    dequant_mxfp8_2d_to_bf16,
 )
 from sglang.srt.utils import set_weight_attrs
 
@@ -34,6 +37,15 @@ _FP4_E2M1_LUT = torch.tensor(
     ],
     dtype=torch.float32,
 )
+
+# The checkpoint tensors each dequantized recipe needs, by name after the layer prefix
+BF16_RECIPE_PARTS = {
+    "MXFP8": ("weight", "weight_scale"),
+    "W4A16_NVFP4": ("weight", "weight_scale", "weight_scale_2"),
+}
+
+# The name the MXFP8 block-scale rename gives `weight_scale` before load_weights
+MXFP8_RENAMED_SCALE = "weight_scale_inv"
 
 
 def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -98,3 +110,49 @@ def dequantize_nvfp4(
         scale = scale * w_s2.to(torch.float32)
     scale = scale.repeat_interleave(NVFP4_BLOCK_SIZE, dim=-1)
     return (deq * scale).to(out_dtype)
+
+
+def bf16_weight_of(recipe: str, parts: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """The BF16 weight of a layer from the PARTS its RECIPE stores."""
+    if recipe == "MXFP8":
+        return dequant_mxfp8_2d_to_bf16(parts["weight"], parts["weight_scale"])
+    return dequantize_nvfp4(
+        parts["weight"], parts["weight_scale"], parts["weight_scale_2"]
+    )
+
+
+def dequantize_layers_to_bf16(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    prefix: str,
+    quant_algo_of: Callable[[str], Optional[str]],
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """WEIGHTS with each MXFP8 or W4A16_NVFP4 layer under PREFIX as one BF16 `weight`.
+
+    For a model that builds those layers in BF16. Every other tensor, biases
+    included, passes through unchanged. A layer missing a part at the end raises.
+    """
+    waiting: Dict[str, Dict[str, torch.Tensor]] = {}
+    for name, tensor in weights:
+        layer, _, part = name.rpartition(".")
+        recipe = quant_algo_of(layer) if name.startswith(prefix) else None
+        if part == MXFP8_RENAMED_SCALE and recipe == "MXFP8":
+            part = "weight_scale"
+        if recipe not in BF16_RECIPE_PARTS or part not in BF16_RECIPE_PARTS[recipe]:
+            yield name, tensor
+            continue
+
+        parts = waiting.setdefault(layer, {})
+        parts[part] = tensor
+        if len(parts) < len(BF16_RECIPE_PARTS[recipe]):
+            continue
+        del waiting[layer]
+        yield f"{layer}.weight", bf16_weight_of(recipe, parts)
+
+    if waiting:
+        incomplete = [
+            f"{layer} ({', '.join(parts)})" for layer, parts in waiting.items()
+        ]
+        raise ValueError(
+            f"{len(waiting)} quantized layer(s) under {prefix!r} are missing parts, "
+            f"e.g. {incomplete[:4]}; the checkpoint is incomplete."
+        )

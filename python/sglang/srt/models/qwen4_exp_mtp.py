@@ -16,7 +16,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
+from sglang.srt.models.qwen3_5_mtp import (
+    Qwen3_5ForCausalLMMTP,
+    _mtp_quant_config,
+    is_mtp_draft_weight,
+)
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
@@ -25,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
+    # The loader reads only these tensors, and only the shards that hold them,
+    # since the draft shares a checkpoint whose other tensors it drops.
+    checkpoint_weight_name_filter = staticmethod(is_mtp_draft_weight)
+
     def __init__(
         self,
         config: PretrainedConfig,
