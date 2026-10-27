@@ -292,6 +292,7 @@ def _low_ratio_metadata(
     TOPK: tl.constexpr,
     PADDED: tl.constexpr,
     BLOCK: tl.constexpr,
+    ZERO_EMPTY: tl.constexpr,
 ):
     row = tl.program_id(0)
     length = tl.load(LENS + row).to(tl.int32)
@@ -302,6 +303,8 @@ def _low_ratio_metadata(
     tl.store(LEN1 + row, len1)
     tl.store(LEN2 + row, len2)
     tl.store(SPARSE1 + row, tl.minimum(len1, TOPK))
+    if ZERO_EMPTY:  # an empty ratio-2 history keeps length 0
+        len2 = length >> 1
     tl.store(SPARSE2 + row, tl.minimum(len2, TOPK))
     cols = tl.arange(0, BLOCK)
     tl.store(PAGE1 + row * PADDED + cols, -1, cols < PADDED)
@@ -321,7 +324,9 @@ class LowRatioMetadata(NamedTuple):
     c2_page_indices: torch.Tensor
 
 
-def build_low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
+def build_low_ratio_metadata(
+    seq_lens, out_loc, topk, zero_empty: bool = False
+) -> LowRatioMetadata:
     assert seq_lens.numel() == out_loc.numel()
     rows = seq_lens.numel()
     kw = dict(device=seq_lens.device, dtype=torch.int32)
@@ -336,7 +341,7 @@ def build_low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
                 torch.empty((rows, padded), **kw),
             ]
         )
-    _low_ratio_metadata[(rows,)](
-        seq_lens, out_loc, *outputs, topk, padded, triton.next_power_of_2(padded)
-    )
+    block = triton.next_power_of_2(padded)
+    args = (seq_lens, out_loc, *outputs, topk, padded, block, zero_empty)
+    _low_ratio_metadata[(rows,)](*args)
     return LowRatioMetadata(*outputs)

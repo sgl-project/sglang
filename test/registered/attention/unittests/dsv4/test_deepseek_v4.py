@@ -982,6 +982,58 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertEqual(core.trtllm_swa_lens[40].item(), 140)  # window + block
         self.assertIsNone(core.trtllm_c4_indices)
 
+    def _small_path_core(self, trtllm: bool):
+        """make_core_attn_metadata's small-metadata path (DSv4.1 decode / verify)."""
+        from sglang.srt.layers.attention import deepseek_v4_backend as bk
+
+        seq_lens = torch.tensor([1, 2, 3, 500, 2000], **self.kw)
+        rows = seq_lens.numel()
+        req_to_token = torch.arange(rows * 2048, **self.kw).view(rows, 2048)
+        fake = SimpleNamespace(
+            low_ratios=(1, 2),
+            present_ratios=(1, 2),
+            token_to_kv_pool=SimpleNamespace(
+                request_window=None,
+                swa_req_ring_size=None,
+                full_to_swa_index_mapping=torch.arange(
+                    rows * 2048, dtype=torch.int64, device=self.dev
+                ),
+            ),
+            page_size=256,
+            req_to_token=req_to_token,
+            cuda_int32_kwargs=self.kw,
+            index_topk=512,
+            trtllm_table_pool=self.pool,
+            trtllm_topk_writes_table=False,
+            trtllm_defer_tables=False,
+            trtllm_attn=trtllm,
+        )
+        with (
+            mock.patch.object(
+                bk, "get_parallel", return_value=SimpleNamespace(attn_cp_size=1)
+            ),
+            mock.patch.object(bk, "_create_flashmla_metadata", return_value=None),
+        ):
+            return bk.DeepseekV4AttnBackend.make_core_attn_metadata(
+                fake,
+                req_to_token=req_to_token,
+                req_pool_indices_repeated=torch.arange(rows, **self.kw),
+                seq_lens_casual=seq_lens,
+                max_seq_len=2048,
+                out_loc=torch.arange(rows, dtype=torch.int64, device=self.dev),
+            )
+
+    def test_small_metadata_keeps_empty_ratio2_lengths_zero_for_trtllm(self):
+        if self.dev != "cuda":
+            self.skipTest("the small-metadata kernels are Triton")
+        # Hand values for seq lens [1, 2, 3, 500, 2000], top-k 512: a ratio-2
+        # history holds len // 2 entries; FlashMLA clamps an empty one to 1.
+        for trtllm, c2 in ((True, [0, 1, 1, 250, 512]), (False, [1, 1, 1, 250, 512])):
+            core = self._small_path_core(trtllm)
+            self.assertEqual(core.c2_sparse_topk_lengths.tolist(), c2)
+            self.assertEqual(core.c1_sparse_topk_lengths.tolist(), [1, 2, 3, 500, 512])
+            self.assertEqual(core.c2_topk_lengths_clamp1.tolist(), [1, 1, 1, 250, 1000])
+
     def test_width_changes_reuse_the_parent_and_growth_is_capture_guarded(self):
         a = self.pool.view("f", 10, fill=-1, width=16)  # parent: 64 (tile) x 16
         a.fill_(3)

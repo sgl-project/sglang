@@ -441,6 +441,8 @@ class DSV4AttnMetadata:
     trtllm_topk_writes_table: bool = False
     # Late-layer tail: the first indexed layer packs the table even if not an index source.
     trtllm_tail_needs_pack: bool = False
+    # The small-metadata kernel already zeroed empty ratio-2 lengths for trtllm.
+    low_ratio_lengths_zeroed: bool = False
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
@@ -564,6 +566,8 @@ class DSV4AttnMetadata:
     def _zero_empty_low_ratio_lengths(self) -> None:
         # FlashMLA clamps empty compressed histories to one length;
         # trtllm needs zero, since a -1 entry still adds to the softmax denominator.
+        if self.low_ratio_lengths_zeroed:
+            return
         for ratio in self.low_ratios:
             if ratio == 1:
                 continue  # seq_lens_casual >= 1, so a ratio-1 history is never empty
@@ -761,6 +765,7 @@ class DSV4AttnMetadata:
                 "trtllm_topk_writes_table",
                 # Eager-prefill tail flag; decode metadata never sets it.
                 "trtllm_tail_needs_pack",
+                "low_ratio_lengths_zeroed",
             ],
         )
 
@@ -1009,6 +1014,7 @@ class DSV4AttnMetadata:
             self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
                 low_ratio_buffers[6:8]
             )
+            self.low_ratio_lengths_zeroed = trtllm  # built with zero_empty=trtllm
             self.c1_flashmla_metadata = _mk()
             self.c2_flashmla_metadata = _mk()
             return
@@ -4949,7 +4955,9 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             low_ratio_buffers = (
-                build_low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                build_low_ratio_metadata(
+                    seq_lens_casual, out_loc, self.index_topk, self.trtllm_attn
+                )
                 if small_metadata
                 else None
             )
