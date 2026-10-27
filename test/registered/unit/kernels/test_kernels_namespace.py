@@ -219,11 +219,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
         "'sglang.kernels.ops.speculative.row_argmax', "
-        "'sglang.kernels.ops.attention.kpool_bf16_index', "
-        "'sglang.kernels.ops.attention.kpool_decode_prepare_indexer', "
-        "'sglang.kernels.ops.attention.kpool_topk_npu', "
-        "'sglang.kernels.ops.kvcache.kpool_index_npu', "
-        "'sglang.kernels.ops.mamba.causal_conv1d_target_verify')) or any("
+        "'sgl_kernel_npu')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -536,7 +532,7 @@ def test_deep_select_spec_matches_wrapper_architectures():
 def test_ascend_kernel_inventory_is_npu_only(op, backend):
     """Inventory tooling must not offer these Ascend implementations on CUDA/CPU."""
     spec = K.registry.get_backend(op, backend)
-    # Retained in-tree kernels are no longer the serving implementation.
+    # Ascend implementations are provided by the external kernel package.
     # Inventory must resolve the public vendor facade, without importing it here.
     assert spec.target.startswith("sgl_kernel_npu.operators.")
     assert spec.capabilities == frozenset({Cap.NPU})

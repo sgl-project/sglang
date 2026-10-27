@@ -1,6 +1,6 @@
-"""Accuracy test for _expand_pool_topk_and_append_tail_batched_npu.
+"""Accuracy test for expand_pool_topk_and_append_tail_batched_npu.
 
-The NPU Triton kernel lives in ``sglang.kernels.ops.attention.kpool_topk_npu``
+The NPU Triton kernel lives in ``sgl_kernel_npu.operators.indexer``
 and is a drop-in replacement for the PyTorch implementation of
 ``IndexerKPool._expand_pool_topk_and_append_tail_batched``. This test calls both
 implementations on identical inputs and compares the output token-level index
@@ -14,9 +14,8 @@ register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
 import pytest
 import torch
 import torch_npu  # noqa: F401
-
-from sglang.kernels.ops.attention.kpool_topk_npu import (
-    _expand_pool_topk_and_append_tail_batched_npu,
+from sgl_kernel_npu.operators.indexer import (
+    expand_pool_topk_and_append_tail_batched_npu,
 )
 
 DEVICE = "npu"
@@ -113,7 +112,7 @@ def _check_op(n_real: int, num_q_padded: int):
         0, pool_size, (total_rows,), device=DEVICE, dtype=torch.int32
     )
 
-    tri_out = _expand_pool_topk_and_append_tail_batched_npu(
+    tri_out = expand_pool_topk_and_append_tail_batched_npu(
         pool_indices,
         seq_lens_per_token,
         n_real,

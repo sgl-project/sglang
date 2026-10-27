@@ -78,8 +78,7 @@ register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
 import pytest
 import torch
 import torch_npu  # noqa: F401
-
-from sglang.kernels.ops.kvcache.kpool_index_npu import (
+from sgl_kernel_npu.operators.mem_cache import (
     kpool_decode_update_and_maybe_write_cache_bf16,
 )
 

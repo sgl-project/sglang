@@ -14,9 +14,10 @@ try:
 except ImportError:
     torch_npu = None
 
-from sglang.kernels.ops.kvcache.kpool_index_npu import (
+from sgl_kernel_npu.operators.mem_cache import (
     kpool_write_tail_and_maybe_compress_npu,
 )
+
 from sglang.test.test_utils import CustomTestCase
 
 HEAD_DIM = 128

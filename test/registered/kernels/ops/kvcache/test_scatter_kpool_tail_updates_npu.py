@@ -1,6 +1,6 @@
 """Accuracy test for scatter_kpool_tail_updates_npu against the GPU reference.
 
-The NPU kernel lives in ``kpool_index_npu.scatter_kpool_tail_updates_npu`` and is a
+The NPU kernel lives in ``sgl_kernel_npu.operators.mem_cache.scatter_kpool_tail_updates_npu`` and is a
 drop-in replacement for ``kpool_fp8_index.scatter_kpool_tail_updates``. This test
 calls both implementations on identical inputs and compares the in-place updated
 ``tail_k`` / ``tail_score`` tensors.
@@ -15,10 +15,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch_npu  # noqa: F401
-
-from sglang.kernels.ops.kvcache.kpool_index_npu import (
+from sgl_kernel_npu.operators.mem_cache import (
     scatter_kpool_tail_updates_npu,
 )
+
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     scatter_kpool_tail_updates,
 )
