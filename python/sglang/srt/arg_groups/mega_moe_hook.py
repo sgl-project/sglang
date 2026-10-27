@@ -24,6 +24,37 @@ def handle_mega_moe(server_args: ServerArgs) -> None:
     check_mega_moe_compat(server_args)
 
 
+def check_aiter_mega_moe_tp_compat(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_aiter_mega_moe_tp:
+        return
+    from sglang.srt.layers.moe.aiter_mega_moe_tp import comm_options
+
+    # TP > 8 and the token window are checked by the kernel when it is built.
+    unsupported = (
+        (not get_platform().is_hip, "a non-ROCm platform"),
+        (cfg.tp_size < 2, "--tp-size < 2 (the kernel fuses the TP all-reduce)"),
+        (cfg.ep_size > 1 or cfg.moe_dp_size > 1, "expert or MoE data parallelism"),
+        (cfg.moe_a2a_backend != "none", "an MoE all-to-all backend"),
+        (cfg.pp_size > 1, "pipeline parallelism"),
+        (cfg.nnodes > 1, "multi-node TP (hipIpc symmetric memory is single-node)"),
+        (attn_dp_enabled_of(cfg) or cfg.attn_cp_size > 1, "attention DP or CP"),
+        (cfg.enable_attn_tp_input_scattered, "scattered attention TP input"),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        (cfg.enable_single_batch_overlap, "single-batch overlap"),
+        (cfg.enable_pdmux, "PD multiplexing"),
+        (cfg.enable_hierarchical_cache, "HiCache (its copy streams share the GPU)"),
+        (cfg.enable_lora, "LoRA (its MoE wrappers would be bypassed)"),
+        (cfg.speculative_algorithm is not None, "speculative decoding"),
+    )
+    for failed, reason in unsupported:
+        if failed:
+            raise ValueError(
+                f"--enable-aiter-mega-moe-tp is not supported with {reason}."
+            )
+    comm_options(envs.SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE.get())
+
+
 def check_mega_moe_compat(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":

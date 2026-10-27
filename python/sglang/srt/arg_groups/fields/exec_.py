@@ -967,6 +967,10 @@ class ExecMoe(msgspec.Struct):
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
+    enable_aiter_mega_moe_tp: A[
+        bool,
+        "Run the eager extend forwards (up to SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS tokens, default 4096) of a GLM-5-Next model (Glm5NextForConditionalGeneration, e.g. GLM-5.3-Flash) as one AITER MegaMoE-TP kernel that fuses the routed experts, the shared expert and the TP all-reduce. Any other model is refused at load. Needs MXFP4 experts on the AITER MoE runner, ROCm gfx950 and TP 2-8 on one node. Decode, CUDA graphs and torch.compile keep the stock MoE path; online weight updates are not supported.",
+    ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],
         Arg(

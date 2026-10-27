@@ -1990,6 +1990,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-aiter-mega-moe-tp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run the eager extend forwards (up to `SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS` tokens, default 4096) of a GLM-5-Next model (`Glm5NextForConditionalGeneration`, e.g. GLM-5.3-Flash) as one AITER MegaMoE-TP kernel that fuses the routed experts, the shared expert and the TP all-reduce. Any other model is refused at load. Needs MXFP4 experts on the AITER MoE runner, ROCm gfx950 and TP 2-8 on one node. Decode, CUDA graphs and torch.compile keep the stock MoE path; online weight updates are not supported. `SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE` sets the dtype of the data the kernel's ranks exchange: `fp8` (default) is lossy, adding quantization error beyond the stock bf16 all-reduce; `bf16` is the accurate mode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-allreduce-fusion-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.</td>

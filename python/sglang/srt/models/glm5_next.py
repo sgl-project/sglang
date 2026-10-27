@@ -50,6 +50,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import aiter_mega_moe_tp
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -754,6 +755,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 reduce_results=False,
             )
+            aiter_mega_moe_tp.register(self.mlp)
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm5NextMLP(
@@ -980,6 +982,17 @@ class Glm5NextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        if isinstance(self.mlp, Glm5NextMoE):
+            reduced = aiter_mega_moe_tp.maybe_forward(
+                self.mlp, hidden_states, forward_batch, gemm_output_zero_allocator
+            )
+            if reduced is not None:
+                # One kernel ran the routed and shared experts and the TP all-reduce.
+                hidden_states = self.ffn_boundary.complete_now(
+                    reduced, forward_batch, already_reduced=True
+                )
+                return (hidden_states, topk_indices)
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
