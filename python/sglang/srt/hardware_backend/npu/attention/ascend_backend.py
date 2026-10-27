@@ -1421,14 +1421,8 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
-        if (
-            dsa_token_shard_plan is not None
-            and is_prefill
-            and not (
-                is_dsa_enable_prefill_cp()
-                and forward_batch.attn_cp_metadata is not None
-            )
-        ):
+        # The plan is refused under prefill CP, so this never meets its layout.
+        if dsa_token_shard_plan is not None and is_prefill:
             actual_seq_lengths_kv = dsa_token_shard_key_lens(
                 forward_batch, dsa_token_shard_plan, q.device
             )

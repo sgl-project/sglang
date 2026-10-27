@@ -19,6 +19,7 @@ Usage:
 import itertools
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -159,6 +160,7 @@ class TestTokenShardRefusesDcp(CustomTestCase):
             extend_seq_lens_cpu=[16384],
             extend_prefix_lens_cpu=[0],
             input_ids=torch.zeros(16384, dtype=torch.int64),
+            attn_cp_metadata=None,
         )
         with get_parallel().override(
             attn_tp_size=16, attn_tp_rank=3, dcp_enabled=dcp_enabled
@@ -172,6 +174,35 @@ class TestTokenShardRefusesDcp(CustomTestCase):
         self.assertIsNone(self._plan(dcp_enabled=True))
 
 
+class TestTokenShardRefusesPrefillCp(CustomTestCase):
+    """Prefill CP hands attention its own prev/next query layout; the plan's
+    cumulative query lengths would replace it and the core would slice a
+    second time."""
+
+    def _plan(self, prefill_cp):
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[16384],
+            extend_prefix_lens_cpu=[0],
+            input_ids=torch.zeros(16384, dtype=torch.int64),
+            attn_cp_metadata=object() if prefill_cp else None,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.dsa.dsa_token_shard.is_dsa_enable_prefill_cp",
+                return_value=prefill_cp,
+            ),
+            get_parallel().override(attn_tp_size=16, attn_tp_rank=3, dcp_enabled=False),
+        ):
+            return _build_dsa_token_shard_plan(batch)
+
+    def test_planned_without_prefill_cp(self):
+        self.assertIsNotNone(self._plan(prefill_cp=False))
+
+    def test_refused_under_prefill_cp(self):
+        self.assertIsNone(self._plan(prefill_cp=True))
+
+
 class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
     """Attention-DP MAX_LEN pads a rank to the widest DP rank. The plan is cut
     from real extend lengths, so a wider batch would trip the redistribute's
@@ -183,6 +214,7 @@ class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
             extend_seq_lens_cpu=[1000],
             extend_prefix_lens_cpu=[0],
             input_ids=torch.zeros(num_rows, dtype=torch.int64),
+            attn_cp_metadata=None,
         )
         with get_parallel().override(
             attn_tp_size=16, attn_tp_rank=3, dcp_enabled=False

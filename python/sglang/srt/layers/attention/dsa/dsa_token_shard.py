@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
 )
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -88,6 +89,13 @@ def _build_dsa_token_shard_plan(forward_batch) -> Optional[DsaTokenShardPlan]:
         # DCP's DSA path all-gathers the query across the DCP group, which
         # expects every head-sharded query row, not this rank's token slice.
         print_info_once("DSA token-shard is off: DCP all-gathers the attention query")
+        return None
+
+    if forward_batch.attn_cp_metadata is not None and is_dsa_enable_prefill_cp():
+        # Prefill CP already splits tokens across the CP group and hands
+        # attention its own prev/next query layout, which knows nothing of
+        # this slice.
+        print_info_once("DSA token-shard is off: DSA prefill CP splits the tokens")
         return None
 
     # The same modes the indexer query shard admits.
