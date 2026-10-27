@@ -52,12 +52,15 @@ KIMI_K3_W4A8_32P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "1",
     "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE": "1",
-    "TRITON_CACHE_DIR": "/tmp/triton_cache",
+    "TRITON_CACHE_DIR": "/root/.cache/sglang/triton",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FOLDED_PROPOSAL": "0",
+    "SGLANG_DSPARK_FOLDED_SAMPLING": "0",
     "SGLANG_DSPARK_STACKED_CTX_KV": "0",
     "SGLANG_DSPARK_EMBED_IN_GRAPH": "0",
+    "SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
@@ -65,10 +68,13 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "HCCL_BUFFSIZE": "2000",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
+    "HCCL_BUFFSIZE": "200",
+    "DEEPEP_HCCL_BUFFSIZE": "1800",
+    "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
+    "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ASCEND_USE_FIA": "1",
+    "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
@@ -97,18 +103,34 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
+    # Everything from here down mirrors the dev 128k-decode serve config
+    # (run.sh / the 128k single-batch decode restore script): this is the
+    # shape the dev 23.2-25.9 ms C12 TPOT was measured on.
+    "--mamba-ssm-dtype",
+    "bfloat16",
     "--mem-fraction-static",
-    0.72,
+    0.75,
+    "--max-total-tokens",
+    250000,
+    "--max-mamba-cache-size",
+    240,
     "--chunked-prefill-size",
-    8192,
+    20480,
+    # C12 must land on a captured graph batch size, else decode falls back
+    # to eager mode.
     "--cuda-graph-bs-decode",
-    1,
+    2,
     4,
+    8,
+    12,
     16,
     "--max-running-requests",
     64,
     "--reasoning-parser",
     "kimi_k3",
+    "--enable-cache-report",
+    "--random-seed",
+    540332093,
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -163,6 +185,11 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     # before the measured pass (bench_serving caps warmup output at 32).
     warmup_requests = 4
     pop_sglang_is_in_ci_for_gsp = True
+    # Greedy decoding: with the default temperature 1.0 the DSPARK draft
+    # accept length collapsed to ~1.6 tokens (dev measured 3.94) and TPOT
+    # landed at 63.7 ms vs the dev 25.9 ms. Dev's perf passes always pin
+    # temperature to 0.
+    temperature = 0
     tpot = 30.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):
