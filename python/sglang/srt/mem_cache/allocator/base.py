@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpace
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
@@ -97,7 +97,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def state_ids(self, sub_pool: str) -> IdSpace:
         """How the state sub-pool ``sub_pool`` indexes the slot ids the request
         table holds, for a consumer outside a forward (the tree, PD transfers)."""
-        from sglang.srt.mem_cache.kv_loc_plan import state_id_space
+        from sglang.srt.mem_cache.kv.alloc.id_space import state_id_space
 
         return state_id_space(self.state_id_spaces(), sub_pool)
 

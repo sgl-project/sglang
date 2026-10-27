@@ -30,13 +30,13 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
     interim_policy_for,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import expect, resolve_level

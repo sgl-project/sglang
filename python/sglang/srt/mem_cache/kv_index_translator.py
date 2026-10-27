@@ -76,12 +76,10 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind, state_id_space
 from sglang.srt.mem_cache.kv_loc_plan import (
-    IdSpace,
-    IdSpaceKind,
     KVLocPlan,
     pad_with_sink,
-    state_id_space,
     window_read_extent,
 )
 from sglang.srt.runtime_context import get_parallel

@@ -38,8 +38,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_hybrid_swa_group,
     build_unified_host_stack,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,

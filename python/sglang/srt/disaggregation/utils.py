@@ -1502,7 +1502,7 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         MHATokenToKVPool,

@@ -41,7 +41,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind, KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

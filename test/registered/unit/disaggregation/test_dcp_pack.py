@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.common.dcp_pack import (
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
