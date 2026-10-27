@@ -19,9 +19,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, buffer_store, mfma
 
-from sglang.kernels.ops.attention.minimax_sparse.decode.nvfp4_decode_gfx950 import (
-    _store_fp8,
-)
+from ..common.out_quant_gfx950 import store_fp8_out
 
 _LOG2E = 1.4426950408889634
 # Measured on MI350X: below these the single-warp programs underfill the GPU; the per-query
@@ -149,12 +147,12 @@ def _store_query_out(
     OUT_QUANT: gl.constexpr,
 ):
     """One query's O: bf16 [H, D], or with OUT_QUANT the per 1 x 128 FP8 bytes and
-    scales the o_proj's separate quant of that bf16 O writes (see ``_store_fp8``)."""
+    scales the o_proj's separate quant of that bf16 O writes (see ``store_fp8_out``)."""
     out = (acc * (v_scale / gl.where(l_i > 0, l_i, 1.0))[:, None]).to(
         o_ptr.dtype.element_ty
     )
     if OUT_QUANT:
-        _store_fp8(
+        store_fp8_out(
             out.to(gl.float32),
             q8_ptr + q8_off + row * stride_q8_n,
             scale_ptr,
