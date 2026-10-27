@@ -76,7 +76,7 @@ impl From<&ServerArgs> for CoreMetadata {
         Self {
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
-            tokenizer_path: args.tokenizer_path.clone(),
+            tokenizer_path: args.public_tokenizer_path.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
             weight_version: args.weight_version.as_deref().map(Arc::from),
             load_format: args.load_format.clone(),
