@@ -798,6 +798,7 @@ def _build_out_tokens_kernel(
     T,
     n_out,
     BLOCK: tl.constexpr,
+    IS_NPU: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -808,7 +809,12 @@ def _build_out_tokens_kernel(
     bonus = tl.load(bonus_ptr + b, mask=mask, other=0)
     draft_mask = mask & (k < gamma)
     draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0)
-    val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
+    if IS_NPU:
+        # Bitwise selection avoids Ascend's int64 select lowering issue.
+        select = -(k == cl).to(tl.int64)
+        val = (bonus & select) | (draft & ~select)
+    else:
+        val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 
@@ -831,6 +837,14 @@ def build_out_tokens_triton(
     BLOCK = 256
     grid = (triton.cdiv(n_out, BLOCK),)
     _build_out_tokens_kernel[grid](
-        draft_tokens, correct_len_i, bonus_i, out, gamma, T, n_out, BLOCK=BLOCK
+        draft_tokens,
+        correct_len_i,
+        bonus_i,
+        out,
+        gamma,
+        T,
+        n_out,
+        BLOCK=BLOCK,
+        IS_NPU=_is_npu,
     )
     return out

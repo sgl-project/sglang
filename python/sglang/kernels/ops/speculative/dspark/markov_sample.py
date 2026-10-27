@@ -11,7 +11,9 @@ import triton.language as tl
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import is_npu
 
-if is_npu():
+_is_npu = is_npu()
+
+if _is_npu:
     # Ascend does not map the generic libdevice stubs to CANN implementations.
     from triton.language.extra.cann import libdevice
 else:
@@ -59,6 +61,7 @@ def _markov_sample_partial_kernel(
     SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    IS_NPU: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     i = part * BLOCK + tl.arange(0, BLOCK)
@@ -87,6 +90,7 @@ def _markov_sample_partial_kernel(
             BLOCK,
             SAMPLE,
             PHILOX_ROUNDS,
+            IS_NPU,
         )
 
 
@@ -107,6 +111,7 @@ def _select_block(
     BLOCK: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    IS_NPU: tl.constexpr,
 ):
     key = value
     if SAMPLE:
@@ -127,8 +132,19 @@ def _select_block(
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
         # Small words convert to FP32 exactly, so the winning small noise stays precise.
+        if IS_NPU:
+            # Ascend does not support uint32-to-float and may sign-extend on widening.
+            bits = bits.to(tl.int64) & 0xFFFFFFFF
         uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
-        exp_noise = -libdevice.log1p(-uniform)
+        if IS_NPU:
+            # Compensate for rounding in 1-u, especially for small Philox words.
+            complement = 1.0 - uniform
+            correction = (1.0 - complement) - uniform
+            exp_noise = -tl.log(complement) - correction / complement
+            exp_noise = tl.where(complement == 0.0, float("inf"), exp_noise)
+            exp_noise = tl.where(uniform == 0.0, 0.0, exp_noise)
+        else:
+            exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
@@ -235,6 +251,7 @@ def _launch_partial(
         select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
+        _is_npu,
         num_warps=4,
     )
     return partial.view(rows, parts * 2)
