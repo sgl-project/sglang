@@ -147,7 +147,7 @@ SGLang 之後繼續使用 fallback path。這不屬於 PR A 的 AWQ MoE config �
 ## PR title
 
 ```text
-[AMD][gfx1151] Add Triton configs for Qwen3.5 AWQ MoE
+[Perf] [AMD] gfx1151: Tune Qwen3.5 AWQ MoE Triton configs
 ```
 
 ## PR description
