@@ -155,7 +155,7 @@ Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/trito
 
 #### AMD Strix Halo / gfx1151 W4A16
 
-For `Qwen3.5-35B-A3B-AWQ-4bit` on a Radeon 8060S, use the Triton path rather than the CDNA-oriented AITER/FlashInfer path:
+For `Qwen3.5-35B-A3B-AWQ-4bit` on Radeon 8060S, use the ROCm Triton path with the single-GPU local tuner:
 
 ```bash
 SGLANG_AWQ_MOE_TRITON_ROCM=1 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
@@ -167,14 +167,14 @@ SGLANG_AWQ_MOE_TRITON_ROCM=1 python benchmark/kernels/fused_moe_triton/tuning_fu
     --tune
 ```
 
-The packed W4A16 `w2` dimension is used for the `N` portion of the runtime filename. The resulting gfx1151 files are:
+The packed W4A16 config files are:
 
 ```text
 E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json
 E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16_down.json
 ```
 
-The Strix Halo tuning pass searched 72 representative ROCm configurations and all eight batch sizes above. It produced per-batch maps for the up projection; the down file currently reuses the same validated map without enabling TMA. The local `--no-ray` mode is recommended for a single-GPU Strix Halo. The checked-in map improved direct fused-MoE kernel time by 23.1%–40.9% across the eight tested batch sizes on the validation machine; repeat tuning when the Triton/ROCm version or GPU changes.
+The gfx1151 profile was tuned over 72 ROCm configurations and eight batch sizes. The checked-in map improved fused-MoE kernel time by 23.1%–40.9% on the validation Radeon 8060S; retune when the GPU, ROCm, or Triton version changes. The down map currently reuses the tuned map without TMA.
 
 ### Supported Models
 
