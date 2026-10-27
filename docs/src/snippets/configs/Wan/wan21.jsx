@@ -8,6 +8,7 @@ export const config = (() => {
   const plan = (s) => {
     const small = !s.variant.endsWith("14b");
     const ascend = ["a2", "a3"].includes(s.hw);
+    const xeon = s.hw === "xeon";
     const fast = ascend ? Number(s.gpus_per_node) === 8 : Number(s.gpus_per_node) > 1;
     let gpus = 1,
       tp = 1,
@@ -22,6 +23,9 @@ export const config = (() => {
         flags.push("--tp-size " + tp, "--sp-degree " + sp, "--num-gpus " + gpus);
       }
       if (fast) flags.push("--attention-backend laser_attn");
+    } else if (xeon) {
+      tp = 4;
+      flags.push("--tp-size 4");
     } else {
       flags.push("--dit-layerwise-offload true");
       if (fast) {
@@ -34,11 +38,12 @@ export const config = (() => {
       "t2v-14b": "NIVEDAN/wan2.1-lora",
       "i2v-14b": "valiantcat/Wan2.1-Fight-LoRA",
     }[s.variant];
-    if (s.lora === s.variant && lora) flags.push("--lora-path " + lora);
+    if (!xeon && s.lora === s.variant && lora) flags.push("--lora-path " + lora);
     return {
       flags,
       gpus,
       topology: { tp_size: tp, ulysses_degree: sp, ring_degree: 1 },
+      env: xeon ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       warnings: ascend ? ["Ascend recipes count NPU chips; one A3 card has two chips."] : [],
     };
   };
@@ -55,10 +60,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "Wan2.1",
-    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3"],
+    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "xeon"],
     hardware: [
       { id: "a2", label: "Ascend A2", vram: "", vendor: "npu" },
       { id: "a3", label: "Ascend A3", vram: "2 NPUs / card", vendor: "npu" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     ],
     groupHardware: false,
     matchDims: [],
@@ -87,6 +93,8 @@ export const config = (() => {
             showWhen: function anonymous(s) {
               return s.variant === "t2v-14b";
             },
+            disabled: (s) => s.hw === "xeon",
+            disableReason: "LoRA is not supported on Intel Xeon CPUs.",
           },
           {
             id: "i2v-14b",
@@ -94,6 +102,8 @@ export const config = (() => {
             showWhen: function anonymous(s) {
               return s.variant === "i2v-14b";
             },
+            disabled: (s) => s.hw === "xeon",
+            disableReason: "LoRA is not supported on Intel Xeon CPUs.",
           },
         ],
       },
@@ -101,8 +111,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
-        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
+        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
