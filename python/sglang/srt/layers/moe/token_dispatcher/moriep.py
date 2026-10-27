@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    is_sbo_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -1702,8 +1703,9 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
 
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap`` each send runs
-    in *_a and its receive in *_b, so a TBO sibling batch computes while the
-    transfer drains; without it the receive follows the send at once."""
+    in *_a and its receive in *_b, so a TBO sibling batch, or SBO's shared experts
+    in the dispatch hook, compute while the transfer drains; without it the
+    receive follows the send at once."""
 
     def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
@@ -1826,9 +1828,13 @@ class MoriEPDispatcher(BaseDispatcher):
                     overlap=True, async_finish=async_finish, **common_kwargs
                 )
             elif get_bool_env_var("MORI_ENABLE_SDMA", "false"):
-                # EPv2 reaches SDMA only through the AsyncLL kernels.
+                # EPv2 reaches SDMA only through the AsyncLL kernels. Under SBO the
+                # receive waits for dispatch_b, so the shared experts run while the
+                # copy engine moves the tokens.
                 self._normal_dispatcher = _MoriEPv2DispatcherImplAsyncLL(
-                    overlap=False, async_finish=async_finish, **common_kwargs
+                    overlap=is_sbo_enabled() and not is_tbo_enabled(),
+                    async_finish=async_finish,
+                    **common_kwargs,
                 )
             else:
                 self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
