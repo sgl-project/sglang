@@ -123,6 +123,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-8-npu-a3",
         "base-b-test-16-npu-a3",
         "base-c-test-acc-2-npu-a3",
+        "base-c-test-acc-16-npu-a3",
         "base-c-test-perf-2-npu-a3",
         "base-c-test-perf-16-npu-a3",
     ],
