@@ -300,20 +300,25 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for npu implementation"
         )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
+        self._match_cos_sin_cache_dtype(query)
+        # torch_npu.npu_mrope reads the axis map from cache_mode, which older
+        # CANN releases ignore; the Triton kernel reads mrope_section directly.
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        # Text-only: fused NPU rope; an all-zero section means plain RoPE.
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
-        # npu_mrope reads an all-zero section as "M-RoPE disabled"; pass the real
-        # split when the positions carry the three axes.
-        is_mrope = positions.ndim == 2 and self.mrope_section
-        mrope_section = self.mrope_section if is_mrope else [0, 0, 0]
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
             key,
             self.cos_sin_cache,
             self.head_size,
-            mrope_section=mrope_section,
+            mrope_section=[0, 0, 0],
             rotary_mode=rotary_mode,
         )
         return query_out, key_out
