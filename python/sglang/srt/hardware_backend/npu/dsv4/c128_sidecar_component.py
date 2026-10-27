@@ -226,13 +226,26 @@ class C128SidecarComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # Pages attach only to full-group endpoints. A host-backed endpoint is a
-        # valid match unless match_device_only requires device residency.
+        # C128 pages attach only to full-group endpoints: one page per block of
+        # ``page_size * kernel_page_size`` tokens. Every other node -- and every
+        # node of a span shorter than one block, which owns no C128 page at all
+        # -- legitimately has no value here, so demanding residency on each node
+        # truncated every DSV4 prefix match to zero. Only a node that really is
+        # a block endpoint must still have its page.
+        ct = self.component_type
+        group_tokens = self._group_tokens()
+        # The walk visits nodes root-to-leaf once per match, so this mirrors the
+        # sliding-window accumulator in the SWA component.
+        state = {"len": 0}
+
         def _valid(node: UnifiedTreeNode) -> bool:
-            cd = node.component_data[self.component_type]
-            if match_device_only:
-                return cd.value is not None
-            return cd.value is not None or cd.host_value is not None
+            cd = node.component_data[ct]
+            state["len"] += len(node.key)
+            if cd.value is not None:
+                return True
+            if not match_device_only and cd.host_value is not None:
+                return True
+            return state["len"] % group_tokens != 0
 
         return _valid
 
