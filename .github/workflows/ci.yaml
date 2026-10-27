@@ -87,8 +87,7 @@ jobs:
           name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: selection.json
           if-no-files-found: error
-          # Phases run serially, so a maximal plan can need ~16 days of wall
-          # time; retention must outlive the worst-case selectable budget.
+          # A maximal plan can run for days; retention must outlive its budget.
           retention-days: 30
 
   cpu-precheck:

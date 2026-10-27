@@ -296,9 +296,7 @@ def aggregate(directory, plan):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "mode", choices=["verify", "aggregate", "dependencies", "outer"]
-    )
+    parser.add_argument("mode", choices=["verify", "aggregate", "outer"])
     parser.add_argument("--plan", default="selection.json")
     parser.add_argument("--entry")
     parser.add_argument("--directory", default="e2e-results")
@@ -338,13 +336,6 @@ def main():
                 runner.sanitize(json.dumps(result, indent=2)) + "\n"
             )
         print(json.dumps(result))
-    elif args.mode == "dependencies":
-        entry = entry_for(plan, args.entry)
-        records = [read_json(p) for p in Path(args.directory).rglob("entry.json")]
-        for name in entry["dependencies"]:
-            matches = [r for r in records if r["id"] == name]
-            require(len(matches) == 1, "Missing/duplicate checkpoint smoke evidence")
-            verify_terminal(matches[0], plan, entry_for(plan, name))
     else:
         check_live(plan, GitHub())
         needs = json.loads(os.environ["NEEDS_JSON"])

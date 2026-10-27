@@ -169,23 +169,13 @@ class E2ESelectionTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["family"], "qwen")
 
-    def test_defaults_and_full_accuracy_dependencies(self):
+    def test_defaults_and_test_all_select_independent_cases(self):
         entries, errors = selector.select(
             self.catalog, ["test-qwen", "test-accuracy-full"]
         )
         self.assertEqual(errors, [])
-        by_id = {e["id"]: e for e in entries}
-        self.assertEqual(len(by_id), len(entries))
-        full = [e for e in entries if e["mode"] == "full"]
-        self.assertTrue(full)
-        for entry in full:
-            self.assertEqual(len(entry["dependencies"]), 1)
-            smoke = by_id[entry["dependencies"][0]]
-            self.assertEqual(smoke["mode"], "smoke")
-            self.assertEqual(
-                selector.read_json(ROOT / entry["config"])["model"],
-                selector.read_json(ROOT / smoke["config"])["model"],
-            )
+        self.assertTrue(any(e["mode"] == "full" for e in entries))
+        self.assertTrue(all(not e["dependencies"] for e in self.catalog["entries"]))
         defaults, errors = selector.select(self.catalog, ["test-qwen"])
         self.assertEqual(errors, [])
         self.assertTrue(
@@ -193,6 +183,11 @@ class E2ESelectionTest(unittest.TestCase):
                 e["nodes"] == 1 and (e["category"] == "answer" or e["mode"] == "smoke")
                 for e in defaults
             )
+        )
+        entries, errors = selector.select(self.catalog, ["test-all"])
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            {e["id"] for e in entries}, {e["id"] for e in self.catalog["entries"]}
         )
 
     def test_explicit_distributed_and_pd_expansion(self):
@@ -736,60 +731,6 @@ class E2EEvidenceTest(unittest.TestCase):
         self.assertIsNone(values["execution_ppu_card_hours"])
         self.assertIsNone(values["pod_startup_seconds"])
 
-    def test_full_accuracy_requires_successful_same_plan_smoke(self):
-        full = next(e for e in self.catalog["entries"] if e["mode"] == "full")
-        smoke = next(
-            e for e in self.catalog["entries"] if e["id"] == full["dependencies"][0]
-        )
-        plan = {
-            "entries": [dict(e, config_digest="a" * 64) for e in (full, smoke)],
-            "run_id": "42",
-            "attempt": "1",
-            "tested_sha": "c" * 40,
-            "plan_hash": "d" * 64,
-        }
-        smoke = plan["entries"][1]
-        terminal = {
-            **report.identity(plan, smoke),
-            "success": True,
-            "ranks": [{"rank": 0}],
-            "evaluation": {"count": 1},
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            plan_path = directory / "plan.json"
-            write_json(plan_path, plan)
-            for state in ("missing", "failed", "stale", "passed", "duplicate"):
-                if state != "missing":
-                    value = copy.deepcopy(terminal)
-                    value["success"] = state != "failed"
-                    if state == "stale":
-                        value["attempt"] = "0"
-                    write_json(directory / "results/one/entry.json", value)
-                    if state == "duplicate":
-                        write_json(directory / "results/two/entry.json", value)
-                with self.subTest(state=state), mock.patch.object(
-                    report, "validate_plan"
-                ), mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        "report",
-                        "dependencies",
-                        "--plan",
-                        str(plan_path),
-                        "--entry",
-                        full["id"],
-                        "--directory",
-                        str(directory / "results"),
-                    ],
-                ):
-                    if state == "passed":
-                        report.main()
-                    else:
-                        with self.assertRaises(ValueError):
-                            report.main()
-
     def test_baseline_aggregation_includes_e2e_on_docs_only_requests(self):
         import pr_report
 
@@ -1119,13 +1060,10 @@ class E2EWorkflowTest(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_sequential_bounded_phases_and_cpu_identity(self):
+    def test_independent_bounded_phases_and_cpu_identity(self):
         jobs = self.workflow("pr-test-ppu-e2e.yml")["jobs"]
-        self.assertEqual(jobs["extended"]["needs"], ["prepare", "default"])
-        self.assertEqual(
-            jobs["distributed"]["needs"], ["prepare", "default", "extended"]
-        )
         for name in ("default", "extended", "distributed"):
+            self.assertEqual(jobs[name]["needs"], "prepare")
             self.assertEqual(jobs[name]["strategy"]["max-parallel"], 1)
             self.assertFalse(jobs[name]["strategy"]["fail-fast"])
             self.assertEqual(jobs[name]["with"]["phase"], name)
@@ -1133,6 +1071,9 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertIn("select_pr_e2e.py cpu", preparation)
         self.assertIn("inputs.cpu_identity", preparation)
         self.assertEqual(jobs["finish"]["if"], "always()")
+        entry = json.dumps(self.workflow("pr-test-ppu-e2e-entry.yml"))
+        self.assertNotIn("pr_e2e_report.py dependencies", entry)
+        self.assertNotIn("e2e-dependencies", entry)
 
     def test_entry_uses_pinned_action_and_strict_sanitized_uploads(self):
         workflow = self.workflow("pr-test-ppu-e2e-entry.yml")

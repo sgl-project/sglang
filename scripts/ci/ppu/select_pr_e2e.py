@@ -81,13 +81,11 @@ def load_catalog(path=CATALOG, root=ROOT):
     registrations = registered_files(root)
     seen = set()
     identities = set()
-    by_id = {}
     for entry in catalog["entries"]:
         name = entry["id"]
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,119}", name) or name in seen:
             raise ValueError(f"Invalid/duplicate entry ID: {name}")
         seen.add(name)
-        by_id[name] = entry
         if entry["family"] not in FAMILIES or entry["format"] not in set().union(
             *FORMATS.values()
         ):
@@ -154,22 +152,8 @@ def load_catalog(path=CATALOG, root=ROOT):
             raise ValueError(f"Duplicate execution identity: {name}")
         identities.add(identity)
     for entry in catalog["entries"]:
-        dependencies = entry["dependencies"]
-        if len(dependencies) != len(set(dependencies)):
-            raise ValueError("Duplicate dependencies")
-        full = entry["category"] == "accuracy" and entry["mode"] == "full"
-        if len(dependencies) != (1 if full else 0):
-            raise ValueError(f"Invalid smoke dependency: {entry['id']}")
-        for dependency in dependencies:
-            smoke = by_id[dependency]
-            config = read_json(root / entry["config"])
-            smoke_config = read_json(root / smoke["config"])
-            if (
-                smoke["category"] != "accuracy"
-                or smoke["mode"] != "smoke"
-                or smoke_config["model"] != config["model"]
-            ):
-                raise ValueError(f"Wrong checkpoint smoke dependency: {entry['id']}")
+        if entry["dependencies"]:
+            raise ValueError(f"E2E entries must be independent: {entry['id']}")
     return catalog
 
 
@@ -216,7 +200,9 @@ def select(catalog, tokens):
     selected = {
         e["id"]: e
         for e in candidates
-        if e["nodes"] == 1 and (e["category"] == "answer" or e["mode"] == "smoke")
+        if "test-all" in selectors
+        or e["nodes"] == 1
+        and (e["category"] == "answer" or e["mode"] == "smoke")
     }
     for modifier in sorted(labels & MODIFIERS):
         matches = [e for e in candidates if additions[modifier](e)]
@@ -225,9 +211,6 @@ def select(catalog, tokens):
                 f"{modifier} matches no execution in the selected model/format union."
             )
         selected.update((e["id"], e) for e in matches)
-    by_id = {e["id"]: e for e in catalog["entries"]}
-    for entry in list(selected.values()):
-        selected.update((name, by_id[name]) for name in entry["dependencies"])
     if selectors and not selected:
         errors.append("Selectors matched no execution.")
     for entry in selected.values():
@@ -449,7 +432,7 @@ def main():
             f"Command: {request['comment_id'] if request else '(none)'}",
             f"Selectors: {', '.join(request['selectors']) if request else '(none)'}",
             f"Selected executions: {len(plan['entries'])}",
-            "Default: Answer + Accuracy smoke. Format/model selectors use union semantics.",
+            "Default: Answer + Accuracy smoke; test-all selects every catalog entry.",
         ]
         summary += [
             f"- {e['id']} ({e['nodes']} x {e['cards_per_node']} PPUs; job ceiling {e['job_minutes']} min)"

@@ -40,7 +40,7 @@ Use one or more model/format selectors after `/run-ppu-e2e`:
 | --- | --- | --- |
 | Model family | `test-qwen`, `test-deepseek`, `test-glm`, `test-kimi`, `test-minimax` | Select cases belonging to those families. |
 | Format | `test-w4a8`, `test-w8a8`, `test-bf16`, `test-fp8`, `test-mxfp4` | Select matching formats across all families. `test-fp8` includes FP8 and FP8 channelwise; `test-mxfp4` maps to MXFP4-FP8. `test-w4a8` is accepted but currently matches no executions (W4A8 left the nightly line), so the request fails closed. |
-| All models/formats | `test-all` | Select every family/format, initially with default coverage. It does not enable every coverage modifier. |
+| All cases | `test-all` | Select every catalog entry, including full Accuracy, performance, multi-node, and PD cases. No coverage modifiers are required. |
 
 **Selectors use union (OR), not intersection (AND).** For example,
 `test-qwen test-glm` selects all Qwen cases plus all GLM cases; it does not mean
@@ -52,7 +52,7 @@ of these modifiers to expand it:
 
 | Modifier | Additional coverage |
 | --- | --- |
-| `test-accuracy-full` | Full Accuracy evaluation, including its required checkpoint-matched smoke dependency. |
+| `test-accuracy-full` | Full Accuracy evaluation, executed independently of its smoke case. |
 | `test-perf` | Single-node performance cases; multi-node performance also requires `test-multinode`. |
 | `test-multinode` | Multi-node Answer cases, plus multi-node performance when combined with `test-perf`. |
 | `test-pd` | Two-node prefill/decode-disaggregated performance cases; does not require `test-perf` or `test-multinode`. |
@@ -69,6 +69,7 @@ previous selection rather than adding to it.
 
 | Goal | Comment |
 | --- | --- |
+| Every E2E case | `/run-ppu-e2e test-all` |
 | Default Qwen coverage | `/run-ppu-e2e test-qwen` |
 | BF16 across all families | `/run-ppu-e2e test-bf16` |
 | Qwen OR GLM | `/run-ppu-e2e test-qwen test-glm` |
@@ -122,12 +123,12 @@ skipped successes.
   their identity; post a new run/clear command to change selection.
 
 In **CI Pipeline**, inspect **PPU E2E Selection**, the E2E jobs under **Full CI**,
-and **PPU E2E Gate**. Selected cases execute in ordered phases: default,
-extended, then distributed, with one entry at a time per phase. Later phases
-require earlier selected phases to succeed. The gate requires verified completion
-of every selected ID; a saved command or successful worker launch alone is not a
-passing result. **CI Result** additionally requires the complete authorized
-pipeline to succeed; a few successful prechecks with Full CI skipped do not pass.
+and **PPU E2E Gate**. Selected cases execute independently in default, extended,
+and distributed phases, with one entry at a time per phase. A failed case does
+not skip another case. The gate requires verified completion of every selected
+ID; a saved command or successful worker launch alone is not a passing result.
+**CI Result** additionally requires the complete authorized pipeline to succeed;
+a few successful prechecks with Full CI skipped do not pass.
 **Human Review Gate** runs in an independent workflow, so waiting for approval
 does not hold the CI Pipeline concurrency slot or delay a later authorized run.
 

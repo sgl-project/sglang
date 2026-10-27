@@ -57,21 +57,13 @@ jobs:
         with:
           name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-e2e
-      - name: Download prior smoke evidence
-        if: inputs.phase == 'extended'
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ppu-e2e-result-${{ github.run_id }}-${{ github.run_attempt }}-*
-          path: e2e-dependencies
-      - name: Validate plan, matrix entry, and checkpoint smoke prerequisites
+      - name: Validate plan and matrix entry
         env:
           ENTRY_NODES: ${{ inputs.nodes }}
           ENTRY_JOB_MINUTES: ${{ inputs.job_minutes }}
           ENTRY_WORKER_MINUTES: ${{ inputs.worker_minutes }}
           ENTRY_PHASE: ${{ inputs.phase }}
-        run: |
-          python3 scripts/ci/ppu/select_pr_e2e.py entry --plan .ppu-e2e/selection.json
-          python3 scripts/ci/ppu/pr_e2e_report.py dependencies --plan .ppu-e2e/selection.json --entry "$ENTRY" --directory e2e-dependencies
+        run: python3 scripts/ci/ppu/select_pr_e2e.py entry --plan .ppu-e2e/selection.json
       - name: Resolve immutable image
         run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Fresh authorization before resource allocation

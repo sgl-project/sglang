@@ -20,9 +20,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "dsv3.2-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "107913533169e97ff4139664110bed4e523c68b2",
@@ -106,9 +104,7 @@
         "SGLANG_DEFAULT_THINKING": "1",
         "SGLANG_DSV4_REASONING_EFFORT": "high"
       },
-      "dependencies": [
-        "dsv4-flash-mxfp4-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "107913533169e97ff4139664110bed4e523c68b2",
@@ -170,9 +166,7 @@
         "SGLANG_DEFAULT_THINKING": "1",
         "SGLANG_DSV4_REASONING_EFFORT": "high"
       },
-      "dependencies": [
-        "dsv4-flash-w8a8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "107913533169e97ff4139664110bed4e523c68b2",
@@ -288,9 +282,7 @@
         "SGLANG_DEFAULT_THINKING": "1",
         "SGLANG_DSV4_REASONING_EFFORT": "high"
       },
-      "dependencies": [
-        "dsv4-pro-mxfp4-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "107913533169e97ff4139664110bed4e523c68b2",
@@ -347,9 +339,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -376,9 +366,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -432,9 +420,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -569,9 +555,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -598,9 +582,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -654,9 +636,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -818,9 +798,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -847,9 +825,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -903,9 +879,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1013,9 +987,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1042,9 +1014,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1098,9 +1068,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1181,9 +1149,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1210,9 +1176,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1266,9 +1230,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1376,9 +1338,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1405,9 +1365,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1461,9 +1419,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1571,9 +1527,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1600,9 +1554,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
@@ -1656,9 +1608,7 @@
       "worker_minutes": 570,
       "job_minutes": 600,
       "environment": {},
-      "dependencies": [
-        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
-      ],
+      "dependencies": [],
       "blocked": "",
       "source": {
         "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",

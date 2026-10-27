@@ -70,11 +70,10 @@ jobs:
     secrets: inherit
 
   extended:
-    needs: [prepare, default]
+    needs: prepare
     if: >-
       always() && !cancelled() && needs.prepare.result == 'success' &&
-      needs.prepare.outputs.extended_selected == 'true' &&
-      (needs.default.result == 'success' || needs.prepare.outputs.default_selected == 'false')
+      needs.prepare.outputs.extended_selected == 'true'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -90,12 +89,10 @@ jobs:
     secrets: inherit
 
   distributed:
-    needs: [prepare, default, extended]
+    needs: prepare
     if: >-
       always() && !cancelled() && needs.prepare.result == 'success' &&
-      needs.prepare.outputs.distributed_selected == 'true' &&
-      (needs.default.result == 'success' || needs.prepare.outputs.default_selected == 'false') &&
-      (needs.extended.result == 'success' || needs.prepare.outputs.extended_selected == 'false')
+      needs.prepare.outputs.distributed_selected == 'true'
     strategy:
       fail-fast: false
       max-parallel: 1
