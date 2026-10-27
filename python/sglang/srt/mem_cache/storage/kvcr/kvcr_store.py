@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.storage.kvcr.endpoints import (
+    control_address,
     rank_endpoint,
     rank_offset,
 )
@@ -182,6 +183,20 @@ class KVCRStore(HiCacheStorage):
         if mem_pool_host.kv_buffer is not None:
             self.register_mem_host_pool_v2(mem_pool_host, PoolName.KV)
 
+    def get_kv_hint_source(self):
+        if (
+            self._offset != 0
+            or self._extra.get("enable_remote_hint", True) is not True
+            or self._extra.get("control_advertise_host") is None
+        ):
+            return None
+        host, port = control_address(self.config, self._extra)
+        return {
+            "dp_rank": self.config.dp_rank,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": f"tcp://{host}:{port}",
+        }
+
     def register_mem_host_pool_v2(self, host_pool, host_pool_name):
         name = str(host_pool_name)
         with self._lock:
@@ -232,15 +247,14 @@ class KVCRStore(HiCacheStorage):
             or not isinstance(pages_by_pool, dict)
         ):
             raise ValueError("Invalid KVCR local DRAM budget")
-        base_port = self._extra.get("control_port", 32100)
-        if type(base_port) is not int or not 0 < base_port <= 65535:
-            raise ValueError("KVCR control_port must be a valid integer port")
+        host, port = control_address(self.config, self._extra)
+        dp_stride = self.config.tp_size * self.config.attn_cp_size * self.config.pp_size
+        offset = self.config.dp_rank * dp_stride + self._offset
+        base_port = port - offset
         nixl_base_port = self._extra.get("nixl_listen_port", base_port + 1024)
         if type(nixl_base_port) is not int or not 0 < nixl_base_port <= 65535:
             raise ValueError("KVCR nixl_listen_port must be a valid integer port")
-        dp_stride = self.config.tp_size * self.config.attn_cp_size * self.config.pp_size
-        offset = self.config.dp_rank * dp_stride + self._offset
-        port, nixl_port = base_port + offset, nixl_base_port + offset
+        nixl_port = nixl_base_port + offset
         if not 0 < port <= 65535 or not 0 < nixl_port <= 65535 or port == nixl_port:
             raise ValueError("KVCR control/NIXL port range is invalid or overlaps")
         layouts, regions, plans = [], [], []
@@ -264,7 +278,6 @@ class KVCRStore(HiCacheStorage):
                         label=component.name,
                     )
                 )
-        host = self._extra.get("control_advertise_host", "127.0.0.1")
         channel = ZmqPeerControlChannel(
             bind_host=self._extra.get("control_host", "0.0.0.0"),
             bind_port=port,
