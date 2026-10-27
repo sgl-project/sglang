@@ -1418,13 +1418,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_cur=v,
             )
         else:
-            kv_cache = pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
 
         # use paged attention
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_layer(
                         forward_batch,
@@ -1473,8 +1473,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert not self.prefill_uses_dequant_workspace, (
                     "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
                 )
-                k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-                v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+                k = self.kv_layers.read(layer.layer_id).kv()[0]
+                v = self.kv_layers.read(layer.layer_id).kv()[1]
             causal = True
             if (
                 layer.is_cross_attention
@@ -1530,7 +1530,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_layer(
                         forward_batch,
@@ -1561,7 +1561,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_layer(
                         forward_batch,
@@ -1587,7 +1587,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
         else:
-            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
 
         # Call the wrapped function
         o = decode_wrapper.forward(
