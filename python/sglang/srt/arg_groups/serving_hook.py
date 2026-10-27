@@ -85,6 +85,13 @@ def handle_ssl_validation(server_args: Any):
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
             "to be specified."
         )
+    if cfg.enable_http_worker_reuseport and (
+        cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+    ):
+        raise ValueError(
+            "--enable-http-worker-reuseport requires --tokenizer-worker-num > 1 "
+            "and has no effect with --enable-http2."
+        )
 
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
@@ -714,7 +721,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

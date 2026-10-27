@@ -30,7 +30,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:
@@ -54,7 +54,12 @@ class _StubFullComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target: EvictLayer = EvictLayer.DEVICE
+        self,
+        node,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         return 0, 0
 
@@ -67,7 +72,7 @@ class _StubFullComponent(TreeComponent):
     def _evict_device_start(self, request_cnt) -> None:
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:

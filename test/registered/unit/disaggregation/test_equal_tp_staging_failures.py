@@ -178,7 +178,6 @@ class TestAllocationFailureIsolation(CustomTestCase):
             None,
             None,
             None,
-            0,
         )
         self.assertIs(result[0], sentinel)
         self.assertFalse(result[1])

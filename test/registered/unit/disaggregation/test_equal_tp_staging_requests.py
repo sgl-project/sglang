@@ -271,18 +271,17 @@ class TestReadyBeforeWait(CustomTestCase):
         notifications = []
         manager = NS(
             _staging_ctx=NS(watermark_cv=CV()),
-            _send_chunk_ready=lambda *args: notifications.append(args),
+            send_chunk_ready=lambda *args, **kwargs: notifications.append(kwargs),
         )
         result = env[node.name](
             manager,
             strategy,
             NS(index_slice=slice(0, 8), prefill_kv_indices=list(range(8))),
-            NS(mooncake_session_id="s"),
+            NS(room=7, endpoint="test", dst_port=1, mooncake_session_id="s"),
             NS(staging_base_ptr=1, staging_total_size=100),
             None,
             None,
             None,
-            0,
         )
         self.assertEqual(result, (0, False))
         self.assertEqual(len(notifications), 1)
