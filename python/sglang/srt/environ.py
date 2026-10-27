@@ -1796,19 +1796,17 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
-    # Deprecated: --engram-config '{"placement": "cpu"}'. Read only by server-arg
-    # resolution (_resolve_engram_config), which translates it.
+    # Deprecated for --engram-config "placement". The deprecated engram variables
+    # are read only by _resolve_engram_config.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # Deprecated: --engram-config "replication"; "shared" is "per_node" and
-    # "per_rank" is "none".
+    # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
-    # Deprecated: --engram-config '{"lookup": "peer_read"}'; takes precedence over
-    # SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE, as before.
+    # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer

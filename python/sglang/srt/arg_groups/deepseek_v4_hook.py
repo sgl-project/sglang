@@ -76,7 +76,6 @@ _DEPRECATED_ENGRAM_ENVS = (
 
 
 def _engram_config_from_env(cfg) -> EngramConfig:
-    """The --engram-config the deprecated environment variables ask for."""
     if (
         envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
         and cfg.tp_size > 1
@@ -95,8 +94,7 @@ def _engram_config_from_env(cfg) -> EngramConfig:
 
 
 def _resolve_engram_config(server_args: ServerArgs) -> None:
-    """Resolve --engram-config, or the deprecated environment variables it
-    replaces, into the one value the Engram layers read."""
+    """The only producer of the engram_config the Engram layers read."""
     cfg = resolving_view(server_args)
     raw = cfg.engram_config
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":

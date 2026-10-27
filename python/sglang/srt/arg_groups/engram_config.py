@@ -1,9 +1,5 @@
-"""--engram-config: where the DeepSeek-V4.1 Engram tables live and how a rank
-reads rows that another rank holds. The --engram-config help says what each
-value means.
-
-Stdlib only, so server-argument resolution can import it without torch.
-"""
+"""Values of --engram-config; its help says what each one means. Stdlib only:
+server-argument resolution imports it without torch."""
 
 import dataclasses
 from typing import Any, Dict
@@ -39,7 +35,6 @@ class EngramConfig:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
-        """Validate a partial --engram-config; omitted keys keep their defaults."""
         choices = {f.name: f.metadata["choices"] for f in dataclasses.fields(cls)}
         invalid = [f"{k}={v!r}" for k, v in raw.items() if v not in choices.get(k, ())]
         if invalid:
