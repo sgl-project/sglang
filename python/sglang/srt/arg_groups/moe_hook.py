@@ -281,6 +281,51 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+def _check_mooncake_xpu_scope(cfg: Any) -> None:
+    # Mooncake EP on Intel XPU covers expert parallelism over the TP ranks of
+    # one node; reject what it does not support before it fails mid-forward.
+    unsupported = []
+    if cfg.nnodes > 1:
+        unsupported.append("more than one node (--nnodes)")
+    if attn_dp_enabled_of(cfg):
+        unsupported.append("DP attention (--attn-dp-size)")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        unsupported.append("two- or single-batch overlap")
+    if cfg.elastic_ep_backend is not None:
+        unsupported.append("elastic EP (--elastic-ep-backend)")
+    # Both change how many tokens a rank dispatches: verify steps carry draft tokens,
+    # and unpadded batches reach the MoE whole on every rank.
+    if cfg.speculative_algorithm is not None:
+        unsupported.append("speculative decoding (--speculative-algorithm)")
+    if cfg.disable_attn_tp_gather:
+        unsupported.append("--disable-attn-tp-gather")
+    if unsupported:
+        raise ValueError(
+            "moe_a2a_backend='mooncake' on XPU supports expert parallelism over "
+            "the TP ranks of one node, e.g. --device xpu --tp 4 --ep-size 4. "
+            "Not supported yet: " + ", ".join(unsupported) + "."
+        )
+
+
+def _fit_batches_to_mooncake_dispatch(server_args: Any, cfg: Any) -> None:
+    # A Mooncake EP dispatch takes at most this many tokens per rank, and TP
+    # attention puts 1/tp_size of each batch on every rank.
+    limit = envs.SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() * cfg.tp_size
+    chunked = cfg.chunked_prefill_size
+    if chunked is None or chunked <= 0 or chunked > limit:
+        declare_resolution(server_args, "_handle_a2a_moe", chunked_prefill_size=limit)
+        logger.warning(
+            f"chunked_prefill_size set to {limit} to fit Mooncake EP's per-rank "
+            "dispatch (SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK x tp_size)"
+        )
+    if cfg.max_running_requests is None or cfg.max_running_requests > limit:
+        declare_resolution(server_args, "_handle_a2a_moe", max_running_requests=limit)
+        logger.warning(
+            f"max_running_requests set to {limit} to fit Mooncake EP's per-rank "
+            "dispatch"
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -571,6 +616,23 @@ def handle_a2a_moe(server_args: Any):
                 "must be >= the per-rank MoRI dispatch tokens "
                 "(chunked_prefill_size by default)"
             )
+
+    if a2a_backend == "mooncake":
+        if cfg.device == "xpu":
+            _check_mooncake_xpu_scope(cfg)
+            _fit_batches_to_mooncake_dispatch(server_args, cfg)
+        if cfg.deepep_mode == "normal":
+            raise ValueError(
+                "moe_a2a_backend='mooncake' only supports low-latency mode; "
+                "set --deepep-mode to 'low_latency' or 'auto'."
+            )
+        if cfg.deepep_mode == "auto":
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                deepep_mode="low_latency",
+            )
+            logger.warning("auto set deepep_mode=`low_latency` for Mooncake EP")
 
     if a2a_backend == "pplx":
         if cfg.deepep_mode == "normal":

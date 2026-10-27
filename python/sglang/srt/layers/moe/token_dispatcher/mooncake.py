@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -21,9 +22,32 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import get_resources
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
+
+# Calls between refills of the XPU all-ranks-active rows; arbitrary.
+_ACTIVE_RANKS_RING_ROWS = 128
+
+
+class _ActiveRanksRing:
+    """All-ranks-active tensors that outlive the receive hooks reading them."""
+
+    def __init__(
+        self, *, num_ranks: int, device: str, num_rows: int = _ACTIVE_RANKS_RING_ROWS
+    ):
+        self._ring = torch.ones((num_rows, num_ranks), dtype=torch.int32, device=device)
+        self._rows = self._ring.unbind(0)
+        self._next = 0
+
+    def take(self) -> torch.Tensor:
+        row = self._rows[self._next]
+        self._next = (self._next + 1) % len(self._rows)
+        if self._next == 0:
+            # The kernels zero a timed-out rank's entry; every row has had its call,
+            # and the in-order queue runs this refill after all their readers.
+            self._ring.fill_(1)
+        return row
 
 
 class MooncakeDispatchOutput(NamedTuple):
@@ -154,8 +178,8 @@ class _MooncakeEPDispatcherImpl:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         # Mooncake EP dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
@@ -163,6 +187,16 @@ class _MooncakeEPDispatcherImpl:
 
         self.first_execution = True
         self.timeout_us = 10000000
+        # The XPU receive hook reads the all-ranks-active tensor after dispatch returns,
+        # and the kernels zero the entry of a rank that times out.
+        self._active_ranks_ring = (
+            _ActiveRanksRing(num_ranks=group.size(), device="xpu") if is_xpu() else None
+        )
+        # The Intel XPU expert path is a BF16 GEMM (no FP8 masked GEMM).
+        self.dispatch_use_fp8 = not is_xpu()
+        # On XPU, given the top-k weights at dispatch, the combine sums each
+        # token's rows on the expert side, halving its transfers.
+        self.dispatch_with_topk_weights = is_xpu()
 
         self.handle = None
 
@@ -181,7 +215,13 @@ class _MooncakeEPDispatcherImpl:
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            use_fp8=True,
+            use_fp8=self.dispatch_use_fp8,
+            # Combine is called with these same weights.
+            topk_weights=(
+                topk_weights.float().contiguous()
+                if self.dispatch_with_topk_weights
+                else None
+            ),
         )
         return (
             hidden_states,
@@ -228,6 +268,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         use_fp8: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         active_ranks = self._get_active_ranks()
@@ -242,6 +283,7 @@ class _MooncakeEPDispatcherImpl:
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **({} if topk_weights is None else {"topk_weights": topk_weights}),
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
@@ -289,6 +331,8 @@ class _MooncakeEPDispatcherImpl:
         elastic_state = ElasticEPStateManager.instance()
         if elastic_state is not None:
             return elastic_state.active_ranks
+        if self._active_ranks_ring is not None:
+            return self._active_ranks_ring.take()
         return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
     def _get_buffer(self):

@@ -1924,6 +1924,68 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             handle_a2a_moe(server_args)
 
 
+class TestMooncakeA2aArgs(CustomTestCase):
+    def _handle(self, device, **kwargs):
+        server_args = ServerArgs(
+            model_path="dummy",
+            device=device,
+            tp_size=4,
+            moe_a2a_backend="mooncake",
+            **kwargs,
+        )
+        handle_a2a_moe(server_args)
+        return server_args
+
+    def test_auto_deepep_mode_resolves_to_low_latency(self):
+        # The Mooncake dispatcher has no normal mode; the default `auto` used to
+        # reach it and fail at startup on every platform.
+        server_args = self._handle("cuda")
+        self.assertEqual(resolution_result(server_args, "deepep_mode"), "low_latency")
+        with self.assertRaisesRegex(ValueError, "only supports low-latency"):
+            self._handle("cuda", deepep_mode="normal")
+
+    def test_xpu_supports_only_expert_parallelism_over_tp_ranks(self):
+        server_args = self._handle("xpu")
+        self.assertEqual(resolution_result(server_args, "ep_size"), 4)
+        for kwargs in (
+            {"attn_dp_size": 4},
+            {"enable_two_batch_overlap": True},
+            {"enable_single_batch_overlap": True},
+            {"nnodes": 2},
+            {"elastic_ep_backend": "mooncake"},
+            {"speculative_algorithm": "NGRAM"},
+            {"disable_attn_tp_gather": True},
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, "on XPU supports"):
+                    self._handle("xpu", **kwargs)
+        # The restriction is XPU's alone.
+        self._handle("cuda", attn_dp_size=4)
+
+    def test_xpu_fits_batches_to_the_per_rank_dispatch(self):
+        # A dispatch takes at most 128 tokens per rank by default; the default
+        # 4096-token prefill chunk put 1024 on each of 4 ranks and the server
+        # died on its first long prompt.
+        with envs.SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            server_args = self._handle("xpu")
+            self.assertEqual(
+                resolution_result(server_args, "chunked_prefill_size"), 512
+            )
+            self.assertEqual(
+                resolution_result(server_args, "max_running_requests"), 512
+            )
+            server_args = self._handle(
+                "xpu", chunked_prefill_size=256, max_running_requests=64
+            )
+            self.assertEqual(
+                resolution_result(server_args, "chunked_prefill_size"), 256
+            )
+            self.assertEqual(resolution_result(server_args, "max_running_requests"), 64)
+            self.assertIsNone(
+                resolution_result(self._handle("cuda"), "chunked_prefill_size")
+            )
+
+
 class TestFlashinferMegaMoeConfig(CustomTestCase):
     def setUp(self):
         self._combine_dtype_backup = os.environ.get(
