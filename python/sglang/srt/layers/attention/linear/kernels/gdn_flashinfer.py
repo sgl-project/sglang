@@ -458,7 +458,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
+            # CUDA graph padding uses -1, which PyTorch indexing would map
+            # to the last live state slot. Use the pool's reserved dummy slot
+            # for both gather and scatter so padded rows cannot corrupt it.
+            safe_cache_indices = cache_indices.clamp_min(0)
+            state_batch = ssm_states[safe_cache_indices]
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -472,7 +476,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            ssm_states[safe_cache_indices] = new_state
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
