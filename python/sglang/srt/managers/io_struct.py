@@ -2059,7 +2059,7 @@ class CheckpointReqType(Enum):
     STATE = 1
     # Release the KV cache once the paused scheduler drains.
     PREPARE = 2
-    RESUME = 3
+    RESTORE = 3
 
 
 class CheckpointState(str, Enum):
@@ -2070,8 +2070,8 @@ class CheckpointState(str, Enum):
     PREPARING = "preparing"
     # Safe to capture.
     PREPARED = "prepared"
-    # Only across ranks, while some resumed and others are still prepared.
-    RESUMING = "resuming"
+    # Only across ranks, while some restored and others are still prepared.
+    RESTORING = "restoring"
     FAILED = "failed"
 
 
@@ -2082,7 +2082,7 @@ class CheckpointReqInput(BaseReq, kw_only=True):
 class CheckpointReqOutput(BaseReq, kw_only=True):
     # False when the request was refused, with nothing changed.
     success: bool
-    # Why it was refused, or why preparing or resuming failed.
+    # Why it was refused, or why preparing or restoring failed.
     message: str = ""
     state: CheckpointState
 
@@ -2098,7 +2098,7 @@ class CheckpointReqOutput(BaseReq, kw_only=True):
         elif CheckpointState.PREPARING in states:
             state = CheckpointState.PREPARING
         else:
-            state = CheckpointState.RESUMING
+            state = CheckpointState.RESTORING
         refused = [out for out in outputs if not out.success]
         message = next((out.message for out in refused or outputs if out.message), "")
         return CheckpointReqOutput(success=not refused, message=message, state=state)

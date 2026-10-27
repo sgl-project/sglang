@@ -831,7 +831,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause_cond = asyncio.Condition()
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
-        # Serializes checkpoint prepare and resume within this process.
+        # Serializes checkpoint prepare and restore within this process.
         self.checkpoint_lock = asyncio.Lock()
 
     def init_lora(self):

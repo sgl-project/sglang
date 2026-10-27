@@ -1,14 +1,14 @@
 """Process checkpoint state of one scheduler.
 
 An external orchestrator captures the whole process once it is prepared,
-restores it elsewhere or keeps it, and resumes it. The scheduler goes
-running -> preparing -> prepared -> running any number of times, or ends in
-failed. Repeated calls are no-ops.
+then restores it, in a process started from the capture or in place. The
+scheduler goes running -> preparing -> prepared -> running any number of
+times, or ends in failed. Repeated calls are no-ops.
 
 The tokenizer pauses generation as /pause_generation does before preparing,
-and continues it after resuming, so clients see a paused server in between.
+and continues it after restoring, so clients see a paused server in between.
 Prepare waits for the paused scheduler to go idle, then releases the KV cache.
-Weights stay on the GPU. Resume brings the KV cache back.
+Weights stay on the GPU. Restore brings the KV cache back.
 """
 
 import logging
@@ -58,18 +58,18 @@ class SchedulerCheckpointManager:
         success, message = True, ""
         if self.state == CheckpointState.FAILED:
             success = False
-        elif recv_req.req_type == CheckpointReqType.RESUME:
+        elif recv_req.req_type == CheckpointReqType.RESTORE:
             if self.state == CheckpointState.PREPARING:
-                success, message = False, "Cannot resume while preparing"
+                success, message = False, "Cannot restore while preparing"
             elif self.state == CheckpointState.PREPARED:
-                logger.info("Resuming from a process checkpoint")
+                logger.info("Restoring from a process checkpoint")
                 try:
                     self._resume_memory_occupation(
                         ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
                     )
                 except Exception as e:
                     self.state = CheckpointState.FAILED
-                    self._error = f"Failed to resume from the checkpoint: {e}"
+                    self._error = f"Failed to restore from the checkpoint: {e}"
                     logger.exception(self._error)
                 else:
                     self.state = CheckpointState.RUNNING
