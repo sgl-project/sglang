@@ -169,7 +169,7 @@ class UnifiedDraftMambaPool(MambaPool):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
-        # Same disabled-state attributes `UnifiedMambaPool` replicates for the
+        # Same disabled-state attributes the state view replicates for the
         # base class's unconditional reads.
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16

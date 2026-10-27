@@ -20,7 +20,7 @@ import torch
 from sglang.srt.mem_cache import memory_pool as mem_pool
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftMambaPool,
     routed_draft_pool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -336,7 +335,7 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_host_whole_entry_ops_carry_the_draft_block(self):
         _, pool = self._pool()
-        host = UnifiedMambaPool(
+        host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
             spec_state_size=2,
@@ -383,7 +382,7 @@ class TestFusedStateHost(unittest.TestCase):
         draft = UnifiedDraftMambaPool(
             arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0}
         )
-        host = UnifiedMambaPool(
+        host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
             spec_state_size=2,

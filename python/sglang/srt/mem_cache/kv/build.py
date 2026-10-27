@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
@@ -39,7 +40,6 @@ from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMambaPool,
     _wire_mamba_slot_allocator,
 )
 
@@ -129,7 +129,7 @@ def _build_state_storage(
     )
     return StateStorage(
         sub_pool=state.name,
-        pool=UnifiedMambaPool(
+        pool=StateView(
             arena=arena,
             spec=state.spec,
             spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates

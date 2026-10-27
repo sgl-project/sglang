@@ -521,7 +521,7 @@ class MambaPool:
     conv_window_axis = -1
 
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
-    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
+    # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
 
     def register_slot_state(self, state) -> None:
@@ -1116,7 +1116,7 @@ class MambaPool:
 
     # Pool-stable (conv tensors don't move after allocation) so cached per instance
     # on first use. A cached_property rather than set in __init__ because
-    # UnifiedMambaPool skips super().__init__.
+    # Subclasses may skip super().__init__.
     @cached_property
     def _conv_fuse_ok(self) -> bool:
         """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.

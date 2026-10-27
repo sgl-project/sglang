@@ -11,192 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The unified placement's per-layout views over a `KVArena`, and the slot
-allocator of its state band.
-
-Every view below is a layout's per-layer tensors over one band of the arena;
-the arena owns the bytes and moves and zeroes their units. Everything above
-the allocator stores virtual ids; the allocator owns the per-sub-pool
-virtual<->physical tables, and compaction only mutates those (no reference
-rewriting).
-"""
+"""The slot allocator of a unified pool's state band, as the static slot
+protocol presents it (deleted with that protocol's last consumer)."""
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
-from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
-
-
-class UnifiedMambaPool(MambaPool):
-    """Mamba state pool whose conv/temporal state are strided views into a
-    `KVArena` band.
-
-    Pure PHYSICAL store: slots and their v<->p mapping are the chain allocator's
-    state band, and the arena moves them. Does NOT call `super().__init__()` --
-    replicates the minimal `MambaPool` state against the arena so inherited
-    methods work.
-    """
-
-    def __init__(
-        self,
-        *,
-        arena: KVArena,
-        spec: MambaSubPoolSpec,
-        spec_state_size: int,
-        mamba_layer_ids: List[int],
-        enable_memory_saver: bool = False,
-        speculative_num_draft_tokens: Optional[int] = None,
-    ):
-        assert spec.layer_num == len(mamba_layer_ids)
-        # PP disagg state transfer maps entries by global layer id.
-        self.mamba_layer_ids = list(mamba_layer_ids)
-        conv_views, temporal_view = spec.views(arena)
-        max_slots = arena.extent_entries(spec.name)
-
-        self._arena = arena
-        self._sub_pool_name = spec.name
-
-        # Replicate the state MambaPool.__init__ would have set.
-        self._max_size = max_slots - 1  # -1 for reserved slot 0
-        self.size = self._max_size
-        self.device = arena.device
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
-        self.enable_custom_mem_pool = False
-        self.custom_mem_pool = None
-        self.num_mamba_layers = spec.layer_num
-        # GDN/KDA ReplaySSM / spec unsupported; replicate parent's disabled-state
-        # attrs so unconditional reads (e.g. `replayssm_cache_base is not None` in
-        # the req-slot alloc path) and `... is not None` guards don't AttributeError.
-        self.enable_linear_replayssm = False
-        self.linear_replayssm_cache_len = 16
-        self.replayssm_write_pos = None
-        self.replayssm_is_kda = False
-        self.enable_linear_replayssm_spec = False
-        self.replayssm_spec_fold = False
-        self.replayssm_spec_write_pos = None
-        self.replayssm_cache_base = None
-        self.replayssm_is_flush = None
-        self.debug_memory_pool = False
-        self.conv_shard_groups = None
-        self.conv_slice_axis = spec.conv_slice_axis
-
-        assert conv_views[0].shape[0] == self.num_mamba_layers, (
-            f"conv_views layers={conv_views[0].shape[0]} vs expected {self.num_mamba_layers}"
-        )
-        assert conv_views[0].shape[1] == self._max_size + 1, (
-            f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
-        )
-
-        # Per-draft-token intermediate buffers have a different outer size
-        # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
-        temporal_state_shape = spec.temporal_state_shape
-        conv_state_shape = spec.conv_state_shapes
-        conv_dtype = spec.conv_dtype
-        ssm_dtype = spec.temporal_dtype
-        if speculative_num_draft_tokens is not None:
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        self.num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device=arena.device,
-                )
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            self.num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            cshape[0],
-                            cshape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=arena.device,
-                    )
-                    for cshape in conv_state_shape
-                ]
-            self.mamba_cache = self.SpeculativeState(
-                conv=list(conv_views),
-                temporal=temporal_view,
-                intermediate_ssm=intermediate_ssm_state_cache,
-                intermediate_conv_window=intermediate_conv_window_cache,
-            )
-        else:
-            self.mamba_cache = self.State(conv=list(conv_views), temporal=temporal_view)
-
-        self.mem_usage = arena.total_bytes / GB
-        logger.info(
-            "[unified-memory-pool] UnifiedMambaPool(%s) over the KV arena: max_slots=%d, "
-            "num_mamba_layers=%d",
-            spec.name,
-            max_slots,
-            self.num_mamba_layers,
-        )
-        self._entry_bytes = spec.entry_bytes()
-
-    def register_slot_state(self, state) -> None:
-        # The arena moves whole entries, so every per-slot state must live in
-        # the entry: side states registered beside it would be left behind.
-        raise ValueError(
-            "--enable-unified-memory keeps a slot's whole state in its entry; "
-            "side states registered beside the state pool are not supported"
-        )
-
-    # State ops take PHYSICAL slot ids and act on whole entries, so a fused
-    # draft state block is cleared and copied with the host streams.
-
-    def clear_slots(self, indices: torch.Tensor):
-        # index_fill_, not `view[indices] = 0`: assigning a Python scalar
-        # through an index tensor synchronizes the host.
-        self._arena.entries(self._sub_pool_name).index_fill_(
-            0, indices.to(torch.int64), 0
-        )
-
-    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
-        assert self.replayssm_write_pos is None
-        entries = self._arena.entries(self._sub_pool_name)
-        entries[dst_indices] = entries[src_indices]
-
-    # -- PD state transfer (StateType.MAMBA) --
-    # The transfer item is the whole per-slot envelope, addressed as
-    # `raw_ptr + physical_slot * entry_bytes`. An envelope cannot be TP-resliced
-    # or PP-subset, so the per-tensor metadata below stays empty and both sides
-    # must build identical mamba specs (equal attn TP, pp=1).
-
-    def get_contiguous_buf_infos(self):
-        raw = self._arena.raw
-        return [raw.data_ptr()], [raw.numel()], [self._entry_bytes]
-
-    def get_state_dim_per_tensor(self):
-        return []
-
-    def get_state_layer_ids(self):
-        return []
-
-    def get_state_slice_outer_counts(self):
-        return []
-
-    def get_state_conv_shard_groups(self):
-        return []
 
 
 class UnifiedMambaSlotAllocator:
@@ -204,7 +31,7 @@ class UnifiedMambaSlotAllocator:
 
     Owns slot alloc/free, sizing, and the v<->p mapping (``translate``), presenting the
     upstream ``MambaSlotAllocator`` interface. ``alloc()`` returns VIRTUAL ids and does
-    NOT clear state — clearing is deferred to ``UnifiedMambaPool.clear_slots``.
+    NOT clear state — clearing is deferred to ``StateView.clear_slots``.
     """
 
     def __init__(

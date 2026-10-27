@@ -14,11 +14,10 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
 from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -65,7 +64,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             enable_memory_saver=False,
         )
         shared.raw.zero_()
-        pool = UnifiedMambaPool(
+        pool = StateView(
             arena=shared,
             spec=shared.spec("mamba"),
             spec_state_size=0,
