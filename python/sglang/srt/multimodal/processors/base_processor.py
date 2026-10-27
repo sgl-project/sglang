@@ -48,7 +48,6 @@ from sglang.srt.multimodal.serving_preprocessing import (
 )
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
-    keeps_mm_features_on_device,
     move_feature_to_cpu,
 )
 from sglang.srt.runtime_context import (
@@ -248,10 +247,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             base_gpu_id=server_args.base_gpu_id,
             skip_mm_pool=kwargs.get("skip_mm_pool", False),
         )
-        # Model processors read these; PositionalEmbedsTransport reuses the pool.
-        self.mm_feature_transport = self._feature_transport.mm_feature_transport
-        self.use_cuda_ipc = self._feature_transport.use_cuda_ipc
-        self.cudaipc_mmfeature_pool = self._feature_transport.cudaipc_mmfeature_pool
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         processor_config = MultimodalProcessorConfig(
@@ -352,7 +347,12 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     @property
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
-        return keeps_mm_features_on_device(self.mm_feature_transport)
+        return self._feature_transport.keep_mm_features_on_device
+
+    @property
+    def cudaipc_mmfeature_pool(self):
+        # PositionalEmbedsTransport looks this pool up by name.
+        return self._feature_transport.cudaipc_mmfeature_pool
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -374,7 +374,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             ),
             "gpu_image_decode": self.gpu_image_decode,
             "image_processor_backend": self.image_processor_backend,
-            "feature_transport": self.mm_feature_transport,
+            "feature_transport": self._feature_transport.mm_feature_transport,
             "image_config": self.image_config,
             "video_config": self.video_config,
             "audio_config": self.audio_config,
@@ -397,7 +397,11 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         super().shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
-        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        start_method = (
+            "spawn"
+            if self._feature_transport.mm_feature_transport == "cuda_vmm"
+            else "fork"
+        )
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),

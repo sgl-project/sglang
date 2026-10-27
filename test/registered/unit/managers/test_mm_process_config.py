@@ -330,8 +330,8 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
                 transport_mode=None,
             )
 
-        self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
-        self.assertTrue(processor.use_cuda_ipc)
+        self.assertEqual(processor._feature_transport.mm_feature_transport, "cuda_ipc")
+        self.assertTrue(processor._feature_transport.use_cuda_ipc)
         self.assertTrue(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
@@ -353,7 +353,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
                 transport_mode=None,
             )
 
-        self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor._feature_transport.use_cuda_ipc)
         self.assertFalse(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
@@ -375,8 +375,8 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
                 transport_mode=None,
             )
 
-        self.assertEqual(processor.mm_feature_transport, "cpu")
-        self.assertFalse(processor.use_cuda_ipc)
+        self.assertEqual(processor._feature_transport.mm_feature_transport, "cpu")
+        self.assertFalse(processor._feature_transport.use_cuda_ipc)
         self.assertFalse(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
@@ -402,8 +402,8 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
         result = processor.process_mm_data("test")
 
-        self.assertEqual(processor.mm_feature_transport, "cuda_vmm")
-        self.assertFalse(processor.use_cuda_ipc)
+        self.assertEqual(processor._feature_transport.mm_feature_transport, "cuda_vmm")
+        self.assertFalse(processor._feature_transport.use_cuda_ipc)
         self.assertTrue(processor.keep_mm_features_on_device)
         self.assertEqual(processor.cpu_executor._mp_context.get_start_method(), "spawn")
         self.assertIs(result["pixel_values"], feature)
@@ -712,6 +712,9 @@ class TestProcessMmDataKwargs(CustomTestCase):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
+        from sglang.srt.multimodal.transport.feature_transport import (
+            MultimodalFeatureTransport,
+        )
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
@@ -735,8 +738,9 @@ class TestProcessMmDataKwargs(CustomTestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
-        proc.mm_feature_transport = server_args.mm_feature_transport
-        proc.use_cuda_ipc = False
+        proc._feature_transport = MultimodalFeatureTransport(
+            server_args.mm_feature_transport, base_gpu_id=0, skip_mm_pool=True
+        )
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
@@ -848,6 +852,10 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
 
     def _make_override_processor(self, processor_cls, mm_process_config):
         """Create an override processor with mocked dependencies."""
+        from sglang.srt.multimodal.transport.feature_transport import (
+            MultimodalFeatureTransport,
+        )
+
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
@@ -864,8 +872,9 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
-        proc.mm_feature_transport = server_args.mm_feature_transport
-        proc.use_cuda_ipc = False
+        proc._feature_transport = MultimodalFeatureTransport(
+            server_args.mm_feature_transport, base_gpu_id=0, skip_mm_pool=True
+        )
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
