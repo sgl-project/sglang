@@ -1118,6 +1118,15 @@ class TestTrtllmSparseTablePool(CustomTestCase):
             self.assertEqual(core.c2_sparse_topk_lengths.tolist(), c2)
             self.assertEqual(core.c1_sparse_topk_lengths.tolist(), [1, 2, 3, 500, 512])
             self.assertEqual(core.c2_topk_lengths_clamp1.tolist(), [1, 1, 1, 250, 1000])
+            if (
+                trtllm
+            ):  # the kernel also writes the shared table's lens: window + length
+                self.assertEqual(
+                    core.trtllm_c2_lens.tolist(), [128, 129, 129, 378, 640]
+                )
+                self.assertEqual(
+                    core.trtllm_c1_lens.tolist(), [129, 130, 131, 628, 640]
+                )
 
     def test_width_changes_reuse_the_parent_and_growth_is_capture_guarded(self):
         a = self.pool.view("f", 10, fill=-1, width=16)  # parent: 64 (tile) x 16

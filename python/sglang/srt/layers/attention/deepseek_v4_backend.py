@@ -443,7 +443,7 @@ class DSV4AttnMetadata:
     trtllm_topk_writes_table: bool = False
     # Late-layer tail: the first indexed layer packs the table even if not an index source.
     trtllm_tail_needs_pack: bool = False
-    # The small-metadata kernel already zeroed empty ratio-2 lengths for trtllm.
+    # trtllm: the small-metadata kernel zeroed empty ratio-2 lengths, wrote d_c{1,2}_lens.
     low_ratio_lengths_zeroed: bool = False
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -638,7 +638,8 @@ class DSV4AttnMetadata:
                 setattr(self, f"trtllm_c{ratio}_lens", lens)
                 topk_lengths = self.sparse_topk_lengths(ratio)
                 if topk_lengths is not None and self._topk_writes_table(ratio):
-                    torch.add(topk_lengths, SWA_WINDOW, out=lens)
+                    if ratio == 4 or not self.low_ratio_lengths_zeroed:
+                        torch.add(topk_lengths, SWA_WINDOW, out=lens)
                     # Sources of every ratio share the tail; _tail_refresh_layers
                     # ensures a layer reads the last source of its own ratio.
                     tail = self.trtllm_c4_indices[:, SWA_WINDOW:]
@@ -4987,9 +4988,15 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
+            lens, pool, rows = (), self.trtllm_table_pool, out_loc.numel()
+            if small_metadata and self.trtllm_attn:  # the kernel writes the table lens
+                lens = [
+                    pool.view(f"d_c{r}_lens", rows, SWA_WINDOW, constant=True)
+                    for r in (1, 2)
+                ]
             low_ratio_buffers = (
                 build_low_ratio_metadata(
-                    seq_lens_casual, out_loc, self.index_topk, self.trtllm_attn
+                    seq_lens_casual, out_loc, self.index_topk, lens, SWA_WINDOW
                 )
                 if small_metadata
                 else None
