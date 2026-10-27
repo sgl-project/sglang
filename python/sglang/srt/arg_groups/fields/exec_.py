@@ -844,8 +844,6 @@ class ExecMoe(msgspec.Struct):
         "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
         "`direct` (every peer reached directly: NVLink in-node, RDMA across nodes) "
         "or `hybrid` (RDMA to one peer per remote node, then NVLink forwarding). "
-        "Both run multi-node; direct has a lower per-call latency floor at "
-        "decode batch sizes. "
         "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
         "inference phase, independent of this knob; not equivalent to DeepEP v1 "
         "normal/low_latency.",
