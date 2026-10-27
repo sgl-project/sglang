@@ -752,14 +752,10 @@ def _convert_local_to_global_physical_count(
 _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
-@dataclass(frozen=True)
-class _EplbCommunication:
-    """Communication group for expert statistics."""
-
-    group: Optional[torch.distributed.ProcessGroup] = None
-
-
 class _Accumulator(ABC):
+    # Backends may override this to use a dedicated statistics communicator.
+    _communication_group: Optional[torch.distributed.ProcessGroup] = None
+
     @staticmethod
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
@@ -780,14 +776,9 @@ class _Accumulator(ABC):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        *,
-        communication=None,
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-        self._communication = (
-            communication if communication is not None else _EplbCommunication()
-        )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -865,7 +856,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             gpu_physical_count,
             dst=0,
             op=torch.distributed.ReduceOp.SUM,
-            group=self._communication.group,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -1035,7 +1026,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
             op=torch.distributed.ReduceOp.SUM,
-            group=self._communication.group,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1082,7 +1073,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 device=get_device_namespace().device,
             )
         torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=self._communication.group
+            avg_rate_tensor, src=0, group=self._communication_group
         )
         return avg_rate_tensor.item()
 

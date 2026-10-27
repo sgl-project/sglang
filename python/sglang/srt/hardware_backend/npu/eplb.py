@@ -14,7 +14,7 @@
 
 """Ascend EPLB adapters used by the shared recorder and weight updater.
 
-Non-NPU calls retain default communication and tensor allocation behavior.
+Callers select these helpers after NPU distributed initialization.
 Import torch_npu only when an NPU operation actually needs it.
 """
 
@@ -26,32 +26,26 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_device
-from sglang.srt.utils import is_npu
-
 logger = logging.getLogger(__name__)
 _group_world = None
 _device_group = None
 _warmed_device_group = None
 
 
-def get_eplb_device_group() -> dist.ProcessGroup | None:
-    """Return the NPU EPLB group, or None to use the default group elsewhere.
+def get_eplb_device_group() -> dist.ProcessGroup:
+    """Return the NPU EPLB group after distributed initialization.
 
     Creation is collective: all WORLD ranks must reach the first call in the
     same order. Cache against WORLD identity to handle distributed reinit.
     """
     global _group_world, _device_group
-    if get_device().device != "npu" or not dist.is_initialized():
-        return None
-
     world = dist.group.WORLD
     if _group_world is not world:
         import torch_npu
 
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        # Keep migration off the forward graph's device-expanded HCCL group.
-        # Use a smaller buffer to limit this separate group's memory footprint.
+        # WORLD inherits DEEPEP_HCCL_BUFFSIZE; using it can allocate large buffers.
+        # Keep EPLB's buffer budget small without changing WORLD's options.
         options.hccl_config = {
             "hccl_buffer_size": 32,
             "hccl_op_expansion_mode": 1,
@@ -68,7 +62,7 @@ def warmup_eplb_communication() -> None:
     """Initialize statistics and all-peer migration channels before serving."""
     global _warmed_device_group
     group = get_eplb_device_group()
-    if group is None or group is _warmed_device_group:
+    if group is _warmed_device_group:
         return
 
     start = time.perf_counter()
@@ -101,7 +95,6 @@ def prepare_expert_weight_update(
     layer_ids: list[int],
     old_map: torch.Tensor,
     new_map: torch.Tensor,
-    update_single_layer: Callable[..., object],
 ) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., object] | None]:
     """Return selected layers, receive buffers, and a single-layer update callable.
 
@@ -112,6 +105,9 @@ def prepare_expert_weight_update(
     ND staging keeps only the current layer's conversion results.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    from sglang.srt.eplb.expert_location_updater import (
+        update_expert_weights_single_layer,
+    )
 
     elastic_ep_enabled = ElasticEPStateManager.instance() is not None
     if not elastic_ep_enabled:
@@ -146,14 +142,15 @@ def prepare_expert_weight_update(
                 for old, new in zip(old_placement, new_placement, strict=True)
             ):
                 return
-        result = update_single_layer(
-            routed_experts_weights=staging.load(routed_experts_weights),
+        migration_weights = staging.load(routed_experts_weights)
+        result = update_expert_weights_single_layer(
+            routed_experts_weights=migration_weights,
             group=group,
             **kwargs,
         )
         # Unchanged local slots may still send; only their writeback is redundant.
         if local_changed:
-            staging.store(routed_experts_weights)
+            staging.store(routed_experts_weights, migration_weights)
         return result
 
     return layer_ids, temp_buffers, update_layer
@@ -183,7 +180,7 @@ def _validate_migration_weights(
                 f"[NPU EPLB] rank={rank} layer={layer}: expected {len(expected)} "
                 f"weight tensors from layer {sample_layer}, got {len(weights)}"
             )
-        for index, (tensor, spec) in enumerate(zip(weights, expected, strict=True)):
+        for index, (tensor, spec) in enumerate(zip(weights, expected)):
             actual = specification(tensor)
             if actual != spec:
                 raise ValueError(
@@ -203,7 +200,7 @@ def needs_nd_staging(tensor: torch.Tensor) -> bool:
 
 
 class ExpertWeightStaging:
-    """Keep one layer's ND conversion results in a validated migration chunk.
+    """Prepare ND migration weights for a validated chunk's tensor formats.
 
     load() prepares the tensors that the updater mutates; store() copies the
     result into model storage without changing addresses held by captured graphs.
@@ -212,29 +209,27 @@ class ExpertWeightStaging:
     def __init__(self, sample_tensors: list[torch.Tensor]):
         # Per-expert NZ conversion can copy the whole backing tensor.
         self._needs_staging = [needs_nd_staging(tensor) for tensor in sample_tensors]
-        self._buffers: list[torch.Tensor] = []
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        buffers = []
-        for weight, needed in zip(weights, self._needs_staging, strict=True):
-            buffers.append(
-                torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
-                if needed
-                else torch.empty_like(weight)
-            )
-        return buffers
+        return [
+            torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
+            if needed
+            else torch.empty_like(weight)
+            for weight, needed in zip(weights, self._needs_staging)
+        ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
-        self._buffers = [
+        return [
             torch.ops.npu.npu_format_cast(weight, 2) if needed else weight
-            for weight, needed in zip(weights, self._needs_staging, strict=True)
+            for weight, needed in zip(weights, self._needs_staging)
         ]
-        return self._buffers
 
-    def store(self, weights: list[torch.Tensor]) -> None:
+    def store(
+        self, weights: list[torch.Tensor], migration_weights: list[torch.Tensor]
+    ) -> None:
         for weight, buffer, needed in zip(
-            weights, self._buffers, self._needs_staging, strict=True
+            weights, migration_weights, self._needs_staging
         ):
             if not needed:
                 continue
@@ -246,14 +241,11 @@ class ExpertWeightStaging:
 
 
 def isolate_npu_draft_recording(forward):
-    """Keep target EPLB statistics untouched throughout an NPU draft operation."""
-    # Preserve the original method on other devices, with no forward-time wrapper.
-    if not is_npu():
-        return forward
+    """Keep target EPLB statistics untouched during NPU draft graph capture."""
 
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):
-        if runner.is_draft_worker and get_device().device == "npu":
+        if runner.is_draft_worker:
             from sglang.srt.eplb.expert_distribution import (
                 get_global_expert_distribution_recorder,
             )

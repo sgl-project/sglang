@@ -25,16 +25,24 @@ from sglang.srt.hardware_backend.npu.eplb import (
 )
 
 
-class NpuEplbCommunication:
-    """Resolve NPU statistics communication without changing accumulator classes."""
+class _NpuAccumulatorMixin:
+    """Use the small EPLB group for all NPU statistics modes."""
 
     # Resolve lazily so distributed initialization and WORLD replacement remain valid.
     @property
-    def group(self) -> torch.distributed.ProcessGroup | None:
+    def _communication_group(self) -> torch.distributed.ProcessGroup:
         return get_eplb_device_group()
 
 
-class NpuExpertDistributionAccumulator(distribution._StatAccumulator):
+class _NpuStatAccumulator(_NpuAccumulatorMixin, distribution._StatAccumulator):
+    pass
+
+
+class _NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulator):
+    pass
+
+
+class NpuExpertDistributionAccumulator(_NpuStatAccumulator):
     """Reduce window totals for EPLB policies that only consume summed loads."""
 
     def _get_physical_count_for_dump(self, output_mode):
@@ -56,15 +64,16 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
 
     def _create_accumulator(self, expert_location_metadata, rank):
         moe = distribution.get_exec().moe
-        accumulator_class = distribution._Accumulator.get_class()
+        accumulator_class = {
+            distribution._StatAccumulator: _NpuStatAccumulator,
+            distribution._DetailAccumulator: _NpuDetailAccumulator,
+        }[distribution._Accumulator.get_class()]
         if moe.enable_eplb and not moe.elastic_ep_backend:
             # Join/scale paths need their own collective initialization order.
             warmup_eplb_communication()
-            if accumulator_class is distribution._StatAccumulator:
+            if accumulator_class is _NpuStatAccumulator:
                 accumulator_class = NpuExpertDistributionAccumulator
-        return accumulator_class(
-            expert_location_metadata, rank, communication=NpuEplbCommunication()
-        )
+        return accumulator_class(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):
         moe = distribution.get_exec().moe

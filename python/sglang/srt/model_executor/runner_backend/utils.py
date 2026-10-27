@@ -111,13 +111,6 @@ def resolve_prefill_backend(
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
-    if cuda_graph_runner.model_runner.device == "npu":
-        from sglang.srt.hardware_backend.npu.graph_runner.eplb_prefill_backend import (
-            resolve_npu_prefill_backend,
-        )
-
-        return resolve_npu_prefill_backend(cuda_graph_runner, backend_name)
-
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,

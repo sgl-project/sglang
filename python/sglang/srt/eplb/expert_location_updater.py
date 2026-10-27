@@ -156,10 +156,7 @@ def _update_expert_weights_raw(
             layer_ids=update_layer_ids,
             old_map=old_expert_location_metadata.physical_to_logical_map_cpu,
             new_map=new_expert_location_metadata.physical_to_logical_map_cpu,
-            update_single_layer=update_expert_weights_single_layer,
         )
-        if not update_layer_ids:
-            return {}
     else:
         temp_buffers = create_temp_buffers(
             routed_experts_weights_of_layer[update_layer_ids[0]]

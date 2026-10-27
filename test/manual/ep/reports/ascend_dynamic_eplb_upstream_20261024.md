@@ -11,9 +11,10 @@ It retains upstream rebalance scheduling and thresholds; the earlier automatic
 64-step initial learning policy is excluded.
 
 - NPU recording reuses the upstream direct sender-route counter. Routing inputs
-  exclude graph padding and shared slots. Draft forwards/capture are isolated
-  from target counts. There is no batched-route buffer, capacity configuration,
-  custom counting kernel, or replay-time statistics state.
+  exclude graph padding and shared slots. Draft forwards and NPU full-graph
+  capture are isolated from target counts. Generic breakable prefill graph
+  capture is outside this adapter's coverage. There is no batched-route buffer,
+  capacity configuration, custom counting kernel, or replay-time statistics state.
 - Supported NPU policies aggregate the statistics window before logical mapping
   and communication. File dumps and policies requiring per-step loads retain
   the full window.
@@ -29,7 +30,7 @@ It retains upstream rebalance scheduling and thresholds; the earlier automatic
   P2P communication, then synchronizes before releasing the tiny buffers. Reuse
   is cached by group identity. This moves channel setup cost to startup.
 
-Eight production files differ from the comparison base: four NPU files and four
+Six production files differ from the comparison base: three NPU files and three
 shared integration files. Shared EPLBManager, placement metadata and the decode
 graph runner are unchanged. GPU retains its original recorder and device
 migration path; no NPU forward wrapper is installed on GPU.
@@ -38,7 +39,7 @@ migration path; no NPU forward wrapper is installed on GPU.
 
 Historical component checks cover dedicated communication warmup, internal-format
 weight conversion and in-place writeback. These precede the latest simplification
-and do not validate the current full-model service. Results for removed batched
+and are not evidence for the current full-model service. Results for removed batched
 statistics, auxiliary packing and static-dispatch optimizations are excluded
 from the current implementation's evidence. Detailed probes and performance
 materials remain outside this PR.
@@ -48,7 +49,10 @@ required model-runner identity; the removed statistics capture state is no longe
 needed. Local source-extracted checks with stand-ins do not establish torch/NPU
 execution or full-package import compatibility.
 
-The current production revision still needs full-model startup, migration followed
-by NPU graph replay, explicit prefill graph modes, GPU regression, and matched
-PD throughput/accuracy validation. No serving-throughput or model-accuracy
-improvement is claimed.
+The simplified production sources passed real-package imports, controlled NPU
+mixed-format multi-layer migration with communicating graph replay, and a short
+non-speculative PD ON startup/rebalance smoke check followed by decode graph
+replay. These are bounded correctness checks, not full model-accuracy validation.
+Generic prefill/draft graph coverage, real GPU regression, and matched PD
+throughput/accuracy validation remain pending. No serving-throughput or
+model-accuracy improvement is claimed. Detailed evidence remains outside the PR.
