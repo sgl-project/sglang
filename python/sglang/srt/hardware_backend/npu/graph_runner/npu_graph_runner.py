@@ -381,38 +381,27 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         ):
             if mla_dcp_graph:
                 mla_backend = get_mla_dcp_backend(self._replay_attn_backend())
-                # This is the live FIA Host input, not the capture-time metadata
-                # list. Normalize to global KV lengths before DCP localization.
-                if forward_batch.seq_lens_cpu is not None:
-                    # DFlash/DSPARK already include the verify block in the Host bound.
-                    global_host_kv_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        and not self.model_runner.spec_algorithm.is_dflash_family()
-                    ):
-                        global_host_kv_lens_cpu = (
-                            global_host_kv_lens_cpu + self.captured_req_width
-                        )
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens = list(
+                        mla_backend.forward_metadata.seq_lens_cpu_list[: self.raw_bs]
+                    )
                 else:
-                    # Device lengths are prefix-only; read them back only without a mirror.
-                    global_host_kv_lens_cpu = forward_batch.seq_lens[
-                        : self.raw_bs
-                    ].cpu()
-                    if forward_batch.forward_mode.is_target_verify():
-                        global_host_kv_lens_cpu = (
-                            global_host_kv_lens_cpu + self.captured_req_width
-                        )
-                local_host_kv_lens_cpu = get_dcp_lens(
-                    global_host_kv_lens_cpu,
-                    mla_backend.dcp_size,
-                    mla_backend.dcp_rank,
-                    interleave_size=mla_backend.page_size,
-                )
-                # replay_with_input_update consumes a Python list; graph-only
-                # padded requests must keep zero lengths.
-                seq_lens = local_host_kv_lens_cpu.tolist() + [0] * (
-                    self.bs - local_host_kv_lens_cpu.numel()
-                )
+                    if forward_batch.seq_lens_cpu is not None:
+                        global_host_kv_lens_cpu = forward_batch.seq_lens_cpu[
+                            : self.raw_bs
+                        ]
+                    else:
+                        global_host_kv_lens_cpu = forward_batch.seq_lens[
+                            : self.raw_bs
+                        ].cpu()
+                    local_host_kv_lens_cpu = get_dcp_lens(
+                        global_host_kv_lens_cpu,
+                        mla_backend.dcp_size,
+                        mla_backend.dcp_rank,
+                        interleave_size=mla_backend.page_size,
+                    )
+                    seq_lens = local_host_kv_lens_cpu.tolist()
+                seq_lens = seq_lens + [0] * (self.bs - len(seq_lens))
             elif forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
