@@ -89,6 +89,7 @@ explicit = true
 sglang-kernel-xpu = { index = "sglang-xpu" }
 torch = { index = "pytorch-xpu" }
 torchaudio = { index = "pytorch-xpu" }
+torchcodec = { index = "pytorch-xpu" }
 torchvision = { index = "pytorch-xpu" }
 triton-xpu = { index = "pytorch-xpu" }
 
