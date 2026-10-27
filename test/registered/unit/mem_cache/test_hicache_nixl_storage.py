@@ -592,7 +592,7 @@ class TestNixlUnified(CustomTestCase):
             ],
         )
         anchor = SimpleNamespace(
-            page_size=64, layout="page_first", size=256, page_num=4
+            page_size=64, layout="page_first", size=256, page_num=4, dedup_size=1
         )
         host = DSAIndexerPoolHost(
             make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False

@@ -552,5 +552,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "enable_mla_hicache_host_dedup",
 )
 # fmt: on

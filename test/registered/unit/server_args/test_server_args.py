@@ -2360,6 +2360,26 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_mla_hicache_host_dedup_requires_direct_l2_only(self):
+        base = {
+            "enable_hierarchical_cache": True,
+            "enable_mla_hicache_host_dedup": True,
+            "hicache_io_backend": "direct",
+            "hicache_mem_layout": "page_first",
+        }
+        # Checked after layout resolution: direct + page_first is page_first_direct.
+        handle_hicache(self._make_args(**base))
+        for override in (
+            {"hicache_io_backend": "kernel"},
+            {"hicache_storage_backend": "file"},
+            {"pp_size": 2},
+        ):
+            with (
+                self.subTest(**override),
+                self.assertRaisesRegex(ValueError, "requires --hicache-io-backend"),
+            ):
+                handle_hicache(self._make_args(**(base | override)))
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
