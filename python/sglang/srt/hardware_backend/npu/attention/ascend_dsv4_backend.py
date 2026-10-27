@@ -1175,7 +1175,9 @@ class LowRatioCompressAscendBackendMixin:
         fm = self.forward_metadata
         if indexer.owns_k:
             self._dsv41_index_k_store(layer, latent)
-        if indexer.is_candidate_source:
+        if indexer.is_candidate_source and not os.environ.get(
+            "SGLANG_DSV41_DISABLE_QSLI"
+        ):
             # Level one: the plain top-k this layer attends with, plus the block
             # candidates every later indexer layer rescoring inside.
             topk, blocks = self._dsv41_index_full_topk(
