@@ -23,9 +23,9 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     "hq,hkv,head_dim", [(8, 1, 128), (8, 8, 128), (4, 2, 64), (64, 2, 128)]
 )
-@pytest.mark.parametrize(
-    "num_tokens", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-)
+# One block per token and no branch on the token count: 1 keeps q contiguous in
+# the fused layout, 7 is odd, 4096 is a large grid.
+@pytest.mark.parametrize("num_tokens", [1, 7, 4096])
 @pytest.mark.parametrize("scale", [None, 0.5, 2.0])
 @pytest.mark.parametrize("fused_qkv", [False, True])
 @pytest.mark.parametrize("quantize_q", [True, False])

@@ -11,10 +11,6 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
-    _minimax_h3_euler_eta0_step,
-    _minimax_h3_rf_v_to_x0,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
@@ -33,6 +29,37 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+
+
+def _minimax_h3_rf_v_to_x0(
+    xt: torch.Tensor,
+    v: torch.Tensor,
+    timestep: torch.Tensor,
+) -> torch.Tensor:
+    cond_t = timestep.to(device=xt.device, dtype=xt.dtype)
+    while cond_t.ndim < xt.ndim:
+        cond_t = cond_t.unsqueeze(-1)
+    sigma_t = 1 - cond_t
+    return xt + sigma_t * v
+
+
+def _minimax_h3_euler_eta0_step(
+    state: torch.Tensor,
+    denoised: torch.Tensor,
+    *,
+    sigma_curr: float,
+    sigma_ratio: torch.Tensor,
+) -> torch.Tensor:
+    if sigma_curr == 0.0:
+        return state
+    compute_dtype = torch.float32
+    if state.dtype not in (torch.float16, torch.bfloat16):
+        compute_dtype = state.dtype
+    ratio = sigma_ratio.to(device=state.device, dtype=compute_dtype)
+    out = ratio * state.to(dtype=compute_dtype) + (1.0 - ratio) * denoised.to(
+        dtype=compute_dtype
+    )
+    return out.to(dtype=state.dtype)
 
 
 def _branch(
@@ -166,7 +193,6 @@ def test_inplace_target_update_matches_scheduler_math():
             state,
             denoised,
             sigma_curr=sigma_curr,
-            sigma_next=sigma_next,
             sigma_ratio=ratio,
         )
 

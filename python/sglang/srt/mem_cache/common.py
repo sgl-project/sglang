@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
+    EvictResult,
     MatchPrefixParams,
     MatchResult,
     zero_match_result,
@@ -109,11 +110,12 @@ def free_swa_out_of_window_slots(
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
-        # frontier, and subtracting at least one page keeps it below the insert
-        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
-        # No extra page margin is needed.
-        evict_threshold = pre_len - max(sliding_window_size, page_size)
+        # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
+        # a key that ends at page_floor(pre_len) still has a full window of live SWA,
+        # and the last leaf, below page_floor(seq_len), is never all-tombstone.
+        evict_threshold = pre_len - ceil_align(
+            max(sliding_window_size, page_size), page_size
+        )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained
@@ -289,8 +291,8 @@ def evict_from_tree_cache(
 
 def _evict_until_allocatable(
     tree_cache: BasePrefixCache, allocator, num_tokens: int
-) -> None:
-    """Keep evicting the shortfall until `num_tokens` are allocatable.
+) -> EvictResult:
+    """Keep evicting until `num_tokens` are allocatable; return all evicted counts.
 
     Under classed page sharding available_size() reports the MIN-CLASS
     capacity floor, so a single evict() sized in tokens can raise that floor by
@@ -298,18 +300,22 @@ def _evict_until_allocatable(
     all owner classes. Looping is deterministic, so it stays mirrored across
     the ranks of a shard group. Stock allocators need no extra pass.
     """
+    total = EvictResult()
     if page_interleave_shard_size(allocator) <= 1:
-        return
+        return total
     while True:
         available_size = allocator.available_size()
         if available_size >= num_tokens:
-            return
+            return total
         shortfall = num_tokens - available_size
         result = tree_cache.evict(
             EvictParams(num_tokens=max(shortfall, allocator.page_size))
         )
+        total.num_tokens_evicted += result.num_tokens_evicted
+        total.swa_num_tokens_evicted += result.swa_num_tokens_evicted
+        total.mamba_num_evicted += result.mamba_num_evicted
         if result.num_tokens_evicted == 0:
-            return
+            return total
 
 
 def dsv4_needs_rebootstrap(
