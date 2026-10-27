@@ -770,6 +770,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BEAM_DECODE_GEMV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run single-token Beam MoE decode through a fused GEMV on SM103 (GB300) for BF16 experts with MoE TP4 and EP1, where Beam fuses the expert sum into its all-reduce (Triton MoE runner). Requires <code>SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1</code>. Unsupported setups and forwards keep their normal MoE path. Only a failed static check (device, BF16 experts, MoE TP/EP or expert shape) logs that the switch is unused.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -1226,6 +1231,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When positive, host KV cache pools on the plain mmap path (<code>SGLANG_HUGEPAGE_SIZE</code> unset or failed) are mapped <code>MAP_PRIVATE | MAP_ANONYMOUS</code> with <code>MADV_HUGEPAGE</code> and <code>MADV_DONTFORK</code>, and prefaulted by this many threads before pinning. A <code>fork()</code>ed child cannot access the buffer. Any failure falls back to the default shared mapping. <code>0</code> disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HF3FS_CONFIG_PATH</code></td>

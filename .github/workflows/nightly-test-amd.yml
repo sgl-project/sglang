@@ -1686,8 +1686,8 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU MI30x tests moved out of PR CI: Kimi-K2-Instruct-0905 and the MoRI EP
-  # configs from test_moriep_small_extra.py
+  # 8-GPU MI30x tests moved out of PR CI: DeepSeek V3, Kimi-K2-Instruct-0905
+  # and the MoRI EP configs.
   # ==============================================================================
 
   nightly-8-gpu:
@@ -1719,7 +1719,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU)
-        timeout-minutes: 150
+        timeout-minutes: 240
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \

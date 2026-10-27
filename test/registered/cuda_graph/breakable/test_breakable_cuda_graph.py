@@ -58,20 +58,21 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         from sglang.srt.models import qwen4_exp
 
         context = SimpleNamespace(forward_batch=SimpleNamespace(rows=8))
-        layer = SimpleNamespace(_qsa_prefill_topk_bridge=None)
+        layer = SimpleNamespace()
         layer._compute_qsa_topk_indices_eager = (
             lambda hidden_states, forward_batch, **kw: hidden_states[
                 : forward_batch.rows
             ]
         )
         x = torch.zeros((8, 2), dtype=torch.int32, device=self.device)
-        inputs = dict(layer=layer, positions=None)
+        result = torch.empty((8, 2), dtype=torch.int32, device=self.device)
+        inputs = dict(layer=layer, positions=None, output=result)
         graph = self.BreakableCUDAGraph()
         with patch.object(
             qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
         ):
             with self.BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
-                result = qwen4_exp._breakable_qsa_indexer(hidden_states=x + 1, **inputs)
+                qwen4_exp._breakable_qsa_indexer(hidden_states=x + 1, **inputs)
             for n in (3, 8):
                 context.forward_batch = SimpleNamespace(rows=n)
                 x.fill_(2)
