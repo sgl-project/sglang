@@ -64,7 +64,8 @@
             "total_tokens": 21,
             "completion_tokens": 16,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -131,7 +132,8 @@
             "total_tokens": 21,
             "completion_tokens": 16,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -252,9 +254,9 @@
       },
       "openai": {
         "events": [
-          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": " ", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 5, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": "1,", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 7, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": " 2,", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 10, "completion_tokens": 6, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": " ", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 5, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": "1,", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 7, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": " 2,", "logprobs": null, "finish_reason": "length", "matched_stop": null}], "usage": {"prompt_tokens": 4, "total_tokens": 10, "completion_tokens": 6, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           {"id": "e1e9b18d1513489e9165393ebca155b9", "object": "text_completion", "created": 1791964719, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 4, "total_tokens": 10, "completion_tokens": 6, "reasoning_tokens": 0}},
           "[DONE]"
         ]
@@ -317,7 +319,8 @@
             "total_tokens": 14,
             "completion_tokens": 8,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -494,7 +497,8 @@
             "total_tokens": 31,
             "completion_tokens": 24,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -749,7 +753,8 @@
             "total_tokens": 13,
             "completion_tokens": 8,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -863,7 +868,8 @@
             "total_tokens": 18,
             "completion_tokens": 8,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -971,7 +977,8 @@
             "total_tokens": 28,
             "completion_tokens": 21,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -1058,7 +1065,8 @@
             "total_tokens": 31,
             "completion_tokens": 22,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -1157,7 +1165,8 @@
             "total_tokens": 12,
             "completion_tokens": 8,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -1224,7 +1233,8 @@
             "total_tokens": 5,
             "completion_tokens": 4,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -1455,7 +1465,8 @@
             "total_tokens": 24,
             "completion_tokens": 9,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -1538,7 +1549,15 @@
         }
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -1573,7 +1592,8 @@
             "total_tokens": 80,
             "completion_tokens": 65,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 63
+            "reasoning_tokens": 63,
+            "completion_tokens_details": {"reasoning_tokens": 63}
           },
           "metadata": {
             "weight_version": "default",
@@ -1620,7 +1640,15 @@
         ]
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -1656,7 +1684,7 @@
           {"id": "a2cb39f9ec204a51bc183a70badaeea0", "object": "chat.completion.chunk", "created": 1791964723, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": " number."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "a2cb39f9ec204a51bc183a70badaeea0", "object": "chat.completion.chunk", "created": 1791964723, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "a2cb39f9ec204a51bc183a70badaeea0", "object": "chat.completion.chunk", "created": 1791964723, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
-          {"id": "a2cb39f9ec204a51bc183a70badaeea0", "object": "chat.completion.chunk", "created": 1791964723, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 93, "completion_tokens": 78, "prompt_tokens_details": null, "reasoning_tokens": 76}},
+          {"id": "a2cb39f9ec204a51bc183a70badaeea0", "object": "chat.completion.chunk", "created": 1791964723, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 93, "completion_tokens": 78, "prompt_tokens_details": null, "reasoning_tokens": 76, "completion_tokens_details": {"reasoning_tokens": 76}}},
           "[DONE]"
         ]
       }
@@ -1795,7 +1823,8 @@
             "total_tokens": 128,
             "completion_tokens": 21,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 19
+            "reasoning_tokens": 19,
+            "completion_tokens_details": {"reasoning_tokens": 19}
           },
           "metadata": {
             "weight_version": "default",
@@ -1824,7 +1853,15 @@
         ]
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 12},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -1935,7 +1972,15 @@
         }
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 24},
         "return_logprob": true,
         "logprob_start_len": -1,
@@ -2256,7 +2301,8 @@
             "total_tokens": 39,
             "completion_tokens": 24,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 24
+            "reasoning_tokens": 24,
+            "completion_tokens_details": {"reasoning_tokens": 24}
           },
           "metadata": {
             "weight_version": "default",
@@ -2290,7 +2336,15 @@
         ]
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 24},
         "return_logprob": true,
         "logprob_start_len": -1,
@@ -2352,16 +2406,16 @@
       "openai": {
         "events": [
           {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " * 23 = 391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 22, "completion_tokens": 7, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": " * 23 = 391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 22, "completion_tokens": 7, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 24, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 24, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "17"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 16, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " * 23 = 391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 22, "completion_tokens": 7, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": " * 23 = 391"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 22, "completion_tokens": 7, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "ddfd1c2edfda448dbd506c6c70c0f2d0", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 24, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 15, "total_tokens": 24, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
           {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 1}]},
-          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 33, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "63809bbe29f54f1d8538e0623c2f7d37", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 15, "total_tokens": 33, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           "[DONE]"
         ]
       }
@@ -2403,7 +2457,7 @@
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " there"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"error": {"object": "error", "message": "Out of memory.", "type": "SERVICE_UNAVAILABLE", "param": null, "code": 503}},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 2, "total_tokens": 3, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 2, "total_tokens": 3, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           "[DONE]"
         ]
       }
@@ -2467,7 +2521,8 @@
             "total_tokens": 24,
             "completion_tokens": 9,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -2541,7 +2596,8 @@
             "total_tokens": 22,
             "completion_tokens": 4,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -2581,8 +2637,13 @@
       },
       "generate": {
         "input_ids": [
-          0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821,
-          5718, 678, 23917
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821, 128822, 5718, 678, 23917
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 48},
         "return_logprob": false,
@@ -2641,7 +2702,11 @@
         }
       },
       "generate": {
-        "input_ids": [0, 128803, 25529, 260, 26639, 2873, 418, 18222, 260, 305, 291, 16, 128804, 128822],
+        "input_ids": [
+          0, 271, 3476, 477, 260, 11502, 22896, 6558, 304, 5238, 26639, 603, 372, 17038, 29478, 979,
+          19905, 418, 26639, 2873, 68861, 16, 128803, 25529, 260, 26639, 2873, 418, 18222, 260, 305,
+          291, 16, 128804, 128822
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 64, "json_schema": "{\"type\": \"object\"}"},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -2675,7 +2740,8 @@
             "total_tokens": 31,
             "completion_tokens": 17,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -2718,7 +2784,15 @@
         }
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 48},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -2753,7 +2827,8 @@
             "total_tokens": 63,
             "completion_tokens": 48,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 51
+            "reasoning_tokens": 51,
+            "completion_tokens_details": {"reasoning_tokens": 51}
           },
           "metadata": {
             "weight_version": "default",
@@ -2795,7 +2870,15 @@
         ]
       },
       "generate": {
-        "input_ids": [0, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361, 24752, 16, 128804, 128821],
+        "input_ids": [
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 128803, 3085, 344, 223, 1002, 982, 223, 1349, 33, 9361,
+          24752, 16, 128804, 128821
+        ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 64},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -2856,8 +2939,13 @@
       },
       "generate": {
         "input_ids": [
-          0, 3476, 477, 259, 10935, 16, 128803, 23166, 128804, 128822, 19923, 16, 1, 128803, 3085,
-          344, 223, 20, 13, 20, 33, 128804, 128821
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 339, 3476, 477, 259, 10935, 16, 128803, 23166, 128804, 128822,
+          19923, 16, 1, 128803, 3085, 344, 223, 20, 13, 20, 33, 128804, 128821
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 64},
         "return_logprob": false,
@@ -2893,7 +2981,8 @@
             "total_tokens": 79,
             "completion_tokens": 56,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 53
+            "reasoning_tokens": 53,
+            "completion_tokens_details": {"reasoning_tokens": 53}
           },
           "metadata": {
             "weight_version": "default",
@@ -2973,7 +3062,8 @@
             "total_tokens": 24,
             "completion_tokens": 9,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -3041,7 +3131,8 @@
             "total_tokens": 12,
             "completion_tokens": 2,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -3137,19 +3228,18 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          1748, 1928, 33, 128804, 128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 1748, 1928, 33, 128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256, "skip_special_tokens": false},
         "return_logprob": false,
@@ -3192,7 +3282,8 @@
             "total_tokens": 425,
             "completion_tokens": 53,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -3273,19 +3364,18 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          1748, 1928, 33, 128804, 128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 1748, 1928, 33, 128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256, "skip_special_tokens": false},
         "return_logprob": false,
@@ -3306,7 +3396,7 @@
           {"id": "3cfe97776e0945739b2cc709999f7899", "object": "chat.completion.chunk", "created": 1791964726, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": " you.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "3cfe97776e0945739b2cc709999f7899", "object": "chat.completion.chunk", "created": 1791964726, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_ca0b194dacd342d7925ba091", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "3cfe97776e0945739b2cc709999f7899", "object": "chat.completion.chunk", "created": 1791964726, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
-          {"id": "3cfe97776e0945739b2cc709999f7899", "object": "chat.completion.chunk", "created": 1791964726, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 372, "total_tokens": 427, "completion_tokens": 55, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "3cfe97776e0945739b2cc709999f7899", "object": "chat.completion.chunk", "created": 1791964726, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 372, "total_tokens": 427, "completion_tokens": 55, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           "[DONE]"
         ]
       }
@@ -3370,32 +3460,36 @@
       },
       "generate": {
         "input_ids": [
-          0, 271, 372, 27193, 271, 3476, 611, 3278, 304, 260, 1341, 294, 6704, 304, 1694, 3287, 270,
-          3967, 734, 3417, 16, 2042, 588, 34756, 6704, 513, 4985, 260, 38322, 128825, 72461, 4941,
-          12548, 48902, 5603, 1277, 270, 2502, 979, 30, 128825, 72461, 4941, 12548, 1018, 30,
-          128825, 40148, 5406, 2329, 84476, 6792, 5896, 35044, 3816, 30, 128825, 41523, 2329, 84476,
-          46630, 4130, 61729, 35044, 4, 3418, 1281, 11476, 94, 19836, 3320, 6, 46630, 4130, 61729,
-          56909, 1718, 128825, 41523, 1018, 7835, 1718, 128825, 40148, 5406, 1018, 30, 128825,
-          40148, 5406, 2329, 84476, 6792, 5896, 35044, 20, 3816, 7835, 1718, 128825, 40148, 5406,
-          1018, 1718, 128825, 72461, 4941, 12548, 4697, 3524, 8252, 1531, 366, 12038, 412, 344, 305,
-          1341, 3608, 4463, 1281, 11476, 4, 37419, 1884, 710, 915, 4815, 343, 62896, 14, 2631, 2065,
-          634, 14, 31939, 14, 8435, 754, 2281, 270, 1990, 295, 26639, 8786, 305, 1341, 3608, 4463,
-          1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
-          754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
-          4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          1748, 1928, 33, 128804, 128821
+          0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366,
+          366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798,
+          4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599,
+          14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14,
+          76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119,
+          20539, 344, 3001, 114867, 56630, 372, 27193, 271, 3476, 611, 3278, 304, 260, 1341, 294,
+          6704, 304, 1694, 3287, 270, 3967, 734, 3417, 16, 2042, 588, 34756, 6704, 513, 4985, 260,
+          38322, 128825, 72461, 4941, 12548, 48902, 5603, 1277, 270, 2502, 979, 30, 128825, 72461,
+          4941, 12548, 1018, 30, 128825, 40148, 5406, 2329, 84476, 6792, 5896, 35044, 3816, 30,
+          128825, 41523, 2329, 84476, 46630, 4130, 61729, 35044, 4, 3418, 1281, 11476, 94, 19836,
+          3320, 6, 46630, 4130, 61729, 56909, 1718, 128825, 41523, 1018, 7835, 1718, 128825, 40148,
+          5406, 1018, 30, 128825, 40148, 5406, 2329, 84476, 6792, 5896, 35044, 20, 3816, 7835, 1718,
+          128825, 40148, 5406, 1018, 1718, 128825, 72461, 4941, 12548, 4697, 3524, 8252, 1531, 366,
+          12038, 412, 344, 305, 1341, 3608, 4463, 1281, 11476, 4, 37419, 1884, 710, 915, 4815, 343,
+          62896, 14, 2631, 2065, 634, 14, 31939, 14, 8435, 754, 2281, 270, 1990, 295, 26639, 8786,
+          305, 1341, 3608, 4463, 1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944,
+          284, 513, 223, 128821, 754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613,
+          128822, 119907, 1117, 4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578,
+          1561, 223, 128822, 418, 4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380,
+          271, 24313, 2852, 3362, 582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270,
+          2573, 9670, 362, 260, 4593, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760,
+          582, 68838, 3362, 28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855,
+          3362, 582, 31060, 2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582,
+          47002, 3362, 20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362,
+          20584, 37399, 13747, 30316, 24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362,
+          582, 6287, 270, 3277, 1014, 295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611,
+          3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362,
+          582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366,
+          29851, 1605, 270, 3554, 6428, 4105, 2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699,
+          603, 128803, 3085, 734, 270, 9670, 295, 11111, 1748, 1928, 33, 128804, 128821
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 512, "skip_special_tokens": false},
         "return_logprob": false,
@@ -3506,20 +3600,19 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          305, 1205, 1014, 344, 436, 295, 30228, 33, 14983, 1952, 6704, 509, 4387, 16, 128804,
-          128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 305, 1205, 1014, 344, 436, 295, 30228, 33, 14983, 1952, 6704, 509, 4387, 16,
+          128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256, "skip_special_tokens": false},
         "return_logprob": false,
@@ -3571,7 +3664,8 @@
             "total_tokens": 492,
             "completion_tokens": 109,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -3666,20 +3760,19 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          305, 1205, 1014, 344, 436, 295, 30228, 33, 14983, 1952, 6704, 509, 4387, 16, 128804,
-          128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 305, 1205, 1014, 344, 436, 295, 30228, 33, 14983, 1952, 6704, 509, 4387, 16,
+          128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256, "skip_special_tokens": false},
         "return_logprob": true,
@@ -3821,7 +3914,8 @@
             "total_tokens": 420,
             "completion_tokens": 48,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
@@ -3913,24 +4007,23 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          1748, 1928, 33, 128804, 128822, 271, 30, 128825, 72461, 4941, 12548, 1018, 30, 128825,
-          40148, 5406, 2329, 1281, 1133, 65, 50219, 3816, 30, 128825, 41523, 2329, 1281, 37399, 4,
-          3418, 1281, 11476, 3320, 51119, 1718, 128825, 41523, 1018, 1718, 128825, 40148, 5406,
-          1018, 1718, 128825, 72461, 4941, 12548, 32, 1, 128803, 30, 72461, 46148, 32, 24313, 26343,
-          4941, 3362, 223, 864, 14, 582, 21307, 3362, 582, 33163, 91, 4, 24568, 72461, 46148, 32,
-          128804, 128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 1748, 1928, 33, 128804, 128822, 271, 30, 128825, 72461, 4941, 12548, 1018, 30,
+          128825, 40148, 5406, 2329, 1281, 1133, 65, 50219, 3816, 30, 128825, 41523, 2329, 1281,
+          37399, 4, 3418, 1281, 11476, 3320, 51119, 1718, 128825, 41523, 1018, 1718, 128825, 40148,
+          5406, 1018, 1718, 128825, 72461, 4941, 12548, 32, 1, 128803, 30, 72461, 46148, 32, 24313,
+          26343, 4941, 3362, 223, 864, 14, 582, 21307, 3362, 582, 33163, 91, 4, 24568, 72461, 46148,
+          32, 128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 64, "skip_special_tokens": false},
         "return_logprob": false,
@@ -4040,19 +4133,18 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670, 295, 11111,
-          1748, 1928, 33, 128804, 128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 3085, 734, 270, 9670,
+          295, 11111, 1748, 1928, 33, 128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 256, "n": 2, "skip_special_tokens": false},
         "return_logprob": false,
@@ -4066,20 +4158,20 @@
       "openai": {
         "events": [
           {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 373, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 373, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 373, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll get", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 375, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": "'ll get", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 375, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": " the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 377, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": " the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 377, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": " weather for Paris.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 381, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": " weather for Paris.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 381, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_0acb95589e824c6ea69ae41d", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 423, "completion_tokens": 51, "prompt_tokens_details": null, "reasoning_tokens": 0}},
-          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_d4f164bae6d5406c8c0fb239", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 423, "completion_tokens": 51, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": "I", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 373, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": "'ll get", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 375, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": "'ll get", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 375, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": " the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 377, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": " the current", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 377, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": " weather for Paris.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 381, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": " weather for Paris.", "reasoning_content": null}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 381, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_0acb95589e824c6ea69ae41d", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 423, "completion_tokens": 51, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
+          {"id": "8825fd65b4654203ba66a8b3232ac5e0", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_d4f164bae6d5406c8c0fb239", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 372, "total_tokens": 423, "completion_tokens": 51, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
           {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 1}]},
-          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 372, "total_tokens": 478, "completion_tokens": 106, "prompt_tokens_details": null, "reasoning_tokens": 0}},
+          {"id": "7f853bbca7474f1ebc84b5b1239509b4", "object": "chat.completion.chunk", "created": 1791964728, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 372, "total_tokens": 478, "completion_tokens": 106, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           "[DONE]"
         ]
       }
@@ -4158,19 +4250,18 @@
           1281, 19836, 4, 108526, 3575, 6892, 71144, 344, 22104, 343, 89944, 284, 513, 223, 128821,
           754, 440, 74366, 5238, 782, 5553, 22805, 6352, 223, 128821, 1613, 128822, 119907, 1117,
           4105, 10699, 469, 4087, 4256, 339, 13079, 6922, 14, 5238, 6578, 1561, 223, 128822, 418,
-          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 20855,
-          3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593, 66910, 582, 2852, 3362, 582, 1133, 65,
-          50219, 1760, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362,
-          28612, 37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060,
-          2329, 87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362,
-          20584, 69, 33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399,
-          13747, 6989, 582, 107701, 3362, 5062, 1778, 24313, 20855, 3362, 582, 6287, 270, 3277,
-          1014, 295, 260, 1014, 16448, 66910, 582, 2852, 3362, 582, 1133, 20035, 1760, 582, 46172,
-          3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612, 8322, 16448, 3362,
-          28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486, 3362, 20584, 8322, 16448, 13747, 6989,
-          582, 107701, 3362, 5062, 2365, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105, 2329, 305,
-          10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 63006, 44388, 295, 7213, 16,
-          128804, 128822
+          4105, 10699, 469, 4087, 4256, 339, 795, 17829, 28249, 13178, 8380, 271, 24313, 2852, 3362,
+          582, 1133, 65, 50219, 1760, 582, 20855, 3362, 582, 6287, 270, 2573, 9670, 362, 260, 4593,
+          66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582, 68838, 3362, 28612,
+          37399, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 20855, 3362, 582, 31060, 2329,
+          87928, 582, 15165, 3362, 28612, 4611, 3362, 582, 4463, 1760, 582, 47002, 3362, 20584, 69,
+          33030, 1760, 582, 72, 37988, 13747, 55695, 582, 24486, 3362, 20584, 37399, 13747, 30316,
+          24313, 2852, 3362, 582, 1133, 20035, 1760, 582, 20855, 3362, 582, 6287, 270, 3277, 1014,
+          295, 260, 1014, 16448, 66910, 582, 46172, 3362, 28612, 4611, 3362, 582, 10325, 1760, 582,
+          68838, 3362, 28612, 8322, 16448, 3362, 28612, 4611, 3362, 582, 4463, 4, 55695, 582, 24486,
+          3362, 20584, 8322, 16448, 13747, 33236, 3476, 74366, 29851, 1605, 270, 3554, 6428, 4105,
+          2329, 305, 10767, 5815, 8380, 304, 34756, 4105, 10699, 603, 128803, 63006, 44388, 295,
+          7213, 16, 128804, 128822
         ],
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 32, "skip_special_tokens": false},
         "return_logprob": false,
@@ -4205,7 +4296,8 @@
             "total_tokens": 400,
             "completion_tokens": 32,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 0
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
           },
           "metadata": {
             "weight_version": "default",
