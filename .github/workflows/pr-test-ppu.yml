@@ -110,6 +110,7 @@ jobs:
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
+              - "test/registered/radix_cache/test_radix_attention.py"
               - "test/registered/ppu/**"
 
   pr-gate:
@@ -243,9 +244,10 @@ jobs:
           CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
           CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
           CONFIG_PPU_CI_MLA_MODEL_PATH: ${{ vars.PPU_CI_MLA_MODEL_PATH }}
+          CONFIG_PPU_CI_SMALL_MODEL_PATH: ${{ vars.PPU_CI_SMALL_MODEL_PATH }}
           CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
         run: |
-          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_MLA_MODEL_PATH PPU_CI_EVAL_CACHE; do
+          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_MLA_MODEL_PATH PPU_CI_SMALL_MODEL_PATH PPU_CI_EVAL_CACHE; do
             override="CONFIG_$key"
             if [[ -n "${!override}" ]]; then
               export "$key=${!override}"

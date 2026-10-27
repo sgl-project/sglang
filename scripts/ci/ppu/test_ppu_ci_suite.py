@@ -59,6 +59,7 @@ class TestPPUCISuite(CustomTestCase):
             [
                 "core/test_basic_sanity_eagle3.py",
                 "core/test_basic_sanity_dflash.py",
+                "radix_cache/test_radix_attention.py",
                 "ppu/test_sail_attention_backends.py",
             ],
         )
@@ -84,13 +85,13 @@ class TestPPUCISuite(CustomTestCase):
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
             for summary, exit_code, expected in (
-                ("Test Summary: 3/3 passed", 0, 0),
+                ("Test Summary: 4/4 passed", 0, 0),
                 ("Test Summary: 0/0 passed", 0, 1),
                 ("Test Summary: 1/1 passed", 0, 1),
                 ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 4/4 passed", 0, 1),
-                ("Test Summary: 3/3 passed", 7, 7),
-                ("Test Summary: 3/3 passed (incomplete)", 0, 1),
+                ("Test Summary: 5/5 passed", 0, 1),
+                ("Test Summary: 4/4 passed", 7, 7),
+                ("Test Summary: 4/4 passed (incomplete)", 0, 1),
                 ("", 0, 1),
             ):
                 with self.subTest(summary=summary, exit_code=exit_code):
@@ -141,6 +142,7 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
             ("scripts/ci/ppu/test_ppu_ci_suite.py", True),
+            ("test/registered/radix_cache/test_radix_attention.py", True),
         ):
             with self.subTest(path=path):
                 self.assertEqual(
