@@ -359,7 +359,9 @@ class C_SchedulerHook(BaseHook):
                     )
 
                     C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
-                        scheduler=self, endpoint=Envs.coordinator_endpoint()
+                        scheduler=self,
+                        endpoint=Envs.coordinator_endpoint(),
+                        timeout_s=Envs.coordinator_wall_timeout(),
                     )
             except Exception as e:
                 logger.error(

@@ -170,6 +170,15 @@ Plain `OFFLINE` cannot account for a client's future requests or tool waits.
 Use `BLOCKING` for clients without coordinator support. Coordination itself
 requires `OFFLINE`.
 
+`SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT` configures the scheduler bridge's
+physical driver/payload wait budget in seconds (default `30`). Values must be
+finite and strictly positive; invalid values fail initialization. If a client
+legitimately needs more wall time to consume an HTTP/SSE terminal response before
+its next `Ready`, set an explicit budget, for example
+`SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT=600` to align with a 600-second client
+budget. This does not change virtual deadlines, cost predictions or protocol
+ordering. An absent driver still fails when the configured budget expires.
+
 #### Driver contract
 
 The protocol uses conservative event synchronization: the server advances only

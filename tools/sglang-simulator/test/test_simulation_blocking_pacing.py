@@ -108,3 +108,55 @@ def test_empty_batch_does_not_consume_cache_load(monkeypatch, hooked_scheduler):
 
     assert clock.sleeps == []
     assert StateManager.get_hicache_l2_load_dur() == 0.3
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, 30.0), ("600", 600.0), ("nan", None)]
+)
+def test_coordinator_wall_budget_reaches_installed_scheduler_hook(
+    monkeypatch, hooked_scheduler, value, expected
+):
+    from sglang_simulator.simulation.sglang import coordinated
+
+    native, _ = hooked_scheduler
+    monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:12345")
+    name = "SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        scheduler,
+        "get_obj_from_args",
+        lambda *a, **kw: SimpleNamespace(disable_overlap_schedule=True),
+    )
+    monkeypatch.setattr(scheduler, "validate_simulator_server_args", lambda args: None)
+    monkeypatch.setattr(scheduler, "validate_required_class_hooks", lambda: None)
+    for getter in ("get_model_info", "get_accelerator_info", "get_scheduler_config"):
+        monkeypatch.setattr(scheduler.ConfigManager, getter, lambda: object())
+    predictor = object()
+    monkeypatch.setattr(
+        scheduler.ConfigManager, "get_inference_time_predictor", lambda *args: predictor
+    )
+    monkeypatch.setattr(scheduler.C_SchedulerHook, "INFERENCE_PREDICTOR", None)
+    monkeypatch.setattr(scheduler.C_SchedulerHook, "OVERLAP_SCHEDULE", False)
+    constructed = []
+
+    def construct(**kwargs):
+        constructed.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(coordinated, "CoordinatedScheduler", construct)
+    if expected is None:
+        with pytest.raises(ValueError, match=name):
+            type(native)()
+        assert constructed == []
+    else:
+        instance = type(native)()
+        assert constructed == [
+            {
+                "scheduler": instance,
+                "endpoint": "tcp://127.0.0.1:12345",
+                "timeout_s": expected,
+            }
+        ]
+        assert scheduler.C_SchedulerHook.INFERENCE_PREDICTOR is predictor

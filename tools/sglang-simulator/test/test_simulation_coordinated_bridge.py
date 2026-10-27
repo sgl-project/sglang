@@ -22,10 +22,30 @@ from sglang_simulator.simulation.coordinator import (
     decode_grant,
     encode_message,
 )
-from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.simulation.sglang import coordinated
 from sglang_simulator.simulation.sglang.coordinated import CoordinatedScheduler
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, 30.0), ("600", 600.0), ("0.125", 0.125)]
+)
+def test_coordinator_wall_timeout_seconds(monkeypatch, value, expected):
+    name = "SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    assert Envs.coordinator_wall_timeout() == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["nan", "NaN", "inf", "-inf", "0", "-1", "", "invalid"]
+)
+def test_invalid_coordinator_wall_timeout_is_not_silently_defaulted(monkeypatch, value):
+    monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT", value)
+    with pytest.raises(ValueError, match="SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT"):
+        Envs.coordinator_wall_timeout()
 
 
 @pytest.mark.parametrize("coordinated", [False, True])
@@ -539,6 +559,28 @@ def test_payload_timeout_excludes_pre_run_dataset_preparation(harness, monkeypat
 
     admitted = harness.run_driver(driver)
     assert [request.rid for request in admitted] == [rid(1)]
+    assert harness.bridge.clock.now_ns == 0
+
+
+@pytest.mark.parametrize("value, elapsed", [(None, 31.0), ("600", 601.0)])
+def test_configured_wall_budget_still_rejects_an_absent_next_ready(
+    harness, monkeypatch, value, elapsed
+):
+    name = "SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    harness.bridge.timeout_s = Envs.coordinator_wall_timeout()
+    harness.bridge.clock.accept_ready(Ready("run", 0, [], next_wakeup_ns=10))
+    harness.bridge.clock.grant()
+    wall = iter((0.0, elapsed))
+    monkeypatch.setattr(
+        coordinated, "time", SimpleNamespace(monotonic=lambda: next(wall))
+    )
+    with pytest.raises(
+        ProtocolError, match=r"round=1: driver/payload timeout; missing=\(\)"
+    ):
+        harness.receive()
     assert harness.bridge.clock.now_ns == 0
 
 

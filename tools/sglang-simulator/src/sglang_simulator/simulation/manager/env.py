@@ -1,3 +1,4 @@
+import math
 import os
 
 from sglang_simulator.utils.logger import get_logger
@@ -13,6 +14,17 @@ class Envs:
     @classmethod
     def coordinator_endpoint(cls) -> str | None:
         return os.getenv("SGLANG_SIMULATOR_COORDINATOR") or None
+
+    @classmethod
+    def coordinator_wall_timeout(cls) -> float:
+        name = "SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT"
+        try:
+            timeout = float(os.getenv(name, "30"))
+        except ValueError:
+            raise ValueError(f"{name} must be finite and > 0 seconds") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(f"{name} must be finite and > 0 seconds")
+        return timeout
 
     @classmethod
     def config_path(cls) -> str:
