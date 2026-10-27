@@ -336,7 +336,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Same trailing-newline trim as detect_and_parse, so both agree.
                     normal_text_parts.append(normal_prefix(call_start))
                 else:
-                    normal_text_parts.append(normal_prefix(invoke_match.start()))
+                    normal_text_parts.append(
+                        normal_prefix(invoke_match.start()).lstrip("\n")
+                    )
 
                 try:
                     current_params = self._parse_parameters_from_xml(invoke_content)
@@ -384,7 +386,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 postamble = postamble.lstrip("\n")
 
             if (
-                postamble
+                postamble.strip()
                 and not any(marker in postamble for marker in dsml_markers)
                 and not any(
                     postamble.rstrip().endswith(prefix) for prefix in dsml_prefixes
