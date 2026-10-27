@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{DisaggregationMode, PreferredSamplingParams};
+use super::config::{DeploymentInfo, DisaggregationMode, PreferredSamplingParams};
 
 /// Static model metadata shared by every public transport.
 #[derive(Clone, Debug, Serialize)]
@@ -42,6 +42,11 @@ pub(crate) struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) startup_time: Option<serde_json::Value>,
     pub(crate) internal_states: Vec<InternalState>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) incremental_streaming_output: bool,
+    pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) deployment_info: DeploymentInfo,
 }
 
 impl ServerInfo {

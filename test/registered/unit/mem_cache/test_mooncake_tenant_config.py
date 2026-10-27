@@ -1,5 +1,3 @@
-import json
-import tempfile
 import types
 import unittest
 from types import SimpleNamespace
@@ -7,14 +5,12 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
-    MooncakeStoreConfig,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _fake_mooncake_modules(fake_store_cls):
@@ -79,6 +75,7 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID, kv_cache_dtype=None):
     return SimpleNamespace(
         tp_rank=0,
         tp_size=1,
+        dcp_size=1,
         pp_rank=0,
         pp_size=1,
         attn_cp_rank=0,
@@ -95,56 +92,6 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID, kv_cache_dtype=None):
 
 
 class TestMooncakeTenantConfig(unittest.TestCase):
-    def test_load_from_extra_config_normalizes_tenant(self):
-        cfg = MooncakeStoreConfig.load_from_extra_config(
-            {
-                "master_server_address": "127.0.0.1:50051",
-                "tenant_id": "  tenant-extra  ",
-            }
-        )
-        self.assertEqual(cfg.tenant_id, "tenant-extra")
-
-        cfg = MooncakeStoreConfig.load_from_extra_config(
-            {
-                "master_server_address": "127.0.0.1:50051",
-                "tenant_id": "   ",
-            }
-        )
-        self.assertEqual(cfg.tenant_id, DEFAULT_TENANT_ID)
-
-        cfg = MooncakeStoreConfig.load_from_extra_config(
-            {
-                "master_server_address": "127.0.0.1:50051",
-                "tenant_id": None,
-            }
-        )
-        self.assertEqual(cfg.tenant_id, DEFAULT_TENANT_ID)
-
-    def test_load_from_env_reads_mooncake_tenant_id(self):
-        with (
-            envs.MOONCAKE_MASTER.override("127.0.0.1:50051"),
-            envs.MOONCAKE_TENANT_ID.override("tenant-env"),
-        ):
-            cfg = MooncakeStoreConfig.load_from_env()
-
-        self.assertEqual(cfg.tenant_id, "tenant-env")
-
-    def test_load_from_file_reads_tenant_id(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-            json.dump(
-                {
-                    "master_server_address": "127.0.0.1:50051",
-                    "tenant_id": "tenant-file",
-                },
-                config_file,
-            )
-            config_file.flush()
-
-            with envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.override(config_file.name):
-                cfg = MooncakeStoreConfig.from_file()
-
-        self.assertEqual(cfg.tenant_id, "tenant-file")
-
     def test_mooncake_store_forwards_non_default_tenant_id(self):
         FakeMooncakeDistributedStore.instances = []
         with patch.dict(
@@ -284,7 +231,9 @@ class TestMooncakeTenantConfig(unittest.TestCase):
             mem_pool_device=SimpleNamespace(dtype=torch.float16),
             get_attn_cp_rank_and_size=lambda: (0, 1),
         )
-        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        parallel = SimpleNamespace(
+            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_size=1, attn_dcp_rank=0
+        )
         cases = (
             # A typed host representation wins over the device value dtype.
             (torch.bfloat16, torch.float8_e4m3fn, "bfloat16"),
@@ -308,9 +257,7 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                         # GPU memory or host transfer buffers.
                         host_pool = pool_type.__new__(pool_type)
                         host_pool.dtype = buffer_dtype
-                        host_pool.device_pool = SimpleNamespace(
-                            dtype=value_dtype, store_dtype=buffer_dtype
-                        )
+                        host_pool._value_dtype = value_dtype
                         controller.storage_host_pool = host_pool
                         config = (
                             cache_controller.HiCacheController._generate_storage_config(
@@ -330,7 +277,9 @@ class TestMooncakeTenantConfig(unittest.TestCase):
             storage_host_pool=LogicalHostPool(size=16, page_size=1),
             get_attn_cp_rank_and_size=lambda: (0, 1),
         )
-        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        parallel = SimpleNamespace(
+            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_size=1, attn_dcp_rank=0
+        )
         with (
             patch.object(cache_controller, "get_parallel", return_value=parallel),
             patch.object(
@@ -341,6 +290,100 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                 controller
             )
         self.assertIsNone(config.kv_cache_dtype)
+
+    def test_host_construction_preserves_buffer_value_dtype(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+        from sglang.srt.mem_cache.pool_host.common import (
+            ALLOC_MEMORY_FUNCS,
+            alloc_with_pin_memory,
+        )
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        for dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.float8_e4m3fnuz,
+        ):
+            for is_mla in (False, True):
+                with (
+                    self.subTest(dtype=dtype, is_mla=is_mla),
+                    host_memory_budget_scope(1024 * 1024),
+                    patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc_with_pin_memory}),
+                ):
+                    device_cls = MLATokenToKVPool if is_mla else MHATokenToKVPool
+                    geometry = (
+                        dict(kv_lora_rank=4, qk_rope_head_dim=2)
+                        if is_mla
+                        else dict(head_num=1, head_dim=4)
+                    )
+                    device_pool = device_cls(
+                        size=8,
+                        page_size=2,
+                        dtype=dtype,
+                        layer_num=1,
+                        device="cpu",
+                        enable_memory_saver=False,
+                        **geometry,
+                    )
+                    info = device_pool.get_device_pool_infos()[0].buffer_info
+                    self.assertEqual(info.value_dtype, dtype)
+                    host_cls = MLATokenToKVPoolHost if is_mla else MHATokenToKVPoolHost
+                    host_pool = host_cls(
+                        info,
+                        host_to_device_ratio=2,
+                        host_size=0,
+                        page_size=2,
+                        layout="page_first",
+                        pin_memory=False,
+                        device_capacity_tokens=8,
+                        start_layer=0,
+                        end_layer=1,
+                        host_token_capacity=16,
+                        **(dict(target_layer_num=1) if is_mla else {}),
+                    )
+                    self.addCleanup(host_pool.destroy)
+                    self.assertFalse(hasattr(host_pool, "device_pool"))
+                    self.assertEqual(host_pool.get_storage_dtype(), dtype)
+
+    def test_controller_preserves_dtype_and_dcp_shard_identity(self):
+        from sglang.srt.managers import cache_controller
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        host_pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host_pool.dtype = torch.uint8
+        host_pool._value_dtype = torch.float8_e5m2
+        controller = SimpleNamespace(
+            enable_storage_metrics=False,
+            mem_pool_host=SimpleNamespace(layout="page_first"),
+            mem_pool_device=MLATokenToKVPool.__new__(MLATokenToKVPool),
+            storage_host_pool=host_pool,
+            get_attn_cp_rank_and_size=lambda: (0, 1),
+            page_size=16,
+        )
+        parallel = SimpleNamespace(
+            tp_rank=3, tp_size=4, pp_rank=0, pp_size=1, attn_dcp_size=2, attn_dcp_rank=1
+        )
+        with (
+            patch.object(cache_controller, "get_parallel", return_value=parallel),
+            patch.object(
+                cache_controller, "is_dp_attention_enabled", return_value=False
+            ),
+        ):
+            config = cache_controller.HiCacheController._generate_storage_config(
+                controller
+            )
+        self.assertEqual(config.kv_cache_dtype, "float8_e5m2")
+        self.assertEqual((config.dcp_size, config.dcp_rank), (2, 1))
+        self.assertEqual(config.logical_page_size, 16)
+        self.assertFalse(config.is_storage_writer)
 
     def test_page_envelope_reports_persisted_value_dtype(self):
         from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool

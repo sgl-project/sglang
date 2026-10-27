@@ -274,6 +274,9 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         )
         self.final_layer = T2IFinalLayer(c.hidden_size, c.patch_size, c.in_channels)
         self.attn_res = BlockAttentionResidual(c.hidden_size)
+        # RoPE tables for one (frames, height, width, device), built once
+        self._ropes_key = None
+        self._ropes = None
 
     @property
     def dtype(self):
@@ -301,10 +304,14 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         else:
             timestep = timestep.float() / c.timestep_norm_scale_factor
         x = self.x_embedder(hidden_states.to(self.dtype))
-        ropes = {
-            "linear": self.rope_linear((frames, height, width), x.device),
-            "softmax": self.rope_softmax((frames, height, width), x.device),
-        }
+        ropes_key = (frames, height, width, x.device)
+        if ropes_key != self._ropes_key:
+            self._ropes = {
+                "linear": self.rope_linear((frames, height, width), x.device),
+                "softmax": self.rope_softmax((frames, height, width), x.device),
+            }
+            self._ropes_key = ropes_key
+        ropes = self._ropes
         t = self.t_embedder(timestep.flatten())
         t0 = self.t_block(t).unflatten(0, timestep.shape)
         t = t.unflatten(0, timestep.shape)
