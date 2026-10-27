@@ -260,7 +260,9 @@ class TorchNativeAttnBackend(AttentionBackend):
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
                     query_offset=seq_len_kv - seq_len_q,
-                    causal=causal,
+                    # local `causal` and `is_causal` are  SDPA's fast-path flag (False in decode since we pass a mask),
+                    # not the attention pattern; decode is still causally masked.
+                    causal=True,
                 )
                 is_causal = False
 
