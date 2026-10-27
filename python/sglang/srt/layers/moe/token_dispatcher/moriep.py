@@ -70,12 +70,19 @@ def round_logical_recv_rows(cluster_rows: int, pow2_buckets: bool) -> int:
     return max(MORI_MIN_LOGICAL_RECV_ROWS, -(-cluster_rows // align) * align)
 
 
-def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> int:
+def mori_recv_bound(
+    local_rows: int, sender_rows: Optional[tuple[int, ...]], subbatch: bool = False
+) -> int:
     """Return the unrounded receive-row bound, or 0 to keep the full view.
 
     Verified MORI kernels deduplicate rows per destination rank, so the bound
     comes from sender rows. The caller checks backend/TBO eligibility and
     applies rounding and the physical capacity.
+
+    With ``subbatch`` the dispatch belongs to one TBO micro-batch while
+    ``sender_rows`` still describe the whole batch. Every rank's micro-batch is at
+    most its full share, so the whole batch's rows remain an upper bound; only the
+    local consistency check relaxes from == to <=.
     """
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size
@@ -89,6 +96,9 @@ def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> 
     attn_tp_rank = parallel.attn_tp_rank
 
     if attn_dp_size == 1:
+        if subbatch:
+            # The local chunk no longer speaks for the other ranks' micro-batches.
+            return 0
         # Use the local tensor_split chunk: DSpark can leave DP token counts stale.
         return attn_tp_size * local_rows + attn_tp_rank
     if (
@@ -99,7 +109,9 @@ def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> 
         return 0
     base, extra = divmod(sender_rows[attn_dp_rank], attn_tp_size)
     expected_local_rows = base + int(attn_tp_rank < extra)
-    if local_rows != expected_local_rows:
+    if local_rows > expected_local_rows or (
+        not subbatch and local_rows != expected_local_rows
+    ):
         return 0
     return sum(sender_rows)
 
@@ -782,11 +794,20 @@ class _MoriEPDispatcherImplBase:
         return has_forward_context() and get_forward_context().is_micro_batch
 
     @staticmethod
-    def _snapshot_sender_rows() -> tuple[int, ...] | None:
-        """Copy CPU scheduler metadata; non-int rows would need a device sync."""
-        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+    def _snapshot_sender_rows(tbo_parent: bool = False) -> tuple[int, ...] | None:
+        """Copy CPU scheduler metadata; non-int rows would need a device sync.
 
-        rows = get_dp_global_num_tokens()
+        ``tbo_parent`` reads the counts of the batch a TBO forward split (a TBO
+        child publishes none of its own); they bound the child's rows from above.
+        """
+        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+        from sglang.srt.model_executor.forward_context import get_forward_context
+
+        rows = (
+            get_forward_context().dp_global_num_tokens_bound
+            if tbo_parent
+            else get_dp_global_num_tokens()
+        )
         if not isinstance(rows, (list, tuple)) or not all(
             isinstance(r, int) for r in rows
         ):
@@ -806,13 +827,13 @@ class _MoriEPDispatcherImplBase:
             # The caller is responsible for covering all received tokens, as
             # with the original EPv1 override. Do not round an explicit cap.
             self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
-        elif (
-            self._trim_recv
-            # The DP token counts describe the whole batch, not a micro-batch.
-            and not self._in_tbo_subbatch
-            and self._is_recv_layout_verified()
-        ):
-            bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
+        elif self._trim_recv and self._is_recv_layout_verified():
+            # A micro-batch's sender rows are its parent batch's, an upper bound.
+            bound = mori_recv_bound(
+                self._num_tokens,
+                self._dispatch_sender_rows,
+                subbatch=self._in_tbo_subbatch,
+            )
             # Empty or unproved bounds keep the full view.
             if bound > 0:
                 cap = round_logical_recv_rows(
@@ -900,7 +921,9 @@ class _MoriEPDispatcherImplBase:
         self._num_tokens = hidden_states.shape[0]
         # Keep metadata attached to this dispatch when a/b are separated or
         # two TBO children interleave.
-        self._dispatch_sender_rows = self._snapshot_sender_rows()
+        self._dispatch_sender_rows = self._snapshot_sender_rows(
+            tbo_parent=self._in_tbo_subbatch
+        )
         output_dtype = hidden_states.dtype
         hidden_states, scale = self._quantize_dispatch_input(hidden_states)
         topk_weights, topk_ids = self._prepare_topk(topk_output)
@@ -1530,14 +1553,12 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         return self.mori_op.cfg.effective_max_recv
 
     def _is_recv_layout_verified(self) -> bool:
-        # Older MORI builds lack these fields; keep their full receive view. The
-        # SDMA / low_latency receive layout has not been checked against
-        # mori_recv_bound.
-        return (
-            not self._uses_async_ll
-            and not getattr(self.mori_op.cfg, "is_internode", True)
-            and getattr(self.mori_op, "backend_name", "unknown") in ("flydsl", "hip")
-        )
+        # Older MORI builds lack these fields; keep their full receive view.
+        # AsyncLL's RecvCopy packs rows into [0, total) by a per-source prefix
+        # sum and dedups per destination rank, so the bound holds there too.
+        return not getattr(self.mori_op.cfg, "is_internode", True) and getattr(
+            self.mori_op, "backend_name", "unknown"
+        ) in ("flydsl", "hip")
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if hidden_states.dtype != torch.bfloat16:
