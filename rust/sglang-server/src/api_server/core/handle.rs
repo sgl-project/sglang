@@ -18,7 +18,7 @@ use crate::message::ids::Rid;
 use crate::message::io_struct::{
     CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
 };
-use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::request::{GenerateRequest, RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
@@ -76,7 +76,7 @@ impl From<&ServerArgs> for CoreMetadata {
         Self {
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
-            tokenizer_path: args.tokenizer_path.clone(),
+            tokenizer_path: args.public_tokenizer_path.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
             weight_version: args.weight_version.as_deref().map(Arc::from),
             load_format: args.load_format.clone(),
@@ -458,12 +458,21 @@ impl CoreHandle {
         text: String,
         add_special_tokens: bool,
     ) -> Result<TokenIds, CoreError> {
-        let mut call = self
-            .submit(RequestKind::Tokenize {
-                text,
-                add_special_tokens,
-            })
-            .await?;
+        self.tokenize_input(TokenizeInput::Text {
+            text,
+            add_special_tokens,
+        })
+        .await
+    }
+
+    /// Encode a rendered chat prompt on the tokenizer pool.
+    pub(crate) async fn tokenize_chat(&self, chat: RenderedChat) -> Result<TokenIds, CoreError> {
+        self.tokenize_input(TokenizeInput::Chat(Box::new(chat)))
+            .await
+    }
+
+    async fn tokenize_input(&self, input: TokenizeInput) -> Result<TokenIds, CoreError> {
+        let mut call = self.submit(RequestKind::Tokenize(input)).await?;
         match call.recv().await {
             Some(ResponseItem::TokenIds(ids)) => Ok(ids),
             Some(ResponseItem::Error(Error::Validation(message))) => {
@@ -1704,10 +1713,10 @@ mod tests {
         assert!(!request.rid.as_str().is_empty());
         assert!(matches!(
             &request.kind,
-            RequestKind::Tokenize {
+            RequestKind::Tokenize(TokenizeInput::Text {
                 text,
                 add_special_tokens: true,
-            } if text == "hi"
+            }) if text == "hi"
         ));
         request
             .sink
