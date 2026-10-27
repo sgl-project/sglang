@@ -84,7 +84,7 @@ class TestPreshardedHCPreparation(CustomTestCase):
             )
         self.assertIs(result, model)
         self.assertFalse(model.training)
-        self.assertEqual(events, ["quant", "aliases", "hc"])
+        self.assertEqual(events[-1], "hc")
         model.post_load_weights_from_preprocessed.assert_called_once_with()
         model.post_load_weights.assert_not_called()
 

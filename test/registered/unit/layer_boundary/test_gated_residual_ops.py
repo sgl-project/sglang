@@ -412,22 +412,20 @@ class TestGatedResidualOps(CustomTestCase):
 
         context = self._sum_context()
         state = context.state
-        layer = SimpleNamespace(mix=Mock())
-        PackedGatedResidual.mix_prepared(layer, state.residual, state)
-        layer.mix.assert_called_once_with(state)
-        layer.mix.reset_mock()
+        layer = SimpleNamespace(mix=lambda value: value)
+        self.assertIs(
+            PackedGatedResidual.mix_prepared(layer, state.residual, state), state
+        )
         changed = state.residual + 1
-        PackedGatedResidual.mix_prepared(layer, changed, state)
-        layer.mix.assert_called_once_with(changed)
+        self.assertIs(PackedGatedResidual.mix_prepared(layer, changed, state), changed)
 
     def test_prepared_sum_odd_slice_preserves_values_when_realigning(self):
         from sglang.srt.layers.hyperconnection_packed import PackedGatedResidual
 
         state = self._sum_context().slice_rows(1, 2).state
         self.assertEqual(state.sum_sq.data_ptr() % 32, 16)
-        layer = SimpleNamespace(mix=Mock())
-        PackedGatedResidual.mix_prepared(layer, state.residual, state)
-        used = layer.mix.call_args.args[0]
+        layer = SimpleNamespace(mix=lambda value: value)
+        used = PackedGatedResidual.mix_prepared(layer, state.residual, state)
         self.assertIs(used.residual, state.residual)
         self.assertEqual(used.sum_sq.data_ptr() % 32, 0)
         torch.testing.assert_close(used.sum_sq, state.sum_sq, rtol=0, atol=0)
@@ -473,15 +471,17 @@ class TestGatedResidualOps(CustomTestCase):
     def test_qwen_ple_invalidates_prepared_statistics(self):
         layer = Qwen4ExpLayerExtensionMixin()
         layer.attn_hyper_connection = SimpleNamespace(
-            _packed_sum_weights=True, mix_prepared=Mock()
+            _packed_sum_weights=True,
+            mix_prepared=lambda residual, prepared: (residual, prepared),
         )
         layer.ple = object()
         state = self._sum_context().state
         updated = state.residual + 1
         layer._add_ple_embedding = Mock(return_value=updated)
         with layer.hc_inputs(state, None):
-            layer._attn_mix(state.residual)
-        layer.attn_hyper_connection.mix_prepared.assert_called_once_with(updated, None)
+            actual, prepared = layer._attn_mix(state.residual)
+        self.assertIs(actual, updated)
+        self.assertIsNone(prepared)
 
 
 if __name__ == "__main__":

@@ -154,7 +154,14 @@ class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         ):
-            for lowrank in (8, 288, 64, 192, 320):
+            for lowrank, packed in (
+                (8, False),
+                (288, False),
+                (64, True),
+                (128, False),
+                (192, True),
+                (320, True),
+            ):
                 with self.subTest(lowrank=lowrank):
                     config = HyperConnectionConfig(
                         hidden_size=512,
@@ -163,12 +170,13 @@ class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
                         params_dtype=torch.bfloat16,
                     )
                     layer = create_gated_residual(config)
-                    if lowrank % 64:
+                    if packed:
+                        self.assertIsInstance(layer, PackedGatedResidual)
+                    else:
                         self.assertIs(type(layer), GatedResidual)
+                    if lowrank % 64:
                         with self.assertRaisesRegex(ValueError, "aligned to 64"):
                             PackedGatedResidual(config)
-                    else:
-                        self.assertIsInstance(layer, PackedGatedResidual)
 
     def _updater(self, model):
         return WeightUpdater(

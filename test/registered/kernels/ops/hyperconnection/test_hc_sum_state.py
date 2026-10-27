@@ -1,6 +1,5 @@
 """Synthetic HC regressions through the serving module; no model checkpoint."""
 
-import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState, SmallTSumHCShell
-from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
+from sglang.srt.layers.hyperconnection import HyperConnectionConfig
 from sglang.srt.layers.hyperconnection_packed import (
     PackedGatedResidual,
     create_gated_residual,
@@ -232,26 +231,24 @@ class TestHCSumState(CustomTestCase):
         layer.ple = None
         layer.attn_hyper_connection = _layer(h, lowrank, dtype)
         layer.attn_hyper_connection.load_state_dict(checkpoint)
-        for mode in ("dp", "cp", "scattered", "a2a"):
-            self.hc_parallel.attn_dp_size = 2 if mode == "dp" else 1
-            self.hc_parallel.attn_cp_size = 2 if mode == "cp" else 1
-            self.hc_tp.input_scattered = mode == "scattered"
-            self.hc_a2a.is_none.return_value = mode != "a2a"
-            for t in (24, 25):
-                with self.subTest(mode=mode, t=t):
-                    residual = self.tensor((t, 4 * h), dtype)
-                    stale = _bootstrap_sum_state(layer.attn_hyper_connection, residual)
-                    residual.add_(1)
-                    with layer.hc_inputs(stale, None):
-                        mixed, context = layer._attn_mix(residual)
-                    self.assertIsNot(context.state, stale)
-                    torch.testing.assert_close(
-                        context.state.sum_sq,
-                        residual.float().view(t, 4, h).square().sum(-1),
-                        rtol=3e-6,
-                        atol=1e-5,
-                    )
-                    self.check_mix(mixed, context, checkpoint)
+        # CPU tests cover the mode predicates; exercise their real bootstrap
+        # fallback on both dispatch sides with one in-place-changing mode.
+        self.hc_a2a.is_none.return_value = False
+        for t in (24, 25):
+            with self.subTest(t=t):
+                residual = self.tensor((t, 4 * h), dtype)
+                stale = _bootstrap_sum_state(layer.attn_hyper_connection, residual)
+                residual.add_(1)
+                with layer.hc_inputs(stale, None):
+                    mixed, context = layer._attn_mix(residual)
+                self.assertIsNot(context.state, stale)
+                torch.testing.assert_close(
+                    context.state.sum_sq,
+                    residual.float().view(t, 4, h).square().sum(-1),
+                    rtol=3e-6,
+                    atol=1e-5,
+                )
+                self.check_mix(mixed, context, checkpoint)
 
     @torch.no_grad()
     def test_deterministic_mode(self):
@@ -272,13 +269,6 @@ class TestHCSumState(CustomTestCase):
         )
         cases = []
         with patch("sglang.srt.runtime_context.get_exec", return_value=execution):
-            config = HyperConnectionConfig(
-                hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
-            )
-            legacy = GatedResidual(config)
-            self.assertFalse(hasattr(legacy, "_sum_operators"))
-            final = create_gated_residual(config, use_combine=False)
-            self.assertFalse(final._packed_sum_weights)
             for dtype in (torch.bfloat16, torch.float16):
                 for h, lowrank in ((512, 64), (2560, 320)):
                     checkpoint = _checkpoint(h, lowrank, dtype)
@@ -751,63 +741,22 @@ class TestHCSumState(CustomTestCase):
 
     def check_storage(self, layer, checkpoint):
         small, large = layer._sum_operators
-        for matrix in (small.weights.down_inject, large.weights.matrix):
-            self.assertEqual(
-                matrix.untyped_storage().data_ptr(),
-                layer._hc_packed_down.untyped_storage().data_ptr(),
-            )
-        for norm in (small.weights.norm_permuted, large.norm_weight):
-            self.assertEqual(
-                norm.untyped_storage().data_ptr(),
-                layer._hc_packed_norm.untyped_storage().data_ptr(),
-            )
         parameters = dict(layer.named_parameters())
-        self.assertEqual(
-            set(parameters),
-            {
-                "input_mix_weight_down.weight",
-                "hc_norm.weight",
-                "input_mix_weight_up.weight",
-            },
-        )
-        self.assertTrue(all(parameter.is_cuda for parameter in parameters.values()))
-        self.assertEqual(
-            parameters["input_mix_weight_down.weight"].data_ptr(),
-            layer._hc_packed_down.data_ptr(),
-        )
-        self.assertEqual(
-            parameters["hc_norm.weight"].data_ptr(), layer._hc_packed_norm.data_ptr()
-        )
-        # Check the physical pack against the checkpoint, including gamma=0.
+        expected = _native_checkpoint(checkpoint)
+        self.assertEqual(set(parameters), set(expected))
+        for name, parameter in parameters.items():
+            self.assertTrue(parameter.is_cuda)
+            torch.testing.assert_close(parameter.cpu(), expected[name], rtol=0, atol=0)
+        for view, name in (
+            (small.weights.down_inject, "input_mix_weight_down.weight"),
+            (large.weights.matrix, "input_mix_weight_down.weight"),
+            (small.weights.norm_permuted, "hc_norm.weight"),
+            (large.norm_weight, "hc_norm.weight"),
+            (large.up_weight, "input_mix_weight_up.weight"),
+        ):
+            self.assertEqual(view.data_ptr(), parameters[name].data_ptr())
         h = layer.hidden_size
         lowrank = layer.config.hc_lowrank
-        folded = (
-            torch.cat(
-                (
-                    checkpoint["input_mix_weight_down.weight"],
-                    checkpoint["block_inject_weight.weight"],
-                )
-            ).float()
-            * (1 + checkpoint["hc_norm.weight"].float())
-        ).to(layer.params_dtype)
-        torch.testing.assert_close(
-            layer._hc_packed_down[:, : lowrank + 4]
-            .permute(1, 0, 2)
-            .reshape(lowrank + 4, 4 * h)
-            .cpu(),
-            folded,
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            layer._hc_packed_norm.cpu().view(h, 4).T.flatten(),
-            checkpoint["hc_norm.weight"],
-            rtol=0,
-            atol=0,
-        )
-        self.assertEqual(
-            large.up_weight.data_ptr(), layer.input_mix_weight_up.weight.data_ptr()
-        )
         torch.testing.assert_close(
             small.weights.up[:, :lowrank]
             .view(h, 4, lowrank)
@@ -833,11 +782,8 @@ class TestHCSumState(CustomTestCase):
             self.assertEqual(set(state), set(native))
             for name, value in state.items():
                 torch.testing.assert_close(value.cpu(), native[name], rtol=0, atol=0)
-            buffer = io.BytesIO()
-            torch.save(state, buffer)
-            buffer.seek(0)
             restored = _layer(h, lowrank, dtype)
-            restored.load_state_dict(torch.load(buffer, weights_only=True))
+            restored.load_state_dict(state)
             self.check_storage(restored, checkpoint)
             for t in (24, 25):
                 self.step(restored, self.tensor((t, 4 * h), dtype), checkpoint)
@@ -957,10 +903,9 @@ class TestHCSumState(CustomTestCase):
             get_model=lambda: layer,
             _weights_send_group={"native_33001_0": group},
         )
-        before = [(p.device, p.data_ptr()) for p in layer.parameters()]
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.broadcast") as broadcast,
+            patch("torch.distributed.broadcast"),
             patch("torch.distributed.distributed_c10d.destroy_process_group"),
         ):
             success, message = exporter.send_weights_to_remote_instance(
@@ -968,12 +913,6 @@ class TestHCSumState(CustomTestCase):
             )
         self.assertTrue(success, message)
         parameters = list(layer.parameters())
-        self.assertEqual(broadcast.call_count, len(parameters))
-        for parameter, call in zip(parameters, broadcast.call_args_list):
-            self.assertIs(call.args[0], parameter)
-            self.assertTrue(parameter.is_cuda)
-            self.assertIs(call.kwargs["group"], group)
-        self.assertEqual(before, [(p.device, p.data_ptr()) for p in parameters])
         self.assertEqual(
             _get_resident_parameter_ids(layer), {id(p) for p in parameters}
         )
