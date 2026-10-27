@@ -14,10 +14,7 @@ subsequent checks for that attempt. Performance failures use the existing
 pytest retry budget (at most six retries), rerunning only failed items.
 Exhausting the budget still fails CI; missing metrics and exceeded thresholds
 are never treated as passing. Consistency failures remain non-retryable.
-Hugging Face HTTP 429 failures use the same bounded failed-item retry policy.
-Retries honor the reported cooldown (60 seconds when no delay is reported),
-including that wait in the retry-deadline budget. Other infrastructure failures
-retain their existing retry policy.
+Standalone infrastructure failures retain their existing retry policy.
 Valid failed measurements are recorded
 before threshold validation; realtime chunk and memory guards remain enabled
 according to their existing configuration.

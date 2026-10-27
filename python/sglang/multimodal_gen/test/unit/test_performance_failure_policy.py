@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.runner import pytest_runner
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     _estimate_failed_test_time,
     _extract_short_test_summary,
@@ -21,12 +20,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     ScenarioConfig,
-)
-
-_HF_RATE_LIMIT = (
-    "httpx.HTTPStatusError: Client error '429 Too Many Requests' for url "
-    "'https://huggingface.co/api/models/test/lora'\n"
-    "Retry after 53 seconds (0/3000 requests remaining in current 300s window)."
 )
 
 
@@ -99,7 +92,6 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
         "multimodal_gen/test/server/test_server_utils.py: AssertionError",
         "Consistency check failed for example\nTimeoutError",
         "[performance] Validation failed\nConsistency check failed for example",
-        _HF_RATE_LIMIT + "\nConsistency check failed for example",
     ],
 )
 def test_validation_failures_are_not_retryable(output):
@@ -143,40 +135,15 @@ def test_infrastructure_failure_policy_is_unchanged(output):
     assert _is_retryable_failure(output)
 
 
-@pytest.mark.parametrize(
-    "output,delay",
-    [
-        (_HF_RATE_LIMIT, 53.0),
-        (_HF_RATE_LIMIT.split("\n")[0], 60.0),
-        (_HF_RATE_LIMIT + "\nRetry after 120 seconds", 120.0),
-        (_HF_RATE_LIMIT.replace("429 Too Many Requests", "401 Unauthorized"), None),
-        (_HF_RATE_LIMIT.replace("huggingface.co", "example.com"), None),
-    ],
-)
-def test_huggingface_rate_limit_retry_policy(output, delay):
-    assert pytest_runner._hf_rate_limit_retry_delay(output) == delay
-    assert _is_retryable_failure(output) == (delay is not None)
-
-
 @pytest.mark.parametrize("with_deadline", [False, True])
-@pytest.mark.parametrize(
-    "failure_message,expected_waits",
-    [
-        ("[performance] Validation failed for E2E Latency", []),
-        (_HF_RATE_LIMIT, [53.0]),
-    ],
-    ids=["performance", "huggingface-rate-limit"],
-)
 def test_performance_retry_recovers_only_failed_items(
-    tmp_path, monkeypatch, with_deadline, failure_message, expected_waits
+    tmp_path, monkeypatch, with_deadline
 ):
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     if with_deadline:
         monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() + 600))
     else:
         monkeypatch.delenv("SGLANG_DIFFUSION_RETRY_DEADLINE", raising=False)
-    waits = []
-    monkeypatch.setattr(pytest_runner.time, "sleep", waits.append)
     test_file = tmp_path / "test_retry.py"
     test_file.write_text(
         "from pathlib import Path\n"
@@ -184,7 +151,7 @@ def test_performance_retry_recovers_only_failed_items(
         "    marker = Path(__file__).with_suffix('.attempt')\n"
         "    if not marker.exists():\n"
         "        marker.touch()\n"
-        f"        assert False, {failure_message!r}\n"
+        "        assert False, '[performance] Validation failed for E2E Latency'\n"
         "def test_fast():\n"
         "    marker = Path(__file__).with_suffix('.passed')\n"
         "    assert not marker.exists(), 'passing case must not rerun'\n"
@@ -194,41 +161,6 @@ def test_performance_retry_recovers_only_failed_items(
     assert code == 0
     assert test_file.with_suffix(".attempt").exists()
     assert test_file.with_suffix(".passed").exists()
-    assert waits == expected_waits
-
-
-@pytest.mark.parametrize(
-    "deadline,expected_attempts,diagnostic",
-    [
-        ("80", 1, "Retry budget exhausted"),
-        (None, 7, "Max retry exceeded"),
-    ],
-)
-def test_huggingface_retry_budget_preserves_failure(
-    monkeypatch, capfd, deadline, expected_attempts, diagnostic
-):
-    if deadline is None:
-        monkeypatch.delenv("SGLANG_DIFFUSION_RETRY_DEADLINE", raising=False)
-    else:
-        monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", deadline)
-    attempts, waits = [], []
-    monkeypatch.setattr(
-        pytest_runner,
-        "time",
-        SimpleNamespace(time=lambda: 0.0, monotonic=lambda: 0.0, sleep=waits.append),
-    )
-
-    def run_attempt(cmd):
-        attempts.append(cmd)
-        return 1, _HF_RATE_LIMIT
-
-    monkeypatch.setattr(pytest_runner, "_run_pytest_attempt", run_attempt)
-    code, _, _ = run_pytest(["test_rate_limited.py"])
-
-    assert code == 1
-    assert len(attempts) == expected_attempts
-    assert waits == [53.0] * (expected_attempts - 1)
-    assert diagnostic in capfd.readouterr().out
 
 
 def test_retry_budget_preserves_failure_and_report(tmp_path, monkeypatch, capfd):
