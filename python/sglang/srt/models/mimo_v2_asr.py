@@ -13,8 +13,8 @@ from typing import Any, Iterable, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -58,8 +58,7 @@ class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
         self.build_audio_encoder(MiMoAudioEncoderConfig(**config.audio_config))
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self):
         if getattr(self.config, "encoder_only", False):

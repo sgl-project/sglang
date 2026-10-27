@@ -7,11 +7,12 @@ export const config = (() => {
     const flags = ["--model-path " + modelOf(s)];
     if (s.hw === "a2") flags.push("--num-gpus 1");
     else if (s.hw === "a3") flags.push("--tp-size 1", "--sp-degree 2", "--num-gpus 2");
-    else flags.push("--ulysses-degree=1", "--ring-degree=1");
+    else if (s.hw !== "xeon") flags.push("--ulysses-degree=1", "--ring-degree=1");
     return {
       flags,
       gpus: s.hw === "a3" ? 2 : 1,
       topology: { tp_size: 1, ulysses_degree: s.hw === "a3" ? 2 : 1, ring_degree: 1 },
+      env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       warnings: s.precision === "nvfp4" ? ["NVFP4 is approximate; evaluate image quality against BF16."] : [],
     };
   };
@@ -27,10 +28,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "Qwen-Image",
-    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3"],
+    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "xeon"],
     hardware: [
       { id: "a2", label: "Ascend A2", vram: "", vendor: "npu" },
       { id: "a3", label: "Ascend A3", vram: "2 NPUs / card", vendor: "npu" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     ],
     groupHardware: false,
     matchDims: [],
@@ -49,8 +51,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
-        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
+        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {

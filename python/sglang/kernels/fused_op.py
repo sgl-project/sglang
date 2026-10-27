@@ -35,7 +35,7 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
    whose method is overridden, that is *declared* in :attr:`capabilities`,
    and whose :class:`~sglang.kernels.spec.CapabilityRequirement` set matches
    the detected platform. Ops may extend :meth:`backend_eligible` with
-   per-call shape/dtype gates; overriding it switches this step from a
+   per-call applicability gates; overriding it switches this step from a
    statically cached choice to per-call selection.
 5. **Platform-specific forward** — ``forward_cuda`` on CUDA, ``forward_hip``
    (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` on MUSA,
@@ -86,12 +86,11 @@ from torch import nn
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.registry import register_kernel
+from sglang.kernels.selector import _platform
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
-    PlatformInfo,
     capabilities_satisfied,
 )
 
@@ -110,6 +109,8 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.FLYDSL: "forward_flydsl",
     KernelBackend.HELION: "forward_helion",
     KernelBackend.KDA: "forward_kda",
+    KernelBackend.CAKE: "forward_cake",
+    KernelBackend.PLUGIN: "forward_plugin",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
@@ -125,6 +126,8 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 # explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
+    KernelBackend.CAKE,
+    KernelBackend.PLUGIN,
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.FLASHINFER,
@@ -157,11 +160,6 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "xpu": ("forward_xpu",),
     "cpu": ("forward_cpu",),
 }
-
-
-@functools.lru_cache(maxsize=1)
-def _platform() -> PlatformInfo:
-    return PlatformInfo.detect()
 
 
 @functools.lru_cache(maxsize=1)
@@ -205,13 +203,6 @@ def _oot_dispatch_key() -> Optional[str]:
     if current_platform.is_out_of_tree():
         return current_platform.get_dispatch_key_name()
     return None
-
-
-def clear_platform_caches() -> None:
-    """Drop the cached platform detection (used by tests that mock platforms)."""
-    _platform.cache_clear()
-    _platform_key.cache_clear()
-    _oot_dispatch_key.cache_clear()
 
 
 # --- global backend override ------------------------------------------------
@@ -350,7 +341,7 @@ class BaseFusedOp(nn.Module, ABC):
     Class attributes
     ----------------
     op:
-        Operator id, ``"<group>.<name>"`` (e.g. ``"layernorm.rmsnorm"``).
+        Operator id, ``"<group>.<name>"`` (e.g. ``"activation.silu_and_mul"``).
         Required for :func:`register_fused_op`; layer-style subclasses that
         are not registered in the kernel registry may leave it empty.
     priority:
@@ -368,10 +359,6 @@ class BaseFusedOp(nn.Module, ABC):
         the ``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` shortcuts,
         e.g. ``{KernelBackend.AOT: {CapabilityRequirement.CUDA,
         CapabilityRequirement.HIP}}``.
-    format_signature:
-        Data-contract description shared by all backends of this op.
-    descriptions:
-        Optional per-backend one-liners for the registry inventory.
     """
 
     op: ClassVar[str] = ""
@@ -379,8 +366,6 @@ class BaseFusedOp(nn.Module, ABC):
     capabilities: ClassVar[
         Mapping[KernelBackend, AbstractSet[CapabilityRequirement]]
     ] = {}
-    format_signature: ClassVar[FormatSignature] = FormatSignature()
-    descriptions: ClassVar[Mapping[KernelBackend, str]] = {}
 
     # OOT forward registry shared by all fused ops: platform dispatch key ->
     # {op class -> forward fn}. Populated by out-of-tree platform plugins.
@@ -438,11 +423,20 @@ class BaseFusedOp(nn.Module, ABC):
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no cute_dsl backend")
 
+    def forward_flydsl(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no flydsl backend")
+
     def forward_helion(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no helion backend")
 
     def forward_kda(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no KDA backend")
+
+    def forward_cake(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no Cake backend")
+
+    def forward_plugin(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no plugin backend")
 
     def forward_flashinfer(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flashinfer backend")
@@ -480,10 +474,12 @@ class BaseFusedOp(nn.Module, ABC):
 
         The base implementation checks the backend's
         :class:`CapabilityRequirement` set (OR semantics) against the detected
-        platform. Subclasses may extend it with per-call shape/dtype gates so
-        auto-selection bounces to the next backend instead of raising;
-        overriding this method switches backend auto-selection from a cached
-        static choice to per-call resolution.
+        platform. Subclasses may extend it with per-call gates for operands the
+        kernel does not cover, where the next backend computes the same result;
+        operands that violate the op's contract are a caller bug the backend's
+        launcher must raise on, not a reason to bounce. Overriding this method
+        switches backend auto-selection from a cached static choice to per-call
+        resolution.
         """
         return capabilities_satisfied(
             self.capabilities.get(backend, frozenset()), _platform()
@@ -586,10 +582,6 @@ class BaseFusedOp(nn.Module, ABC):
             _record_trace(self, _dispatch_label(method), args, kwargs)
         return result
 
-    def dispatch_forward(self) -> Callable:
-        """The static dispatch target for this op on the current platform."""
-        return self._resolve_forward_method()
-
     # --- torch.compile mode ---
 
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
@@ -684,7 +676,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
     ``KernelSpec.load()`` can lazily resolve e.g.
     ``"<module>:<attr>.forward_aot"`` to the bound backend method. Returns
     ``instance`` so group packages can write
-    ``_RMSNORM = register_fused_op(_RMSNormOp(), __name__, "_RMSNORM")``.
+    ``_SILU_AND_MUL = register_fused_op(SiluAndMulOp(), __name__, "_SILU_AND_MUL")``.
     """
     for backend in instance.available_backends():
         register_kernel(
@@ -693,8 +685,6 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
                 backend=backend,
                 target=f"{module}:{attr}.{BACKEND_METHODS[backend]}",
                 capabilities=frozenset(instance.capabilities.get(backend, ())),
-                format_signature=instance.format_signature,
-                description=instance.descriptions.get(backend, ""),
             )
         )
     return instance

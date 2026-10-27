@@ -97,6 +97,7 @@ def _make_model_runner(
 
     mr.use_mla_backend = use_mla_backend
     mr.is_draft_worker = False
+    mr.dflash_draft_cell_size_per_token = None
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
     mr.end_layer = num_layers
@@ -835,6 +836,49 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
+class TestPerWorkerRequestSplit(CustomTestCase):
+    """A --max-running-requests cap below the attention DP size must still leave
+    every worker one request slot, not zero."""
+
+    def test_max_num_reqs_keeps_one_slot_below_dp_size(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, max_running_requests=1)
+        kvc = SimpleNamespace(
+            attn_dp_size=4,
+            mambaish_config=None,
+            model_config=SimpleNamespace(context_len=8192),
+        )
+        self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(kvc, 1 << 20), 1)
+
+    def test_chunk_cache_cap_sizes_one_request_below_dp_size(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=1000,
+            sliding_window_size=4,
+            page_size=1,
+            max_running_requests=1,
+            disaggregation_mode="decode",
+        )
+        mr.attn_dp_size = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1_000_000, page_size=1)
+
+        # One request per worker at 4 + 1 + 4 + 1 = 10 SWA tokens, the same
+        # per-request cost as test_chunk_cache_cap_drops_prefill_for_disagg_decode.
+        self.assertEqual(config.swa_max_total_num_tokens, 10)
+
+
 class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
@@ -1045,6 +1089,49 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
+    def test_non_arch35_npu_budget_uses_compact_indexer_capacity(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+            "shared",
+            "shared",
+        ]
+        available_bytes = 1_000_000
+
+        with (
+            mock_cpu_env(kv_size=2),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            pool_sizes = configurator.calculate_pool_sizes(
+                available_bytes,
+                page_size=1,
+            )
+
+        compact_cell_size = 576 * num_layers * 2 + 128 * 2 * 2
+        dense_cell_size = (576 + 128) * num_layers * 2
+        self.assertEqual(configurator._cell_size, compact_cell_size)
+        self.assertGreater(
+            pool_sizes.max_total_num_tokens,
+            available_bytes // dense_cell_size,
+        )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
     def test_resolved_hicache_override_prices_producer_layers_only(
         self,
         _mock_calculate_mla_kv_cache_dim,
@@ -1243,6 +1330,66 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_pool_setup_prices_the_resolved_layout_and_handles_no_draft(self):
+        import torch
+
+        from sglang.srt.configs.draft_parallel import DraftParallelLayout
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        runner = _make_model_runner(self)
+        draft = SimpleNamespace(
+            dtype=torch.bfloat16,
+            head_dim=64,
+            v_head_dim=32,
+            get_num_kv_heads=lambda tp: 8 // tp,
+        )
+        aux = SpecAuxHiddenStateConfig(
+            draft_model_config=draft, dflash_draft_num_layers=2
+        )
+        layout = DraftParallelLayout(tp_group=None, attn_tp_size=2)
+        for algorithm, is_draft, metadata, expected in (
+            (SpeculativeAlgorithm.DFLASH, False, aux, 4 * (64 + 32) * 2 * 2),
+            (SpeculativeAlgorithm.DFLASH, True, SpecAuxHiddenStateConfig(), None),
+            (SpeculativeAlgorithm.NONE, False, SpecAuxHiddenStateConfig(), None),
+        ):
+            with (
+                self.subTest(algorithm=algorithm, is_draft=is_draft),
+                mock_cpu_env(tp_size=8),
+            ):
+                config = KVCacheConfigurator(
+                    device="cpu",
+                    gpu_id=0,
+                    attn_dp_size=1,
+                    pp_size=1,
+                    pp_group=runner.pp_group,
+                    model=None,
+                    model_config=runner.model_config,
+                    server_args=get_server_args(),
+                    kv_cache_dtype=torch.bfloat16,
+                    model_dtype=torch.bfloat16,
+                    page_size=1,
+                    sliding_window_size=None,
+                    spec_algorithm=algorithm,
+                    is_draft_worker=is_draft,
+                    post_capture_kv_active=False,
+                    spec_aux_config=metadata,
+                    draft_parallel_layout=layout,
+                    is_hybrid_swa=False,
+                    is_hybrid_swa_compress=False,
+                    use_mla_backend=False,
+                    layer_info=runner.layer_info,
+                    forward_stream=None,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    memory_pool_config=None,
+                )
+                self.assertEqual(config.dflash_draft_cell_size_per_token, expected)
+                self.assertIs(config.draft_parallel_layout, layout)
+
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
@@ -1251,8 +1398,9 @@ class TestDflashDraftKvBudget(CustomTestCase):
         mr.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=None,
             dflash_draft_num_layers=5,
-            dflash_draft_cell_size_per_token=draft_kv_per_token,
         )
+
+        mr.dflash_draft_cell_size_per_token = draft_kv_per_token
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
         for dcp_size in (1, 8):
@@ -1287,10 +1435,10 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 swa_num_kv_heads=4,
             )
             mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
-                dflash_draft_cell_size_per_token=draft_kv_per_token,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
@@ -1539,10 +1687,10 @@ class TestSWAPoolFloor(CustomTestCase):
         paged = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 0)
         self.assertEqual(planner.swa_cap_tokens, 0)
-        # Three draft stages of one (128 + 6)-row ring per request slot.
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
         self.assertEqual(
             planner.request_window_bytes - paged.request_window_bytes,
-            (3 * (128 + 6) + 256) * 3 * 584,
+            (3 * 256 + 256) * 3 * 584,
         )
         sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, 0)
@@ -1754,6 +1902,226 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         config = cfg.calculate_pool_sizes(available, 1)
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_fused_swa_entry_replaces_the_swa_terms(self):
+        """A draft placed in the swa sub-pool is priced through the fused swa
+        entry: the separate per-layer swa draft term must go, or the draft is
+        charged twice (once inside the entry, once as a private pool)."""
+        mr, cfg = self._make(fused_entry=None, draft_layers=2)
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 2
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        self.assertEqual(fused._draft_swa_layers_num, 0)
+        self.assertEqual(fused._draft_full_layers_num, 0)
+        self.assertEqual(
+            fused._cell_size,
+            fused._full_per_token * fused._full_layers_num
+            + fused._swa_full_tokens_ratio * 4_321,
+        )
+
+
+class TestDSV4LowRatioBudget(CustomTestCase):
+    """Price the real CPU tensors built by the FlashMLA pool factories.
+
+    These tests select an already-supported layout at the device boundary; they
+    exercise allocation and sizing, not whether a CPU can run the GPU readers.
+    """
+
+    @contextlib.contextmanager
+    def _planner(
+        self, layout, option, page_size, index_page_size, ratios, sources, stage=None
+    ):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=len(ratios),
+            page_size=page_size,
+            sliding_window_size=128,
+            max_running_requests=2,
+        )
+        _publish_config(
+            self,
+            dsv4_attn_backend="flashmla",
+            enable_encoder_swa_bounded_replay=False,
+            page_size=page_size,
+            max_running_requests=2,
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            disaggregation_mode="null",
+            disaggregation_decode_extra_slots=0,
+            chunked_prefill_size=None,
+            enable_hisparse=False,
+        )
+        mr.server_args = get_server_args()
+        mr.kv_cache_dtype_str = "fp8_e4m3"
+        mr.model_config.qk_nope_head_dim = 448
+        mr.model_config.index_head_dim = 128
+        mr.model_config.compress_ratios = ratios
+        mr.model_config.window_size = 128
+        mr.model_config.hf_config.kv_source_layer_ids = sources
+        if stage is not None:
+            mr.layer_info.start_layer, mr.layer_info.end_layer = stage
+            mr.pp_size = 2
+        module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
+        with (
+            patch(
+                f"{module}.select_dsv4_kv_layout",
+                return_value=(KVLayout(layout), option),
+            ),
+            patch(f"{module}.DSV41_INDEX_PAGE_SIZE", index_page_size),
+        ):
+            planner = DSV4PoolConfigurator(mr)
+            # Isolate global KV and its request-scoped pair state. SWA's existing
+            # ratio/cap/replay tests above cover its separate budget contract.
+            planner.swa_cap_tokens = 0
+            planner.request_window_bytes = 0
+            planner.bytes_per_full_token = planner._get_bytes_per_full_token()
+            yield planner
+
+    def _allocated_bytes(self, planner, full_tokens, layout, option):
+        import torch
+
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        # Run the production factories, including their page rounding and
+        # dummy pages, without allocating unrelated SWA or model weights.
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.uniform_fp8 = False
+        pool.compressed_pool_configs = {}
+        pool.sources_by_ratio = planner.stage_owner_layers
+        pool.full_size = full_tokens
+        pool.qk_nope_head_dim = 448
+        pool.qk_rope_head_dim = 64
+        pool.indexer_head_dim = 128
+        pool.kv_layout = KVLayout(layout)
+        pool.compressed_kv_layout_option = option
+        pool.device = "cpu"
+        pool.num_req_slots = planner.requested_max_running_requests_per_worker + 1
+        pool._init_compressed_pools(
+            stage_ratios=planner.stage_compress_ratios,
+            page_size=planner.page_size,
+            dtype=torch.float8_e4m3fn,
+            device="cpu",
+            enable_memory_saver=False,
+            enable_hisparse=False,
+            kv_pool_cls=DeepSeekV4SingleKVPool,
+        )
+        main = sum(b.nbytes for p in pool.kv_pools.values() for b in p.kv_buffer)
+        index = sum(
+            b.nbytes
+            for p in pool.index_pools.values()
+            for b in p.contiguous_page_row_buffers()
+        )
+        state = sum(
+            pool._make_pair_state_pool(False).kv_score_buffer.kv_score.nbytes
+            for _ in pool.sources_by_ratio.get(2, ())
+        )
+        return main, index, state
+
+    def test_low_ratio_coefficient_matches_allocated_growth(self):
+        for layout, option in (("v4", None), ("v41", "fp8"), ("v41", None)):
+            with (
+                self.subTest(layout=layout, option=option),
+                self._planner(
+                    layout, option, 256, 128, [2, 2, 2, 1], [0, 1, 2, 3]
+                ) as planner,
+            ):
+                # V4 page padding, V41 FP8, and default V41 FP4 pricing.
+                small = self._allocated_bytes(planner, 0, layout, option)
+                large = self._allocated_bytes(planner, 512, layout, option)
+                self.assertEqual(
+                    planner.bytes_per_full_token * 512, sum(large) - sum(small)
+                )
+                self.assertEqual(small[2], large[2])
+
+    def test_low_ratio_capacity_matches_allocated_page_boundaries(self):
+        # At full page 128 / ratio 2, 256 tokens plus both reserved pages
+        # need 320 index slots, rounded up to 384. The one-byte-under check
+        # catches omitting that rounding as well as omitting reserved pages.
+        for page, tokens in ((256, 512), (128, 256)):
+            with (
+                self.subTest(page=page, tokens=tokens),
+                self._planner(
+                    "v41", "fp4", page, 128, [2, 2, 2, 1], [0, 1, 2, 3]
+                ) as planner,
+            ):
+                budget = sum(self._allocated_bytes(planner, tokens, "v41", "fp4"))
+                config = planner.calculate_pool_sizes(budget, page)
+                self.assertEqual(config.max_total_num_tokens, tokens)
+                smaller = planner.calculate_pool_sizes(budget - 1, page)
+                self.assertEqual(smaller.max_total_num_tokens, tokens - page)
+
+    def test_low_ratio_capacity_counts_only_stage_local_owners(self):
+        # Exclude both the owner outside this stage and reused layers within it.
+        with self._planner(
+            "v41", "fp4", 256, 128, [2, 2, 2, 1, 1], [0, 2, 3], stage=(2, 5)
+        ) as planner:
+            self.assertEqual(planner.stage_owner_layers, {1: [3], 2: [2]})
+            budget = sum(self._allocated_bytes(planner, 512, "v41", "fp4"))
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
+            )
+
+    def test_no_low_ratio_owners_add_no_padding(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        planner = object.__new__(DSV4PoolConfigurator)
+        planner._unified = False
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+            side_effect=AssertionError(
+                "a stage without low-ratio owners needs no layout"
+            ),
+        ):
+            for owners in ({}, {4: [0], 128: [1]}):
+                planner.stage_owner_layers = owners
+                self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+
+    def test_other_backends_keep_existing_byte_contract(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        # Exercise sizing guards only; this does not assert these backends can
+        # serve a low-ratio model or use the FlashMLA layouts.
+        for unified, npu, backend, kv_bytes in (
+            (True, False, "flashmla", 1024),
+            (False, True, "flashmla", 584),
+            (False, False, "trtllm", 512),
+        ):
+            with self.subTest(unified=unified, npu=npu, backend=backend):
+                _publish_config(self, dsv4_attn_backend=backend)
+                planner = object.__new__(DSV4PoolConfigurator)
+                planner._unified = unified
+                planner.kv_bytes = kv_bytes
+                planner.low_ratio_index_bytes = 68
+                planner.stage_owner_layers = {1: [0], 2: [1]}
+                with (
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", npu),
+                    patch(
+                        "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+                        side_effect=AssertionError(
+                            "this backend does not use FlashMLA pages"
+                        ),
+                    ),
+                ):
+                    for ratio in (1, 2):
+                        self.assertEqual(
+                            planner._compressed_bytes_per_full_token(ratio),
+                            (kv_bytes + 68) / ratio,
+                        )
+                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
 
 
 if __name__ == "__main__":

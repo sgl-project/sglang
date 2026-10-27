@@ -175,25 +175,8 @@ void deepseek_v4_topk_transform_512(
 #endif
 
 /*
- * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ * From csrc/elementwise (DeepSeek-V4 indexer rope + hadamard quant)
  */
-void dsv4_fused_q_norm_rope(
-    const at::Tensor& q_input,
-    at::Tensor& q_output,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    double eps);
-
-void dsv4_fused_k_norm_rope_flashmla(
-    const at::Tensor& kv,
-    const at::Tensor& kv_weight,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    const at::Tensor& out_loc,
-    at::Tensor& kvcache,
-    double eps,
-    int64_t page_size);
-
 void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& q_input,
     at::Tensor& q_fp8,
@@ -275,6 +258,10 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+/// \brief Weight contiguous expert rows in place, writing zero for negative expert IDs.
+/// The paired GGUF projections accept negative IDs and bound padding metadata reads.
+void apply_gguf_moe_weights(torch::Tensor& outputs, const torch::Tensor& weights, const torch::Tensor& ids);
+
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -316,25 +303,8 @@ void apply_shuffle_mul_sum(
     const std::optional<torch::Tensor>& factors);
 
 /*
- * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ * From csrc/elementwise (DeepSeek-V4 indexer rope + hadamard quant)
  */
-void dsv4_fused_q_norm_rope(
-    const at::Tensor& q_input,
-    at::Tensor& q_output,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    double eps);
-
-void dsv4_fused_k_norm_rope_flashmla(
-    const at::Tensor& kv,
-    const at::Tensor& kv_weight,
-    const at::Tensor& freqs_cis,
-    const at::Tensor& positions,
-    const at::Tensor& out_loc,
-    at::Tensor& kvcache,
-    double eps,
-    int64_t page_size);
-
 void dsv4_fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& q_input,
     at::Tensor& q_fp8,
