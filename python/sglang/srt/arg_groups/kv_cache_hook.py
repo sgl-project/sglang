@@ -481,7 +481,6 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
         "triton",
         "trtllm_mla",
         "cutedsl_mla",
-        "tokenspeed_mla",
         "flashmla",
         "flashinfer",
         "fa3",
@@ -749,7 +748,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     # The trtllm_mla family builds its DCP block table through the pool's v2p
     # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
     # two-stage contract as flashinfer.
-    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= dcp_allowed, (
@@ -806,7 +805,6 @@ def handle_page_major_kv_layout(server_args: Any):
             "trtllm_mla",
             "flashinfer",
             "cutedsl_mla",
-            "tokenspeed_mla",
             "flashmla",
         }
     elif model_config.has_asymmetric_kv:

@@ -21,7 +21,8 @@ import itertools
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range, should_run_full_tests
+from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -32,9 +33,9 @@ from sglang.kernels.ops.quantization.per_token_group_quant import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=65, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=200, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
 
 G = 128
 FMAX = float(fp8_max)  # 448 for e4m3
@@ -417,10 +418,10 @@ def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind)
     """The masked kernel's grid is capped at the resident CTAs, so one CTA may walk
     several real rows of masked_m. Every real row must match the contig kernel
     byte for byte, and no padded row may be written."""
-    from sglang.kernels.ops.moe.dsv4 import (
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
         silu_and_mul_contig_post_quant,
-        silu_and_mul_masked_post_quant,
     )
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 
     group_size, hidden, experts, topk = 128, 2048, 8, 8
     scale_ue8m0 = transposed
@@ -525,6 +526,124 @@ def test_fused_silu(scale_ue8m0, column_major):
 
     deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G) if scale_ue8m0 else x_s
     assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
+
+
+def _check_dense_silu(x, scale_ue8m0, column_major):
+    original = x.view(torch.int16).clone()
+    kwargs = dict(scale_ue8m0=scale_ue8m0, column_major_scales=column_major)
+    expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
+    q, s = per_token_group_quant(
+        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), expected_s.view(torch.int32))
+    assert torch.equal(x.view(torch.int16), original)
+
+
+@pytest.mark.parametrize(
+    "dtype,scale_ue8m0,column_major",
+    get_ci_test_range(
+        list(
+            itertools.product(
+                [torch.bfloat16, torch.float16], [False, True], [False, True]
+            )
+        ),
+        [
+            (torch.bfloat16, True, True),
+            (torch.float16, True, True),
+            (torch.bfloat16, False, False),
+        ],
+    ),
+)
+@pytest.mark.parametrize(
+    "shape",
+    get_ci_test_range(
+        [(1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)],
+        [(1, 768), (32, 14336)],
+    ),
+)
+def test_dense_silu_bitexact(dtype, shape, scale_ue8m0, column_major):
+    """Dense fusion preserves the separately stored activation's rounding.
+
+    The legacy fused mode rounds SiLU before multiplication and fails this
+    comparison. Use the real CUDA activation as the compiler-math reference.
+    """
+    torch.manual_seed(42)
+    m, h = shape
+    x = torch.randn(m, 2 * h, device="cuda", dtype=dtype) * 3
+    x[0, :8] = torch.tensor(
+        [0.0, -0.0, 1e-6, -1e-6, 100, -100, float("inf"), float("nan")],
+        device="cuda",
+        dtype=dtype,
+    )
+    _check_dense_silu(x, scale_ue8m0, column_major)
+
+
+@pytest.mark.skipif(
+    not should_run_full_tests(),
+    reason="Set SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 for the sweep",
+)
+def test_dense_silu_extended():
+    """Opt-in amplitude/layout sweep and all 65,536 BF16/FP16 gate encodings."""
+    torch.manual_seed(20261017)
+    layouts = list(itertools.product((False, True), repeat=2))
+    for dtype in (torch.bfloat16, torch.float16):
+        for (m, k), amplitude in itertools.product(
+            ((1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)),
+            (0, 0.001, 1, 10, 100),
+        ):
+            x = (torch.randn(m, 2 * k, device="cuda") * amplitude).to(dtype)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
+        # Signed zeros, subnormals, finite extremes, infinities and NaNs.
+        gate = (
+            torch.arange(65536, device="cuda", dtype=torch.int32)
+            .to(torch.int16)
+            .view(dtype)
+            .reshape(64, 1024)
+        )
+        for up_value in (0, 0.25, 1, 1.125, -2.25):
+            x = torch.cat((gate, torch.full_like(gate, up_value)), dim=1)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
+
+
+def test_dense_silu_graph_replay():
+    """Replays must use new input values and retain the allocated output buffers."""
+    x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(scale_ue8m0=True, column_major_scales=True)
+    q, s = per_token_group_quant(
+        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        per_token_group_quant(
+            x, q, s, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+        )
+    for amplitude in (0, 0.001, 10):
+        x.normal_().mul_(amplitude)
+        graph.replay()
+        expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
+        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(s, expected_s)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"silu_and_mul_mode": "unknown"},
+        {"fuse_silu_and_mul": False},
+        {"out_dtype": torch.int8},
+        {"group_size": 64},
+        {"masked_m": torch.tensor([1], dtype=torch.int32)},
+    ],
+)
+def test_dense_silu_invalid_mode(overrides):
+    x = torch.zeros(1, 256, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(fuse_silu_and_mul=True, silu_and_mul_mode="dense")
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match="mode"):
+        per_token_group_quant(x, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -690,21 +809,16 @@ NON_FINITE_CASES = get_ci_test_range(
 
 
 @pytest.mark.parametrize("poison,scale_ue8m0,masked", NON_FINITE_CASES)
-def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
-    """CUDA-graph capture warmup runs the model on reused, uninitialized
-    buffers, so quant inputs can contain NaN/Inf bit patterns. The v1/v2/Triton
-    kernels clamp before converting (IEEE fminf/fmaxf drop the NaN operand),
-    quantizing non-finite values to +-fp8_max; emitting fp8 NaN codes instead
-    poisons the downstream GEMM and trips the sampler NaN check
-    (TestTBOWithTPAttn H100 CI). Pin the sanitizing behavior."""
+def test_fp16_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
+    """FP16 scaling can overflow for finite inputs; retain its sanitization."""
     torch.manual_seed(0)
     if masked:
-        x = torch.randn(4, 32, 512, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(4, 32, 512, device="cuda", dtype=torch.float16)
         x[1, 3, 100] = poison
         x[2, 0, 300] = poison
         masked_m = torch.tensor([32, 16, 4, 0], device="cuda", dtype=torch.int32)
     else:
-        x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(16, 512, device="cuda", dtype=torch.float16)
         x[3, 100] = poison
         x[7, 500] = poison
         masked_m = None
@@ -723,6 +837,95 @@ def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
     else:
         written = x_q
     assert not torch.isnan(written.float()).any(), "quant emitted fp8 NaN codes"
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["plain", "fused"])
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_bf16_nan_inputs_are_preserved(fused, scale_ue8m0, masked):
+    torch.manual_seed(0)
+    hidden = 384
+    shape = (4, 32, hidden) if masked else (17, hidden)
+    input_shape = (*shape[:-1], hidden * (2 if fused else 1))
+    x = torch.randn(input_shape, device="cuda", dtype=torch.bfloat16)
+    if masked:
+        x[0, 0, :G] = float("nan")
+        x[1, 3, 100:102] = float("nan")
+        x[1, 3, 103] = 0.0
+        x[2, 2, -1] = float("nan")
+        if fused:
+            x[1, 2, hidden + G + 17] = float("nan")
+        masked_m = torch.tensor([31, 17, 3, 0], device="cuda", dtype=torch.int32)
+        for e, m in enumerate(masked_m.tolist()):
+            x[e, m:] = float("nan")
+    else:
+        x[0, :G] = float("nan")
+        x[3, 100:102] = float("nan")
+        x[3, 103] = 0.0
+        x[7, -1] = float("nan")
+        if fused:
+            x[5, hidden + G + 17] = float("nan")
+        masked_m = None
+
+    x_q = torch.zeros(shape, device="cuda", dtype=fp8_dtype)
+    x_s = _alloc_scale(shape, column_major=True, scale_ue8m0=scale_ue8m0)
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        G,
+        scale_ue8m0=scale_ue8m0,
+        masked_m=masked_m,
+        fuse_silu_and_mul=fused,
+    )
+    quant_input = _ref_silu_mul(x, hidden) if fused else x
+    expected_nan = torch.isnan(quant_input)
+    if masked:
+        for e, m in enumerate(masked_m.tolist()):
+            expected_nan[e, m:] = False
+            assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding codes touched"
+            assert torch.all(x_s[e, m:] == 0), "padding scales touched"
+    assert torch.equal(torch.isnan(x_q.float()), expected_nan), "NaN positions changed"
+
+
+@pytest.mark.parametrize(
+    "capture_nan", [False, True], ids=["finite-capture", "dirty-capture"]
+)
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+def test_bf16_nan_inputs_are_preserved_on_graph_replay(scale_ue8m0, capture_nan):
+    x = torch.ones((17, 384), device="cuda", dtype=torch.bfloat16)
+    x_q = torch.empty_like(x, dtype=fp8_dtype)
+    x_s = _alloc_scale(x.shape, column_major=True, scale_ue8m0=scale_ue8m0)
+
+    def quantize():
+        per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=scale_ue8m0)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        quantize()
+    torch.cuda.current_stream().wait_stream(stream)
+    finite_codes = x_q.view(torch.int8).clone()
+    finite_scales = x_s.clone()
+    if capture_nan:
+        x[3, 100] = float("nan")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        quantize()
+    graph.replay()
+    assert torch.equal(torch.isnan(x_q.float()), torch.isnan(x))
+
+    x[3, 100] = float("nan")
+    graph.replay()
+    assert torch.equal(torch.isnan(x_q.float()), torch.isnan(x))
+
+    x.fill_(1.0)
+    graph.replay()
+    assert torch.equal(x_q.view(torch.int8), finite_codes), (
+        "finite codes changed after replay"
+    )
+    assert torch.equal(x_s, finite_scales), "finite scales changed after replay"
 
 
 def test_mn_major_tma_aligned_transform_keeps_ownership():

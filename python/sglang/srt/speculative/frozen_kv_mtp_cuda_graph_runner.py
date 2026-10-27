@@ -357,7 +357,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
         try:
-            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
                     forward_batch
                 )
