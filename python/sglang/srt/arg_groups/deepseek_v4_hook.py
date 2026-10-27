@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -60,6 +61,69 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     return "flashmla_mega"
 
 
+_DEPRECATED_ENGRAM_ENVS = (
+    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE",
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT",
+    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS",
+)
+
+
+def _engram_config_from_env(cfg) -> dict:
+    """The --engram-config the deprecated environment variables ask for."""
+    if (
+        envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
+        and cfg.tp_size > 1
+        and get_platform().is_cuda
+    ):
+        return {"placement": "gpu", "lookup": "peer_read"}
+    if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        if layout not in ("shared", "per_rank"):
+            raise ValueError(
+                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; "
+                "expected 'shared' or 'per_rank'"
+            )
+        replication = "per_node" if layout == "shared" else "none"
+        return {"placement": "cpu", "replication": replication}
+    return {}
+
+
+def _resolve_engram_config(server_args: ServerArgs) -> None:
+    """Resolve --engram-config, or the deprecated environment variables it
+    replaces, into the one value the Engram layers read."""
+    from sglang.srt.layers.engram_config import EngramConfig
+
+    cfg = resolving_view(server_args)
+    raw = cfg.engram_config
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if raw is not None:
+            raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
+        return
+    legacy = [n for n in _DEPRECATED_ENGRAM_ENVS if getattr(envs, n).is_set()]
+    if legacy and raw is None:
+        raw = _engram_config_from_env(cfg)
+        logger.warning(
+            "%s deprecated; use --engram-config '%s' instead.",
+            ", ".join(legacy),
+            json.dumps(raw),
+        )
+    elif legacy:
+        logger.warning("--engram-config is set; ignoring %s.", ", ".join(legacy))
+    config = EngramConfig.from_dict(raw)
+    if config.lookup == "peer_read" and not get_platform().is_cuda:
+        raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    # One mapping per TP group, shared by its ranks through /proc.
+    if config.replication == "per_node" and cfg.nnodes > 1:
+        raise ValueError(
+            "--engram-config: replication 'per_node' needs the TP group on one "
+            "node (--nnodes 1)."
+        )
+    declare_resolution(
+        server_args, "_resolve_engram_config", engram_config=config.to_dict()
+    )
+    logger.info("DeepSeek-V4.1 Engram tables: %s", config)
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -81,6 +145,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    _resolve_engram_config(server_args)
 
     if cfg.dsv4_attn_backend == "auto":
         declare_resolution(

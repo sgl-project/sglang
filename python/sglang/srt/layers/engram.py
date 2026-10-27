@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.engram_config import EngramConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -64,7 +65,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -689,11 +690,6 @@ class _HostTable:
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group):
-        if layout not in ("shared", "per_rank"):
-            raise ValueError(
-                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
-                "'shared' or 'per_rank'"
-            )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
@@ -800,14 +796,6 @@ class _HostTable:
             )
         else:
             logger.info(msg)
-
-
-@functools.cache
-def _warn_host_table_ignored() -> None:
-    logger.warning(
-        "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS takes precedence: the engram tables "
-        "stay in device memory and SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE is ignored"
-    )
 
 
 class _PeerShards:
@@ -986,9 +974,9 @@ class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
     Rows are sharded over the TP group in device memory, aligned to the hash
-    columns where they divide evenly (`shard_range`); with
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
-    one shared copy or one shard per rank (see _HostTable). Loading is sharded
+    columns where they divide evenly (`shard_range`); --engram-config can read
+    the peers' shards in place or keep the rows in host memory instead, as one
+    shard per rank or one copy per node (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
 
@@ -1011,19 +999,15 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        if (
-            envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
-            and self.tp_size > 1
-            and is_cuda()
-        ):
-            if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get() and tp_rank == 0:
-                _warn_host_table_ignored()
+        config = EngramConfig.from_dict(get_exec().offload.engram_config)
+        if config.lookup == "peer_read" and self.tp_size > 1:
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
-        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
-            self._init_host_table(num_embeddings, dim, layer_id)
+        elif config.placement == "cpu":
+            layout = "shared" if config.replication == "per_node" else "per_rank"
+            self._init_host_table(num_embeddings, dim, layer_id, layout)
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -1038,8 +1022,9 @@ class EngramEmbedding(nn.Module):
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
-    def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+    def _init_host_table(
+        self, num_embeddings: int, dim: int, layer_id: int, layout: str
+    ):
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)

@@ -1796,23 +1796,19 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
-    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
-    # below) and gather rows from the GPU instead of sharding them over HBM.
+    # Deprecated: --engram-config '{"placement": "cpu"}'. Read only by server-arg
+    # resolution (_resolve_engram_config), which translates it.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
-    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
-    # anonymous mapping per rank holding only its rows, gathered with the
-    # all-reduce, and the only layout that gets huge pages without shmem THP.
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Deprecated: --engram-config "replication"; "shared" is "per_node" and
+    # "per_rank" is "none".
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
-    # Keep each rank's engram row shard in exportable device memory (CUDA VMM,
-    # FABRIC handles across an NVLink domain) mapped by every rank of the TP group:
-    # a rank reads its own tokens' rows from the owning shard, with no id gather
-    # and no reduce-scatter. Takes precedence over the host table.
+    # Deprecated: --engram-config '{"lookup": "peer_read"}'; takes precedence over
+    # SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE, as before.
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
