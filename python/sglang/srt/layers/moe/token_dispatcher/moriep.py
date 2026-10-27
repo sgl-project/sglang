@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
+    is_gfx1250_supported,
     is_hip,
 )
 
@@ -1467,13 +1468,26 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
 
     def _restrict_transport_dtypes(self) -> None:
         # The SDMA / low_latency kernels move bf16 or fp8 tokens and combine
-        # unquantized.
+        # unquantized. In place of fp4, MXFP8 keeps the MoE's group-32 e8m0
+        # layout and moves half of bf16's bytes. gfx1250's a8w4 MoE quantizes its
+        # bf16 input itself and takes no pre-quantized activation, so stay bf16.
         if self.dispatch_dtype == DispatchDtype.fp4:
+            fp4_weights = (
+                self.quant_config is not None
+                and self.quant_config.get("weight_dtype") == torch.float4_e2m1fn_x2
+            )
+            fallback = (
+                DispatchDtype.mxfp8
+                if fp4_weights
+                and not is_gfx1250_supported()
+                and _aiter_supports_mxfp8_dispatch()
+                else DispatchDtype.bf16
+            )
             logger.warning_once(
                 "MORI EPv2 SDMA / low_latency transport has no fp4 dispatch; "
-                "falling back to bf16 dispatch."
+                f"falling back to {fallback.name} dispatch."
             )
-            self.dispatch_dtype = DispatchDtype.bf16
+            self.dispatch_dtype = fallback
         if self.combine_dtype != CombineDtype.bf16:
             logger.warning_once(
                 f"MORI EPv2 SDMA / low_latency transport has no {self.combine_dtype} "
