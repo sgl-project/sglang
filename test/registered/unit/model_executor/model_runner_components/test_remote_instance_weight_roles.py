@@ -115,8 +115,11 @@ class TestPublicationRoles(CustomTestCase):
             },
         )
 
-    def test_a_rank_without_a_transfer_engine_publishes_no_transfer_engine_info(self):
-        """Only a rank whose weights a transfer engine registered has a session to name; its layout still publishes."""
+    def test_a_rank_without_a_transfer_engine_publishes_its_weight_locations_but_no_session(
+        self,
+    ):
+        """A colocated peer copies into the published locations without a transfer engine, so they publish even
+        though there is no session to name."""
         server, url = _start_bootstrap_server()
         self.addCleanup(server.close)
         _publish("target", None, server.port, with_transfer_engine=False)
@@ -132,7 +135,7 @@ class TestPublicationRoles(CustomTestCase):
             get("get_rank_info").json(),
             {
                 "parallelism_config": {"published_by": "target"},
-                "weight_locations": None,
+                "weight_locations": {"target.weight": [1, 4, 2]},
                 "transfer_session_id": None,
             },
         )

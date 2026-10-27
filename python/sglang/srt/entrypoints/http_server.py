@@ -153,6 +153,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1518,6 +1519,25 @@ async def end_weight_update(
 ):
     """Close the weight-update session and finalize quantized weights."""
     success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/update_weights_from_colocated_param_bytes")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_colocated_param_bytes(
+    obj: Annotated[UpdateWeightsFromColocatedParamBytesReqInput, Body()],
+    request: Request,
+):
+    """Pull param bytes from the colocated trainer processes inside an open weight-update session."""
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_colocated_param_bytes(
         obj, request
     )
     return ORJSONResponse(
