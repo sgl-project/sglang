@@ -599,6 +599,173 @@ class TestStageDeploymentFlux3(TestDisaggFlux3Image):
         asyncio.run(check())
 
 
+class TestStageEncoderPools(CustomTestCase):
+    """Public checkpoints, 2:1 replicas, targeted tensor returns, and bounded prefetch.
+
+    Shares one GPU for this functional test; use separate GPUs for throughput tests.
+    """
+
+    def test_targeted_encoders_and_prefetch(self):
+        from io import BytesIO
+        from tempfile import TemporaryDirectory
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+            DeploymentServer,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+            Deployment,
+            ExecutionPlan,
+        )
+
+        _require_gpus(1)
+        model = "Tongyi-MAI/Z-Image-Turbo"
+        cluster = DisaggCluster(model, "encoder_pools", {})
+        text_endpoints = [f"tcp://{HOST}:{find_free_port(HOST)}" for _ in range(2)]
+        deployment = {
+            "stages": [
+                {"name": "InputValidationStage", "after": []},
+                {
+                    "name": "TextEncodingStage",
+                    "outputs": ["prompt_embeds"],
+                    "components": ["text_encoder", "tokenizer"],
+                    "after": [],
+                },
+                {
+                    "name": "ImageVAEEncodingStage",
+                    "outputs": ["image_latent"],
+                    "components": ["vae"],
+                    "after": ["InputValidationStage"],
+                },
+            ],
+            "roles": {
+                "text": {
+                    "stages": ["TextEncodingStage"],
+                    "node": "text",
+                    "endpoints": text_endpoints,
+                },
+                "image": {
+                    "stages": ["InputValidationStage", "ImageVAEEncodingStage"],
+                    "node": "image",
+                    "endpoints": [f"tcp://{HOST}:{find_free_port(HOST)}"],
+                    "server_args": {
+                        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+                        "num_gpus": 1,
+                    },
+                },
+            },
+            "outputs": ["prompt_embeds", "image_latent"],
+        }
+        reference = BytesIO()
+        Image.new("RGB", (256, 256), "teal").save(reference, format="PNG")
+        request = {
+            "prompt": "A red teapot",
+            "width": 256,
+            "height": 256,
+            "seed": 42,
+            "image_path": [
+                "data:image/png;base64,"
+                + base64.b64encode(reference.getvalue()).decode()
+            ],
+        }
+        endpoint = f"tcp://{HOST}:{cluster.base_port}"
+
+        async def check():
+            async with EncodingClient(endpoint, max_in_flight=2) as client:
+                text, image = await asyncio.gather(
+                    client.encode(request, role="text"),
+                    client.encode(request, role="image"),
+                )
+                expected = {**text, **image}
+                self.assertTrue(
+                    all(
+                        t.is_cuda and torch.isfinite(t).all()
+                        for t in tree_leaves(expected)
+                    )
+                )
+                torch.testing.assert_close(
+                    await client.encode(request), expected, rtol=0, atol=0
+                )
+                async with client.prefetch(
+                    [request] * 6, role="text", depth=3
+                ) as batches:
+                    count = 0
+                    async for result in batches:
+                        torch.testing.assert_close(result, text, rtol=0, atol=0)
+                        count += 1
+                    self.assertEqual(count, 6)
+                async with client.prefetch(
+                    [request] * 20, role="image", depth=3
+                ) as batches:
+                    await anext(batches)
+                self.assertFalse(client.pending)
+                with self.assertRaises(RuntimeError):
+                    await client.encode(request, role="missing")
+                torch.testing.assert_close(
+                    await client.encode(request, role="text"), text, rtol=0, atol=0
+                )
+
+        with TemporaryDirectory(prefix="encoder-pools-") as directory:
+            path = Path(directory) / "deployment.json"
+            path.write_text(json.dumps(deployment))
+            server = DeploymentServer(
+                ExecutionPlan.compile(Deployment.load(path)), timeout=120, capacity=4
+            )
+            try:
+                # Exercise both node-level model overrides and independently launched replicas.
+                for index, (role, address) in enumerate(
+                    [("image", None), *[("text", e) for e in text_endpoints]]
+                ):
+                    mode = (
+                        ["--stage-node", "image"]
+                        if role == "image"
+                        else ["--stage-role", role, "--stage-endpoint", address]
+                    )
+                    log = _LOG_DIR / f"disagg_encoder_pools_{index}.log"
+                    proc = cluster._start_proc(
+                        [
+                            "sglang",
+                            "serve",
+                            "--model-path",
+                            model,
+                            "--stage-deployment",
+                            str(path),
+                            *mode,
+                            "--num-gpus",
+                            "1",
+                            "--warmup-mode",
+                            "off",
+                            "--master-port",
+                            str(find_free_port(HOST)),
+                            "--scheduler-port",
+                            str(find_free_port(HOST)),
+                        ],
+                        log,
+                    )
+                    self.assertTrue(
+                        _wait_for_log(
+                            log,
+                            f"Stage role {role} ready",
+                            cluster.startup_timeout,
+                            proc,
+                        ),
+                        _tail_log(log),
+                    )
+                server.start(endpoint)
+                asyncio.run(check())
+                self.assertFalse(server.leases)
+                self.assertFalse(server.jobs)
+            finally:
+                if server.thread is not None:
+                    server.stop()
+                cluster.stop()
+
+
 # ---------------------------------------------------------------------------
 # Disagg + OTel tracing
 # ---------------------------------------------------------------------------

@@ -23,6 +23,14 @@ This page describes the experimental `--stage-deployment` path; the existing
 index `i`, the base GPU is `base_gpu_id + i * num_gpus`. Each replica has
 its own model components, transfer pool, and internal scheduler/master ports.
 
+Same-checkpoint workers inherit explicit parent settings and resolve automatic
+parallelism and placement for their own GPU count. A role specifying
+`server_args.model_path` instead builds a fresh model configuration and inherits
+only `disagg_*` transport settings; put its precision, backend, and placement
+overrides in that role's `server_args`. Mixed-checkpoint deployments require
+explicit top-level stage contracts, with matching factories in each selected
+pipeline. Stage names remain unique across the deployment.
+
 For an individually managed role, use its registered endpoint:
 
 ```bash

@@ -3682,6 +3682,7 @@ class TestPerRoleParallelism(unittest.TestCase):
 
         with (
             patch.object(PipelineConfig, "from_kwargs", side_effect=config),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
             mock_cuda_platform(),
         ):
             source = ServerArgs.from_kwargs(

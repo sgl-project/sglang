@@ -5,6 +5,7 @@ import asyncio
 import json
 import pickle
 import sys
+import threading
 from graphlib import CycleError
 from types import SimpleNamespace
 
@@ -13,7 +14,7 @@ import torch
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.disaggregation.deployment import client
+from sglang.multimodal_gen.runtime.disaggregation.deployment import client, transport
 from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
     DeploymentServer,
 )
@@ -387,7 +388,9 @@ def test_coordinator_parallel_join_and_cleanup():
             await server.release(result["lease"])
             assert not live
             with pytest.raises(KeyError):
-                await server.execute(Req(), ["extra.image"], role="text")
+                await server.execute(
+                    Req(prompt="text only"), ["extra.image"], role="text"
+                )
             assert not live
             control = context.socket(zmq.ROUTER)
             sockets.append(control)
@@ -549,6 +552,68 @@ def test_client_prefetch_is_bounded_ordered_and_cleans_up(monkeypatch):
             assert not active and not encoder.pending
             result = await encoder.encode(0, role="image")
             assert result["image"].tolist() == [0]
+
+    asyncio.run(asyncio.wait_for(run(), 5))
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_receive_waits_for_copy_before_freeing_slot(monkeypatch, cancel):
+    entered, complete = threading.Event(), threading.Event()
+    freed = []
+    tensors, scalar = pack_fields({"extra.value": torch.ones(2)})
+
+    class CopyEvent:
+        def synchronize(self):
+            entered.set()
+            assert complete.wait(2)
+
+    def load(key, manifest, device, *, stream):
+        assert stream is receiver.receive_stream
+        return tensors, CopyEvent()
+
+    def free(key):
+        assert complete.is_set()
+        freed.append(key)
+
+    async def reply(*args):
+        return {"manifest": {}, "scalar": scalar}
+
+    monkeypatch.setattr(transport, "rpc", reply)
+    receiver = object.__new__(transport.TensorTransport)
+    receiver.device = torch.device("cpu")
+    receiver.receive_stream = object()
+    receiver.manager = SimpleNamespace(
+        allocate_receive_slot=lambda *args: SimpleNamespace(
+            slot=SimpleNamespace(offset=0)
+        ),
+        session_id="test",
+        pool_data_ptr=0,
+        load_tensors_async=load,
+        free_receive_slot=free,
+    )
+
+    async def run():
+        source = {
+            "fields": ["extra.value"],
+            "sizes": {"extra.value": 8},
+            "endpoint": "unused",
+            "ticket": "test",
+        }
+        task = asyncio.create_task(receiver.receive(None, source, 1))
+        # another coroutine can run while the receive stream is busy
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not freed
+        if cancel:
+            task.cancel()
+            timer = threading.Timer(0.02, complete.set)
+            timer.start()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            timer.join()
+        else:
+            complete.set()
+            assert (await task)["extra.value"].tolist() == [1, 1]
+        assert len(freed) == 1
 
     asyncio.run(asyncio.wait_for(run(), 5))
 

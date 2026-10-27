@@ -350,6 +350,104 @@ runs independent branches concurrently and waits for their results at the join.
 See the [stage deployment reference](/docs/sglang-diffusion/disaggregation/stage-contracts)
 for a matching placement example, field semantics, and integration requirements.
 
+## Encoder-only pools
+
+A deployment can stop at encoding: no denoiser or decoder is required. Use
+explicit contracts with named tensor outputs, and list those fields in
+`outputs`. Each role can have its own checkpoint and replica count.
+
+For example, this three-GPU deployment pairs two Z-Image text encoders with
+one FLUX.2 Klein VAE encoder. It returns the pipelines' existing conditioning
+tensors, not a new training-specific representation:
+
+```json encoder-pools.json
+{
+  "stages": [
+    {"name": "InputValidationStage", "after": []},
+    {"name": "TextEncodingStage", "outputs": ["prompt_embeds"],
+     "components": ["text_encoder", "tokenizer"], "after": []},
+    {"name": "ImageVAEEncodingStage", "outputs": ["image_latent"],
+     "components": ["vae"], "after": ["InputValidationStage"]}
+  ],
+  "roles": {
+    "text": {
+      "stages": ["TextEncodingStage"],
+      "endpoints": ["tcp://127.0.0.1:19000", "tcp://127.0.0.1:19001"],
+      "server_args": {"num_gpus": 1, "base_gpu_id": 0}
+    },
+    "image": {
+      "stages": ["InputValidationStage", "ImageVAEEncodingStage"],
+      "endpoints": ["tcp://127.0.0.1:19010"],
+      "server_args": {"model_path": "black-forest-labs/FLUX.2-klein-4B",
+                      "num_gpus": 1, "base_gpu_id": 2}
+    }
+  },
+  "outputs": ["prompt_embeds", "image_latent"]
+}
+```
+
+Launch the workers and coordinator in separate terminals:
+
+```bash
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
+  --stage-deployment encoder-pools.json --stage-node local
+
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
+  --stage-deployment encoder-pools.json --scheduler-port 19090
+```
+
+`EncodingClient` talks to the coordinator's private scheduler endpoint, not
+its HTTP port. It selects a pool by role name and pulls named results directly
+from the selected workers onto the caller's GPU:
+
+```python
+import asyncio
+from sglang.multimodal_gen.runtime.disaggregation.deployment.client import EncodingClient
+
+async def encode_sample(image_url):
+    async with EncodingClient("tcp://127.0.0.1:19090", device="cuda:0") as client:
+        text, image = await asyncio.gather(
+            client.encode({"prompt": "A red teapot"}, role="text"),
+            client.encode({"prompt": "A red teapot", "image_path": [image_url],
+                           "width": 512, "height": 512, "seed": 42}, role="image"),
+        )
+        return text["prompt_embeds"], image["image_latent"]
+```
+
+Input URLs or paths must be readable by the workers; image data URLs also
+work. Do not send client-local filesystem paths unless they are shared.
+Across machines, replace loopback endpoints with routable private addresses
+and set `--disagg-p2p-hostname` on workers and `hostname=` on the client.
+Transport requires the same Mooncake setup as other stage deployments.
+
+### Bounded prefetch
+
+Use a lazy iterable and a scoped prefetch stream for repeated requests:
+
+```python
+async with EncodingClient(endpoint, max_in_flight=4, hostname=client_ip) as client:
+    async with client.prefetch(requests, role="text", depth=2) as batches:
+        async for tensors in batches:
+            await asyncio.to_thread(consume_tensors, tensors)
+```
+
+Results retain input order. `depth` bounds lookahead in addition to the current
+consumer-owned result; `max_in_flight` bounds active encode calls across the
+client. Exiting either scope cancels pending work and releases remote result
+leases. Errors propagate without silently skipping or retrying samples.
+The consumer must yield the event loop (or run blocking work in another
+thread) for prefetch to progress; this does not guarantee GPU compute overlap.
+
+`outputs=[...]` narrows exported fields. Without `role`, it selects deployment
+outputs and runs their dependency graph; with `role`, it selects that role's
+exports and executes only that role and its required ancestors. Automatic
+full-context boundaries cannot be used as named encoder outputs.
+
+These are frozen, inference-only encoders: no cross-process autograd is
+provided. Hidden-layer selection, VAE posterior sampling, scaling, packing,
+and preprocessing remain model-stage semantics. Validate those against the
+consumer's expected tensors; separating a stage does not change its semantics.
+
 ## Before serving production traffic
 
 - **Warm up through the coordinator.** Stage workers skip standalone warmup.
