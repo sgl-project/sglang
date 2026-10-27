@@ -648,6 +648,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_cpu=(
                 None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
             ),
+            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,

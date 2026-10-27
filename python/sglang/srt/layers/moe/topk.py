@@ -469,9 +469,11 @@ def _simulate_balanced_routing_kernel(
     stride_ik,
     stride_wm,
     stride_wk,
+    num_non_padded_ptr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     RANDOM: tl.constexpr,
+    HAS_NON_PADDED: tl.constexpr = False,
 ):
     """One program per token: overwrite its top-k row with a balanced expert
     assignment and uniform ``1/k`` weights, in a single launch — so the
@@ -507,12 +509,13 @@ def _simulate_balanced_routing_kernel(
         gid = (deal % num_ranks) * experts_per_rank + (
             deal // num_ranks
         ) % experts_per_rank
+    w = tl.full((BLOCK_K,), inv_k, tl.float32)
+    if HAS_NON_PADDED:
+        is_pad = t >= tl.load(num_non_padded_ptr)
+        gid = tl.where(is_pad, -1, gid)
+        w = tl.where(is_pad, 0.0, w)
     tl.store(topk_ids_ptr + t * stride_im + j * stride_ik, gid, mask=mask)
-    tl.store(
-        topk_weights_ptr + t * stride_wm + j * stride_wk,
-        tl.full((BLOCK_K,), inv_k, tl.float32),
-        mask=mask,
-    )
+    tl.store(topk_weights_ptr + t * stride_wm + j * stride_wk, w, mask=mask)
 
 
 # Per-launch seed for the uniform (RANDOM=True) path: varies across eager calls so
@@ -531,6 +534,8 @@ def _simulate_balanced_routing(
     token_shard_rank: int = 0,
     num_token_shards: int = 1,
     seed: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    weight_scale: float = 1.0,
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
@@ -591,7 +596,7 @@ def _simulate_balanced_routing(
         num_ranks,
         experts_per_rank,
         deal_offset,
-        1.0 / k,
+        weight_scale / k,
         seed,
         token_shard_rank,
         num_token_shards,
@@ -599,9 +604,11 @@ def _simulate_balanced_routing(
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        num_token_non_padded if num_token_non_padded is not None else topk_ids,
         K=k,
         BLOCK_K=triton.next_power_of_2(k),
         RANDOM=random,
+        HAS_NON_PADDED=num_token_non_padded is not None,
     )
 
 
@@ -2392,6 +2399,68 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
+def routing_simulation_enabled() -> bool:
+    return (
+        envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
+
+
+def apply_routing_simulation(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    *,
+    num_routed_topk: int,
+    top_k: int,
+    layer_id: Optional[int],
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    weight_scale: float = 1.0,
+) -> None:
+    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    # Benchmark-only: override gating with a balanced expert assignment (so
+    # dummy/random benchmark tokens don't skew MoE load) via a single fused
+    # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
+    # replaces, to minimize timing perturbation. Do NOT use in production.
+    parallel = get_parallel()
+    if is_moe_input_scattered_across_dp_ranks():
+        token_shard_rank = parallel.attn_dp_rank
+        num_token_shards = parallel.attn_dp_size
+        forward = get_forward()
+        if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
+            # This forward routes attention-TP-local rows (sequence-sharded
+            # attention TP, or the layer-boundary attention input scatter):
+            # each attention-TP rank holds its own slice of the DP shard, so
+            # it is a shard of its own rather than a replica of its peers.
+            token_shard_rank = (
+                token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+            )
+            num_token_shards *= parallel.attn_tp_size
+    else:
+        # Gathered MoE presents one global token buffer to every rank, so
+        # its routing must remain identical across those replicas.
+        token_shard_rank, num_token_shards = 0, 1
+
+    override_topk_ids, override_topk_weights = topk_ids, topk_weights
+    if num_routed_topk < top_k:
+        # Only the routed columns are simulated; a fused shared-expert
+        # column keeps the id and weight the router gave it.
+        override_topk_ids = topk_ids[:, :num_routed_topk]
+        override_topk_weights = topk_weights[:, :num_routed_topk]
+    _simulate_balanced_routing(
+        override_topk_ids,
+        override_topk_weights,
+        num_experts,
+        random=simulate_uniform_experts,
+        num_ranks=parallel.moe_ep_size,
+        layer_id=layer_id,
+        token_shard_rank=token_shard_rank,
+        num_token_shards=num_token_shards,
+        num_token_non_padded=num_token_non_padded,
+        weight_scale=weight_scale,
+    )
+
+
 def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
     """Whether routing already applied the scale that the MoE epilogue must skip."""
     if topk_config.apply_routed_scaling_factor_on_output:
@@ -3051,44 +3120,13 @@ def select_experts(
         topk_weights[:, :num_routed_for_gate] *= routed_scaling_factor
 
     if routing_overridden:
-        # Benchmark-only: override gating with a balanced expert assignment (so
-        # dummy/random benchmark tokens don't skew MoE load) via a single fused
-        # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
-        # replaces, to minimize timing perturbation. Do NOT use in production.
-        parallel = get_parallel()
-        if is_moe_input_scattered_across_dp_ranks():
-            token_shard_rank = parallel.attn_dp_rank
-            num_token_shards = parallel.attn_dp_size
-            forward = get_forward()
-            if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
-                # This forward routes attention-TP-local rows (sequence-sharded
-                # attention TP, or the layer-boundary attention input scatter):
-                # each attention-TP rank holds its own slice of the DP shard, so
-                # it is a shard of its own rather than a replica of its peers.
-                token_shard_rank = (
-                    token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
-                )
-                num_token_shards *= parallel.attn_tp_size
-        else:
-            # Gathered MoE presents one global token buffer to every rank, so
-            # its routing must remain identical across those replicas.
-            token_shard_rank, num_token_shards = 0, 1
-
-        override_topk_ids, override_topk_weights = topk_ids, topk_weights
-        if num_routed_topk < top_k:
-            # Only the routed columns are simulated; a fused shared-expert
-            # column keeps the id and weight the router gave it.
-            override_topk_ids = topk_ids[:, :num_routed_topk]
-            override_topk_weights = topk_weights[:, :num_routed_topk]
-        _simulate_balanced_routing(
-            override_topk_ids,
-            override_topk_weights,
+        apply_routing_simulation(
+            topk_ids,
+            topk_weights,
             router_logits.shape[1],
-            random=simulate_uniform_experts,
-            num_ranks=parallel.moe_ep_size,
+            num_routed_topk=num_routed_topk,
+            top_k=top_k,
             layer_id=layer_id,
-            token_shard_rank=token_shard_rank,
-            num_token_shards=num_token_shards,
         )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False

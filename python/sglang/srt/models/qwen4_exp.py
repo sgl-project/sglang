@@ -79,6 +79,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
@@ -126,25 +129,24 @@ def _ple_table_is_fp8(
 
 
 @eager_on_graph(True)
-def _breakable_qsa_indexer(layer, hidden_states, positions):
+def _breakable_qsa_indexer(layer, hidden_states, positions, output):
+    """Writes the top-k into ``output``, the caller's rows of the layer's bridge;
+    allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     topk = layer._compute_qsa_topk_indices_eager(
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
-        use_host_prefill_lengths=True,
     )
-    # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
-    # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
-    bridge = layer._qsa_prefill_topk_bridge
-    if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
-        bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
-        layer._qsa_prefill_topk_bridge = bridge
-    output = bridge[: hidden_states.shape[0]]
+    if output is None:
+        # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA
+        # layers. For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB
+        # shared. Graphs captured on a smaller bridge keep writing and reading it.
+        output = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
+        layer._qsa_prefill_topk_bridges.insert(0, output)
     output.fill_(0)
     output[: topk.shape[0]].copy_(topk)
-    return output
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -185,20 +187,23 @@ class _PLEBatch(msgspec.Struct, frozen=True):
 
 
 class _BreakablePLEBatch:
-    # _copy_output needs __dict__ to replace batch on replay; Struct uses slots.
-    def __init__(self, batch: Optional[_PLEBatch]):
-        self.batch = batch
+    """The live batch's PLE layout for the PLE breaks of one forward. A capture
+    records this holder, and ``_breakable_prepare_ple_batch`` refills it at every
+    replay."""
+
+    def __init__(self):
+        self.batch: Optional[_PLEBatch] = None
 
 
 @eager_on_graph(True)
-def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
-    return _BreakablePLEBatch(
-        batch=_prepare_ple_batch(
-            input_ids=input_ids,
-            forward_batch=get_tc_piecewise_forward_context().forward_batch,
-            ngram_size=ngram_size,
-            ngram_eos_token_id=ngram_eos_token_id,
-        )
+def _breakable_prepare_ple_batch(
+    input_ids, *, ngram_size, ngram_eos_token_id, holder: _BreakablePLEBatch
+):
+    holder.batch = _prepare_ple_batch(
+        input_ids=input_ids,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        ngram_size=ngram_size,
+        ngram_eos_token_id=ngram_eos_token_id,
     )
 
 
@@ -1811,7 +1816,8 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
-        self._qsa_prefill_topk_bridge = None
+        # The prefill graphs' top-k bridges, newest first. Buckets share the newest.
+        self._qsa_prefill_topk_bridges: list = []
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -1829,9 +1835,25 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return _breakable_qsa_indexer(
-                layer=self, hidden_states=hidden_states, positions=positions
+            rows = hidden_states.shape[0]
+            bridges = self._qsa_prefill_topk_bridges
+            output = (
+                bridges[0][:rows] if bridges and bridges[0].shape[0] >= rows else None
             )
+            # A capture records the bridge it is given; the warmup before it
+            # allocates one.
+            assert output is not None or _current_capture_var.get() is None, (
+                "qsa top-k bridge not allocated before capture"
+            )
+            _breakable_qsa_indexer(
+                layer=self,
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+            )
+            if output is None:  # first run: the break allocated the bridge
+                output = bridges[0][:rows]
+            return output
         return self._compute_qsa_topk_indices_eager(
             hidden_states=hidden_states,
             positions=positions,
@@ -1843,8 +1865,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
-        use_host_prefill_lengths: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1863,13 +1883,6 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        if use_host_prefill_lengths:
-            indexer_metadata = msgspec.structs.replace(
-                indexer_metadata,
-                prefill_sequence_lengths_cpu=tuple(
-                    forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
-                ),
-            )
         indexer_kwargs = {}
         if _shards_rows_over_cp(forward_batch):
             # Prefill CP: this rank's rows select against the index keys of the
@@ -1934,6 +1947,16 @@ class Qwen4ExpAttentionDecoderLayer(
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
+            if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+                from sglang.srt.layers.attention.qsa.glue import (
+                    resolve_qsa_sparse_backend,
+                )
+
+                # Every CP rank issues the K/V gather before the index-key
+                # gather, overlapping it with the indexer's local computation.
+                resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
+                    self.attn, k, v, forward_batch
+                )
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
                 hidden_states, positions, forward_batch
             )
@@ -2064,10 +2087,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         ple_batch = None
         if breakable_ple:
-            ple_batch = _breakable_prepare_ple_batch(
+            ple_batch = _BreakablePLEBatch()
+            _breakable_prepare_ple_batch(
                 input_ids=input_ids,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                holder=ple_batch,
             )
         elif self.has_ple:
             ple_batch = _prepare_ple_batch(

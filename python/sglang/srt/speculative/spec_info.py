@@ -140,8 +140,9 @@ class SpeculativeAlgorithm(Enum):
 
         The backend must still declare a pre-replay read end.
         """
-        # DSPARK's draft KV inject reads the SWA mapping after the target prefill.
-        return self.is_none() or self.is_dflash()
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
+        return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -299,6 +300,14 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
+    def get_platform_worker_cls(self) -> Optional[type]:
+        """Out-of-tree platform's replacement worker, or None for the built-in one."""
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            return None
+        return current_platform.get_speculative_worker_cls(algorithm=self.name)
+
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
@@ -307,6 +316,10 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        platform_worker_cls = self.get_platform_worker_cls()
+        if platform_worker_cls is not None:
+            return platform_worker_cls
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
