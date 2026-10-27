@@ -292,6 +292,12 @@ def _check_mooncake_xpu_scope(cfg: Any) -> None:
         unsupported.append("two- or single-batch overlap")
     if cfg.elastic_ep_backend is not None:
         unsupported.append("elastic EP (--elastic-ep-backend)")
+    # Both change how many tokens a rank dispatches: verify steps carry draft tokens,
+    # and unpadded batches reach the MoE whole on every rank.
+    if cfg.speculative_algorithm is not None:
+        unsupported.append("speculative decoding (--speculative-algorithm)")
+    if cfg.disable_attn_tp_gather:
+        unsupported.append("--disable-attn-tp-gather")
     if unsupported:
         raise ValueError(
             "moe_a2a_backend='mooncake' on XPU supports expert parallelism over "

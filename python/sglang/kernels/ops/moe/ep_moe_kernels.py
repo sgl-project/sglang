@@ -2467,17 +2467,25 @@ def expand_to_masked_slab(
     max_m: int,
     expert_alignment: int,
     check_overflow: Optional[bool] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """expanded [total, hidden] -> ([E_local, max_m, hidden], [E_local, max_m, sh] or None, masked_m[E_local]).
 
     check_overflow=None checks unless a CUDA graph is being captured; False
     skips the host-synchronizing check for callers whose counts fit max_m.
+    out, a contiguous [E_local, max_m, hidden] tensor, takes the rows instead
+    of a new one.
     """
     hidden = recv_x.shape[1]
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
-    output_tensor = torch.empty(
-        (num_local_experts * max_m, hidden), device=recv_x.device, dtype=recv_x.dtype
-    )
+    if out is None:
+        output_tensor = torch.empty(
+            (num_local_experts * max_m, hidden),
+            device=recv_x.device,
+            dtype=recv_x.dtype,
+        )
+    else:
+        output_tensor = out.view(num_local_experts * max_m, hidden)
     masked_m = torch.empty(
         (num_local_experts,), device=recv_x.device, dtype=torch.int32
     )

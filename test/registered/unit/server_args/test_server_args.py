@@ -1953,6 +1953,8 @@ class TestMooncakeA2aArgs(CustomTestCase):
             {"enable_single_batch_overlap": True},
             {"nnodes": 2},
             {"elastic_ep_backend": "mooncake"},
+            {"speculative_algorithm": "NGRAM"},
+            {"disable_attn_tp_gather": True},
         ):
             with self.subTest(**kwargs):
                 with self.assertRaisesRegex(ValueError, "on XPU supports"):

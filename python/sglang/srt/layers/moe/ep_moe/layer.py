@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.moe import (
+    MoeRunnerConfig,
     get_deepep_mode,
     get_moe_a2a_backend,
 )
@@ -168,10 +169,10 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
         if _is_xpu and self.deepep_mode.enable_low_latency():
-            # Both XPU masked runners are BF16 GEMMs; no quantized masked GEMM.
-            assert quant_config is None, (
-                "Low-latency expert parallelism on Intel XPU supports "
-                "unquantized MoE weights only"
+            _check_xpu_masked_moe_layer(
+                quant_config=quant_config,
+                with_bias=self.with_bias,
+                runner_config=self.moe_runner_config,
             )
             self.xpu_grouped_activation_type = _xpu_grouped_activation_type(
                 activation=self.moe_runner_config.activation,
@@ -338,6 +339,9 @@ class DeepEPMoE(FusedMoE):
                 hidden_states=hidden_states,
                 masked_m=masked_m,
                 num_topk=topk_ids.shape[1],
+                # Batches are padded to the attention TP size,
+                # so every EP rank dispatches as many tokens as this one.
+                num_step_tokens=topk_ids.shape[0] * self.moe_ep_size,
                 w13=self.w13_weight,
                 w2=self.w2_weight,
                 activation_type=self.xpu_grouped_activation_type,
@@ -345,19 +349,18 @@ class DeepEPMoE(FusedMoE):
         # Fallback: bmm over each expert's first m rows, m covering the fullest
         # expert; one host sync per layer instead of a capacity-sized GEMM.
         capacity = hidden_states.shape[1]
-        # Combine reads only each expert's first masked_m rows, so rows past
-        # them may hold anything.
-        out = torch.empty_like(hidden_states)
         m = int(masked_m.max().item())
         if m == 0:
-            return out
+            return hidden_states
         # Rounded so steps with similar occupancy reuse one GEMM shape.
         m = min(capacity, -(-m // 16) * 16)
         gate_up = torch.bmm(hidden_states[:, :m], self.w13_weight.transpose(1, 2))
-        out[:, :m] = torch.bmm(
+        # The output overwrites the received rows;
+        # combine reads only each expert's first masked_m rows.
+        hidden_states[:, :m] = torch.bmm(
             self.xpu_masked_activation(gate_up), self.w2_weight.transpose(1, 2)
         )
-        return out
+        return hidden_states
 
     def combine(
         self,
@@ -396,6 +399,38 @@ class DeepEPMoE(FusedMoE):
         )
 
 
+def _check_xpu_masked_moe_layer(
+    *,
+    quant_config: Optional[QuantizationConfig],
+    with_bias: bool,
+    runner_config: MoeRunnerConfig,
+) -> None:
+    # Both XPU masked runners are BF16 GEMMs; no quantized masked GEMM.
+    assert quant_config is None, (
+        "Low-latency expert parallelism on Intel XPU supports "
+        "unquantized MoE weights only"
+    )
+    unapplied = [
+        name
+        for name, used in (
+            ("expert biases", with_bias),
+            ("gemm1_alpha", runner_config.gemm1_alpha is not None),
+            ("gemm1_beta", runner_config.gemm1_beta is not None),
+            ("gemm1_clamp_limit", runner_config.gemm1_clamp_limit is not None),
+            ("swiglu_limit", runner_config.swiglu_limit is not None),
+            (
+                "apply_router_weight_on_input",
+                runner_config.apply_router_weight_on_input,
+            ),
+        )
+        if used
+    ]
+    if unapplied:
+        raise NotImplementedError(
+            "The Intel XPU low-latency MoE path does not apply " + ", ".join(unapplied)
+        )
+
+
 def _xpu_grouped_activation_type(
     *, activation: str, is_gated: bool, num_local_experts: int
 ) -> Optional[int]:
@@ -411,16 +446,13 @@ def _xpu_masked_grouped_experts(
     hidden_states: torch.Tensor,
     masked_m: torch.Tensor,
     num_topk: int,
+    num_step_tokens: int,
     w13: torch.Tensor,
     w2: torch.Tensor,
     activation_type: int,
 ) -> torch.Tensor:
-    """Expert MLPs over the masked [num_local_experts, capacity, hidden] layout.
-
-    sgl-kernel's grouped GEMM reads the per-expert row counts on the device, so
-    nothing waits on the host and experts without rows read no weights. It needs
-    each expert's rows contiguous, hence the compaction and expansion copies.
-    """
+    """Expert MLPs over the masked [num_local_experts, capacity, hidden] layout,
+    in place; the grouped GEMM needs each expert's rows contiguous, hence the copies."""
     from sgl_kernel.utils import is_xe3_arch
 
     from sglang.kernels.ops.moe.ep_moe_kernels import (
@@ -429,9 +461,10 @@ def _xpu_masked_grouped_experts(
     )
 
     num_local_experts, capacity, hidden_size = hidden_states.shape
+    rows_per_token = min(num_topk, num_local_experts)
     # Each expert holds at most `capacity` rows, and each of the capacity source
     # tokens brings at most num_topk of them.
-    max_rows = min(num_topk, num_local_experts) * capacity
+    max_rows = rows_per_token * capacity
     psum = torch.cumsum(masked_m, dim=0, dtype=torch.int32)
     rows = masked_slab_to_expand(
         input_tensor=hidden_states,
@@ -445,11 +478,20 @@ def _xpu_masked_grouped_experts(
         else torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20
     )
     act = rows.new_empty((max_rows, w2.shape[2]))
-    grouped_mm(act, rows, w13, None, masked_m, num_local_experts, activation_type, True)
+    # The GEMM sizes its tile by its row count and finds each expert's rows by masked_m,
+    # so its views are sized by the rows this step can carry.
+    step_rows = min(max_rows, rows_per_token * num_step_tokens)
+    step_x, step_act = rows[:step_rows], act[:step_rows]
+    grouped_mm(
+        step_act, step_x, w13, None, masked_m, num_local_experts, activation_type, True
+    )
     # GEMM1 was the last reader of `rows`; the down projection overwrites it.
-    grouped_mm(rows, act, w2, None, masked_m, num_local_experts, activation_type, False)
-    # Combine reads only each expert's first masked_m rows.
-    out, _, _ = expand_to_masked_slab(
+    grouped_mm(
+        step_x, step_act, w2, None, masked_m, num_local_experts, activation_type, False
+    )
+    # The output overwrites the received rows;
+    # combine reads only each expert's first masked_m rows.
+    expand_to_masked_slab(
         recv_x=rows,
         recv_x_scale=None,
         psum_num_recv_tokens_per_expert=psum,
@@ -457,16 +499,15 @@ def _xpu_masked_grouped_experts(
         max_m=capacity,
         expert_alignment=1,
         check_overflow=False,
+        out=hidden_states,
     )
-    return out
+    return hidden_states
 
 
 def _xpu_masked_activation(
     activation: str, is_gated: bool
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Activation over a [num_experts, m, width] gate-up output."""
-    if not is_gated and activation in ("silu", "gelu"):
-        return getattr(torch.nn.functional, activation)
+    """Gated activation over a [num_experts, m, width] gate-up output."""
     if is_gated and activation in ("silu", "gelu"):
         from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 

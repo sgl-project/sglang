@@ -154,7 +154,9 @@ exchange tokens over Level Zero IPC, with no MPI or ISHMEM.
 
 Mooncake's prebuilt wheels do not include XPU support, so build it from source
 with the oneAPI compiler, after installing its dependencies
-(`sudo bash dependencies.sh`):
+(`sudo bash dependencies.sh`). Mooncake EP runs on PyTorch's SYCL queues, so use
+a oneAPI release whose SYCL runtime major version (`libsycl.so.N`) matches the
+one PyTorch XPU installs; PyTorch 2.14+xpu ships `libsycl.so.9`, from oneAPI 2026:
 
 ```bash
 git clone https://github.com/kvcache-ai/Mooncake.git && cd Mooncake
@@ -182,8 +184,8 @@ sglang serve                         \
 
 | Item | Status |
 |---|---|
-| Parallelism | Expert parallelism over the TP ranks of one node (`--ep-size` equal to `--tp`). DP attention, two- and single-batch overlap, elastic EP and multiple nodes are rejected at startup |
-| MoE weights | BF16 only; quantized MoE is rejected |
+| Parallelism | Expert parallelism over the TP ranks of one node (`--ep-size` equal to `--tp`). DP attention, two- and single-batch overlap, elastic EP, speculative decoding, `--disable-attn-tp-gather` and multiple nodes are rejected at startup |
+| MoE weights | BF16, with gated SiLU or GELU experts. Quantized MoE, expert biases, `gemm1_alpha`/`gemm1_beta`, clamp or SwiGLU limits and router weights applied on the input are rejected when the model is built |
 | Dispatch mode | Low latency; `--deepep-mode auto` resolves to it |
 | Batch size | Prefill chunks and running requests are capped at `SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128) times `--tp`, i.e. 512 at TP4. Raise the variable (up to 1024) for larger batches, at the cost of a larger EP buffer |
 | XPU graphs | Not validated with Mooncake EP; they are off by default on XPU |
