@@ -25,6 +25,7 @@ from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
 
 from ..common.nvfp4 import Nvfp4Cache
 from ..common.nvfp4_gfx950 import fits_buffer_offsets
+from ..common.out_quant_gfx950 import store_fp8_out
 from ..common.utils import robust_allocator, sparse_out_dtype
 
 _LOG2E = 1.4426950408889634
@@ -289,30 +290,6 @@ def _attend(
 
 
 @gluon.jit
-def _rcp_f32(x):
-    # aiter's per-token kernel multiplies by the approximate v_rcp_f32, not 1 / scale.
-    return gl.inline_asm_elementwise(
-        "v_rcp_f32 $0, $1", "=v,v", [x], dtype=gl.float32, is_pure=True, pack=1
-    )
-
-
-@gluon.jit
-def _store_fp8(x, q8_ptrs, scale_ptr, scale_offs, OUT_QUANT: gl.constexpr):
-    """Quantize the bf16-rounded O [H, D] (fp32 ``x``) as the separate aiter quant of
-    the o_proj input would: per token over the row (1) or per 1 x 128 head (2), the
-    arithmetic of ``fp8_per_token_quant`` / ``fp8_group_quant``."""
-    if OUT_QUANT == 1:
-        scale = gl.max(gl.max(gl.abs(x), axis=1), axis=0) * (1.0 / 448.0)
-        q = gl.clamp(x * _rcp_f32(scale), -448.0, 448.0)
-    else:
-        scale = gl.maximum(gl.max(gl.abs(x), axis=1), 1e-10) * (1.0 / 448.0)
-        inv = gl.div_rn(gl.full(scale.shape, 1.0, gl.float32, scale.type.layout), scale)
-        q = gl.clamp(x * inv[:, None], -448.0, 448.0)
-    gl.store(q8_ptrs, q.to(gl.float8e4nv))
-    gl.store(scale_ptr + scale_offs, scale)
-
-
-@gluon.jit
 def _store_merged(
     o_ptr,
     lse_ptr,
@@ -330,7 +307,7 @@ def _store_merged(
     OUT_QUANT: gl.constexpr,
 ):
     """Merge the warps' softmax states and store O [H, D] (dims in order) and its lse,
-    or, with ``OUT_QUANT``, O quantized to FP8 for the o_proj (see ``_store_fp8``)."""
+    or, with ``OUT_QUANT``, O quantized to FP8 for the o_proj (see ``store_fp8_out``)."""
     m_i, l_i, acc = state
     W: gl.constexpr = acc.shape[0]
     H: gl.constexpr = acc.shape[1]
@@ -358,7 +335,7 @@ def _store_merged(
         # A single top-k chunk: O is final and only the o_proj reads it.
         q8_ptrs = q8_ptr + q8_base + oh[:, None] * D + od[None, :]
         scale_offs = scale_base if OUT_QUANT == 1 else scale_base + oh * stride_s_h
-        _store_fp8(o.to(gl.float32), q8_ptrs, scale_ptr, scale_offs, OUT_QUANT)
+        store_fp8_out(o.to(gl.float32), q8_ptrs, scale_ptr, scale_offs, OUT_QUANT)
 
 
 @gluon.jit
@@ -408,7 +385,7 @@ def _nvfp4_sparse_decode_kernel(
     PAGE_SIZE: gl.constexpr,
     PAY_ROW: gl.constexpr,  # bytes
     SC_ROW: gl.constexpr,
-    OUT_QUANT: gl.constexpr,  # 0: bf16 O and lse; 1 / 2: see _store_fp8
+    OUT_QUANT: gl.constexpr,  # 0: bf16 O and lse; 1 / 2: see store_fp8_out
     num_warps: gl.constexpr,
 ):
     W: gl.constexpr = num_warps
@@ -558,7 +535,7 @@ def _merge_quant_kernel(
     H: gl.constexpr,
     D: gl.constexpr,
     NUM_TOPK_CHUNKS: gl.constexpr,
-    OUT_QUANT: gl.constexpr,  # see _store_fp8
+    OUT_QUANT: gl.constexpr,  # see store_fp8_out
     num_warps: gl.constexpr,
 ):
     """One row's chunks merged as `_merge_topk_attn_out_kernel` merges them, bitwise:
@@ -596,7 +573,7 @@ def _merge_quant_kernel(
     scale_offs = pid_b * stride_s_b
     if OUT_QUANT == 2:
         scale_offs = scale_offs + oh * stride_s_h
-    _store_fp8(x, q8_ptrs, scale_ptr, scale_offs, OUT_QUANT)
+    store_fp8_out(x, q8_ptrs, scale_ptr, scale_offs, OUT_QUANT)
 
 
 def can_use_nvfp4_decode_gfx950(
