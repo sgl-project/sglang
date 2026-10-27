@@ -26,12 +26,25 @@ on:
         required: false
         type: boolean
         default: true
+      test_release:
+        description: 'Test release: push only to rocm/sgl-dev and add _test to the end of the tag'
+        required: false
+        type: boolean
+        default: false
+      test_label:
+        description: 'Optional label before _test, e.g. rccl-1c0ab42 (also makes this a test release)'
+        required: false
+        type: string
+        default: ''
   schedule:
     - cron: '0 10 * * *'  # before the ROCm 7.2 build, so it is not queued behind it
 
 # Scheduled runs always push; a manual dispatch can turn the push off.
 env:
   PUSH_IMAGES: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+  # A test release goes to rocm/sgl-dev only, and its tag ends in [-<test_label>]_test.
+  TEST_RELEASE: ${{ github.event_name == 'workflow_dispatch' && (inputs.test_release || inputs.test_label != '') }}
+  TEST_LABEL: ${{ inputs.test_label }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
@@ -102,6 +115,9 @@ jobs:
           esac
 
           image_tag="v${VERSION}-${rocm_tag}-${DATE}"
+          if [ "${TEST_RELEASE}" = "true" ]; then
+            image_tag="${image_tag}${TEST_LABEL:+-${TEST_LABEL}}_test"
+          fi
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -122,14 +138,14 @@ jobs:
           fi
 
       - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         run: |
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
@@ -180,6 +196,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           image_tag="v${VERSION}-rocm101-mi45x-${DATE}"
+          if [ "${TEST_RELEASE}" = "true" ]; then
+            image_tag="${image_tag}${TEST_LABEL:+-${TEST_LABEL}}_test"
+          fi
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -200,14 +219,14 @@ jobs:
           fi
 
       - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         run: |
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
@@ -261,6 +280,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           image_tag="v${VERSION}-rocm10-mi45x-${DATE}"
+          if [ "${TEST_RELEASE}" = "true" ]; then
+            image_tag="${image_tag}${TEST_LABEL:+-${TEST_LABEL}}_test"
+          fi
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -281,14 +303,14 @@ jobs:
           fi
 
       - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
+        if: env.PUSH_IMAGES == 'true' && env.TEST_RELEASE != 'true'
         run: |
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
