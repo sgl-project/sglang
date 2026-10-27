@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
+from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
@@ -38,6 +39,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
+
+    # Before any handler reads the DP layout.
+    run_hook(handle_deprecated_dp_attention, server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
@@ -57,10 +63,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
+        handle_watermark_config,
     )
 
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
+    run_hook(handle_watermark_config, server_args)
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
@@ -72,6 +80,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_offload_compatibility, server_args)
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
+        handle_aux_hidden_state_capture,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_response_store,
@@ -81,6 +90,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
+    # Before any reader of speculative_algorithm: the flag may reset it.
+    run_hook(handle_aux_hidden_state_capture, server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
@@ -103,6 +114,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_source_paths, server_args)
+
+    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
+    # whose heuristic reads the post-capture KV sizing switch.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
 
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
@@ -157,10 +174,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
-        apply_glm5_chunked_prefill_default,
-        apply_glm5_prefill_cuda_graph_policy,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+        apply_prefill_cp_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -173,9 +189,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_dwdp, server_args)
 
     run_hook(handle_cuda_graph_config, server_args)
-    # Requires the parsed backend and explicit-input locks, and must precede
-    # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
-    run_hook(apply_glm5_chunked_prefill_default, server_args)
 
     from sglang.srt.arg_groups.platform_hook import (
         handle_amd_specifics,
@@ -238,7 +251,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_mamba_backend, server_args)
     run_hook(handle_int8_mamba_checkpoint, server_args)
     run_hook(handle_linear_attn_backend, server_args)
-    run_hook(apply_glm5_prefill_cuda_graph_policy, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
@@ -264,13 +276,19 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+    if cfg.enable_prefill_cp:
+        run_hook(apply_prefill_cp_cuda_graph_default, server_args)
+
+    # Validate logical-page KV cache sharding after its page size, attention
+    # backend, memory budget, and shard topology have all resolved.
+    run_hook(handle_kv_cache_sharding, server_args)
 
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
-        validate_cutedsl_a2a_token_budget,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
+        validate_flashinfer_a2a_token_budget,
     )
 
     run_hook(handle_moe_kernel_config, server_args)
@@ -296,8 +314,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_layernorm_sp, server_args)
 
-    # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
-    run_hook(validate_cutedsl_a2a_token_budget, server_args)
+    # Validate the FlashInfer A2A token budget now that draft-token counts are final.
+    run_hook(validate_flashinfer_a2a_token_budget, server_args)
 
     from sglang.srt.arg_groups.mega_moe_hook import (
         validate_mega_moe_token_budget_for_model,
@@ -333,7 +351,24 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
 
+    # needs the resolved CUDA-graph, attention-backend and speculative settings
+    from sglang.srt.kernel_plugins.amd.binding import (
+        handle_amd_monokernel,
+    )
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        handle_nvidia_megakernel,
+    )
+
+    # first, so a server with both kernel flags gets every reason in one error
+    run_hook(handle_nvidia_megakernel, server_args)
+    run_hook(handle_amd_monokernel, server_args)
+
     finalize_cuda_graph_prefill_max_context(server_args)
+
+    # Capability adjustments can late-force a different attention backend or
+    # disable chunked prefill. Re-run the idempotent sharding gate over the
+    # final resolving view.
+    run_hook(handle_kv_cache_sharding, server_args)
 
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)

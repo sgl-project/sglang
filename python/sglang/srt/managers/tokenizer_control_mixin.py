@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
 import time
@@ -37,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -134,6 +137,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("get_hicache_l3_cache_layout", GetHiCacheL3LayoutReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
@@ -186,7 +190,7 @@ class TokenizerControlMixin:
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
-                get_parallel().dp_size,
+                get_parallel().num_dp_ranks,
                 mode,
             )
             setattr(self, f"{name}_communicator", comm)
@@ -195,7 +199,7 @@ class TokenizerControlMixin:
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
-            get_parallel().enable_dp_attention
+            get_parallel().attn_dp_enabled
             and not get_parallel().enable_dp_attention_local_control_broadcast
         )
         if primary_group_control:
@@ -444,8 +448,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from distributed"
         )
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -457,8 +461,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for destroy parameter update group"
         )
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -502,8 +506,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from distributed"
         )
 
         if obj.abort_all_requests:
@@ -535,8 +539,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert get_parallel().dp_size == 1, (
-            "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        assert get_parallel().num_dp_ranks == 1, (
+            "init_weights_send_group_for_remote_instance requires a single DP rank"
         )
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
@@ -550,8 +554,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         # TODO: support DP
-        assert get_parallel().dp_size == 1, (
-            "dp_size must be 1 for send_weights_to_remote_instance"
+        assert get_parallel().num_dp_ranks == 1, (
+            "send_weights_to_remote_instance requires a single DP rank"
         )
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
@@ -562,8 +566,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for update weights from tensor"
         )
 
         if obj.abort_all_requests:
@@ -600,8 +604,8 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         try:
             # For now, we only support single data parallel instance
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for update weights from IPC"
             )
             logger.info("Starting IPC weight update")
 
@@ -665,8 +669,8 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
@@ -751,8 +755,8 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
@@ -841,8 +845,8 @@ class TokenizerControlMixin:
                 "lora_name must be provided to unload LoRA adapter"
             )
 
-            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
-                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            assert get_parallel().dp_size == 1, (
+                "data-parallel replicas are not supported for dynamic lora loading"
             )
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
@@ -862,7 +866,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             return all_parameters[0]
         else:
             return all_parameters
@@ -927,10 +931,19 @@ class TokenizerControlMixin:
                 new_role=obj.new_role,
                 safe_to_restore=True,
             )
-        results = await self.pd_role_switch_communicator(obj)
-        all_success = all(r.success for r in results)
+        # The caller must drain ingress and serialize role-switch requests.
+        # Check every DP worker before allowing any of them to tear down.
+        if get_parallel().num_dp_ranks > 1:
+            prepare_req = copy.copy(obj)
+            prepare_req.prepare_only = True
+            results = await self.pd_role_switch_communicator(prepare_req)
+            if results and all(r.success for r in results) and not obj.prepare_only:
+                results = await self.pd_role_switch_communicator(obj)
+        else:
+            results = await self.pd_role_switch_communicator(obj)
+        all_success = bool(results) and all(r.success for r in results)
         safe_to_restore = bool(results) and all(r.safe_to_restore for r in results)
-        if all_success:
+        if all_success and not obj.prepare_only:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
             self.record_config_updates(
@@ -938,6 +951,8 @@ class TokenizerControlMixin:
             )
             self.disaggregation_mode = DisaggregationMode(obj.new_role)
             msg = "ok"
+        elif all_success:
+            msg = "ready"
         else:
             # Surface only the failing workers' messages.
             msg = "; ".join(r.message for r in results if not r.success)
@@ -957,6 +972,16 @@ class TokenizerControlMixin:
         ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_hicache_l3_cache_layout(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetHiCacheL3LayoutReq()
+        responses: List[
+            GetHiCacheL3LayoutReqOutput
+        ] = await self.get_hicache_l3_cache_layout_communicator(req)
+        return [res.layout for res in responses]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq

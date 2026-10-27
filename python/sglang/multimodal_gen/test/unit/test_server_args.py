@@ -1,12 +1,16 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
-from unittest.mock import patch
+from contextlib import ExitStack
+from unittest.mock import Mock, patch
+
+import zmq
 
 from sglang.cli.utils import get_is_diffusion_model
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -21,9 +25,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.helios import (
-    HeliosDistilledConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -36,9 +37,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
-    LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
@@ -70,6 +71,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -85,54 +87,18 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
-
-
-@contextmanager
-def _mock_cuda_platform(
-    *,
-    memory_gb: int = 80,
-    available_memory_gb: int | dict[int, int] | None = None,
-):
-    def get_available_gpu_memory(device_id=0, **_kwargs):
-        if isinstance(available_memory_gb, dict):
-            return available_memory_gb[device_id]
-        if available_memory_gb is not None:
-            return available_memory_gb
-        return memory_gb
-
-    with (
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
-            return_value=False,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
-            return_value=False,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-            return_value=True,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
-            return_value=memory_gb * 1024**3,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
-            side_effect=get_available_gpu_memory,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
-            return_value=True,
-        ),
-    ):
-        yield
+from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
 
 
 def _from_dict_without_model_resolution(
@@ -141,9 +107,26 @@ def _from_dict_without_model_resolution(
     pipeline_config = pipeline_config or QwenImagePipelineConfig()
     with (
         patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
-        _mock_cuda_platform(),
+        mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
+
+
+class TestServerArgsColdImport(unittest.TestCase):
+    def test_public_entry_points_import_in_fresh_processes(self):
+        modules = (
+            "sglang.multimodal_gen.runtime.server_args",
+            "sglang.multimodal_gen.test.runner.diffusion_suite_runner",
+        )
+        for module in modules:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-c", f"import {module}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TestPlatformLifecycleHooks(unittest.TestCase):
@@ -158,7 +141,123 @@ class TestPlatformLifecycleHooks(unittest.TestCase):
         apply_defaults.assert_called_once_with(server_args)
 
 
-class TestServerArgsPathExpansion(unittest.TestCase):
+class TestExplicitCliArgs(unittest.TestCase):
+    def test_prepare_uses_its_argv_not_process_flags(self):
+        argv = [
+            "--model-path",
+            "test/model",
+            "--mode=manual",
+            "--dit-cpu-offload",
+            "false",
+        ]
+        with (
+            patch.object(sys, "argv", ["host-program", "--port", "12345"]),
+            patch.object(ServerArgs, "from_dict", side_effect=lambda kwargs: kwargs),
+        ):
+            kwargs = server_args_module.prepare_server_args(argv)
+        self.assertEqual(kwargs["model_path"], "test/model")
+        self.assertEqual(kwargs["performance_mode"], "manual")
+        self.assertIs(kwargs["dit_cpu_offload"], False)
+        self.assertNotIn("port", kwargs)
+        self.assertEqual(
+            kwargs["_explicit_arg_names"],
+            {"model_path", "performance_mode", "dit_cpu_offload"},
+        )
+
+    def test_registered_aliases_use_their_destination(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--pipeline", "CustomPipeline"], "pipeline_class_name", "CustomPipeline"),
+            (["--mode=manual"], "performance_mode", "manual"),
+            (["--cfg-parallel-size", "1"], "cfg_parallel_degree", 1),
+            (["--dp", "2"], "dp_size", 2),
+            (
+                ["--layerwise-offload-modules", "transformer"],
+                "layerwise_offload_components",
+                ["transformer"],
+            ),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+
+class _CudaPlatformTestCase(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # Residency queries inspect the platform after argument construction too.
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock_cuda_platform())
+
+
+class TestSchedulerEndpoints(unittest.TestCase):
+    def test_host_normalization_preserves_replica_ports(self):
+        """The scheduler ingress is an unauthenticated pickle-RPC endpoint; it must
+        never follow a wildcard --host (see ServerArgs.scheduler_endpoint_for)."""
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.dp_size = 2
+        args.scheduler_port = 23000
+        for host, expected_host in (
+            (None, "127.0.0.1"),
+            ("localhost", "127.0.0.1"),
+            ("::", "127.0.0.1"),
+            ("::1", "127.0.0.1"),
+            ("2001:db8::1", "127.0.0.1"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("scheduler.example", "scheduler.example"),
+        ):
+            for ports in (None, [23100, 23200]):
+                with self.subTest(host=host, ports=ports):
+                    args.host = host
+                    args.scheduler_ports = ports
+                    expected = [
+                        f"tcp://{expected_host}:{port}"
+                        for port in (ports or [23000, 23001])
+                    ]
+                    self.assertEqual(args.scheduler_endpoint, expected[0])
+                    self.assertEqual(args.scheduler_endpoints, expected)
+                    for replica, endpoint in enumerate(expected):
+                        self.assertEqual(args.scheduler_endpoint_for(replica), endpoint)
+
+    def test_wildcard_and_ipv6_http_hosts_allow_internal_zmq_round_trip(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        args.scheduler_port = 0
+        args.scheduler_ports = None
+        for host, http_host in (
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::1]"),
+            ("::1", "[::1]"),
+        ):
+            with self.subTest(host=host), zmq.Context() as context:
+                args.host = host
+                args.scheduler_port = 0
+                self.assertEqual(args.url(), f"http://{http_host}:{args.port}")
+                with (
+                    context.socket(zmq.REP) as receiver,
+                    context.socket(zmq.REQ) as sender,
+                ):
+                    for socket in (receiver, sender):
+                        socket.setsockopt(zmq.LINGER, 0)
+                        socket.setsockopt(zmq.RCVTIMEO, 2000)
+                        socket.setsockopt(zmq.SNDTIMEO, 2000)
+                    receiver.bind(args.scheduler_endpoint)
+                    bound_endpoint = receiver.getsockopt_string(zmq.LAST_ENDPOINT)
+                    self.assertTrue(bound_endpoint.startswith("tcp://127.0.0.1:"))
+                    args.scheduler_port = int(bound_endpoint.rsplit(":", 1)[1])
+                    sender.connect(args.scheduler_endpoint)
+                    sender.send(b"ping")
+                    self.assertEqual(receiver.recv(), b"ping")
+                    receiver.send(b"pong")
+                    self.assertEqual(sender.recv(), b"pong")
+
+
+class TestServerArgsPathExpansion(_CudaPlatformTestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
 
@@ -175,6 +274,21 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             {"model_path": "/data/my-model"}
         )
         self.assertEqual(args.model_path, "/data/my-model")
+
+    def test_numa_node_cli_takes_one_node_per_gpu(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake", "--numa-node", "0", "1"]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+        self.assertEqual(server_args.numa_node, [0, 1])
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
@@ -268,27 +382,59 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
 
-    def test_ltx_automatic_text_encoder_backend_is_not_explicit(self):
-        args = _from_dict_without_model_resolution(
-            {"model_path": "Lightricks/LTX-2.3"},
-            pipeline_config=LTX2PipelineConfig(),
-        )
+    def _fasth3_args(self, capability=(9, 0), **kwargs):
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_capability",
+            return_value=DeviceCapability(*capability),
+        ):
+            return _from_dict_without_model_resolution(
+                {"model_path": "FastVideo/FastVideo-FastH3-8-Step-V2", **kwargs},
+                pipeline_config=FastH3PipelineConfig(),
+            )
 
-        self.assertEqual(
-            args.component_attention_backends, {"text_encoder": "torch_sdpa"}
-        )
-        self.assertTrue(args.is_component_attention_backend_automatic("text_encoder"))
+    def test_fasth3_selects_vsa_h3_for_the_transformer(self):
+        for capability in ((8, 0), (9, 0), (10, 0), (10, 3)):
+            # Check configuration selection without importing a GPU backend.
+            with (
+                self.subTest(capability=capability),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+                ) as get_attn_backend,
+            ):
+                args = self._fasth3_args(capability)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"transformer": "video_sparse_attn_h3"},
+                )
+                get_attn_backend.assert_called_once()
+                self.assertEqual(
+                    get_attn_backend.call_args.kwargs["selected_attention_backend"],
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+                )
+                self.assertTrue(
+                    get_attn_backend.call_args.kwargs[
+                        "attention_requirements"
+                    ].packed_varlen
+                )
 
-    def test_ltx_explicit_text_encoder_backend_remains_explicit(self):
-        args = _from_dict_without_model_resolution(
-            {
-                "model_path": "Lightricks/LTX-2.3",
-                "component_attention_backends": {"text_encoder": "torch_sdpa"},
-            },
-            pipeline_config=LTX2PipelineConfig(),
+    def test_fasth3_keeps_a_requested_or_incompatible_transformer_backend(self):
+        cases = (
+            ({"component_attention_backends": {"transformer": "fa"}}, (9, 0)),
+            ({"attention_backend": "fa"}, (9, 0)),
+            ({"enable_torch_compile": True}, (9, 0)),
+            ({"component_attention_backends": {"transformer": "fa"}}, (8, 0)),
+            ({"attention_backend": "fa"}, (8, 0)),
+            ({"enable_torch_compile": True}, (8, 0)),
+            ({}, (8, 6)),
+            ({}, (8, 9)),
         )
-
-        self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
+        for kwargs, capability in cases:
+            with self.subTest(kwargs=kwargs, capability=capability):
+                args = self._fasth3_args(capability, **kwargs)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    kwargs.get("component_attention_backends", {}),
+                )
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
@@ -349,6 +495,66 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
 
+    def test_role_qualified_component_keys_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "transformer.self=sage_attn,transformer.cross=fa3"
+                ),
+            }
+        )
+
+        # Role-qualified entries must not leak into the flat component map, or
+        # every consumer that looks a component up by name would see them.
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"self": "sage_attn", "cross": "fa"}},
+        )
+
+    def test_role_and_component_wide_keys_are_split(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "text_encoder=torch_sdpa,transformer=fa,transformer.cross=fa3"
+                ),
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
+        )
+
+    def test_role_qualified_component_normalizes_hyphenated_component(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder.cross=torch_sdpa",
+            }
+        )
+
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"text_encoder": {"cross": "torch_sdpa"}},
+        )
+
+    def test_invalid_component_attention_role_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"transformer.bogus": "fa"},
+                }
+            )
+
     def test_dynamic_component_precision_cli_args(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -364,12 +570,105 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             patch.object(
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.component_precisions, {"text_encoder_2": "fp32"})
+
+    def test_dynamic_role_qualified_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.transformer.cross=fa",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.component_attention_backends, {})
+        self.assertEqual(
+            server_args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
+        )
+
+    def test_resolve_component_backend_by_role_returns_overrides(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.self": "sage_attn",
+                    "transformer.cross": "fa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role,
+            {
+                AttentionRole.SELF: AttentionBackendEnum.SAGE_ATTN,
+                AttentionRole.CROSS: AttentionBackendEnum.FA,
+            },
+        )
+
+    def test_resolve_component_backend_by_role_only_returns_configured_roles(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_two_stage_fallback(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        # transformer_2 has no explicit role override, so it inherits the base
+        # transformer.cross entry via the two-stage fallback.
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_prefers_two_stage_override(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.cross": "fa",
+                    "transformer_2.cross": "torch_sdpa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.TORCH_SDPA}
+        )
 
     def test_layerwise_offload_components_imply_layerwise(self):
         args = self._from_dict_without_model_resolution(
@@ -575,7 +874,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
                 "--component-quantizations.text_encoder",
-                "kitchen_int8",
+                "convrot_int8",
                 "--component-quantization-ignored-layers.text_encoder",
                 "model.layers.0",
                 "lm_head",
@@ -623,7 +922,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends,
         )
         self.assertEqual(
-            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            {"text_encoder": "convrot_int8", "transformer": "fp8"},
             server_args.component_quantizations,
         )
         self.assertEqual(
@@ -865,7 +1164,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
                 self.assertEqual(sa.warmup_mode, "server")
 
-    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+    def test_bcg_warns_but_stays_enabled_off_the_validated_lists(self):
         for model_path, config in (
             ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
             ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
@@ -874,10 +1173,26 @@ class TestWarmupModeNormalization(unittest.TestCase):
             with self.subTest(model_path=model_path, config=type(config).__name__):
                 sa = ServerArgs.__new__(ServerArgs)
                 sa.model_path = model_path
+                sa.model_id = None
                 sa.pipeline_config = config
                 sa.enable_breakable_cuda_graph = True
-                sa._adjust_breakable_cuda_graph_support()
-                self.assertFalse(sa.enable_breakable_cuda_graph)
+                sa.warmup_resolutions = ["1024x1024"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertIn("not validated", warning.call_args[0][0])
+
+    def test_bcg_does_not_warn_for_a_validated_model(self):
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.model_path = "black-forest-labs/FLUX.1-dev"
+        sa.model_id = None
+        sa.pipeline_config = FluxPipelineConfig()
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = ["1024x1024"]
+        with patch.object(server_args_module.logger, "warning") as warning:
+            sa._adjust_breakable_cuda_graph_support()
+        self.assertTrue(sa.enable_breakable_cuda_graph)
+        warning.assert_not_called()
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -954,35 +1269,16 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         )
 
 
-class TestOffloadDefaults(unittest.TestCase):
-    def test_wan_decode_precision_defaults(self):
-        for pipeline_config in (
-            WanT2V480PConfig(),
-            WanI2V480PConfig(),
-        ):
-            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
-                self.assertEqual(pipeline_config.vae_precision, "fp32")
-                self.assertEqual(pipeline_config.vae_decode_precision, "bf16")
-
-        for pipeline_config in (
-            FastWan2_2_TI2V_5B_Config(),
-            Wan2_2_T2V_A14B_Config(),
-            Wan2_2_I2V_A14B_Config(),
-        ):
-            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
-                self.assertEqual(pipeline_config.vae_precision, "fp32")
-                self.assertEqual(pipeline_config.vae_decode_precision, "fp32")
-
-        generic_config = PipelineConfig()
-        self.assertEqual(generic_config.vae_precision, "fp32")
-        self.assertIsNone(generic_config.vae_decode_precision)
-
+class TestOffloadDefaults(_CudaPlatformTestCase):
     def _from_dict_with_pipeline_config(
         self,
         pipeline_config,
         *,
         memory_gb=80,
         available_memory_gb=None,
+        dit_parameter_count=None,
+        checkpoint_sizes=None,
+        is_cuda=True,
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -995,6 +1291,18 @@ class TestOffloadDefaults(unittest.TestCase):
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
             patch(
+                "sglang.multimodal_gen.runtime.server_args.auto_tune.dit_parameter_count",
+                (
+                    dit_parameter_count
+                    if isinstance(dit_parameter_count, Mock)
+                    else Mock(return_value=dit_parameter_count)
+                ),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.auto_tune.checkpoint_component_sizes",
+                return_value=checkpoint_sizes,
+            ),
+            patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
@@ -1004,12 +1312,13 @@ class TestOffloadDefaults(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-                return_value=True,
+                return_value=is_cuda,
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
+            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
@@ -1290,6 +1599,17 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.residency_mode("text_encoder"), COMPONENT_OFFLOAD)
         self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.text_encoder_cpu_offload)
+
+    def test_numa_node_must_cover_every_local_gpu(self):
+        with self.assertRaisesRegex(ValueError, "--numa-node needs one node per"):
+            self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "num_gpus": 2,
+                    "numa_node": [0],
+                },
+            )
 
     def test_explicit_false_layerwise_keeps_dit_resident(self):
         args = self._from_dict_with_pipeline_config(
@@ -1626,108 +1946,21 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.layerwise_offload_components, ["dit"])
         self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
 
-    def test_pipeline_configs_declare_auto_tune_hints(self):
-        qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
-        cosmos3_deployment = Cosmos3Config(
-            model_path="nvidia/Cosmos3-Nano"
-        ).get_model_deployment_config()
-        cosmos3_super_deployment = Cosmos3Config(
-            model_path="nvidia/Cosmos3-Super"
-        ).get_model_deployment_config()
-        local_cosmos3_nano_deployment = Cosmos3Config(
-            model_path="/models/custom-checkpoint", is_nano=True
-        ).get_model_deployment_config()
-        wan_deployment = WanT2V480PConfig().get_model_deployment_config()
-        mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
-        zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
-        lingbot_deployment = LingBotWorldCausalDMDConfig().get_model_deployment_config()
-        ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
-        ltx23_config = LTX23PipelineConfig()
-        longlive_deployment = LongLive2T2VConfig().get_model_deployment_config()
-        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
+    def test_cosmos3_resident_threshold_follows_checkpoint_size(self):
+        def threshold(**kwargs):
+            deployment = Cosmos3Config(**kwargs).get_model_deployment_config()
+            return deployment.keep_resident_min_available_gb
 
-        self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
-
-        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 90)
-        self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
-        self.assertEqual(cosmos3_super_deployment.keep_resident_min_available_gb, 120)
+        nano = threshold(model_path="nvidia/Cosmos3-Nano")
         self.assertEqual(
-            local_cosmos3_nano_deployment.keep_resident_min_available_gb, 90
+            threshold(model_path="/models/custom-checkpoint", is_nano=True), nano
         )
+        self.assertGreater(threshold(model_path="nvidia/Cosmos3-Super"), nano)
 
-        self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(wan_deployment.keep_resident_min_available_gb, 60)
-        self.assertEqual(wan_deployment.keep_resident_components, ("dit",))
-
-        self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
-        self.assertEqual(
-            mova_deployment.dit_layerwise_offload_modes, ("auto", "memory")
-        )
-        self.assertEqual(mova_deployment.keep_resident_min_available_gb, 130)
-        self.assertEqual(mova_deployment.keep_resident_components, ("dit", "vae"))
-
-        self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
-        self.assertEqual(zimage_deployment.keep_resident_min_available_gb, 30)
-        self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
-        self.assertEqual(zimage_deployment.dit_layerwise_offload_modes, ())
-
-        self.assertEqual(lingbot_deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(lingbot_deployment.keep_resident_min_available_gb, 70)
-        self.assertEqual(lingbot_deployment.keep_resident_components, ("dit",))
-
-        self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
-        self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
-        self.assertEqual(
-            ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
-        )
-        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
-        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
-        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
-        self.assertEqual(longlive_deployment.keep_resident_min_available_gb, 60)
-        self.assertEqual(
-            longlive_deployment.keep_resident_components,
-            ("dit", "text_encoder", "vae"),
-        )
-        self.assertFalse(
-            LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
-        )
-        self.assertFalse(
-            ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
-        )
-
-        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
-        self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
-        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
-
-        helios_deployment = HeliosDistilledConfig().get_model_deployment_config()
-        self.assertEqual(helios_deployment.keep_resident_min_available_gb, 120)
-        self.assertEqual(helios_deployment.keep_resident_components, ("dit", "vae"))
-        self.assertEqual(helios_deployment.dit_layerwise_offload_modes, ("memory",))
-
-        fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
-        self.assertEqual(fast_hunyuan_deployment.keep_resident_min_available_gb, 60)
-        self.assertEqual(
-            fast_hunyuan_deployment.keep_resident_components, ("dit", "vae")
-        )
-
-        fast_wan_deployment = FastWan2_2_TI2V_5B_Config().get_model_deployment_config()
-        self.assertEqual(fast_wan_deployment.keep_resident_min_available_gb, 60)
-        self.assertEqual(fast_wan_deployment.keep_resident_components, ("dit",))
-
-        for dual_dit_config in (
-            Wan2_2_T2V_A14B_Config(),
-            Wan2_2_I2V_A14B_Config(),
-        ):
-            dual_dit_deployment = dual_dit_config.get_model_deployment_config()
-            self.assertIsNone(dual_dit_deployment.keep_resident_min_available_gb)
-            self.assertEqual(dual_dit_deployment.keep_resident_components, ("vae",))
-
-        # default keeps only vae resident (encoders are large, dit owned by FSDP)
-        self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
-        self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
+    def test_auto_cfg_parallel_degree_falls_back_to_two(self):
+        deployment = LTX2PipelineConfig().get_model_deployment_config()
+        self.assertEqual(deployment.get_auto_cfg_parallel_degree(4), 1)
+        self.assertEqual(deployment.get_auto_cfg_parallel_degree(2), 2)
 
     def test_longlive_residency_scales_with_available_memory(self):
         high_memory_args = self._from_dict_with_pipeline_config(
@@ -1926,6 +2159,101 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder"],
         )
 
+    def _zimage_turbo(
+        self, *, memory_gb=141, available_memory_gb=139, checkpoint_sizes=None, **kwargs
+    ):
+        return self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=memory_gb,
+            available_memory_gb=available_memory_gb,
+            checkpoint_sizes=checkpoint_sizes,
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image-Turbo",
+                "performance_mode": "auto",
+                **kwargs,
+            },
+        )
+
+    # (parameters, stored bytes) of Tongyi-MAI/Z-Image-Turbo: the DiT is stored in
+    # fp32 (22.9 GiB) and served in bf16, 19.3 GiB per GPU in all
+    ZIMAGE_TURBO_SIZES = {
+        "transformer": (6_154_908_736, 24_619_634_944),
+        "text_encoder": (4_022_468_096, 8_044_936_192),
+        "vae": (83_819_683, 335_278_732),
+    }
+
+    def _residency(self, args):
+        return {
+            name: args.residency_mode(name)
+            for name in ("transformer", "text_encoder", "image_encoder", "vae")
+        }
+
+    def test_auto_keeps_every_component_resident_when_weights_fit_twice(self):
+        args = self._zimage_turbo(checkpoint_sizes=self.ZIMAGE_TURBO_SIZES)
+
+        self.assertIsNone(args.layerwise_offload_components)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+    def test_auto_tier_sizes_weights_in_their_serving_precision(self):
+        # fits twice in 45 GiB at bf16; the fp32-stored bytes would not
+        args = self._zimage_turbo(
+            memory_gb=48,
+            available_memory_gb=45,
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+        )
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+    def test_auto_tier_leaves_consumer_gpus_on_their_policy(self):
+        for memory_gb, available_gb in ((32, 31), (24, 23)):
+            with self.subTest(memory_gb=memory_gb):
+                sized = self._zimage_turbo(
+                    memory_gb=memory_gb,
+                    available_memory_gb=available_gb,
+                    checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+                )
+                unsized = self._zimage_turbo(
+                    memory_gb=memory_gb, available_memory_gb=available_gb
+                )
+                self.assertEqual(self._residency(sized), self._residency(unsized))
+                self.assertNotEqual(sized.residency_mode("text_encoder"), RESIDENT)
+
+    def test_auto_tier_skips_batching_shared_memory_and_unsized_checkpoints(self):
+        unsized = self._zimage_turbo()
+        self.assertEqual(unsized.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+        batching = self._zimage_turbo(
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES, batching_max_size=2
+        )
+        self.assertEqual(batching.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+        with patch.object(
+            current_platform, "device_shares_host_memory", return_value=True
+        ):
+            shared = self._zimage_turbo(checkpoint_sizes=self.ZIMAGE_TURBO_SIZES)
+        self.assertEqual(shared.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_auto_tier_replaces_whole_component_offload_off_cuda(self):
+        # off CUDA auto has no layerwise defaults and offloads the encoder whole
+        unsized = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=192,
+            available_memory_gb=190,
+            is_cuda=False,
+            kwargs={"model_path": "Tongyi-MAI/Z-Image-Turbo"},
+        )
+        sized = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=192,
+            available_memory_gb=190,
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+            is_cuda=False,
+            kwargs={"model_path": "Tongyi-MAI/Z-Image-Turbo"},
+        )
+
+        self.assertTrue(unsized.text_encoder_cpu_offload)
+        self.assertFalse(sized.text_encoder_cpu_offload)
+        self.assertEqual(set(self._residency(sized).values()), {RESIDENT})
+
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(
             LingBotWorldCausalDMDConfig(),
@@ -2034,6 +2362,45 @@ class TestOffloadDefaults(unittest.TestCase):
                     ["dit", "text_encoder", "image_encoder", "vae"],
                 )
 
+    def test_auto_wan2_2_a14b_keeps_both_experts_resident_above_120gb(self):
+        for pipeline_config, model_path in (
+            (Wan2_2_T2V_A14B_Config(), "Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
+            (Wan2_2_I2V_A14B_Config(), "Wan-AI/Wan2.2-I2V-A14B-Diffusers"),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=141,
+                    available_memory_gb=139,
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+
+                self.assertFalse(args.dit_cpu_offload)
+                self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+                self.assertEqual(args.residency_mode("transformer_2"), RESIDENT)
+                self.assertEqual(args.residency_mode("vae"), RESIDENT)
+                self.assertEqual(
+                    args.layerwise_offload_components,
+                    ["text_encoder", "image_encoder"],
+                )
+
+                # two 14B experts plus T5 fit twice over: the encoder joins them
+                rich = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=288,
+                    available_memory_gb=280,
+                    checkpoint_sizes={
+                        "transformer": (14_288_901_184, 57_155_604_736),
+                        "transformer_2": (14_288_901_184, 57_155_604_736),
+                        "text_encoder": (5_680_910_336, 22_723_641_344),
+                        "vae": (126_892_531, 507_570_124),
+                    },
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+                self.assertIsNone(rich.layerwise_offload_components)
+                self.assertEqual(rich.residency_mode("text_encoder"), RESIDENT)
+                self.assertEqual(rich.residency_mode("transformer_2"), RESIDENT)
+
     def test_auto_wan2_1_14b_keeps_dit_resident_on_h100(self):
         for pipeline_config, model_path in (
             (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers"),
@@ -2069,6 +2436,108 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.dit_cpu_offload)
 
+    def test_auto_wan2_1_14b_streams_a_dit_that_overflows_the_card(self):
+        """With no placement flags, a Wan2.1 14B DiT OOMed on 24 GB cards."""
+        i2v_path = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+        for pipeline_config, model_path, kwargs in (
+            (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers", {}),
+            (WanI2V480PConfig(), i2v_path, {}),
+            (
+                WanI2V480PConfig(),
+                i2v_path,
+                {"num_gpus": 8, "enable_cfg_parallel": True, "ulysses_degree": 4},
+            ),
+        ):
+            with self.subTest(model_path=model_path, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=24,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": model_path,
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
+        # 16B parameters fit a 48 GB card in BF16 but not in FP32
+        for pipeline_config, kwargs in (
+            (WanI2V480PConfig(dit_precision="fp32"), {}),
+            (WanI2V480PConfig(), {"component_precisions": {"dit": "fp32"}}),
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=48,
+                    dit_parameter_count=16_000_000_000,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_sizes_a_dit_whose_config_has_no_precision_field(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            memory_gb=24,
+            dit_parameter_count=16_000_000_000,
+            kwargs={
+                "model_path": "/models/SANA-WM-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_does_not_size_a_dit_it_cannot_or_need_not_size(self):
+        for pipeline_config, memory_gb, model_path in (
+            # above the model's keep-resident threshold
+            (WanI2V480PConfig(), 80, "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
+            # an overlay's source repo
+            (SanaWMPipelineConfig(), 24, "Efficient-Large-Model/SANA-WM_bidirectional"),
+        ):
+            with self.subTest(model_path=model_path):
+                sizer = Mock(return_value=40_000_000_000)
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=memory_gb,
+                    dit_parameter_count=sizer,
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+
+                sizer.assert_not_called()
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
+
+    def test_auto_keeps_the_dit_placement_when_streaming_is_not_needed(self):
+        for memory_gb, params, kwargs in (
+            (24, 1_400_000_000, {}),
+            (48, 16_000_000_000, {}),
+            (24, None, {}),
+            (24, 16_000_000_000, {"num_gpus": 2, "tp_size": 2}),
+            (24, 16_000_000_000, {"quantization": "fp8"}),
+            (24, 16_000_000_000, {"component_quantizations": {"transformer": "fp8"}}),
+        ):
+            with self.subTest(memory_gb=memory_gb, params=params, **kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=memory_gb,
+                    dit_parameter_count=params,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "performance_mode": "auto",
+                        **kwargs,
+                    },
+                )
+
+                self.assertNotIn("dit", args.layerwise_offload_components or [])
+
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
@@ -2101,6 +2570,49 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
         self.assertTrue(args.use_fsdp_inference)
+
+    def test_explicit_multi_gpu_fsdp_keeps_the_dit_out_of_component_offload(self):
+        """Explicit multi-GPU FSDP shards the DiT unless its placement is set explicitly."""
+        for dit_cpu_offload in (None, True):
+            with self.subTest(dit_cpu_offload=dit_cpu_offload):
+                kwargs = {
+                    "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                    "use_fsdp_inference": True,
+                }
+                if dit_cpu_offload is not None:
+                    kwargs["dit_cpu_offload"] = dit_cpu_offload
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(), memory_gb=24, kwargs=kwargs
+                )
+
+                self.assertTrue(args.use_fsdp_inference)
+                self.assertEqual(args.dit_cpu_offload, dit_cpu_offload is True)
+                self.assertEqual(
+                    args.should_use_fsdp_for_component("transformer"),
+                    dit_cpu_offload is None,
+                )
+
+    def test_explicit_fsdp_keeps_the_dit_offload_default_where_it_cannot_shard(self):
+        for kwargs in (
+            {"dp_size": 2},
+            {"transformer_weights_path": "/models/wan-14b-q4.gguf"},
+        ):
+            with self.subTest(**kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    WanI2V480PConfig(),
+                    memory_gb=24,
+                    kwargs={
+                        "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                        "num_gpus": 2,
+                        "performance_mode": "auto",
+                        "use_fsdp_inference": True,
+                        **kwargs,
+                    },
+                )
+
+                self.assertTrue(args.dit_cpu_offload)
 
     def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -2324,14 +2836,18 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
     def test_explicit_multi_gpu_dit_layerwise_only_selects_dit_group(self):
-        args = self._from_dict_with_pipeline_config(
-            MOVAPipelineConfig(),
-            kwargs={
-                "model_path": "OpenMOSS-Team/MOVA-360p",
-                "num_gpus": 2,
-                "dit_layerwise_offload": True,
-            },
-        )
+        with patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={"_class_name": "MOVAPipeline"},
+        ):
+            args = self._from_dict_with_pipeline_config(
+                MOVAPipelineConfig(),
+                kwargs={
+                    "model_path": "OpenMOSS-Team/MOVA-360p",
+                    "num_gpus": 2,
+                    "dit_layerwise_offload": True,
+                },
+            )
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.dit_cpu_offload)
@@ -2380,6 +2896,19 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
+
+    def test_auto_ltx2_two_stage_device_mode_follows_device_memory(self):
+        for memory_gb, mode in ((140, "resident"), (80, "original")):
+            args = self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                memory_gb=memory_gb,
+                kwargs={
+                    "model_path": "Lightricks/LTX-2",
+                    "num_gpus": 2,
+                    "pipeline_class_name": "LTX2TwoStagePipeline",
+                },
+            )
+            self.assertEqual(args.ltx2_two_stage_device_mode, mode)
 
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(
@@ -2616,6 +3145,29 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.vae_cpu_offload)
         self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
+    def test_minimax_h3_memory_mode_keeps_one_vae_tile_per_forward(self):
+        for pipeline_cls, mode, expected in (
+            (MiniMaxH3PipelineConfig, "speed", (64, 1)),
+            (MiniMaxH3PipelineConfig, "memory", (1, 1)),
+            (FastH3PipelineConfig, "speed", (0, 1)),
+            (FastH3PipelineConfig, "memory", (1, 1)),
+        ):
+            config = pipeline_cls()
+            self._from_dict_with_pipeline_config(
+                config,
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "ulysses_degree": 4,
+                    "performance_mode": mode,
+                },
+            )
+            self.assertEqual(
+                (config.vae_config.decoder_tile_batch, config.vae_config.window_batch),
+                expected,
+                (pipeline_cls.__name__, mode),
+            )
+
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
             ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
@@ -2834,6 +3386,116 @@ class TestOffloadDefaults(unittest.TestCase):
             parser.parse_known_args(argv)
 
 
+class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
+    """Unset BCG turns on only where the served path keeps fixed DiT weights."""
+
+    LTX2_TWO_STAGE_SERVE = {
+        "model_path": "Lightricks/LTX-2",
+        "num_gpus": 2,
+        "pipeline_class_name": "LTX2TwoStagePipeline",
+        "enable_cfg_parallel": True,
+        "warmup_mode": "server",
+    }
+
+    def _resolve(
+        self,
+        *,
+        memory_gb=141,
+        available_memory_gb=139,
+        device_name="NVIDIA H200",
+        **overrides,
+    ):
+        with (
+            patch.object(
+                current_platform, "device_shares_host_memory", return_value=False
+            ),
+            patch.object(current_platform, "get_device_name", return_value=device_name),
+        ):
+            return TestOffloadDefaults._from_dict_with_pipeline_config(
+                self,
+                LTX2PipelineConfig(),
+                memory_gb=memory_gb,
+                available_memory_gb=available_memory_gb,
+                kwargs={**self.LTX2_TWO_STAGE_SERVE, **overrides},
+            )
+
+    def test_flagless_ltx2_two_stage_serving_captures_the_model_default(self):
+        args = self._resolve()
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        self.assertEqual(args.warmup_resolutions, ["768x512"])
+        self.assertEqual(args.warmup_mode, "server")
+
+    def test_ltx23_needs_both_stage_dits_resident(self):
+        resident = self._resolve(model_path="Lightricks/LTX-2.3")
+        self.assertEqual(resident.ltx2_two_stage_device_mode, "resident")
+        self.assertTrue(resident.enable_breakable_cuda_graph)
+
+        original = self._resolve(
+            model_path="Lightricks/LTX-2.3", ltx2_two_stage_device_mode="original"
+        )
+        self.assertFalse(original.enable_breakable_cuda_graph)
+
+    def test_ltx25_distilled_two_stage_serving_turns_bcg_on(self):
+        args = self._resolve(
+            model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
+        )
+        self.assertTrue(args.enable_breakable_cuda_graph)
+
+    def test_gates_keep_unset_bcg_off(self):
+        cases = {
+            "explicit off": {"enable_breakable_cuda_graph": False},
+            "offline run": {"warmup_mode": None},
+            "request warmup": {"warmup_mode": "request"},
+            "memory mode": {"performance_mode": "memory"},
+            "manual mode": {"performance_mode": "manual"},
+            "torch.compile": {"enable_torch_compile": True},
+            "dynamic batching": {"batching_max_size": 2},
+            "startup LoRA": {"lora_path": "/loras/style.safetensors"},
+            "ComfyUI": {"comfyui_mode": True},
+            "one-stage pipeline": {"pipeline_class_name": "LTX2Pipeline"},
+            "HQ pipeline": {"pipeline_class_name": "LTX2TwoStageHQPipeline"},
+            "unvalidated checkpoint": {"model_path": "/models/custom-ltx"},
+            "DiT layerwise offload": {"dit_layerwise_offload": True},
+            "DiT component offload": {"dit_cpu_offload": True},
+            "DiT residency selector": {
+                "component_residency": ["transformer=layerwise-offload"]
+            },
+            # below LTX-2's keep-resident threshold auto component-offloads the DiT
+            "low free memory": {"available_memory_gb": 60},
+            # the DiT stays resident, but capture outgrows a speed-mode 80 GB card
+            "80 GB card": {
+                "memory_gb": 80,
+                "available_memory_gb": 79,
+                "device_name": "NVIDIA H100 80GB HBM3",
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._resolve(**overrides).enable_breakable_cuda_graph)
+
+    def test_platform_gates(self):
+        args = self._resolve(enable_breakable_cuda_graph=False)
+        with patch.object(
+            current_platform, "get_device_total_memory", return_value=141 * 1024**3
+        ):
+            with patch.object(
+                current_platform, "device_shares_host_memory", return_value=False
+            ):
+                self.assertTrue(args._breakable_cuda_graph_default())
+                # ROCm answers torch.cuda.is_available() but not the platform check
+                with patch.object(current_platform, "is_cuda", return_value=False):
+                    self.assertFalse(args._breakable_cuda_graph_default())
+            with patch.object(
+                current_platform, "device_shares_host_memory", return_value=True
+            ):
+                self.assertFalse(args._breakable_cuda_graph_default())
+
+    def test_explicit_enable_elsewhere_is_unchanged(self):
+        args = self._resolve(enable_breakable_cuda_graph=True, warmup_mode=None)
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        self.assertEqual(args.warmup_mode, "server")
+
+
 class TestKVGatherDegree(unittest.TestCase):
     def test_sp2_defaults_to_kv_gather(self):
         args = _from_dict_without_model_resolution(
@@ -2982,13 +3644,6 @@ class TestModelIdResolution(unittest.TestCase):
 
         self.assertIs(info.pipeline_config_cls, QwenImagePipelineConfig)
 
-    def test_model_id_works_after_tilde_expansion(self):
-        # simulate the full flow: user passes ~/..., engine expands and resolves
-        expanded = os.path.expanduser("~/.cache/huggingface/hub/bbb/snapshots/ccc")
-        _get_config_info.cache_clear()
-        info = _get_config_info(expanded, model_id="Qwen-Image")
-        self.assertIsNotNone(info)
-
     def test_hf_cache_snapshot_path_resolves_registered_nvfp4_model(self):
         path = (
             "/root/.cache/huggingface/hub/"
@@ -3014,6 +3669,93 @@ class TestPerRoleParallelism(unittest.TestCase):
 
     def _from_dict(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
+
+    def test_role_derivation_recalculates_automatic_topology(self):
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", side_effect=lambda _: WanT2V480PConfig()
+            ),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
+            mock_cuda_platform(),
+        ):
+            for source_options in ({}, {"enable_cfg_parallel": False}):
+                source = ServerArgs.from_kwargs(
+                    model_path="/fake", num_gpus=2, **source_options
+                )
+                original = vars(source).copy()
+                explicit = source._explicit_arg_names.copy()
+                for role in (
+                    RoleType.ENCODER,
+                    RoleType.PROMPT_ENCODER,
+                    RoleType.IMAGE_ENCODER,
+                    RoleType.DENOISER,
+                    RoleType.DECODER,
+                ):
+                    for devices in (1, 2, 4):
+                        with self.subTest(
+                            options=source_options, role=role, gpus=devices
+                        ):
+                            args = source.for_disagg_role(role, num_gpus=devices)
+                            self.assertEqual(args.hsdp_shard_dim, devices)
+                            self.assertEqual(
+                                args.tp_size
+                                * args.sp_degree
+                                * args.cfg_parallel_degree,
+                                devices,
+                            )
+                            self.assertEqual(args.disagg_role, role)
+                            self.assertTrue(args.disagg_mode)
+                            if devices == 1:
+                                self.assertFalse(args.enable_cfg_parallel)
+                                self.assertEqual(args.kv_gather_degree, 1)
+                                self.assertFalse(args.sp_split_auto)
+                self.assertEqual(vars(source), original)
+                self.assertEqual(source._explicit_arg_names, explicit)
+
+    def test_role_derivation_respects_explicit_parallelism(self):
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", side_effect=lambda _: WanT2V480PConfig()
+            ),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
+            mock_cuda_platform(),
+        ):
+            for role, option, field in (
+                (RoleType.ENCODER, "encoder_tp", "tp_size"),
+                (RoleType.DENOISER, "denoiser_tp", "tp_size"),
+                (RoleType.DENOISER, "denoiser_sp", "sp_degree"),
+                (RoleType.DENOISER, "denoiser_ulysses", "ulysses_degree"),
+                (RoleType.DECODER, "decoder_sp", "sp_degree"),
+            ):
+                with self.subTest(role=role, option=option):
+                    source = ServerArgs.from_kwargs(
+                        model_path="/fake", num_gpus=2, **{option: 2}
+                    )
+                    args = source.for_disagg_role(role)
+                    self.assertEqual(vars(args)[field], 2)
+                    self.assertEqual(args.cfg_parallel_degree, 1)
+                    self.assertTrue(args.is_arg_explicitly_set(field))
+                    self.assertFalse(source.is_arg_explicitly_set(field))
+
+            source = ServerArgs.from_kwargs(model_path="/fake", num_gpus=2, tp_size=2)
+            self.assertEqual(source.for_disagg_role(RoleType.DENOISER).tp_size, 2)
+            source.denoiser_tp = 1
+            self.assertEqual(source.for_disagg_role(RoleType.DENOISER).tp_size, 1)
+
+            for options in (
+                {"tp_size": 2},
+                {"cfg_parallel_degree": 2},
+                {"enable_cfg_parallel": True},
+                {"hsdp_shard_dim": 2},
+                {"kv_gather_degree": 2, "enable_cfg_parallel": False},
+                {"denoiser_tp": 2, "cfg_parallel_degree": 2},
+            ):
+                with self.subTest(invalid=options):
+                    source = ServerArgs.from_kwargs(
+                        model_path="/fake", num_gpus=2, **options
+                    )
+                    with self.assertRaises(ValueError):
+                        source.for_disagg_role(RoleType.DENOISER, num_gpus=1)
 
     def test_defaults_are_none(self):
         args = self._from_dict({"model_path": "/fake"})
@@ -3092,18 +3834,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
-    def test_disagg_args_import_path_matches_server_args_package(self):
-        from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args.disagg import (
-            DisaggServerArgsMixin,
-        )
-
-        self.assertIs(disagg_args.DisaggArgsMixin, DisaggServerArgsMixin)
-        self.assertIs(
-            disagg_args.DISAGG_RESULT_PORT_OFFSETS,
-            DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS,
-        )
-
     def test_gpu_ids_normalize_lists_and_commas(self):
         args = self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "6", "7 8"]})
 
@@ -3130,14 +3860,6 @@ class TestPerRoleParallelism(unittest.TestCase):
             args.derive_pool_work_endpoint(),
             f"tcp://0.0.0.0:{args.scheduler_port}",
         )
-        self.assertEqual(
-            args.derive_pool_control_endpoint(),
-            f"tcp://0.0.0.0:{args.scheduler_port + 1}",
-        )
-        self.assertEqual(
-            args.derive_pool_control_advertised_endpoint(),
-            f"tcp://10.0.0.7:{args.scheduler_port + 1}",
-        )
 
     def test_pool_result_endpoint_validates_addr_and_role(self):
         args = self._from_dict({"model_path": "/fake", "disagg_server_addr": "bad"})
@@ -3147,7 +3869,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         args = self._from_dict(
             {"model_path": "/fake", "disagg_server_addr": "127.0.0.1:30000"}
         )
-        with self.assertRaisesRegex(ValueError, "only defined for encoder"):
+        with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
     def test_cli_args_parsed(self):
@@ -3182,6 +3904,13 @@ class TestPerRoleParallelism(unittest.TestCase):
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()
+        model_index = patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={"_class_name": "QwenImageLayeredPipeline"},
+        )
+        model_index.start()
+        self.addCleanup(model_index.stop)
+        self.addCleanup(_get_config_info.cache_clear)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()
@@ -3195,7 +3924,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         with (
             patch.object(sys, "argv", ["sglang"] + argv),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -3214,7 +3943,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         with (
             patch.object(sys, "argv", ["sglang"] + argv),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -3224,12 +3953,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
-    def test_disagg_defaults_match_reviewed_values(self):
-        args = _from_dict_without_model_resolution({"model_path": "/fake"})
-        self.assertEqual(args.disagg_max_slots_per_instance, 8)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 1800)
-        self.assertEqual(args.disagg_timeout, 3600)
-
     def test_downstream_wait_timeout_cli_arg_is_parsed(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3242,14 +3965,6 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_downstream_wait_timeout, 45)
-
-    def test_disagg_timeout_help_uses_current_defaults(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        help_text = parser.format_help()
-
-        self.assertIn("Default: 3600.", help_text)
-        self.assertIn("Default: 1800.", help_text)
 
     def test_disagg_role_alias_cli_arg_is_accepted(self):
         parser = FlexibleArgumentParser()
@@ -3271,10 +3986,6 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
 
 class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
-    def test_scheduler_rpc_timeout_defaults_to_unbounded(self):
-        args = _from_dict_without_model_resolution({"model_path": "/fake"})
-        self.assertIsNone(args.scheduler_rpc_timeout)
-
     def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3304,11 +4015,40 @@ class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
                     )
 
 
-class TestDisaggTransferBackendArgs(unittest.TestCase):
-    def test_transfer_backend_defaults_to_auto(self):
-        args = _from_dict_without_model_resolution({"model_path": "/fake"})
-        self.assertEqual(args.disagg_transfer_backend, "auto")
+class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
+    def test_cli_default_and_explicit_timeout(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake"]
+        self.assertIsNone(parser.parse_args(argv).http_graceful_shutdown_timeout)
+        for timeout in (0, 30):
+            with self.subTest(timeout=timeout):
+                args = parser.parse_args(
+                    argv + ["--http-graceful-shutdown-timeout", str(timeout)]
+                )
+                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
 
+    def test_config_values(self):
+        for timeout in (None, 0, 30):
+            with self.subTest(timeout=timeout):
+                args = _from_dict_without_model_resolution(
+                    {"model_path": "/fake", "http_graceful_shutdown_timeout": timeout}
+                )
+                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
+        for timeout in (-1, True, 1.5, "1"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(
+                    ValueError, "http_graceful_shutdown_timeout"
+                ):
+                    _from_dict_without_model_resolution(
+                        {
+                            "model_path": "/fake",
+                            "http_graceful_shutdown_timeout": timeout,
+                        }
+                    )
+
+
+class TestDisaggTransferBackendArgs(unittest.TestCase):
     def test_transfer_backend_cli_arg_is_parsed(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3341,7 +4081,7 @@ class TestNcclNvlsArgs(unittest.TestCase):
         self.assertFalse(disabled_args.enable_nccl_nvls)
 
 
-class TestDirectGpuWeightLoading(unittest.TestCase):
+class TestDirectGpuWeightLoading(_CudaPlatformTestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
         args.direct_gpu_weight_loading = True

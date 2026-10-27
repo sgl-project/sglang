@@ -323,15 +323,10 @@ def handle_tag_run_ci(
     we always add `run-ci` alongside `run-ci-extra`. Reuses the same
     `can_tag_run_ci_label` permission.
 
-    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
-    include `labeled` in `on.pull_request.types`, so adding a label fires a
-    new `pull_request.labeled` event with the up-to-date label set in its
-    payload, which spawns a fresh workflow run that satisfies the
-    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
-    label-gated run — `run.rerun()` on a previously-skipped pull_request run
-    reuses the original event payload (frozen labels), so it would skip
-    again. handle_rerun_failed_ci can't recover label-skipped runs; the
-    labeled event is the recovery mechanism.
+    Labels added here do not start a run: GITHUB_TOKEN label events do not
+    trigger workflows, and no PR workflow listens to `labeled`. The label
+    gate in pr-gate.yml reads the live label set, so the next push, or a
+    rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
 
     Returns True if action was taken, False otherwise.
     """
@@ -439,12 +434,9 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
     #
     #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
-    #   reruns of `pull_request`-event runs that were skipped because their
-    #   `if` evaluated to false (e.g. missing label) will skip again — the
-    #   label set in the frozen payload doesn't update. To un-skip a
-    #   label-gated workflow, add the missing label (the `labeled` event
-    #   dispatches a fresh run with the current label set); this function
-    #   cannot recover those by rerun alone.
+    #   a job skipped by an `if` on that payload skips again. The label gates
+    #   read live labels inside pr-gate.yml instead, so a missing label fails
+    #   the gate job and the run is recoverable by rerun once labeled.
     # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
     #   every job that didn't succeed — cancelled ones included — plus their
     #   dependents, and carries the passing jobs over untouched. A full
@@ -942,6 +934,8 @@ _OTHER_BACKEND_REGISTERS = {
     "register_xpu_ci": "XPU",
     "register_musa_ci": "MUSA",
     "register_mlx_ci": "MLX",
+    "register_mps_ci": "MPS",
+    "register_ppu_ci": "PPU",
 }
 
 
@@ -1577,11 +1571,6 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
-    # Echo the originating command so each reply is self-identifying when
-    # several /rerun-test commands are in flight at once. Backtick-wrapping
-    # also keeps any `*` in the pattern from rendering as italics.
-    if command_label:
-        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
@@ -1646,6 +1635,80 @@ def handle_rerun_group(
     )
 
 
+CPU_CI_WORKFLOW_FILE = "run-cpu-ci.yml"
+CPU_CI_SUITE = "base-a-test-cpu"
+
+
+def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
+    """
+    Handles /run-cpu-ci: dispatch run-cpu-ci.yml, which runs only the CPU unit
+    suite (base-a-test-cpu) against the PR head, partitioned the way PR CI is.
+
+    Always dispatched on main with the head SHA as an input, for forks and
+    in-repo PRs alike, so the workflow definition is main's. It runs PR code on
+    hosted runners with no secrets, so it takes the /rerun-test gate.
+    """
+    if not _check_rerun_test_permissions(
+        gh_repo, pr, comment, user_perms, "run-cpu-ci"
+    ):
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
+        return False
+
+    head_sha = pr.head.sha
+    ref = gh_repo.default_branch
+    try:
+        workflow = gh_repo.get_workflow(CPU_CI_WORKFLOW_FILE)
+    except Exception as e:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(f"⛔ `{CPU_CI_WORKFLOW_FILE}` not found: {e}")
+        return False
+
+    dispatch_time = time.time()
+    resp = requests.post(
+        f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{workflow.id}/dispatches",
+        json={
+            "ref": ref,
+            "inputs": {"git_ref": head_sha, "pr_number": str(pr.number)},
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    if resp.status_code not in (200, 204):
+        print(f"Dispatch failed: {resp.status_code} {resp.text}")
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            f"⛔ Failed to dispatch `{CPU_CI_WORKFLOW_FILE}`: {resp.status_code}"
+        )
+        return False
+
+    run_url = find_workflow_run_url(
+        gh_repo,
+        workflow.id,
+        ref,
+        "run-cpu-ci",
+        token,
+        dispatch_time,
+        pr_head_sha=head_sha,
+    )
+    target = f"`{CPU_CI_SUITE}` on `{head_sha[:12]}`"
+    if run_url:
+        pr.create_issue_comment(f"🚀 Running {target}: [View workflow run]({run_url})")
+    else:
+        pr.create_issue_comment(
+            f"🚀 Running {target}. Could not retrieve the run URL; check the "
+            f"[Actions tab](https://github.com/{gh_repo.full_name}/actions/workflows/{CPU_CI_WORKFLOW_FILE})."
+        )
+    comment.create_reaction("+1")
+    return True
+
+
 # Namespaces this handler owns. Anything else reaching the script is a comment
 # that merely quoted a path, and is left alone.
 OWNED_COMMAND_PREFIXES = ("/tag-", "/rerun-", "/run-")
@@ -1660,6 +1723,7 @@ KNOWN_COMMANDS = (
     "/rerun-test",
     "/run-full-ci",
     "/run-extra-ci",
+    "/run-cpu-ci",
 )
 
 # Removed commands, kept because they were documented long enough that muscle
@@ -1777,6 +1841,9 @@ def main():
 
     elif is_extra_ci:
         handle_run_extra_ci(repo, pr, comment, user_perms)
+
+    elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
+        handle_run_cpu_ci(repo, pr, comment, user_perms, token)
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
