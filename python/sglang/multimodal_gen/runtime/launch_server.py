@@ -1,7 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import copy
-import dataclasses
 import multiprocessing as mp
 import os
 import sys
@@ -737,13 +735,15 @@ def launch_stage_deployment(server_args: ServerArgs):
             model_id=server_args.model_id,
         ).pipeline_cls
     )
-    plan = ExecutionPlan.compile(
-        Deployment.load(server_args.stage_deployment), pipeline_cls.stage_specs
-    )
+    deployment = Deployment.load(server_args.stage_deployment)
+    if not deployment.stages and any(
+        "model_path" in role.server_args for role in deployment.roles.values()
+    ):
+        raise ValueError("Per-role models require explicit deployment stage contracts")
+    plan = ExecutionPlan.compile(deployment, pipeline_cls.stage_specs)
     if server_args.stage_node:
         if server_args.stage_role:
             raise ValueError("Use --stage-node or --stage-role, not both")
-        deployment = Deployment.load(server_args.stage_deployment)
         context = mp.get_context("spawn")
         processes = []
         reserved = {
@@ -761,8 +761,6 @@ def launch_stage_deployment(server_args: ServerArgs):
                     if key.startswith("_")
                     or key
                     in {
-                        "model_path",
-                        "pipeline_config",
                         "stage_deployment",
                         "stage_node",
                         "stage_role",
@@ -779,15 +777,16 @@ def launch_stage_deployment(server_args: ServerArgs):
                         reserved.add(overrides[port])
                     overrides["base_gpu_id"] = int(
                         overrides.get("base_gpu_id", server_args.base_gpu_id)
-                    ) + index * int(overrides.get("num_gpus", server_args.num_gpus))
-                    args = dataclasses.replace(
-                        copy.deepcopy(server_args),
+                    ) + index * int(
+                        overrides.get(
+                            "num_gpus",
+                            1 if "model_path" in overrides else server_args.num_gpus,
+                        )
+                    )
+                    args = server_args.for_stage_role(
+                        name,
                         **overrides,
-                        stage_node=None,
-                        stage_role=name,
                         stage_endpoint=endpoint,
-                        _explicit_arg_names=server_args._explicit_arg_names
-                        | overrides.keys(),
                     )
                     process = context.Process(
                         target=bootstrap_stage_role,

@@ -55,6 +55,11 @@ class TensorTransport:
         )
         buffer = TransferTensorBuffer(pool_size, device=str(self.device))
         self.manager = DiffusionTransferManager(engine, buffer)
+        self.receive_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
 
     def push(self, values, target):
         if self.device.type == "cuda":
@@ -112,10 +117,15 @@ class TensorTransport:
             if self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
             tensors, event = self.manager.load_tensors_async(
-                key, reply["manifest"], self.device
+                key, reply["manifest"], self.device, stream=self.receive_stream
             )
             if event is not None:
-                event.synchronize()
+                try:
+                    # leave the event loop available for other pools and client prefetch
+                    await asyncio.to_thread(event.synchronize)
+                finally:
+                    # cancellation cannot return this slot while its D2D copy is pending
+                    event.synchronize()
             return unpack_fields(tensors, reply["scalar"], self.device)
         finally:
             if acknowledged:

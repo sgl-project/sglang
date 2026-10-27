@@ -330,6 +330,7 @@ def test_coordinator_parallel_join_and_cleanup():
         context = zmq.asyncio.Context()
         sockets, tasks, completed, live = [], [], set(), set()
         both_started = asyncio.Event()
+        require_join = True
         started = set()
 
         async def peer(name, socket):
@@ -337,7 +338,7 @@ def test_coordinator_parallel_join_and_cleanup():
                 message = pickle.loads(await socket.recv())
                 method = message["method"]
                 if method == "execute":
-                    if name in ("text", "image"):
+                    if require_join and name in ("text", "image"):
                         started.add(name)
                         if len(started) == 2:
                             both_started.set()
@@ -377,6 +378,16 @@ def test_coordinator_parallel_join_and_cleanup():
             assert completed == set(roles)
             assert result["sources"][0]["fields"] == ["result.output"]
             await server.release(result["lease"])
+            assert not live
+            require_join = False
+            completed.clear()
+            result = await server.execute(Req(prompt="text only"), role="text")
+            assert completed == {"text"}
+            assert result["sources"][0]["fields"] == ["extra.text"]
+            await server.release(result["lease"])
+            assert not live
+            with pytest.raises(KeyError):
+                await server.execute(Req(), ["extra.image"], role="text")
             assert not live
             control = context.socket(zmq.ROUTER)
             sockets.append(control)
@@ -484,6 +495,60 @@ def test_client_failure_cancels_outstanding_rpc(monkeypatch, error):
             await asyncio.gather(task, return_exceptions=True)
             socket.close()
             context.term()
+
+    asyncio.run(asyncio.wait_for(run(), 5))
+
+
+def test_client_prefetch_is_bounded_ordered_and_cleans_up(monkeypatch):
+    class NoGpuTransport:
+        def __init__(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client, "TensorTransport", NoGpuTransport)
+
+    async def run():
+        active, seen = set(), []
+        peak = 0
+
+        async def remote(self, request, outputs, role):
+            nonlocal peak
+            active.add(request)
+            seen.append(request)
+            peak = max(peak, len(active))
+            try:
+                await asyncio.sleep(0.02 if request % 2 == 0 else 0)
+                if request == -1:
+                    raise RuntimeError("invalid sample")
+                return {role: torch.full((request + 1,), request)}
+            finally:
+                active.remove(request)
+
+        monkeypatch.setattr(client.EncodingClient, "_encode", remote)
+        async with client.EncodingClient("unused", max_in_flight=2) as encoder:
+            async with encoder.prefetch(range(6), role="text", depth=3) as batches:
+                for index in range(6):
+                    result = await anext(batches)
+                    torch.testing.assert_close(
+                        result["text"], torch.full((index + 1,), index)
+                    )
+                    await asyncio.sleep(0.03)  # slow consumer must not drain the input
+                    assert len(seen) <= index + 4
+                with pytest.raises(StopAsyncIteration):
+                    await anext(batches)
+            assert peak == 2 and not active and not encoder.pending
+            async with encoder.prefetch(range(100), role="text", depth=3) as batches:
+                await anext(batches)
+            assert not active and not encoder.pending
+            with pytest.raises(RuntimeError, match="invalid sample"):
+                async with encoder.prefetch([0, -1, 2, 3], role="text") as batches:
+                    async for _ in batches:
+                        pass
+            assert not active and not encoder.pending
+            result = await encoder.encode(0, role="image")
+            assert result["image"].tolist() == [0]
 
     asyncio.run(asyncio.wait_for(run(), 5))
 

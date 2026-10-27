@@ -11,6 +11,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import fork_request
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import REQUEST_CONTEXT
 from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import rpc
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     create_dispatch_policy,
@@ -46,17 +47,26 @@ class DeploymentServer:
         self.leases = {}
         self.jobs = {}
 
-    async def execute(self, request, outputs=None):
+    async def execute(self, request, outputs=None, role=None):
         """return result descriptors and their lease; the caller owns final release"""
         # 1. inline head-local uploads before dispatch; workers need no shared upload path
         if isinstance(request, Req) and request.image_path:
             request = fork_request(request)
             request.image_path = inline_local_image_paths(request.image_path)
-        desired = (
+        available = (
             self.plan.outputs
-            if outputs is None
-            else {path: self.plan.outputs[path] for path in outputs}
+            if role is None
+            else dict.fromkeys(self.plan.roles[role].outputs, role)
         )
+        desired = (
+            available
+            if outputs is None
+            else {path: available[path] for path in outputs}
+        )
+        if not desired or REQUEST_CONTEXT in desired:
+            raise ValueError(
+                "Encoding requires named outputs from explicit stage contracts"
+            )
         # walk the validated DAG backwards so requested roles bring all their ancestors
         selected = set(desired.values())
         for name in reversed(self.plan.order):
@@ -170,7 +180,9 @@ class DeploymentServer:
                         await self.admission.acquire()
                         try:
                             response = await self.execute(
-                                message["request"], message["outputs"]
+                                message["request"],
+                                message["outputs"],
+                                message.get("role"),
                             )
                             # returning descriptors does not release the client's admission permit
                             self.leases[job_id] = (

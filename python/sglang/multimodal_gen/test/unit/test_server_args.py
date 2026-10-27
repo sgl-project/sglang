@@ -3670,6 +3670,43 @@ class TestPerRoleParallelism(unittest.TestCase):
     def _from_dict(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
 
+    def test_stage_role_rebuilds_defaults_and_isolates_model_config(self):
+        def config(kwargs):
+            if "pipeline_config" in kwargs:
+                return kwargs["pipeline_config"]
+            return (
+                ZImagePipelineConfig()
+                if kwargs["model_path"] == "/image"
+                else WanT2V480PConfig()
+            )
+
+        with (
+            patch.object(PipelineConfig, "from_kwargs", side_effect=config),
+            mock_cuda_platform(),
+        ):
+            source = ServerArgs.from_kwargs(
+                model_path="/video",
+                stage_deployment="pools.json",
+                num_gpus=2,
+                attention_backend="TORCH_SDPA",
+                disagg_timeout=17,
+            )
+            worker = source.for_stage_role("text", num_gpus=1)
+            self.assertEqual(worker.num_gpus, 1)
+            self.assertEqual(
+                worker.tp_size * worker.sp_degree * worker.cfg_parallel_degree, 1
+            )
+            self.assertEqual(worker.attention_backend, "TORCH_SDPA")
+            self.assertIsNot(worker.pipeline_config, source.pipeline_config)
+            image = source.for_stage_role("image", model_path="/image", num_gpus=1)
+            self.assertIsInstance(image.pipeline_config, ZImagePipelineConfig)
+            self.assertIsInstance(source.pipeline_config, WanT2V480PConfig)
+            self.assertFalse(image.is_arg_explicitly_set("attention_backend"))
+            self.assertEqual(image.disagg_timeout, 17)
+            self.assertEqual(image.stage_deployment, "pools.json")
+            self.assertEqual(source.num_gpus, 2)
+            self.assertIsNone(source.stage_role)
+
     def test_role_derivation_recalculates_automatic_topology(self):
         with (
             patch.object(
