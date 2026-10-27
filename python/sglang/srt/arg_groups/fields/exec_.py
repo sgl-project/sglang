@@ -581,14 +581,15 @@ class ExecMamba(msgspec.Struct):
     ] = False
     linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps. With --enable-linear-replayssm-spec on GDN models it is also the spec-verify ring length, which must be a power of two, at least 16 and at least the number of draft tokens.",
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify
     # stores each draft step's raw inputs into a per-slot window and the commit
-    # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
-    # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
-    # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
+    # replays the accepted prefix into the fp32 checkpoint. GDN keeps a ring of
+    # length --linear-replayssm-cache-len (a power of two, at least 16, that
+    # holds the draft window); KDA folds a (raw v, pre-norm k, gate, beta) ring
+    # of the same length. Linear-chain (topk <= 1) only.
     enable_linear_replayssm_spec: A[
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
