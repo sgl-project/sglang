@@ -137,6 +137,8 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
 # Bound the walk cost using scheduling passes, which agree across TP ranks.
 WAITING_PREFIX_REFRESH_INTERVAL = 32
+# PD prefill: bootstrap-queued requests the waiting-prefix refresh also touches.
+WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = 512
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -215,6 +217,7 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
+        bootstrap_queue: Optional[List[Req]] = None,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -277,14 +280,19 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._touch_waiting_prefixes(policy, waiting_queue)
+        self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
 
-    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+    def _touch_waiting_prefixes(
+        self,
+        policy: Policy,
+        waiting_queue: List[Req],
+        bootstrap_queue: Optional[List[Req]] = None,
+    ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
         if (
             isinstance(policy, CacheAwarePolicy)
-            or not waiting_queue
+            or not (waiting_queue or bootstrap_queue)
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
             or get_memory().radix_eviction_policy.lower() != "lru"
@@ -298,6 +306,11 @@ class SchedulePolicy:
         self._waiting_prefix_refresh_calls += 1
         if not refresh:
             return
+        # Bootstrap-queued requests run after the waiting queue, so touch them first.
+        for r in reversed(
+            (bootstrap_queue or [])[:WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX]
+        ):
+            touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
