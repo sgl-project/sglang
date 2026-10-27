@@ -507,6 +507,40 @@ class FlashAttentionImpl(AttentionImpl):
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
 
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata = None,
+    ) -> bool:
+        # FA4 writes its epilogue through any token stride; same call as forward
+        if fa_ver != 4 or self._request_skip_softmax_threshold()[0]:
+            return False
+        if out is None:
+            return True
+        if attn_metadata is not None:
+            max_seqlen_q = attn_metadata.max_seqlen_q or query.shape[1]
+            max_seqlen_k = attn_metadata.max_seqlen_k or key.shape[1]
+        else:
+            max_seqlen_q, max_seqlen_k = query.shape[1], key.shape[1]
+        flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            window_size=(-1, -1),
+            ver=fa_ver,
+            out=out,
+        )
+        return True
+
     def forward_varlen(
         self,
         query: torch.Tensor,
