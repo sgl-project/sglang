@@ -40,8 +40,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -653,14 +653,21 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(0), indexer_metadata=None
         )
         capture_metadata.sparse_prefill_cache = object()
+        captured_swa_loc = torch.zeros(2, dtype=torch.int32)
+        capture_metadata.core_attn_metadata.swa_out_cache_loc = captured_swa_loc
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend.prefill_candidates = object.__new__(DenseBlocksBackend)
-        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=None,
+            swa_req_ring_size=None,
+            translate_loc_from_full_to_swa=lambda loc: loc + 100,
+        )
         backend.low_ratios = ()
+        backend.has_c4 = backend.has_c128 = True
         calls = []
 
         def fake_build_forward_metadata(
@@ -671,7 +678,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend._build_forward_metadata = fake_build_forward_metadata
         forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
-        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(
+            name="static",
+            max_seq_len_override=None,
+            out_cache_loc=torch.tensor([5, 6], dtype=torch.int64),
+        )
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
@@ -684,6 +695,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
+        # The captured layer stores read the SWA locations by address.
+        self.assertIs(
+            capture_metadata.core_attn_metadata.swa_out_cache_loc, captured_swa_loc
+        )
+        self.assertEqual(captured_swa_loc.tolist(), [105, 106])
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,

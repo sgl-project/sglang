@@ -34,6 +34,7 @@ def _make_layer() -> BaseLayerWithLoRA:
 
 def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
+    pipeline._stages = []
     pipeline.modules = {"transformer": torch.nn.Module()}
     pipeline.server_args = SimpleNamespace(
         lora_alpha=None,
@@ -283,6 +284,20 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     assert pipeline.loaded_adapter_alphas["adapter"] == 8
     assert layer.lora_rank == 1
     assert layer.lora_alpha == 8
+
+
+def test_fractional_layer_alpha_scales_merged_delta():
+    layer = _make_layer()
+    base = layer.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.lora_adapters["adapter"]["linear.alpha"] = torch.tensor(0.5)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline._apply_lora_to_layers(
+            pipeline.lora_layers, ["adapter"], ["/adapter"], 0, [1.0]
+        )
+
+    torch.testing.assert_close(layer.base_layer.weight, base + 0.5)
 
 
 def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
