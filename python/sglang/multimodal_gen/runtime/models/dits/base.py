@@ -147,6 +147,27 @@ class BaseDiT(nn.Module, ABC):
         """Get the device of the model."""
         return next(self.parameters()).device
 
+    @staticmethod
+    def _request_cache(forward_batch, name):
+        """Per-request cache dict on ``forward_batch.extra``; None disables caching."""
+        if forward_batch is None or torch.is_grad_enabled():
+            return None
+        return forward_batch.extra.setdefault(name, {})
+
+    @staticmethod
+    def _tensor_key(t):
+        """Identity key for ``t``; equal only for the same underlying tensor."""
+        if t is None:
+            return None
+        return (
+            t.data_ptr(),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.dtype,
+            t.device.type,
+            t.device.index,
+        )
+
 
 class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
     """

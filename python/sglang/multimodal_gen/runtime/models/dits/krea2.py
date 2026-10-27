@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -677,6 +680,23 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # under --dit-layerwise-offload, keeping only a small working set resident.
         self.layer_names = ["transformer_blocks"]
 
+    def _get_text_context(self, context, txt_key, txt_meta):
+        # Text conditioning is constant across denoise steps; compute once per request.
+        ctx = get_forward_context_or_none()
+        forward_batch = ctx.forward_batch if ctx is not None else None
+        cache = self._request_cache(forward_batch, "krea2_text")
+        key = (self._tensor_key(context), self._tensor_key(txt_key))
+        hit = cache.get(key) if cache is not None else None
+        if hit is not None:
+            return hit[-1]
+        out = self.txt_in(
+            self.text_fusion(context, key_mask=txt_key, mask_meta=txt_meta)
+        )
+        if cache is not None:
+            # Holding the inputs keeps their data_ptr from being reused in this request.
+            cache[key] = (context, txt_key, out)
+        return out
+
     def _forward_impl(
         self,
         img: Tensor,
@@ -699,8 +719,7 @@ class Krea2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             joint_key = mask
             joint_meta = build_varlen_mask_meta(mask)
 
-        context = self.text_fusion(context, key_mask=txt_key, mask_meta=txt_meta)
-        context = self.txt_in(context)
+        context = self._get_text_context(context, txt_key, txt_meta)
 
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)

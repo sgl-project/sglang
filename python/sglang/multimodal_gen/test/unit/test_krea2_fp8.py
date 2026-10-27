@@ -89,3 +89,33 @@ def test_only_ragged_prompts_carry_a_key_mask():
         [ragged.bool(), torch.ones(2, image_tokens, dtype=torch.bool)], dim=1
     )
     torch.testing.assert_close(kwargs["mask"], expected, atol=0, rtol=0)
+
+
+def test_text_context_is_cached_per_request():
+    """Static text conditioning is computed once per request and never leaks across."""
+    calls = []
+
+    def fusion(c, key_mask, mask_meta):
+        calls.append(c)
+        return c * 2
+
+    model = SimpleNamespace(
+        text_fusion=fusion,
+        txt_in=lambda c: c + 1,
+        _request_cache=Krea2Transformer2DModel._request_cache,
+        _tensor_key=Krea2Transformer2DModel._tensor_key,
+    )
+    run = Krea2Transformer2DModel._get_text_context
+    req, other_req = SimpleNamespace(extra={}), SimpleNamespace(extra={})
+    pos, neg = torch.randn(1, 3, 4), torch.randn(1, 3, 4)
+    with torch.no_grad():
+        for forward_batch in (req, req, other_req):
+            ctx = SimpleNamespace(forward_batch=forward_batch)
+            with patch(
+                f"{Krea2Transformer2DModel.__module__}.get_forward_context_or_none",
+                lambda: ctx,
+            ):
+                for c in (pos, neg):
+                    torch.testing.assert_close(run(model, c, None, None), c * 2 + 1)
+    # pos/neg once per request; the second step of ``req`` hits the cache.
+    assert len(calls) == 4
