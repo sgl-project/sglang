@@ -232,6 +232,9 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
 
 _SRT = pathlib.Path(__file__).resolve().parents[4] / "python/sglang/srt"
 _WRITE_DOORS = ("set_kv_buffer", "set_mla_kv_buffer")
+# A layer router's per-layer handle (`KVLayer`) writes through these; a call is one
+# when made on `<router>.layer(...)`, since other classes have a `store` too.
+_LAYER_WRITE_DOORS = ("store", "store_mla")
 _MARKED_CONSTRUCTORS = ("for_batch", "for_layer")
 # The attention backends --enable-unified-memory admits, by resolved name.
 _UNIFIED_BACKEND_FILES = {
@@ -285,7 +288,7 @@ class _WriteLocCensus:
                     continue
                 name = _callee_name(node)
                 self.calls[name].append(node)
-                if name in _WRITE_DOORS:
+                if _is_door_call(node):
                     self.doors.append((where, node))
 
     def unmarked(self):
@@ -376,6 +379,18 @@ def _callee_name(call) -> str:
     return f.id if isinstance(f, ast.Name) else ""
 
 
+def _is_door_call(call) -> bool:
+    name = _callee_name(call)
+    if name in _WRITE_DOORS:
+        return True
+    receiver = getattr(call.func, "value", None)
+    return (
+        name in _LAYER_WRITE_DOORS
+        and isinstance(receiver, ast.Call)
+        and _callee_name(receiver) == "layer"
+    )
+
+
 def _loc_argument(call):
     for k in call.keywords:
         if k.arg in ("loc_info", "loc"):
@@ -431,7 +446,7 @@ def _door_takes_a_write_loc(fn) -> bool:
         name = _callee_name(node)
         if name == "unwrap_write_loc" and node.args and _is_name(node.args[0], loc):
             return True
-        if name in _WRITE_DOORS and not reassigned:
+        if _is_door_call(node) and not reassigned:
             if _is_name(_loc_argument(node), loc):
                 return True
     return False
@@ -444,7 +459,10 @@ def _pool_doors_taking_a_bare_loc(sources):
             if not isinstance(cls, ast.ClassDef):
                 continue
             for fn in cls.body:
-                if isinstance(fn, ast.FunctionDef) and fn.name in _WRITE_DOORS:
+                names = _WRITE_DOORS + (
+                    _LAYER_WRITE_DOORS if cls.name == "KVLayer" else ()
+                )
+                if isinstance(fn, ast.FunctionDef) and fn.name in names:
                     doors += 1
                     if not _door_takes_a_write_loc(fn):
                         bad.append(f"{where}:{cls.name}.{fn.name}")

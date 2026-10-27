@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -202,6 +203,13 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    @property
+    def kv_layers(self) -> KVLayerRouter:
+        """Per-layer KV of ``token_to_kv_pool``, derived on every access: a
+        frozen-KV MTP draft swaps its backend's pool for the target's, and its
+        reads and writes must follow the swap."""
+        return self.token_to_kv_pool.layer_router
 
     def require_spec_mode(self, model_runner: ModelRunner, mode: SpecMode) -> None:
         """Refuse to run ``mode`` for ``model_runner`` unless this backend
