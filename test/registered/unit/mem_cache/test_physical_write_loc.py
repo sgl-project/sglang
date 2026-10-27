@@ -31,15 +31,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
     write_loc_is_physical,
-)
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
@@ -108,8 +105,12 @@ def _unified_mha_pool(ps=1):
         enable_memory_saver=False,
         page_size=ps,
     )
-    return UnifiedMHATokenToKVPool(
-        arena=kv, spec=kv.spec("full"), page_size=ps, enable_alt_stream=False
+    return MHAView(
+        arena=kv,
+        spec=kv.spec("full"),
+        page_size=ps,
+        model_layer_ids=tuple(range(full.layer_num)),
+        enable_alt_stream=False,
     )
 
 

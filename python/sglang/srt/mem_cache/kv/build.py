@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     WindowLifetime,
 )
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.plan import (
@@ -40,7 +40,6 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaPool,
-    UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
     _wire_mamba_slot_allocator,
 )
@@ -167,10 +166,11 @@ def _build_token_view(
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
             page_size=plan.page_size,
         )
-    return UnifiedMHATokenToKVPool(
+    return MHAView(
         arena=arena,
         spec=sub_pool.spec,
         page_size=plan.page_size,
+        model_layer_ids=tuple(sub_pool.layer_ids),
         start_layer=ctx.start_layer,
         end_layer=ctx.end_layer,
     )
@@ -216,10 +216,6 @@ def build_kv_storage(
     )
     token_sub_pools = [s for s in plan.owner_first() if s is not state]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
-    for s in token_sub_pools:
-        # Only the pool routing a layer knows its model id.
-        if isinstance(views[s.name], UnifiedMHATokenToKVPool):
-            views[s.name].model_layer_ids = tuple(s.layer_ids)
     # Today's token capacity of the pool: the owner's configured cap where
     # the owner is the only token sub-pool, else its slots (until sizing
     # follows one rule for every chain).

@@ -18,7 +18,7 @@ from sglang.srt.layers.attention import trtllm_mha_backend as tm
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -32,9 +32,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -97,8 +94,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
-            for name in ("full", "swa")
+            name: MHAView(
+                arena=buffer,
+                spec=buffer.spec(name),
+                page_size=1,
+                model_layer_ids=(layer_id,),
+            )
+            for name, layer_id in (("full", 0), ("swa", 1))
         }
         target_pool = RoutedKVCache(
             arena=buffer,
@@ -532,8 +534,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
-            for name in ("full", "swa")
+            name: MHAView(
+                arena=buffer,
+                spec=buffer.spec(name),
+                page_size=1,
+                model_layer_ids=(layer_id,),
+            )
+            for name, layer_id in (("full", 0), ("swa", 1))
         }
         target_pool = RoutedKVCache(
             arena=buffer,

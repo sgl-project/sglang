@@ -159,7 +159,7 @@ class TestMHAEnvelopeTransferAddressing(CustomTestCase):
 
     def test_envelope_move_is_a_whole_page_copy(self):
         """Relocating a page envelope must move every layer's K and V with it;
-        this is what `UnifiedMHATokenToKVPool.move_kv_cache` relies on and what
+        this is what the unified MHA pool's unit moves relies on and what
         makes a physical page id a valid PD transfer index after compaction."""
         layer_num, page_size, head_num, head_dim, num_pages = 2, 2, 1, 8, 4
         store_dtype = torch.bfloat16

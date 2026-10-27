@@ -18,7 +18,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -34,10 +34,7 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftMambaPool,
     routed_draft_pool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMambaPool,
-    UnifiedMHATokenToKVPool,
-)
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -217,8 +214,11 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         # the arena moves host unit A to B, with no draft-side move.
         pool = self._pool()
         dp = self._draft_pool(pool)
-        host = UnifiedMHATokenToKVPool(
-            arena=pool, spec=pool.spec("full"), page_size=self.PS
+        host = MHAView(
+            arena=pool,
+            spec=pool.spec("full"),
+            page_size=self.PS,
+            model_layer_ids=tuple(range(pool.spec("full").layer_num)),
         )
         src_page, dst_page = 3, 5
         src_t, dst_t = src_page * self.PS, dst_page * self.PS

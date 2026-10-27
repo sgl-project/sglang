@@ -32,13 +32,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-)
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -314,15 +311,16 @@ def _layer(l):
 
 def _make_pool_and_kv(ps, device=_DEV):
     kv = _make_pool(ps=ps, device=device)
-    return kv, UnifiedMHATokenToKVPool(
+    return kv, MHAView(
         arena=kv,
         spec=kv.spec("full"),
         page_size=ps,
+        model_layer_ids=tuple(range(kv.spec("full").layer_num)),
         enable_alt_stream=False,
     )
 
 
-class TestUnifiedMHATokenToKVPool(unittest.TestCase):
+class TestMHAView(unittest.TestCase):
     def test_size_is_slot_bound(self):
         """`size` drives BOTH the python OOB check and the store kernel's
         device-side size_limit; `size + page_size` must be the view row count."""
@@ -406,10 +404,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         self.assertEqual(len(item_lens), 1)
         self.assertEqual(ptrs[0], kv.raw.data_ptr())
         self.assertEqual(lens[0], kv.raw.numel())
-        self.assertEqual(item_lens[0], pool._page_bytes)
+        self.assertEqual(item_lens[0], pool.page_bytes)
         # The whole addressable page range must fit the registered region, or
         # the last page's write would run off the end of the RDMA mapping.
-        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
+        self.assertLessEqual(pool.num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven

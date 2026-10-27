@@ -30,114 +30,14 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
-from sglang.srt.mem_cache.memory_pool import (
-    MambaPool,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import MambaPool, MLATokenToKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
-
-
-class UnifiedMHATokenToKVPool(MHATokenToKVPool):
-    """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are token-major views
-    into a `KVArena` band: `(num_pages * ps, head_num, head_dim)` with the whole
-    entry as slot stride, indexed by the physical token id. The arena moves and
-    zeroes its units.
-    """
-
-    requires_physical_write_loc = True
-
-    def __init__(
-        self,
-        *,
-        arena: KVArena,
-        spec: MHASubPoolSpec,
-        page_size: int = 1,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        enable_alt_stream: bool = True,
-    ):
-        k_views, v_views = spec.views(arena)
-        max_slots = arena.extent_entries(spec.name)
-
-        self._arena = arena
-        self._sub_pool_name = spec.name
-        self._k_views = k_views
-        self._v_views = v_views
-        self._num_pages = max_slots // page_size
-        self._page_bytes = page_size * spec.entry_bytes()
-        view_rows = self._num_pages * page_size
-
-        super().__init__(
-            size=view_rows - page_size,
-            page_size=page_size,
-            dtype=spec.kv_cache_dtype,
-            head_num=spec.head_num,
-            head_dim=spec.head_dim,
-            layer_num=spec.layer_num,
-            device=arena.device,
-            enable_memory_saver=False,  # the arena owns the bytes
-            v_head_dim=spec.v_head_dim,
-            start_layer=start_layer,
-            end_layer=end_layer,
-            enable_alt_stream=enable_alt_stream,
-            enable_kv_cache_copy=False,
-            kv_cache_layout="page_major",
-        )
-
-    def _kv_tokens_per_row(self) -> int:
-        return 1
-
-    def _create_buffers(self):
-        self.k_buffer = self._k_views
-        self.v_buffer = self._v_views
-        # This override must initialize the pointers and row strides used by HiCache.
-        self._init_data_ptrs_and_strides()
-
-    def _clear_buffers(self):
-        # The arena owns the bytes; do not delete the views.
-        pass
-
-    def get_kv_size_bytes(self):
-        return 0, 0  # the arena logs the total; per-sub-pool would double-count
-
-    def get_contiguous_buf_infos(self):
-        """Register the raw buffer as physical page envelopes for PD transfer.
-
-        Full and SWA expose the same allocation with different envelope sizes;
-        the transfer backend preserves both logical entries while deduplicating
-        the underlying memory registration.
-        """
-        return (
-            [self._arena.raw.data_ptr()],
-            [self._arena.accessible_bytes],
-            [self._page_bytes],
-        )
-
-    def get_page_envelope_buffer(self) -> torch.Tensor:
-        """Return this sub-pool's page-strided view of the shared allocation."""
-        page_count = self._arena.num_entries(self._sub_pool_name) // self.page_size
-        return self._arena.raw[: page_count * self._page_bytes].view(
-            page_count, self._page_bytes
-        )
-
-    @property
-    def grow_direction(self) -> str:
-        """Physical growth direction used by this sub-pool's L1 allocator."""
-        return self._arena.band(self._sub_pool_name).grow_direction
-
-    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
-        raise NotImplementedError(
-            "prefix-valid commit is unsupported under the unified layout "
-            "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
-        )
 
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
@@ -168,9 +68,9 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         self._sub_pool_name = spec.name
         self._kv_views = spec.views(arena)
         max_slots = arena.extent_entries(spec.name)
-        self._num_pages = max_slots // page_size
-        self._page_bytes = page_size * spec.entry_bytes()
-        self._view_rows = self._num_pages * page_size
+        self.num_pages = max_slots // page_size
+        self.page_bytes = page_size * spec.entry_bytes()
+        self._view_rows = self.num_pages * page_size
 
         super().__init__(
             # OOB checks bound locs by `size + page_size`; physical ids run to
@@ -210,7 +110,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         specs.
         """
         raw = self._arena.raw
-        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+        return [raw.data_ptr()], [raw.numel()], [self.page_bytes]
 
 
 class UnifiedMambaPool(MambaPool):

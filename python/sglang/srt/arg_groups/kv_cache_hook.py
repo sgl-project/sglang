@@ -640,8 +640,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     assert use_mla_backend(server_args), (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
-        "MHA unified pool has no DCP-aware masked write path "
-        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+        "MHA unified pool has no DCP-aware masked write path."
     )
     assert not model_config_of(server_args).is_hybrid_swa, (
         "--enable-unified-memory with decode context parallelism "

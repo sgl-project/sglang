@@ -577,7 +577,7 @@ class TestBand(unittest.TestCase):
 
 class _FakeUnifiedSWAKVPool:
     """Minimal stand-in for a full + window unified pool: a real one would
-    construct `UnifiedMHATokenToKVPool` views, heavier than these tests need."""
+    construct `MHAView` views, heavier than these tests need."""
 
     class _SubKV(_FakeKVCache):
         def __init__(self, arena, name):

@@ -727,7 +727,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             (sa, self._size_swa),
         ):
             pool = c.views[allocator.sub_pool_name]
-            pool._num_pages = allocator.num_pages
+            pool.num_pages = allocator.num_pages
             pool.size = allocator.num_pages * c.page_size - c.page_size
             pool.host_capacity_tokens = host_capacity
             pool.host_capacity_bytes = host_capacity * allocator.entry_bytes

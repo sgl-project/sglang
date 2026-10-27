@@ -4118,7 +4118,7 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         self.use_dsa = use_dsa
         if full_kv_pool is not None:
-            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
+            # Shared-KV-pool path: the caller built an MHA view
             # aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
