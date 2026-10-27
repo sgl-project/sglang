@@ -80,8 +80,8 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix, is_device_stream_capturing
 
-if current_platform.is_xpu() or current_platform.is_hip():
-    # CuTe DSL (cutlass) is unavailable on XPU and ROCm; use the unfused q/k norm path.
+if current_platform.is_xpu() or current_platform.is_hip() or current_platform.is_cpu():
+    # CuTe DSL (cutlass) is unavailable on XPU, CPU and ROCm; use the unfused q/k norm path.
     can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
     fused_rmsnorm_interleaved_rope_ = None
     fused_rmsnorm_interleaved_rope_into_blocks = None
