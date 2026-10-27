@@ -23,9 +23,6 @@ def bf16_mega_gate(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import deep_gemm
 
-    if valid_token_mask is not None:
-        hidden_states = torch.where(valid_token_mask[:, None], hidden_states, 0)
-
     if out is None:
         ids = torch.empty(
             (hidden_states.shape[0], top_k),
