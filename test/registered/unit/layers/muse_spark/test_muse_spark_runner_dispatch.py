@@ -22,13 +22,17 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class _CpuMoeAlltoAll:
-    def __init__(self, **_kwargs):
-        self.invalid_token_expert_id = None
+class _CpuCommunication:
+    def __init__(self, _bootstrap, params, **_kwargs):
+        self.params = params
 
-    def dispatch(self, _topk_ids, payloads, _max_tokens, **kwargs):
-        self.invalid_token_expert_id = kwargs["invalid_token_expert_id"]
-        return payloads
+    def dispatch(self, hidden_states, topk_ids, topk_weights, **_kwargs):
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
 
 class TestMuseSparkRunnerDispatch(CustomTestCase):
@@ -83,11 +87,11 @@ class TestMuseSparkRunnerDispatch(CustomTestCase):
             with ExitStack() as stack:
                 for name, value in {
                     "use_flashinfer": True,
-                    "moe_a2a_get_workspace_size_per_rank": lambda **_: 128,
-                    "Mapping": lambda **_: None,
-                    "MnnvlConfig": lambda **_: None,
+                    "BootstrapConfig": lambda **_: None,
+                    "MoEEpCommParams": SimpleNamespace,
+                    "NVLinkOneSidedConfig": lambda **_: None,
                     "TorchDistributedCommBackend": lambda _: None,
-                    "MoeAlltoAll": _CpuMoeAlltoAll,
+                    "create_communication": _CpuCommunication,
                     "get_flashinfer_a2a_dispatch_type": lambda: (
                         FlashinferA2ADispatchType.BF16
                     ),
@@ -118,7 +122,7 @@ class TestMuseSparkRunnerDispatch(CustomTestCase):
                             torch.zeros((2, 128), dtype=torch.bfloat16), topk
                         )
                         self.assertEqual(
-                            dispatcher.sp_prefill_moe_a2a.invalid_token_expert_id, -1
+                            dispatcher.sp_prefill_moe_a2a.params.invalid_expert_id, -1
                         )
                         torch.testing.assert_close(
                             output.topk_output.topk_ids, topk.topk_ids

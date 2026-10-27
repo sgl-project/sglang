@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     _max_tokens_per_scattered_source,
-    _workspace_size_for_namespace,
+    _max_tokens_for_namespace,
 )
 from sglang.srt.layers.quantization import fp8  # noqa: F401
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -38,11 +38,11 @@ class TestFlashinferA2AWideEPPlumbing(CustomTestCase):
         self.assertEqual(_max_tokens_per_scattered_source([512] * 16, 1), 512)
 
     def test_target_and_draft_decode_use_distinct_workspaces(self):
-        sizes = {
-            _workspace_size_for_namespace(4096, speculative=speculative)
+        capacities = {
+            _max_tokens_for_namespace(4096, speculative=speculative)
             for speculative in (False, True)
         }
-        self.assertEqual(sizes, {4096, 4224})
+        self.assertEqual(capacities, {4096, 4097})
 
     def test_deepgemm_dispatch_marks_empty_expert_lanes_invalid(self):
         topk_ids = torch.tensor([-1, 0, -1, 1], dtype=torch.int32, device="cuda")
