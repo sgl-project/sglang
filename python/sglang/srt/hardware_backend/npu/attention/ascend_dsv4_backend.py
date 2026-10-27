@@ -1271,7 +1271,9 @@ class LowRatioCompressAscendBackendMixin:
             k_scale_cache=pool.get_index_scale(layer.layer_id),
             storage_mode=0,
         )
-        if indexer.is_candidate_source:
+        if indexer.is_candidate_source and not os.environ.get(
+            "SGLANG_DSV41_DISABLE_QSLI_CACHE"
+        ):
             # Level-two K, read by QSLI: the same rows again, eight to a record,
             # fused with their scales (indexer_prologue_k_dsl README L49-L52).
             ds41.indexer_prologue_k(
@@ -1848,14 +1850,37 @@ class LowRatioCompressAscendBackendMixin:
             # Reserved by the operator (README L107); derived like the rest so
             # the value is live rather than capture-time.
             compressed_lens = (forward_batch.seq_lens // compress_ratio).to(torch.int32)
+            cmp_kv = pool.get_compress_buffer(layer.layer_id, False).view(torch.uint8)
+            cmp_bt = getattr(fm, f"c{compress_ratio}_page_table").to(torch.int32)
+            if (
+                os.environ.get("SGLANG_DSV41_DEBUG_QSLI")
+                and ("smla", layer.layer_id) not in self._dsv41_debugged
+            ):
+                self._dsv41_debugged.add(("smla", layer.layer_id))
+                rows_per_page = int(cmp_kv.shape[1]) if cmp_kv.dim() > 1 else 1
+                need_cols = int((compressed_lens.max() - 1) // rows_per_page) + 1
+                # Per-row page maxima: a row above the pool size is the row the
+                # kernel turns into a wild address, and a -1 is the sentinel
+                # leaking out of the write path.
+                row_max = cmp_bt.max(dim=1).values[:16].tolist()
+                print(
+                    f"[dsv41] smla layer={layer.layer_id} ratio={compress_ratio}\n"
+                    f"[dsv41]   cmp_kv={tuple(cmp_kv.shape)} rows_per_page={rows_per_page}\n"
+                    f"[dsv41]   bt={tuple(cmp_bt.shape)} bt_max={int(cmp_bt.max())} "
+                    f"need_cols={need_cols} bt_cols_ok="
+                    f"{cmp_bt.shape[1] >= need_cols}\n"
+                    f"[dsv41]   page_max_ok={int(cmp_bt.max()) < cmp_kv.shape[0]} "
+                    f"negs={int((cmp_bt < 0).sum())}\n"
+                    f"[dsv41]   row_max={row_max}\n"
+                    f"[dsv41]   visible={compressed_lens[:16].tolist()}\n"
+                    f"[dsv41]   cmp_topk={tuple(topk.shape)} "
+                    f"topk_max={int(topk.max())} topk_neg={int((topk < 0).sum())}",
+                    flush=True,
+                )
             attn_kwargs.update(
-                cmp_kv=pool.get_compress_buffer(layer.layer_id, False).view(
-                    torch.uint8
-                ),
+                cmp_kv=cmp_kv,
                 cmp_sparse_indices=topk.view(-1, 1, topk.shape[-1]).to(torch.int32),
-                cmp_block_table=getattr(fm, f"c{compress_ratio}_page_table").to(
-                    torch.int32
-                ),
+                cmp_block_table=cmp_bt,
                 # seqused_cmp_kv is reserved by the operator (README L107).
                 seqused_cmp_kv=compressed_lens,
                 # One length per query row, from the position, capped by
