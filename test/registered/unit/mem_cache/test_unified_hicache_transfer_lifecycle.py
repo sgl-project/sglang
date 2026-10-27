@@ -16,7 +16,8 @@ and the moves they block, the transfer-done event waits, load-back admission,
 and the write-policy switch check.
 
 The pools are real CPU tensors. CUDA stream waits are recorded by a stand-in
-for `torch.cuda.current_stream()` rather than executed.
+for `torch.cuda.current_stream()` rather than executed, and the HiCache
+transfer events come from a stand-in device the test can hold in flight.
 
     python -m pytest test/registered/unit/mem_cache/test_unified_hicache_transfer_lifecycle.py -v
 """
@@ -30,8 +31,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers import cache_controller
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache import l2_transfer
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,
@@ -48,6 +51,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
+from sglang.srt.mem_cache.pool_host import unified as unified_host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
@@ -153,6 +157,77 @@ class _Stream:
 
     def wait_stream(self, stream) -> None:
         self.log.append(("wait_stream", stream))
+
+    def synchronize(self) -> None:
+        pass
+
+
+class _Event:
+    """A device event that completes when recorded, unless its device holds it."""
+
+    def __init__(self, device: "_Device"):
+        self._device = device
+        # A never-recorded CUDA event also queries as complete.
+        self.done = True
+
+    def record(self, stream=None) -> None:
+        self.done = not self._device.holding
+        if not self.done:
+            self._device.pending.append(self)
+
+    def query(self) -> bool:
+        return self.done
+
+    def synchronize(self) -> None:
+        # A host wait returns only once the work is done.
+        self.done = True
+
+    def wait(self, stream=None) -> None:
+        pass
+
+    def elapsed_time(self, end_event) -> float:
+        return 0.0
+
+
+class _Device:
+    """Stands in for the device module HiCache transfers run on, so the CPU
+    pools see the same events and streams whether or not an accelerator is
+    visible; `hold()` keeps the copies recorded under it in flight."""
+
+    def __init__(self):
+        self.holding = False
+        self.pending: list[_Event] = []
+        self._current = _Stream([])
+
+    def Event(self, **kwargs) -> _Event:
+        return _Event(self)
+
+    def Stream(self, *args, **kwargs) -> _Stream:
+        return _Stream([])
+
+    def current_stream(self, *args, **kwargs) -> _Stream:
+        return self._current
+
+    @contextlib.contextmanager
+    def stream(self, stream: _Stream):
+        previous, self._current = self._current, stream
+        try:
+            yield
+        finally:
+            self._current = previous
+
+    @contextlib.contextmanager
+    def hold(self):
+        self.holding = True
+        try:
+            yield
+        finally:
+            self.holding = False
+
+    def complete_pending(self) -> None:
+        for event in self.pending:
+            event.done = True
+        self.pending.clear()
 
 
 @contextlib.contextmanager
@@ -414,9 +489,18 @@ class _UnifiedHiCacheCase(_ConfigCase):
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
         ):
             cache = UnifiedRadixCache(params=params)
-        # CPU host tensors need no page-locking.
-        with mock.patch.object(host_memory, "_cuda_host_register"):
-            cache.init_hicache(server_args, params)
+        self.device = _Device()
+        # Patched until after the host pools are released: CPU host tensors
+        # need no page-locking, and every transfer event comes from `self.device`.
+        for patcher in (
+            mock.patch.object(host_memory, "_cuda_host_register"),
+            mock.patch.object(unified_host_memory, "_cuda_host_unregister"),
+            mock.patch.object(cache_controller, "device_module", self.device),
+            mock.patch.object(l2_transfer, "device_module", self.device),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        cache.init_hicache(server_args, params)
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)
         controller = cache.cache_controller
@@ -447,6 +531,29 @@ class _UnifiedHiCacheCase(_ConfigCase):
         full, swa = self.rows.read(ids)
         self.assertTrue(torch.equal(full, expected[0]))
         self.assertTrue(torch.equal(swa[-swa_tail:], expected[1][-swa_tail:]))
+
+
+class TestWriteThroughAck(_UnifiedHiCacheCase):
+    """A write-through backup pins its device rows until its copy's event completes."""
+
+    def test_rows_stay_pinned_while_the_backup_is_in_flight(self):
+        self._cache(write_policy="write_through", tokens=64)
+        tokens = list(range(1, 9))
+        with self.device.hold():
+            self._insert(tokens, 100)
+            self.cache.flush_pending_backups()
+        node = self._match(tokens).last_device_node
+        core = self.cache.tree_core
+
+        self.cache.writing_check()
+        self.assertEqual(len(self.controller.ack_write_queue), 1)
+        self.assertEqual(core.get_component_device_lock_ref(node, FULL), 1)
+
+        self.device.complete_pending()
+        self.cache.writing_check()
+        self.assertEqual(self.controller.ack_write_queue, [])
+        self.assertEqual(core.get_component_device_lock_ref(node, FULL), 0)
+        self.cache.sanity_check()
 
 
 class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
