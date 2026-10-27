@@ -1693,26 +1693,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     }
 
     def test_gemma_keeps_hybrid_swa_memory(self):
-        for architecture, model_type in (
-            ("Gemma2ForCausalLM", "gemma2"),
-            ("Gemma3ForCausalLM", "gemma3_text"),
-            ("Gemma3ForConditionalGeneration", "gemma3"),
+        for architecture, model_type, backend in (
+            ("Gemma2ForCausalLM", "gemma2", "fa3"),
+            ("Gemma3ForCausalLM", "gemma3_text", "triton"),
+            ("Gemma3ForConditionalGeneration", "gemma3", "triton"),
         ):
-            with self.subTest(architecture=architecture):
+            with self.subTest(architecture=architecture, backend=backend):
                 sa = self._construct(
                     architecture,
                     model_type,
                     config_extra=self._SWA_MIX,
-                    attention_backend="fa3",
+                    attention_backend=backend,
                 )
                 self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_gemma3_disables_hybrid_swa_memory_on_fa3(self):
+        for architecture, model_type in (
+            ("Gemma3ForCausalLM", "gemma3_text"),
+            ("Gemma3ForConditionalGeneration", "gemma3"),
+        ):
+            for backends in (
+                {"attention_backend": "fa3"},
+                {
+                    "prefill_attention_backend": "triton",
+                    "decode_attention_backend": "fa3",
+                },
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, model_type, config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_gemma2_gemma3_overrides",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
 
     def test_gemma3n_disables_hybrid_swa_memory(self):
         for architecture in ("Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"):
             with self.subTest(architecture=architecture):
                 sa = self._construct(architecture, "llama", config_extra=self._SWA_MIX)
                 self.assertIn(
-                    ("_gemma3n_overrides", {"disable_hybrid_swa_memory": True}),
+                    ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
                     sa._resolved_overrides,
                 )
 

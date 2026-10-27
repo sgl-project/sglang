@@ -625,6 +625,8 @@ def handle_model_specific_adjustments(server_args: Any):
         )
         # The moe_runner_backend selection moved to the override registry
         # (arg_groups/overrides.py: _llama4_overrides).
+    # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
+    # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
     elif model_arch in (
         "Gemma4ForConditionalGeneration",
         "Gemma4ForCausalLM",
