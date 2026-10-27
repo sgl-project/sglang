@@ -112,13 +112,15 @@ class TestRustServerExtension(CustomTestCase):
             def _load_extension(cls):
                 return extension
 
-        scheduler = SimpleNamespace(
+        launch_config = dict(
             server_args=sentinel.server_args,
-            processor=sentinel.processor,
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
             ),
+            processor=sentinel.processor,
+            tokenizer_path="tokenizer",
+            max_total_num_tokens=1024,
         )
         with (
             launch_context(BuiltinServer),
@@ -131,11 +133,11 @@ class TestRustServerExtension(CustomTestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "no Rust MM pipeline for model_type='unsupported_vlm'"
             ):
-                BuiltinServer.launch(scheduler)
+                BuiltinServer.launch(**launch_config)
             extension.Server.assert_not_called()
 
             mm_processor.return_value.resolve_spec.return_value = sentinel.spec
-            instance = BuiltinServer.launch(scheduler)
+            instance = BuiltinServer.launch(**launch_config)
 
         extension.Server.assert_called_once()
         instance.server.start_mm_workers.assert_called_once_with(
