@@ -20,8 +20,15 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         return {}
     if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
         raise ValueError("DSA DCP does not support HiSparse or HiCache.")
-    if cfg.disaggregation_mode != "null":
-        raise ValueError("DSA DCP does not support PD disaggregation.")
+    # The PD relayout requires DCP1 prefill and a ROCm decode whose draft
+    # KV is striped like its target KV.
+    if cfg.disaggregation_mode != "null" and not (
+        cfg.disaggregation_mode == "decode" and get_platform().is_hip
+    ):
+        raise ValueError(
+            "DSA DCP with PD disaggregation is supported only as a DCP1 prefill "
+            "feeding a ROCm DCP decode."
+        )
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
     overrides = {
