@@ -38,7 +38,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+from sglang.srt.runtime_context import get_device, get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -203,12 +203,17 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    tp_group.rank,
-                    tp_group.cpu_group,
-                    src=tp_group.ranks[0],
-                )
+                # With sleep-on-idle rank 0 parks on its sockets for up to 1 s per idle
+                # iteration; gloo readers sleep meanwhile, MessageQueue readers busy-poll.
+                if not get_device().sleep_on_idle:
+                    recv_reqs = tp_group.broadcast_object(recv_reqs)
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
