@@ -23,11 +23,14 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
 )
 from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.moe.flashinfer_autotune import (
+    flashinfer_moe_tune_max_num_tokens,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
 )
-from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
+from sglang.srt.utils.common import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -467,7 +470,7 @@ class MuseSpark1xBf16Experts(nn.Module):
                 routed_scaling_factor=1.0,
                 routing_method_type=_ROUTING_METHOD_UNUSED,
                 do_finalize=False,  # we need the per-expert outputs
-                tune_max_num_tokens=next_power_of_2(num_tokens),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(num_tokens),
                 activation_type=_SWIGLU,
             )[:3]
         )

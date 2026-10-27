@@ -314,7 +314,11 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
+        from sglang.srt.layers.dp_attention import dp_gather_width
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.moe.flashinfer_autotune import (
+            flashinfer_moe_autotune_context,
+        )
         from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
             megamoe_autotune_context,
         )
@@ -325,6 +329,18 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+        prefill_num_tokens = (
+            max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        )
+        # Standard MoE prefill gathers the per-DP-rank chunk before the kernel.
+        # Extend the kernels' profiling range even when the startup model
+        # forward is DECODE/TARGET_VERIFY. Draft and PD-decode workers retain
+        # their decode-only range.
+        moe_prefill_num_tokens = (
+            prefill_num_tokens * dp_gather_width()
+            if not mr.is_draft_worker and get_disagg().disaggregation_mode != "decode"
+            else 0
+        )
         mega_context = empty_context()
         if (
             get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
@@ -333,9 +349,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         ):
             # The chunk size is already per DP rank. Prepare one prefill profile
             # independently of the optional full-model EXTEND autotune pass.
-            prefill_num_tokens = (
-                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-            )
             mega_context = megamoe_autotune_context(
                 decode_num_tokens=max(
                     mr.max_decode_logits_rows(),
@@ -354,6 +367,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 skip_ops=skip_ops,
             ),
             autotune_v2(mode="tune", persistent_cache=False),
+            flashinfer_moe_autotune_context(moe_prefill_num_tokens),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):

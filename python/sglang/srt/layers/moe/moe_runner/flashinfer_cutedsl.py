@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.flashinfer_autotune import (
+    flashinfer_cutedsl_moe_autotune,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -492,22 +495,23 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
-    output = quant_info.wrapper.run(
-        x=x_fp4,
-        x_sf=x_sf,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
-        w1_weight=quant_info.w13_weight,
-        w1_weight_sf=quant_info.w13_weight_sf,
-        w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=(
-            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
-        ),
-        w2_weight=quant_info.w2_weight,
-        w2_weight_sf=quant_info.w2_weight_sf,
-        w2_alpha=quant_info.w2_alpha,
-        per_token_scale=per_token_scale,
-    )
+    with flashinfer_cutedsl_moe_autotune(hidden_states.shape[0]):
+        output = quant_info.wrapper.run(
+            x=x_fp4,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            w1_weight=quant_info.w13_weight,
+            w1_weight_sf=quant_info.w13_weight_sf,
+            w1_alpha=quant_info.w1_alpha,
+            fc2_input_scale=(
+                None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+            ),
+            w2_weight=quant_info.w2_weight,
+            w2_weight_sf=quant_info.w2_weight_sf,
+            w2_alpha=quant_info.w2_alpha,
+            per_token_scale=per_token_scale,
+        )
 
     return StandardCombineInput(hidden_states=output)
 
@@ -594,22 +598,23 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
-    output = quant_info.wrapper.run(
-        x=x_fp4,
-        x_sf=x_sf,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
-        w1_weight=quant_info.w13_weight,
-        w1_weight_sf=quant_info.w13_weight_sf,
-        w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=(
-            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
-        ),
-        w2_weight=quant_info.w2_weight,
-        w2_weight_sf=quant_info.w2_weight_sf,
-        w2_alpha=quant_info.w2_alpha,
-        per_token_scale=per_token_scale,
-    )
+    with flashinfer_cutedsl_moe_autotune(hidden_states.shape[0]):
+        output = quant_info.wrapper.run(
+            x=x_fp4,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            w1_weight=quant_info.w13_weight,
+            w1_weight_sf=quant_info.w13_weight_sf,
+            w1_alpha=quant_info.w1_alpha,
+            fc2_input_scale=(
+                None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+            ),
+            w2_weight=quant_info.w2_weight,
+            w2_weight_sf=quant_info.w2_weight_sf,
+            w2_alpha=quant_info.w2_alpha,
+            per_token_scale=per_token_scale,
+        )
 
     # Note: output contains routed expert results; shared_expert is handled separately
 

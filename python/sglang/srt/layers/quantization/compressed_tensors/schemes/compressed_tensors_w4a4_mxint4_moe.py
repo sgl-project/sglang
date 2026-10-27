@@ -11,6 +11,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.flashinfer_autotune import (
+    flashinfer_moe_tune_max_num_tokens,
+)
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     RoutingMethodType,
@@ -21,7 +24,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import is_flashinfer_available, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +361,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(x.shape[0]),
             output=symm_output,
         )
 

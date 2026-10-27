@@ -12,6 +12,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.flashinfer_autotune import (
+    flashinfer_moe_tune_max_num_tokens,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
@@ -23,7 +26,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import next_power_of_2, print_warning_once
+from sglang.srt.utils.common import print_warning_once
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
@@ -518,7 +521,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=num_local_experts,
             do_finalize=not defer_finalize,
-            tune_max_num_tokens=next_power_of_2(num_tokens),
+            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(num_tokens),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )

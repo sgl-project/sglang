@@ -22,6 +22,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.flashinfer_autotune import (
+    flashinfer_moe_tune_max_num_tokens,
+)
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_out_wrapper,
@@ -35,10 +38,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils.common import (
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils.common import is_flashinfer_available
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -818,7 +818,7 @@ def _run_fp8_per_tensor_scale_moe(
             if runner_config.routed_scaling_factor is not None
             else 1.0
         ),
-        tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+        tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(a_q.shape[0]),
         activation_type=quant_info.activation_type,
     )
     if use_routed_topk:
@@ -1004,7 +1004,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(a_q.shape[0]),
             )
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
@@ -1064,7 +1064,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(a_q.shape[0]),
             )
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -1244,7 +1244,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 routed_scaling_factor=None,
                 routing_method_type=RoutingMethodType.TopK.value,
                 activation_type=ActivationType.Situ.value,
-                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(
+                    x_quant.shape[0],
+                ),
                 output=symm_output,
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
@@ -1295,7 +1297,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             norm_topk_prob=topk_output.topk_config.renormalize,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
-            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
         )
@@ -1330,7 +1332,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         None,  # routed_scaling_factor
         1,  # routing_method_type, renormalize
         True,  # do finalize
-        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+        tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
     )[0]
@@ -1585,7 +1587,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
             do_finalize=not defer_finalize,
             activation_type=activation_type,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
         if not defer_finalize:
@@ -1639,7 +1641,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             ),
             do_finalize=not defer_finalize,
             activation_type=activation_type,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
         if not defer_finalize:
@@ -1777,7 +1779,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 ),
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(hidden_states.shape[0]),
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(
+                    hidden_states.shape[0],
+                ),
                 activation_type=activation_type,
             )
             if defer_finalize:
@@ -1805,7 +1809,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 local_num_experts=runner_config.num_local_experts,
                 routing_method_type=runner_config.routing_method_type,
                 routed_scaling_factor=runner_config.routed_scaling_factor,
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                tune_max_num_tokens=flashinfer_moe_tune_max_num_tokens(
+                    hidden_states.shape[0],
+                ),
                 activation_type=activation_type,
                 do_finalize=not defer_finalize,
             )

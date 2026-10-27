@@ -69,6 +69,9 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
 class TestMegaMoEAutotuneStartup(CustomTestCase):
     def test_context_bridges_profile_limits(self):
         from sglang.srt.layers.moe import flashinfer_megamoe_autotune as mega_autotune
+        from sglang.srt.layers.moe.flashinfer_autotune import (
+            flashinfer_moe_tune_max_num_tokens,
+        )
 
         runner = SimpleNamespace(
             device="cuda",
@@ -97,6 +100,9 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
             ),
             "sglang.srt.layers.logits_processor": SimpleNamespace(
                 autotune_dummy_run_mode=lambda **_: nullcontext()
+            ),
+            "sglang.srt.layers.dp_attention": SimpleNamespace(
+                dp_gather_width=lambda: 4
             ),
         }
         # The resolved chunk size is already per DP rank. Disabled chunking
@@ -136,6 +142,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         max_speculative_num_draft_tokens=lambda: width,
                         max_prefill_buffer_tokens=lambda: max(chunk_size, 0),
                         get_schedule=lambda: SimpleNamespace(max_prefill_tokens=16384),
+                        get_disagg=lambda: SimpleNamespace(disaggregation_mode="null"),
                     ),
                     patch.object(
                         autotune.torch.cuda,
@@ -158,6 +165,12 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             skip_ops=skip_ops,
                         )
                         context = mega_autotune._active_context
+                        # Generic kernels see gathered prefill tokens; MegaMoE
+                        # keeps its per-rank profile. Draft scopes keep decode M.
+                        self.assertEqual(
+                            flashinfer_moe_tune_max_num_tokens(384),
+                            512 if draft else (max(chunk_size, 0) or 16384) * 4,
+                        )
                         if prefill is None:
                             self.assertIs(context, previous)
                         else:
@@ -169,6 +182,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             self.assertEqual(context.decode_num_tokens, decode)
                             self.assertEqual(context.prefill_num_tokens, prefill)
                     self.assertIs(mega_autotune._active_context, previous)
+                    self.assertEqual(flashinfer_moe_tune_max_num_tokens(384), 512)
 
             # Cache-disabled startups in the same second must still write to
             # different files, even if they use the same device and rank.
@@ -368,7 +382,9 @@ class TestAutotuneCachePhases(CustomTestCase):
         tuner = AutoTuner.get()
         tuner.clear_cache()
         self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
+        runner = SimpleNamespace(
+            device="cuda", forward_stream=torch.cuda.Stream(), is_draft_worker=False
+        )
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
                 Path(directory) / name for name in ("target.json", "draft.json")
