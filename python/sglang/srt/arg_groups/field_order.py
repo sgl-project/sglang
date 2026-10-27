@@ -121,6 +121,7 @@ POSITIONAL_FIELD_ORDER = (
     "smg_grpc_mode",
     "grpc_mode",
     "grpc_port",
+    "grpc_response_timeout_secs",
     "grpc_worker_threads",
     "sidecar",
     "sidecar_args",
