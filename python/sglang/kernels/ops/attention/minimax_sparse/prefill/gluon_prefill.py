@@ -36,9 +36,9 @@ from sglang.srt.layers.attention.aiter_utils import (
 from sglang.srt.utils.common import async_h2d
 
 try:
-    from . import gluon_prefill_pair
+    from . import gluon_prefill_pair_gfx950
 except ImportError:  # Gluon without the CDNA4 buffer/MFMA ops
-    gluon_prefill_pair = None
+    gluon_prefill_pair_gfx950 = None
 
 SPARSE_BLOCK_SIZE = 128
 # The Gluon PS kernel takes kv_block_size 16 or 64; 64 halves the block-table width.
@@ -459,12 +459,12 @@ def can_use_gluon_prefill(
 
 def _pair_prefill_module(q: torch.Tensor, k_cache: torch.Tensor | Nvfp4Cache):
     """The two-queries-per-program kernel module when it serves this forward, else None."""
-    if gluon_prefill_pair is None:
+    if gluon_prefill_pair_gfx950 is None:
         return None
     fp8_pool = not isinstance(k_cache, Nvfp4Cache) and k_cache.dtype == _FP8_KV_DTYPE
     return (
-        gluon_prefill_pair
-        if gluon_prefill_pair.can_use_pair_prefill(q, fp8_pool)
+        gluon_prefill_pair_gfx950
+        if gluon_prefill_pair_gfx950.can_use_pair_prefill(q, fp8_pool)
         else None
     )
 
