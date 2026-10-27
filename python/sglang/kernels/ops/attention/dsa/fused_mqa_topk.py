@@ -7,8 +7,8 @@ FP8 scan a per-row gate set from a sampled quantile of the row's scores
 (LiteTopK) keeps the candidates, selection runs in-kernel, and blocks whose
 candidate count falls outside the exact range are rescanned densely, so the
 result is the exact top-k up to ties at the k-th score. The kernel is LiteTopK
-(arXiv:2607.11976) as optimized in vLLM PR #60618, with further changes; see
-``kernels/jit/csrc/dsa/fused_mqa_topk/README.md``.
+(arXiv:2607.11976) as optimized in vLLM PR #60618, with further changes;
+``kernels/jit/csrc/dsa/fused_mqa_topk/README.md`` describes it.
 """
 
 from __future__ import annotations
