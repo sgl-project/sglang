@@ -97,6 +97,7 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "prefix-weave",
             ],
         ),
     ] = "fcfs"

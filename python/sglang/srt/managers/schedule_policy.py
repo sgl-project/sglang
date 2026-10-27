@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
+from array import array
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -174,6 +176,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    PREFIX_WEAVE = "prefix-weave"  # cache reuse and marginal prefix overlap scheduling
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
 
@@ -197,6 +200,8 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        chunked_prefill_size: int | None = None,
+        max_prefill_tokens: int = 16384,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -210,12 +215,28 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
+        # For PrefixWeave scheduling policy
+        self.calc_time = 0
+        self.calc_count = 0
+        self.token_batch_size = (
+            min(chunked_prefill_size, max_prefill_tokens)
+            if chunked_prefill_size
+            else max_prefill_tokens
+        )
+        self.last_req_rid = None
+        self.classified_reqs: Set[str] = set()
+        self.finished_req_lengths: Dict[str, int] = {}
+        self.estimated_cached_tokens: Dict[str, int] = {}
+
     def calc_priority(
         self,
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
+        max_req_num: Optional[int] = None,
+        token_budget: int = 8192 * 2,
         processed_tokens: int = 0,
     ) -> None:
+        start_time = time.perf_counter()
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -234,32 +255,41 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif isinstance(policy, CacheAwarePolicy):
-            temporary_deprioritized = self._compute_prefix_matches(
-                waiting_queue, policy
-            )
-            if policy == CacheAwarePolicy.LPM:
-                SchedulePolicy._sort_by_longest_prefix(
-                    waiting_queue, temporary_deprioritized
+            if policy == CacheAwarePolicy.PREFIX_WEAVE:
+                if max_req_num is None:
+                    max_req_num = len(waiting_queue)
+                calculated = SchedulePolicy._sort_by_prefix_weave(
+                    self, waiting_queue, max_req_num, token_budget
                 )
-            elif policy == CacheAwarePolicy.DFS_WEIGHT:
-                SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
-            elif policy == CacheAwarePolicy.HRRN:
-                SchedulePolicy._sort_by_hrrn(
-                    waiting_queue, temporary_deprioritized, processed_tokens
-                )
-            elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
-                )
-                self._shortest_prefill_calls += 1
-                if waiting_queue and self._shortest_prefill_calls % 128 == 1:
-                    logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
-                        len(waiting_queue),
-                        self._shortest_prefill_work(waiting_queue[0]),
-                    )
+                if not calculated:
+                    self.calc_count -= 1
             else:
-                raise ValueError(f"Unknown CacheAware Policy: {policy=}")
+                temporary_deprioritized = self._compute_prefix_matches(
+                    waiting_queue, policy
+                )
+                if policy == CacheAwarePolicy.LPM:
+                    SchedulePolicy._sort_by_longest_prefix(
+                        waiting_queue, temporary_deprioritized
+                    )
+                elif policy == CacheAwarePolicy.DFS_WEIGHT:
+                    SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+                elif policy == CacheAwarePolicy.HRRN:
+                    SchedulePolicy._sort_by_hrrn(
+                        waiting_queue, temporary_deprioritized, processed_tokens
+                    )
+                elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                    SchedulePolicy._sort_by_shortest_prefill(
+                        waiting_queue, temporary_deprioritized
+                    )
+                    self._shortest_prefill_calls += 1
+                    if waiting_queue and self._shortest_prefill_calls % 128 == 1:
+                        logger.info(
+                            "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
+                            len(waiting_queue),
+                            self._shortest_prefill_work(waiting_queue[0]),
+                        )
+                else:
+                    raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
@@ -278,6 +308,8 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
         self._touch_waiting_prefixes(policy, waiting_queue)
+        self.calc_time += time.perf_counter() - start_time
+        self.calc_count += 1
 
     def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
@@ -351,8 +383,6 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
-            extra_key = r.extra_key
-            cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -363,19 +393,10 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(
-                            token_ids=prefix_ids,
-                            extra_key=extra_key,
-                            cache_salt=cache_salt,
-                        )
-                    )
+                match_result = self._match_batch_prefix_for_req(
+                    req=r,
+                    token_ids=prefix_ids,
                 )
-                if envs.SGLANG_RADIX_FORCE_MISS.get():
-                    match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
-                    )
                 if (
                     match_result.device_prefix_len
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
@@ -383,17 +404,238 @@ class SchedulePolicy:
                     temporary_deprioritized.add(r.rid)
                 else:
                     # Insert with a dummy key
-                    self.waiting_queue_radix_tree.insert(
-                        InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids,
-                                extra_key=extra_key,
-                                cache_salt=cache_salt,
-                            ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
-                        )
+                    self._insert_inbatch_tree(
+                        req=r,
+                        prefix_ids=prefix_ids,
                     )
         return temporary_deprioritized
+
+    def update_classified_reqs(self, reqs: List[Req]) -> None:
+        if self.policy != CacheAwarePolicy.PREFIX_WEAVE:
+            return
+        for r in reqs:
+            self.classified_reqs.discard(r.rid)
+
+    def update_finished_reqs_info(self, r: Req) -> None:
+        if self.policy != CacheAwarePolicy.PREFIX_WEAVE:
+            return
+        key = r.routing_key
+        if key is not None:
+            completed_sequence_len = len(r.origin_input_ids) + len(r.output_ids)
+            self.finished_req_lengths[key] = completed_sequence_len
+
+            if len(self.finished_req_lengths) > 1e6:
+                oldest_key = next(iter(self.finished_req_lengths))
+                del self.finished_req_lengths[oldest_key]
+
+    def _match_batch_prefix_for_req(
+        self, req: Req, token_ids: Optional[array[int]] = None
+    ):
+        if token_ids is None:
+            token_ids = req.origin_input_ids + req.output_ids
+
+        match_result = self.waiting_queue_radix_tree.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=token_ids,
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
+            )
+        )
+        if envs.SGLANG_RADIX_FORCE_MISS.get():
+            match_result = zero_match_result(
+                self.waiting_queue_radix_tree,
+                match_result,
+                extra_key=req.extra_key,
+            )
+        return match_result
+
+    def _insert_inbatch_tree(self, req: Req, prefix_ids: array[int]):
+        self.waiting_queue_radix_tree.insert(
+            InsertParams(
+                key=RadixKey(
+                    token_ids=prefix_ids,
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
+                value=torch.empty(len(prefix_ids), dtype=torch.bool),
+            )
+        )
+
+    def _prefix_weave_phase0_presort(
+        self, waiting_queue: List[Req], max_req_num: int, max_token: int
+    ) -> bool:
+        """Phase 0: update estimates and pre-sort; False means early exit."""
+        no_multi_turn = True
+        for r in reversed(waiting_queue):
+            if r.rid == self.last_req_rid:
+                break
+            key = r.routing_key
+            if key is None:
+                continue
+            if key in self.finished_req_lengths:
+                self.estimated_cached_tokens[key] = self.finished_req_lengths[key]
+                no_multi_turn = False
+            else:
+                prefix_ids = r.origin_input_ids + r.output_ids
+                match_result = match_kv_cache(
+                    req=r,
+                    tree_cache=self.tree_cache,
+                    token_ids=prefix_ids,
+                )
+                self.estimated_cached_tokens[key] = match_result.device_prefix_len
+
+            if len(self.estimated_cached_tokens) > 1e6:
+                oldest_key = next(iter(self.estimated_cached_tokens))
+                del self.estimated_cached_tokens[oldest_key]
+
+        if no_multi_turn and self._prefix_weave_early_exit(
+            waiting_queue, max_token, max_req_num
+        ):
+            return False
+
+        waiting_queue.sort(
+            key=lambda r: -self.estimated_cached_tokens.get(r.routing_key, 0)
+        )
+        return True
+
+    def _prefix_weave_early_exit(
+        self, waiting_queue: List[Req], max_token: int, max_req_num: int
+    ) -> bool:
+        """Check whether previously assigned requests fill the admission budget."""
+        if len(self.classified_reqs) >= max_req_num:
+            return True
+
+        classified_tokens = sum(
+            len(r.origin_input_ids)
+            + len(r.output_ids)
+            - self.estimated_cached_tokens.get(r.routing_key, r.prefix_len)
+            for r in waiting_queue
+            if r.rid in self.classified_reqs
+        )
+        return classified_tokens >= max_token
+
+    def _prefix_weave_phase1_assign_tiers(
+        self,
+        waiting_queue: List[Req],
+    ) -> tuple[Set[str], Set[str], Set[str]]:
+        """Phase 1: assign tiers within the token budget."""
+        high_cache_ratio = 0.9
+        overlap_tolerance = 0.05
+
+        def compute_cache_ratio(req: Req, prefix_ids: array[int]) -> tuple[float, int]:
+            match_result = match_kv_cache(
+                req=req,
+                tree_cache=self.tree_cache,
+                token_ids=prefix_ids,
+            )
+            cached_tokens = match_result.device_prefix_len
+            cache_ratio = cached_tokens / len(prefix_ids) if prefix_ids else 0.0
+            return cache_ratio, cached_tokens
+
+        def compute_overlap_ratio(req: Req, prefix_ids: array[int]) -> float:
+            match_result = self._match_batch_prefix_for_req(req, prefix_ids)
+            return (
+                match_result.device_prefix_len / len(prefix_ids) if prefix_ids else 0.0
+            )
+
+        def compute_cache_threshold(
+            req: Req,
+            prefix_len: int,
+            rolling_prefix: float,
+        ) -> float:
+            if (
+                req.routing_key is not None
+                and req.routing_key in self.finished_req_lengths
+            ):
+                high_cache_hit = (
+                    self.finished_req_lengths[req.routing_key] * high_cache_ratio
+                )
+                return high_cache_hit / prefix_len if prefix_len > 0 else 0.0
+            return min((rolling_prefix + high_cache_ratio) / 2, high_cache_ratio)
+
+        def compute_overlap_threshold(cache_ratio: float) -> float:
+            return cache_ratio + overlap_tolerance
+
+        def update_rolling_prefix(rolling_prefix: float, cache_ratio: float) -> float:
+            return (rolling_prefix + cache_ratio) / 2
+
+        self.waiting_queue_radix_tree.reset()
+        tier_1: Set[str] = set()
+        tier_2: Set[str] = set()
+        tier_3: Set[str] = set()
+        deferred: List[tuple[Req, int, float]] = []
+        # Build a reusable candidate window; PrefillAdder enforces live admission.
+        new_token_budget = self.token_batch_size * 2
+        total_new_tokens = 0
+        rolling_prefix = 0.0
+
+        for r in waiting_queue:
+            if total_new_tokens >= new_token_budget:
+                break
+
+            prefix_ids = r.origin_input_ids + r.output_ids
+            cache_ratio, cached_tokens = compute_cache_ratio(r, prefix_ids)
+            overlap_ratio = compute_overlap_ratio(r, prefix_ids)
+            cache_threshold = compute_cache_threshold(
+                r, len(prefix_ids), rolling_prefix
+            )
+            overlap_threshold = compute_overlap_threshold(cache_ratio)
+            rolling_prefix = update_rolling_prefix(rolling_prefix, cache_ratio)
+
+            if r.routing_key is not None:
+                self.estimated_cached_tokens[r.routing_key] = cached_tokens
+
+            if cache_ratio > cache_threshold:
+                if overlap_ratio < overlap_threshold:
+                    tier_1.add(r.rid)
+                else:
+                    tier_2.add(r.rid)
+                total_new_tokens += len(prefix_ids) - cached_tokens
+                self._insert_inbatch_tree(req=r, prefix_ids=prefix_ids)
+            else:
+                deferred.append((r, cached_tokens, overlap_threshold))
+
+        for r, cached_tokens, overlap_threshold in deferred:
+            if total_new_tokens >= new_token_budget:
+                break
+
+            prefix_ids = r.origin_input_ids + r.output_ids
+            overlap_ratio = compute_overlap_ratio(r, prefix_ids)
+            if overlap_ratio < overlap_threshold:
+                tier_3.add(r.rid)
+                total_new_tokens += len(prefix_ids) - cached_tokens
+                self._insert_inbatch_tree(req=r, prefix_ids=prefix_ids)
+
+        return tier_1, tier_2, tier_3
+
+    def _sort_by_prefix_weave(
+        self, waiting_queue: List[Req], max_req_num: int, max_token: int
+    ) -> bool:
+        if not self._prefix_weave_phase0_presort(waiting_queue, max_req_num, max_token):
+            return False
+        tiers = self._prefix_weave_phase1_assign_tiers(waiting_queue)
+
+        # Phase 2: reorder by tier, then by descending cached-prefix length.
+        tier_1, tier_2, tier_3 = tiers
+        waiting_queue.sort(
+            key=lambda r: (
+                (
+                    1
+                    if r.rid in tier_1
+                    else 2
+                    if r.rid in tier_2
+                    else 3
+                    if r.rid in tier_3
+                    else 4
+                ),
+                -r.prefix_len,
+            )
+        )
+        self.classified_reqs = tier_1 | tier_2 | tier_3
+        self.last_req_rid = waiting_queue[-1].rid if waiting_queue else None
+        return True
 
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:

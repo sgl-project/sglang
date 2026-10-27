@@ -758,6 +758,8 @@ class SchedulerMetricsReporter:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+            f"#calc-time: {self.scheduler.policy.calc_time:.4f}, "
+            f"#calc-count: {self.scheduler.policy.calc_count}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 

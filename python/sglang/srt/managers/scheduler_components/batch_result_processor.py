@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.schedule_policy import SchedulePolicy
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -113,6 +114,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    policy: SchedulePolicy
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -127,6 +129,7 @@ class SchedulerBatchResultProcessor:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
+                self.policy.update_finished_reqs_info(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -390,6 +393,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
+                        self.policy.update_finished_reqs_info(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -491,6 +495,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
+                        self.policy.update_finished_reqs_info(req)
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
                 else:
@@ -1466,6 +1471,7 @@ class SchedulerBatchResultProcessor:
                 release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
+            self.policy.update_finished_reqs_info(req)
 
         self._maybe_collect_customized_info(i, req, logits_output)
 

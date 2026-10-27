@@ -92,6 +92,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
+        policy=SimpleNamespace(update_finished_reqs_info=lambda req: None),
     )
 
 
