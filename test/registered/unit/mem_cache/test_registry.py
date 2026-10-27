@@ -67,6 +67,8 @@ def _make_ctx(
     params = MagicMock()
     # Static pools: the tree's slots follow the pool shape.
     params.token_to_kv_pool_allocator.storage = None
+    params.sliding_window_size = 128
+    params.draft_swa_window = 0
     return TreeCacheBuildContext(
         server_args=server_args,
         params=params,
@@ -163,6 +165,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         from sglang.srt.mem_cache.allocator.hisparse import (
             DeepSeekV4HiSparseTokenToKVPoolAllocator,
         )
+        from sglang.srt.mem_cache.kv.plan import TREE_WINDOW, TreeSlot
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
         params = CacheInitParams(
@@ -174,7 +177,11 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             page_size=64,
             sliding_window_size=128,
         )
-        component = SWAComponent(MagicMock(), params)
+        component = SWAComponent(
+            MagicMock(),
+            params,
+            TreeSlot(component="SWA", family=TREE_WINDOW, window=128),
+        )
         self.assertEqual(component.full_window_pages, 2)
 
     def test_pure_swa_with_disable_radix_skips_storage_backends(self):
@@ -356,12 +363,15 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_ssm=True)
         fake_module = MagicMock()
         fake_components = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-            },
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                },
+            ),
+            patch("sglang.srt.runtime_context.mamba_cache_chunk_size", return_value=64),
         ):
             default_radix_cache_factory(ctx)
 

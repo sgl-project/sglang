@@ -395,6 +395,7 @@ class KVStorage:
         write_pos = self._allocator.state.pool.replayssm_write_pos
         if write_pos is None:
             return 0
+        slot = self._allocator.state_ids(sub_pool).ids(slot)
         lag = int(write_pos[slot].item())
         write_pos[slot] = 0
         return lag
@@ -425,10 +426,11 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
-    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slot per sub-pool, in the order the tree drives
-        their eviction."""
-        return self._plan.tree_slots()
+        their eviction; ``window_reach`` widens the window a prefix keeps for a
+        reader beyond the window's own layers (a fused draft)."""
+        return self._plan.tree_slots(window_reach=window_reach)
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]

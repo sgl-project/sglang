@@ -327,7 +327,10 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA),
+                window=128 * page_size if window is None else window,
+            ),
         )
     )
     slots = allocator.alloc(occupancy * page_size)
@@ -366,7 +369,8 @@ def build_tri_cache(
                     (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
                     if state_cache
                     else (ComponentType.FULL, ComponentType.SWA)
-                )
+                ),
+                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -526,6 +530,7 @@ def build_test_unified_pools(
         window_tokens=swa_max_total_num_tokens,
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
+        floor_window=sliding_window_size,
     )
     ctx = UnifiedBuildContext(
         device=device,
@@ -605,6 +610,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
+        floor_window=g.window if g.swa_layer_ids else None,
     )
     ctx = UnifiedBuildContext(
         device=g.device,

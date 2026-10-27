@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -67,21 +68,23 @@ class SWAComponent(TreeComponent):
     value stays intact.
     """
 
-    def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+    def __init__(
+        self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
+    ):
         # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
         # only frees through free_swa_segment / free / free_group_*, which the
         # HiSparse allocator defines.
         assert params.token_to_kv_pool_allocator.has_window_pool, (
             f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
-        if params.sliding_window_size is None or params.sliding_window_size <= 0:
-            raise ValueError("SWAComponent requires a positive sliding_window_size")
+        if slot.window is None or slot.window <= 0:
+            raise ValueError("SWAComponent requires a positive window in its slot")
 
-        super().__init__(cache, params)
+        super().__init__(cache, params, slot)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
-        # This is the tree's required history, including widened draft reads;
-        # it does not change the model's attention window.
-        self.sliding_window_size = params.swa_retain_window
+        # The history a prefix keeps, which every reader of the window needs
+        # (a fused draft's reads included); not the model's attention window.
+        self.sliding_window_size = slot.window
         self.gates_prefix_match = params.swa_gates_prefix_match
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1

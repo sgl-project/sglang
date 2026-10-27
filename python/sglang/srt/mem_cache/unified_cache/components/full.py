@@ -48,8 +48,8 @@ if TYPE_CHECKING:
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
 
-    def __init__(self, cache, params):
-        super().__init__(cache, params)
+    def __init__(self, cache, params, slot):
+        super().__init__(cache, params, slot)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
         # Lazy bind eviction strategy since tree core is initialized after component init.

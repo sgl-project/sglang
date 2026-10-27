@@ -254,7 +254,14 @@ def build_fixture(
         sliding_window_size=cfg.sliding_window_size,
         draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
-        tree_slots=tree_slots_of(cfg.components),
+        tree_slots=tree_slots_of(
+            cfg.components,
+            window=(
+                None
+                if cfg.sliding_window_size is None
+                else max(cfg.sliding_window_size, cfg.draft_swa_window)
+            ),
+        ),
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,

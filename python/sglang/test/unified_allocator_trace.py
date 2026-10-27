@@ -143,7 +143,9 @@ class BuilderAdapter:
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=self.page_size,
                 sliding_window_size=32,
-                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=32
+                ),
             )
         )
 

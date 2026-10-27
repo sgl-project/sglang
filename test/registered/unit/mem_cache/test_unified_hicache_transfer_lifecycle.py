@@ -415,7 +415,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA), window=self.window
+            ),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}

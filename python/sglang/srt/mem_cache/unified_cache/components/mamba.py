@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -43,15 +44,12 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    mamba_cache_chunk_size,
-    mamba_checkpoint_grid,
-)
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -66,7 +64,9 @@ if TYPE_CHECKING:
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
-    def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+    def __init__(
+        self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
+    ):
 
         assert params.req_to_token_pool.holds_state_slots, (
             "MambaComponent requires a request table with state slots, got "
@@ -78,11 +78,13 @@ class MambaComponent(TreeComponent):
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
-        super().__init__(cache, params)
-        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        super().__init__(cache, params, slot)
+        self.mamba_cache_chunk_size = slot.checkpoint_interval
         # params.page_size is the tree page the allocator actually uses, already
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
-        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
+        self.mamba_checkpoint_grid = math.lcm(
+            slot.checkpoint_interval, params.page_size
+        )
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled

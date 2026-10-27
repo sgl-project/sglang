@@ -242,7 +242,9 @@ def create_bench_cache(
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,
                 disable=False,
-                tree_slots=tree_slots_of(components),
+                tree_slots=tree_slots_of(
+                    components, window=sliding_window_size if has_swa else None
+                ),
                 sliding_window_size=sliding_window_size if has_swa else None,
             )
         )

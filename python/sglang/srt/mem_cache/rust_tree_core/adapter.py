@@ -66,7 +66,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
 )
-from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
@@ -428,12 +428,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 tlru_float_config = _tlru_float_config(
                     self._bindings, threshold, next_prompt_estimate
                 )
-        if TREE_WINDOW in families and (
-            params.sliding_window_size is None or params.sliding_window_size <= 0
-        ):
-            raise ValueError(
-                "the SWA tree component requires a positive sliding_window_size"
-            )
+        numbers = {slot.family: slot for slot in params.tree_slots}
+        window = numbers[TREE_WINDOW].window if TREE_WINDOW in families else None
+        if TREE_WINDOW in families and (window is None or window <= 0):
+            raise ValueError("the SWA tree component requires a positive window")
 
         self._page_size = params.page_size
         self._swa_backup_index_mapper: Optional[
@@ -478,14 +476,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
-                # Rust's tree window has the same cache-history contract as
-                # SWAComponent, including the fused draft's front rows.
-                swa_sliding_window_size=params.swa_retain_window,
+                # The window slot's history, as SWAComponent keeps it, the
+                # fused draft's front rows included.
+                swa_sliding_window_size=window,
                 swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
-                    mamba_cache_chunk_size() if has_mamba else None
+                    numbers[TREE_STATE].checkpoint_interval if has_mamba else None
                 ),
                 mamba_max_states_per_path=(
                     mamba_max_states_per_path

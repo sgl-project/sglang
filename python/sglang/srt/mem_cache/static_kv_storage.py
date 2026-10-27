@@ -47,6 +47,10 @@ class StaticPoolShape(msgspec.Struct, frozen=True, kw_only=True):
     token_capacity: int
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
+    # The prefix tree's numbers: the window layers' attention window, and the
+    # token interval a cached recurrent state is valid at.
+    window: Optional[int] = None
+    checkpoint_interval: Optional[int] = None
 
 
 def kv_storage_of(
@@ -419,6 +423,7 @@ class StaticKVStorage:
         write_pos = self._allocator.state.pool.replayssm_write_pos
         if write_pos is None:
             return 0
+        slot = self._allocator.state_ids(sub_pool).ids(slot)
         lag = int(write_pos[slot].item())
         write_pos[slot] = 0
         return lag
@@ -506,17 +511,24 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
         shape = self._shape
+        window = max(shape.window, window_reach) if shape.window is not None else None
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (
-                (TreeSlot(component="SWA", family=TREE_WINDOW),)
+                (TreeSlot(component="SWA", family=TREE_WINDOW, window=window),)
                 if shape.has_window
                 else ()
             )
             + (
-                (TreeSlot(component="MAMBA", family=TREE_STATE),)
+                (
+                    TreeSlot(
+                        component="MAMBA",
+                        family=TREE_STATE,
+                        checkpoint_interval=shape.checkpoint_interval,
+                    ),
+                )
                 if shape.has_state
                 else ()
             )

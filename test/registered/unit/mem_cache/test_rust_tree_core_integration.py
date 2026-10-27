@@ -84,7 +84,7 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
+from sglang.test.tree_slots import FAMILY_OF, slot_of, tree_slots_of
 
 
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
@@ -104,7 +104,14 @@ def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+    return UnifiedTreeCore(
+        params,
+        {
+            ComponentType.FULL: FullComponent(
+                cache, params, slot_of(params, ComponentType.FULL)
+            )
+        },
+    )
 
 
 def _path_indices(core: RustUnifiedTreeCore, node_id) -> torch.Tensor:
@@ -410,7 +417,14 @@ def _tlru_tree_core(backend, config=None, page_size=1, is_eagle=False):
     if backend == "rust":
         return RustUnifiedTreeCore(params)
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+    return UnifiedTreeCore(
+        params,
+        {
+            ComponentType.FULL: FullComponent(
+                cache, params, slot_of(params, ComponentType.FULL)
+            )
+        },
+    )
 
 
 def _tlru_insert(core, token_ids, indices, tier):
@@ -1005,7 +1019,7 @@ def test_stale_handles_nested_in_transfer_results_do_not_poison_the_core():
 
 def test_stale_handle_component_access_does_not_poison_the_core():
     core = _tree_core(
-        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA), window=8),
         sliding_window_size=8,
     )
     stale_root = core.root_node_handle()
@@ -1231,7 +1245,9 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
         False, None, None, 1, tree_slots=tree_slots_of((ComponentType.FULL,))
     )
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    driver = SideBackingFullComponent(cache, params)
+    driver = SideBackingFullComponent(
+        cache, params, slot_of(params, ComponentType.FULL)
+    )
     core = UnifiedTreeCore(params, {ComponentType.FULL: driver})
     leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
     node = core.node_by_id(leaf)
@@ -2355,7 +2371,9 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
 
 def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
     return _tree_core(
-        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+        tree_slots=tree_slots_of(
+            (ComponentType.FULL, ComponentType.SWA), window=window
+        ),
         sliding_window_size=window,
         **params_overrides,
     )
@@ -2393,7 +2411,9 @@ def _swa_transfer_core(
         is_eagle=is_eagle,
         tree_slots=tree_slots_of(
             (ComponentType.FULL, ComponentType.SWA)
-            + ((ComponentType.MAMBA,) if mamba else ())
+            + ((ComponentType.MAMBA,) if mamba else ()),
+            window=window,
+            checkpoint_interval=256,
         ),
         sliding_window_size=window,
         swa_gates_prefix_match=not request_window,
@@ -2411,11 +2431,17 @@ def _swa_transfer_core(
                 kv_storage=lambda: StaticKVStorage(None, allocator),
             )
             components = {
-                ComponentType.FULL: FullComponent(cache, params),
-                ComponentType.SWA: SWAComponent(cache, params),
+                ComponentType.FULL: FullComponent(
+                    cache, params, slot_of(params, ComponentType.FULL)
+                ),
+                ComponentType.SWA: SWAComponent(
+                    cache, params, slot_of(params, ComponentType.SWA)
+                ),
             }
             if mamba:
-                components[ComponentType.MAMBA] = MambaComponent(cache, params)
+                components[ComponentType.MAMBA] = MambaComponent(
+                    cache, params, slot_of(params, ComponentType.MAMBA)
+                )
             core = UnifiedTreeCore(params, components)
             cache.tree_core = core
     core.set_hicache_enabled()
@@ -2720,7 +2746,7 @@ def test_swa_core_rejects_a_missing_or_non_positive_window():
     """A zero window can never fill, so no boundary uuid would ever be stamped;
     the adapter refuses it up front instead of letting the core misbehave later."""
     for window in (None, 0, -1):
-        with pytest.raises(ValueError, match="positive sliding_window_size"):
+        with pytest.raises(ValueError, match="positive window"):
             _swa_tree_core(window=window)
 
 
@@ -2855,7 +2881,9 @@ def _swa_cache(
                 disable=False,
                 sliding_window_size=window,
                 swa_gates_prefix_match=not (ring or request_window),
-                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=window
+                ),
                 component_registry_override=component_registry_override,
             )
         )
@@ -2902,7 +2930,9 @@ def _swa_mamba_cache(
                         ComponentType.FULL,
                         ComponentType.SWA,
                         ComponentType.MAMBA,
-                    )
+                    ),
+                    window=window,
+                    checkpoint_interval=256,
                 ),
             )
         )
@@ -3670,7 +3700,9 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             sliding_window_size=4,
-            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.AUXILIARY_SWA)),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.AUXILIARY_SWA), window=4
+            ),
             component_registry_override={
                 FAMILY_OF[ComponentType.AUXILIARY_SWA]: AuxiliarySWAComponent
             },
@@ -3740,7 +3772,10 @@ def test_aux_host_reclaim_uses_its_own_load_back_sources(
                     req_to_token_pool=Mock(spec=HybridReqToTokenPool),
                     token_to_kv_pool_allocator=None,
                     page_size=1,
-                    tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.MAMBA),
+                        checkpoint_interval=256,
+                    ),
                 )
             )
         core = cache.tree_core
@@ -3845,7 +3880,10 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
                     req_to_token_pool=request_pool,
                     token_to_kv_pool_allocator=allocator,
                     page_size=1,
-                    tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.MAMBA),
+                        checkpoint_interval=256,
+                    ),
                 )
             )
     core = cache.tree_core
@@ -4331,7 +4369,9 @@ def _mamba_tree_core(
         mamba_max_states_per_path=mamba_max_states_per_path,
     ):
         return _tree_core(
-            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.MAMBA), checkpoint_interval=256
+            ),
             page_size=page_size,
             **params_overrides,
         )
@@ -4352,7 +4392,9 @@ def _hybrid_swa_mamba_tree_core(window: int) -> RustUnifiedTreeCore:
                     ComponentType.FULL,
                     ComponentType.SWA,
                     ComponentType.MAMBA,
-                )
+                ),
+                window=window,
+                checkpoint_interval=256,
             ),
             sliding_window_size=window,
         )
@@ -4531,14 +4573,20 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
         req_to_token_pool=Mock(spec=HybridReqToTokenPool),
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
+        tree_slots=tree_slots_of(
+            (ComponentType.FULL, ComponentType.MAMBA), checkpoint_interval=256
+        ),
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
     ):
         cache.components = {
-            ComponentType.FULL: FullComponent(cache, params),
-            ComponentType.MAMBA: MambaComponent(cache, params),
+            ComponentType.FULL: FullComponent(
+                cache, params, slot_of(params, ComponentType.FULL)
+            ),
+            ComponentType.MAMBA: MambaComponent(
+                cache, params, slot_of(params, ComponentType.MAMBA)
+            ),
         }
         core = (
             RustUnifiedTreeCore(params)

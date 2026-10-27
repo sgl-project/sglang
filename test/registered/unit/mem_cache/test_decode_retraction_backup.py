@@ -211,7 +211,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     (ComponentType.FULL, ComponentType.SWA)
                     if hybrid_swa
                     else (ComponentType.FULL,)
-                )
+                ),
+                window=8 if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
             mtp_draft_device_pools=(

@@ -100,10 +100,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
-        from sglang.srt.mem_cache.static_kv_storage import (
-            StaticPoolShape,
-            kv_storage_of,
-        )
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
             LMCacheUnifiedRadixCache,
         )
@@ -112,16 +109,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         storage = kv_storage_of(
             params.req_to_token_pool,
             allocator,
-            shape=StaticPoolShape(
-                has_window=ctx.is_hybrid_swa,
-                has_state=ctx.is_hybrid_ssm,
-                token_capacity=allocator.size,
-            ),
+            shape=_static_tree_shape(ctx, allocator),
         )
         # A pure-window model keeps no full-attention prefix in LMCache.
         params.tree_slots = tuple(
             slot
-            for slot in storage.tree_slots()
+            for slot in storage.tree_slots(window_reach=params.draft_swa_window)
             if not (is_pure_swa and slot.family == TREE_TOKEN)
         )
         return LMCacheUnifiedRadixCache(
@@ -158,6 +151,22 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return create_unified_radix_cache(ctx)
 
 
+def _static_tree_shape(ctx: TreeCacheBuildContext, allocator):
+    """What static pools tell their prefix tree (a unified pool's plan says it
+    itself): which slots the model has, its window layers' attention window,
+    and the token interval a cached recurrent state is valid at."""
+    from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape
+    from sglang.srt.runtime_context import mamba_cache_chunk_size
+
+    return StaticPoolShape(
+        has_window=ctx.is_hybrid_swa,
+        has_state=ctx.is_hybrid_ssm,
+        token_capacity=allocator.size,
+        window=ctx.params.sliding_window_size,
+        checkpoint_interval=mamba_cache_chunk_size() if ctx.is_hybrid_ssm else None,
+    )
+
+
 def create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     *,
@@ -172,20 +181,16 @@ def create_unified_radix_cache(
             raise ValueError("Host-pool retraction does not support pure-SWA models.")
 
     from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TreeSlot
-    from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     allocator = params.token_to_kv_pool_allocator
     storage = kv_storage_of(
         params.req_to_token_pool,
         allocator,
-        shape=StaticPoolShape(
-            has_window=ctx.is_hybrid_swa,
-            has_state=ctx.is_hybrid_ssm,
-            token_capacity=allocator.size,
-        ),
+        shape=_static_tree_shape(ctx, allocator),
     )
-    tree_slots = list(storage.tree_slots())
+    tree_slots = list(storage.tree_slots(window_reach=params.draft_swa_window))
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (

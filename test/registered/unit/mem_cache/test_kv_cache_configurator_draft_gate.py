@@ -552,7 +552,10 @@ class TestSWARetainWindow(CustomTestCase):
                 page_size=1,
                 sliding_window_size=_WINDOW,
                 draft_swa_window=draft_swa_window,
-                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.SWA)),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA),
+                    window=max(_WINDOW, draft_swa_window),
+                ),
             )
         )
         req = Req(

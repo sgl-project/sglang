@@ -171,7 +171,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             ),
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_slots=tree_slots_of(tree_components),
+            tree_slots=tree_slots_of(tree_components, checkpoint_interval=64),
             component_registry_override=component_registry_override,
             **kwargs,
         )

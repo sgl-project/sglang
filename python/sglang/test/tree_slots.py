@@ -5,7 +5,7 @@ sub-pool's family by its lifetime. A hand-built test names component ids
 instead; ``FAMILY_OF`` gives each id the family production gives its sub-pool.
 """
 
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from sglang.srt.mem_cache.kv.plan import (
     TREE_BLOCK,
@@ -30,9 +30,36 @@ FAMILY_OF = {
 }
 
 
-def tree_slots_of(components: Iterable[ComponentType]) -> Tuple[TreeSlot, ...]:
-    """The slots of a tree whose components are ``components``, in order."""
-    return tuple(
-        TreeSlot(component=ComponentType(c).name, family=FAMILY_OF[ComponentType(c)])
-        for c in components
-    )
+def tree_slots_of(
+    components: Iterable[ComponentType],
+    *,
+    window: Optional[int] = None,
+    checkpoint_interval: Optional[int] = None,
+) -> Tuple[TreeSlot, ...]:
+    """The slots of a tree whose components are ``components``, in order. A
+    window slot keeps ``window`` tokens (the test's retained window); a state
+    slot's checkpoint interval defaults to the runtime's chunk size, where
+    production's plan takes it from."""
+    slots = []
+    for c in components:
+        family = FAMILY_OF[ComponentType(c)]
+        numbers = {}
+        if family in (TREE_WINDOW, CUSTOM_WINDOW):
+            numbers["window"] = window
+        if family == TREE_STATE:
+            if checkpoint_interval is None:
+                from sglang.srt.runtime_context import mamba_cache_chunk_size
+
+                checkpoint_interval = mamba_cache_chunk_size()
+            numbers["checkpoint_interval"] = checkpoint_interval
+        slots.append(
+            TreeSlot(component=ComponentType(c).name, family=family, **numbers)
+        )
+    return tuple(slots)
+
+
+def slot_of(params, component: ComponentType) -> TreeSlot:
+    """The slot ``params`` gives ``component``, for a test that builds a
+    component directly."""
+    name = ComponentType(component).name
+    return next(slot for slot in params.tree_slots if slot.component == name)

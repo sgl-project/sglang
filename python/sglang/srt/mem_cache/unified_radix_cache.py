@@ -232,7 +232,7 @@ class UnifiedRadixCache(BasePrefixCache):
             }
         self.components: dict[ComponentType, TreeComponent] = {}
         for slot in params.tree_slots:
-            component = component_registry[slot.family](self, params)
+            component = component_registry[slot.family](self, params, slot)
             # The family gives the behavior; the slot gives the id it goes by.
             component.component_type = ComponentType[slot.component]
             self.components[component.component_type] = component
@@ -248,9 +248,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # Required cache history, shared by retention, budgeting and transfers.
-        self._sliding_window_size = (
-            params.swa_retain_window if self.is_swa_enabled else None
+        # Required cache history, shared by retention, budgeting and transfers:
+        # the window slot's.
+        self._sliding_window_size = next(
+            (slot.window for slot in params.tree_slots if slot.family == TREE_WINDOW),
+            None,
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         self.draft_swa_window = params.draft_swa_window

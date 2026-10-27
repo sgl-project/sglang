@@ -530,7 +530,7 @@ class TestTriJointReclaim(CustomTestCase):
                             page_size=1,
                             sliding_window_size=128,
                             tree_slots=tree_slots_of(
-                                (ComponentType.FULL, ComponentType.SWA)
+                                (ComponentType.FULL, ComponentType.SWA), window=128
                             ),
                         )
                     )
