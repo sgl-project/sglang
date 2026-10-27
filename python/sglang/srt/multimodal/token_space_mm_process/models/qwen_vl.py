@@ -5,14 +5,16 @@ import torch
 from transformers import BatchFeature
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessorKwargs,
-    _get_feat_extract_output_lengths,
 )
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
     Qwen3VLVideoProcessor,
 )
 
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.multimodal.mrope_rope_index import get_rope_index
+from sglang.srt.multimodal.mrope_rope_index import (
+    _get_feat_extract_output_lengths,
+    get_rope_index,
+)
 from sglang.srt.multimodal.qwen_vl_media_processing import (
     FPS_MAX_FRAMES,
     QWEN_VIDEO_PREPROCESS_CONFIG_KEYS,
