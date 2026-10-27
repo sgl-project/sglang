@@ -39,7 +39,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -178,14 +184,7 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         # Lean's auto-gate is calibrated for gfx942/gfx950. Explicit True still
         # allows bring-up on other architectures.
-        gcn_arch = (
-            torch.cuda.get_device_properties(model_runner.device).gcnArchName
-            if torch.version.hip
-            else ""
-        )
-        self.lean_attention_auto_supported = not any(
-            arch in gcn_arch for arch in ("gfx1100", "gfx1201")
-        )
+        self.lean_attention_auto_supported = not get_platform().is_rdna
         self.enable_lean_attention = get_exec().kernel.enable_lean_attention
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
