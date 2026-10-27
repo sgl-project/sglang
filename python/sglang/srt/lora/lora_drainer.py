@@ -53,6 +53,7 @@ class LoRADrainer:
         self.max_loras_per_batch = max_loras_per_batch
         self.max_wait_time_secs = max_wait_time_secs
         self.drained_adapter_to_drain: Dict[Optional[str], Drain] = {}
+        self.running_req_ids: set[int] = set()
 
     def update_draining_state(
         self,
@@ -61,6 +62,7 @@ class LoRADrainer:
     ) -> None:
         """Ends drains that are no longer needed; starts drains for starving adapters."""
         running_reqs = [req for req in running_reqs if not req.finished()]
+        self.running_req_ids = {id(req) for req in running_reqs}
         running_adapters = {req.lora_id for req in running_reqs}
         waiting_adapters = {req.lora_id for req in waiting_queue}
 
@@ -91,7 +93,8 @@ class LoRADrainer:
             return True
 
         anchor_req = drain.anchor_req
-        if anchor_req.finished():
+        # A retracted or preempted anchor no longer makes progress.
+        if anchor_req.finished() or id(anchor_req) not in self.running_req_ids:
             return False
 
         return req.sampling_params.max_new_tokens <= _max_rem_tokens(anchor_req)

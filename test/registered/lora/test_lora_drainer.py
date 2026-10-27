@@ -97,6 +97,29 @@ class TestLoRADrainer(unittest.TestCase):
         drainer.update_draining_state(waiting, [anchor, admitted])
         self.assertFalse(drainer.can_schedule(make_req("B", max_new_tokens=1)))
 
+    def test_drained_adapter_admits_nothing_once_its_anchor_is_retracted(self):
+        drainer = self.make_drainer(max_loras_per_batch=1)
+        waiting = [starving_req("A")]
+        anchor = make_req("B", max_new_tokens=100)
+        anchor.output_ids = [0]
+        running = make_req("B", max_new_tokens=100)
+        running.output_ids = [0] * 98
+        drainer.update_draining_state(waiting, [anchor, running])
+        self.assertTrue(drainer.can_schedule(make_req("B", max_new_tokens=3)))
+
+        # Retraction requeues the unfinished anchor; its token budget stops shrinking.
+        waiting.append(anchor)
+        drainer.update_draining_state(waiting, [running])
+        self.assertFalse(anchor.finished())
+        self.assertFalse(drainer.can_schedule(make_req("B", max_new_tokens=3)))
+        self.assertFalse(drainer.can_schedule(make_req("B", max_new_tokens=1)))
+        self.assertFalse(drainer.can_schedule(anchor))
+        self.assertEqual(drainer.drained_adapter_to_drain["B"].starving_adapter, "A")
+
+        drainer.update_draining_state(waiting, [])
+        self.assert_not_draining(drainer, "B")
+        self.assertTrue(drainer.can_schedule(waiting[0]))
+
     def test_drain_ends_once_the_starving_adapter_no_longer_needs_a_slot(self):
         """A drain whose starving adapter needs no slot must stop rejecting requests."""
         running_b = make_req("B", max_new_tokens=5)
