@@ -2336,11 +2336,11 @@ class CPUGraphRunner:
             self._mark_dynamic_token_axis(forward_batch)
 
         output = self._run_prefill_once(compiled_fn, forward_batch)
-        if (
-            isinstance(output, LogitsProcessorOutput)
-            and output.hidden_states is not None
-        ):
-            output.hidden_states = output.hidden_states[:raw_num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            if output.hidden_states is not None:
+                output.hidden_states = output.hidden_states[:raw_num_tokens]
+            if getattr(output, "last_hidden_states", None) is not None:
+                output.last_hidden_states = output.last_hidden_states[:raw_num_tokens]
         return output
 
 
