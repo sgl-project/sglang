@@ -381,9 +381,19 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         ):
             if mla_dcp_graph:
                 mla_backend = get_mla_dcp_backend(self._replay_attn_backend())
-                seq_lens_cpu = forward_batch.seq_lens.cpu()
-                if forward_batch.forward_mode.is_target_verify():
-                    seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+                if forward_batch.seq_lens_cpu is not None:
+                    # DFlash/DSPARK already include the verify block in the Host bound.
+                    seq_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        and not self.model_runner.spec_algorithm.is_dflash_family()
+                    ):
+                        seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+                else:
+                    # Device lengths are prefix-only; read them back only without a mirror.
+                    seq_lens_cpu = forward_batch.seq_lens[: self.raw_bs].cpu()
+                    if forward_batch.forward_mode.is_target_verify():
+                        seq_lens_cpu = seq_lens_cpu + self.captured_req_width
                 local_seq_lens = get_dcp_lens(
                     seq_lens_cpu,
                     mla_backend.dcp_size,
