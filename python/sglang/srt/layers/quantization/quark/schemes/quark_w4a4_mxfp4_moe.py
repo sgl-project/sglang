@@ -1021,10 +1021,17 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # gfx1250 grouped kernel expects GUGU (gate/up row-interleaved) layout.
             # moe_shuffle_weight does interleave_gate_up_rows then tile shuffle,
             # which is what grouped_gemm_gfx1250_a8w4 reads.
-            layer.w13_weight.data = moe_shuffle_weight(
-                layer.w13_weight.contiguous(), is_guinterleave=True, gate_up=True
-            )
-            layer.w2_weight.data = moe_shuffle_weight(layer.w2_weight.contiguous())
+            # Per-expert chunks in place: a whole-tensor shuffle holds two extra w13
+            # copies at peak, which OOMs a 144 GiB partition (4 layers at TP2).
+            for w, kw in (
+                (layer.w13_weight, dict(is_guinterleave=True, gate_up=True)),
+                (layer.w2_weight, {}),
+            ):
+                w.data = w.data.contiguous()
+                for e in range(0, w.shape[0], 16):
+                    w.data[e : e + 16].copy_(
+                        moe_shuffle_weight(w.data[e : e + 16].contiguous(), **kw)
+                    )
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
         elif _is_shuffle_moe_mxfp4:
