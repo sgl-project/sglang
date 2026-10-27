@@ -3348,6 +3348,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
         ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
         ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.multimodal.modality", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         (
@@ -4512,6 +4513,7 @@ def get_physical_cpus_by_numa():
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
