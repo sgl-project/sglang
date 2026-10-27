@@ -541,6 +541,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_last_error = None
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
+        self.abort_dispatch_window = get_serving().abort_dispatch_window
         self.enable_lora = get_lora().enable_lora
         self.enable_trace = get_observability().enable_trace
         self.allow_auto_truncate = get_serving().allow_auto_truncate
@@ -2427,7 +2428,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(2)
+            await asyncio.sleep(self.abort_dispatch_window)
             rids = [obj.rid] if obj.is_single else obj.rid
             for rid in rids:
                 if rid in self.rid_to_state:

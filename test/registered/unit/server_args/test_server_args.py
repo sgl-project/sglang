@@ -185,6 +185,26 @@ class TestServerArgsPositionalOrder(CustomTestCase):
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_abort_dispatch_window_is_configurable(self):
+        default_args = prepare_server_args(["--model-path", "dummy"])
+        cli_args = prepare_server_args(
+            ["--model-path", "dummy", "--abort-dispatch-window", "0.25"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nabort-dispatch-window: 0.5\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        config_args = prepare_server_args(["--config", config_path])
+
+        self.assertEqual(default_args.abort_dispatch_window, 2.0)
+        self.assertEqual(cli_args.abort_dispatch_window, 0.25)
+        self.assertEqual(config_args.abort_dispatch_window, 0.5)
+
+        with self.assertRaisesRegex(ValueError, "abort_dispatch_window"):
+            prepare_server_args(
+                ["--model-path", "dummy", "--abort-dispatch-window", "-1"]
+            )
+
     def test_optimistic_prefill_allows_l2_write_through_only(self):
         for policy, expected in (
             ("write_back", 2),

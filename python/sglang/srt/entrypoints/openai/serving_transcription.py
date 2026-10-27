@@ -367,7 +367,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         abort_assigned_rids()
 
         async def abort_after_dispatch_window():
-            await asyncio.sleep(2)
+            await asyncio.sleep(self.tokenizer_manager.abort_dispatch_window)
             abort_assigned_rids()
 
         asyncio.create_task(abort_after_dispatch_window())

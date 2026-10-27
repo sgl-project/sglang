@@ -273,6 +273,10 @@ class Serving(msgspec.Struct):
         bool,
         "Whether to output as a sequence of disjoint segments.",
     ] = False
+    abort_dispatch_window: A[
+        float,
+        "Seconds to wait before retrying abort for requests that may not have been dispatched yet.",
+    ] = 2.0
     enable_streaming_session: A[
         bool, "Enable streaming session mode and StreamingSession wrapper."
     ] = False
