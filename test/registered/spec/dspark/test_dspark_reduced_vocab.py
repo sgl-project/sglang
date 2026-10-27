@@ -291,9 +291,70 @@ class TestReducedVocabConfig(CustomTestCase):
         self.assertEqual(normalized["architectures"], ["Qwen3DSparkModel"])
         self.assertEqual(normalized["hidden_size"], 2048)
         self.assertEqual(normalized["draft_vocab_size"], 32000)
-        self.assertEqual(normalized["target_layer_ids"], [2, 10, 20, 30, 37])
+        self.assertEqual(normalized["target_layer_ids"], [1, 9, 19, 29, 36])
+        self.assertEqual(normalized["aux_hidden_state_layer_ids"], [2, 10, 20, 30, 37])
         self.assertNotIn("auto_map", normalized)
         self.assertNotIn("transformer_layer_config", normalized)
+
+    def test_normalize_aux_layer_index_boundaries(self):
+        for sequence_type in (list, tuple):
+            with self.subTest(sequence_type=sequence_type):
+                config = {
+                    "speculators_model_type": "dspark",
+                    "transformer_layer_config": {"model_type": "qwen3"},
+                    "aux_hidden_state_layer_ids": sequence_type([0, 1, 37]),
+                }
+                normalized = _normalize_speculators_draft_config_dict(config)
+                # Embedding output and first decoder-layer output map to -1
+                # and 0; capture then adds 1 to recover the HF indices.
+                self.assertEqual(normalized["target_layer_ids"], [-1, 0, 36])
+                self.assertEqual(
+                    normalized["aux_hidden_state_layer_ids"], sequence_type([0, 1, 37])
+                )
+                self.assertEqual(
+                    config["aux_hidden_state_layer_ids"], sequence_type([0, 1, 37])
+                )
+                self.assertNotIn("target_layer_ids", config)
+
+    def test_normalize_preserves_explicit_target_layer_ids(self):
+        for nested in (False, True):
+            for target_layer_ids in ([3, 7], [], None):
+                with self.subTest(nested=nested, target_layer_ids=target_layer_ids):
+                    config = {
+                        "speculators_model_type": "dspark",
+                        "transformer_layer_config": {"model_type": "qwen3"},
+                        "aux_hidden_state_layer_ids": [2, 10, 37],
+                    }
+                    backbone = config["transformer_layer_config"]
+                    if nested:
+                        backbone["target_layer_ids"] = target_layer_ids
+                    else:
+                        backbone["target_layer_ids"] = [99]
+                        config["target_layer_ids"] = target_layer_ids
+                    normalized = _normalize_speculators_draft_config_dict(config)
+                    self.assertEqual(normalized["target_layer_ids"], target_layer_ids)
+
+    def test_normalize_empty_or_missing_aux_layer_ids(self):
+        for aux_fields in (
+            {},
+            {"aux_hidden_state_layer_ids": None},
+            {"aux_hidden_state_layer_ids": []},
+            {"aux_hidden_state_layer_ids": ()},
+        ):
+            with self.subTest(aux_fields=aux_fields):
+                normalized = _normalize_speculators_draft_config_dict(
+                    {
+                        "speculators_model_type": "dspark",
+                        "transformer_layer_config": {"model_type": "qwen3"},
+                        **aux_fields,
+                    }
+                )
+                if isinstance(
+                    aux_fields.get("aux_hidden_state_layer_ids"), (list, tuple)
+                ):
+                    self.assertEqual(normalized["target_layer_ids"], [])
+                else:
+                    self.assertNotIn("target_layer_ids", normalized)
 
     def test_does_not_normalize_other_speculators_formats(self):
         self.assertIsNone(

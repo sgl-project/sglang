@@ -94,7 +94,12 @@ def _normalize_speculators_draft_config_dict(config_dict: dict) -> Optional[dict
     if "target_layer_ids" not in normalized and isinstance(
         normalized.get("aux_hidden_state_layer_ids"), (list, tuple)
     ):
-        normalized["target_layer_ids"] = normalized["aux_hidden_state_layer_ids"]
+        # Speculators indexes HF hidden_states, including the embedding output
+        # at index 0. SGLang target_layer_ids name the layer whose output is
+        # captured, so undo the +1 used by Speculators checkpoint converters.
+        normalized["target_layer_ids"] = [
+            layer_id - 1 for layer_id in normalized["aux_hidden_state_layer_ids"]
+        ]
     normalized.pop("auto_map", None)
     return normalized
 
