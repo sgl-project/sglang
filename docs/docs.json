@@ -1371,6 +1371,7 @@
                   {
                     "group": "LiquidAI",
                     "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM3",
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },
@@ -1690,6 +1691,12 @@
                     "group": "SANA-WM",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  },
+                  {
+                    "group": "HY-Nomas",
+                    "pages": [
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   }
                 ]
