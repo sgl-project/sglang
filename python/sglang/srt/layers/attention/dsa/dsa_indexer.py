@@ -1378,10 +1378,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
+            if q_offset == 0:
+                # Aiter's SplitKV scheduling divides by the query count.
+                # An empty rank needs only invalid top-k indices, no kernels.
+                return torch.full(
+                    (q_fp8.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=q_fp8.device,
+                )
+            # DP-attention can pad q/weights beyond the real metadata rows.
+            # Aiter has no q_offset argument, so trim its inputs explicitly;
+            # top-k padding is restored below for the downstream consumer.
             logits = aiter_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 max_seq_len,
@@ -1449,7 +1461,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
+        if q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
