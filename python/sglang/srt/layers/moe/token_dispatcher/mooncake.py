@@ -22,9 +22,32 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import get_resources
-from sglang.srt.utils import get_device, is_xpu
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
+
+# Calls between refills of the XPU all-ranks-active rows; arbitrary.
+_ACTIVE_RANKS_RING_ROWS = 128
+
+
+class _ActiveRanksRing:
+    """All-ranks-active tensors that outlive the receive hooks reading them."""
+
+    def __init__(
+        self, *, num_ranks: int, device: str, num_rows: int = _ACTIVE_RANKS_RING_ROWS
+    ):
+        self._ring = torch.ones((num_rows, num_ranks), dtype=torch.int32, device=device)
+        self._rows = self._ring.unbind(0)
+        self._next = 0
+
+    def take(self) -> torch.Tensor:
+        row = self._rows[self._next]
+        self._next = (self._next + 1) % len(self._rows)
+        if self._next == 0:
+            # The kernels zero a timed-out rank's entry; every row has had its call,
+            # and the in-order queue runs this refill after all their readers.
+            self._ring.fill_(1)
+        return row
 
 
 class MooncakeDispatchOutput(NamedTuple):
@@ -164,7 +187,11 @@ class _MooncakeEPDispatcherImpl:
 
         self.first_execution = True
         self.timeout_us = 10000000
-        self._all_ranks_active = None
+        # The XPU receive hook reads the all-ranks-active tensor after dispatch returns,
+        # and the kernels zero the entry of a rank that times out.
+        self._active_ranks_ring = (
+            _ActiveRanksRing(num_ranks=group.size(), device="xpu") if is_xpu() else None
+        )
         # The Intel XPU expert path is a BF16 GEMM (no FP8 masked GEMM).
         self.dispatch_use_fp8 = not is_xpu()
         # On XPU, given the top-k weights at dispatch, the combine sums each
@@ -304,11 +331,9 @@ class _MooncakeEPDispatcherImpl:
         elastic_state = ElasticEPStateManager.instance()
         if elastic_state is not None:
             return elastic_state.active_ranks
-        if self._all_ranks_active is None:
-            self._all_ranks_active = torch.ones(
-                self.group.size(), dtype=torch.int32, device=get_device()
-            )
-        return self._all_ranks_active
+        if self._active_ranks_ring is not None:
+            return self._active_ranks_ring.take()
+        return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
     def _get_buffer(self):
         return EPBuffer.get_ep_buffer(
