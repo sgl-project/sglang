@@ -207,6 +207,7 @@ class TestTrieGraphIsolation(CustomTestCase):
         runner.model_runner = SimpleNamespace(
             lora_manager=None,
             canary_manager=None,
+            capture_head_hooks=[],
             capture_tail_hooks=[],
             spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
         )
