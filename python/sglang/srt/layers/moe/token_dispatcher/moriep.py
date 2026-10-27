@@ -1642,20 +1642,18 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
 
 
 class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
+    """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches."""
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
         # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
-        # comm stream with the events async_finish records. SDMA needs none (see
-        # _uses_async_ll): the send half returns at once and the recv half waits.
-        if self._tbo_enabled and async_finish and not self._uses_async_ll:
+        # comm stream with the events async_finish records.
+        if self._tbo_enabled and async_finish:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
 
     @property
     def _uses_async_ll(self) -> bool:
-        # MORI EPv2 reaches SDMA only through its AsyncLL send/recv kernels, so
-        # init_mori_epv2_op builds an AsyncLL op under SDMA; normal runs the two
-        # halves back to back.
-        return self.enable_sdma
+        return False
 
     def _use_comm_stream(self) -> bool:
         # Only a TBO micro-batch has a sibling to overlap with; other forwards of
@@ -1671,7 +1669,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         self, hidden_states, topk_weights, topk_ids, scale, ready_event
     ):
         kwargs = {"return_routing": True}
-        if not self._uses_async_ll and _supports_dynamic_recv_cap(self.mori_op):
+        if _supports_dynamic_recv_cap(self.mori_op):
             # A manual cap is an exact MoE input limit, not a MORI graph tier.
             # Keep the full transport view so arbitrary caps need no new JIT
             # specialization during capture; AITER applies the logical slice.
@@ -1681,13 +1679,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 else self._recv_cap
             )
             kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
-        if self.enable_sdma:
-            # SDMA: send and receive back to back (see _uses_async_ll).
-            result = self.mori_op.dispatch_send(
-                hidden_states, topk_weights, scale, topk_ids, return_routing=True
-            )
-            self.mori_op.dispatch_recv()
-        elif not self._use_comm_stream():
+        if not self._use_comm_stream():
             result = self.mori_op.dispatch(
                 hidden_states, topk_weights, scale, topk_ids, **kwargs
             )
@@ -1707,13 +1699,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         return result
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
-        if self.enable_sdma:
-            # SDMA: send and receive back to back (see _uses_async_ll).
-            out, _ = self.mori_op.combine_send(
-                hidden_states, None, self._recv_topk_ids, routing=self._routing
-            )
-            self.mori_op.combine_recv()
-        elif not self._use_comm_stream():
+        if not self._use_comm_stream():
             out, _ = self.mori_op.combine(
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )
@@ -1739,12 +1725,14 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         return out
 
 
-class _MoriEPv2DispatcherImplLowLatency(_MoriEPv2DispatcherImplBase):
-    """MORI EPv2 on AsyncLL kernels with send in *_a and receive in *_b, so a TBO
-    sibling batch computes while the transfer drains."""
+class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
+    """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap`` each send runs
+    in *_a and its receive in *_b, so a TBO sibling batch computes while the
+    transfer drains; without it the receive follows the send at once."""
 
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
+        self._overlap = overlap
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
@@ -1761,6 +1749,8 @@ class _MoriEPv2DispatcherImplLowLatency(_MoriEPv2DispatcherImplBase):
         self._pending_dispatch = self.mori_op.dispatch_send(
             hidden_states, topk_weights, scale, topk_ids, return_routing=True
         )
+        if not self._overlap:
+            self.mori_op.dispatch_recv()
         return state
 
     def _dispatch_transport(
@@ -1769,7 +1759,8 @@ class _MoriEPv2DispatcherImplLowLatency(_MoriEPv2DispatcherImplBase):
         result = self._pending_dispatch
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
-        self.mori_op.dispatch_recv()
+        if self._overlap:
+            self.mori_op.dispatch_recv()
         return result
 
     def combine_a(
@@ -1783,13 +1774,16 @@ class _MoriEPv2DispatcherImplLowLatency(_MoriEPv2DispatcherImplBase):
         self._pending_combine, _ = self.mori_op.combine_send(
             hidden_states, None, self._recv_topk_ids, routing=self._routing
         )
+        if not self._overlap:
+            self.mori_op.combine_recv()
         return state
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
         out = self._pending_combine
         self._pending_combine = None
         assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
-        self.mori_op.combine_recv()
+        if self._overlap:
+            self.mori_op.combine_recv()
         return out
 
 
@@ -1853,8 +1847,13 @@ class MoriEPDispatcher(BaseDispatcher):
         if self._is_epv2:
             # deepep_mode is normal or low_latency here; auto became normal above.
             if self.deepep_mode.enable_low_latency():
-                self._low_latency_dispatcher = _MoriEPv2DispatcherImplLowLatency(
-                    async_finish=async_finish, **common_kwargs
+                self._low_latency_dispatcher = _MoriEPv2DispatcherImplAsyncLL(
+                    overlap=True, async_finish=async_finish, **common_kwargs
+                )
+            elif get_bool_env_var("MORI_ENABLE_SDMA", "false"):
+                # EPv2 reaches SDMA only through the AsyncLL kernels.
+                self._normal_dispatcher = _MoriEPv2DispatcherImplAsyncLL(
+                    overlap=False, async_finish=async_finish, **common_kwargs
                 )
             else:
                 self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
