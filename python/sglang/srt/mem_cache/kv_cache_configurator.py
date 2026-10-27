@@ -248,8 +248,7 @@ def _pp_local_per_request_bytes(
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
-    from sglang.srt.mem_cache.kv.memory.arena import KVArena
-    from sglang.srt.mem_cache.unified_memory_pool import UnifiedPoolBundle
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
         ModelLayerInfo,
     )
@@ -270,14 +269,12 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
-    arena: Optional[KVArena] = None
 
 
 class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: KVCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    arena: Optional[KVArena] = None
     # The recurrent state the KV pool's router routes, when the model has it.
     state: Optional[StateStorage] = None
 
@@ -526,7 +523,6 @@ class KVCacheConfigurator:
             token_to_kv_pool=pools.token_to_kv_pool,
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
             memory_pool_config=config,
-            arena=pools.arena,
         )
 
     # Note(kpham-sgl):
@@ -626,13 +622,13 @@ class KVCacheConfigurator:
                 current_platform,
                 subsystem="the unified memory pool (--enable-unified-memory)",
             )
-            bundle = self._init_unified_pools(sizes=sizes)
+            storage = self._init_unified_pools(sizes=sizes)
+            allocator = storage.allocator
             return _InitializedPools(
-                req_to_token_pool=bundle.req_to_token_pool,
-                token_to_kv_pool=bundle.token_to_kv_pool,
-                token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
-                arena=bundle.arena,
-                state=bundle.token_to_kv_pool_allocator.state,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool=allocator.get_kvcache(),
+                token_to_kv_pool_allocator=allocator,
+                state=allocator.state,
             )
 
         # The unified allocator hands out VIRTUAL token ids from the whole
@@ -679,7 +675,6 @@ class KVCacheConfigurator:
                         req_to_token_pool=binding.req_to_token_pool,
                         token_to_kv_pool=binding.token_to_kv_pool,
                         token_to_kv_pool_allocator=alloc,
-                        arena=None,
                         state=binding.state,
                     )
                 draft_virtual_id_space = alloc.draft_virtual_id_space
@@ -955,7 +950,7 @@ class KVCacheConfigurator:
             **state,
         )
 
-    def _init_unified_pools(self, *, sizes: _PoolSizes) -> UnifiedPoolBundle:
+    def _init_unified_pools(self, *, sizes: _PoolSizes) -> KVStorage:
         """Build the unified pool stack: one byte buffer shared by every sub-pool
         this runner's layers declare, with virtual ids above the allocator."""
         from sglang.srt.mem_cache.kv.build import (
@@ -963,7 +958,6 @@ class KVCacheConfigurator:
             build_unified_pools,
         )
         from sglang.srt.mem_cache.kv.sizing import KVSizingInputs
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedPoolBundle
 
         decls = self._kv_layer_decls()
         has_window, has_state = self._unified_window_and_state()
@@ -998,10 +992,11 @@ class KVCacheConfigurator:
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
             extra_max_context_len += get_spec().speculative_num_draft_tokens
-        bundle = build_unified_pools(
+        storage = build_unified_pools(
             decls=decls,
             page_size=self.page_size,
             fused_draft=fused_draft,
+            requests=req_to_token_pool,
             sizing=KVSizingInputs(
                 token_budget_bytes=token_budget_bytes,
                 full_tokens=full_tokens,
@@ -1049,14 +1044,7 @@ class KVCacheConfigurator:
                 mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             ),
         )
-        if req_to_token_pool is None:
-            return bundle
-        return UnifiedPoolBundle(
-            arena=bundle.arena,
-            token_to_kv_pool=bundle.token_to_kv_pool,
-            token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
-            req_to_token_pool=req_to_token_pool,
-        )
+        return storage
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""

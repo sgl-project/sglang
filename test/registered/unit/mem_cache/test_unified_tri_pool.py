@@ -1154,7 +1154,7 @@ class TestTriFactorySizing(unittest.TestCase):
                                 cfg, "_should_enable_lazy_compaction", return_value=True
                             ),
                         ):
-                            bundle = cfg.KVCacheConfigurator._init_unified_pools(
+                            storage = cfg.KVCacheConfigurator._init_unified_pools(
                                 configurator,
                                 sizes=SimpleNamespace(
                                     max_running_requests=4,
@@ -1165,9 +1165,9 @@ class TestTriFactorySizing(unittest.TestCase):
                                     unified_memory_pool_bytes=None,
                                 ),
                             )
-                            pool = bundle.req_to_token_pool
+                            pool = storage.requests
                         self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
-                        state = bundle.token_to_kv_pool_allocator.state
+                        state = storage.allocator.state
                         allocator = state.slots
                         initial_available = allocator.available_size()
                         req = SimpleNamespace(

@@ -24,7 +24,7 @@ rewriting).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, NamedTuple, Optional
+from typing import Callable, List, Optional
 
 import torch
 
@@ -45,7 +45,6 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
-
 
 
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
@@ -582,19 +581,6 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-
-class UnifiedPoolBundle(NamedTuple):
-    arena: KVArena
-    token_to_kv_pool: object  # RoutedKVCache
-    token_to_kv_pool_allocator: object  # ChainAllocator
-    # A plan with state has its own request table; None for the caller to build.
-    req_to_token_pool: object  # Optional[UnifiedHybridReqToTokenPool]
 
 
 def _wire_mamba_slot_allocator(

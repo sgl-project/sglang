@@ -1021,8 +1021,6 @@ class ModelRunner:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
-        # Keep a reference so the shared byte buffer is not GC'd.
-        self._kv_arena = result.arena
 
         self._init_post_memory_pool_components()
 

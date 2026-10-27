@@ -1,8 +1,8 @@
-"""Build the unified KV pool stack from declarations: plan, size, then construct.
+"""Build the unified KV storage from declarations: plan, size, then construct.
 
-`build_unified_pools` is the one entry point. Every plan gets one arena of
-bytes, a view per sub-pool, one `RoutedKVCache` over the token views and one
-`ChainAllocator` over all of them.
+`build_unified_pools` is the one entry point and returns a `KVStorage`. Every
+plan gets one arena of bytes, a view per sub-pool, one `RoutedKVCache` over the
+token views and one `ChainAllocator` over all of them.
 """
 
 import logging
@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
-    UnifiedPoolBundle,
     _wire_mamba_slot_allocator,
 )
 
@@ -167,10 +166,12 @@ def build_kv_storage(
     sized: SizedKVStorage,
     sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
-) -> UnifiedPoolBundle:
-    """One byte buffer for the plan's sub-pools, a view per token sub-pool,
-    the routed KV cache over them, and the chain allocator handing out their
-    ids. A plan with state also gets its request table and state storage."""
+    requests=None,
+) -> KVStorage:
+    """The plan's KV storage: one arena for its sub-pools, a view per token
+    sub-pool, the routed KV cache over them, and the chain allocator handing
+    out their ids. A plan with state also gets its request table and state
+    storage; a plan without one takes the table its caller built."""
     assert not ctx.is_draft_worker, (
         "a draft worker binds views over the target's buffer instead of "
         "building one of its own"
@@ -233,7 +234,7 @@ def build_kv_storage(
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
         bs1_floor_terms=sized.bs1_floor_terms,
     )
-    req_to_token_pool = None
+    req_to_token_pool = requests
     state_storage = None
     if state is not None:
         req_to_token_pool = _build_state_request_table(plan, ctx)
@@ -282,6 +283,7 @@ def build_kv_storage(
         router=token_to_kv_pool.layer_router,
         allocator=allocator,
         start_layer=ctx.start_layer,
+        requests=req_to_token_pool,
     )
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- sub-pools %s"
@@ -307,12 +309,7 @@ def build_kv_storage(
             )
         ),
     )
-    return UnifiedPoolBundle(
-        arena=arena,
-        token_to_kv_pool=token_to_kv_pool,
-        token_to_kv_pool_allocator=allocator,
-        req_to_token_pool=req_to_token_pool,
-    )
+    return allocator.storage
 
 
 def build_unified_pools(
@@ -322,8 +319,10 @@ def build_unified_pools(
     sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
     fused_draft: Optional[FusedDraftPlacement] = None,
-):
-    """Declarations -> plan -> sizing -> the unified pool stack."""
+    requests=None,
+) -> KVStorage:
+    """Declarations -> plan -> sizing -> the unified KV storage. ``requests`` is
+    the request table a caller built for a plan without state."""
     plan = plan_kv_storage(decls, page_size=page_size, fused_draft=fused_draft)
     sized = size_kv_storage(plan, sizing)
-    return build_kv_storage(plan, sized, sizing, ctx)
+    return build_kv_storage(plan, sized, sizing, ctx, requests=requests)

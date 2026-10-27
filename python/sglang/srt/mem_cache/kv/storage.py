@@ -58,10 +58,13 @@ class KVStorage:
         router: KVLayerRouter,
         allocator,
         start_layer: int,
+        requests=None,
     ):
         self._plan = plan
         self._allocator = allocator
         self.start_layer = start_layer
+        # The request table: rows and the ids they hold.
+        self.requests = requests
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -85,6 +88,12 @@ class KVStorage:
                 )
             )
         self._sub_pools = tuple(sub_pools)
+
+    @property
+    def allocator(self):
+        """The chain allocator the scheduler drives directly until it takes the
+        request lifecycle through this storage."""
+        return self._allocator
 
     @property
     def plan(self) -> KVStoragePlan:

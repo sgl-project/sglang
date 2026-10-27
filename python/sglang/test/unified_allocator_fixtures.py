@@ -238,6 +238,18 @@ def arena_of(
     )
 
 
+def storage_parts(storage) -> SimpleNamespace:
+    """A built KV storage's parts, under the names the runtime holds them by."""
+    allocator = storage.allocator
+    return SimpleNamespace(
+        storage=storage,
+        token_to_kv_pool_allocator=allocator,
+        token_to_kv_pool=allocator.get_kvcache(),
+        arena=allocator.arena,
+        req_to_token_pool=storage.requests,
+    )
+
+
 def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
@@ -536,12 +548,14 @@ def build_test_unified_pools(
         decode_pre_alloc_size=decode_pre_alloc_size,
         mamba_full_memory_ratio=mamba_full_memory_ratio,
     )
-    return build_unified_pools(
-        decls=decls,
-        page_size=page_size,
-        sizing=sizing,
-        ctx=ctx,
-        fused_draft=fused_draft,
+    return storage_parts(
+        build_unified_pools(
+            decls=decls,
+            page_size=page_size,
+            sizing=sizing,
+            ctx=ctx,
+            fused_draft=fused_draft,
+        )
     )
 
 
@@ -605,12 +619,14 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         state_cache_params=cache_params,
         disable_overlap_schedule=True,
     )
-    return build_unified_pools(
-        decls=decls,
-        page_size=g.page_size,
-        sizing=sizing,
-        ctx=ctx,
-        fused_draft=g.fused_draft,
+    return storage_parts(
+        build_unified_pools(
+            decls=decls,
+            page_size=g.page_size,
+            sizing=sizing,
+            ctx=ctx,
+            fused_draft=g.fused_draft,
+        )
     )
 
 
