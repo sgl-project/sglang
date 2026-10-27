@@ -250,7 +250,7 @@ class Gfx950NormQuant:
             and get_moe_a2a_backend().is_none()
         ):
             return {}
-        from sglang.srt.layers.layer_boundary.fusions.all_reduce_norm_quant import (
+        from sglang.srt.models.minimax_common.amd.minimax_m3_all_reduce_norm_quant import (
             AllReduceNormQuantFusion,
         )
 
