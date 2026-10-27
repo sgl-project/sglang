@@ -152,6 +152,10 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
     )
+    if _cfg_get(draft_hf_config, "architectures", []) == ["DSparkMiniMaxDraftModel"]:
+        from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
+
+        draft_hf_config = configure_minimax_m3_dspark(draft_hf_config)
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
 
 

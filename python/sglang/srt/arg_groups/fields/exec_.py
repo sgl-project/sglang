@@ -123,6 +123,38 @@ class ExecFeatures(msgspec.Struct):
             choices=["last", "full"],
         ),
     ] = None
+    # Changes what --speculative-algorithm means: with this flag it only names
+    # the capture convention (EAGLE3, DFLASH or DSPARK) and
+    # handle_aux_hidden_state_capture resets it to None, so no draft is loaded,
+    # nothing is reserved for one, and the speculative stack stays off.
+    enable_return_aux_hidden_states: A[
+        bool,
+        "Capture auxiliary hidden states on the target model without running a "
+        "speculative draft. --speculative-algorithm then only names the capture "
+        "convention (EAGLE3, DFLASH or DSPARK) and is reset to None. Requests "
+        "with return_hidden_states receive the concatenated aux hidden states in "
+        "place of the last-layer hidden states. Sets --return-hidden-states-mode "
+        "to full when unset. Requires pp_size == 1.",
+    ] = False
+    # The capture convention behind --enable-return-aux-hidden-states, taken from
+    # --speculative-algorithm. It stays an enum because the models' capture hooks
+    # still differ by draft family (layer-id conventions, mHC contraction).
+    # TODO: unify the per-family capture hooks, then collapse this to the bool.
+    aux_hidden_state_capture: A[
+        Optional[str],
+        Arg(
+            help="Resolved from --enable-return-aux-hidden-states and "
+            "--speculative-algorithm.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = None
+    return_aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target-model layer ids for the selected capture convention. These may "
+        "differ from draft-checkpoint layer ids. Required for DFLASH and DSPARK; "
+        "EAGLE3 defaults to the model's EAGLE3 layers.",
+    ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
@@ -330,7 +362,9 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
