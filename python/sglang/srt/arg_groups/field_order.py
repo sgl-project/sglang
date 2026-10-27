@@ -325,6 +325,7 @@ POSITIONAL_FIELD_ORDER = (
     "expert_distribution_recorder_buffer_size",
     "expert_balancedness_report_mode",
     "deepep_config",
+    "moe_ascend_ops_config",
     "moe_dense_tp_size",
     "elastic_ep_backend",
     "enable_elastic_expert_backup",

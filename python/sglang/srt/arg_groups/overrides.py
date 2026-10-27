@@ -1611,8 +1611,7 @@ def _a2a_backend_overrides(view: Any) -> dict:
 
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
-    backend = view.moe_a2a_backend
-    if backend in _A2A_EP_SPANNING_BACKENDS:
+    if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
         if view.ep_size != view.tp_size:
             logger.info(
                 f"{backend} MoE is enabled. The expert parallel size "
