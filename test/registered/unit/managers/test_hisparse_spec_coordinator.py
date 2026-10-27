@@ -122,6 +122,23 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         self.assertNotIn(1, spec_swap._scratch_reqs)
         self.assertEqual(spec_swap.req_to_scratch[:, 1].count_nonzero(), 0)
 
+    def test_prefill_scratch_marks_the_rows_the_retirer_releases(self):
+        """A request can finish or abort during prefill, before staging; the
+        retirer frees its rows only while holds_rows says so."""
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                coordinator = object.__new__(HiSparseCoordinator)
+                coordinator.spec_swap = SimpleNamespace(
+                    enabled=enabled, allocate_scratch=MagicMock()
+                )
+                coordinator._holds_rows = [False] * 4
+                req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=2))
+
+                coordinator.allocate_spec_scratch([2])
+
+                coordinator.spec_swap.allocate_scratch.assert_called_once_with(2)
+                self.assertEqual(coordinator.holds_rows(req), enabled)
+
     def test_spec_workspace_is_reserved_before_request_becomes_runnable(self):
         coordinator = object.__new__(HiSparseCoordinator)
         coordinator.is_dsv4_hisparse = False

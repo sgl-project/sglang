@@ -812,6 +812,10 @@ class HiSparseCoordinator:
     def allocate_spec_scratch(self, req_pool_indices: List[int]) -> None:
         for req_pool_idx in req_pool_indices:
             self.spec_swap.allocate_scratch(req_pool_idx)
+            if self.spec_swap.enabled:
+                # A request that finishes or aborts during prefill releases
+                # its scratch through request_finished.
+                self._holds_rows[req_pool_idx] = True
 
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
@@ -934,8 +938,8 @@ class HiSparseCoordinator:
         )
 
     def holds_rows(self, req: Req) -> bool:
-        """Whether this coordinator holds host rows or a device buffer for
-        req, so its release must free them."""
+        """Whether this coordinator holds host rows, a device buffer, or
+        speculative scratch for req, so its release must free them."""
         return self._holds_rows[req.kv.req_pool_idx]
 
     def host_token_len(self, kv_allocated_len: int) -> int:
