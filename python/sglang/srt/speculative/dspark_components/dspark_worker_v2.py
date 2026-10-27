@@ -100,7 +100,6 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
-    is_hip,
     is_npu,
 )
 from sglang.srt.utils.common import async_h2d
@@ -110,11 +109,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_hip = is_hip()
 _is_npu = is_npu()
-
-if _is_hip:
-    from sglang.srt.speculative.dspark_components import dspark_hip as _hip
 
 
 @runtime_checkable
@@ -517,8 +512,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
-        if _is_hip:
-            _hip.defer_verify_logits_gather(self)
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -1188,17 +1181,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
-                    needs_logits=not _is_hip
-                    or _hip.verify_needs_logits(
-                        self, batch, sampling_info, simulate_bonus_sampling_info
-                    ),
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        target_argmax = (
-            _hip.take_target_argmax(logits_output, verify_ids_2d) if _is_hip else None
-        )
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -1252,7 +1238,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-                target_argmax=target_argmax,
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
