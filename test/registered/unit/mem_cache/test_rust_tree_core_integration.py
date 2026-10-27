@@ -84,7 +84,7 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.tree_slots import FAMILY_OF, slot_of, tree_slots_of
+from sglang.test.tree_slots import FAMILY_OF, index_slots, slot_of, tree_slots_of
 
 
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
@@ -4197,9 +4197,14 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
     )
     # A five-token window stages two four-token pages. Bigrams add one raw
     # boundary token but preserve the logical repair span [8, 16).
-    ranges = core.swa_tombstone_ranges(key, 8, 16)
+    ranges = core.swa_tombstone_ranges(key, 8, 16, component_type=ComponentType.SWA)
     assert ranges == [(8, 16)]
-    assert core.attach_swa_window(key, 8, 16, torch.arange(50, 58)) == []
+    assert (
+        core.attach_swa_window(
+            key, 8, 16, torch.arange(50, 58), component_type=ComponentType.SWA
+        )
+        == []
+    )
     matched_len, leaf, _ = core.match_full_device_prefix(key)
     assert matched_len == 16
     assert torch.equal(
@@ -4208,7 +4213,9 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
     assert core.get_component_device_value(leaf, ComponentType.SWA).tolist() == list(
         range(50, 58)
     )
-    assert core.swa_tombstone_ranges(key, 0, 16) == [(0, 8)]
+    assert core.swa_tombstone_ranges(key, 0, 16, component_type=ComponentType.SWA) == [
+        (0, 8)
+    ]
     assert core.full_evictable_size() == 16
     assert core.swa_evictable_size() == 8
     core.sanity_check([], [])
@@ -4232,9 +4239,14 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
             component_evicted_seqlens={ComponentType.SWA: 8},
         ),
     )
-    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 8)]
+    assert core.swa_tombstone_ranges(key, 0, 8, component_type=ComponentType.SWA) == [
+        (0, 8)
+    ]
     values = torch.arange(50, 54, dtype=torch.int64)
-    assert core.attach_swa_window(key, 2, 6, values) == []
+    assert (
+        core.attach_swa_window(key, 2, 6, values, component_type=ComponentType.SWA)
+        == []
+    )
     values.fill_(-1)
 
     # Slicing and namespace conversion must retain logical bigram positions.
@@ -4250,8 +4262,14 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
         else:
             assert swa is None
     assert full_values == list(range(10, 18))
-    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
-    assert core.swa_tombstone_ranges(key, 1, 7) == [(1, 2), (6, 7)]
+    assert core.swa_tombstone_ranges(key, 0, 8, component_type=ComponentType.SWA) == [
+        (0, 2),
+        (6, 8),
+    ]
+    assert core.swa_tombstone_ranges(key, 1, 7, component_type=ComponentType.SWA) == [
+        (1, 2),
+        (6, 7),
+    ]
     for extra_key, cache_salt in (("adapter-b", "tenant-a"), ("adapter-a", "tenant-b")):
         other_key = RadixKey(
             key.token_ids,
@@ -4259,7 +4277,10 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
             cache_salt=cache_salt,
             is_bigram=is_bigram,
         )
-        assert core.swa_tombstone_ranges(other_key, 0, 8) == []
+        assert (
+            core.swa_tombstone_ranges(other_key, 0, 8, component_type=ComponentType.SWA)
+            == []
+        )
     assert core.full_evictable_size() == 8
     assert core.swa_evictable_size() == 4
     core.sanity_check([], [])
@@ -4280,7 +4301,9 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
     _, leaf, _ = core.match_full_device_prefix(key)
     receipt = core.inc_lock_ref(leaf)
     core.mark_write_through_pending([leaf], ack_id=leaf)
-    actions = core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    actions = core.attach_swa_window(
+        key, 2, 6, torch.arange(50, 54), component_type=ComponentType.SWA
+    )
     assert len(actions) == 2
     for action in actions:
         assert isinstance(action, UpdatePendingBackupOnNodeSplit)
@@ -4308,12 +4331,25 @@ def test_swa_window_repair_rejects_invalid_publication_without_partial_changes()
             component_evicted_seqlens={ComponentType.SWA: 8},
         ),
     )
-    core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    core.attach_swa_window(
+        key, 2, 6, torch.arange(50, 54), component_type=ComponentType.SWA
+    )
     with pytest.raises(AssertionError, match="over live SWA"):
-        core.attach_swa_window(key, 0, 6, torch.arange(60, 66))
+        core.attach_swa_window(
+            key, 0, 6, torch.arange(60, 66), component_type=ComponentType.SWA
+        )
     with pytest.raises(AssertionError, match="int64"):
-        core.attach_swa_window(key, 0, 2, torch.zeros(2, dtype=torch.int32))
-    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
+        core.attach_swa_window(
+            key,
+            0,
+            2,
+            torch.zeros(2, dtype=torch.int32),
+            component_type=ComponentType.SWA,
+        )
+    assert core.swa_tombstone_ranges(key, 0, 8, component_type=ComponentType.SWA) == [
+        (0, 2),
+        (6, 8),
+    ]
     assert core.swa_evictable_size() == 4
     core.sanity_check([], [])
 
@@ -4588,6 +4624,7 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
                 cache, params, slot_of(params, ComponentType.MAMBA)
             ),
         }
+        index_slots(cache, cache.components)
         core = (
             RustUnifiedTreeCore(params)
             if backend == "rust"

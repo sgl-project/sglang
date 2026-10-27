@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import index_slots
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
@@ -392,6 +393,7 @@ class TestUnifiedTriPool(unittest.TestCase):
                     ComponentType.SWA,
                     ComponentType.MAMBA,
                 )
+                index_slots(cache, cache.tree_components)
                 cache.is_swa_enabled = True
                 cache.cache_controller = None
                 cache.metrics_collector = None

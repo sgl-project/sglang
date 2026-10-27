@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     chain_snapshot,
@@ -3275,6 +3276,7 @@ class TestDcpWidening(unittest.TestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None

@@ -44,7 +44,10 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
     UpdatePendingBackupOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
@@ -383,6 +386,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         assert params.tree_slots is not None
         self.tree_components = params.tree_components
         families = {slot.family for slot in params.tree_slots}
+        # Each family's slot id: the adapter names a slot by its family, never
+        # by a kind.
+        self._family_slot_ids: dict[str, ComponentType] = {}
+        for slot in params.tree_slots:
+            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -524,6 +532,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # backend-neutral APIs: sessions (#29173), C128 (#33676).
         raise NotImplementedError("node_by_id: not yet ported to the Rust tree core")
 
+    def slot_id(self, family: str) -> Optional[ComponentType]:
+        """The id of the tree's slot of ``family``; None when it has none."""
+        return self._family_slot_ids.get(family)
+
     @property
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
@@ -533,10 +545,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
-        if component_type != ComponentType.SWA:
-            raise NotImplementedError("The Rust tree core supports one SWA window")
+        if component_type != self.slot_id(TREE_WINDOW):
+            raise NotImplementedError("The Rust tree core supports one window slot")
         return self._binding.swa_tombstone_ranges(
             self._bindings.MatchParamsBinding(
                 key=_radix_key_buffer(key),
@@ -553,10 +565,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
-        if component_type != ComponentType.SWA:
-            raise NotImplementedError("The Rust tree core supports one SWA window")
+        if component_type != self.slot_id(TREE_WINDOW):
+            raise NotImplementedError("The Rust tree core supports one window slot")
         return self._cache_actions_from_tagged(
             self._binding.attach_swa_window(
                 self._bindings.MatchParamsBinding(
@@ -721,17 +733,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def full_protected_size(self) -> int:
         return self._binding.full_protected_size()
 
+    def _slot_size(self, size_of: Callable[[int], int], family: str) -> int:
+        """``size_of`` the tree's slot of ``family``; 0 when it has none."""
+        slot_id = self.slot_id(family)
+        return 0 if slot_id is None else size_of(int(slot_id))
+
     def swa_evictable_size(self) -> int:
-        return self._binding.component_evictable_size(int(ComponentType.SWA))
+        return self._slot_size(self._binding.component_evictable_size, TREE_WINDOW)
 
     def mamba_evictable_size(self) -> int:
-        return self._binding.component_evictable_size(int(ComponentType.MAMBA))
+        return self._slot_size(self._binding.component_evictable_size, TREE_STATE)
 
     def swa_protected_size(self) -> int:
-        return self._binding.component_protected_size(int(ComponentType.SWA))
+        return self._slot_size(self._binding.component_protected_size, TREE_WINDOW)
 
     def mamba_protected_size(self) -> int:
-        return self._binding.component_protected_size(int(ComponentType.MAMBA))
+        return self._slot_size(self._binding.component_protected_size, TREE_STATE)
 
     def total_size(self) -> tuple[int, int]:
         return self._binding.total_size()
@@ -813,7 +830,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
-                swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
+                swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,
                 inserted_len=params.inserted_len,
                 priority=0 if params.priority is None else params.priority,
@@ -962,7 +979,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        self._refresh_swa_backup_indices(comp_xfers.get(ComponentType.SWA, ()))
+        self._refresh_swa_backup_indices(comp_xfers.get(self.slot_id(TREE_WINDOW), ()))
         return device_value, comp_xfers
 
     def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
@@ -976,7 +993,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # Compaction can relocate SWA rows after the tree records them.
             # FULL virtual IDs retain their meaning across that relocation.
             full_values = [
-                self.get_component_device_value(node_id, ComponentType.FULL)
+                self.get_component_device_value(node_id, BASE_COMPONENT_TYPE)
                 for node_id in transfer.nodes_to_load
             ]
             transfer.device_indices = self._swa_backup_index_mapper(

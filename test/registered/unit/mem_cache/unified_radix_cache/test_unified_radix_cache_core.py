@@ -99,7 +99,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
+from sglang.test.tree_slots import FAMILY_OF, index_slots, tree_slots_of
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
@@ -1884,6 +1884,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_retraction_uses_engine_transfer_index_domains(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.is_swa_enabled = True
+        index_slots(cache, (ComponentType.FULL, ComponentType.SWA))
         cache._sliding_window_size = 3
         cache.tree_core = mock.Mock(page_size=2)
         cache.page_size = 2
@@ -2009,6 +2010,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             ComponentType.FULL: order.full,
             ComponentType.MAMBA: order.mamba,
         }
+        index_slots(cache, cache.components)
 
         def complete_match(params, result):
             return UnifiedRadixCache._finalize_match_result(cache, params, finalized)

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -242,10 +243,18 @@ class TestDecSwaLockSkip(unittest.TestCase):
         swa = _RecordingComp(ComponentType.SWA, 1)
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
+        slot_ids = {
+            TREE_TOKEN: ComponentType.FULL,
+            TREE_WINDOW: ComponentType.SWA,
+            TREE_STATE: ComponentType.MAMBA,
+        }
+        components_by_type = {ComponentType.SWA: swa}
         tree_core = SimpleNamespace(
             root_node=object(),
             components=(full, swa, mamba),
-            components_by_type={ComponentType.SWA: swa},
+            components_by_type=components_by_type,
+            slot_id=slot_ids.get,
+            component_of=lambda family: components_by_type.get(slot_ids.get(family)),
             node_by_id=lambda node_id: node,
             _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )

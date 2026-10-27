@@ -63,3 +63,18 @@ def slot_of(params, component: ComponentType) -> TreeSlot:
     component directly."""
     name = ComponentType(component).name
     return next(slot for slot in params.tree_slots if slot.component == name)
+
+
+def index_slots(cache, components: Iterable[ComponentType]) -> None:
+    """Give a hand-built cache (``object.__new__(UnifiedRadixCache)``) the
+    family-to-slot table its ``__init__`` builds from its slots, for a tree
+    whose components are ``components``. The table names slots only, so the
+    slots carry no numbers."""
+    cache._index_slots(
+        tuple(
+            TreeSlot(
+                component=ComponentType(c).name, family=FAMILY_OF[ComponentType(c)]
+            )
+            for c in components
+        )
+    )
