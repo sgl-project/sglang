@@ -18,6 +18,9 @@ The base ``preloaded_weights_bytes`` property reads the Torch model loader.
 The MLX stub never creates one because its native runner owns model loading
 and KV sizing, so it must report zero for the Torch accounting hook.
 
+The base weight updater walks the Torch model, which the stub replaces with
+``_DummyModel``, so online weight updates must fail with a message instead.
+
 The checks are MLX-gated because importing the stub pulls in ``mlx.core``.
 """
 
@@ -28,7 +31,7 @@ import inspect
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,6 +111,32 @@ class TestMlxRunnerPoolContract(CustomTestCase):
             pass
 
         self.assertEqual(runner.model.shared_experts_config.num_fused_shared_experts, 0)
+
+    def test_online_weight_update_fails_cleanly(self):
+        """A weight update must return an error, not raise in the scheduler."""
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.device = "mps"
+        runner.gpu_id = 0
+        runner.model_config = SimpleNamespace(
+            model_path="model",
+            is_hybrid_swa=False,
+            sliding_window_size=None,
+            attention_chunk_size=None,
+            dtype=None,
+        )
+        runner.load_model()
+
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(tp_rank=0),
+        ):
+            runner.init_weight_updater()
+            success, message = runner.weight_updater.update_weights_from_disk(
+                model_path="new-model", load_format="auto"
+            )
+
+        self.assertFalse(success)
+        self.assertIn("MLX", message)
 
     def test_stub_overrides_base_alloc_memory_pool(self):
         self.assertIn(
