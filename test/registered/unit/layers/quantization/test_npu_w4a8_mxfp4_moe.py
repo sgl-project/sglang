@@ -156,8 +156,12 @@ class TestNPUW4A8MXFP4MoE(CustomTestCase):
                         "_quantize_weight_online",
                         return_value=(packed.clone(), scales.reshape(2, 96, 2, 2)),
                     ) as quantize,
+                    patch.object(moe_methods.logger, "debug") as debug_log,
+                    patch.object(moe_methods.logger, "info") as info_log,
                 ):
                     method.process_weights_after_loading(layer, "w13")
+                info_log.assert_not_called()
+                self.assertEqual(debug_log.call_count, int(online))
                 self.assertEqual(quantize.call_count, int(online))
                 self.assertTrue(torch.equal(layer.w13_weight, packed.transpose(1, 2)))
                 self.assertTrue(

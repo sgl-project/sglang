@@ -359,7 +359,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
         if online:
-            logger.info(
+            logger.debug(
                 "Prepared online W4A8 MXFP MoE %s: packed weight=%s %s, scale=%s %s.",
                 weight_prefix,
                 tuple(weight.shape),
