@@ -85,6 +85,7 @@ else:
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_FUSE_DG_ACT_QUANT = get_bool_env_var("SGLANG_DEEPGEMM_FUSE_ACTIVATION_QUANT", "false")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
@@ -468,7 +469,49 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        fused_bf16_quant = (
+            _FUSE_DG_ACT_QUANT
+            and _is_cuda
+            and self.config.activation == "silu"
+            and self.swiglu_limit is not None
+            and not self.config.silu_mul_keep_fp32
+            and not self.use_swizzle
+            and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+            and not quant_info.use_mxfp8
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and scale_block_size == 128
+            and 0 < N // 2 <= 8192
+            and (N // 2) % 256 == 0
+        )
+        if fused_bf16_quant:
+            half_n = N // 2
+            # A row uses half_n / 8 threads. Keep every CTA within 1024
+            # threads even when another model has wider intermediate states.
+            rows_per_cta = 4 if half_n <= 2048 else 2 if half_n <= 4096 else 1
+            down_input_fp8 = torch.empty(
+                (all_tokens, half_n),
+                device=gateup_output.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                (all_tokens, half_n),
+                gateup_output.device,
+                scale_block_size,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=False,
+            )
+            silu_and_mul_contig_post_quant(
+                gateup_output,
+                down_input_fp8,
+                down_input_scale,
+                scale_block_size,
+                swiglu_limit=self.swiglu_limit,
+                round_to_bf16=True,
+                rows_per_cta=rows_per_cta,
+            )
+            del gateup_output
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -619,7 +662,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not fused_bf16_quant:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         # The down activation is quantized here, independently of dispatch.
