@@ -508,6 +508,43 @@ def test_cutedsl_scale_residual_gate_index_modes(norm_type, index_mode):
     _run_cute(True, norm_type=norm_type, gate_mode=index_mode)
 
 
+@pytest.mark.parametrize("norm_type", NORM_TYPES)
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_cutedsl_norm_chunks_per_warp_keep_bits(monkeypatch, norm_type, with_residual):
+    """A warp walking several 256-column chunks keeps the bits of one chunk per warp."""
+    fused_norm_scale_shift, fused_scale_residual_norm_scale_shift = _import_cutedsl()
+    from sglang.kernels.ops.diffusion.norm import scale_residual_norm_cutedsl
+
+    B, S, D = 2, 300, 5120  # 20 chunks per row
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    x, residual = (
+        torch.randn(B, S, D, generator=g, device=DEVICE).mul(4).bfloat16()
+        for _ in range(2)
+    )
+    gate = torch.randn(B, 1, D, generator=g, device=DEVICE)
+    weight, bias = (torch.randn(D, generator=g, device=DEVICE) for _ in range(2))
+    scale, shift = (torch.randn(B, 1, D, generator=g, device=DEVICE) for _ in range(2))
+
+    def run():
+        if with_residual:
+            return fused_scale_residual_norm_scale_shift(
+                residual, x, gate, weight, bias, scale, shift, norm_type, EPS
+            )
+        return (fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, EPS),)
+
+    outs = {}
+    for chunks_per_warp in (1, 2, 4, 5):
+        monkeypatch.setattr(
+            scale_residual_norm_cutedsl,
+            "_chunks_per_warp",
+            lambda D, gated_affine, c=chunks_per_warp: c,
+        )
+        outs[chunks_per_warp] = run()
+    for chunks_per_warp in (2, 4, 5):
+        for out, ref in zip(outs[chunks_per_warp], outs[1]):
+            assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
 def test_validate_scale_shift_rejects_non_divisible_frames():
     _import_cutedsl()
     from sglang.kernels.ops.diffusion import validate_scale_shift
