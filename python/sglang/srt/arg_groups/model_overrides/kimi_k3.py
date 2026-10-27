@@ -170,18 +170,19 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 
 def _reject_flashinfer_mxfp4_cutlass_situ(hf_config: Any) -> None:
-    # The SM90 and SM120 FlashInfer MXFP4 runners are CUTLASS kernels that
-    # compute GPT-OSS SwiGLU; only the SM100-family trtllm-gen runner has SiTU.
-    if not (get_platform().is_sm90 or get_platform().is_sm120):
+    # Only the SM100-family trtllm-gen runner has SiTU; the CUTLASS runners
+    # compute GPT-OSS SwiGLU. Same split as Mxfp4MoEMethod's kernel choice.
+    if not get_platform().is_cuda or get_platform().is_sm100:
         return
     if not _is_mxfp4_pack_quantized(hf_config):
         return
     if hf_config.text_config.hidden_act != "situ":
         return
     raise RuntimeError(
-        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on SM90/SM120 would "
-        "run the routed experts with GPT-OSS SwiGLU instead of SiTU. Use "
-        "--moe-runner-backend marlin on this GPU."
+        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on "
+        f"SM{get_platform().device_sm} would run the routed experts with GPT-OSS "
+        "SwiGLU instead of SiTU; only SM100-family GPUs have the SiTU kernels. "
+        "Use --moe-runner-backend marlin on this GPU."
     )
 
 

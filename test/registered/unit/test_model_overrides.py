@@ -1255,7 +1255,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         )
 
     def test_kimi_k3_flashinfer_mxfp4_rejects_situ_without_trtllm_gen(self):
-        """An explicit flashinfer_mxfp4 on SM90/SM120 ran K3's SiTU experts as SwiGLU."""
+        """An explicit flashinfer_mxfp4 outside the SM100 family ran K3's SiTU experts as SwiGLU."""
         from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
             _kimi_k3_moe_runner_overrides,
         )
@@ -1274,14 +1274,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     SimpleNamespace(moe_runner_backend=runner), hf_config
                 )
 
-        hopper = dict(is_sm90=True, is_sm100=False, is_sm120=False, device_sm=90)
-        sm120 = dict(is_sm90=False, is_sm100=False, is_sm120=True, device_sm=120)
-        b200 = dict(is_sm90=False, is_sm100=True, is_sm120=False, device_sm=100)
-        for platform in (hopper, sm120):
+        def _gpu(sm):
+            return dict(
+                is_cuda=True,
+                is_sm90=sm == 90,
+                is_sm100=sm // 10 == 10,
+                is_sm120=sm // 10 == 12,
+                device_sm=sm,
+            )
+
+        hopper = _gpu(90)
+        # SM110 stands in for an arch without a dedicated check.
+        for platform in (hopper, _gpu(120), _gpu(110)):
             with self.subTest(**platform):
                 with self.assertRaisesRegex(RuntimeError, "marlin"):
                     _run("flashinfer_mxfp4", _k3_hf("situ"), **platform)
-        self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("situ"), **b200), {})
+        for platform in (_gpu(100), _gpu(103)):
+            with self.subTest(**platform):
+                self.assertEqual(
+                    _run("flashinfer_mxfp4", _k3_hf("situ"), **platform), {}
+                )
         self.assertEqual(_run("marlin", _k3_hf("situ"), **hopper), {})
         self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("silu"), **hopper), {})
 
