@@ -35,13 +35,13 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
-from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
     DraftStateRegion,
     FusedDraftPlacement,
 )
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
@@ -1238,7 +1238,7 @@ class TestTriFactorySizing(unittest.TestCase):
                 mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
                 allocator = state.slots
                 reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
-                rows = acquire(pool, state, reqs)
+                rows = acquire_rows(pool, state, reqs)
 
                 def buffers():
                     return [
