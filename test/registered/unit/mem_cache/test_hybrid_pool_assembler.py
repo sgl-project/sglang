@@ -502,6 +502,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 controller = SimpleNamespace(
                     mem_pool_host=SimpleNamespace(logical_size=pool.size),
                     page_size=64,
+                    transfer_layer_id_max=3,
                 )
                 with (
                     patch.object(
