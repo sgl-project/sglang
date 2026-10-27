@@ -30,6 +30,24 @@ class TestSchedulerFlushCache(unittest.TestCase):
             ),
         )
 
+    def _new_flushable_scheduler(self) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._engine_paused = False
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+        scheduler.cur_batch_for_debug = object()
+        scheduler.last_batch = object()
+        scheduler.tree_cache = MagicMock()
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.grammar_manager = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.metrics_reporter.is_stats_logging_rank = False
+        scheduler.draft_worker = None
+        scheduler.waiting_queue = []
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.reqs = []
+        return scheduler
+
     def test_immediate_flush_no_timeout(self):
         """No timeout → flush immediately regardless of idle state."""
         scheduler = self._new_scheduler()
@@ -133,6 +151,28 @@ class TestSchedulerFlushCache(unittest.TestCase):
         Scheduler.send_control_output(rust, output, req)
         rust.rust_server.push_control_output.assert_called_once_with(req, output)
         rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+    def test_successful_flush_clears_mm_embedding_cache_before_allocator(self):
+        scheduler = self._new_flushable_scheduler()
+        embedding_cache = MagicMock()
+        call_order = []
+        embedding_cache.clear.side_effect = lambda: call_order.append("mm_cache")
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.mm_schedule.embedding_cache",
+                embedding_cache,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.current_platform.empty_cache",
+                side_effect=lambda: call_order.append("allocator"),
+            ),
+        ):
+            success = scheduler.flush_cache()
+
+        self.assertTrue(success)
+        self.assertEqual(call_order, ["mm_cache", "allocator"])
+        embedding_cache.clear.assert_called_once_with()
 
 
 if __name__ == "__main__":
