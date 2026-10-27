@@ -25,6 +25,9 @@ from sglang.srt.hardware_backend.npu.eplb import (
     get_eplb_device_group,
     warmup_eplb_communication,
 )
+from sglang.srt.hardware_backend.npu.eplb_statistics_kernel import (
+    accumulate_route_counts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +41,35 @@ class NpuEplbCommunication:
         return get_eplb_device_group()
 
 
+class NpuExpertDistributionAccumulator(distribution._StatAccumulator):
+    """Reduce window totals for EPLB policies that only consume summed loads."""
+
+    def _get_physical_count_for_dump(self, output_mode):
+        counts = super()._get_physical_count_for_dump(output_mode)
+        if output_mode == "object" and distribution.get_exec().moe.eplb_algorithm in (
+            "auto",
+            "deepseek",
+            "deepseek_hierarchical",
+        ):
+            # These policies sum the time dimension before planning. Aggregate
+            # before mapping/all_reduce; keep int64 to avoid window-sum overflow.
+            # File dumps and policies using per-step loads retain the full window.
+            return counts.sum(dim=0, keepdim=True)
+        return counts
+
+
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""
 
     def _create_accumulator(self, expert_location_metadata, rank):
         moe = distribution.get_exec().moe
+        accumulator_class = distribution._Accumulator.get_class()
         if moe.enable_eplb and not moe.elastic_ep_backend:
             # Join/scale paths need their own collective initialization order.
             warmup_eplb_communication()
-        return distribution._Accumulator.get_class()(
+            if accumulator_class is distribution._StatAccumulator:
+                accumulator_class = NpuExpertDistributionAccumulator
+        return accumulator_class(
             expert_location_metadata, rank, communication=NpuEplbCommunication()
         )
 
@@ -118,18 +141,6 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         self._direct_counting = False
         logger.info("[NPU EPLB batch statistics] capacity=%d routes/layer", capacity)
 
-    def on_graph_capture_forward_start(self) -> None:
-        # Capture warmups bypass the normal reset. Reset offsets without
-        # recording a buffer clear into the graph.
-        self._route_offsets = [0] * len(self._route_offsets)
-
-    def get_graph_capture_state(self) -> bool:
-        return any(self._route_offsets)
-
-    def on_graph_replay_forward_start(self, has_batched_routes: bool) -> None:
-        # Graph replay does not call the Python on_select_experts hook.
-        self._has_batched_routes |= has_batched_routes
-
     def reset(self):
         super().reset()
         if self._has_batched_routes:
@@ -142,11 +153,9 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         count = topk_ids.numel()
         if count == 0:
             return
-        if self._direct_counting:
-            return super().on_select_experts(layer_idx, topk_ids)
         start = self._route_offsets[layer_idx]
         end = start + count
-        if end > self._batched_routes.shape[1]:
+        if self._direct_counting or end > self._batched_routes.shape[1]:
             # Count overflow directly; collect() adds any earlier buffered calls.
             return super().on_select_experts(layer_idx, topk_ids)
         self._batched_routes[layer_idx, start:end].copy_(topk_ids.flatten())
@@ -155,9 +164,7 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
 
     def collect(self):
         if self._has_batched_routes and not self._batch_collected:
-            ids = self._batched_routes
-            mask = (ids >= 0) & (ids < self._data.shape[1])
-            self._data.scatter_add_(1, ids.masked_fill(~mask, 0).long(), mask.int())
+            accumulate_route_counts(self._batched_routes, self._data)
             self._batch_collected = True
         return super().collect()
 
@@ -179,25 +186,27 @@ def _get_npu_gatherers(recorder=None) -> dict[str, NpuExpertDistributionGatherer
 
 
 def on_graph_capture_forward_start(recorder=None):
+    # Capture warmups bypass reset; clear offsets without capturing a buffer clear.
     for gatherer in _get_npu_gatherers(recorder).values():
-        gatherer.on_graph_capture_forward_start()
+        gatherer._route_offsets = [0] * len(gatherer._route_offsets)
 
 
-def get_graph_capture_state(recorder=None) -> dict[str, bool]:
-    # False flags are replay no-ops; omit them so direct-counting graphs skip the hook.
-    return {
-        key: True
+def get_graph_capture_state(recorder=None) -> tuple[str, ...]:
+    # Only buffered gatherers need replay notification; retain their names per graph.
+    return tuple(
+        key
         for key, gatherer in _get_npu_gatherers(recorder).items()
-        if gatherer.get_graph_capture_state()
-    }
+        if any(gatherer._route_offsets)
+    )
 
 
-def on_graph_replay_forward_start(state, recorder=None):
+def on_graph_replay_forward_start(state: tuple[str, ...], recorder=None):
     gatherers = _get_npu_gatherers(recorder)
     if not gatherers:
         return
-    for key, gatherer_state in state.items():
-        gatherers[key].on_graph_replay_forward_start(gatherer_state)
+    # Graph replay does not call the Python on_select_experts hook.
+    for key in state:
+        gatherers[key]._has_batched_routes = True
 
 
 @contextmanager

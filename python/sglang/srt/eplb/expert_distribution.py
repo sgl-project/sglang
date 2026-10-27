@@ -1022,7 +1022,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            self._get_physical_count_for_dump(output_mode),
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
@@ -1051,6 +1051,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         else:
             raise NotImplementedError
+
+    def _get_physical_count_for_dump(self, output_mode: _OutputMode):
+        return self._global_physical_count_of_buffered_step.get_all()
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(

@@ -54,7 +54,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self.is_draft_worker = cuda_graph_runner.model_runner.is_draft_worker
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
-        self._eplb_capture_states: Dict[ShapeKey, Dict[str, bool]] = {}
+        self._eplb_capture_states: Dict[ShapeKey, tuple[str, ...]] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()

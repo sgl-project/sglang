@@ -130,21 +130,6 @@ def prepare_expert_weight_update(
     staging = ExpertWeightStaging(sample, coalesce_aux=not elastic_ep_enabled)
     temp_buffers = staging.create_temp_buffers(sample)
     group = get_eplb_device_group()
-    if logger.isEnabledFor(logging.DEBUG):
-        # Planned logical bytes include lazy staging, not allocator padding/cache.
-        workspace_bytes = sum(t.numel() * t.element_size() for t in temp_buffers) + sum(
-            t.numel() * t.element_size()
-            for indices in staging._groups
-            for index in indices
-            for t in (sample[index],)
-            if len(indices) > 1 or staging._needs_staging[index]
-        )
-        logger.debug(
-            "[NPU EPLB] rank=%d layers=%d workspace_logical_bytes=%d",
-            rank,
-            len(layer_ids),
-            workspace_bytes,
-        )
 
     def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> object:
         start = kwargs["rank"] * kwargs["num_local_physical_experts"]
@@ -191,7 +176,7 @@ def _validate_migration_weights(
         raise ValueError(
             f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
         )
-    for layer in layer_ids:
+    for layer in layer_ids[1:]:
         weights = weights_by_layer[layer]
         if len(weights) != len(expected):
             raise ValueError(
@@ -217,16 +202,6 @@ def needs_nd_staging(tensor: torch.Tensor) -> bool:
     return torch_npu.get_npu_format(tensor) not in (0, 2)
 
 
-def create_temp_buffers(sample_tensors: list[torch.Tensor]) -> list[torch.Tensor]:
-    """Allocate slot-copy buffers, using ordinary storage for internal NPU formats."""
-    return [
-        torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-        if needs_nd_staging(tensor)
-        else torch.empty_like(tensor)
-        for tensor in sample_tensors
-    ]
-
-
 class ExpertWeightStaging:
     """Keep one layer's ND conversion results in a validated migration chunk.
 
@@ -250,22 +225,23 @@ class ExpertWeightStaging:
             )
             groups.setdefault(tensor.dtype if small_aux else index, []).append(index)
         self._groups = list(groups.values())
+        self._packed_buffers: dict[int, torch.Tensor] = {}
+        self._packed_views: dict[int, tuple[torch.Tensor, ...]] = {}
         self.buffers: list[torch.Tensor] = []
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        return [
-            torch.empty(
-                (
-                    weights[indices[0]].shape[0],
-                    sum(weights[i].shape[1] for i in indices),
-                ),
-                dtype=weights[indices[0]].dtype,
-                device=weights[indices[0]].device,
+        buffers = []
+        for indices in self._groups:
+            weight = weights[indices[0]]
+            shape = weight.shape
+            if len(indices) > 1:
+                shape = (weight.shape[0], sum(weights[i].shape[1] for i in indices))
+            buffers.append(
+                torch.empty(shape, dtype=weight.dtype, device=weight.device)
+                if len(indices) > 1 or self._needs_staging[indices[0]]
+                else torch.empty_like(weight)
             )
-            if len(indices) > 1
-            else create_temp_buffers([weights[indices[0]]])[0]
-            for indices in self._groups
-        ]
+        return buffers
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
@@ -274,23 +250,34 @@ class ExpertWeightStaging:
             torch.ops.npu.npu_format_cast(weight, 2) if needed else weight
             for weight, needed in zip(weights, self._needs_staging, strict=True)
         ]
-        self.buffers = [
-            torch.cat([converted[i] for i in indices], dim=1)
-            if len(indices) > 1
-            else converted[indices[0]]
-            for indices in self._groups
-        ]
+        for group_index, indices in enumerate(self._groups):
+            if len(indices) > 1:
+                # The updater waits for P2P before store/load on this stream.
+                # Retain only small packed auxiliaries across layers in the chunk.
+                buffer = torch.cat(
+                    [converted[i] for i in indices],
+                    dim=1,
+                    out=self._packed_buffers.get(group_index),
+                )
+                if group_index not in self._packed_buffers:
+                    self._packed_buffers[group_index] = buffer
+                    # Shapes are validated for the chunk; these views remain
+                    # valid while load() reuses the same packed storage.
+                    self._packed_views[group_index] = buffer.split(
+                        [weights[i].shape[1] for i in indices], dim=1
+                    )
+            else:
+                buffer = converted[indices[0]]
+            self.buffers.append(buffer)
         return self.buffers
 
     def store(self, weights: list[torch.Tensor]) -> None:
-        for indices, buffer in zip(self._groups, self.buffers, strict=True):
+        for group_index, (indices, buffer) in enumerate(
+            zip(self._groups, self.buffers, strict=True)
+        ):
             if len(indices) == 1 and not self._needs_staging[indices[0]]:
                 continue
-            pieces = (
-                buffer.split([weights[i].shape[1] for i in indices], dim=1)
-                if len(indices) > 1
-                else [buffer]
-            )
+            pieces = self._packed_views[group_index] if len(indices) > 1 else [buffer]
             for index, piece in zip(indices, pieces, strict=True):
                 weight = weights[index]
                 if self._needs_staging[index]:
