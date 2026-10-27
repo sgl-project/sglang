@@ -24,7 +24,6 @@ import torch
 
 from sglang.srt.layers.moe.utils import DispatcherOutputDtype
 
-
 INT8_QUANT_MODE = 1
 MXFP8_QUANT_MODE = 3
 MXFP4_QUANT_MODE = 9

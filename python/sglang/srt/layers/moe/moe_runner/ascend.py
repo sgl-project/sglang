@@ -68,8 +68,7 @@ def _reshape_received_scale(received_scale: torch.Tensor) -> torch.Tensor:
         return received_scale
     if received_scale.ndim != 2 or received_scale.shape[1] % 2 != 0:
         raise RuntimeError(
-            "invalid communicated MoE scale shape: "
-            f"{tuple(received_scale.shape)}"
+            f"invalid communicated MoE scale shape: {tuple(received_scale.shape)}"
         )
     return received_scale.reshape(
         received_scale.shape[0], received_scale.shape[1] // 2, 2
