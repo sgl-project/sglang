@@ -62,9 +62,9 @@ def pcg_dsa_indexer_prefill_split(
         "Internal error: DSA graph dispatch is only supported on CUDA and ROCm"
     )
     if _is_hip and not _is_gfx1250_supported:
-        from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+        from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
     else:
-        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
     if x_s is not None:
         x = (x, x_s) if x_bf16 is None else (x, x_s, x_bf16)
 

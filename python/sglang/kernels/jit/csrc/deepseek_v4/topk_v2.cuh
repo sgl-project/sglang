@@ -772,7 +772,7 @@ struct alignas(128) SplitCounters {
   uint32_t count_gt;
   uint32_t count_eq;
   uint32_t arrive;
-  uint32_t _pad;
+  uint32_t tie_nonzero;
 };
 
 struct SplitWorkspace {
@@ -871,6 +871,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
+    const bool zero_bin = is_zero_bin(v_lo);
+    if (zero_bin && tx == 0) smem->tie_nonzero = 0;
     __syncthreads();
 
     for_each_input(problem.in + chunk.start, chunk.len, [&](float val, uint32_t local) {
@@ -882,6 +884,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
           smem->staged[pos] = static_cast<int32_t>(idx);
       } else if (val >= v_lo) {
         const auto slot = atomicAdd(&smem->count_eq, 1u);
+        if (zero_bin && __float_as_uint(val) != 0u) atomicOr(&smem->tie_nonzero, 1u);
         if (slot < kMaxNumTie) [[likely]]
           smem->tie_values[slot] = {val, idx};
       }
@@ -894,6 +897,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
       // Uncapped: finish_ties needs the row's exact bin size to detect overflow and refine.
       smem->base_eq = atomicAdd(&ctr->count_eq, smem->count_eq);
+      if (zero_bin && smem->tie_nonzero != 0) atomicOr(&ctr->tie_nonzero, 1u);
     }
     __syncthreads();
     const auto base_gt = smem->base_gt;
@@ -923,6 +927,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
         // served out of this CU's own stale cache.
         smem->total_gt = atomicAdd(&ctr->count_gt, 0u);
         smem->total_eq = atomicAdd(&ctr->count_eq, 0u);
+        if (is_zero_bin(smem->v_lo)) smem->tie_nonzero = atomicAdd(&ctr->tie_nonzero, 0u);
       }
     }
     __syncthreads();
@@ -935,7 +940,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
-    if (smem->total_eq > kMaxNumTie) [[unlikely]] {
+    const bool zero_ties = is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
+    if (smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       // The global list holds an arrival-order subset. refine_ties emits after
       // the slots every rank already took, so seed its counter with their total.
       if (tx == 0) smem->count_gt = smem->total_gt;
@@ -945,7 +951,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       tie_count = min(smem->count_eq, kMaxNumTie);
     } else {
       above_count = smem->total_gt;
-      tie_count = smem->total_eq;
+      tie_count = zero_ties ? min(smem->total_eq, kMaxNumTie) : smem->total_eq;
       for (uint32_t t = tx; t < tie_count; t += kBlockSize)
         smem->tie_values[t] = ties[t];
       __syncthreads();

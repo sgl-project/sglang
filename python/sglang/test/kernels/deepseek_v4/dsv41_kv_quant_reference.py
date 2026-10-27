@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import ceil_pow2
+from sglang.kernels.ops.quantization.fp4_fake_quant import ceil_pow2
 
 KV_DIM = 512
 FP4_GROUP = 16  # values per e4m3 scale
@@ -144,4 +144,40 @@ def dequantize_k_cache_v41(pages: torch.Tensor, page_size: int) -> torch.Tensor:
     scale_bf16 = scale.view(torch.float8_e8m0fnu).to(torch.bfloat16)
     return (values.view(num_pages, page_size, 16, 32) * scale_bf16.unsqueeze(-1)).view(
         num_pages, page_size, 512
+    )
+
+
+# ---------------------------------------------------------------------------
+# The interleaved arrangement of the same bytes (V41_NEW / V41_FP4_NEW): each
+# token is its data immediately followed by its scales, pages unpadded.
+# ---------------------------------------------------------------------------
+
+
+def interleave_pages(
+    pages: torch.Tensor, page_size: int, data_bytes: int, scale_bytes: int
+) -> torch.Tensor:
+    """Block-split pages ``[num_pages, >= page_size * (data + scale)]`` uint8 ->
+    interleaved ``[num_pages, page_size * (data + scale)]``."""
+    num_pages = pages.shape[0]
+    split = page_size * data_bytes
+    data = pages[:, :split].reshape(num_pages, page_size, data_bytes)
+    scale = pages[:, split : split + page_size * scale_bytes].reshape(
+        num_pages, page_size, scale_bytes
+    )
+    return torch.cat([data, scale], dim=-1).reshape(num_pages, -1)
+
+
+def deinterleave_pages(
+    pages: torch.Tensor, page_size: int, data_bytes: int, scale_bytes: int
+) -> torch.Tensor:
+    """Inverse of :func:`interleave_pages`, without page padding."""
+    num_pages = pages.shape[0]
+    tokens = pages.view(torch.uint8)[:, : page_size * (data_bytes + scale_bytes)]
+    tokens = tokens.reshape(num_pages, page_size, data_bytes + scale_bytes)
+    return torch.cat(
+        [
+            tokens[..., :data_bytes].reshape(num_pages, -1),
+            tokens[..., data_bytes:].reshape(num_pages, -1),
+        ],
+        dim=-1,
     )

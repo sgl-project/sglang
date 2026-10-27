@@ -19,6 +19,83 @@ _SCORING_FUNC_MAP = {
 
 
 @triton.jit
+def _sm120_router_top22_kernel(
+    scores_ptr,
+    bias_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride_sm,
+    stride_sn,
+    scale,
+    RENORMALIZE: tl.constexpr,
+    APPLY_SCALE: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n = tl.arange(0, 512)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    scores = tl.load(scores_ptr + row * stride_sm + n * stride_sn).to(tl.float32)
+    bias = tl.load(bias_ptr + n).to(tl.float32)
+    activated = tl.sigmoid(scores)
+    biased = activated + bias
+    biased = tl.where(biased == biased, biased, -1e30)
+    biased = tl.where(biased == 0.0, 0.0, biased)
+    bits = biased.to(tl.uint32, bitcast=True)
+    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    keys = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - n.to(tl.uint32)).to(tl.uint64)
+    winners = tl.topk(keys, 32)
+    ids = (0xFFFFFFFF - (winners & 0xFFFFFFFF).to(tl.uint32)).to(tl.int32)
+    k = tl.arange(0, 32)
+    values = tl.gather(activated, ids, axis=0)
+    values = tl.where(k < 22, values, 0.0)
+    total = tl.sum(values, 0)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    if RENORMALIZE:
+        values = values / tl.where(total > 0.0, total, 1.0)
+    if APPLY_SCALE:
+        values = values * scale
+    tl.store(weights_ptr + row * 22 + k, values, k < 22)
+    tl.store(ids_ptr + row * 22 + k, ids, k < 22)
+
+
+def _topk_gate_small_m(
+    scores,
+    bias,
+    topk=22,
+    renormalize=True,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
+):
+    assert scores.is_cuda and bias.device == scores.device
+    assert scores.ndim == 2 and scores.shape[1] == 512
+    assert scores.dtype == torch.float32
+    assert 1 <= scores.shape[0] <= 16
+    assert bias.shape == (512,) and bias.dtype == torch.float32 and bias.is_contiguous()
+    assert topk == 22
+    m = scores.shape[0]
+    weights = torch.empty((m, 22), device=scores.device, dtype=torch.float32)
+    ids = torch.empty((m, 22), device=scores.device, dtype=torch.int32)
+    pdl = is_arch_support_pdl()
+    _sm120_router_top22_kernel[(m,)](
+        scores,
+        bias,
+        weights,
+        ids,
+        scores.stride(0),
+        scores.stride(1),
+        float(routed_scaling_factor),
+        RENORMALIZE=bool(renormalize),
+        APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
+        USE_PDL=pdl,
+        num_warps=1,
+        **({"launch_pdl": True} if pdl else {}),
+    )
+    return weights, ids
+
+
+@triton.jit
 def _router_triton_kernel(
     scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
@@ -205,15 +282,6 @@ def _router_triton_kernel(
         :, None
     ]  # [BLOCK_M, 1]
 
-    # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
-    # id = num_experts + (slot - K_ROUTED).
-    if K_ROUTED < K:
-        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
-        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
-        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
-        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
-        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
-
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -225,6 +293,13 @@ def _router_triton_kernel(
         selected_vals = selected_vals / norm
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
+    if K_ROUTED < K:
+        # The shared expert's contribution is independent of routed normalization.
+        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
+        shared_weight = 1.0 if APPLY_SCALE else 1.0 / routed_scaling_factor
+        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
+        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
+        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
     if HAS_PADDING:
         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
         selected_idx = tl.where(live_m[:, None], selected_idx, -1)
@@ -328,11 +403,45 @@ def moe_fused_gate(
         assert input_ids.shape == (scores.size(0),)
     if packed_out is not None:
         assert packed_out.dtype == torch.int32, "packed_out must be int32"
-        assert packed_out.shape == (scores.size(0), topk), (
-            "packed_out must be [M, topk]"
-        )
+        assert packed_out.shape == (
+            scores.size(0),
+            topk,
+        ), "packed_out must be [M, topk]"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
+
+    from sglang.srt.environ import envs
+
+    if (
+        envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
+        and scores.is_cuda
+        and torch.cuda.get_device_capability(scores.device) == (12, 0)
+        and 2 <= scores.shape[0] <= 16
+        and scores.shape[1] == 512
+        and scores.dtype == torch.float32
+        and scores.stride(1) == 1
+        and bias is not None
+        and bias.dtype == torch.float32
+        and bias.is_contiguous()
+        and topk == 22
+        and scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and moe_softcapping == 0.0
+        and input_ids is None
+        and num_token_non_padded is None
+        and renormalize_epsilon == 0.0
+        and packed_out is None
+        and not sqrtsoftplus_log1p
+    ):
+        return _topk_gate_small_m(
+            scores,
+            bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
 
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this

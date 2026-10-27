@@ -62,9 +62,6 @@ class CacheInitParams:
     # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
     draft_swa_window: int = 0
 
-    # Time-to-live for cache entries in seconds. If None, TTL is disabled.
-    cache_ttl_seconds: Optional[float] = None
-
     tree_components: Optional[tuple[ComponentType, ...]] = None
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
@@ -72,6 +69,8 @@ class CacheInitParams:
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    # Draft KV pools that share the target KV slots but are stored apart from it.
+    sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
 
     @property
