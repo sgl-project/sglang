@@ -45,7 +45,6 @@ class AttentionBackendEnum(enum.Enum):
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
-    ASCEND_QUANT_FA = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
     SOL_ATTN = enum.auto()

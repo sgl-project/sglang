@@ -1202,10 +1202,16 @@ class ServerArgs(DisaggServerArgsMixin):
             MiniMaxH3PipelineConfig,
         )
 
+        explicit_ascend_quant = (
+            current_platform.is_npu()
+            and self.attention_backend == "fa"
+            and "precision" in self.attention_backend_config
+        )
+
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend in {"laser_attn", "ascend_quant_fa"}
+            and (self.attention_backend == "laser_attn" or explicit_ascend_quant)
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):

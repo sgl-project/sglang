@@ -2,7 +2,7 @@
 """Compare Ascend FA and MindIE-SD attention on identical floating-point Q/K/V.
 
 Run from an installed SGLang environment with Ascend 950 and MindIE-SD.
-The A5 / D=64,128 comparison matrix is not an ascend_quant_fa runtime limit.
+The A5 / D=64,128 comparison matrix is not an Ascend FA runtime limit.
 Prints JSON containing native dispatch, latency, memory and error measurements.
 """
 
@@ -24,12 +24,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--sd-head-chunk-size", type=int, default=4)
     args = parser.parse_args()
     if (
         min(args.batch, args.seq_len, args.heads, args.iterations) < 1
         or args.warmup < 1
     ):
         parser.error("shape dimensions, warmup and iterations must be positive")
+    if args.sd_head_chunk_size < 0:
+        parser.error("--sd-head-chunk-size must be non-negative; 0 disables chunking")
     if args.seq_len % 64:
         parser.error(
             "--seq-len must be divisible by 64 so each batch boundary is aligned "
@@ -44,9 +47,6 @@ def main():
     from sglang.multimodal_gen import envs
     from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
         AscendFAImpl,
-    )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_quant_fa import (
-        AscendQuantFAImpl,
     )
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
     from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -93,17 +93,18 @@ def main():
             )
         if not torch.isfinite(output).all():
             raise RuntimeError(f"{name} returned non-finite values")
-        if isinstance(impl, AscendQuantFAImpl):
-            matrix = impl._get_rotation(query)
+        sd_executor = impl._sd_executor
+        if sd_executor is not None:
+            matrix = sd_executor._get_rotation(query)
             options = dict(
-                precision=impl.precision,
+                precision=sd_executor.precision,
                 layout="BSND",
                 scale=scale,
                 q_rot=matrix,
                 k_rot=matrix,
             )
-            if impl.precision == "fp8":
-                options["fp8_fa_mode"] = impl.fp8_fa_mode
+            if sd_executor.precision == "fp8":
+                options["fp8_fa_mode"] = sd_executor.fp8_fa_mode
                 direct = torch.cat(
                     [
                         mindiesd.quant_attention(
@@ -124,6 +125,26 @@ def main():
             reference = actual
         difference = actual - reference
         metrics = {
+            "provider": "mindiesd" if sd_executor is not None else "native",
+            "precision": (
+                sd_executor.precision
+                if sd_executor is not None
+                else "mxfp8"
+                if impl._quant_scheme
+                else "float"
+            ),
+            "qk_rotation": (
+                sd_executor.qk_rotation
+                if sd_executor is not None
+                else bool(impl._quant_scheme and not impl.use_offline_qk_rotation)
+            ),
+            "head_chunk_size": (
+                sd_executor.head_chunk_size
+                if sd_executor is not None
+                else impl._mxfp8_head_chunk_size
+                if impl._quant_scheme
+                else 0
+            ),
             "relative_rmse": (
                 difference.norm() / reference.norm().clamp_min(1e-12)
             ).item(),
@@ -172,6 +193,7 @@ def main():
         flush=True,
     )
     with torch.no_grad():
+        envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION = False
         reference = measure(
             "ascend_fa_float",
             AscendFAImpl(args.heads, args.head_dim, False, scale),
@@ -184,7 +206,7 @@ def main():
             impl = AscendFAImpl(
                 args.heads, args.head_dim, False, scale, quant_config=MXFP8Config()
             )
-            if impl._quant_scheme != "MXFP8":
+            if impl._quant_scheme != "MXFP8" or impl._sd_executor is not None:
                 raise RuntimeError(
                     "Native MXFP8 was not enabled; refusing a mislabeled baseline"
                 )
@@ -202,20 +224,26 @@ def main():
             )
             for mode in modes:
                 for rotation in (True, False):
-                    config = dict(precision=precision, qk_rotation=rotation)
+                    config = dict(
+                        precision=precision,
+                        qk_rotation=rotation,
+                        head_chunk_size=args.sd_head_chunk_size,
+                    )
                     if precision == "fp8":
                         config["fp8_fa_mode"] = mode
                     set_global_server_args(
                         SimpleNamespace(attention_backend_config=config)
                     )
-                    impl = AscendQuantFAImpl(args.heads, args.head_dim, False, scale)
+                    impl = AscendFAImpl(args.heads, args.head_dim, False, scale)
+                    assert impl._sd_executor is not None
                     expected_operator = {
                         "fp8": "mindiesd::fused_infer_attention_score_v2",
                         "mxfp8": "npu::npu_fused_infer_attention_score_v2",
                         "mxfp4": "mindiesd::quant_flash_attn",
                     }[precision]
                     measure(
-                        f"sd_{precision}_{mode if precision == 'fp8' else 'default'}_rotation{int(rotation)}",
+                        f"sd_{precision}_{mode if precision == 'fp8' else 'default'}"
+                        f"_rotation{int(rotation)}_chunk{args.sd_head_chunk_size}",
                         impl,
                         expected_operator,
                         reference,

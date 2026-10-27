@@ -456,12 +456,6 @@ def _cached_get_attn_backend(
     elif selected_backend is None and len(supported_attention_backends) == 1:
         selected_backend = next(iter(supported_attention_backends))
 
-    if (
-        selected_backend == AttentionBackendEnum.ASCEND_QUANT_FA
-        and not current_platform.is_npu()
-    ):
-        raise ValueError("ascend_quant_fa is only supported on Ascend NPU")
-
     attention_cls = current_platform.get_attn_backend_cls_str(
         selected_backend, head_size, dtype
     )

@@ -721,6 +721,8 @@ def _minimax_h3_pipelined_dense_attention(
     if attention._attention_backend_enum not in _PIPELINED_ATTENTION_BACKENDS:
         return None
     impl = attention._attention_impl
+    if not getattr(impl, "supports_pipelined_attention", True):
+        return None
     skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
     if skip_softmax is not None and skip_softmax()[0]:
         return None

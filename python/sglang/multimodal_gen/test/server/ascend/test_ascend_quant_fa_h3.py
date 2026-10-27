@@ -3,6 +3,8 @@
 
 Set SGLANG_TEST_H3_BF16_MODEL_PATH to an unquantized checkpoint to enable.
 Every case uses --quantization mxfp8 for online weight quantization on NPU.
+SD cases select only fa + precision and exercise automatic H3 text-encoder
+routing. FP8 defaults to HIGH_PRECISION; only the alternate mode overrides it.
 Pre-quantized checkpoints require their own loader and are not used here.
 VAE tiles run locally to avoid depending on an unrelated NPU gather workaround.
 The existing FA baseline uses BF16 attention: arbitrary H3 packed boundaries
@@ -41,14 +43,14 @@ def _cases():
     for ulysses in (False, True):
         for name, backend, config in (
             ("fa_bf16", "fa", {}),
-            ("sd_fp8", "ascend_quant_fa", {"precision": "fp8"}),
+            ("sd_fp8", "fa", {"precision": "fp8"}),
             (
                 "sd_fp8_c8v16",
-                "ascend_quant_fa",
+                "fa",
                 {"precision": "fp8", "fp8_fa_mode": "C8V16_TILING512"},
             ),
-            ("sd_mxfp8", "ascend_quant_fa", {"precision": "mxfp8"}),
-            ("sd_mxfp4", "ascend_quant_fa", {"precision": "mxfp4"}),
+            ("sd_mxfp8", "fa", {"precision": "mxfp8"}),
+            ("sd_mxfp4", "fa", {"precision": "mxfp4"}),
         ):
             server_args = replace(
                 base.server_args,
@@ -74,8 +76,13 @@ def _cases():
                     backend,
                     "--attention-backend-config",
                     shlex.quote(json.dumps(config)),
-                    "--component-attention-backends",
-                    "text_encoder=torch_sdpa",
+                    # Match the SD cases' automatic text-encoder default in the
+                    # floating-point baseline as well.
+                    *(
+                        ["--component-attention-backends", "text_encoder=torch_sdpa"]
+                        if name == "fa_bf16"
+                        else []
+                    ),
                     "--component-residency",
                     "text_encoder=layerwise-offload",
                 ],
@@ -122,4 +129,4 @@ class TestAscendQuantFAH3(DiffusionServerBase):
             encoding="utf-8", errors="replace"
         )
         if "sd_" in case.id:
-            assert "Using MindIE-SD ascend_quant_fa:" in logs
+            assert "Using Ascend FA: provider=mindiesd," in logs
