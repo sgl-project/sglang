@@ -2686,17 +2686,24 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
+        # PD prefill never decodes: budget the single handoff token and return
+        # before the clamps, which could only lower it to a dummy prefill-only
+        # 0. Constant output: every PP rank must derive the same
+        # sampling_params (rank consensus hashes them).
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.sampling_params.max_new_tokens = 1
+            # min <= max invariant; EOS stays legal as the handoff token
+            # unless the user set min_new_tokens.
+            req.sampling_params.min_new_tokens = min(
+                req.sampling_params.min_new_tokens, 1
+            )
+            return
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
             req.sampling_params.max_new_tokens
             if req.sampling_params.max_new_tokens is not None
             else 1 << 30
         )
-        # PD prefill never decodes: budget one token so PrefillAdder does not
-        # reserve the full decode length. Idempotent under the PP relay, which
-        # re-runs this on the already-overridden value downstream.
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            max_new_tokens = 1
         if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
             if max_new_tokens > self.max_new_tokens_limit:
                 logger.warning(
