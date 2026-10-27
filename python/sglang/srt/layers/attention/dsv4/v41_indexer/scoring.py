@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_scores import candidate_scores
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     flat_selection_slots,
@@ -455,10 +456,6 @@ def _score_chunks(
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
         if candidate_only:
-            from sglang.kernels.ops.attention.dsv4.candidate_scores import (
-                candidate_scores,
-            )
-
             s = candidate_scores(
                 q[tok_c],
                 index_k,
