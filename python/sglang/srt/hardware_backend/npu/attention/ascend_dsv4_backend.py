@@ -1174,16 +1174,17 @@ class LowRatioCompressAscendBackendMixin:
         fm = self.forward_metadata
         if indexer.owns_k:
             self._dsv41_index_k_store(layer, latent)
-        if indexer.is_candidate_source or indexer.uses_candidates:
-            # Candidate block filtering needs quant_sparse_lightning_indexer plus
-            # the 544B combined index cache; M1 is QLI-only.
-            raise NotImplementedError(
-                "DeepSeek-V4.1 candidate block filtering is not implemented for "
-                "NPU yet (needs quant_sparse_lightning_indexer + the combined "
-                "index cache). Disable it by leaving candidate_source_layer_id "
-                f"at -1 in the checkpoint config (layer {layer.layer_id})."
+        if indexer.is_candidate_source:
+            # Level one: the plain top-k this layer attends with, plus the block
+            # candidates every later indexer layer rescoring inside.
+            topk, blocks = self._dsv41_index_full_topk(
+                layer, x, q_lora, pos, forward_batch, candidate=True
             )
-        topk = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
+            fm.dsv41_candidate_blocks = blocks
+        elif indexer.uses_candidates:
+            topk = self._dsv41_index_qsli_topk(layer, x, q_lora, pos, forward_batch)
+        else:
+            topk, _ = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
         setattr(fm, f"c{ratio}_topk_indices", topk)
         # No indexer-topk capture here: get_num_indexer_layers() sizes that
         # capturer from the ratio-4 layers (model_config.py L482-L484), which
@@ -1236,45 +1237,57 @@ class LowRatioCompressAscendBackendMixin:
             cache_dtype=torch.float32,
         )
         ds41 = _ds41_ops()
-        ds41.indexer_prologue_k(
+        # The operator reads wk in FRACTAL_NZ, and the cast is deliberately
+        # *inside* the traced region: the NZ tensor is then either an
+        # intermediate node consumed straight by the op, or a constant cast
+        # at trace time -- in neither case a *graph input*, so aclgraph's
+        # input clone cannot degrade it back to ND.  The README's "ACLGraph
+        # must disable input clone" note is about a pre-cast NZ tensor that
+        # arrives *as an input*: that is the recipes layout, where
+        # modeling_deepseek.py L2854-2863 casts attn.indexer.wk in place to
+        # FRACTAL_NZ at load time and passes the parameter straight through.
+        # Casting here yields the same format without depending on that
+        # framework flag, which sglang never sets.  Do NOT hoist this cast
+        # into a cached attribute: a long-lived NZ tensor can be lifted as a
+        # graph input, which is exactly the case the README warns about.
+        # Both storage modes share every argument but the destination.
+        common = dict(
             latent=latent.reshape(-1, latent.shape[-1]),
-            # The operator reads wk in FRACTAL_NZ, and the cast is deliberately
-            # *inside* the traced region: the NZ tensor is then either an
-            # intermediate node consumed straight by the op, or a constant cast
-            # at trace time -- in neither case a *graph input*, so aclgraph's
-            # input clone cannot degrade it back to ND.  The README's "ACLGraph
-            # must disable input clone" note is about a pre-cast NZ tensor that
-            # arrives *as an input*: that is the recipes layout, where
-            # modeling_deepseek.py L2854-2863 casts attn.indexer.wk in place to
-            # FRACTAL_NZ at load time and passes the parameter straight through.
-            # Casting here yields the same format without depending on that
-            # framework flag, which sglang never sets.  Do NOT hoist this cast
-            # into a cached attribute: a long-lived NZ tensor can be lifted as a
-            # graph input, which is exactly the case the README warns about.
             wk=torch_npu.npu_format_cast(
                 indexer.wk.weight, torch_npu.Format.FRACTAL_NZ
             ),
             norm_weight=indexer.k_norm.weight.to(torch.float32),
             rope_sin=sin,
             rope_cos=cos,
-            k_cache=pool.get_index_k(layer.layer_id),
-            k_scale_cache=pool.get_index_scale(layer.layer_id),
             cache_index=cache_index.to(torch.int64),
-            storage_mode=0,
             norm_eps=indexer.k_norm.eps,
         )
+        ds41.indexer_prologue_k(
+            **common,
+            k_cache=pool.get_index_k(layer.layer_id),
+            k_scale_cache=pool.get_index_scale(layer.layer_id),
+            storage_mode=0,
+        )
+        if indexer.is_candidate_source:
+            # Level-two K, read by QSLI: the same rows again, eight to a record,
+            # fused with their scales (indexer_prologue_k_dsl README L49-L52).
+            ds41.indexer_prologue_k(
+                **common,
+                k_cache=self._dsv41_qsli_cache(layer),
+                k_scale_cache=None,
+                storage_mode=1,
+                combined_block_size=indexer.candidate_block_size,
+            )
 
-    def _dsv41_index_full_topk(self, layer, x, q_lora, pos, forward_batch):
-        """Score the compressed history with ``quant_lightning_indexer``.
+    def _dsv41_index_q(self, layer, x, q_lora, pos):
+        """Packed MXFP4 Q, its E8M0 scales and the head weights, for both indexers.
 
-        Recipes: indexer.py L295-L309 (non-candidate branch) and L338-L400.
+        Recipes: indexer.py L341-L357 and L410-L415 — QLI and QSLI take the same
+        Q side, so it is built once here for both.
         """
         import torch_npu
 
         indexer = layer.indexer
-        ratio = layer.compress_ratio
-        fm = self.forward_metadata
-        pool = self.token_to_kv_pool
         t = int(q_lora.shape[0])
         packed_dim = indexer.index_head_dim // 2
 
@@ -1313,6 +1326,25 @@ class LowRatioCompressAscendBackendMixin:
         # QLI wants the E8M0 scales observed as [..., 2, 2]; the pool stores the
         # same 4 bytes per row, so both are pure reshapes.
         descale_q = q_scale.view(torch.uint8).view(t, indexer.n_heads, 2, 2)
+        w = indexer.head_weights(x).view(-1, indexer.n_heads).float()
+        return q_packed, descale_q, w
+
+    def _dsv41_index_full_topk(
+        self, layer, x, q_lora, pos, forward_batch, *, candidate: bool = False
+    ):
+        """Score the compressed history with ``quant_lightning_indexer``.
+
+        With ``candidate`` the same operator call also emits the level-one block
+        candidates, and its third and fourth returns stop being empty tensors.
+        Recipes: indexer.py L338-L400.
+        """
+        indexer = layer.indexer
+        ratio = layer.compress_ratio
+        fm = self.forward_metadata
+        pool = self.token_to_kv_pool
+        t = int(q_lora.shape[0])
+        packed_dim = indexer.index_head_dim // 2
+        q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
 
         k = pool.get_index_k(layer.layer_id)
         k_scale = pool.get_index_scale(layer.layer_id)
@@ -1341,17 +1373,21 @@ class LowRatioCompressAscendBackendMixin:
         # buffer are sized with (L1336 / L1761); the op both selects and reshapes
         # with it.
         topk = self._dsv4_index_topk
-        metadata = fm.kernel_metadata.get(f"c{ratio}a_qli_metadata")
+        key = (
+            f"c{ratio}a_qli_candidate_metadata"
+            if candidate
+            else f"c{ratio}a_qli_metadata"
+        )
+        metadata = fm.kernel_metadata.get(key)
         if metadata is None:
             raise RuntimeError(
-                f"DeepSeek-V4.1 QLI for layer {layer.layer_id} has no "
-                f"c{ratio}a_qli_metadata; the kernel-metadata builder must run "
-                "before the source layers."
+                f"DeepSeek-V4.1 QLI for layer {layer.layer_id} has no {key}; the "
+                "kernel-metadata builder must run before the source layers."
             )
-        indices, _, _, _ = _ds41_ops().quant_lightning_indexer(
+        result = _ds41_ops().quant_lightning_indexer(
             q=q_packed,
             k=k,
-            w=indexer.head_weights(x).view(-1, indexer.n_heads).float(),
+            w=w,
             descale_q=descale_q,
             descale_k=descale_k,
             topk=topk,
@@ -1368,6 +1404,121 @@ class LowRatioCompressAscendBackendMixin:
             layout_k="PA_BBND",
             return_value=False,
             metadata=metadata,
+            # -1 leaves the operator's third and fourth returns empty.
+            candidate_topk_blocks=indexer.candidate_topk_blocks if candidate else -1,
+            candidate_block_size=indexer.candidate_block_size if candidate else -1,
+        )
+        indices, _, candidate_indices, candidate_lengths = result
+        scored = indices.view(t, topk).to(torch.int32)
+        if not candidate:
+            return scored, None
+        return scored, (candidate_indices, candidate_lengths)
+
+    def _dsv41_qsli_cache(self, layer) -> torch.Tensor:
+        """The combined index-K record QSLI reads: ``[pages, page_size/8, 1, 544]``.
+
+        ``indexer_prologue_k`` in ``storage_mode=1`` packs the same K rows eight
+        to a record -- K[8, 64] as 512B, then their e8m0 scales as 32B -- which
+        is exactly the PA_BBND K layout QSLI takes
+        (quant_sparse_lightning_indexer_dsl/README.md L12-L29). Only the
+        candidate source layer writes it, so it is allocated per (ratio, source
+        slot) on first use instead of for every layer of the ratio; the consumer
+        layers reach the source's buffer through the same ``layer_mapping`` slot.
+        """
+        pool = self.token_to_kv_pool
+        item = pool.layer_mapping[layer.layer_id]
+        key = (item.compress_ratio, item.compress_layer_id)
+        cache = self._dsv41_qsli_caches.get(key)
+        if cache is None:
+            index_k = pool.get_index_k(layer.layer_id)
+            block = self._dsv41_candidate_block_size
+            pages, page_rows = int(index_k.shape[0]), int(index_k.shape[1])
+            if block <= 0 or page_rows % block:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 QSLI needs candidate_block_size to divide the "
+                    f"compressed page rows, got block={block} rows={page_rows}."
+                )
+            head_dim = int(index_k.shape[-1]) * 2
+            # 32 = the prologue's e4m3 scale group (indexer_prologue_k_dsl
+            # README L40-L52: 64 payload bytes + 4 scale bytes per 128-dim row).
+            record = block * (head_dim // 2 + head_dim // 32)
+            cache = torch.zeros(
+                pages,
+                page_rows // block,
+                1,
+                record,
+                dtype=torch.uint8,
+                device=index_k.device,
+            )
+            self._dsv41_qsli_caches[key] = cache
+        return cache
+
+    def _dsv41_index_qsli_topk(self, layer, x, q_lora, pos, forward_batch):
+        """Level two: rescore the published candidate blocks with this layer's Q.
+
+        The candidates are logical ``candidate_block_size`` blocks of compressed
+        tokens; the operator expands them itself, so the block ids pass through
+        unchanged. Recipes: indexer.py L402-L453.
+        """
+        indexer = layer.indexer
+        ratio = layer.compress_ratio
+        fm = self.forward_metadata
+        t = int(q_lora.shape[0])
+        blocks = getattr(fm, "dsv41_candidate_blocks", None)
+        if blocks is None:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 QSLI for layer {layer.layer_id} has no published "
+                "candidate blocks; the candidate source layer must run before "
+                "its consumers."
+            )
+        candidate_indices, candidate_lengths = blocks
+        if candidate_indices.shape[0] != t:
+            raise RuntimeError(
+                "DeepSeek-V4.1 QSLI candidate blocks are stale: "
+                f"{candidate_indices.shape[0]} rows published, {t} needed."
+            )
+        q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
+        page_table = getattr(fm, f"c{ratio}_index_page_table", None)
+        if page_table is None:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 QSLI for layer {layer.layer_id} is missing the "
+                "compressed index page table."
+            )
+        metadata = fm.kernel_metadata.get(f"c{ratio}a_qsli_metadata")
+        if metadata is None:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 QSLI for layer {layer.layer_id} has no "
+                f"c{ratio}a_qsli_metadata; the kernel-metadata builder must run "
+                "before the index layers."
+            )
+        topk = self._dsv4_index_topk
+        indices, _ = _ds41_ops().quant_sparse_lightning_indexer(
+            q_packed,
+            # QSLI takes the record rows without the singleton head axis.
+            self._dsv41_qsli_cache(layer).squeeze(-2),
+            w,
+            descale_q,
+            candidate_indices,
+            candidate_lengths,
+            topk,
+            1,
+            indexer.candidate_block_size,
+            descale_k=None,
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_q=None,
+            seqused_k=(forward_batch.seq_lens // ratio).to(torch.int32),
+            # Only mask_mode=3 with cmp_ratio != 1 needs it, and the consumers
+            # are ratio-1 layers (README "公共可选参数").
+            cmp_residual_k=None,
+            block_table=page_table.to(torch.int32),
+            output_idx_offset=None,
+            metadata=metadata,
+            max_seqlen_q=-1,
+            mask_mode=3,
+            cmp_ratio=ratio,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            return_value=False,
         )
         return indices.view(t, topk).to(torch.int32)
 
@@ -1387,33 +1538,109 @@ class LowRatioCompressAscendBackendMixin:
             return {}
         ds41 = _ds41_ops()
         out: dict = {}
-        for ratio in self._dsv41_low_ratios():
-            cmp_lens = (seq_lens // ratio).to(torch.int32)
-            metadata = ds41.quant_lightning_indexer_metadata(
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_q=None,
-                seqused_k=cmp_lens,
-                # mask_mode=3 + cmp_ratio != 1 requires the residual (README).
-                cmp_residual_k=(
-                    None if ratio == 1 else (seq_lens % ratio).to(torch.int32)
-                ),
-                batch_size=int(forward_batch.batch_size),
-                num_heads_q=self._dsv4_index_n_heads,
-                num_heads_k=1,
-                head_dim=self._dsv4_index_head_dim,
-                topk=self._dsv4_index_topk,
-                mask_mode=3,
-                cmp_ratio=ratio,
-                layout_q="TND",
-                layout_k="PA_BBND",
-            )
-            key = f"c{ratio}a_qli_metadata"
+
+        def keep(key: str, metadata: torch.Tensor) -> None:
             # aclgraph binds the address at capture: refresh in place.
             buf = fm.kernel_metadata.get(key)
             if buf is not None and buf.shape == metadata.shape:
                 buf.copy_(metadata)
                 metadata = buf
             out[key] = metadata
+
+        batch_size = int(forward_batch.batch_size)
+        for ratio in self._dsv41_low_ratios():
+            cmp_lens = (seq_lens // ratio).to(torch.int32)
+            keep(
+                f"c{ratio}a_qli_metadata",
+                ds41.quant_lightning_indexer_metadata(
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_q=None,
+                    seqused_k=cmp_lens,
+                    # mask_mode=3 + cmp_ratio != 1 requires the residual (README).
+                    cmp_residual_k=(
+                        None if ratio == 1 else (seq_lens % ratio).to(torch.int32)
+                    ),
+                    batch_size=batch_size,
+                    num_heads_q=self._dsv4_index_n_heads,
+                    num_heads_k=1,
+                    head_dim=self._dsv4_index_head_dim,
+                    topk=self._dsv4_index_topk,
+                    mask_mode=3,
+                    cmp_ratio=ratio,
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                ),
+            )
+        candidate_ratio = self._dsv41_candidate_ratio()
+        if candidate_ratio is not None:
+            block = self._dsv41_candidate_block_size
+            if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 has a candidate source layer but no "
+                    f"candidate_topk_blocks/candidate_block_size "
+                    f"({self._dsv41_candidate_topk_blocks}/{block})."
+                )
+            cmp_lens = (seq_lens // candidate_ratio).to(torch.int32)
+            # Level one publishes blocks, so its dispatch table is a separate
+            # instance from the plain per-ratio one (recipes indexer.py L388-L393).
+            keep(
+                f"c{candidate_ratio}a_qli_candidate_metadata",
+                ds41.quant_lightning_indexer_metadata(
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_q=None,
+                    seqused_k=cmp_lens,
+                    cmp_residual_k=(
+                        None
+                        if candidate_ratio == 1
+                        else (seq_lens % candidate_ratio).to(torch.int32)
+                    ),
+                    batch_size=batch_size,
+                    num_heads_q=self._dsv4_index_n_heads,
+                    num_heads_k=1,
+                    head_dim=self._dsv4_index_head_dim,
+                    topk=self._dsv4_index_topk,
+                    mask_mode=3,
+                    cmp_ratio=candidate_ratio,
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                    candidate_topk_blocks=self._dsv41_candidate_topk_blocks,
+                    candidate_block_size=block,
+                ),
+            )
+        if candidate_ratio is not None and self._dsv41_has_candidate_consumers():
+            # QSLI only needs a scheduling bound for the candidate prefix, so the
+            # length is the visible block count per row, computed the way the
+            # reference does it (modeling_deepseek.py L3241-L3245).
+            visible_blocks = (
+                torch.div(
+                    forward_batch.positions.reshape(-1) + candidate_ratio * block,
+                    candidate_ratio * block,
+                    rounding_mode="floor",
+                )
+                .clamp_min(1)
+                .clamp_max(self._dsv41_candidate_topk_blocks)
+            )
+            keep(
+                f"c{candidate_ratio}a_qsli_metadata",
+                ds41.quant_sparse_lightning_indexer_metadata(
+                    visible_blocks.to(torch.int32).view(-1, 1),
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_q=None,
+                    seqused_k=(seq_lens // candidate_ratio).to(torch.int32),
+                    cmp_residual_k=None,
+                    batch_size=batch_size,
+                    num_heads_q=self._dsv4_index_n_heads,
+                    num_heads_k=1,
+                    head_dim=self._dsv4_index_head_dim,
+                    topk=self._dsv4_index_topk,
+                    quant_mode=1,
+                    candidate_block_size=block,
+                    mask_mode=3,
+                    cmp_ratio=candidate_ratio,
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                ),
+            )
         return out
 
     # ---- Seam D: mixed-quant sparse MLA ---------------------------------------
@@ -1637,6 +1864,20 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_low_ratios(self) -> list:
         return [r for r in self._dsv4_unique_compress_ratios if r in (1, 2)]
+
+    def _dsv41_candidate_ratio(self) -> Optional[int]:
+        """The compression ratio of the layer that publishes candidate blocks."""
+        layer_id = self._dsv41_candidate_source_layer
+        if layer_id < 0 or layer_id >= len(self._dsv4_compress_ratios):
+            return None
+        return self._dsv4_compress_ratios[layer_id]
+
+    def _dsv41_has_candidate_consumers(self) -> bool:
+        """Whether any later index source layer rescoring inside the candidates."""
+        source = self._dsv41_candidate_source_layer
+        return self._dsv41_candidate_ratio() is not None and any(
+            layer > source for layer in self._dsv41_index_source_layers
+        )
 
     @staticmethod
     def _dsv41_compact_1d(
@@ -2024,6 +2265,22 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_index_n_heads = hf.index_n_heads
         self._dsv4_index_head_dim = hf.index_head_dim
         self._dsv4_compress_ratios = hf.compress_ratios
+        # Two-level indexer: the layer that publishes candidate blocks and the
+        # consumer layers that rescore inside them. -1 / 0 on a plain V4 model.
+        self._dsv41_candidate_source_layer = int(
+            getattr(hf, "candidate_source_layer_id", -1)
+        )
+        self._dsv41_candidate_topk_blocks = int(getattr(hf, "candidate_topk_blocks", 0))
+        self._dsv41_candidate_block_size = int(getattr(hf, "candidate_block_size", 0))
+        # A layer that publishes candidates is only useful when a later index
+        # source layer consumes them; read through _dsv41_has_candidate_consumers
+        # because a draft worker empties the ratio list below.
+        self._dsv41_index_source_layers = tuple(
+            getattr(hf, "index_source_layer_ids", ())
+        )
+        # QSLI's 544B/8-token K records, allocated on first write; see
+        # _dsv41_qsli_cache.
+        self._dsv41_qsli_caches: dict = {}
         if getattr(model_runner, "is_draft_worker", False):
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
