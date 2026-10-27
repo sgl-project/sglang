@@ -14,6 +14,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _load_megamoe_module(monkeypatch):
     """Load the adapter with only its small import-time dependencies stubbed."""
+    from sglang.srt.runtime_context import ForwardFlags
 
     class MoeQuantInfo:
         pass
@@ -69,6 +70,8 @@ def _load_megamoe_module(monkeypatch):
         return buffers[name]
 
     runtime_context.get_buffer = get_buffer
+    forward_flags = ForwardFlags()
+    runtime_context.get_forward = lambda: forward_flags
     resources = types.SimpleNamespace(flashinfer_megamoe_workspaces={})
     runtime_context.get_resources = lambda: resources
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
@@ -522,9 +525,9 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     assert mega.return_workspace_view is supports_output_view
 
 
-def test_adapter_refreshes_the_tensor_the_quant_info_holds_on_every_call(monkeypatch):
-    """The kernel reads the count at launch, so a stale value from an earlier
-    batch (or another graph shape) would make it reduce the wrong row count."""
+def _fake_megamoe_run(monkeypatch):
+    """(module, run, seen, owned): `run(rows, tensor)` launches the adapter and
+    `seen` collects the count the kernel would read at each launch."""
     module = _load_megamoe_module(monkeypatch)
 
     class FakeMoEEpTensors:
@@ -563,11 +566,45 @@ def test_adapter_refreshes_the_tensor_the_quant_info_holds_on_every_call(monkeyp
             types.SimpleNamespace(routed_scaling_factor=1.0),
         )
 
+    return module, run, seen, owned
+
+
+def test_adapter_refreshes_the_tensor_the_quant_info_holds_on_every_call(monkeypatch):
+    """The kernel reads the count at launch, so a stale value from an earlier
+    batch (or another graph shape) would make it reduce the wrong row count."""
+    _, run, seen, owned = _fake_megamoe_run(monkeypatch)
+
     run(5, owned)
     run(3, owned)
     run(9, None)
 
     assert seen == [5, 3, 3]
+
+
+def test_forward_scope_fills_once_and_never_carries_over_to_the_next_forward(
+    monkeypatch,
+):
+    """Layers of one forward share a fill. The next forward must refill even
+    with the same row count: a CUDA graph replay in between overwrites the
+    tensor with the value baked at capture time, so a skip that survived the
+    forward would hand the kernel that stale count."""
+    module, run, seen, owned = _fake_megamoe_run(monkeypatch)
+    forward = sys.modules["sglang.srt.runtime_context"].get_forward()
+
+    with module.megamoe_forward_scope():
+        run(5, owned)
+        owned.fill_(99)  # stands in for anything else that touches the tensor
+        run(5, owned)  # same rows in this forward: no second fill
+        run(3, owned)  # rows changed (e.g. two overlapped sub-batches): refill
+    assert forward.megamoe_valid_rows is None
+
+    owned.fill_(99)  # a graph replay between two forwards
+    with module.megamoe_forward_scope():
+        run(3, owned)  # new forward, same rows as the last one: must refill
+    owned.fill_(99)
+    run(3, owned)  # outside any forward scope every call fills
+
+    assert seen == [5, 99, 3, 3, 3]
 
 
 def test_autotune_geometry_key_serializes_enum_and_skips_tensor():

@@ -216,6 +216,33 @@ def _num_valid_tokens_tensor() -> torch.Tensor:
     )
 
 
+# Inside a forward scope the flag starts here; real row counts are never negative.
+_ROWS_UNFILLED = -1
+
+
+def megamoe_forward_scope():
+    """One model forward: layers with the same row count share a single fill.
+
+    Nothing carries over to the next forward, because a CUDA graph replay in
+    between overwrites the tensor with the value baked at capture time.
+    """
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().scoped(megamoe_valid_rows=_ROWS_UNFILLED)
+
+
+def _refresh_num_valid_tokens(tensor: torch.Tensor, rows: int) -> None:
+    from sglang.srt.runtime_context import get_forward
+
+    forward = get_forward()
+    if forward.megamoe_valid_rows == rows:
+        return
+    tensor.fill_(rows)
+    # None means no forward scope: keep filling on every call.
+    if forward.megamoe_valid_rows is not None:
+        forward.set("megamoe_valid_rows", rows)
+
+
 def _persistent_finalize_kwargs(*, layer: FusedMoE) -> dict[str, Any]:
     """Config kwargs for persistent finalize; records the shared tensor on `layer`."""
     if not envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get():
@@ -710,9 +737,9 @@ def run_flashinfer_megamoe(
     mega = quant_info.mega
 
     if quant_info.num_valid_tokens is not None:
-        # Refreshed every call: the kernel reads it at launch, and inside a CUDA
-        # graph the fill replays with the value baked for that capture shape.
-        quant_info.num_valid_tokens.fill_(x.shape[0])
+        # The kernel reads it at launch; inside a CUDA graph the fill replays with
+        # the value baked for that capture shape.
+        _refresh_num_valid_tokens(quant_info.num_valid_tokens, x.shape[0])
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
