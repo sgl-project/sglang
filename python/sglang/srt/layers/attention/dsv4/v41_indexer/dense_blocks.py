@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_scores import candidate_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
 from .scoring import (
@@ -229,10 +230,6 @@ class DenseBlocksBackend:
         ):
             for chunk in chunks:
                 if chunk.candidate_only:
-                    from sglang.kernels.ops.attention.dsv4.candidate_scores import (
-                        candidate_topk,
-                    )
-
                     idx = candidate_topk(
                         chunk.scores,
                         published.blocks[chunk.tok],
