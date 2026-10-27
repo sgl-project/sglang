@@ -1294,7 +1294,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         # Rebuild the packed view from the layers when they are still adjacent
         # rows of one buffer. .to(dtype/device), loaders and offload prefetch
         # give each layer a new tensor, which breaks adjacency.
-        params = [getattr(layer, name).data for layer in (self.to_q, self.to_k, self.to_v)]
+        params = [
+            getattr(layer, name).data for layer in (self.to_q, self.to_k, self.to_v)
+        ]
         first = params[0]
         offset = first.storage_offset()
         storage = first.untyped_storage().data_ptr()
