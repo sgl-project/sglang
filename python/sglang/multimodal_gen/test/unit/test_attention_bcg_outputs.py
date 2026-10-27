@@ -77,7 +77,6 @@ class TestAttentionBCGOutputs(unittest.TestCase):
     def test_local_attention_replays_into_captured_output(self):
         q = torch.zeros(1, 4, 2, 3)
         output = self._capture_and_replay(_attention(layer.LocalAttention), q, q, q)
-        # The capture pass only records the break; the replay is the first call.
         self.assertTrue(torch.all(output == 1))
 
     def test_ulysses_attention_replays_into_captured_tuple(self):

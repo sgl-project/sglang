@@ -52,7 +52,6 @@ def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypa
         with recording_capture() as (graph, events):
             assert layer._eager_scale(x, output) is None
     assert events == ["end", "begin"]
-    # The capture pass records the break without running it.
     assert output.item() == 0
     pointer = output.data_ptr()
     # Exercise the public, argument-free replay API between two segments.

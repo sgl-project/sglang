@@ -251,7 +251,6 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     index_pointer = index_output.data_ptr() if sparse else None
     with attention_scope(live_batch, backend, raw_num_tokens=1):
         graph._break_fns[0]()
-    # The capture pass records the break; only the replay runs it.
     assert seen == [live_batch]
     assert output.data_ptr() == pointer
     assert torch.all(output[:1] == 1) and torch.count_nonzero(output[1:]) == 0

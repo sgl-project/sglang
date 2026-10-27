@@ -274,9 +274,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
 
 class TestCapturePassRecordsBreaks(CustomTestCase):
-    """The capture pass records a break without running its body, which would
-    read inputs the captured segments never computed."""
-
     def _capture(self):
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             breakable_cuda_graph as bcg,

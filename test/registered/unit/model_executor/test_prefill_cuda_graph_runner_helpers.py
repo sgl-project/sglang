@@ -226,7 +226,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         ngram_eos_token_id=None,
                         holder=holder,
                     )
-                    # The capture pass only records the break.
                     self.assertIsNone(holder.batch)
                 for replay in capture.cuda_graph._break_fns:
                     replay()

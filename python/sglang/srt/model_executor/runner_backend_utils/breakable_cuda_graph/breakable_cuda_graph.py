@@ -212,14 +212,11 @@ def eager_on_graph(
 ):
     """Record an eager call between captured segments.
 
-    Arguments retain their capture-time identity. A break returns None: it
-    writes its results into buffers the caller allocated, which the next
-    segments read. Tensor arguments are held weakly, so a buffer allocated
-    outside the captured region must be owned by an object that outlives the
-    graph. Request-specific state must be read inside the eager
-    function at execution time. The capture pass records the call without
-    running it, since its inputs were never computed; ``capture_stub`` runs
-    in its place for host setup a later captured segment needs.
+    The capture pass records the call without running it; ``capture_stub``
+    runs in its place for host setup a later captured segment reads. Tensor
+    arguments keep their capture-time identity and are held weakly, so a buffer
+    allocated outside the captured region needs an owner that outlives the
+    graph. Request-specific state is read inside the body when it runs.
 
     Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
     This explicit entry bypasses graph segmentation and capture stubs; methods
@@ -250,8 +247,7 @@ def eager_on_graph(
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Re-sync ranks after segment teardown (the slow, variable step)
-            # before a capture stub. Capture-only; replay bypasses this wrapper.
+            # Re-sync ranks after the slow, variable segment teardown.
             if capture._barrier_fn is not None:
                 capture._barrier_fn()
 

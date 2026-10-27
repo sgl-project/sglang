@@ -30,7 +30,7 @@ This mode is intended for debugging only — it eliminates the performance benef
 
 ### Selective Graph Breaks in Model Code
 
-For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside of capture, they behave normally. A graph break returns None: it writes its results into buffers the caller allocated, which the following segments read.
+For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
 
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
