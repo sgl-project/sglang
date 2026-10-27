@@ -415,7 +415,9 @@ def main(args: argparse.Namespace):
     else:
         ray.init()
         num_gpus = int(ray.available_resources()["GPU"])
-        workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+        workers = [
+            BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)
+        ]
 
         def _distribute(method: str, inputs: List[Any]) -> List[Any]:
             outputs = []
