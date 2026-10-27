@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -40,9 +41,10 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         self.input_proj = nn.Linear(
             config.hidden_size * 2, config.hidden_size, bias=False
         )
-        self.mtp_block = Qwen2DecoderLayer(
-            config=config, quant_config=quant_config, prefix=prefix
-        )
+        with layer_stack():
+            self.mtp_block = Qwen2DecoderLayer(
+                config=config, quant_config=quant_config, prefix=prefix
+            )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(

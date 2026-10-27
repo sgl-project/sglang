@@ -19,7 +19,9 @@ KV caching events
 
 import atexit
 import enum
+import hashlib
 import logging
+import os
 import queue
 import threading
 import time
@@ -27,7 +29,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import msgspec
 import zmq
@@ -288,6 +290,9 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
+    # Public adapter name for router lookup. Published hashes are opaque IDs
+    # scoped to the internal cache namespace, including the adapter load.
+    lora_name: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -297,6 +302,42 @@ class BlockRemoved(KVCacheEvent):
 
 class AllBlocksCleared(KVCacheEvent):
     pass
+
+
+# The dynamo format publishes namespaced hashes as block hashes. If you change
+# this tag, all of these hashes change. unified_tree_core.rs has a Rust copy.
+_NAMESPACE_SEED_TAG = b"sglang-kv-event-namespace-v1"
+
+
+def kv_event_namespace_seed(
+    *, extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[bytes]:
+    """Return the seed for namespaced_block_hash, or None for no namespace."""
+    if extra_key is None and cache_salt is None:
+        return None
+    digest = hashlib.sha256(_NAMESPACE_SEED_TAG)
+    # The presence byte and the length prefix make ("a", "bc") and ("ab", "c") differ.
+    for part in (extra_key, cache_salt):
+        if part is None:
+            digest.update(b"\x00")
+            continue
+        encoded = part.encode("utf-8")
+        digest.update(b"\x01" + len(encoded).to_bytes(8, "little") + encoded)
+    return digest.digest()
+
+
+def namespaced_block_hash(block_hash: int, *, namespace_seed: Optional[bytes]) -> int:
+    """Return the namespaced hash of a published block hash.
+
+    If namespace_seed is None, the result is ``block_hash``. If not, the result is
+    the first 8 bytes of SHA-256(seed, block_hash as 8 big-endian bytes), as int64.
+    """
+    if namespace_seed is None:
+        return block_hash
+    digest = hashlib.sha256(
+        namespace_seed + block_hash.to_bytes(8, "big", signed=True)
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class KVEventBatch(EventBatch):
@@ -329,6 +370,10 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Describe a source accessible to a separate local process, if any."""
+        return None
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -349,7 +394,7 @@ class ZmqEventPublisher(EventPublisher):
     ----------
     endpoint:
         PUB address. Use ``tcp://*:5557`` to bind or ``tcp://host:5557`` to
-        connect.
+        connect, unless overridden by ``bind``.
     replay_endpoint:
         Optional ROUTER address for replay requests. When given, subscribers can
         request missed batches by sending the starting sequence number as an
@@ -362,6 +407,9 @@ class ZmqEventPublisher(EventPublisher):
         Maximum number of events to buffer in memory.
     topic:
         Topic to publish events to.
+    bind:
+        Whether to bind the PUB socket. When unset, preserve the endpoint-based
+        heuristic: bind wildcard, IPC and inproc addresses; connect otherwise.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -376,6 +424,7 @@ class ZmqEventPublisher(EventPublisher):
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
         topic: str = "",
+        bind: Optional[bool] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -384,9 +433,12 @@ class ZmqEventPublisher(EventPublisher):
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
+        self._local_pub_endpoint: Optional[str] = None
+        self._local_replay_endpoint: Optional[str] = None
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
+        self._bind = bind
         self._replay_endpoint = self.offset_endpoint_port(
             replay_endpoint, self._dp_rank
         )
@@ -414,6 +466,43 @@ class ZmqEventPublisher(EventPublisher):
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
+
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Report the bound socket, not a port reconstructed from global DP size.
+
+        Connect-style publishers and inproc sockets have no subscribable local
+        endpoint. They keep working as before, but are not advertised to external
+        processes. Wildcard binds are reachable on loopback from this node.
+        """
+
+        def local_endpoint(endpoint: Optional[str]) -> Optional[str]:
+            if endpoint is None:
+                return None
+            if endpoint.startswith("ipc://"):
+                return endpoint
+            if parse_advertisable_tcp(endpoint) is None:
+                return None
+            address = NetworkAddress.parse(endpoint[len("tcp://") :])
+            host = address.host
+            if host in ("*", "0.0.0.0"):
+                host = "127.0.0.1"
+            elif host == "::":
+                host = "::1"
+            return NetworkAddress(host, address.port).to_tcp()
+
+        endpoint = local_endpoint(self._local_pub_endpoint)
+        if endpoint is None:
+            return None
+        source = {
+            "dp_rank": self._dp_rank,
+            "endpoint": endpoint,
+            "topic": self._topic_bytes.decode("utf-8"),
+            "block_size": block_size,
+        }
+        replay_endpoint = local_endpoint(self._local_replay_endpoint)
+        if replay_endpoint is not None:
+            source["replay_endpoint"] = replay_endpoint
+        return source
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -453,23 +542,27 @@ class ZmqEventPublisher(EventPublisher):
         if self._pub is None:
             self._pub = self._ctx.socket(zmq.PUB)
             self._pub.set_hwm(self._hwm)
-            # Heuristic: bind if wildcard / * present, else connect.
+            # Default heuristic: bind if wildcard / * present, else connect.
             # bind stable, connect volatile convention.
             # ``0.0.0.0`` is the IPv4 bind-all wildcard alongside ``*``
             # and ``::``; ``/server_info`` advertises it as a wildcard,
             # so the publisher must bind it for the advertised endpoint
             # to actually be listening.
-            if (
-                "*" in self._endpoint
-                or "::" in self._endpoint
-                or "0.0.0.0" in self._endpoint
-                or self._endpoint.startswith("ipc://")
-                or self._endpoint.startswith("inproc://")
-            ):
+            should_bind = self._bind
+            if should_bind is None:
+                should_bind = (
+                    "*" in self._endpoint
+                    or "::" in self._endpoint
+                    or "0.0.0.0" in self._endpoint
+                    or self._endpoint.startswith("ipc://")
+                    or self._endpoint.startswith("inproc://")
+                )
+            if should_bind:
                 logger.debug(
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
                 self._pub.bind(self._endpoint)
+                self._local_pub_endpoint = self._bound_endpoint(self._pub)
             else:
                 self._pub.connect(self._endpoint)
 
@@ -483,6 +576,19 @@ class ZmqEventPublisher(EventPublisher):
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
+            self._local_replay_endpoint = self._bound_endpoint(self._replay)
+
+    @staticmethod
+    def _bound_endpoint(socket: zmq.Socket) -> str:
+        endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        if endpoint.startswith("ipc://"):
+            path = endpoint[len("ipc://") :]
+            # Capture the publisher's working directory at bind time so a
+            # separate process can use the address. Abstract IPC names are
+            # independent of the filesystem and must remain unchanged.
+            if not path.startswith("@"):
+                endpoint = f"ipc://{os.path.abspath(path)}"
+        return endpoint
 
     def _publisher_thread(self) -> None:
         """Background thread that processes the event queue."""
@@ -534,15 +640,12 @@ class ZmqEventPublisher(EventPublisher):
 
         for seq, buf in self._buffer:
             if seq >= start_seq:
-                # [identity, empty_delim, seq_bytes, payload]
-                # (identity, empty_delim) are stripped off by the router
-                # receiving payload is (seq_bytes, payload)
+                # Subscribers receive the same topic, sequence, and payload as live events.
                 self._replay.send_multipart(
-                    (client_id, b"", seq.to_bytes(8, "big"), buf)
+                    (client_id, b"", self._topic_bytes, seq.to_bytes(8, "big"), buf)
                 )
         # Send end of sequence marker
-        # receiving payload is (-1, b""")
-        self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
+        self._replay.send_multipart((client_id, b"", b"", self.END_SEQ, b""))
 
     @staticmethod
     def offset_endpoint_port(
@@ -589,6 +692,11 @@ class KVEventsConfig(BaseModel):
     """The zmq endpoint to use for publishing kv events.
     """
 
+    bind: Optional[bool] = None
+    """Bind (true) or connect (false) the PUB socket. When unset, infer from
+    the endpoint as before. Use true to bind a concrete address such as loopback.
+    """
+
     replay_endpoint: Optional[str] = None
     """The zmq endpoint to use for replaying kv events.
     """
@@ -612,10 +720,22 @@ class KVEventsConfig(BaseModel):
     this topic to receive events.
     """
 
+    format: Literal["default", "dynamo"] = "default"
+    """The event format. "default" is the SGLang format. "dynamo" is the format
+    the Dynamo KV router reads: block hashes also depend on extra_key and
+    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
         return KVEventsConfig.model_validate_json(cli_value)
+
+
+def uses_dynamo_format(kv_events_config: Optional[str]) -> bool:
+    if not kv_events_config:
+        return False
+    return KVEventsConfig.from_cli(kv_events_config).format == "dynamo"
 
 
 class EventPublisherFactory:
@@ -637,6 +757,8 @@ class EventPublisherFactory:
             return NullEventPublisher()
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
+        # The cache event recorder uses the format. The publisher does not accept it.
+        config_dict.pop("format")
 
         kind = config_dict.pop("publisher", "null")
         try:

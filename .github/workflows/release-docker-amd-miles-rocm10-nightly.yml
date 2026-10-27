@@ -2,6 +2,23 @@ name: Release Docker Images Nightly Miles ROCm10 (AMD)
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build only this variant (all = every variant below)"
+        required: false
+        type: choice
+        options: [all, rocm10-mi35x, rocm10-mi30x]
+        default: all
+      miles_repo:
+        description: "Miles repository to build from (e.g. a fork, to test an unmerged docker/ change)"
+        required: false
+        type: string
+        default: radixark/miles
+      miles_ref:
+        description: "Miles branch, tag or commit to build from"
+        required: false
+        type: string
+        default: main
   schedule:
     - cron: "0 12 * * *"
 
@@ -19,19 +36,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant:
-          - rocm10-mi35x
+        variant: ${{ fromJSON((inputs.variant && inputs.variant != 'all') && format('["{0}"]', inputs.variant) || '["rocm10-mi35x", "rocm10-mi30x"]') }}
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4
         with:
-          repository: radixark/miles
-          ref: main
+          repository: ${{ inputs.miles_repo || 'radixark/miles' }}
+          ref: ${{ inputs.miles_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Record miles commit
-        run: echo "Building from miles main @ $(git rev-parse HEAD)"
+        run: echo "Building from ${{ inputs.miles_repo || 'radixark/miles' }}@${{ inputs.miles_ref || 'main' }} ($(git rev-parse HEAD))"
 
       - name: Set date
         run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV

@@ -1,13 +1,12 @@
 import unittest
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
-)
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.kda import (
@@ -15,12 +14,77 @@ from sglang.kernels.ops.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
+
+
+@triton.jit
+def _normalize_qk_reference(X, Y, K: tl.constexpr, BK: tl.constexpr):
+    offsets = tl.program_id(0) * K + tl.arange(0, BK)
+    x = tl.load(X + offsets, tl.arange(0, BK) < K, other=0).to(tl.float32)
+    reciprocal_norm = 1.0 / tl.sqrt(tl.sum(x * x) + 1e-6)
+    tl.store(Y + offsets, x * reciprocal_norm, tl.arange(0, BK) < K)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestRecurrentQKNormalization(unittest.TestCase):
+    def test_fused_matches_pre_normalized_inputs(self):
+        torch.manual_seed(42)
+        device = get_device()
+        for is_kda in (False, True):
+            for K in (32, 64, 128):
+                with self.subTest(is_kda=is_kda, head_dim=K):
+                    B, T, H, V = 2, 4, 2, 32
+                    # Exact sums of squares isolate normalization arithmetic
+                    # from the standalone kernel's different reduction layout.
+                    q = torch.randint(-8, 9, (B, T, H, K), device=device).float()
+                    k = torch.randint(-8, 9, q.shape, device=device).float()
+                    normalized_q, normalized_k = (
+                        torch.empty_like(q),
+                        torch.empty_like(k),
+                    )
+                    for raw, normalized in ((q, normalized_q), (k, normalized_k)):
+                        _normalize_qk_reference[(B * T * H,)](
+                            raw, normalized, K, triton.next_power_of_2(K), num_warps=1
+                        )
+
+                    state = torch.randn(B, H, V, K, device=device)
+                    reference_state = state.clone()
+                    gate_dim = H * K if is_kda else H
+                    common = dict(
+                        A_log=torch.randn(H, device=device),
+                        a=torch.randn(B, T, gate_dim, device=device),
+                        dt_bias=torch.randn(gate_dim, device=device),
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                        v=torch.randn(B, T, H, V, device=device),
+                        b=torch.randn(B, T, H, device=device),
+                        initial_state_indices=torch.arange(B, device=device),
+                        is_kda=is_kda,
+                    )
+                    expected = fused_sigmoid_gating_delta_rule_update(
+                        q=normalized_q,
+                        k=normalized_k,
+                        initial_state_source=reference_state,
+                        use_qk_l2norm_in_kernel=False,
+                        **common,
+                    )
+                    actual = fused_sigmoid_gating_delta_rule_update(
+                        q=q,
+                        k=k,
+                        initial_state_source=state,
+                        use_qk_l2norm_in_kernel=True,
+                        **common,
+                    )
+                    self.assertTrue(torch.equal(actual, expected))
+                    self.assertTrue(torch.equal(state, reference_state))
 
 
 @unittest.skipIf(
@@ -726,6 +790,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         )
         return decode_output, decode_state, verify_output, verify_state[slots]
 
+    @unittest.skipIf(torch.version.hip, "match_cutedsl_decode is NVIDIA-only")
     def test_bf16_state_verify_matches_single_token_launches(self):
         for K in (128, 64):
             with self.subTest(head_dim=K):
@@ -754,6 +819,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
             verify_output.float(), decode_output.float(), atol=2e-2, rtol=1e-2
         )
 
+    @unittest.skipIf(torch.version.hip, "match_cutedsl_decode is NVIDIA-only")
     def test_fp32_state_pool_is_not_rounded(self):
         _, decode_state, _, verify_state = self._run_decode_loop_and_verify(
             B=2, T=16, H=4, K=128, state_dtype=torch.float32, match_decode=True
@@ -761,6 +827,13 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         self.assertTrue(torch.equal(verify_state, decode_state))
         rounded = verify_state.to(torch.bfloat16).to(torch.float32)
         self.assertFalse(torch.equal(verify_state, rounded))
+
+    @unittest.skipUnless(torch.version.hip, "ROCm rejects the parity mode")
+    def test_parity_mode_is_rejected_on_rocm(self):
+        with self.assertRaises(NotImplementedError):
+            self._run_decode_loop_and_verify(
+                B=1, T=1, H=1, K=64, state_dtype=torch.bfloat16, match_decode=True
+            )
 
 
 if __name__ == "__main__":

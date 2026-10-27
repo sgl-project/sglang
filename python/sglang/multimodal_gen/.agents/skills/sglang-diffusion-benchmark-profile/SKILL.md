@@ -9,7 +9,7 @@ Use this skill when measuring denoise performance, finding the slow op, checking
 
 This skill is diagnosis-first. It owns:
 - checked-in denoise benchmark presets
-- same-GPU quality/BCG applicability checks with repeated lossless, extra-high, and high rows
+- same-GPU quality/BCG applicability checks with repeated exact, lossless, and high rows
 - perf dump collection and before/after comparison
 - `torch.profiler` trace capture and quick hotspot ranking
 - mapping hot kernels back to known fast paths and fusion families
@@ -65,15 +65,15 @@ Always rule out these existing families first:
 - Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - SANA-Video's packed projections and request-scoped BF16-input linear
-  attention at `quality=extra-high` or `quality=high`; keep the second attention GEMM in FP32 and
-  compare against `quality=lossless` before changing its precision further
+  attention at `quality=lossless` or `quality=high`; keep the second attention GEMM in FP32 and
+  compare against `quality=exact` before changing its precision further
 - SANA-Video reuse of SANA's bit-exact bias/activation, residual-gate, and
   LayerNorm-modulation fast paths before adding video-only kernels
 - MiniMax-H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV,
   USP relayout, and batched TP AdaLN collectives
 - bit-exact diffusion adaLN modulation and fused LayerNorm + modulation for
   FLUX.1, GLM-Image, and SANA
-- request-scoped DiT and VAE fast paths at `quality=extra-high` or `quality=high`
+- request-scoped DiT and VAE fast paths at `quality=lossless` or `quality=high`
 - LingBot Video's default-on fused group-limited top-k expert selection before
   treating its router's `topk`/mask/gather chain as a new hotspot
 - Wan causal-VAE cache/padding and DupUp3D data-movement fusions
@@ -96,12 +96,12 @@ controlled comparator, never for the eager ground truth. The legacy
 `--no-torch-compile` spelling remains accepted but is redundant.
 
 For kernel/BCG discovery, run `--quality-bcg-matrix`. It executes Eager/BCG as
-A-B-B-A at `lossless`, then repeats the pair at `extra-high` and `high`, on
-one locked GPU set and one isolated checkpoint cache. The extra-high/high+BCG
+A-B-B-A at `exact`, then repeats the pair at `lossless` and `high`, on
+one locked GPU set and one isolated checkpoint cache. The lossless/high+BCG
 rows are applicability checks, not presumed-valid performance cells. A BCG row is invalid unless the log
 contains `[Diffusion BCG] captured` and contains no support-disable,
 capture-failure, serving-signature-miss, or late quality-fusion marker. In
-particular, a request-scoped DiT fusion mounted after lossless warmup capture
+particular, a request-scoped DiT fusion mounted after exact warmup capture
 would be bypassed by replay; reject that row even when capture and signature
 checks pass. For video presets, the helper declares both the request resolution
 and `--warmup-num-frames` so the synthetic BCG warmup captures the requested
@@ -122,7 +122,7 @@ its normal cleanup finally block without modifying the seed cache.
 
 Keep prompt, negative prompt, seed, shape, steps, guidance, dtype, topology,
 and residency fixed. Lossless comparisons require byte-identical artifacts.
-For `quality=extra-high` and `quality=high`, report aggregate and worst-frame SSIM/PSNR; the repository
+For `quality=lossless` and `quality=high`, report aggregate and worst-frame SSIM/PSNR; the repository
 defaults are 0.95/28 dB for images and 0.92/24 dB for video unless the model's
 checked-in consistency metadata defines a different threshold. A performance
 PR needs repeated saved-request e2e improvement of at least 1.5%, a

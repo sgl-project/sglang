@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h as model
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -11,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _rms(x):
@@ -48,16 +49,17 @@ def _build(pattern, tp, capture):
     instance.norm_f = _Norm()
     instance.layers_to_capture = set(range(len(pattern) + 1)) if capture else set()
     layers = []
-    for i, kind in enumerate(pattern):
-        cls = model.ALL_DECODER_LAYER_TYPES[kind]
-        layer = cls.__new__(cls)
-        nn.Module.__init__(layer)
-        layer.norm = _Norm()
-        layer._init_stage_boundary(config, i)
-        layer.mixer = _Mixer(0.5 if kind in "M*" else 0.25, tp)
-        if kind == "M":
-            layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)
-        layers.append(layer)
+    with layer_stack():
+        for i, kind in enumerate(pattern):
+            cls = model.ALL_DECODER_LAYER_TYPES[kind]
+            layer = cls.__new__(cls)
+            nn.Module.__init__(layer)
+            layer.norm = _Norm()
+            layer._init_stage_boundary(config, i)
+            layer.mixer = _Mixer(0.5 if kind in "M*" else 0.25, tp)
+            if kind == "M":
+                layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)
+            layers.append(layer)
     instance.layers = nn.ModuleList(layers)
     return instance
 

@@ -24,9 +24,9 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -61,21 +61,6 @@ def _find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
-
-
-def _previous_stage(block_configs, layer_idx: int):
-    """The declaration of the last attention or FFN before this layer, or None
-    when this layer's first stage starts the layer stack."""
-    for block in reversed(block_configs[:layer_idx]):
-        if not block.ffn.no_op:
-            return declare_ffn()
-        if not block.attention.no_op:
-            return declare_attn()
-    return None
-
-
-def _has_stage(block) -> bool:
-    return not (block.attention.no_op and block.ffn.no_op)
 
 
 class DeciLMDecoderLayer(nn.Module):
@@ -149,31 +134,36 @@ class DeciLMDecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        # A layer whose attention and FFN are both no-ops has no stages.
-        stages = []
+        norms = []
         if not self._is_no_op_attention:
-            stages.append((declare_attn(), self.input_layernorm))
+            norms.append(self.input_layernorm)
         if not self._is_no_op_ffn:
-            stages.append(
-                (
-                    declare_ffn(sparse=False, next_layer_sparse=False),
-                    self.post_attention_layernorm,
-                )
-            )
+            norms.append(self.post_attention_layernorm)
+        stages = list(zip(self.stage_facts(config, layer_idx), norms, strict=True))
         self.entry_boundary = None
         if stages:
-            boundaries = make_stages(
+            boundaries = append_stages(
                 *stages,
-                previous=_previous_stage(config.block_configs, layer_idx),
-                terminal=not any(
-                    _has_stage(block) for block in config.block_configs[layer_idx + 1 :]
-                ),
             )
             self.entry_boundary = boundaries[0]
             if not self._is_no_op_attention:
                 self.attn_boundary = boundaries[0]
             if not self._is_no_op_ffn:
                 self.ffn_boundary = boundaries[-1]
+
+    @staticmethod
+    def stage_facts(config: LlamaConfig, layer_idx: int):
+        """The stages a DeciLM layer declares, from its block config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers)."""
+        block_config = config.block_configs[layer_idx]
+        # A layer whose attention and FFN are both no-ops has no stages.
+        stages = []
+        if not block_config.attention.no_op:
+            stages.append(declare_attn())
+        if not block_config.ffn.no_op:
+            stages.append(declare_ffn(sparse=False, next_layer_sparse=False))
+        return tuple(stages)
 
     def forward(
         self,
@@ -242,6 +232,7 @@ class DeciModel(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: layer_type.stage_facts(config, idx),
         )
         if get_parallel().pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

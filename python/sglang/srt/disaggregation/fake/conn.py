@@ -43,8 +43,6 @@ class FakeKVSender(BaseKVSender):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
@@ -75,6 +73,9 @@ class FakeKVSender(BaseKVSender):
         logger.debug("FakeKVSender poll success")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self.poll()
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         # A send() that never comes must not pin the prefill inflight queue forever.
