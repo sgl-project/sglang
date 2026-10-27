@@ -34,9 +34,18 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
+    get_spec,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
+
+if is_xpu():
+    # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; isinstance(x, ()) is False.
+    CustomAllReduceV2 = ()
+else:
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -182,6 +191,9 @@ class DpPaddingMode(IntEnum):
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
+        if _decode_sum_len_fits_custom_all_reduce(global_num_tokens):
+            return cls.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
@@ -192,13 +204,43 @@ class DpPaddingMode(IntEnum):
             return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+    def get_default_mode_in_cuda_graph(
+        cls, global_num_tokens: Optional[List[int]] = None
+    ) -> DpPaddingMode:
+        """``global_num_tokens``: a decode capture's per-rank token counts."""
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or (
+            global_num_tokens is not None
+            and _decode_sum_len_fits_custom_all_reduce(global_num_tokens)
+        ):
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
+
+
+def _decode_sum_len_fits_custom_all_reduce(global_num_tokens: List[int]) -> bool:
+    """SUM_LEN gathers and combines DP decode rows with one TP all-reduce of the
+    summed buffer; take it while the custom all-reduce can hold that buffer.
+    A one-rank gather or a batch with an idle rank keeps the cost-based choice."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if (
+        dp_gather_width() <= 1
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) == 0
+        or not get_moe_a2a_backend().is_none()
+        or get_spec().speculative_algorithm is not None
+    ):
+        return False
+    comm = get_parallel().tp_group.ca_comm
+    dp = get_flags().dp
+    nbytes = sum(global_num_tokens) * dp.buffer_hidden_size * dp.buffer_dtype.itemsize
+    return (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and nbytes <= comm.max_size
+    )
 
 
 class _DpGatheredBufferWrapper:
@@ -226,7 +268,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-
         dp = get_flags().dp
         dp.buffer_hidden_size = hidden_size
         dp.buffer_dtype = dtype
@@ -249,7 +290,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
@@ -295,17 +335,14 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
-
         return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-
         return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-
         return get_flags().dp.buffer_device
 
     @classmethod
@@ -398,7 +435,6 @@ def set_is_extend_in_batch(is_extend_in_batch: bool):
 
 
 def get_is_extend_in_batch() -> bool:
-
     return get_forward().is_extend_in_batch
 
 
@@ -941,6 +977,13 @@ def _note_dp_gather_in_prefill_graph() -> None:
         dp.prefill_graph_has_dp_gather = True
 
 
+def note_rank_barrier_in_prefill_graph() -> None:
+    """For breaks that capture graphs of their own behind TP-group barriers."""
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_rank_barrier = True
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -1132,7 +1175,6 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-
     return get_stream("dp_tbo_comm")
 
 
@@ -1143,7 +1185,6 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
 def _tbo_event(key) -> torch.cuda.Event:
-
     pool = get_resources().tbo_event_pool
     ev = pool.get(key)
     if ev is None:
@@ -1206,17 +1247,36 @@ def dp_reduce_scatterv_async(
     sizes: List[int],
     event_key=("combine", 0),
 ) -> torch.cuda.Event:
-    """Launch the variable-length reduce_scatterv (combine) on the shared DP TBO
-    comm stream; re-record + return a PERSISTENT event (keyed by `event_key`).
-    Matches the gatherv (SUM_LEN) path."""
+    """Launch the TBO variable-length combine on the shared comm stream.
+    ``sizes`` has one entry per full-TP rank: a shard of its DP-local rows."""
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
+    parallel = get_parallel()
+    attn_tp_size = parallel.attn_tp_size
+    if attn_tp_size == 1:
+        output_shard = output_local
+    else:
+        shard_rows = sizes[parallel.tp_group.rank_in_group]
+        assert output_local.shape[0] == shard_rows * attn_tp_size
+        output_shard = get_tbo_persistent_buffer(
+            ("combine_shard", event_key),
+            shard_rows,
+            output_local.shape[1],
+            output_local.dtype,
+            output_local.device,
+        )
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
-        get_parallel().tp_group.reduce_scatterv(
-            global_tokens, output=output_local, sizes=sizes
+        parallel.tp_group.reduce_scatterv(
+            global_tokens, output=output_shard, sizes=sizes
         )
+        if attn_tp_size > 1:
+            # Not the group's custom all-gather: the other micro-batch's
+            # attention uses its buffers on the compute stream meanwhile.
+            all_gather_single(
+                output_local, output_shard, group=parallel.attn_tp_group.device_group
+            )
         ev.record(comm)
     return ev
 
