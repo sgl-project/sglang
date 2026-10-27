@@ -137,6 +137,7 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
     resolve_collector_class,
+    tokenizer_metric_labels,
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -724,13 +725,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
+    def is_healthy(self) -> bool:
+        """Return whether startup completed and the server is neither unhealthy nor shutting down."""
+        return not self.gracefully_exit and self.server_status == ServerStatus.Up
+
     def is_ready(self) -> bool:
         """Return whether this server should receive new requests."""
-        return (
-            not self.is_pause
-            and not self.gracefully_exit
-            and self.server_status == ServerStatus.Up
-        )
+        return not self.is_pause and self.is_healthy()
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -834,23 +835,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
-            )
-
-            labels = {
-                "model_name": get_serving().served_model_name,
-                "engine_type": engine_type,
-            }
-            if self.enable_priority_scheduling:
-                labels["priority"] = ""
-            if get_observability().tokenizer_metrics_allowed_custom_labels:
-                for (
-                    label
-                ) in get_observability().tokenizer_metrics_allowed_custom_labels:
-                    labels[label] = ""
-            if get_observability().extra_metric_labels:
-                labels.update(get_observability().extra_metric_labels)
+            labels = tokenizer_metric_labels()
             tokenizer_collector_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_TOKENIZER,
                 TokenizerMetricsCollector,

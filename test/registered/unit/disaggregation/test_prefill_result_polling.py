@@ -37,7 +37,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 class _StopLoop(Exception):
@@ -155,12 +155,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.attn_tp_cpu_group = None
         self.last_batch = None
         self.result_queue = deque()
+        self._deferred_responses = None
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
+        self._pause_started_at = None
+        self._pause_intervals = deque()
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
@@ -299,8 +302,13 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             result.delay_sample_func = sample
         return result
 
+    war_barrier_is_coarse = True
+
+    def _war_barrier_is_coarse(self):
+        return self.war_barrier_is_coarse
+
     def _apply_war_barrier(self):
-        pass
+        self.actions.append((self.iteration, "barrier", None))
 
     def process_batch_result(self, batch, result):
         assert all(pending is not result for _, pending in self.result_queue)
@@ -622,6 +630,32 @@ class TestPrefillResultPolling(CustomTestCase):
                 check_support.assert_not_called()
                 self.assertFalse(scheduler.enable_continuous_input_polling)
 
+    def test_coarse_war_barrier_follows_previous_result_processing(self):
+        steps = ("launch", "process_result", "inflight", "barrier")
+        for coarse, polling, ready_at, expected in (
+            # A whole-forward barrier waits until the previous result is processed.
+            (True, False, 1, ["launch", "process_result", "inflight", "barrier"]),
+            (True, True, 1, ["launch", "process_result", "inflight", "barrier"]),
+            # Polling for an unfinished result still applies it before intake.
+            (True, True, 2, ["launch", "barrier"]),
+            # A read-done barrier keeps its place right after the launch.
+            (False, False, 1, ["launch", "barrier", "process_result", "inflight"]),
+            (False, True, 2, ["launch", "barrier"]),
+        ):
+            with self.subTest(coarse=coarse, polling=polling, ready_at=ready_at):
+                scheduler = _Scheduler(
+                    [_batch(1), _batch(2)] + [None] * 4,
+                    {name: _result() for name in (1, 2)},
+                    {1: ready_at, 2: ready_at + 1},
+                )
+                scheduler.war_barrier_is_coarse = coarse
+                _run_loop(scheduler, enabled=polling)
+                # Step 1 launches batch 2 while batch 1's result is pending.
+                self.assertEqual(
+                    [a[1] for a in scheduler.actions if a[0] == 1 and a[1] in steps],
+                    expected,
+                )
+
     def test_chunk_handoffs_across_polling_and_retract_pause(self):
         for enabled, pause_at, blocking_ends in (
             (True, None, ()),
@@ -810,6 +844,66 @@ class TestPrefillResultPolling(CustomTestCase):
                     if process.is_alive():
                         process.terminate()
                         process.join(timeout=5)
+
+
+class _ForwardLaunched(Exception):
+    pass
+
+
+class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
+    """Just enough Scheduler state for run_batch to reach the forward launch."""
+
+    def __init__(self):
+        self.scheduler_stage_metrics = None
+        self.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        self.forward_ct = 0
+        self._sched_idled = False
+        self.processed_tokens_counter = 0
+        self.scripted_scheduler_hook = None
+        self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
+        self.forward_sleep_time = None
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.enable_staging = False
+        self.enable_overlap = False
+        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
+        self.send_kv_chunk = Mock()
+
+    @property
+    def is_generation(self):
+        raise _ForwardLaunched
+
+
+class TestCachedPrefixEarlySend(CustomTestCase):
+    def test_batch_that_starts_a_hicache_load_back_does_not_early_send(self):
+        """A request can match pages whose HiCache load-back was submitted in the same
+        build; early-sending them would read KV the H2D has not written yet (#44070)."""
+        for consumer_index, expect_send in ((-1, True), (0, False)):
+            scheduler = _EarlySendScheduler()
+            req = SimpleNamespace(
+                prefix_len=128,
+                host_hit_length=0,
+                start_send_idx=0,
+                pending_bootstrap=False,
+                early_send_prefix_end=None,
+            )
+            batch = SimpleNamespace(
+                reqs=[req],
+                hicache_consumer_index=consumer_index,
+                extend_num_tokens=32,
+                forward_mode=SimpleNamespace(
+                    is_split_prefill=lambda: False, is_prebuilt=lambda: False
+                ),
+            )
+            with self.subTest(consumer_index=consumer_index):
+                with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+                    with self.assertRaises(_ForwardLaunched):
+                        Scheduler.run_batch(scheduler, batch)
+                if expect_send:
+                    scheduler.send_kv_chunk.assert_called_once_with(
+                        req, last_chunk=False, end_idx=128
+                    )
+                else:
+                    scheduler.send_kv_chunk.assert_not_called()
 
 
 if __name__ == "__main__":

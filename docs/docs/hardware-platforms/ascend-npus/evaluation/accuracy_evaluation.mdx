@@ -26,10 +26,7 @@ First, launch the SGLang environment using the provided container image:
   <Tab title="Ascend A3 Series">
 
 ```shell Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily uses the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
-export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \

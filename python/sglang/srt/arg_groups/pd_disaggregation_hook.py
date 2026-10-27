@@ -248,8 +248,23 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
     field and agrees automatically. Decode is untouched: there the field names
     the PREFILL side's bootstrap port and must stay as the operator set it.
+    A transfer backend that brings its own bootstrap server keeps the port as
+    configured: that server, not the Rust registry, listens there.
     """
+    # Lazy: disagg_service pulls in the disaggregation package. Its helper calls
+    # disagg_service.get_kv_class, which a transfer backend registered at
+    # runtime may rebind.
+    from sglang.srt.managers.disagg_service import rust_server_serves_kv_bootstrap
+
     cfg = resolving_view(server_args)
+    if not rust_server_serves_kv_bootstrap(cfg.disaggregation_transfer_backend):
+        logger.info(
+            "SGLANG_RUST_SERVER: transfer backend %s runs its own KV bootstrap "
+            "server; keeping disaggregation_bootstrap_port %d",
+            cfg.disaggregation_transfer_backend,
+            cfg.disaggregation_bootstrap_port,
+        )
+        return
     default_port = next(
         f.default
         for f in record_fields(type(server_args))
@@ -351,12 +366,13 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MuseSpark."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
         )
 
     if (
