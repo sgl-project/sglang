@@ -1164,6 +1164,18 @@ def is_gfx1250_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_rdna_supported():
+    """Whether the device is a consumer AMD RDNA GPU (gfx11xx, gfx120x).
+
+    Excludes gfx1250 (MI455).
+    """
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        return arch.startswith(("gfx11", "gfx120"))
+    return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
