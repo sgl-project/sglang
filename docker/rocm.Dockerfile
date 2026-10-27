@@ -369,7 +369,9 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 ENV BUILD_RCCL="1"
-ENV RCCL_COMMIT_DEFAULT="4ca8623b699fe723929621d394af5144c9e643e0"
+# Head of ROCm/rocm-systems#14254: develop plus a fix for a hang in the first
+# all-reduce on gfx1250. Not merged yet; move to develop once it is.
+ENV RCCL_COMMIT_DEFAULT="1c0ab425abda9d1fd80fa977c253556b14eb140b"
 # hipBLASLt 10.1 looks for TensileLibrary_lazy_gfx1250.dat directly under
 # library/, not library/<arch>/, and every GEMM fails without this.
 ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
