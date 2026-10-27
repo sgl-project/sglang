@@ -1,0 +1,8 @@
+[package]
+name = "sglang-disagg"
+description = "Byte-exact wire codecs and room state machines for the SGLang P/D disaggregation data plane (Python-owned wire formats)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

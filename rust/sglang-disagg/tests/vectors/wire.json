@@ -1,0 +1,1515 @@
+{
+ "pack": [
+  {
+   "lists": [],
+   "fmt": "Q",
+   "packed": ""
+  },
+  {
+   "lists": [
+    []
+   ],
+   "fmt": "Q",
+   "packed": "0100000000000000"
+  },
+  {
+   "lists": [
+    [
+     "1",
+     "2"
+    ],
+    [],
+    [
+     "18446744073709551615"
+    ]
+   ],
+   "fmt": "Q",
+   "packed": "0300000010000000000000000800000001000000000000000200000000000000ffffffffffffffff"
+  },
+  {
+   "lists": [
+    [
+     "0",
+     "4294967295"
+    ],
+    [
+     "7"
+    ]
+   ],
+   "fmt": "I",
+   "packed": "02000000080000000400000000000000ffffffff07000000"
+  },
+  {
+   "lists": [
+    [
+     "-1",
+     "0",
+     "2147483647",
+     "-2147483648"
+    ]
+   ],
+   "fmt": "i",
+   "packed": "0100000010000000ffffffff00000000ffffff7f00000080"
+  },
+  {
+   "lists": [
+    [],
+    []
+   ],
+   "fmt": "i",
+   "packed": "020000000000000000000000"
+  }
+ ],
+ "pack_buffers": [
+  {
+   "buffers": [],
+   "packed": ""
+  },
+  {
+   "buffers": [
+    ""
+   ],
+   "packed": "0100000000000000"
+  },
+  {
+   "buffers": [
+    "68656c6c6f",
+    "",
+    "00ff00ff00ff00ff00ff00ff00ff"
+   ],
+   "packed": "0300000005000000000000000e00000068656c6c6f00ff00ff00ff00ff00ff00ff00ff"
+  }
+ ],
+ "kv_status": [
+  {
+   "name": "plain_boot",
+   "tag": null,
+   "carries_reason": false,
+   "frames": [
+    "34323432",
+    "31",
+    "3137"
+   ],
+   "parsed": [
+    4242,
+    1,
+    17,
+    null
+   ]
+  },
+  {
+   "name": "plain_success",
+   "tag": null,
+   "carries_reason": false,
+   "frames": [
+    "34323432",
+    "34",
+    "3137"
+   ],
+   "parsed": [
+    4242,
+    4,
+    17,
+    null
+   ]
+  },
+  {
+   "name": "nixl_waiting",
+   "tag": "KV_STATUS",
+   "carries_reason": true,
+   "frames": [
+    "4b565f535441545553",
+    "34323432",
+    "32",
+    "3137",
+    ""
+   ],
+   "parsed": [
+    4242,
+    2,
+    17,
+    null
+   ]
+  },
+  {
+   "name": "nixl_failed_reason",
+   "tag": "KV_STATUS",
+   "carries_reason": true,
+   "frames": [
+    "4b565f535441545553",
+    "34323432",
+    "30",
+    "3137",
+    "706565722064696564"
+   ],
+   "parsed": [
+    4242,
+    0,
+    17,
+    "peer died"
+   ]
+  },
+  {
+   "name": "nixl_failed_unicode",
+   "tag": "KV_STATUS",
+   "carries_reason": true,
+   "frames": [
+    "4b565f535441545553",
+    "34323432",
+    "30",
+    "3137",
+    "6465616420e298a02070c3a96572"
+   ],
+   "parsed": [
+    4242,
+    0,
+    17,
+    "dead \u2620 p\u00e9er"
+   ]
+  },
+  {
+   "name": "mori_failed_empty",
+   "tag": "MoriMsgGuard",
+   "carries_reason": true,
+   "frames": [
+    "4d6f72694d73674775617264",
+    "34323432",
+    "30",
+    "3137",
+    ""
+   ],
+   "parsed": [
+    4242,
+    0,
+    17,
+    null
+   ]
+  }
+ ],
+ "abort": [
+  {
+   "name": "room_only",
+   "frames": [
+    "41424f5254",
+    "3939"
+   ],
+   "parsed": {
+    "room": 99,
+    "decode_ip": null,
+    "decode_port": null,
+    "generation": null
+   }
+  },
+  {
+   "name": "addr",
+   "frames": [
+    "41424f5254",
+    "3939",
+    "31302e302e302e33",
+    "3330303031"
+   ],
+   "parsed": {
+    "room": 99,
+    "decode_ip": "10.0.0.3",
+    "decode_port": 30001,
+    "generation": null
+   }
+  },
+  {
+   "name": "addr_gen",
+   "frames": [
+    "41424f5254",
+    "3939",
+    "31302e302e302e33",
+    "3330303031",
+    "37"
+   ],
+   "parsed": {
+    "room": 99,
+    "decode_ip": "10.0.0.3",
+    "decode_port": 30001,
+    "generation": 7
+   }
+  },
+  {
+   "name": "gen_no_addr",
+   "frames": [
+    "41424f5254",
+    "3939"
+   ],
+   "parsed": {
+    "room": 99,
+    "decode_ip": null,
+    "decode_port": null,
+    "generation": null
+   }
+  },
+  {
+   "name": "bad_addr_degrades",
+   "frames": [
+    "41424f5254",
+    "3939",
+    "31302e302e302e33",
+    "6e6f742d612d706f7274"
+   ],
+   "parsed": {
+    "room": 99,
+    "decode_ip": null,
+    "decode_port": null,
+    "generation": null
+   }
+  }
+ ],
+ "abort_ack": [
+  {
+   "name": "plain",
+   "frames": [
+    "41424f52545f41434b",
+    "3939",
+    "33"
+   ],
+   "parsed": {
+    "room": 99,
+    "prefill_rank": 3,
+    "generation": null
+   }
+  },
+  {
+   "name": "gen",
+   "frames": [
+    "41424f52545f41434b",
+    "3939",
+    "33",
+    "37"
+   ],
+   "parsed": {
+    "room": 99,
+    "prefill_rank": 3,
+    "generation": 7
+   }
+  }
+ ],
+ "bootstrap": [
+  {
+   "frames": [
+    "424f4f545354524150",
+    "34323432",
+    "3139322e3136382e312e39",
+    "3330303032"
+   ],
+   "parsed": {
+    "room": 4242,
+    "ip": "192.168.1.9",
+    "port": 30002
+   }
+  }
+ ],
+ "chunk_ready": [
+  {
+   "frames": [
+    "4348554e4b5f5245414459",
+    "34323432",
+    "33",
+    "313430",
+    "3136",
+    "7772697465722d30",
+    "35"
+   ],
+   "parsed": {
+    "room": 4242,
+    "chunk_idx": 3,
+    "page_start": 140,
+    "num_pages": 16,
+    "writer_id": "writer-0"
+   }
+  }
+ ],
+ "registration": [
+  {
+   "name": "basic",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "4e6f6e65",
+    "3139322e3136382e312e3337",
+    "3330303031",
+    "6167656e742d58",
+    "01026167656e742d6d657461ff",
+    "00100000007f000000200100007f0000",
+    "00000200007f0000",
+    "040000000800000008000000080000000800000000001000007f000000101000007f000000201000007f000000301000007f0000",
+    "35",
+    "3136",
+    "33",
+    "34303936",
+    "040000000400000004000000040000000400000000400000004000000040000000400000",
+    "04000000080000000800000008000000080000000200000080000000020000008000000002000000800000000200000080000000",
+    "",
+    "",
+    "323536",
+    "5652414d2c4452414d",
+    "00100000000000000010000000000000",
+    "040000000400000004000000040000000400000000000000010000000200000003000000",
+    "03000000070000000b0000003b000000",
+    "31",
+    "30",
+    "04000000080000000800000008000000080000000000010000000000000001000000000000000100000000000000010000000000"
+   ],
+   "parsed": {
+    "room": "None",
+    "endpoint": "192.168.1.37",
+    "dst_port": 30001,
+    "agent_name": "agent-X",
+    "agent_metadata": "01026167656e742d6d657461ff",
+    "dst_kv_ptrs": [
+     "139637976731648",
+     "139637976801280"
+    ],
+    "dst_kv_mem_kinds": [
+     "VRAM",
+     "DRAM"
+    ],
+    "dst_aux_ptrs": [
+     "139637976858624"
+    ],
+    "dst_state_data_ptrs": [
+     [
+      "139637977776128"
+     ],
+     [
+      "139637977780224"
+     ],
+     [
+      "139637977784320"
+     ],
+     [
+      "139637977788416"
+     ]
+    ],
+    "gpu_id": 5,
+    "decode_tp_size": 16,
+    "decode_tp_rank": 3,
+    "dst_kv_item_len": "4096",
+    "dst_kv_item_lens": [
+     "4096",
+     "4096"
+    ],
+    "dst_kv_layer_ids": [
+     3,
+     7,
+     11,
+     59
+    ],
+    "dst_dcp_size": 1,
+    "dst_dcp_rank": 0,
+    "dst_num_slots": "256",
+    "dst_state_item_lens": [
+     [
+      16384
+     ],
+     [
+      16384
+     ],
+     [
+      16384
+     ],
+     [
+      16384
+     ]
+    ],
+    "dst_state_dim_per_tensor": [
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ]
+    ],
+    "dst_state_layer_ids": [
+     [
+      0
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      3
+     ]
+    ],
+    "staging_base_ptr": "0",
+    "staging_total_size": "0",
+    "dst_state_data_lens": [
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "staging",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "4e6f6e65",
+    "3139322e3136382e312e3337",
+    "3330303031",
+    "6167656e742d58",
+    "01026167656e742d6d657461ff",
+    "00100000007f000000200100007f0000",
+    "00000200007f0000",
+    "040000000800000008000000080000000800000000001000007f000000101000007f000000201000007f000000301000007f0000",
+    "35",
+    "3136",
+    "33",
+    "34303936",
+    "040000000400000004000000040000000400000000400000004000000040000000400000",
+    "04000000080000000800000008000000080000000200000080000000020000008000000002000000800000000200000080000000",
+    "00000080007f0000",
+    "3136373737323136",
+    "323536",
+    "5652414d2c4452414d",
+    "00100000000000000010000000000000",
+    "040000000400000004000000040000000400000000000000010000000200000003000000",
+    "03000000070000000b0000003b000000",
+    "31",
+    "30",
+    "04000000080000000800000008000000080000000000010000000000000001000000000000000100000000000000010000000000"
+   ],
+   "parsed": {
+    "room": "None",
+    "endpoint": "192.168.1.37",
+    "dst_port": 30001,
+    "agent_name": "agent-X",
+    "agent_metadata": "01026167656e742d6d657461ff",
+    "dst_kv_ptrs": [
+     "139637976731648",
+     "139637976801280"
+    ],
+    "dst_kv_mem_kinds": [
+     "VRAM",
+     "DRAM"
+    ],
+    "dst_aux_ptrs": [
+     "139637976858624"
+    ],
+    "dst_state_data_ptrs": [
+     [
+      "139637977776128"
+     ],
+     [
+      "139637977780224"
+     ],
+     [
+      "139637977784320"
+     ],
+     [
+      "139637977788416"
+     ]
+    ],
+    "gpu_id": 5,
+    "decode_tp_size": 16,
+    "decode_tp_rank": 3,
+    "dst_kv_item_len": "4096",
+    "dst_kv_item_lens": [
+     "4096",
+     "4096"
+    ],
+    "dst_kv_layer_ids": [
+     3,
+     7,
+     11,
+     59
+    ],
+    "dst_dcp_size": 1,
+    "dst_dcp_rank": 0,
+    "dst_num_slots": "256",
+    "dst_state_item_lens": [
+     [
+      16384
+     ],
+     [
+      16384
+     ],
+     [
+      16384
+     ],
+     [
+      16384
+     ]
+    ],
+    "dst_state_dim_per_tensor": [
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ],
+     [
+      2,
+      128
+     ]
+    ],
+    "dst_state_layer_ids": [
+     [
+      0
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      3
+     ]
+    ],
+    "staging_base_ptr": "139640124211200",
+    "staging_total_size": "16777216",
+    "dst_state_data_lens": [
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ],
+     [
+      "65536"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "empty_state",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "4e6f6e65",
+    "3139322e3136382e312e3337",
+    "3330303031",
+    "6167656e742d58",
+    "01026167656e742d6d657461ff",
+    "00100000007f000000200100007f0000",
+    "00000200007f0000",
+    "",
+    "35",
+    "3136",
+    "33",
+    "34303936",
+    "",
+    "",
+    "",
+    "",
+    "323536",
+    "5652414d2c4452414d",
+    "00100000000000000010000000000000",
+    "",
+    "03000000070000000b0000003b000000",
+    "31",
+    "30",
+    ""
+   ],
+   "parsed": {
+    "room": "None",
+    "endpoint": "192.168.1.37",
+    "dst_port": 30001,
+    "agent_name": "agent-X",
+    "agent_metadata": "01026167656e742d6d657461ff",
+    "dst_kv_ptrs": [
+     "139637976731648",
+     "139637976801280"
+    ],
+    "dst_kv_mem_kinds": [
+     "VRAM",
+     "DRAM"
+    ],
+    "dst_aux_ptrs": [
+     "139637976858624"
+    ],
+    "dst_state_data_ptrs": [],
+    "gpu_id": 5,
+    "decode_tp_size": 16,
+    "decode_tp_rank": 3,
+    "dst_kv_item_len": "4096",
+    "dst_kv_item_lens": [
+     "4096",
+     "4096"
+    ],
+    "dst_kv_layer_ids": [
+     3,
+     7,
+     11,
+     59
+    ],
+    "dst_dcp_size": 1,
+    "dst_dcp_rank": 0,
+    "dst_num_slots": "256",
+    "dst_state_item_lens": [],
+    "dst_state_dim_per_tensor": [],
+    "dst_state_layer_ids": [],
+    "staging_base_ptr": "0",
+    "staging_total_size": "0",
+    "dst_state_data_lens": []
+   }
+  }
+ ],
+ "metadata": [
+  {
+   "name": "kv_run",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373737",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "640000006500000066000000670000006800000069000000",
+    "32",
+    "38",
+    "",
+    "30",
+    "30"
+   ],
+   "parsed": {
+    "room": 777,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [
+     100,
+     101,
+     102,
+     103,
+     104,
+     105
+    ],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [],
+    "decode_prefix_len": 0,
+    "is_dummy": false
+   }
+  },
+  {
+   "name": "state_only",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373738",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "",
+    "32",
+    "38",
+    "020000000800000004000000010000000200000003000000",
+    "30",
+    "30"
+   ],
+   "parsed": {
+    "room": 778,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [
+     [
+      1,
+      2
+     ],
+     [
+      3
+     ]
+    ],
+    "decode_prefix_len": 0,
+    "is_dummy": false
+   }
+  },
+  {
+   "name": "prefix_hit",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373739",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "",
+    "32",
+    "38",
+    "020000000400000004000000090000000a000000",
+    "37",
+    "30"
+   ],
+   "parsed": {
+    "room": 779,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [
+     [
+      9
+     ],
+     [
+      10
+     ]
+    ],
+    "decode_prefix_len": 7,
+    "is_dummy": false
+   }
+  },
+  {
+   "name": "aux_only",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373830",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "",
+    "32",
+    "38",
+    "",
+    "30",
+    "30"
+   ],
+   "parsed": {
+    "room": 780,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [],
+    "decode_prefix_len": 0,
+    "is_dummy": false
+   }
+  },
+  {
+   "name": "kv_and_state",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373831",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "05000000060000000700000008000000",
+    "32",
+    "38",
+    "02000000040000000000000009000000",
+    "30",
+    "30"
+   ],
+   "parsed": {
+    "room": 781,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [
+     5,
+     6,
+     7,
+     8
+    ],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [
+     [
+      9
+     ],
+     []
+    ],
+    "decode_prefix_len": 0,
+    "is_dummy": false
+   }
+  },
+  {
+   "name": "dummy",
+   "frames": [
+    "4e69786c4d73674775617264",
+    "373832",
+    "31302e302e302e39",
+    "3330303032",
+    "6167656e742d59",
+    "",
+    "32",
+    "38",
+    "",
+    "30",
+    "31"
+   ],
+   "parsed": {
+    "room": 782,
+    "endpoint": "10.0.0.9",
+    "dst_port": 30002,
+    "agent_name": "agent-Y",
+    "dst_kv_indices": [],
+    "dst_aux_index": 2,
+    "required_dst_info_num": 8,
+    "dst_state_indices": [],
+    "decode_prefix_len": 0,
+    "is_dummy": true
+   }
+  }
+ ],
+ "http": {
+  "put_row": "{\"attn_tp_size\": 16, \"attn_tp_rank\": 3, \"attn_cp_size\": 1, \"attn_cp_rank\": 0, \"attn_dp_size\": 2, \"attn_dp_rank\": 1, \"pp_size\": 1, \"pp_rank\": 0, \"system_dp_size\": 1, \"system_dp_rank\": 0, \"rank_ip\": \"10.0.0.5\", \"rank_port\": 30011, \"page_size\": 1, \"kv_cache_dtype\": \"auto\", \"kv_layout\": null, \"dsv41_spec_layout\": null, \"load_balance_method\": \"round_robin\", \"enable_dsa_cache_layer_split\": false, \"enable_kv_cache_sharding\": false, \"prefill_http_port\": 8100, \"decode_allocation_policy\": \"early\"}",
+  "rank_row": "{\"rank_ip\": \"10.0.0.5\", \"rank_port\": 30011}",
+  "get_row": "{\"attn_tp_size\": 8, \"attn_cp_size\": 1, \"dp_size\": 16, \"pp_size\": 1, \"page_size\": 1, \"kv_cache_dtype\": \"auto\", \"follow_bootstrap_room\": true, \"enable_dsa_cache_layer_split\": false, \"decode_allocation_policy\": \"early\", \"enable_kv_cache_sharding\": false, \"prefill_http_port\": 8100, \"target_tp_rank\": null, \"target_tp_ranks\": null, \"target_cp_ranks\": null, \"target_pp_ranks\": null, \"required_dst_info_num\": null, \"required_prefill_response_num\": null}",
+  "get_row_kv_layout": "{\"attn_tp_size\": 8, \"attn_cp_size\": 1, \"dp_size\": 16, \"pp_size\": 1, \"page_size\": 1, \"kv_cache_dtype\": \"auto\", \"follow_bootstrap_room\": true, \"enable_dsa_cache_layer_split\": false, \"kv_layout\": \"layer_first\", \"decode_allocation_policy\": \"early\", \"enable_kv_cache_sharding\": false, \"prefill_http_port\": 8100, \"target_tp_rank\": null, \"target_tp_ranks\": null, \"target_cp_ranks\": null, \"target_pp_ranks\": null, \"required_dst_info_num\": null, \"required_prefill_response_num\": null}",
+  "get_row_dsv41": "{\"attn_tp_size\": 8, \"attn_cp_size\": 1, \"dp_size\": 16, \"pp_size\": 1, \"page_size\": 1, \"kv_cache_dtype\": \"auto\", \"follow_bootstrap_room\": true, \"enable_dsa_cache_layer_split\": false, \"dsv41_spec_layout\": {\"a\": 1, \"b\": \"x\"}, \"kv_layout\": \"layer_first\", \"decode_allocation_policy\": \"early\", \"enable_kv_cache_sharding\": false, \"prefill_http_port\": 8100, \"target_tp_rank\": null, \"target_tp_ranks\": null, \"target_cp_ranks\": null, \"target_pp_ranks\": null, \"required_dst_info_num\": null, \"required_prefill_response_num\": null}"
+ },
+ "room": {
+  "update_status": [
+   {
+    "name": "monotone",
+    "steps": [
+     [
+      1,
+      1
+     ],
+     [
+      1,
+      2
+     ],
+     [
+      1,
+      3
+     ],
+     [
+      1,
+      4
+     ]
+    ],
+    "final": {
+     "1": 4
+    }
+   },
+   {
+    "name": "open_waiting",
+    "steps": [
+     [
+      2,
+      2
+     ]
+    ],
+    "final": {
+     "2": 2
+    }
+   },
+   {
+    "name": "no_create_on_terminal",
+    "steps": [
+     [
+      3,
+      4
+     ],
+     [
+      3,
+      0
+     ],
+     [
+      3,
+      3
+     ]
+    ],
+    "final": {}
+   },
+   {
+    "name": "failed_over_success",
+    "steps": [
+     [
+      4,
+      1
+     ],
+     [
+      4,
+      4
+     ],
+     [
+      4,
+      0
+     ]
+    ],
+    "final": {
+     "4": 0
+    }
+   },
+   {
+    "name": "failed_terminal",
+    "steps": [
+     [
+      5,
+      1
+     ],
+     [
+      5,
+      0
+     ],
+     [
+      5,
+      4
+     ],
+     [
+      5,
+      3
+     ]
+    ],
+    "final": {
+     "5": 0
+    }
+   },
+   {
+    "name": "lower_ignored",
+    "steps": [
+     [
+      6,
+      1
+     ],
+     [
+      6,
+      3
+     ],
+     [
+      6,
+      2
+     ],
+     [
+      6,
+      1
+     ]
+    ],
+    "final": {
+     "6": 3
+    }
+   }
+  ],
+  "decode": [
+   {
+    "name": "quorum_two",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      1,
+      2
+     ],
+     [
+      "apply",
+      1,
+      4,
+      0,
+      null
+     ],
+     [
+      "apply",
+      1,
+      4,
+      1,
+      null
+     ]
+    ],
+    "final_status": {
+     "1": 4
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "1": [
+      0,
+      1
+     ]
+    }
+   },
+   {
+    "name": "duplicate_rank_no_quorum",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      2,
+      2
+     ],
+     [
+      "apply",
+      2,
+      4,
+      0,
+      null
+     ],
+     [
+      "apply",
+      2,
+      4,
+      0,
+      null
+     ]
+    ],
+    "final_status": {
+     "2": 1
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "2": [
+      0
+     ]
+    }
+   },
+   {
+    "name": "missing_required_warns",
+    "defer": false,
+    "ops": [
+     [
+      "open_tracker_only",
+      3
+     ],
+     [
+      "apply",
+      3,
+      4,
+      0,
+      null
+     ]
+    ],
+    "final_status": {
+     "3": 1
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "3": [
+      0
+     ]
+    }
+   },
+   {
+    "name": "failed_reason",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      4,
+      1
+     ],
+     [
+      "apply",
+      4,
+      0,
+      0,
+      "peer died"
+     ]
+    ],
+    "final_status": {
+     "4": 0
+    },
+    "final_failures": {
+     "4": "peer died"
+    },
+    "final_tracker": {
+     "4": []
+    }
+   },
+   {
+    "name": "failed_default_reason",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      5,
+      1
+     ],
+     [
+      "apply",
+      5,
+      0,
+      0,
+      null
+     ]
+    ],
+    "final_status": {
+     "5": 0
+    },
+    "final_failures": {
+     "5": "Failed to get kvcache from prefill instance, it might be dead"
+    },
+    "final_tracker": {
+     "5": []
+    }
+   },
+   {
+    "name": "late_status_dropped",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      6,
+      1
+     ],
+     [
+      "clear",
+      6
+     ],
+     [
+      "apply",
+      6,
+      0,
+      0,
+      "late"
+     ]
+    ],
+    "final_status": {},
+    "final_failures": {},
+    "final_tracker": {}
+   },
+   {
+    "name": "waiting_defer_off",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      7,
+      1
+     ],
+     [
+      "apply",
+      7,
+      2,
+      0,
+      null
+     ]
+    ],
+    "final_status": {
+     "7": 1
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "7": []
+    }
+   },
+   {
+    "name": "waiting_defer_on",
+    "defer": true,
+    "ops": [
+     [
+      "open",
+      8,
+      1
+     ],
+     [
+      "apply",
+      8,
+      2,
+      0,
+      null
+     ]
+    ],
+    "final_status": {
+     "8": 2
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "8": []
+    }
+   },
+   {
+    "name": "abort_active",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      9,
+      1
+     ],
+     [
+      "abort",
+      9
+     ]
+    ],
+    "final_status": {
+     "9": 0
+    },
+    "final_failures": {
+     "9": "Aborted by AbortReq."
+    },
+    "final_tracker": {
+     "9": []
+    }
+   },
+   {
+    "name": "abort_msg_success_room",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      10,
+      1
+     ],
+     [
+      "apply",
+      10,
+      4,
+      0,
+      null
+     ],
+     [
+      "abort_msg",
+      10
+     ]
+    ],
+    "final_status": {
+     "10": 4
+    },
+    "final_failures": {},
+    "final_tracker": {
+     "10": [
+      0
+     ]
+    }
+   },
+   {
+    "name": "abort_msg_failed_room",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      11,
+      1
+     ],
+     [
+      "apply",
+      11,
+      0,
+      0,
+      null
+     ],
+     [
+      "abort_msg",
+      11
+     ]
+    ],
+    "final_status": {
+     "11": 0
+    },
+    "final_failures": {
+     "11": "Failed to get kvcache from prefill instance, it might be dead"
+    },
+    "final_tracker": {
+     "11": []
+    }
+   },
+   {
+    "name": "clear_keeps_failure",
+    "defer": false,
+    "ops": [
+     [
+      "open",
+      12,
+      1
+     ],
+     [
+      "apply",
+      12,
+      0,
+      0,
+      "x"
+     ],
+     [
+      "clear",
+      12
+     ]
+    ],
+    "final_status": {},
+    "final_failures": {
+     "12": "x"
+    },
+    "final_tracker": {}
+   }
+  ],
+  "deferred_abort": [
+   [
+    "register",
+    1,
+    1
+   ],
+   [
+    "register",
+    2,
+    2
+   ],
+   [
+    "note_ack",
+    1,
+    0,
+    1
+   ],
+   [
+    "note_ack",
+    1,
+    1,
+    99
+   ],
+   [
+    "is_safe",
+    1,
+    1,
+    true
+   ],
+   [
+    "register",
+    1,
+    3
+   ],
+   [
+    "note_ack",
+    1,
+    0,
+    1
+   ],
+   [
+    "is_safe",
+    1,
+    1,
+    false
+   ],
+   [
+    "note_ack",
+    1,
+    0,
+    3
+   ],
+   [
+    "is_safe",
+    1,
+    1,
+    true
+   ],
+   [
+    "clear",
+    1
+   ],
+   [
+    "is_safe",
+    1,
+    0,
+    true
+   ]
+  ],
+  "prefill": [
+   {
+    "name": "quorum_two_agents",
+    "adds": [
+     [
+      101,
+      "a",
+      2,
+      null,
+      false
+     ],
+     [
+      101,
+      "b",
+      2,
+      7,
+      false
+     ]
+    ],
+    "results": [
+     null,
+     7
+    ],
+    "final_status": {
+     "101": 2
+    },
+    "final_prefixes": {
+     "101": 7
+    }
+   },
+   {
+    "name": "single_agent_no_prefix",
+    "adds": [
+     [
+      102,
+      "a",
+      1,
+      null,
+      false
+     ]
+    ],
+    "results": [
+     0
+    ],
+    "final_status": {
+     "102": 2
+    },
+    "final_prefixes": {
+     "102": 0
+    }
+   },
+   {
+    "name": "overwrite_then_complete",
+    "adds": [
+     [
+      103,
+      "a",
+      2,
+      null,
+      false
+     ],
+     [
+      103,
+      "a",
+      2,
+      5,
+      false
+     ],
+     [
+      103,
+      "b",
+      2,
+      null,
+      false
+     ]
+    ],
+    "results": [
+     null,
+     null,
+     5
+    ],
+    "final_status": {
+     "103": 2
+    },
+    "final_prefixes": {
+     "103": 5
+    }
+   }
+  ]
+ }
+}
