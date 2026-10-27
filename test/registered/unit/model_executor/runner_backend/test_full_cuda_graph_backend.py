@@ -51,13 +51,12 @@ class _FakeGraphCtx:
 
 
 def _make_backend(runner):
-    """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
-    touch CUDA), wiring just the attributes ``capture_one`` reads."""
-    backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
-    backend._graphs = {}
-    backend._outputs = {}
-    backend._pool = None
-    backend._capture_stream = None
+    """Use the production constructor; replace only CUDA memory measurement."""
+    with mock.patch(
+        "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.get_parallel",
+        return_value=SimpleNamespace(tp_group=SimpleNamespace(barrier=mock.Mock())),
+    ):
+        backend = FullCudaGraphBackend(runner)
     backend._precarve = SimpleNamespace(
         measure=contextlib.nullcontext, mint=mock.Mock()
     )
@@ -66,7 +65,6 @@ def _make_backend(runner):
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
-    backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     return backend
 
 
@@ -84,6 +82,24 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
     if profiler is not _UNSET:
         runner._profiler = profiler
     return runner
+
+
+class TestStandaloneExecutionContext(CustomTestCase):
+    def test_rejects_invalid_warmup_policy(self):
+        for count in (-1, True, 0.5):
+            with self.subTest(warmup_steps=count), self.assertRaises(ValueError):
+                FullCudaGraphBackend(device_module=object(), warmup_steps=count)
+        with self.assertRaises(ValueError):
+            FullCudaGraphBackend(
+                device_module=object(), warmup_steps=0, reuse_output_buffer=True
+            )
+
+    def test_requires_one_execution_context(self):
+        with self.assertRaises(ValueError):
+            FullCudaGraphBackend()
+        runner = _make_runner(enable_profile=False, profiler=None)
+        with self.assertRaises(ValueError):
+            FullCudaGraphBackend(runner, device_module=runner.device_module)
 
 
 class TestCaptureOneNoProfiling(CustomTestCase):

@@ -25,6 +25,13 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.afd.config import AFDExecutionMode
+from sglang.srt.afd.model_hooks import (
+    afd_execution_mode,
+    afd_m2n_enabled,
+    afd_model_forward,
+)
+from sglang.srt.afd.model_proxy import AFDProxyAttention, AFDProxyMLP
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed import (
@@ -46,6 +53,7 @@ from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
+    get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -59,6 +67,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -82,9 +91,19 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    DeepseekV2ForCausalLM,
+    DeepseekV2MLP,
+    DeepseekV2Model,
+    MoEGate,
+)
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1281,8 +1300,318 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
+class Glm5AFDRouterShared(nn.Module):
+    """Native GLM router/shared expert on A; routed expert storage remains on F."""
+
+    def __init__(self, config, layer_id, quant_config, prefix):
+        super().__init__()
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.moe.topk import TopKOutputFormat
+
+        if (
+            config.hidden_size != 6144
+            or config.n_routed_experts != 256
+            or config.moe_intermediate_size != 2048
+            or config.num_experts_per_tok != 8
+            or config.n_shared_experts != 1
+            or config.routed_scaling_factor != 2.5
+            or config.hidden_act != "silu"
+        ):
+            raise RuntimeError("AFD_M2N_GLM5_ROUTER_SHARED_LAYOUT_REQUIRED")
+        self.gate = MoEGate(
+            config=config, quant_config=quant_config, prefix=add_prefix("gate", prefix)
+        )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            scoring_func=config.scoring_func,
+            correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
+            routed_scaling_factor=config.routed_scaling_factor,
+            # M2N AG applies routed scale. Shared output is added afterwards.
+            apply_routed_scaling_factor_on_output=False,
+            output_format=TopKOutputFormat.STANDARD,
+        )
+        self.topk.bind_runner_backend(
+            MoeRunnerBackend.TRITON, routing_method_type=RoutingMethodType.DeepSeekV3
+        )
+        if is_routed_scaling_factor_fused_in_topk(self.topk.topk_config):
+            raise RuntimeError("AFD_M2N_ROUTED_SCALE_MUST_REMAIN_SEPARATE")
+        self.shared_experts = DeepseekV2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            reduce_results=False,
+            prefix=add_prefix("shared_experts", prefix),
+            swiglu_limit=getattr(config, "swiglu_limit", None),
+            parallel_group="replicated",
+        )
+
+    def route(self, hidden_states):
+        return self.topk(hidden_states, self.gate(hidden_states))
+
+
+def make_glm_dsa_attention_mlp(*, config, layer_id, quant_config, prefix=""):
+    if afd_execution_mode() != AFDExecutionMode.ATTENTION:
+        raise RuntimeError("AFD_GLM_DSA_ATTENTION_COMPUTE_ROLE_INVALID")
+    if quant_config is not None and quant_config.get_name() != "fp8":
+        raise RuntimeError("AFD_GLM_ROUTING_QUANTIZATION_UNSUPPORTED")
+    if config.hidden_act != "silu" or layer_id < getattr(config, "num_hash_layers", 0):
+        raise RuntimeError("AFD_GLM_ROUTING_EXPERT_LAYOUT_UNSUPPORTED")
+    if afd_m2n_enabled() and DeepseekV2DecoderLayer._is_layer_sparse(
+        config, layer_id, False
+    ):
+        return Glm5AFDRouterShared(config, layer_id, quant_config, prefix)
+    return AFDProxyMLP()
+
+
+class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
+    """Narrow AFD role projection over a production GLM-5.2 DSA layer."""
+
+    @classmethod
+    def install(cls, layer: DeepseekV2DecoderLayer) -> None:
+        if type(layer) is not DeepseekV2DecoderLayer:
+            raise RuntimeError(
+                "AFD_GLM_DSA_LAYER_CLASS_MISMATCH "
+                f"actual={type(layer).__module__}.{type(layer).__name__}"
+            )
+        mode = afd_execution_mode()
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.is_none():
+            raise RuntimeError("AFD_GLM_DSA_INTERNAL_COLLECTIVE_UNSUPPORTED")
+        if layer.is_layer_sparse:
+            moe_config = get_exec().moe
+            if (
+                moe_config.enable_eplb
+                or moe_config.init_expert_location != "trivial"
+                or moe_config.ep_num_redundant_experts
+                or moe_config.enable_waterfill
+                or getattr(layer.mlp, "is_hash", False)
+            ):
+                raise RuntimeError("AFD_GLM_ROUTING_EXPERT_LAYOUT_UNSUPPORTED")
+            backend = get_moe_runner_backend().value
+            if backend not in ("auto", "triton", "deep_gemm", "cutlass"):
+                raise RuntimeError(f"AFD_GLM_ROUTING_BACKEND_UNSUPPORTED {backend}")
+            if mode == AFDExecutionMode.FFN and layer.mlp.num_fused_shared_experts:
+                raise RuntimeError("AFD_GLM_ROUTING_FUSED_SHARED_UNSUPPORTED")
+        if mode == AFDExecutionMode.ATTENTION:
+            if not (afd_m2n_enabled() and layer.is_layer_sparse):
+                layer.mlp = AFDProxyMLP()
+            elif not isinstance(layer.mlp, Glm5AFDRouterShared):
+                raise RuntimeError("AFD_M2N_GLM5_ROUTER_SHARED_NOT_PROJECTED")
+        elif mode == AFDExecutionMode.FFN:
+            layer.attn_boundary.plan.qkv_latent_func = None
+            layer.self_attn = AFDProxyAttention()
+        else:
+            raise RuntimeError(f"AFD_GLM_DSA_ROLE_INVALID mode={mode}")
+        layer.__class__ = cls
+
+    def forward_attention_for_afd(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if afd_execution_mode() != AFDExecutionMode.ATTENTION:
+            raise RuntimeError("AFD_GLM_DSA_ATTENTION_COMPUTE_ROLE_INVALID")
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self._resolve_gfx95_quant_format(),
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
+                prev_topk_indices=prev_topk_indices,
+            )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
+        get_attn_tp_context().clear_attn_inputs()
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        return (
+            hidden_states,
+            residual_batch.written_residual(forward_batch),
+            topk_indices,
+        )
+
+    # TP1 shared weights use one contributor to the outer F reduce-scatter.
+    afd_shared_expert_partial = True
+
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        if afd_execution_mode() != AFDExecutionMode.FFN:
+            raise RuntimeError("AFD_GLM_DSA_FFN_COMPUTE_ROLE_INVALID")
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.is_none():
+            raise RuntimeError("AFD_GLM_DSA_INTERNAL_COLLECTIVE_UNSUPPORTED")
+        if getattr(self.mlp, "_shared_expert_tp1", False):
+            # Native TP1 loading avoids splitting an FP8 scale block at F32.
+            # Reuse native routed-expert math, but compute shared only once.
+            # Shared reads the original input before a native in-place routed
+            # kernel can overwrite it; only F rank 0 contributes it to the sum.
+            shared = (
+                self.mlp.shared_experts(hidden_states)
+                if get_parallel().tp_rank == 0
+                else None
+            )
+            routed = self.mlp.forward_normal(hidden_states, skip_shared_experts=True)
+            if shared is not None:
+                routed = routed + shared
+            return routed
+        return self.mlp(hidden_states, forward_batch=forward_batch)
+
+
+class GlmMoeDsaAFDModel(DeepseekV2Model):
+    """AFD projection of the GLM-5.2 decoder stack."""
+
+    afd_pipeline = None
+
+    def set_afd_pipeline(self, pipeline) -> None:
+        self.afd_pipeline = pipeline
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if self.afd_pipeline is None:
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        return afd_model_forward(
+            model=self,
+            pipeline=self.afd_pipeline,
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        mode = afd_execution_mode()
+        if mode == AFDExecutionMode.OFF:
+            return
+        if quant_config is not None and quant_config.get_name() != "fp8":
+            raise RuntimeError("AFD_GLM_ROUTING_QUANTIZATION_UNSUPPORTED")
+        if type(self.model) is not DeepseekV2Model:
+            raise RuntimeError(
+                "AFD_GLM_DSA_MODEL_CLASS_MISMATCH "
+                f"actual={type(self.model).__module__}.{type(self.model).__name__}"
+            )
+        if (
+            self.model.start_layer != 0
+            or self.model.end_layer != config.num_hidden_layers
+        ):
+            raise RuntimeError(
+                "AFD_GLM_DSA_PIPELINE_PARTITION_UNSUPPORTED "
+                f"start={self.model.start_layer} end={self.model.end_layer}"
+            )
+        self.model.__class__ = GlmMoeDsaAFDModel
+        for layer in self.model.layers:
+            GlmMoeDsaAFDDecoderLayer.install(layer)
+        if mode == AFDExecutionMode.FFN:
+            self.model.embed_tokens = AFDProxyMLP()
+            self.lm_head = AFDProxyMLP()
+
+        # Role projection discards complete modules whose parameter loader
+        # callbacks can retain cycles. Reclaim them before KV memory profiling.
+        from sglang.srt.afd.projection_gc import collect_projection_garbage
+
+        collect_projection_garbage(self, mode.value)
+
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        return self.model.layers[layer_idx].compute_ffn_output(
+            hidden_states,
+            forward_batch,
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        mode = afd_execution_mode()
+        if mode != AFDExecutionMode.OFF and is_nextn:
+            raise RuntimeError("AFD_GLM_DSA_MTP_UNSUPPORTED")
+        if mode == AFDExecutionMode.ATTENTION:
+            keep_m2n = afd_m2n_enabled()
+            weights = (
+                (name, value)
+                for name, value in weights
+                if ".mlp." not in name
+                or (
+                    keep_m2n
+                    and (".mlp.gate." in name or ".mlp.shared_experts." in name)
+                )
+            )
+        elif mode == AFDExecutionMode.FFN:
+            weights = (
+                (name, value) for name, value in weights if ".self_attn." not in name
+            )
+        return super().load_weights(weights, is_nextn=is_nextn)
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        # The inherited implementation exists solely to split
+        # self_attn.kv_b_proj into w_kc/w_vc. Loaders that never call
+        # model.load_weights (dummy / sharded state / remote) invoke this
+        # directly, so routing load_weights is not enough. The FFN role has
+        # every attention module proxied, so there is nothing to split --
+        # verify that instead of assuming it, or a partial install surfaces
+        # much later during graph capture.
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            unproxied = [
+                layer_id
+                for layer_id, layer in enumerate(self.model.layers)
+                if not isinstance(layer.self_attn, AFDProxyAttention)
+            ]
+            if unproxied:
+                raise RuntimeError(
+                    "AFD_GLM_DSA_FFN_ATTENTION_NOT_PROXIED "
+                    f"count={len(unproxied)} layers={unproxied[:8]}"
+                )
+            return
+        return super().post_load_weights(
+            is_nextn=is_nextn,
+            weight_names=weight_names,
+        )
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):

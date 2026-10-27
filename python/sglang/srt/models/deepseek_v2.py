@@ -47,6 +47,8 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.afd.config import AFDExecutionMode
+from sglang.srt.afd.model_hooks import afd_execution_mode
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -2651,7 +2653,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             config, layer_id, is_nextn=is_nextn
         )
 
-        if self.is_layer_sparse:
+        if (
+            getattr(config, "model_type", None) == "glm_moe_dsa"
+            and afd_execution_mode() == AFDExecutionMode.ATTENTION
+        ):
+            # Project before constructing experts: their TP is unrelated to A DP.
+            from sglang.srt.models.glm4_moe import make_glm_dsa_attention_mlp
+
+            self.mlp = make_glm_dsa_attention_mlp(
+                config=config,
+                layer_id=layer_id,
+                quant_config=moe_quant_config_override or quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
+        elif self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=moe_quant_config_override or quant_config,
@@ -2707,11 +2722,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         return (
             declare_attn(output_transform=attn_output),
             declare_ffn(
-                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                # The AFD projection receives an already-reduced lane-local sum.
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
+                and afd_execution_mode() != AFDExecutionMode.ATTENTION,
                 next_layer_sparse=cls._is_layer_sparse(
                     config, layer_id + 1, is_nextn=False
                 ),
                 output_transform=output,
+                dense_tp_size=(
+                    1 if afd_execution_mode() == AFDExecutionMode.ATTENTION else None
+                ),
             ),
         )
 

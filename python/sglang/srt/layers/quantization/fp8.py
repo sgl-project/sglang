@@ -2287,6 +2287,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         weight_shape=weight.shape[-2:],
                         grouped_moe=True,
                     )
+                if get_moe_a2a_backend().is_megamoe():
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    build_mega_moe_experts_weights(layer)
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (

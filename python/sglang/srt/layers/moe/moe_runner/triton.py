@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
@@ -130,6 +131,7 @@ class TritonRunnerCore(MoeRunnerCore):
         filter_expert = (
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
+            or get_server_args().afd_execution_mode == "ffn"
         )
 
         out = _fused_moe_kernel_sequence(

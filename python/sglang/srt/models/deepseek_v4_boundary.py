@@ -373,9 +373,11 @@ def materialize(hidden_states, batch, *, consume=True, next=None):
     return result
 
 
-def stages(config, layer_id, *, layer=None):
+def stages(config, layer_id, *, layer=None, afd_mode="off"):
     from sglang.srt.layers.layer_boundary.layout import token_axis_sizes
 
+    if afd_mode == "ffn":
+        return ()
     ep = not get_moe_a2a_backend().is_none()
     table_attn, table_ffn, overlapped_ffn = {}, {}, {}
     for variant in (BatchVariant.ORDINARY, BatchVariant.CONTEXT_PARALLEL):
@@ -400,8 +402,12 @@ def stages(config, layer_id, *, layer=None):
             SumGroup.ATTN_TP,
             SumGroup.ATTN_CP if get_parallel().attn_cp_size > 1 else None,
         )
-        table_ffn[variant] = TransportRows(
-            source, compute, source, None if ep else SumGroup.MOE_OUTPUT
+        table_ffn[variant] = (
+            TransportRows(source, source, source)
+            if afd_mode == "attention"
+            else TransportRows(
+                source, compute, source, None if ep else SumGroup.MOE_OUTPUT
+            )
         )
         if not cp:
             overlapped_ffn[variant] = TransportRows(
@@ -495,6 +501,19 @@ class AttentionTransport(ComputeTransport):
         if group is None:
             raise ValueError("attention output owes no declared transport sum")
         return UnreducedOutput(output.partial, group=_sum_group(group))
+
+
+class AFDLocalMoeTransport(ComputeTransport):
+    """A prepares the local FFN operand; F already returns its completed sum."""
+
+    def __init__(self, hidden_states, rows):
+        if rows.source != rows.compute or rows.source != rows.returned or rows.group:
+            raise ValueError("AFD FFN return must be a completed source-row result")
+        self.input = hidden_states
+        self.rows = rows
+
+    def release(self):
+        self.input = None
 
 
 class MoeTransport(MoeRowTransport):

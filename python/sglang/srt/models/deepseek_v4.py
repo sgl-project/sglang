@@ -47,6 +47,9 @@ from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.afd.config import AFDExecutionMode
+from sglang.srt.afd.model_hooks import afd_execution_mode
+from sglang.srt.afd.model_proxy import AFDProxyAttention, AFDProxyMLP
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -3132,14 +3135,18 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             else boundary_pre_from_prev
         )
         self.boundary_mhc_fusions = boundary_mhc_fusions
-        self.self_attn = self._build_self_attn(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            alt_streams=alt_streams,
-            compress_ratio_override=compress_ratio_override,
-        )
+        self.afd_local_ffn = afd_execution_mode() == AFDExecutionMode.ATTENTION
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.self_attn = AFDProxyAttention()
+        else:
+            self.self_attn = self._build_self_attn(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                alt_streams=alt_streams,
+                compress_ratio_override=compress_ratio_override,
+            )
         moe_alt_stream = (
             alt_streams[0]
             if (
@@ -3152,19 +3159,27 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             )
             else None
         )
-        self.mlp = deepseek_v2.DeepseekV2MoE(
-            config=config,
-            quant_config=moe_quant_config_override or quant_config,
-            prefix=add_prefix("mlp", prefix),
-            layer_id=self.layer_id,
-            alt_stream=moe_alt_stream,
-            routed_quant_stream=moe_routed_quant_stream,
-            is_nextn=is_nextn,
-            is_deepseek_v4=True,
-            vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0
-            and not getattr(config, "language_model_only", False),
-        )
+        if afd_execution_mode() == AFDExecutionMode.ATTENTION:
+            self.mlp = AFDProxyMLP()
+        else:
+            self.mlp = deepseek_v2.DeepseekV2MoE(
+                config=config,
+                quant_config=moe_quant_config_override or quant_config,
+                prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
+                alt_stream=moe_alt_stream,
+                routed_quant_stream=moe_routed_quant_stream,
+                is_nextn=is_nextn,
+                is_deepseek_v4=True,
+                vl_correction_bias=config.model_type == "deepseek_v41"
+                and config.vision_n_layers > 0
+                and not getattr(config, "language_model_only", False),
+            )
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            # Native MoeFinalize assigns a replicated shared output to one rank
+            # before AFD's reduce-scatter. F owns no mHC state or parameters.
+            self.afd_shared_expert_partial = True
+            return
 
         if _use_aiter:
             # V4.1 runs its FP4 routed experts on MXFP8 activations
@@ -3555,12 +3570,56 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            return
         self.self_attn.wo_b.reduce_results = False
         self.mlp.reduce_results = False
-        declarations = hc_boundary.stages(self.config, self.layer_id, layer=self)
+        declarations = hc_boundary.stages(
+            self.config, self.layer_id, layer=self, afd_mode=afd_execution_mode()
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declarations[0], self.input_layernorm),
             (declarations[1], self.post_attention_layernorm),
+        )
+
+    def forward_attention_for_afd(self, *, positions, hidden_states, forward_batch):
+        if afd_execution_mode() != AFDExecutionMode.ATTENTION:
+            raise RuntimeError("AFD_DSV4_ATTENTION_COMPUTE_ROLE_INVALID")
+        call = hc_boundary.LayerCall(
+            forward_batch.input_ids,
+            forward_batch.input_ids,
+            allow_cross_layer_fusion=False,
+        )
+        residual_batch.start(forward_batch)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, read_context=call
+        )
+        quantized = residual_batch.written_residual(forward_batch).quantized
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self._run_boundary_attention(
+                hidden_states, positions, forward_batch, quantized
+            )
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        return self.ffn_boundary.prepare(
+            hidden_states, forward_batch, read_context=call
+        )
+
+    def compute_ffn_output(self, hidden_states, forward_batch=None, *, input_ids=None):
+        from sglang.srt.models.deepseek_common.moe_transport import MoeFinalize
+        from sglang.srt.runtime_context import get_forward
+
+        if afd_execution_mode() != AFDExecutionMode.FFN:
+            raise RuntimeError("AFD_DSV4_FFN_COMPUTE_ROLE_INVALID")
+        if self.mlp.is_hash and input_ids is None:
+            raise RuntimeError("AFD_DSV4_HASH_INPUT_IDS_REQUIRED")
+        pieces = self.mlp.forward_normal(
+            hidden_states,
+            input_ids=input_ids,
+            input_ids_global=input_ids,
+            leave_output_sum=True,
+        )
+        return MoeFinalize(pieces=pieces).complete(
+            reduce=not get_forward().mlp_reduce_scatter
         )
 
     def _run_boundary_attention(
@@ -3580,6 +3639,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         return hc_boundary.AttentionTransport(self, hidden_states, batch, call, rows)
 
     def _bind_moe_transport(self, hidden_states, batch, call, rows, overlapped_rows):
+        if getattr(self, "afd_local_ffn", False):
+            return hc_boundary.AFDLocalMoeTransport(hidden_states, rows)
         if call.tbo:
             if overlapped_rows is None:
                 raise NotImplementedError(
@@ -3761,7 +3822,10 @@ class DeepseekV4Model(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
-        if self.pp_group.is_first_rank:
+        self.afd_pipeline = None
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.embed_tokens = AFDProxyMLP()
+        elif self.pp_group.is_first_rank:
             embedding_quant_config = (
                 quant_config
                 if quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -3829,11 +3893,15 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=functools.partial(hc_boundary.stages, config)
+            stage_facts=functools.partial(
+                hc_boundary.stages, config, afd_mode=afd_execution_mode()
+            )
             if _is_cuda
             else None,
         )
-        if self.pp_group.is_last_rank:
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.norm = AFDProxyMLP()
+        elif self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -3843,7 +3911,11 @@ class DeepseekV4Model(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
-        if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
+        if (
+            afd_execution_mode() != AFDExecutionMode.FFN
+            and self.pp_group.is_last_rank
+            and not self.hc_pre_from_prev_sublayer
+        ):
             (
                 self.hc_head_fn,
                 self.hc_head_base,
@@ -4418,6 +4490,9 @@ class DeepseekV4Model(nn.Module):
         finally:
             residual_batch.clear(forward_batch)
 
+    def set_afd_pipeline(self, pipeline):
+        self.afd_pipeline = pipeline
+
     @torch.no_grad()
     def _forward_impl(
         self,
@@ -4444,7 +4519,10 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if self.afd_pipeline is not None:
+            # F receives the real lane-local IDs with its first hidden payload.
+            input_ids_global = input_ids
+        elif get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -4499,7 +4577,14 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
-        if self.hc_pre_from_prev_sublayer:
+        if self.afd_pipeline is not None:
+            hidden_states, _ = self.afd_pipeline.execute(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        elif self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             # Hand the layer input over without keeping a reference here, so the
             # layer loop can free it once the first residual replaces it.
@@ -4703,7 +4788,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_parallel().pp_group
-        if self.pp_group.is_last_rank:
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.lm_head = AFDProxyMLP()
+        elif self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -5057,6 +5144,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            return
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
@@ -5187,6 +5276,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         path; the barrier keeps ranks from proceeding while a peer is still
         compiling. The early returns below must stay rank-uniform.
         """
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            return
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
@@ -5249,6 +5340,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        from sglang.srt.afd.model_adapters.deepseek_v4 import owns_checkpoint_weight
+
+        mode = afd_execution_mode()
+        if mode != AFDExecutionMode.OFF:
+            weights = (
+                (name, weight)
+                for name, weight in weights
+                if owns_checkpoint_weight(name, mode)
+            )
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 

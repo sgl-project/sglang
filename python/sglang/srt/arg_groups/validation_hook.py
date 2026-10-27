@@ -170,6 +170,9 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 
 
 def check_server_args(server_args: Any):
+    from sglang.srt.arg_groups.afd_hook import handle_afd_config
+
+    handle_afd_config(server_args)
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
