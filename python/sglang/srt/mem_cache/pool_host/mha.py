@@ -160,6 +160,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pool_label: str = "kv",
         head_group_num: int = 1,
         page_unified_layout: PageUnifiedLayout | None = None,
+        host_token_capacity: int | None = None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -230,6 +231,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=device,
             allocator_type=allocator_type,
             pool_label=pool_label,
+            host_token_capacity=host_token_capacity,
         )
         self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
         self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)

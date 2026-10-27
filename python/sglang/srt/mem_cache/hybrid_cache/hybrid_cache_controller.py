@@ -874,6 +874,11 @@ class HybridCacheController(BaseHiCacheController):
                 or pool_transfer.device_indices is None
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
+            if (
+                pool_transfer.host_indices.numel() == 0
+                and pool_transfer.device_indices.numel() == 0
+            ):
+                continue
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
             transfers.append(
                 L2Transfer(
