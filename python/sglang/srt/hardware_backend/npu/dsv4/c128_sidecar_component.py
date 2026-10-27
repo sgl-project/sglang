@@ -455,21 +455,25 @@ class C128SidecarComponent(TreeComponent):
         logical_len = token_ids_len
         if self.tree_core.is_eagle and logical_len > 0:
             logical_len -= 1
-        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
-        cache_len = logical_len // group_tokens * group_tokens
-        num_pages = cache_len // group_tokens
+        group_tokens = self._group_tokens()
+        # Only complete C128 blocks own a page, but this must not shorten the
+        # combined cache length: the FULL component still caches every
+        # page-aligned token, so a 205-token request was caching nothing and a
+        # 4005-token one only 2048. Slice the pages we do have and report the
+        # page-aligned span.
+        blocks_len = logical_len // group_tokens * group_tokens
+        num_pages = blocks_len // group_tokens
         insert_params.c128_value = self.cache.req_to_token_pool.req_to_c128_sidecar[
             int(req.kv.req_pool_idx), :num_pages
         ].clone()
+        page = self.tree_core.page_size
+        cache_len = logical_len // page * page
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 
     def floor_cache_len(self, cache_len: int) -> int:
-        logical_len = cache_len
-        if self.tree_core.is_eagle and logical_len > 0:
-            logical_len -= 1
-        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
-        floored = logical_len // group_tokens * group_tokens
-        return floored + 1 if self.tree_core.is_eagle and floored > 0 else floored
+        # ``cache_len`` is the combined prefix length, not this pool's span, and
+        # the BLOCK_GROUPS contract is that C128 never gates the KV prefix.
+        return cache_len
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
