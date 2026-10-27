@@ -28,6 +28,7 @@ runtime_base = [
   "blobfile==3.0.0",
   "build",
   "datasets",
+  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "easydict",
   "einops",
   "fastapi",
@@ -73,7 +74,7 @@ runtime_common = [
   "sglang[runtime_base]",
   "compressed-tensors",
   "outlines==0.1.11",
-  "timm==1.0.16",
+  "timm==1.0.25",
   "xgrammar==0.2.7",
 ]
 
@@ -107,9 +108,9 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
-# Monokernels for gfx950 (--monokernel-backend amd); the ROCm image checks out this pin too.
+# Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@b27d604c9f500ef7871f7a07d77caf01fb293f13",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@05e0bb02e1519b95d6337808d6f7645261f554d8",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD

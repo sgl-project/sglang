@@ -111,7 +111,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.poll_timer import PollTimer
@@ -317,6 +322,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Session of the insert whose actions are being applied (see ``insert``).
+        self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -616,11 +623,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        return self._finalize_match_result(params, result)
+
+    def _finalize_match_result(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if self.linker is not None and params.req is not None:
+        # PD decode has no linker load-back path, so it only offloads.
+        if (
+            self.linker is not None
+            and params.req is not None
+            and get_disagg().disaggregation_mode != "decode"
+        ):
             result = self.linker.match(params.key, params.req, result)
         return result
 
@@ -648,6 +665,8 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
+        # External linker offloads (BackupKV) issued by this insert carry its session.
+        self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -660,7 +679,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 step = self.tree_core.resume_insert()
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
-            self._apply_cache_actions(self.tree_core.end_insert())
+            try:
+                self._apply_cache_actions(self.tree_core.end_insert())
+            finally:
+                self.insert_session_id = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
@@ -1727,9 +1749,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Preserve the ordinary controller API when no shard owner is present.
+        start_owner = self.tree_core.rotation_phase_of(node_id)
+        shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            flush=False,
+            **shard_kwargs,
         )
 
     def _track_write_through_node(
@@ -3450,7 +3479,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing(wait_for_forward=True)
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()

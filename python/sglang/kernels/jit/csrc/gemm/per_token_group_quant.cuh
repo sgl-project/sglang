@@ -238,7 +238,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kDenseSiluAndMul = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -253,6 +254,7 @@ struct QuantTrait {
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
   static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
   static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
+  static_assert(!kDenseSiluAndMul || (kFuseSiluAndMul && kGroupSize == 128 && std::is_same_v<QuantType, fp8_e4m3_t>));
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
@@ -302,8 +304,15 @@ struct QuantTrait {
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         const auto gate = cast<float2>(in[i]);
-        const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
-        in[i] = __hmul2(act, up[i]);
+        if constexpr (kDenseSiluAndMul) {
+          // Match dense activation.cuh: round the product, not SiLU, to T.
+          const auto up_f32 = cast<float2>(up[i]);
+          in[i] = cast<T2>(
+              float2{(gate.x / (1.0f + expf(-gate.x))) * up_f32.x, (gate.y / (1.0f + expf(-gate.y))) * up_f32.y});
+        } else {
+          const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
+          in[i] = __hmul2(act, up[i]);
+        }
       }
     }
 
@@ -342,7 +351,9 @@ struct QuantTrait {
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue / amax;
+      // Dense mode uses activation's compiler flags, but quantization must
+      // retain the fast division used by the standalone quantizer.
+      const float quant_scale = kDenseSiluAndMul ? __fdividef(kMaxValue, amax) : kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -621,9 +632,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kDenseSiluAndMul = false>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kDenseSiluAndMul>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
