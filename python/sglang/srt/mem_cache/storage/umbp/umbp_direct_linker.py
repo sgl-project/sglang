@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -142,6 +141,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         _storage=None,
         forward_stream=None,
     ):
+        extra_config = dict(extra_config or {})
+        if extra_config.pop("load_mode", "layer_wise") != "layer_wise":
+            raise ValueError("UMBP linker does not implement prefetch loading.")
         self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
@@ -195,7 +197,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = dict(extra_config or {})
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -479,7 +480,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return valid_pages
 
-    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+    def prefetch(self, transfers: list[PoolTransfer]) -> None:
         return None
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:

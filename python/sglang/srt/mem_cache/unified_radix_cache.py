@@ -414,7 +414,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
             memory = get_memory()
-            self.prefetch_stop_policy = memory.linker_prefetch_policy
+            self.prefetch_stop_policy = cache_linker.prefetch_policy
             config = memory.unified_cache_external_linker_config
             (
                 _,
@@ -3848,7 +3848,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_protected_size(self) -> int:
-        return self.tree_core.mamba_protected_size()
+        return self.tree_core.mamba_protected_size() + (
+            self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
+        )
 
     def total_size(self) -> tuple[int, int]:
         return self.tree_core.total_size()

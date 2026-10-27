@@ -33,44 +33,31 @@ This integration is particularly valuable for production deployments involving l
 
 ### Direct linker prefetch
 
-Mooncake's external linker defaults to `--linker-load-mode layer_wise`. To
-enable full-layer prefetch, use these flags alongside your Mooncake storage
-configuration:
+Set common load options alongside Mooncake connection settings:
 
 ```bash
 --enable-unified-cache-external-linker \
---linker-load-mode prefetch \
---linker-prefetch-policy timeout
+--unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
 ```
 
-Set Mooncake connection settings with `--unified-cache-external-linker-config`.
-The deprecated `--hicache-storage-backend-extra-config` is used only when the
-linker configuration is omitted.
+`load_mode` defaults to `layer_wise`. Prefetch starts at `_prefetch_kvcache()` on
+enqueue and reuses the load thread for concurrent requests. It supports
+Full/SWA/Mamba within existing linker layout limits and requires PP=1.
+All attention TP ranks read into private GPU slots; only complete KV confirmed
+successful by every rank joins the radix tree. Failed reads fall back to recomputation.
 
-Prefetch starts when the scheduler enqueues a request through
-`_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV
-into the radix tree after all attention ranks confirm success.
-Failed reads release the slots and fall back to recomputation. It currently
-supports Full/SWA components, requires PP=1, reads on every attention TP rank,
-and allows multiple requests in flight through the existing load thread.
-Admission can select later ready requests while others are still loading.
+Set `prefetch_policy` in the same JSON:
 
-Select the linker admission policy with `--linker-prefetch-policy`:
+- `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.
+- `wait_complete`: wait until every rank finishes.
+- `timeout` (default): wait from the first blocked admission poll for
+  `prefetch_timeout_base` + tokens / 1024 * `prefetch_timeout_per_ki_token` seconds.
+  These JSON options default to 1 and 0.25 respectively.
 
-- `best_effort`: use completed KV when the request reaches admission; otherwise
-  stop waiting and recompute.
-- `wait_complete`: keep the request waiting until every rank finishes the load.
-- `timeout` (default): wait up to `prefetch_timeout_base` plus the requested token
-  count / 1024 times `prefetch_timeout_per_ki_token`, starting at the first
-  blocked admission poll. The defaults are 1 second and 0.25 seconds per 1024
-  tokens. Set these through the same linker configuration.
-
-Only complete, successful full-layer reads are published. Stopping the wait
-cancels queued reads; a running Store read retains its private slots until all
-ranks stop writing, then releases them without publishing. Those slots continue
-to consume GPU capacity during cleanup. Reset and shutdown also drain the load
-thread before freeing slots. Layer-wise queues, counters, and MLA broadcast are
-unchanged.
+Stopping the wait cancels queued reads. Running reads retain their private slots
+until every rank stops writing, then discard them without publishing. Pending
+slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
+The deprecated HiCache extra config is used only when linker JSON is omitted.
 
 ### Decode context parallelism (DCP)
 

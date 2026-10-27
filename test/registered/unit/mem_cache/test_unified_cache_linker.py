@@ -7,6 +7,7 @@ from array import array
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from itertools import product
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -244,7 +245,7 @@ class TestMooncakePrefetch(CustomTestCase):
         ):
             return linker.prefetch([transfer])
 
-    def test_waits_for_event_and_all_layers_before_ready_or_reset(self):
+    def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
         """Neither publication nor reset may overtake the final device write."""
         ready, waiting, last_layer, release = (threading.Event() for _ in range(4))
 
@@ -273,6 +274,9 @@ class TestMooncakePrefetch(CustomTestCase):
         assert not future.done()
         assert buffers[0][4:6].tolist() == [[1, 1], [1, 1]]
         assert not torch.any(buffers[1])
+        canceled = self._prefetch(linker, indices=(2, 3))
+        later = self._prefetch(linker, indices=(6, 7))
+        assert canceled.cancel() and not future.cancel()
         joining = threading.Event()
         join = linker.load_queue.join
 
@@ -291,10 +295,11 @@ class TestMooncakePrefetch(CustomTestCase):
             finally:
                 release.set()
             reset.result(timeout=5)
-        assert future.result(timeout=5)
+        assert future.result(timeout=5) and later.result(timeout=5)
+        assert canceled.cancelled()
         assert linker.layer_done_counter.producer_index == -1
         for layer, buffer in enumerate(buffers):
-            assert buffer[4:6].tolist() == [[layer + 1] * 2] * 2
+            assert buffer[4:].tolist() == [[layer + 1] * 2] * 4
             assert not torch.any(buffer[:4])
 
     def test_short_read_or_exception_returns_failure(self):
@@ -312,40 +317,14 @@ class TestMooncakePrefetch(CustomTestCase):
                 assert torch.any(buffers[0])
                 assert not torch.any(buffers[1])
 
-    def test_queued_cancel_does_not_affect_running_or_later_device_writes(self):
-        """A canceled queue entry must neither write nor steal another completion."""
-        waiting, release = threading.Event(), threading.Event()
-
-        def synchronize():
-            waiting.set()
-            assert release.wait(5)
-
-        def read(keys, pointers, sizes):
-            for ptrs, lengths in zip(pointers, sizes):
-                for pointer, size in zip(ptrs, lengths):
-                    ctypes.memset(pointer, 1, size)
-            return [sum(lengths) for lengths in sizes]
-
-        linker, buffers = self._linker(read)
-        self.addCleanup(release.set)
-        running = self._prefetch(linker, synchronize)
-        assert waiting.wait(5)
-        canceled = self._prefetch(linker, indices=(2, 3))
-        later = self._prefetch(linker, indices=(6, 7))
-        assert canceled.cancel() and not running.cancel()
-        release.set()
-        assert running.result(timeout=5) and later.result(timeout=5)
-        assert canceled.cancelled()
-        for buffer in buffers:
-            assert not torch.any(buffer[:4])
-            assert buffer[4:].tolist() == [[1, 1]] * 4
-
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, policy="wait_complete"):
+    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
         cfg = CacheConfig(
-            page_size=2,
-            components=(ComponentType.FULL,) + ((ComponentType.SWA,) if swa else ()),
+            page_size=1 if mamba else 2,
+            components=(ComponentType.FULL,)
+            + ((ComponentType.SWA,) if swa else ())
+            + ((ComponentType.MAMBA,) if mamba else ()),
             sliding_window_size=2 if swa else None,
             kv_size=32,
             num_layers=2,
@@ -357,6 +336,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         if swa:
             backend.pools[PoolName.SWA] = object()
         backend.load_mode = "prefetch"
+        backend.prefetch_policy = policy
         backend.prefetch_futures = []
 
         def submit(transfers):
@@ -366,13 +346,15 @@ class TestLinkerDevicePrefetch(CustomTestCase):
 
         backend.prefetch = MagicMock(side_effect=submit)
         backend.lookup = MagicMock(wraps=backend.lookup)
-        backend.restorable = [1, 2, 3]
+        backend.restorable = list(range(1, 6 // cfg.page_size + 1))
         with get_context().override_server_args(
-            linker_prefetch_policy=policy,
             hicache_storage_prefetch_policy="best_effort",
-            hicache_storage_backend_extra_config=(
-                '{"prefetch_timeout_base":1,"prefetch_timeout_per_ki_token":512}'
-            ),
+            unified_cache_external_linker_config={
+                "load_mode": "prefetch",
+                "prefetch_policy": policy,
+                "prefetch_timeout_base": 1,
+                "prefetch_timeout_per_ki_token": 512,
+            },
         ):
             cache.init_cache_linker(backend)
         self.addCleanup(cache.linker.close)
@@ -405,6 +387,11 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         if ComponentType.SWA in cache.components:
             free = allocator.swa_attn_allocator.available_size()
             assert free + cache.swa_evictable_size() + cache.swa_protected_size() == 32
+        if ComponentType.MAMBA in cache.components:
+            free = cache.req_to_token_pool.mamba_allocator.available_size()
+            assert (
+                free + cache.mamba_evictable_size() + cache.mamba_protected_size() == 20
+            )
 
     def _enqueue(self, cache, req):
         # Exercise the real scheduler hook without simulating its entire loop.
@@ -438,39 +425,89 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert cache.prefetch_timeout_base == expected[0]
                 assert cache.prefetch_timeout_per_page == expected[1] * 2 / 1024
 
-    def test_success_publishes_shared_swa_kv_owned_by_tree(self):
-        cache, backend, req, allocator = self._fixture(swa=True)
-        self._enqueue(cache, req)
-        transfers = {t.name: t for t in backend.prefetch.call_args.args[0]}
-        loaded = transfers[PoolName.KV].device_indices.clone()
-        assert not cache.check_prefetch_progress(req.cache_request_handle)
-        assert self._match(cache, req).device_prefix_len == 0
-        assert allocator.full_to_swa_index_mapping[loaded].tolist() == [0] * 6
-        self._assert_balanced(cache, allocator)
-        backend.prefetch_futures[-1].set_result(True)
-        cache.check_hicache_events()
-        result = self._match(cache, req)
-        assert cache.check_prefetch_progress(req.cache_request_handle)
-        assert result.device_prefix_len == 6
-        assert torch.equal(cache.path_device_indices(result.last_device_node), loaded)
-        assert torch.equal(
-            allocator.translate_loc_from_full_to_swa(loaded[-2:]),
-            transfers[PoolName.SWA].device_indices,
-        )
-        cache.linker.release_request(req.cache_request_handle)
-        assert self._match(cache, req).device_prefix_len == 6
-        assert allocator.full_attn_allocator.available_size() == 26
-        assert allocator.swa_attn_allocator.available_size() == 30
-        assert not backend.queued_loads
-        cache.evict(EvictParams(num_tokens=6, swa_num_tokens=2))
-        assert allocator.full_attn_allocator.available_size() == 32
-        assert allocator.swa_attn_allocator.available_size() == 32
-        cache.sanity_check()
+    def test_publication_owns_swa_and_mamba_slots_and_frees_racing_duplicates(self):
+        for mamba in (False, True):
+            with self.subTest(mamba=mamba):
+                cache, backend, req, allocator = self._fixture(swa=True, mamba=mamba)
+                requests = (req, self._request("duplicate"))
+                for request in requests:
+                    self._enqueue(cache, request)
+                transfers = [
+                    {t.name: t for t in submitted.args[0]}
+                    for submitted in backend.prefetch.call_args_list
+                ]
+                if mamba:
+                    pool = cache.req_to_token_pool
+                    states = pool.mamba_pool.mamba_cache
+                    # The recycled slot's replay cursor is not stored state.
+                    pool.mamba_pool.replayssm_write_pos = torch.full((21,), 7)
+                    for i, transfer in enumerate(transfers, 1):
+                        state = transfer[PoolName.MAMBA]
+                        assert state.keys == transfer[PoolName.KV].keys[-1:]
+                        for buffer in [*states.conv, states.temporal]:
+                            buffer[:, state.device_indices] = 11 * i
+                    assert not any(r.kv.holds_mamba for r in requests)
+                    assert cache.mamba_protected_size() == 2
+                loaded = transfers[0][PoolName.KV].device_indices
+                assert not cache.check_prefetch_progress(req.cache_request_handle)
+                assert self._match(cache, req).device_prefix_len == 0
+                assert allocator.full_to_swa_index_mapping[loaded].tolist() == [0] * 6
+                self._assert_balanced(cache, allocator)
+                for future in backend.prefetch_futures:
+                    future.set_result(True)
+                    cache.check_hicache_events()
+                    self._assert_balanced(cache, allocator)
+                assert cache.check_prefetch_progress(req.cache_request_handle)
+                result = cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(req.origin_input_ids[:-1]),
+                        req=req,
+                        cow_mamba=mamba,
+                    )
+                )
+                assert result.device_prefix_len == 6
+                assert torch.equal(
+                    cache.path_device_indices(result.last_device_node), loaded
+                )
+                assert torch.equal(
+                    allocator.translate_loc_from_full_to_swa(loaded[-2:]),
+                    transfers[0][PoolName.SWA].device_indices,
+                )
+                if mamba:
+                    source = transfers[0][PoolName.MAMBA].device_indices
+                    assert torch.equal(req.kv.mamba_cow_src_index, source)
+                    assert int(req.kv.mamba_pool_idx) != int(source)
+                    assert not req.kv.mamba_needs_clear
+                    dst = req.kv.mamba_pool_idx.unsqueeze(0)
+                    pool.copy_mamba_state(req.kv.mamba_cow_src_index, dst)
+                    assert all(
+                        torch.all(b[:, dst] == 11)
+                        for b in [*states.conv, states.temporal]
+                    )
+                    assert pool.mamba_pool.replayssm_write_pos[source].item() == 0
+                    pool.free_mamba_cache(req)
+                    assert pool.mamba_allocator.available_size() == 19
+                cache.linker.release_request(req.cache_request_handle)
+                assert self._match(cache, req).device_prefix_len == 6
+                assert allocator.full_attn_allocator.available_size() == 26
+                assert allocator.swa_attn_allocator.available_size() == 30
+                assert not backend.queued_loads
+                cache.evict(
+                    EvictParams(num_tokens=6, swa_num_tokens=2, mamba_num=int(mamba))
+                )
+                assert allocator.full_attn_allocator.available_size() == 32
+                assert allocator.swa_attn_allocator.available_size() == 32
+                if mamba:
+                    assert pool.mamba_allocator.available_size() == 20
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
 
     def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
-        for outcome in ("local-failure", "peer-failure", "peer-pending"):
-            with self.subTest(outcome=outcome):
-                cache, backend, req, allocator = self._fixture(swa=True)
+        for outcome, mamba in product(
+            ("local-failure", "peer-failure", "peer-pending"), (False, True)
+        ):
+            with self.subTest(outcome=outcome, mamba=mamba):
+                cache, backend, req, allocator = self._fixture(swa=True, mamba=mamba)
                 self._enqueue(cache, req)
                 backend.prefetch_futures[-1].set_result(outcome != "local-failure")
 
@@ -502,56 +539,23 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                     assert cache.linker.load_back(req) == (0, req.last_node)
                 cache.sanity_check()
 
-    def test_cancel_retains_private_slots_and_anchor_until_writer_stops(self):
-        cache, backend, req, allocator = self._fixture()
-        prefix = allocator.alloc(2)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(req.origin_input_ids[:2]), value=prefix, inserted_len=2
-            )
-        )
-        req.init_next_round_input(cache)
-        cache.linker.prefetch(req)
-        anchor, handle = req.last_node, req.cache_request_handle
-        future = backend.prefetch_futures[-1]
-        assert future.set_running_or_notify_cancel()
-        with patch.object(
-            future, "result", side_effect=AssertionError("writer is running")
-        ):
-            cache.linker.release_request(handle)
-            cache.linker.check_prefetch_events()
-        assert cache.check_prefetch_progress(handle)
-        assert handle in cache.linker.prefetches
-        assert allocator.available_size() == 26
-        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 1
-        self._enqueue(cache, self._request())
-        assert cache.linker.prefetches[handle].future is future
-        assert len(backend.prefetch_futures) == 1
-        cache.linker.release_request(handle)
-        self._assert_balanced(cache, allocator)
-        future.set_result(True)
-        cache.linker.check_prefetch_events()
-        assert not cache.linker.prefetches and not cache.linker.prefetch_attempts
-        assert allocator.available_size() == 30
-        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
-        self._assert_balanced(cache, allocator)
-        assert self._match(cache, req).device_prefix_len == 2
-        cache.evict(EvictParams(num_tokens=2))
-        assert allocator.available_size() == 32
-        cache.sanity_check()
-
     def test_admission_policy_and_timeout_begin_at_first_blocked_poll(self):
         """Stopping admission cannot recycle an in-flight writer's private slots."""
-        for policy, outcome in (
-            ("best_effort", "queued"),
-            ("best_effort", "running"),
-            ("best_effort", "ready"),
-            ("wait_complete", "running"),
-            ("timeout", "local"),
-            ("timeout", "peer"),
+        for (policy, outcome), mamba in product(
+            (
+                ("best_effort", "queued"),
+                ("best_effort", "running"),
+                ("best_effort", "ready"),
+                ("wait_complete", "running"),
+                ("timeout", "local"),
+                ("timeout", "peer"),
+            ),
+            (False, True),
         ):
-            with self.subTest(policy=policy, outcome=outcome):
-                cache, backend, req, allocator = self._fixture(swa=True, policy=policy)
+            with self.subTest(policy=policy, outcome=outcome, mamba=mamba):
+                cache, backend, req, allocator = self._fixture(
+                    swa=True, mamba=mamba, policy=policy
+                )
                 self._enqueue(cache, req)
                 handle, future = req.cache_request_handle, backend.prefetch_futures[-1]
                 if outcome != "queued":
@@ -601,30 +605,45 @@ class TestLinkerDevicePrefetch(CustomTestCase):
 
     def test_out_of_order_completions_isolate_rids_and_reused_attempts(self):
         cache, backend, old, allocator = self._fixture()
+        prefix = allocator.alloc(2)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(old.origin_input_ids[:2]), value=prefix, inserted_len=2
+            )
+        )
         other, new = self._request("other", start=11), self._request(attempt=1)
         for req in (old, other, new):
             self._enqueue(cache, req)
             assert backend.prefetch_futures[-1].set_running_or_notify_cancel()
         first, second, third = backend.prefetch_futures
         new_slots = backend.prefetch.call_args.args[0][0].device_indices.clone()
+        anchor = old.last_node
         cache.linker.release_request(old.cache_request_handle)
-        assert len(cache.linker.prefetches) == 3 and allocator.available_size() == 14
+        cache.linker.check_prefetch_events()
+        self._enqueue(cache, new)
+        assert len(backend.prefetch_futures) == 3
+        assert len(cache.linker.prefetches) == 3 and allocator.available_size() == 16
+        assert cache.check_prefetch_progress(old.cache_request_handle)
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 2
         self._assert_balanced(cache, allocator)
-        assert cache.linker.prefetch_attempts[new.rid] == new.cache_request_handle
         third.set_result(True)
         cache.linker.check_prefetch_events()
         result = self._match(cache, new)
         assert torch.equal(
-            cache.path_device_indices(result.last_device_node), new_slots
+            cache.path_device_indices(result.last_device_node),
+            torch.cat([prefix, new_slots]),
         )
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 1
         assert not cache.check_prefetch_progress(other.cache_request_handle)
         first.set_result(True)
         cache.linker.check_prefetch_events()
         assert old.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
-        assert cache.prefetch_loaded_tokens_by_reqid[new.cache_request_handle] == 6
+        assert cache.prefetch_loaded_tokens_by_reqid[new.cache_request_handle] == 4
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
         self._assert_balanced(cache, allocator)
         assert torch.equal(
-            cache.path_device_indices(result.last_device_node), new_slots
+            cache.path_device_indices(result.last_device_node),
+            torch.cat([prefix, new_slots]),
         )
         second.set_result(True)
         cache.linker.check_prefetch_events()
@@ -635,23 +654,34 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         assert allocator.available_size() == 32
         cache.sanity_check()
 
-    def test_refusal_or_no_capacity_falls_back_without_retry(self):
-        for no_capacity in (False, True):
-            with self.subTest(no_capacity=no_capacity):
+    def test_miss_refusal_or_no_capacity_can_retry_but_active_read_is_deduplicated(
+        self,
+    ):
+        for unavailable in ("miss", "refusal", "capacity"):
+            with self.subTest(unavailable=unavailable):
                 cache, backend, req, allocator = self._fixture()
-                occupied = allocator.alloc(28) if no_capacity else None
+                occupied = allocator.alloc(28) if unavailable == "capacity" else None
+                if unavailable == "miss":
+                    backend.restorable = []
                 available = allocator.available_size()
                 with patch.object(backend, "prefetch", return_value=None):
                     self._enqueue(cache, req)
-                self._enqueue(cache, req)
                 assert cache.check_prefetch_progress(req.cache_request_handle)
                 assert not cache.linker.prefetches
                 assert not backend.prefetch.called
                 assert not backend.queued_loads
-                assert backend.lookup.call_count == 1
                 assert allocator.available_size() == available
                 if occupied is not None:
                     allocator.free(occupied)
+                backend.restorable = [1, 2, 3]
+                self._enqueue(cache, req)
+                self._enqueue(cache, req)
+                assert backend.lookup.call_count == 2
+                assert len(backend.prefetch_futures) == 1
+                backend.prefetch_futures[-1].set_result(True)
+                cache.check_hicache_events()
+                assert self._match(cache, req).device_prefix_len == 6
+                self._assert_balanced(cache, allocator)
                 cache.sanity_check()
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
@@ -694,7 +724,6 @@ def test_cache_linker_attachment_is_backend_independent():
     [
         (ComponentType.C128, "layer_wise"),
         (ComponentType.C128, "prefetch"),
-        (ComponentType.MAMBA, "prefetch"),
     ],
 )
 def test_cache_linker_rejects_unsupported_tree_components(component_type, load_mode):

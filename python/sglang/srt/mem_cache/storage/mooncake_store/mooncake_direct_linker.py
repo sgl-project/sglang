@@ -27,7 +27,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -79,7 +78,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
-        self.load_mode = get_memory().linker_load_mode
+        self.load_mode = extra_config.pop("load_mode", "layer_wise")
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.

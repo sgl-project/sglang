@@ -23,26 +23,19 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
-    if cfg.linker_load_mode not in ("layer_wise", "prefetch"):
-        raise ValueError("--linker-load-mode must be 'layer_wise' or 'prefetch'.")
-    if cfg.linker_load_mode == "prefetch" and (
-        not cfg.enable_unified_cache_external_linker
-        or cfg.unified_cache_external_linker_backend != "mooncake"
-    ):
-        raise ValueError("--linker-load-mode=prefetch requires the Mooncake linker.")
+    from sglang.srt.mem_cache.unified_cache.linker_config import (
+        UnifiedCacheLinkerConfig,
+        parse_linker_load_options,
+    )
+
     config = cfg.unified_cache_external_linker_config
-    if config is not None and not isinstance(config, dict):
-        raise ValueError(
-            "--unified-cache-external-linker-config must be a JSON object."
-        )
+    _, _, backend_config = parse_linker_load_options(config)
     if cfg.unified_cache_external_linker_backend == "dynamic" and (
         cfg.enable_unified_cache_external_linker or config is not None
     ):
-        from sglang.srt.mem_cache.unified_cache.linker_config import (
-            UnifiedCacheLinkerConfig,
+        UnifiedCacheLinkerConfig.from_dict(
+            backend_config if config is not None else None
         )
-
-        UnifiedCacheLinkerConfig.from_dict(config)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"

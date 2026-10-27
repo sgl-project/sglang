@@ -217,25 +217,14 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori", "dynamic"],
         ),
     ] = "mooncake"
-    linker_load_mode: A[
-        str,
-        Arg(
-            help="KV load mode for the Mooncake external linker: layer_wise overlaps loading with execution; prefetch loads all layers before admission.",
-            choices=["layer_wise", "prefetch"],
-        ),
-    ] = "layer_wise"
-    linker_prefetch_policy: A[
-        str,
-        Arg(
-            help="Control when the Mooncake external linker stops waiting for prefetched KV before request admission. Applies to --linker-load-mode prefetch.",
-            choices=["best_effort", "wait_complete", "timeout"],
-        ),
-    ] = "timeout"
     unified_cache_external_linker_config: A[
         Optional[Dict[str, Any]],
         Arg(
             help=(
-                "JSON configuration for the selected linker backend. Built-in "
+                "JSON configuration for the selected linker backend. Common "
+                "options include load_mode (layer_wise or prefetch) and "
+                "prefetch_policy (best_effort, wait_complete, or timeout). "
+                "Defaults are layer_wise and timeout. Built-in "
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "

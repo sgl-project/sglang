@@ -2140,7 +2140,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--unified-cache-external-linker-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object configuring the selected backend. For <code>dynamic</code>, provide <code>linker</code> (class name), <code>linker_module_path</code> (Python module), and optional <code>linker_extra_config</code> (object). Built-in backends accept storage options directly; when supplied, this config replaces <code>--hicache-storage-backend-extra-config</code>, even when empty. You can supply config while the linker is disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object configuring the selected backend. Common options are <code>load_mode</code> (<code>layer_wise</code>, default, or <code>prefetch</code>) and <code>prefetch_policy</code> (<code>best_effort</code>, <code>wait_complete</code>, or <code>timeout</code>, default). Prefetch supports Full/SWA/Mamba within the backend’s existing layout limits and requires PP=1. For <code>dynamic</code>, provide <code>linker</code> (class name), <code>linker_module_path</code> (Python module), and optional <code>linker_extra_config</code> (object). Built-in backends accept storage options directly; when supplied, this config replaces <code>--hicache-storage-backend-extra-config</code>, even when empty. You can supply config while the linker is disabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON object</td>
     </tr>
@@ -2183,18 +2183,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-prefetch-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control when prefetching from the storage backend should stop.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`timeout`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>best_effort</code>, <code>wait_complete</code>, <code>timeout</code></td>
-    </tr>
-        <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linker-load-mode`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache load mode for the unified cache external linker. Prefetch stages full-layer reads for multiple queued requests and uses `--linker-prefetch-policy` to control admission waits. It currently requires Mooncake, Full/SWA cache components, and PP=1.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`layer_wise`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>layer_wise</code>, <code>prefetch</code></td>
-    </tr>
-        <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linker-prefetch-policy`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control when the Mooncake external linker stops waiting for prefetched KV before request admission. Applies to `--linker-load-mode prefetch`: best_effort uses completed reads immediately, wait_complete waits for all reads, and timeout waits up to the configured budget.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`timeout`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>best_effort</code>, <code>wait_complete</code>, <code>timeout</code></td>
     </tr>
