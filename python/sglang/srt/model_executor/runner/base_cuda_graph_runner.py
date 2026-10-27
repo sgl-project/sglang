@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -32,7 +31,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_graph_batch_size_alignment,
-    is_cuda,
 )
 
 if TYPE_CHECKING:
@@ -62,52 +60,6 @@ def freeze_gc(enable_cudagraph_gc: bool):
         if should_freeze:
             gc.unfreeze()
             gc.collect()
-
-
-def _compact_dflash_capture_sizes(
-    model_runner: ModelRunner, capture_bs: List[int], captured_req_width: int
-) -> List[int]:
-    """Bound automatic target-verification graph count with geometric buckets.
-
-    Full verification graphs include multiple token rows per request. Keep the
-    smallest and largest aligned sizes, but trade extra padding at intermediate
-    sizes for fewer resident graph executables. Explicit size lists and modes
-    that require exact sizes retain the original capture policy.
-    """
-    locked = getattr(
-        getattr(model_runner, "server_args", None),
-        "_cuda_graph_config_locked",
-        None,
-    )
-    # Missing provenance must not turn an explicit list into an automatic one.
-    if locked is None or (Phase.DECODE, "bs") in locked:
-        return capture_bs
-    execution = get_exec()
-    if (
-        not is_cuda()
-        or execution.graph.disable_cuda_graph_padding
-        or execution.graph.cuda_graph_config.decode.backend != Backend.FULL
-        or execution.overlap.enable_two_batch_overlap
-        or captured_req_width <= 1
-        or model_runner.is_draft_worker
-        or not model_runner.spec_algorithm.is_dflash()
-    ):
-        return capture_bs
-
-    compact = [capture_bs[0]]
-    for size in capture_bs[1:-1]:
-        if size >= 2 * compact[-1]:
-            compact.append(size)
-    if compact[-1] != capture_bs[-1]:
-        compact.append(capture_bs[-1])
-    if len(compact) < len(capture_bs):
-        logger.info(
-            "DFLASH target CUDA graphs: retaining %d of %d automatic capture sizes: %s",
-            len(compact),
-            len(capture_bs),
-            compact,
-        )
-    return compact
 
 
 def get_batch_sizes_to_capture(
@@ -150,9 +102,6 @@ def get_batch_sizes_to_capture(
     capture_bs = list(sorted(set(capture_bs)))
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
-    capture_bs = _compact_dflash_capture_sizes(
-        model_runner, capture_bs, captured_req_width
-    )
     compile_bs = (
         [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
         if get_flags().capture.enable_torch_compile
