@@ -13,7 +13,7 @@
 # ==============================================================================
 """KVIndexTranslator with a fused draft region.
 
-A FUSED-DRAFT runner (`UnifiedDraftKVPool` bound to the target's allocator)
+A FUSED-DRAFT runner (`DraftMHAView` bound to the target's allocator)
 translates exactly as the target does -- same v2p table, same physical ids,
 the draft parts sitting inside the host entries -- and, routing no window
 layers, has no sliding-window write ids; one with window layers in the swa
@@ -32,14 +32,13 @@ import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import (
-    UnifiedDraftKVPool,
     routed_draft_pool,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -145,7 +144,7 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         need_sort=False,
         forward_stream=None,
     )
-    draft_pool = UnifiedDraftKVPool(
+    draft_pool = DraftMHAView(
         arena=pool,
         host_spec=pool.spec("full"),
         layer_lanes={0: 0},

@@ -18,9 +18,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
+from sglang.srt.mem_cache.kv.layout.state import (
+    DraftStateView,
+    MambaSubPoolSpec,
+    StateView,
+)
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -30,8 +34,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
-    UnifiedDraftKVPool,
-    UnifiedDraftMambaPool,
     routed_draft_pool,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -158,7 +160,7 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
 
-class TestUnifiedDraftKVPool(unittest.TestCase):
+class TestDraftMHAView(unittest.TestCase):
     PS = 2
     PAGES = 8
 
@@ -183,7 +185,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        return UnifiedDraftKVPool(
+        return DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
@@ -262,7 +264,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             page_size=self.PS,
             fused_draft=_placement(region),
         )
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
@@ -356,9 +358,7 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_draft_views_alias_the_fused_block(self):
         _, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0}
-        )
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
         draft_conv, _ = pool.spec("mamba").draft_views(pool)
         self.assertEqual(
             draft.mamba_cache.conv[1].shape, (1, pool.num_entries("mamba"), 2, 4)
@@ -379,9 +379,7 @@ class TestFusedStateHost(unittest.TestCase):
         Equally, they must NOT clear the whole entry: the host's own streams
         share it and stay live while the draft's block is recycled."""
         spec, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0}
-        )
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
@@ -530,7 +528,7 @@ class TestFusedMLAHost(unittest.TestCase):
             forward_stream=None,
             lazy_compaction=False,
         )
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
@@ -550,7 +548,7 @@ class TestFusedMLAHost(unittest.TestCase):
 
     def test_draft_pool_binds_over_the_mla_host(self):
         pool = self._pool()
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},

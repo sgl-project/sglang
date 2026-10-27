@@ -2039,11 +2039,11 @@ def validate_fused_hicache_draft(
         )
 
     if draft_device_pools is not None:
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 
         if not (
             len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], UnifiedDraftKVPool)
+            and isinstance(draft_device_pools[0], DraftMHAView)
             and draft_device_pools[0]._host_sub_pool_name == "full"
         ):
             raise NotImplementedError(

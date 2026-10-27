@@ -337,3 +337,82 @@ class StateView:
 
     def get_state_conv_shard_groups(self):
         return []
+
+
+class DraftStateView(StateView):
+    """A fused draft runner's recurrent state: views of the draft block inside
+    every slot entry of the host's state sub-pool, laid out as the host's
+    (``mamba_cache.conv[stream][layer]``). Slot ids are the target's physical
+    ones. The host's whole-entry operations carry the block, so the draft's own
+    clear and copy touch the block alone, and it has no transfer or copy of its
+    own."""
+
+    def __init__(
+        self,
+        *,
+        arena: "KVArena",
+        spec: MambaSubPoolSpec,
+        layer_lanes: "dict[int, int]",
+    ):
+        region = spec.draft_region
+        assert isinstance(region, DraftStateRegion), (
+            f"sub-pool {spec.name!r} carries no fused draft state region"
+        )
+        layer_ids = sorted(layer_lanes)
+        assert layer_ids, "a fused draft state view binds at least one layer"
+        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
+        # A runner's lanes are one contiguous range, so its layers are one
+        # strided slice of the region's views (a gather would copy).
+        start = lanes[0]
+        assert lanes == list(range(start, start + len(lanes))) and (
+            0 <= start and start + len(lanes) <= region.lane_num
+        ), (
+            f"draft state lanes {lanes} must be a contiguous range within "
+            f"{region.lane_num}"
+        )
+        stop = start + len(lanes)
+        conv_views, temporal_view = spec.draft_views(arena)
+        self._arena = arena
+        self._sub_pool_name = spec.name
+        self._entry_bytes = spec.entry_bytes()
+        self.layer_lanes = dict(layer_lanes)
+        self.mamba_layer_ids = layer_ids
+        self.num_mamba_layers = len(layer_ids)
+        self.conv_slice_axis = spec.conv_slice_axis
+        self.device = arena.device
+        self.size = arena.extent_entries(spec.name) - 1
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        self.mamba_cache = self.State(
+            conv=[view[start:stop] for view in conv_views],
+            temporal=temporal_view[start:stop],
+        )
+        self.mem_usage = 0.0  # fused into the host entries
+
+    def clear_slots(self, indices: torch.Tensor) -> None:
+        """Zero this runner's state block in the given slots, the block only:
+        the host's streams share the entry and stay live while a new request
+        takes over the draft's block. The host's whole-entry clear covers the
+        block too, but only on a plain extend forward, not on the decode,
+        target-verify and draft-extend forwards the draft needs it in."""
+        for view in self.mamba_cache.conv:
+            view[:, indices] = 0
+        self.mamba_cache.temporal[:, indices] = 0
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        """Copy-on-write this runner's state block, the block only."""
+        for view in self.mamba_cache.conv:
+            view[:, dst_indices] = view[:, src_indices]
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
+        ]
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft state has no region of its own; state transfer is unsupported"
+        )
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft state")
+
+    def load_cpu_copy(self, mamba_cache_cpu, indices) -> None:
+        raise NotImplementedError("CPU offloading is unsupported for fused draft state")

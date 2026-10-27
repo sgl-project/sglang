@@ -42,7 +42,7 @@ import torch
 from sglang.srt.mem_cache import kv_index_translator
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import TokenSpan
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -50,7 +50,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -200,7 +199,7 @@ class TestKVLocPlan(CustomTestCase):
             need_sort=False,
             forward_stream=None,
         )
-        draft_pool = UnifiedDraftKVPool(
+        draft_pool = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},

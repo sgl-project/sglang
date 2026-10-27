@@ -10,10 +10,9 @@ new host kind reaches the draft worker.
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
-import torch
 
-from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.layout.state import DraftStateView, MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
@@ -21,215 +20,10 @@ from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
     LAYER_WINDOW,
-    DraftStateRegion,
     FusedDraftPlacement,
     draft_state_layer_ids,
     draft_swa_layer_ids,
 )
-from sglang.srt.mem_cache.memory_pool import MambaPool, MHATokenToKVPool
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-
-class UnifiedDraftKVPool(MHATokenToKVPool):
-    """Dense draft KV over the draft parts of one host sub-pool's entries.
-
-    Per-layer `k_buffer` / `v_buffer` are views of the draft parts inside
-    every slot of the host sub-pool; ``layer_lanes`` maps each of this
-    runner's layer ids to its region lane. Locs are the target's PHYSICAL
-    token ids, translated through the id spaces of the allocator the draft
-    runner shares with the target. Compaction moves whole page envelopes on
-    the HOST pool, draft bytes included, so `move_kv_cache` raises rather
-    than let a per-slot move corrupt the fused layout.
-    """
-
-    requires_physical_write_loc = True
-
-    def __init__(
-        self,
-        *,
-        arena: KVArena,
-        host_spec: SubPoolSpec,
-        layer_lanes: Mapping[int, int],
-        page_size: int = 1,
-    ):
-        region = host_spec.draft_region
-        assert region is not None, (
-            f"sub-pool {host_spec.name!r} carries no fused draft region"
-        )
-        layer_ids = sorted(layer_lanes)
-        assert layer_ids, "UnifiedDraftKVPool binds at least one layer"
-        start_layer = layer_ids[0]
-        assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
-            f"fused draft layer ids must be contiguous; got {layer_ids}"
-        )
-        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
-        assert len(set(lanes)) == len(lanes) and all(
-            0 <= s < region.lane_num for s in lanes
-        ), f"draft lanes {lanes} must be distinct and within range({region.lane_num})"
-        k_views, v_views = host_spec.draft_views(arena)
-        max_slots = arena.extent_entries(host_spec.name)
-
-        self._arena = arena
-        self._host_sub_pool_name = host_spec.name
-        self.layer_lanes: Dict[int, int] = dict(layer_lanes)
-        self._k_views: List[torch.Tensor] = [k_views[s] for s in lanes]
-        self._v_views: List[torch.Tensor] = [v_views[s] for s in lanes]
-        num_pages = max_slots // page_size
-
-        super().__init__(
-            size=num_pages * page_size - page_size,
-            page_size=page_size,
-            # The KV dtype, not its storage: `set_kv_buffer` casts to `dtype`
-            # and views the result as `store_dtype` (uint8 for fp8).
-            dtype=region.resolved_kv_dtype(),
-            head_num=region.head_num,
-            head_dim=region.head_dim,
-            layer_num=len(layer_ids),
-            device=arena.device,
-            enable_memory_saver=False,  # the arena owns the bytes
-            v_head_dim=region.resolved_v_head_dim(),
-            start_layer=start_layer,
-            end_layer=start_layer + len(layer_ids) - 1,
-            enable_kv_cache_copy=False,
-            kv_cache_layout="page_major",
-        )
-
-    def _create_buffers(self):
-        self.k_buffer = self._k_views
-        self.v_buffer = self._v_views
-
-    def _clear_buffers(self):
-        pass  # the arena owns the bytes
-
-    def get_kv_size_bytes(self):
-        return 0, 0  # fused into the host entries; the arena logs the total
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        raise NotImplementedError(
-            "fused draft KV relocates with the HOST pool's whole-page move; a "
-            "draft-side per-slot move would corrupt the fused layout"
-        )
-
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "fused draft KV has no per-layer contiguous regions; KV transfer / "
-            "disaggregation is unsupported."
-        )
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
-
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
-
-
-class UnifiedDraftMambaPool(MambaPool):
-    """A draft runner's recurrent state as views of the draft block fused into
-    the host's state entries: `mamba_cache.conv[stream][layer]` is laid out
-    exactly as a private `MambaPool`'s. Slot ids are the target's, translated
-    by the shared allocator. Pure view: the host's whole-entry clear and copy
-    already cover the draft block, so the block ops here act on the draft block alone, and it
-    never calls `MambaPool.__init__` (no buffers of its own)."""
-
-    def __init__(
-        self,
-        *,
-        arena: KVArena,
-        spec: MambaSubPoolSpec,
-        layer_lanes: Mapping[int, int],
-    ):
-        region = spec.draft_region
-        assert isinstance(region, DraftStateRegion), (
-            f"UnifiedDraftMambaPool: sub-pool {spec.name!r} carries no fused "
-            "draft state region"
-        )
-        layer_ids = sorted(layer_lanes)
-        assert layer_ids, "UnifiedDraftMambaPool binds at least one layer"
-        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
-        # A runner's lanes are one contiguous range, so its layers are one
-        # strided slice of the region's views (a gather would copy).
-        start = lanes[0]
-        assert lanes == list(range(start, start + len(lanes))) and (
-            0 <= start and start + len(lanes) <= region.lane_num
-        ), (
-            f"draft state lanes {lanes} must be a contiguous range within "
-            f"{region.lane_num}"
-        )
-        conv_views, temporal_view = spec.draft_views(arena)
-        stop = start + len(lanes)
-
-        self._arena = arena
-        self._sub_pool_name = spec.name
-        self.layer_lanes: Dict[int, int] = dict(layer_lanes)
-        self.mamba_layer_ids = layer_ids
-        self.num_mamba_layers = len(layer_ids)
-        self._max_size = arena.extent_entries(spec.name) - 1
-        self.size = self._max_size
-        self.device = arena.device
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
-        self.enable_custom_mem_pool = False
-        self.custom_mem_pool = None
-        # Same disabled-state attributes the state view replicates for the
-        # base class's unconditional reads.
-        self.enable_linear_replayssm = False
-        self.linear_replayssm_cache_len = 16
-        self.replayssm_write_pos = None
-        self.replayssm_is_kda = False
-        self.enable_linear_replayssm_spec = False
-        self.replayssm_spec_fold = False
-        self.replayssm_cache_base = None
-        self.replayssm_is_flush = None
-        self.debug_memory_pool = False
-        self.conv_shard_groups = None
-        self.conv_slice_axis = spec.conv_slice_axis
-        self.mamba_cache = self.State(
-            conv=[view[start:stop] for view in conv_views],
-            temporal=temporal_view[start:stop],
-        )
-        self.mem_usage = 0.0  # fused into the host entries
-
-    def clear_slots(self, indices: torch.Tensor):
-        """Zero THIS runner's state block in the given slots.
-
-        The block only, never the whole entry: the host's own streams share
-        the entry and must survive, since a new request takes over the
-        draft's block while the target's state for that slot is still live.
-        The host's whole-entry clear covers the block too, but only on a
-        plain EXTEND forward: ModelRunner skips it on decode, target-verify
-        and draft-extend, the modes the draft needs it in.
-        """
-        for view in self.mamba_cache.conv:
-            view[:, indices] = 0
-        self.mamba_cache.temporal[:, indices] = 0
-
-    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
-        """Copy-on-write THIS runner's state block, block only (see above)."""
-        for view in self.mamba_cache.conv:
-            view[:, dst_indices] = view[:, src_indices]
-        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-            :, src_indices
-        ]
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        raise NotImplementedError(
-            "fused draft state relocates with the HOST pool's whole-entry move"
-        )
-
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "fused draft state has no contiguous region of its own; state "
-            "transfer / disaggregation is unsupported."
-        )
-
-    def get_cpu_copy(self, indices):
-        raise NotImplementedError(
-            "CPU offloading is unsupported for fused draft state."
-        )
-
-    def load_cpu_copy(self, mamba_cache_cpu, indices):
-        raise NotImplementedError(
-            "CPU offloading is unsupported for fused draft state."
-        )
 
 
 def draft_kv_layer_ids(model) -> List[int]:
@@ -388,7 +182,7 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         f"{ {host: list(lanes) for host, lanes in lanes_by_host.items()} }"
     )
     if hosts == (ctx.owner,):
-        pool = UnifiedDraftKVPool(
+        pool = DraftMHAView(
             arena=ctx.arena,
             host_spec=ctx.plan.sub_pool(ctx.owner).spec,
             layer_lanes=dict(zip(layers_by_host[ctx.owner], lanes_by_host[ctx.owner])),
@@ -423,7 +217,7 @@ def routed_draft_pool(
     layer_maps = []
     for host, layer_lanes in lanes_by_host.items():
         layer_ids = sorted(layer_lanes)
-        view = UnifiedDraftKVPool(
+        view = DraftMHAView(
             arena=arena,
             host_spec=plan.sub_pool(host).spec,
             layer_lanes={
@@ -476,7 +270,7 @@ def fused_draft_state(
     target's), and a view of the block keyed by the runner's own layer ids."""
     return StateStorage(
         sub_pool=target.sub_pool,
-        pool=UnifiedDraftMambaPool(
+        pool=DraftStateView(
             arena=arena,
             spec=spec,
             layer_lanes=layer_lanes,

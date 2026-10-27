@@ -212,24 +212,60 @@ class MHAView(MHAKVView):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
     ):
+        k_buffer, v_buffer = spec.views(arena)
+        self._bind(
+            arena=arena,
+            sub_pool=spec.name,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            head_num=spec.head_num,
+            head_dim=spec.head_dim,
+            v_head_dim=spec.v_head_dim,
+            dtype=spec.kv_cache_dtype,
+            page_size=page_size,
+            entry_bytes=spec.entry_bytes(),
+            model_layer_ids=model_layer_ids,
+            start_layer=start_layer,
+            end_layer=end_layer if end_layer is not None else spec.layer_num - 1,
+            enable_alt_stream=enable_alt_stream,
+        )
+
+    def _bind(
+        self,
+        *,
+        arena: "KVArena",
+        sub_pool: str,
+        k_buffer: List[torch.Tensor],
+        v_buffer: List[torch.Tensor],
+        head_num: int,
+        head_dim: int,
+        v_head_dim: int,
+        dtype: torch.dtype,
+        page_size: int,
+        entry_bytes: int,
+        model_layer_ids: Tuple[int, ...],
+        start_layer: int,
+        end_layer: int,
+        enable_alt_stream: bool,
+    ) -> None:
         self._arena = arena
-        self._sub_pool_name = spec.name
-        self.k_buffer, self.v_buffer = spec.views(arena)
+        self._sub_pool_name = sub_pool
+        self.k_buffer, self.v_buffer = k_buffer, v_buffer
         # The pages the view spans, and one page envelope's bytes (all layers).
-        self.num_pages = arena.extent_entries(spec.name) // page_size
-        self.page_bytes = page_size * spec.entry_bytes()
+        self.num_pages = arena.extent_entries(sub_pool) // page_size
+        self.page_bytes = page_size * entry_bytes
         # Rows 0..page_size-1 are the padding sink; physical ids run to the rows.
         self.size = self.num_pages * page_size - page_size
         self.page_size = page_size
-        self.dtype = spec.kv_cache_dtype
-        self.store_dtype = spec.store_dtype
+        self.dtype = dtype
+        self.store_dtype = _store_dtype_for(dtype)
         self.device = arena.device
-        self.head_num = spec.head_num
-        self.head_dim = spec.head_dim
-        self.v_head_dim = spec.v_head_dim
-        self.layer_num = spec.layer_num
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.v_head_dim = v_head_dim
+        self.layer_num = len(k_buffer)
         self.start_layer = start_layer
-        self.end_layer = end_layer if end_layer is not None else spec.layer_num - 1
+        self.end_layer = end_layer
         self.model_layer_ids = model_layer_ids
         self.quant_method = UnquantizedKVCacheMethod()
         self.layer_transfer_counter: Optional[LayerDoneCounter] = None
@@ -400,6 +436,12 @@ class MHAView(MHAKVView):
             "(it assumes token-id indexing)."
         )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "a unified pool moves whole units in its arena; a per-slot move "
+            "would corrupt the entries"
+        )
+
     # -- host transfer and PD --
 
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
@@ -497,3 +539,70 @@ class MHAView(MHAKVView):
                     self.v_buffer[0].device, non_blocking=True
                 )
         current_platform.synchronize()
+
+
+class DraftMHAView(MHAView):
+    """A fused draft runner's K and V: views of the draft parts inside every
+    slot entry of its host sub-pool, one region lane per draft layer. Ids are
+    the target's physical token ids in the host sub-pool's space; the host's
+    unit moves carry the draft bytes, so the draft has no transfer or copy of
+    its own. Its methods take the draft's model layer ids."""
+
+    def __init__(
+        self,
+        *,
+        arena: "KVArena",
+        host_spec: SubPoolSpec,
+        layer_lanes: "dict[int, int]",
+        page_size: int,
+    ):
+        region = host_spec.draft_region
+        assert region is not None, (
+            f"sub-pool {host_spec.name!r} carries no fused draft region"
+        )
+        layer_ids = sorted(layer_lanes)
+        assert layer_ids, "a fused draft view binds at least one layer"
+        start_layer = layer_ids[0]
+        assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
+            f"fused draft layer ids must be contiguous; got {layer_ids}"
+        )
+        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
+        assert len(set(lanes)) == len(lanes) and all(
+            0 <= lane < region.lane_num for lane in lanes
+        ), f"draft lanes {lanes} must be distinct and within range({region.lane_num})"
+        k_views, v_views = host_spec.draft_views(arena)
+        self.layer_lanes = dict(layer_lanes)
+        self._bind(
+            arena=arena,
+            sub_pool=host_spec.name,
+            k_buffer=[k_views[lane] for lane in lanes],
+            v_buffer=[v_views[lane] for lane in lanes],
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            v_head_dim=region.resolved_v_head_dim(),
+            # The KV dtype, not its storage: stores cast to it and view the
+            # result as the storage dtype (bytes for FP8).
+            dtype=region.resolved_kv_dtype(),
+            page_size=page_size,
+            entry_bytes=host_spec.entry_bytes(),
+            model_layer_ids=tuple(layer_ids),
+            start_layer=start_layer,
+            end_layer=start_layer + len(layer_ids) - 1,
+            enable_alt_stream=True,
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft KV has no region of its own; KV transfer is unsupported"
+        )
+
+    def get_page_envelope_buffer(self) -> torch.Tensor:
+        raise NotImplementedError("fused draft KV rides in its host's envelopes")
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV")
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV")
