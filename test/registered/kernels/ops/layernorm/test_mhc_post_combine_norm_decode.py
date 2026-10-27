@@ -50,7 +50,7 @@ def test_matches_unfused(m: int, threads: int, quant: bool):
     from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-    x, residual, post, comb, pre, weight = _inputs(m, m * 7 + threads)
+    x, residual, post, comb, pre, weight = _inputs(m, m * 7 + (threads or 0))
     updated_ref = mhc_post_split_h(x, residual, post, comb)
     y_ref = hc_combine_norm(updated_ref.flatten(1), pre, weight, EPS)
 
