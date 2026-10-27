@@ -141,8 +141,8 @@ class MooncakeStoreConfig:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
         if (
-            "master_server_address" not in config
-            and "client_server_address" not in config
+            config.get("master_server_address") is None
+            and config.get("client_server_address") is None
         ):
             raise ValueError(
                 "Either master_server_address or client_server_address is required in config file"
@@ -223,8 +223,8 @@ class MooncakeStoreConfig:
     def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
         """Load config from extra_config dictionary."""
         if (
-            "master_server_address" not in extra_config
-            and "client_server_address" not in extra_config
+            extra_config.get("master_server_address") is None
+            and extra_config.get("client_server_address") is None
         ):
             raise ValueError(
                 "Either master_server_address or client_server_address is required in extra_config"
@@ -465,7 +465,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                if mem_pool is None or not isinstance(
+                    mem_pool.allocator, MooncakeHostTensorAllocator
+                ):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
@@ -605,7 +607,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mla_suffix = ""
 
             self.storage_config = storage_config
-            self.should_split_heads = storage_config.should_split_heads
+            self.should_split_heads = bool(
+                storage_config is not None and storage_config.should_split_heads
+            )
             self.split_factor = 0
             if self.should_split_heads:
                 self.split_factor = (

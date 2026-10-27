@@ -197,6 +197,48 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
             }
             self.assertEqual(len(paths), 8)
 
+    def test_init_with_none_storage_config(self):
+        """MooncakeStore(storage_config=None) should default should_split_heads to False."""
+        fake_store_cls = _fake_store_class()
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    **_fake_mooncake_modules(fake_store_cls),
+                    **_fake_host_pool_modules(),
+                },
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_MASTER": "127.0.0.1:50051",
+                    "MOONCAKE_CHECK_SERVER": "false",
+                },
+            ),
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+                MooncakeStoreConfig,
+            )
+
+            store = MooncakeStore(storage_config=None)
+            self.assertFalse(store.should_split_heads)
+            self.assertEqual(store.split_factor, 0)
+
+            cfg = MooncakeStoreConfig.load_from_extra_config(
+                {
+                    "master_server_address": None,
+                    "client_server_address": "127.0.0.1:50052",
+                }
+            )
+            self.assertIsNone(cfg.master_server_address)
+            self.assertEqual(cfg.client_server_address, "127.0.0.1:50052")
+
+            with self.assertRaises(ValueError):
+                MooncakeStoreConfig.load_from_extra_config(
+                    {"master_server_address": None, "client_server_address": None}
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
