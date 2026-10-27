@@ -460,6 +460,41 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+def test_precreated_device_groups_are_reused():
+    """An engine inside a larger world takes its device groups from the ones
+    created up front (set_precreated_device_groups) and creates only its CPU
+    groups. Single-rank gloo world, so it stays in the CPU suite."""
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        backend="gloo", store=dist.HashStore(), rank=0, world_size=1
+    )
+    saved = parallel_state._PRECREATED_DEVICE_GROUPS
+    try:
+        precreated = dist.new_group([0], backend="gloo")
+        parallel_state.set_precreated_device_groups(0, {(0,): precreated})
+        coord = parallel_state.GroupCoordinator(
+            group_ranks=[[0]],
+            local_rank=0,
+            torch_distributed_backend="gloo",
+            use_pynccl=False,
+            use_mscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_message_queue_broadcaster=False,
+            group_name="tp",
+        )
+        assert coord.device_group is precreated
+        assert coord.cpu_group is not precreated
+        assert coord.ranks == [0] and coord.rank_in_group == 0
+    finally:
+        parallel_state._PRECREATED_DEVICE_GROUPS = saved
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -471,6 +506,7 @@ if __name__ == "__main__":
         test_group_desc_propagated_via_real_new_group("tp")
         test_group_desc_propagated_via_real_new_group("pp")
         test_group_desc_none_normalized_to_anonymous()
+        test_precreated_device_groups_are_reused()
 
         sys.exit(0)
     except AssertionError as e:

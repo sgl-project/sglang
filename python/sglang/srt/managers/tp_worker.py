@@ -380,8 +380,7 @@ class TpModelWorker(BaseTpWorker):
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                get_parallel().tp_size * get_parallel().pp_rank
-                + get_parallel().tp_rank,
+                self.world_group.ranks[self.world_group.rank_in_group],
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]

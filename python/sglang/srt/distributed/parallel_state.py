@@ -330,6 +330,18 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
         # Scale cohorts create these groups without the serving ranks.
         use_local_synchronization = rank_offset > 0 and not recovered_rank
+        precreated = _PRECREATED_DEVICE_GROUPS
+        if precreated is not None:
+            # An engine inside a larger world: shift its groups into world rank
+            # space, keep only its own, and take their device groups from the
+            # pre-created ones (see set_precreated_device_groups).
+            rank_base, precreated_groups = precreated
+            group_ranks = [
+                [r + rank_base for r in ranks]
+                for ranks in group_ranks
+                if self.rank - rank_base in ranks
+            ]
+            use_local_synchronization = True
 
         self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
@@ -391,14 +403,17 @@ class GroupCoordinator:
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend=torch_distributed_backend,
-                    pg_options=pg_options,
-                    timeout=subgroup_timeout,
-                    group_desc=f"{group_name}:device",
-                    use_local_synchronization=use_local_synchronization,
-                )
+                if precreated is not None:
+                    device_group = precreated_groups[tuple(ranks)]
+                else:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=torch_distributed_backend,
+                        pg_options=pg_options,
+                        timeout=subgroup_timeout,
+                        group_desc=f"{group_name}:device",
+                        use_local_synchronization=use_local_synchronization,
+                    )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
@@ -2129,6 +2144,28 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
 
 _WORLD: Optional[GroupCoordinator] = None
 
+# (rank base, {world ranks: device group}) of an engine that runs inside a larger
+# torch.distributed world, or None. See set_precreated_device_groups.
+_PRECREATED_DEVICE_GROUPS: Optional[
+    tuple[int, dict[tuple[int, ...], torch.distributed.ProcessGroup]]
+] = None
+
+
+def set_precreated_device_groups(
+    rank_base: int, groups: dict[tuple[int, ...], torch.distributed.ProcessGroup]
+) -> None:
+    """Run this engine inside a larger, already initialized torch.distributed world.
+
+    For backends where every device subgroup must be created by all processes of
+    the world in lockstep: the caller has initialized the world and created the
+    device groups up front (keyed by their world ranks). The engine then builds
+    its groups in its own rank space (world size = its own TP x PP), shifted by
+    ``rank_base``; device groups come from ``groups`` and CPU groups are created
+    by their members only. Call before init_distributed_environment.
+    """
+    global _PRECREATED_DEVICE_GROUPS
+    _PRECREATED_DEVICE_GROUPS = (rank_base, dict(groups))
+
 
 def get_world_group() -> GroupCoordinator:
     return get_parallel().world_group
@@ -2547,7 +2584,13 @@ def init_distributed_environment(
             local_rank = rank
     global _WORLD
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
+        ranks = list(
+            range(
+                world_size
+                if _PRECREATED_DEVICE_GROUPS is not None
+                else torch.distributed.get_world_size()
+            )
+        )
         _WORLD = init_world_group(
             ranks=ranks,
             local_rank=local_rank,
@@ -2555,7 +2598,7 @@ def init_distributed_environment(
             recovered_rank=recovered_rank,
             max_world_size=max_world_size,
         )
-    else:
+    elif _PRECREATED_DEVICE_GROUPS is None:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size"
         )
@@ -2639,7 +2682,7 @@ def initialize_model_parallel(
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
-        if recovered_rank or rank_offset > 0
+        if recovered_rank or rank_offset > 0 or _PRECREATED_DEVICE_GROUPS is not None
         else torch.distributed.get_world_size()
     )
 
