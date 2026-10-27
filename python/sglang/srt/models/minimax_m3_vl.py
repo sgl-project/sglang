@@ -91,6 +91,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if _is_gfx95_supported:
+            from sglang.srt.models.minimax_common.amd.aiter_intree_tune import (
+                install_m31_aiter_tables,
+            )
+
+            # before any layer looks up an aiter GEMM or fused-MoE config
+            install_m31_aiter_tables(config)
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
