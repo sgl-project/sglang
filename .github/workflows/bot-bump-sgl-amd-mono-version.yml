@@ -1,7 +1,7 @@
 name: Bot Bump sgl-amd-mono Version
 #
 # Pins sgl-amd-mono (the monokernels_hip extra in python/pyproject_other.toml)
-# at the head of its main branch once a day and opens a PR with the change.
+# at the head of its main branch once a day and opens or updates one PR with the change.
 on:
   schedule:
     - cron: '0 8 * * *'  # daily 08:00 UTC
@@ -14,7 +14,6 @@ on:
         default: main
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
 
@@ -28,7 +27,8 @@ jobs:
         with:
           # Branch off main even when a manual run is dispatched from another branch.
           ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # A push with GITHUB_TOKEN starts no CI on the bot PR; the PAT's push does.
+          token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,10 +42,18 @@ jobs:
         run: |
           python scripts/release/bump_sgl_amd_mono_version.py "$REF"
 
+      - name: Configure Git and branch
+        if: steps.bump.outputs.needs_bump == 'true'
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          BRANCH_NAME="bot/bump-sgl-amd-mono"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
       - name: Commit and create PR
         if: steps.bump.outputs.needs_bump == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
-          CANCEL_RUNS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash scripts/release/commit_and_pr_sgl_amd_mono.sh "${{ steps.bump.outputs.old_commit }}" "${{ steps.bump.outputs.new_commit }}"
+          bash scripts/release/commit_and_pr_sgl_amd_mono.sh "${{ steps.bump.outputs.old_commit }}" "${{ steps.bump.outputs.new_commit }}" "$BRANCH_NAME"

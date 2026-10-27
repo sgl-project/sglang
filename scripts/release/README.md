@@ -101,7 +101,7 @@ python scripts/release/bump_docs_install_version.py 0.5.13
 - `docs/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
 
 ### `bump_sgl_amd_mono_version.py`
-Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) (the `monokernels_hip` extra, which the gfx950 ROCm image also checks out) at a branch head or a full commit SHA, `main` by default. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which opens a PR labeled `run-ci` when sgl-amd-mono's `main` has moved, then closes the bump PR it replaces and cancels that PR's unfinished runs. Closing a bump PR without merging it keeps the bot from reopening one for that commit.
+Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) (the `monokernels_hip` extra, which the gfx950 ROCm image also checks out) at a branch head or a full commit SHA, `main` by default. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which force-pushes `bot/bump-sgl-amd-mono` when sgl-amd-mono's `main` has moved and opens one PR from it, labeled `run-ci`, or updates the open one. A run whose target the open PR already pins does nothing.
 
 **Usage:**
 ```bash
