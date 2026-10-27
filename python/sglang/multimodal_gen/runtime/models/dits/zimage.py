@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
+    apply_qk_norm,
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -389,7 +390,10 @@ class ZImageAttention(nn.Module):
                 q, k, self.norm_q, self.norm_k, self.head_dim
             )
 
-        if self.qk_norm and fused_qk is None:
+        # Off CUDA only the batched 3D table (the one with positions) may take the
+        # fused QKNorm+RoPE kernels; a 2D table gets qk-norm, then the class.
+        rope_in_qk_norm = _is_cuda or rope_positions is not None
+        if self.qk_norm and fused_qk is None and rope_in_qk_norm:
             q, k = apply_qk_norm_with_optional_rope(
                 q=q.contiguous(),
                 k=k.contiguous(),
@@ -397,16 +401,23 @@ class ZImageAttention(nn.Module):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=rope_cos_sin_cache,
-                freqs_complex=rope_freqs_complex,
                 is_neox=False,
                 positions=rope_positions,
-                # CUDA keeps main's unfused path here; ROCm/XPU get their in-place
-                # qk-norm(+RoPE) kernels back, as main's no-cache branch allowed.
+                # CUDA lands here when native qk-norm is refused; keep it unfused.
                 allow_inplace=self.enable_zimage_qk_fusion and not _is_cuda,
             )
         else:
             if fused_qk is not None:
                 q, k = fused_qk
+            elif self.qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    allow_inplace=self.enable_zimage_qk_fusion,
+                )
             q, k = self.rotary_emb(
                 query=q,
                 key=k,
@@ -1202,7 +1213,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         elif cos.dim() == 2:
             cos_sin_cache = torch.cat([cos_f32, sin_f32], dim=-1)
             positions = None
-            # [S, D/2]; apply_qk_norm_with_optional_rope adds the head dim itself.
+            # [S, D/2]; the attention adds the head dim before calling the class.
             freqs_complex = torch.complex(cos_f32, sin_f32)
         else:
             return None, None, None

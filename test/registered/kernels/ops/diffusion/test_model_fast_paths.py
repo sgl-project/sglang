@@ -91,7 +91,6 @@ from sglang.multimodal_gen.runtime.models.dits.ernie_image import (
     _ernie_norm_scale_shift,
     _ernie_qknorm_rope,
     _ernie_qknorm_rope_reference,
-    _ernie_qknorm_rotary,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import (
     _flux_fused_ln_modulate,
@@ -947,16 +946,8 @@ def test_ernie_qknorm_rope_first_attempt_exception_uses_pristine_inputs():
         is_neox_style=True,
         use_precomputed_cache=False,
     )
-    # the exception arm runs the class, which is not bit-exact with the oracle
-    q_ref, k_ref = _ernie_qknorm_rotary(
-        q.clone(),
-        k.clone(),
-        q_norm,
-        k_norm,
-        head_dim,
-        rotary_emb=rotary_emb,
-        shared_rope_cos=cos,
-        shared_rope_sin=sin,
+    q_ref, k_ref = _ernie_qknorm_rope_reference(
+        q.clone(), k.clone(), q_norm, k_norm, head_dim, cos, sin
     )
 
     def mutate_then_raise(**kwargs):

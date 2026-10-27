@@ -48,7 +48,8 @@ class RotaryEmbedding(CustomOp):
         self.dtype = dtype
         self.use_precomputed_cache = use_precomputed_cache
         self._complex_dtype = complex_dtype
-        # False sends forward_cuda to forward_native (triton / fp32 eager).
+        # False sends forward_cuda to forward_native (triton / fp32 eager), which
+        # then needs cos/sin or complex_freqs: a cache-only call raises.
         self.use_flashinfer = use_flashinfer
         self._is_full_rotation = rotary_dim == head_size
         self._is_complex_style = not is_neox_style
@@ -335,7 +336,7 @@ class RotaryEmbedding(CustomOp):
         )
 
     # flashinfer is imported only on CUDA, so forward_cuda would end in its bf16
-    # eager fallback here; native keeps triton / fp32 math.
+    # eager fallback here; native keeps cos/sin and complex_freqs on triton / fp32.
     def forward_hip(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
@@ -383,8 +384,7 @@ class RotaryEmbedding(CustomOp):
         if is_complex_derivable:
             # No fused kernel for interleaved rotation on native backends;
             # complex-multiply is equivalent and needs fewer kernel
-            # launches. CUDA has its own fused path (forward_cuda) and
-            # never reaches here for this case.
+            # launches. forward_cuda lands here only with use_flashinfer=False.
             derived_complex_freqs = torch.complex(
                 cos.to(torch.float32), sin.to(torch.float32)
             ).unsqueeze(-2)
@@ -437,7 +437,7 @@ class RotaryEmbedding(CustomOp):
                 ),
             )
 
-        if cos_sin_cache is not None:
+        if cos_sin_cache is not None and self.use_flashinfer:
             batch_size, seq_len, _, _ = query.shape
             num_tokens = batch_size * seq_len
 

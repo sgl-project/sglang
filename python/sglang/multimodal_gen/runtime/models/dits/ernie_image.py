@@ -483,12 +483,20 @@ def _ernie_qknorm_rotary(
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     head_dim: int,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
     *,
     rotary_emb: RotaryEmbedding,
     shared_rope_cos: torch.Tensor,
     shared_rope_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Non-fused path; the bit-exact oracle stays _ernie_qknorm_rope_reference."""
+    """Non-fused path: the bit-exact oracle on CUDA/ROCm, the class elsewhere."""
+    # On CUDA the class runs a full-width table as multi-op fp32 eager,
+    # while the oracle is a single bit-exact triton kernel.
+    if q.is_cuda:
+        return _ernie_qknorm_rope_reference(
+            q, k, q_norm, k_norm, head_dim, rope_cos, rope_sin
+        )
     q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
     return rotary_emb(query=q, key=k, cos=shared_rope_cos, sin=shared_rope_sin)
 
@@ -536,6 +544,8 @@ def _ernie_qknorm_rope(
                 q_norm,
                 k_norm,
                 head_dim,
+                rope_cos,
+                rope_sin,
                 rotary_emb=rotary_emb,
                 shared_rope_cos=shared_rope_cos,
                 shared_rope_sin=shared_rope_sin,
@@ -565,6 +575,8 @@ def _ernie_qknorm_rope(
         q_norm,
         k_norm,
         head_dim,
+        rope_cos,
+        rope_sin,
         rotary_emb=rotary_emb,
         shared_rope_cos=shared_rope_cos,
         shared_rope_sin=shared_rope_sin,

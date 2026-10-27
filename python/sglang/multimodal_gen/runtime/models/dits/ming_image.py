@@ -143,8 +143,8 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         x_valid = x_target if self.learned_padding else x_length
         cap_valid = cap_target if self.learned_padding else cap_length
         x_freqs, cap_freqs = self.rotary_emb(x_ids), self.rotary_emb(cap_ids)
-        # Freqs are rebuilt every forward, so the data_ptr-keyed _get_rope_cache
-        # could only hit on a reused address with stale contents.
+        # Freqs are rebuilt every forward, so the identity-keyed _get_rope_cache
+        # would never hit.
         x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
             self._build_rope_cache(x_freqs)
         )
