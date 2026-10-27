@@ -421,14 +421,12 @@ def maybe_flashinfer_autotune_speculative_draft(
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
-    """Also autotune kernels at the prefill token ceiling.
+    """Also autotune prefill-only kernel variants and non-MoE operators.
 
-    The decode-shaped autotune only covers token counts up to the decode
-    batch size, so larger prefill/extend batches fall outside the tuned
-    buckets and run flashinfer's default heuristic — which can be far
-    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
-    untuned at >=8k tokens on sm100). One extra forward at the largest
-    per-rank extend token count tunes all buckets up to it.
+    MoE startup profiles cover prefill token counts without an EXTEND model
+    forward. A model hook or the opt-in full forward can additionally reach
+    operators and dispatch/precision/finalization variants that the decode
+    dummy does not execute.
     """
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
