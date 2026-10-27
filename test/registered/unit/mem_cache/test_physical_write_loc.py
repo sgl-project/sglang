@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
 # `set_kv_buffer` dispatches on the platform, so the pools that get written live
 # on the platform's device; the mark itself is device-free.
@@ -243,7 +243,6 @@ _UNIFIED_BACKEND_FILES = {
     "trtllm_mha": ("layers/attention/trtllm_mha_backend.py",),
     "trtllm_mla": ("layers/attention/trtllm_mla_backend.py",),
     "cutedsl_mla": ("layers/attention/cutedsl_mla_backend.py",),
-    "tokenspeed_mla": ("layers/attention/tokenspeed_mla_backend.py",),
     "flashmla": ("layers/attention/flashmla_backend.py",),
 }
 # Model code and the rest of the forward path also write KV directly.

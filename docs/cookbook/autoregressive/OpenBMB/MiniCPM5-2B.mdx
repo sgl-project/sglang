@@ -1,7 +1,6 @@
 ---
 title: MiniCPM5-2B
 description: "Deploy OpenBMB MiniCPM5-2B with SGLang — a 2.5B dense Llama-architecture on-device model with 131K context, thinking mode, XML tool calling and DSpark speculative decoding on H200, RTX PRO 6000, RTX 5090 and DGX Spark."
-tag: NEW
 ---
 
 ## Deployment
