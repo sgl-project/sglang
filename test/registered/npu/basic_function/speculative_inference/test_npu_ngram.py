@@ -24,7 +24,7 @@ class TestNpuNgram(unittest.TestCase):
     def generate(self, **options):
         import sglang as sgl
 
-        engine = sgl.Engine(
+        engine_options = dict(
             model_path=os.environ.get(
                 "SGLANG_TEST_NGRAM_MODEL", QWEN3_0_6B_WEIGHTS_PATH
             ),
@@ -41,9 +41,16 @@ class TestNpuNgram(unittest.TestCase):
             disable_overlap_schedule=True,
             disable_radix_cache=True,
             log_level="warning",
-            **options,
         )
+        engine_options.update(options)
+        engine = sgl.Engine(**engine_options)
         try:
+            if options.get("disable_cuda_graph") is False:
+                info = engine.get_server_info()
+                self.assertFalse(info["disable_cuda_graph"])
+                self.assertGreater(
+                    info["startup_time"]["cuda_graph"]["target_verify"], 0
+                )
             # The second batch reuses the CPU trie learned from the first one.
             outputs = [
                 engine.generate(
@@ -70,6 +77,25 @@ class TestNpuNgram(unittest.TestCase):
             return outputs
         finally:
             engine.shutdown()
+
+    def test_graph_matches_eager_with_long_prefix(self):
+        self.prompts = PROMPTS + [
+            "Context only: "
+            + "The integer list is 1, 2, 3, 4, 5, 6, 7, 8, 9, 10. " * 6
+            + "\nContinue the sequence: 1, 2, 3, 4, 5,"
+        ]
+        options = dict(
+            speculative_algorithm="NGRAM",
+            speculative_num_draft_tokens=12,
+            speculative_ngram_capacity=10000,
+            cuda_graph_bs_decode=[1, 2, 4],
+            cuda_graph_max_bs_decode=4,
+        )
+        expected = self.generate(**options, disable_cuda_graph=True)
+        actual = self.generate(**options, disable_cuda_graph=False)
+        for expected_batch, actual_batch in zip(expected, actual):
+            for reference, output in zip(expected_batch, actual_batch):
+                self.assertEqual(output["output_ids"], reference["output_ids"])
 
     def test_eight_options_match_greedy_baseline(self):
         from transformers import AutoTokenizer

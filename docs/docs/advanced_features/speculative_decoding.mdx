@@ -115,7 +115,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ngram cache from previous tokens</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm NGRAM</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA, CPU, XPU, Ascend NPU; no DP attention (<code>--attn-dp-size</code> &gt; 1); NPU uses eager execution and synchronous scheduling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA, CPU, XPU, Ascend NPU; no DP attention (<code>--attn-dp-size</code> &gt; 1); NPU uses synchronous scheduling and supports MHA/GQA target-verification graphs</td>
     </tr>
 </tbody>
 </table>
@@ -855,7 +855,7 @@ Notes:
 - BFS breadth bounds must satisfy `1 <= min <= max`. `PROB` uses the maximum as per-node top-k and ignores the minimum. A breadth of one can still produce branches when several suffix matches are merged.
 - Optional: set `SGLANG_NGRAM_FORCE_GREEDY_VERIFY=True` to force greedy verification.
 
-Ascend NPU verifies irregular trees with paged full-mask attention, follows child/sibling pointers during greedy verification, and compacts the accepted KV rows before the next iteration. It requires an updated `sgl-kernel-npu` with the NGRAM attention-mask builder, mask reconstruction, and tree-aware greedy verification. NPU execution is eager and synchronous. Full-attention MHA/GQA and dense MLA models with FP16/BF16 KV caches are supported. MHA/GQA uses BSH attention; MLA uses latent+RoPE TND attention and supports both ND and NZ KV layouts. Sliding-window/linear attention, sparse indexed MLA, attention sinks, ALiBi, logit capping, pipeline/context parallelism, and chain rejection sampling are unsupported.
+Ascend NPU verifies irregular trees with paged full-mask attention, follows child/sibling pointers during greedy verification, and compacts the accepted KV rows before the next iteration. It requires an updated `sgl-kernel-npu` with the NGRAM attention-mask builder, mask reconstruction, and tree-aware greedy verification. NPU execution uses synchronous scheduling. Full-attention MHA/GQA and dense MLA models with FP16/BF16 KV caches are supported. MHA/GQA uses BSH attention and supports NPU graphs for target verification; pass `--disable-cuda-graph` to use eager execution. Prefill and MLA remain eager. The graph path updates a fixed-address mask buffer and KV lengths before replay; CPU corpus lookup and acceptance processing stay outside the graph. MLA uses latent+RoPE TND attention and supports both ND and NZ KV layouts. Sliding-window/linear attention, sparse indexed MLA, attention sinks, ALiBi, logit capping, pipeline/context parallelism, and chain rejection sampling are unsupported.
 
 For MLA accuracy comparisons, set `ASCEND_USE_FIA=true` for both ordinary decoding and NGRAM so they use the same attention family. The legacy paged MLA decoder can produce different BF16 rounding. Weight quantization and KV quantization are separate: W8A8 target weights can use a BF16 KV cache. MLA validation uses DeepSeek-V2-Lite-W8A8 on Linux with Ascend910_9362 and CANN 9.1.
 

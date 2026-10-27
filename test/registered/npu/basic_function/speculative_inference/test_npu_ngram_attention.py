@@ -8,7 +8,10 @@ import torch_npu  # noqa: F401
 from sgl_kernel_npu.attention.ngram_attention import build_ngram_attention_mask
 
 from sglang.srt.arg_groups.overrides import resolved_view
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+    ForwardMetadata,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_fia_nz
 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -17,7 +20,9 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -215,12 +220,27 @@ class TestNgramAttention(unittest.TestCase):
         args = ServerArgs(**options)
         args.resolve_once()
         args = resolved_view(args)
-        self.assertTrue(args.disable_cuda_graph)
+        self.assertFalse(args.disable_cuda_graph)
         self.assertTrue(args.disable_overlap_schedule)
-        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
         self.assertEqual(args.speculative_num_draft_tokens, 12)
         self.assertGreaterEqual(args.speculative_num_steps, 1)
+        disabled = ServerArgs(**options, disable_cuda_graph=True)
+        disabled.resolve_once()
+        self.assertTrue(resolved_view(disabled).disable_cuda_graph)
+        self.assertEqual(
+            resolved_view(disabled).cuda_graph_config.decode.backend, Backend.DISABLED
+        )
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook.use_mla_backend", return_value=True
+        ):
+            mla = ServerArgs(**options)
+            mla.resolve_once()
+        self.assertTrue(resolved_view(mla).disable_cuda_graph)
+        self.assertEqual(
+            resolved_view(mla).cuda_graph_config.decode.backend, Backend.DISABLED
+        )
         for invalid in (
             dict(speculative_ngram_external_corpus_path="corpus.jsonl"),
             dict(
@@ -237,6 +257,65 @@ class TestNgramAttention(unittest.TestCase):
         ):
             with self.subTest(options=invalid), self.assertRaises(ValueError):
                 ServerArgs(**dict(options, **invalid)).resolve_once()
+
+    def test_graph_metadata_updates_mask_and_lengths_in_place(self):
+        bs, d, page = 2, 4, 128
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "npu"
+        backend.page_size = page
+        backend.speculative_num_draft_tokens = d
+        backend.use_sliding_window_kv_pool = False
+        backend.is_hybrid_swa = False
+        backend.is_draft_worker = False
+        backend.req_to_token = torch.arange(bs * 2 * page, device="npu").reshape(
+            bs, 2 * page
+        )
+        metadata = ForwardMetadata(
+            block_tables=torch.zeros((bs, 2), dtype=torch.int32, device="npu"),
+            seq_lens=torch.empty(bs, dtype=torch.int64, device="npu"),
+        )
+        backend.graph_metadata = {bs: metadata}
+        branch = torch.tensor(
+            [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
+            dtype=torch.bool,
+        )
+        mask_ptr = None
+        # Move between padded and full batches, change the tree, and cross a page.
+        for prefixes, tree in (
+            ([125, 1], branch),
+            ([130, 127], torch.ones_like(branch).tril()),
+            ([3, 1], branch),
+        ):
+            live_bs = 1 if prefixes[1] == 1 else bs
+            trees = tree.repeat(live_bs, 1, 1)
+            with patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ):
+                backend._apply_cuda_graph_metadata(
+                    bs=bs,
+                    req_pool_indices=torch.arange(bs, device="npu"),
+                    seq_lens=torch.tensor(prefixes, device="npu"),
+                    seq_lens_cpu=torch.tensor(prefixes),
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    spec_info=SimpleNamespace(
+                        spec_input_type=SpecInputType.NGRAM_VERIFY,
+                        draft_token_num=d,
+                        custom_mask=trees.flatten().npu(),
+                    ),
+                )
+            current_ptr = metadata.ngram_attn_mask.data_ptr()
+            if mask_ptr is not None:
+                self.assertEqual(current_ptr, mask_ptr)
+            mask_ptr = current_ptr
+            expected = torch.ones((bs, 1, d, 2 * page), dtype=torch.bool)
+            for b in range(live_bs):
+                prefix = prefixes[b]
+                expected[b, 0, :, :prefix] = False
+                expected[b, 0, :, prefix : prefix + d] = ~tree
+            torch.testing.assert_close(metadata.ngram_attn_mask.cpu(), expected)
+            self.assertEqual(metadata.seq_lens_cpu_list, [p + d for p in prefixes])
+            self.assertIsNone(metadata.seq_lens_cpu_int)
 
     def test_paged_gqa_with_ragged_prefix_and_branch(self):
         torch.manual_seed(42)

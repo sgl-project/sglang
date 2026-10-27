@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
+    use_mla_backend,
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
@@ -1221,20 +1222,25 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             with_phase,
         )
 
-        # NGRAM's irregular, CPU-generated masks have a different shape on
-        # every iteration. Keep them out of the fixed MTP graph capture path.
         graph_config = with_phase(
-            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         )
-        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
+        overrides = {}
+        # Target-verification graphs are supported for full-attention MHA/GQA.
+        # Keep the existing eager path for MLA until its graph path is validated.
+        if use_mla_backend(server_args):
+            graph_config = with_phase(
+                graph_config, Phase.DECODE, backend=Backend.DISABLED
+            )
+            overrides["disable_cuda_graph"] = True
         declare_resolution(
             server_args,
             "_handle_ngram",
             cuda_graph_config=graph_config,
-            disable_cuda_graph=True,
             disable_overlap_schedule=True,
+            **overrides,
         )
-        logger.warning("NGRAM on NPU uses eager execution and synchronous scheduling.")
+        logger.warning("NGRAM on NPU uses synchronous scheduling.")
 
     if cfg.max_running_requests is None:
         declare_resolution(

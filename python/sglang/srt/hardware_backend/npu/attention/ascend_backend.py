@@ -1085,6 +1085,32 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
+        if _is_ngram_verify(spec_info):
+            from sgl_kernel_npu.attention.ngram_attention import (
+                build_ngram_attention_mask,
+            )
+
+            d = int(spec_info.draft_token_num)
+            kv_len = metadata.block_tables.shape[1] * self.page_size
+            if metadata.ngram_attn_mask is None:
+                # Allocate once per graph bucket; replay updates this storage.
+                metadata.ngram_attn_mask = torch.empty(
+                    (bs, 1, d, kv_len), dtype=torch.bool, device=self.device
+                )
+            # A live batch can have fewer requests than its captured bucket.
+            # Block every key for padding rows and expand only the live trees.
+            mask_bs = min(bs, spec_info.custom_mask.numel() // (d * d))
+            metadata.ngram_attn_mask.fill_(True)
+            metadata.ngram_attn_mask[:mask_bs].copy_(
+                build_ngram_attention_mask(
+                    spec_info.custom_mask[: mask_bs * d * d],
+                    seq_lens[:mask_bs] - d,
+                    d,
+                    kv_len,
+                )
+            )
+            metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
+
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -2426,6 +2452,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         bs = forward_batch.batch_size
         d = int(forward_batch.spec_info.draft_token_num)
+        actual_seq_lengths_kv = (
+            self.forward_metadata.seq_lens_cpu_list
+            if self.forward_metadata.seq_lens_cpu_int is None
+            else self.forward_metadata.seq_lens_cpu_int.tolist()
+        )
         if self.use_mla:
             c_kv, rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
@@ -2468,7 +2499,7 @@ class AscendAttnBackend(AttentionBackend):
                 atten_mask=self.forward_metadata.ngram_attn_mask,
                 scale=layer.scaling,
                 actual_seq_lengths=[(b + 1) * d for b in range(bs)],
-                actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int.tolist(),
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
                 sparse_mode=0,
                 pre_tokens=FULL_ATTENTION_WINDOW,
                 next_tokens=FULL_ATTENTION_WINDOW,
@@ -2495,7 +2526,7 @@ class AscendAttnBackend(AttentionBackend):
             atten_mask=self.forward_metadata.ngram_attn_mask,
             scale=layer.scaling,
             actual_seq_lengths=[d] * bs,
-            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int.tolist(),
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             sparse_mode=0,
             pre_tokens=FULL_ATTENTION_WINDOW,
             next_tokens=FULL_ATTENTION_WINDOW,
