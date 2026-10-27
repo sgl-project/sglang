@@ -598,11 +598,10 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
+        target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         fused_argmax: bool = False,
-        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
             candidates=candidates,
@@ -610,7 +609,6 @@ class AcceptGreedy:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
-            target_predict=target_predict,
         )
 
     @classmethod
@@ -618,11 +616,10 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
+        target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         fused_argmax: bool = False,
-        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
             candidates=candidates,
@@ -630,24 +627,21 @@ class AcceptGreedy:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
-            target_predict=target_predict,
         )
 
 
 def accept_greedy(
     *,
     candidates: torch.Tensor,
-    target_logits: Optional[torch.Tensor],
+    target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     fused_argmax: bool = False,
-    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """target_predict: target_logits' row argmax when the caller already has it."""
     bs = candidates.shape[0]
-    if target_predict is None:
-        target_predict = _row_argmax(target_logits, fused=fused_argmax)
-    target_predict = target_predict.view(bs, verify_num_draft_tokens)
+    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
+        bs, verify_num_draft_tokens
+    )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -714,17 +708,15 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
-    target_logits: Optional[torch.Tensor],
+    target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     fused_argmax: bool = False,
-    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """target_predict: target_logits' row argmax when the caller already has it."""
     bs = candidates.shape[0]
-    if target_predict is None:
-        target_predict = _row_argmax(target_logits, fused=fused_argmax)
-    target_predict = target_predict.view(bs, verify_num_draft_tokens)
+    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
+        bs, verify_num_draft_tokens
+    )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
