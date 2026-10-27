@@ -1162,6 +1162,7 @@ class Envs:
     # MUSA
     # ===================================================================
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+    SGLANG_MUSA_FA3_SYNC_BEFORE_KVCACHE_ATTENTION = EnvBool(False)
 
     # ===================================================================
     # Intel XPU
