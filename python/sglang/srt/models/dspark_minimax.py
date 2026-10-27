@@ -27,11 +27,6 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
 )
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-if _is_hip:
-    from sglang.srt.models.minimax_common.amd import dspark_minimax_hip as _hip
 
 
 class DSparkMiniMaxAttention(MiniMaxM3Attention):
@@ -180,10 +175,6 @@ class MiniMaxDraftBackbone(DFlashDraftModel):
 class DSparkMiniMaxDraftModel(DSparkDraftMixin, MiniMaxDraftBackbone):
     supports_vocab_parallel_draft_logits = True
 
-    def __init__(self, config, quant_config=None, prefix=""):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        self._ctx_kv_writer = _hip.ctx_kv_writer(self) if _is_hip else None
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
@@ -207,14 +198,6 @@ class DSparkMiniMaxDraftModel(DSparkDraftMixin, MiniMaxDraftBackbone):
         return self._fused_kv_write_layout(
             pool, project=lambda x: method.apply(projection, x)
         )
-
-    def write_target_hidden_kv(self, *, target_hidden, pool, **kwargs) -> None:
-        if self._ctx_kv_writer is None or not self._ctx_kv_writer.write(
-            target_hidden, pool, **kwargs
-        ):
-            super().write_target_hidden_kv(
-                target_hidden=target_hidden, pool=pool, **kwargs
-            )
 
     def _stacked_ctx_kv_params(self):
         if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
@@ -288,8 +271,6 @@ class DSparkMiniMaxDraftModel(DSparkDraftMixin, MiniMaxDraftBackbone):
         self._mxfp8_ctx_kv_cache = False
         # The fused write bundle snapshots stacked weights and k-norm multipliers.
         self._fused_kv_write_cache = None
-        if self._ctx_kv_writer is not None:
-            self._ctx_kv_writer.reset()
         params = dict(self.named_parameters())
         loaded = set()
         loaded_shards = {}

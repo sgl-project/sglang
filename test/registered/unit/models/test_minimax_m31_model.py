@@ -493,7 +493,6 @@ class TestMiniMaxM31DSparkDraft(CustomTestCase):
         nn.Module.__init__(model)
         model.fc = nn.Linear(2, 2, bias=False)
         model.confidence_head = None
-        model._ctx_kv_writer = None
         model.k_scale = nn.Parameter(torch.tensor(-1.0))
         model.k_scale._skip_weight_check = True
         with self.assertRaisesRegex(ValueError, "Missing.*fc.weight"):
