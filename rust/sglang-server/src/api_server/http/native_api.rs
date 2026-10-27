@@ -46,7 +46,7 @@ use sglang_api_types::api::v1 as api;
 /// `/generate` currently exposes only `e2e_latency`; this avoids putting
 /// API-only timestamps onto scheduler messages.
 #[derive(Clone, Debug)]
-struct RequestTiming {
+pub(super) struct RequestTiming {
     // TODO: Move request lifecycle timing into a dedicated tracing/metrics
     // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
@@ -55,7 +55,7 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             created_at: Instant::now(),
             time_to_first_token: None,
@@ -87,7 +87,7 @@ impl RequestTiming {
 /// API-local state for one request: its timing, and the annotator a model
 /// package's [`GenerateHook`](super::generate_hook::GenerateHook) started for
 /// it.
-struct RequestState {
+pub(super) struct RequestState {
     timing: RequestTiming,
     /// The scheduler's decode latency, sent for a finished non-streaming
     /// request: this frontend sees that request's first output only up to
@@ -98,7 +98,7 @@ struct RequestState {
 }
 
 impl RequestState {
-    fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
+    pub(super) fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
         Self {
             timing,
             scheduler_decode_latency: None,
@@ -152,7 +152,7 @@ impl RequestState {
 /// One native `/generate` frame: the `api.v1` frame, plus the keys a model
 /// package's hook added after the schema's own.
 #[derive(Debug)]
-struct NativeFrame {
+pub(super) struct NativeFrame {
     frame: api::GenerateResponse,
     keys: Option<Box<GenerateFrameKeys>>,
 }
@@ -328,41 +328,11 @@ async fn generate(
     {
         return native_error(StatusCode::BAD_REQUEST, &error, false);
     }
-    // Read before the fills below: only a `max_new_tokens` the client sent is
-    // checked against the context window.
-    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    // Launch-time preferred sampling params fill in beneath the request's own
-    // keys before decoding, so an explicit request value (even a default or
-    // null) wins: Python TokenizerManager's precedence.
-    if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
-    {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
-    let default_max_new_tokens = serde_json::json!({
-        "max_new_tokens": state.server_args.default_max_new_tokens,
-    });
-    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // The schema (sglang_api_types) is the contract: decode errors carry
-    // serde's field-level text, as Python's 400s do.
-    let body: api::GenerateRequest = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    let (payloads, is_batch) = match generate_requests(&state, body) {
+        Ok(requests) => requests,
+        Err((code, message, stream)) => return native_error(code, &message, stream),
     };
-    let stream = body.stream.unwrap_or(false);
-    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
-    // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (mut payloads, is_batch) = match into_requests(body, &state.generation_policy) {
-        Ok(v) => v,
-        // Request normalization only returns validation failures.
-        Err(e) => {
-            return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
-        }
-    };
-    client_max_new_tokens.mark(&mut payloads);
+    let stream = payloads.first().is_some_and(|request| request.stream);
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
@@ -380,6 +350,46 @@ async fn generate(
     } else {
         generate_batch(&state, payloads, stream, timing).await
     }
+}
+
+/// Decode a `/generate` body under the launch-time defaults into its requests and
+/// whether it is a batch; an error carries the body's `stream` flag once known.
+pub(super) fn generate_requests(
+    state: &AppState,
+    mut body: serde_json::Value,
+) -> Result<(Vec<GenerateRequest>, bool), (StatusCode, String, bool)> {
+    // Read before the fills below: only a `max_new_tokens` the client sent is
+    // checked against the context window.
+    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
+    // Launch-time preferred sampling params fill in beneath the request's own
+    // keys before decoding, so an explicit request value (even a default or
+    // null) wins: Python TokenizerManager's precedence.
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
+    {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
+    let default_max_new_tokens = serde_json::json!({
+        "max_new_tokens": state.server_args.default_max_new_tokens,
+    });
+    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // The schema (sglang_api_types) is the contract: decode errors carry
+    // serde's field-level text, as Python's 400s do.
+    let body: api::GenerateRequest = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
+    };
+    let stream = body.stream.unwrap_or(false);
+    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
+    // payloads. `is_batch` = list form -> the response is a JSON array.
+    // Request normalization only returns validation failures.
+    let (mut requests, is_batch) = into_requests(body, &state.generation_policy)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string(), stream))?;
+    client_max_new_tokens.mark(&mut requests);
+    Ok((requests, is_batch))
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -420,7 +430,7 @@ async fn generate_single(
 /// failed batch item is its own `{ "error": ... }` entry in the array).
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
-enum GenerateItem {
+pub(super) enum GenerateItem {
     // Boxed: a frame is ~300 bytes against the error's ~40, and a batch
     // array holds one per item.
     Frame(Box<NativeFrame>),
@@ -428,11 +438,26 @@ enum GenerateItem {
 }
 
 /// Fold a unary request to its terminal HTTP result. Shared by single + batch.
-async fn drain_unary(
+pub(super) async fn drain_unary(
+    call: &mut CoreCall,
+    rid_str: &str,
+    request: RequestState,
+) -> (StatusCode, GenerateItem) {
+    match drain_unary_frame(call, rid_str, request).await {
+        Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
+        Err(error) => (
+            error.http_status(),
+            GenerateItem::Error(error.stream_error(None)),
+        ),
+    }
+}
+
+/// [`drain_unary`]'s terminal frame, or the error that failed the call.
+pub(super) async fn drain_unary_frame(
     call: &mut CoreCall,
     rid_str: &str,
     mut request: RequestState,
-) -> (StatusCode, GenerateItem) {
+) -> Result<NativeFrame, CoreError> {
     let mut accumulated = CoreOutput::default();
     while let Some(item) = call.recv().await {
         match item {
@@ -444,25 +469,17 @@ async fn drain_unary(
                 request.finish(&out);
                 accumulated.append_delta(&out);
                 let e2e_latency = Some(e2e_latency(&request.timing));
-                let frame = request.frame(accumulated.frame(rid_str, None, e2e_latency));
-                return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
+                return Ok(request.frame(accumulated.frame(rid_str, None, e2e_latency)));
             }
             CoreEvent::Failed(error) => {
                 request.timing.finish();
-                return (
-                    error.http_status(),
-                    GenerateItem::Error(error.stream_error(None)),
-                );
+                return Err(error);
             }
         }
     }
     // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
-    let truncated = CoreError::ResponseTruncated;
-    (
-        truncated.http_status(),
-        GenerateItem::Error(truncated.stream_error(None)),
-    )
+    Err(CoreError::ResponseTruncated)
 }
 
 /// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
@@ -515,10 +532,22 @@ async fn generate_batch(
 /// Multiplex calls into SSE `data` strings + a final `[DONE]`; `with_index` tags
 /// each frame (batch only), `incremental` = delta vs cumulative. Each call
 /// aborts itself if the stream is dropped while it is unfinished.
-fn generation_event_stream(
+pub(super) fn generation_event_stream(
     calls: Vec<(CoreCall, RequestState)>,
     incremental: bool,
     with_index: bool,
+) -> impl futures::Stream<Item = String> {
+    generation_event_stream_with(calls, incremental, with_index, |error, index| {
+        json_string(&error.stream_error(index))
+    })
+}
+
+/// [`generation_event_stream`], writing a failed call's frame with `error_frame`.
+pub(super) fn generation_event_stream_with(
+    calls: Vec<(CoreCall, RequestState)>,
+    incremental: bool,
+    with_index: bool,
+    error_frame: impl Fn(&CoreError, Option<u32>) -> String,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         use futures::StreamExt;
@@ -582,7 +611,7 @@ fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                yield json_string(&error.stream_error(idx(i)));
+                yield error_frame(&error, idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
@@ -724,6 +753,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -766,6 +796,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         // Each probe that reaches intake counts as scheduler output.
         tokio::spawn(async move {
@@ -807,6 +838,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
 
         let responder = tokio::spawn(async move {
@@ -887,6 +919,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         let responder = tokio::spawn(async move {
             let mut submitted = Vec::new();
@@ -1114,6 +1147,7 @@ mod tests {
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
+                openai_chat: None,
             });
             // Both items' delta, then both terminals: an incremental stream
             // emits two frames per item.

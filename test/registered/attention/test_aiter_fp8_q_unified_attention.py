@@ -65,6 +65,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         backend.page_size = 1
         backend.scale = head_dim**-0.5
         backend.logits_soft_cap = 0.0
+        backend.q_scale = torch.ones(1, dtype=torch.float32, device=device)
         backend.k_scale = scale
         backend.v_scale = scale
         backend.workspace_buffer = torch.empty(1, device=device)
@@ -157,8 +158,10 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
                 self.assertEqual(output.numel(), q.numel())
                 if branch == "unified":
                     quant.assert_called_once()
-                    self.assertIs(quant.call_args.args[1], layer.k_scale)
-                    self.assertIs(unified.call_args.kwargs["q_descale"], layer.k_scale)
+                    self.assertIs(quant.call_args.args[1], backend.q_scale)
+                    self.assertIs(
+                        unified.call_args.kwargs["q_descale"], backend.q_scale
+                    )
                     torch.testing.assert_close(
                         unified.call_args.kwargs["q"].reshape(q.shape[0], -1),
                         sentinel_q,
@@ -201,6 +204,19 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             original_q,
         )
 
+    def test_decode_applies_the_layer_softcap(self):
+        backend, layer, forward_batch, q = self._make_backend_case(
+            "unified", torch.bfloat16
+        )
+        layer.logit_cap = 50.0
+
+        with mock.patch.object(aiter_backend, "unified_attention") as unified:
+            backend.forward_decode(
+                q, None, None, layer, forward_batch, save_kv_cache=False
+            )
+
+        self.assertEqual(unified.call_args.kwargs["softcap"], 50.0)
+
     def test_fp8_q_kv_matches_bf16_reference_at_decode_shape(self):
         # This is the per-TP-rank production shape used by the full trace.
         batch, num_q_heads, num_kv_heads = 4, 16, 1
@@ -242,7 +258,8 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         fp8_max = torch.finfo(fp8_dtype).max
         k_scale = (k.abs().float().amax() / fp8_max).clamp(min=1e-9).view(1)
         v_scale = (v.abs().float().amax() / fp8_max).clamp(min=1e-9).view(1)
-        q_fp8, _ = scaled_fp8_quant(q.reshape(batch, -1), k_scale)
+        q_scale = torch.ones(1, dtype=torch.float32, device=device)
+        q_fp8, _ = scaled_fp8_quant(q.reshape(batch, -1), q_scale)
         k_fp8, _ = scaled_fp8_quant(k.reshape(-1, head_dim), k_scale)
         v_fp8, _ = scaled_fp8_quant(v.reshape(-1, head_dim), v_scale)
 
@@ -269,7 +286,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             window_size=(-1, -1),
             block_table=block_table,
             softcap=0,
-            q_descale=k_scale,
+            q_descale=q_scale,
             k_descale=k_scale,
             v_descale=v_scale,
             sinks=None,
