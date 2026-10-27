@@ -15,14 +15,33 @@ step outputs:
                        enumerated a non-empty registered pool, and this
                        suite's bucket is empty -> the caller skips the whole
                        job; also 'false' for ALL suites when nothing was
-                       recommended and every PR change is under python/sglang/
-                       (--changed-files); 'true' otherwise (incl. full suites).
-                       A suite forced full by the multimodal safety gate stays
-                       'true' regardless of both skip paths.
+                       recommended and the changed-file list is available;
+                       'true' otherwise (incl. full suites). A suite forced
+                       full by the multimodal safety gate stays 'true'
+                       regardless of both skip paths.
 
 Suite keys replace '-' with '_' because GitHub Actions output names must be
 valid shell identifiers. Any failure path yields empty/missing outputs, which
 callers treat as "run the full suite".
+
+Decision model (precision vs full)
+----------------------------------
+Precision mode has the highest priority: when --precision-mode is not 'true',
+every suite runs in full, no matter what was recommended. Otherwise a full run
+is triggered by only two signals:
+
+  - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
+  - a missing changed-file list (test_selector.py failed),
+
+plus the multimodal baseline safety gate described below.
+
+Everything else is decided by the recommendation: an empty one skips every
+suite, a non-empty one runs only the buckets. Precision mode is therefore not
+keyed off "is any bucket non-empty" — a recommendation that no scheduled suite
+contains (a base-a CPU unit test, a nightly-only test, a deleted test file) is
+not runnable in this workflow, and a full run would not run it either. This is
+what keeps a PR that only edits a CPU unit test from re-running the whole a3
+matrix.
 
 Diffusion (multimodal_gen) suites are enumerated from the NPU diffusion case
 config instead of test/registered, and they recommend at test-case
@@ -119,8 +138,24 @@ def normalize_rel(path: str) -> str:
     return p
 
 
+# The only changes that force a full run. They are exactly the non-test paths
+# that trigger this workflow's paths filter and shape its environment or its
+# selection logic, so their effect cannot be judged from the coverage baseline
+# (and a selector change must not be validated by the selector's own output).
+_FULL_RUN_PATHS = {
+    ".github/workflows/pr-test-npu.yml",
+    "python/pyproject_npu.toml",
+    "scripts/ci/npu/npu_ci_install_dependency.sh",
+}
+
+
+def needs_full_run(path: str) -> bool:
+    """True when this changed path must not be judged by the recommendation."""
+    return path.strip().replace("\\", "/").removeprefix("./") in _FULL_RUN_PATHS
+
+
 def enumerate_suite_files(suite: str, work_dir: Path) -> list:
-    """List the suite's registered PR-mode test files via list_tests.py."""
+    """List the suite's registered NPU PR-mode test files via list_tests.py."""
     out_file = work_dir / (suite.replace("-", "_") + ".txt")
     subprocess.run(
         [
@@ -349,37 +384,48 @@ def write_github_summary(
     target_files: list,
     raw_entries: list,
     recommended: set,
-    all_pool: set,
     buckets: dict,
     suite_pool_sizes: dict,
     force_full: set,
     baseline_gaps: dict,
     precision_mode: bool,
     skip_all_suites: bool = False,
+    decision: str = "",
+    decision_reason: str = "",
+    full_run_paths: list | None = None,
+    unknown_recommended: list | None = None,
 ) -> None:
     """Append a markdown section with the recommendation results to every
     target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
-    unbucketed = sorted(recommended - all_pool)
+    full_run_paths = full_run_paths or []
+    unknown_recommended = unknown_recommended or []
     lines = []
     lines.append("### Recommended tests from coverage")
     lines.append("")
+    if decision:
+        lines.append(f"**Decision**: `{decision}` — {decision_reason}")
+        lines.append("")
     if precision_mode:
         lines.append(
             "Precision mode **on** — a3 suites run only the bucketed subset below."
         )
+    elif skip_all_suites and not force_full:
+        lines.append("**All suites skipped**: the changes recommend no test.")
     else:
         lines.append("Precision mode **off** — suites run in full.")
-    if skip_all_suites and not force_full:
+    if full_run_paths:
         lines.append("")
         lines.append(
-            "**All suites skipped**: nothing was recommended and every PR "
-            "change is under `python/sglang/`."
+            "**Full run forced — pipeline configuration changed** "
+            "(not judgeable from coverage):"
         )
+        lines.append("")
+        lines.extend(f"- `{p}`" for p in full_run_paths)
     lines.append("")
     lines.append(
         f"Recommended **{len(raw_entries)}** test cases "
         f"({len(recommended)} unique files); "
-        f"{len(unbucketed)} match no suite pool."
+        f"{len(unknown_recommended)} are not run by this workflow."
     )
     lines.append("")
     lines.append("| Suite | Registered | Bucketed | Action |")
@@ -415,20 +461,21 @@ def write_github_summary(
         lines.extend(raw_entries)
         lines.append("```")
         lines.append("</details>")
-    if unbucketed:
+    if unknown_recommended:
         lines.append("")
         lines.append(
-            f"<details><summary>Matched no suite pool — not run by a3 suites ({len(unbucketed)})</summary>"
+            f"<details><summary>Not run by this workflow ({len(unknown_recommended)})</summary>"
         )
         lines.append("")
         lines.append("```")
-        lines.extend(unbucketed)
+        lines.extend(unknown_recommended)
         lines.append("```")
         lines.append("")
         lines.append(
-            f"Not registered in any of the {len(buckets)} bucketed a3 suites — "
-            "they may still run elsewhere (e.g. base-a runs its full suite; "
-            "nightly tests run in nightly pipelines)."
+            "Recommended but not registered in any suite this workflow runs "
+            "(base-a / CPU / nightly suites belong to other pipelines, or the "
+            "file was deleted). Running the full suites would not run them "
+            "either."
         )
         lines.append("</details>")
     if any(buckets.values()):
@@ -480,15 +527,19 @@ def main():
         "--precision-mode",
         type=str,
         default="false",
-        help="'true' to enable precision mode (run only the recommended tests)",
+        help="'true' to enable precision mode (run only the recommended tests). "
+        "Any other value has the highest priority and forces every suite to "
+        "run in full",
     )
     parser.add_argument(
         "--changed-files",
         type=str,
         default="",
-        help="pr_changed_files.txt written by test_selector.py; enables the "
-        "skip-all rule: nothing recommended + every change under python/sglang/"
-        " -> should_run 'false' for all suites (empty/missing = rule disabled)",
+        help="pr_changed_files.txt written by test_selector.py. A path listed "
+        "in _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml, "
+        "npu_ci_install_dependency.sh) forces a full run; a missing or empty "
+        "file forces it too, and everything else is decided by the "
+        "recommendation",
     )
     parser.add_argument(
         "--github-output",
@@ -528,10 +579,8 @@ def main():
         print(f"::warning::Recommended file not found: {rec_file}")
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
 
-    # Skip-all rule: an empty recommendation is only trustworthy when every
-    # changed file lives under the covered product tree (python/sglang/);
-    # test/script/workflow changes are invisible to the coverage baseline, so
-    # those PRs keep the full-suite fallback.
+    # Only the pipeline configuration paths force a full run; everything else
+    # is decided by the coverage recommendation (or the missing-list fallback).
     changed_files: list[str] = []
     if args.changed_files:
         cf = Path(args.changed_files)
@@ -539,11 +588,7 @@ def main():
             changed_files = [
                 ln.strip() for ln in cf.read_text().splitlines() if ln.strip()
             ]
-    skip_all_suites = (
-        not raw_entries
-        and bool(changed_files)
-        and all(p.startswith("python/sglang/") for p in changed_files)
-    )
+    full_run_paths = sorted(p for p in changed_files if needs_full_run(p))
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
     diffusion_suites = {}
@@ -636,14 +681,50 @@ def main():
                 f"{len(tokens)} recommended"
             )
 
+    precision_switch = args.precision_mode == "true"
+    if not precision_switch:
+        # Highest priority: the switch is the operator's override, so it must
+        # win over every automatic decision below.
+        decision = "full"
+        decision_reason = "precision mode disabled (--precision-mode is not 'true')"
+    elif not changed_files:
+        # test_selector.py writes this file on every PR run; missing/empty
+        # means it failed, so there is no evidence to narrow anything down.
+        decision = "full"
+        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+    elif full_run_paths:
+        decision = "full"
+        decision_reason = "pipeline configuration changed: " + ", ".join(full_run_paths)
+    elif not raw_entries:
+        decision = "skip_all"
+        decision_reason = "no test recommended"
+    else:
+        decision = "precision"
+        decision_reason = f"{len(raw_entries)} recommended test(s)"
+    skip_all_suites = decision == "skip_all"
+    print(
+        f"Decision: {decision} ({decision_reason}); "
+        f"{len(changed_files)} changed path(s), {len(full_run_paths)} full-run path(s)"
+    )
+
     total_count = sum(len(b) for b in buckets.values())
-    if skip_all_suites and not force_full:
+    # Recommendations no suite here contains: base-a / CPU / nightly tests run
+    # by other pipelines, or a deleted file. None of them can be run by this
+    # workflow, and a full run would not run them either, so this is reported
+    # but never escalates to a full run.
+    unknown_recommended = sorted(recommended - all_pool)
+    if unknown_recommended:
         print(
-            "::notice::No tests recommended and every changed file is under "
-            "python/sglang/ — skipping all suites."
+            "::notice::Recommended test(s) not run by any suite in this "
+            f"workflow: {', '.join(unknown_recommended)}"
         )
-    precision_mode = args.precision_mode == "true" and total_count > 0
-    print(f"total_count={total_count} precision_mode={precision_mode}")
+
+    if skip_all_suites and not force_full:
+        print("::notice::No test recommended — skipping all suites.")
+    precision_mode = decision == "precision"
+    print(
+        f"total_count={total_count} decision={decision} precision_mode={precision_mode}"
+    )
 
     # Outputs first, summary last: a summary failure must never cost the
     # downstream jobs their bucket outputs (they'd fall back to full suites).
@@ -662,13 +743,14 @@ def main():
                 out.write("EOF\n")
                 # 'false' when precision mode is on, the suite enumerated a
                 # non-empty registered pool, and this bucket is empty -> the
-                # caller skips the whole suite job; or for ALL suites under the
-                # skip-all rule (nothing recommended, all changes confined to
-                # python/sglang/). An empty ENUMERATION (0 registered files,
-                # e.g. a list_tests/run_suite filter drift) falls back to
-                # 'true' so the job runs the full suite instead of silently
-                # vanishing. Anything else ('true', or a missing output from a
-                # failed step) means full-suite run.
+                # caller skips the whole suite job; or for ALL suites when
+                # nothing was recommended and the changed-file list was
+                # available (decision 'skip_all'). An empty ENUMERATION (0
+                # registered files, e.g. a list_tests/run_suite filter drift)
+                # falls back to 'true' so the job runs the full suite instead of
+                # silently vanishing, except under 'skip_all', where no suite is
+                # expected to run at all. Anything else ('true', or a missing
+                # output from a failed step) means a full-suite run.
                 # A force_full suite never takes either skip path: its baseline
                 # is incomplete, so "nothing recommended" proves nothing.
                 should_run = (
@@ -690,13 +772,16 @@ def main():
             [p for p in (args.github_summary, args.report_file) if p],
             raw_entries,
             recommended,
-            all_pool,
             buckets,
             suite_pool_sizes,
             force_full,
             baseline_gaps,
             precision_mode,
             skip_all_suites,
+            decision=decision,
+            decision_reason=decision_reason,
+            full_run_paths=full_run_paths,
+            unknown_recommended=unknown_recommended,
         )
 
 
