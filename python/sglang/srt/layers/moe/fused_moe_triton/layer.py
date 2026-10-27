@@ -189,9 +189,7 @@ def create_moe_dispatcher(
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_ascend_ops():
-        return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
-    elif (
+    if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_flashinfer_megamoe()
@@ -246,6 +244,8 @@ def create_moe_dispatcher(
                 else 128
             ),
         )
+    elif a2a_backend.is_ascend_ops():
+        return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_parallel().tp_group.device_group,

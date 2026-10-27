@@ -52,7 +52,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
-    validate_ascend_ops_speculative_draft,
+    resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -2525,8 +2525,8 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
 
-class TestWaterfillArgs(CustomTestCase):
-    def test_waterfill_rejects_ascend_ops_without_config(self):
+class TestAscendOpsArgs(CustomTestCase):
+    def test_ascend_ops_rejected_by_waterfill_without_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
@@ -2535,7 +2535,7 @@ class TestWaterfillArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
             handle_a2a_moe(server_args)
 
-    def test_waterfill_rejects_ascend_ops_with_config(self):
+    def test_ascend_ops_rejected_by_waterfill_with_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
@@ -2552,7 +2552,7 @@ class TestWaterfillArgs(CustomTestCase):
             speculative_moe_a2a_backend="ascend_ops",
         )
         with self.assertRaisesRegex(ValueError, "only supported on NPU"):
-            validate_ascend_ops_speculative_draft(server_args)
+            handle_a2a_moe(server_args)
 
     # Protects the target/draft backend invariant required by the shared
     # Ascend Ops configuration and communication groups.
@@ -2563,9 +2563,24 @@ class TestWaterfillArgs(CustomTestCase):
             moe_a2a_backend="ascend_ops",
             speculative_moe_a2a_backend="deepep",
         )
-        with self.assertRaisesRegex(ValueError, "must both use ascend_ops"):
-            validate_ascend_ops_speculative_draft(server_args)
+        self.assertEqual(
+            resolve_ascend_ops_speculative_draft(server_args),
+            {"speculative_moe_a2a_backend": "ascend_ops"},
+        )
 
+    # Protects the inverse invariant: a non-Ascend main backend cannot use
+    # Ascend Ops only for the speculative draft model.
+    def test_non_ascend_ops_rejects_ascend_ops_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(AssertionError, "cannot be ascend_ops"):
+            resolve_ascend_ops_speculative_draft(server_args)
+
+
+class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",

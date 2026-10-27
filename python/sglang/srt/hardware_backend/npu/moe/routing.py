@@ -24,18 +24,22 @@ import torch
 
 from sglang.srt.layers.moe.utils import DispatcherOutputDtype
 
-# ``npu_moe_init_routing_v2`` quant modes for the a2a wire formats:
-# 1 -> per-token int8 + fp32 scale, 3 -> MXFP8 (float8_e4m3fn payload plus
-# e8m0 block scales, fusing the activation quant that would otherwise need a
-# separate ``npu_dynamic_mx_quant`` pass), 9 -> MXFP4 (fp4_e2m1fn_x2 + e8m0).
+
 INT8_QUANT_MODE = 1
 MXFP8_QUANT_MODE = 3
 MXFP4_QUANT_MODE = 9
 
-# Dispatch dtype -> quant mode of the routing op above.  Each torch_npu op
-# family defines its own quant_mode enum (the MC2 distribute ops use 0/2/4
-# for the same formats), so a dtype legitimately maps to a different number
-# per op.
+# Routing quant modes currently implemented by this module are 1 (INT8),
+# 3 (MXFP8/E4M3FN), and 9 (MXFP4); -1 means unquantized dispatch.
+# The following Ascend routing quant modes are planned for support:
+# 0 (static quant), 2 (MXFP8/E5M2), 4/5 (FP8 per-group/E5M2/E4M3FN),
+# 6/7/8 (HIF8 direct/per-tensor/per-token), 11/12 (FP8 per-block/E5M2/E4M3FN,
+# FP32 3D scales),
+# 13 (INT4 dynamic), 14/15 (FP8 per-group with RoundScale+Amax), and
+# 16/17 (MXFP8 with RoundScale+Amax/E5M2/E4M3FN).
+# Dispatch dtype -> quant mode. Each torch_npu op family defines its own enum
+# (the MC2 distribute ops use 0/2/4 for the same formats), so a dtype can map
+# to a different mode per op.
 ROUTING_QUANT_MODES = {
     DispatcherOutputDtype.BF16: -1,
     DispatcherOutputDtype.INT8: INT8_QUANT_MODE,
