@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import LlamaConfig, Qwen3_5Config
+from transformers import LlamaConfig, PretrainedConfig, Qwen3_5Config
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
@@ -69,7 +69,7 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 
 class TestEmbeddingNemotron3Config(CustomTestCase):
     def test_detects_bidirectional_mean_pooled_ministral3(self):
-        config = SimpleNamespace(
+        config = PretrainedConfig(
             architectures=["Ministral3Model"], is_causal=False, pooling="avg"
         )
         self.assertTrue(is_embedding_nemotron3(config))
@@ -86,7 +86,7 @@ class TestEmbeddingNemotron3Config(CustomTestCase):
             },
         ):
             with self.subTest(fields=fields):
-                self.assertFalse(is_embedding_nemotron3(SimpleNamespace(**fields)))
+                self.assertFalse(is_embedding_nemotron3(PretrainedConfig(**fields)))
 
 
 class TestDraftModelConfig(CustomTestCase):

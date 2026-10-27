@@ -67,6 +67,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
                 is_embedding_gemma=False,
             ),
             joint_head_config=None,
+            pointer_head=None,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["EmbeddingNemotron3Model"]),
         )

@@ -2339,10 +2339,11 @@ def is_embedding_nemotron3(config) -> bool:
     which is also used by generative checkpoints. Its bidirectional attention
     and mean pooling fields are the defining distinction.
     """
+    fields = config.to_dict()
     return (
-        "Ministral3Model" in (getattr(config, "architectures", None) or [])
-        and getattr(config, "is_causal", True) is False
-        and getattr(config, "pooling", None) == "avg"
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
     )
 
 
