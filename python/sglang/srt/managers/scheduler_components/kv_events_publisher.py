@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import (
@@ -20,6 +21,8 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -52,6 +55,7 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    metrics_drop_warned: bool = False
 
     def __post_init__(self) -> None:
         self.init_kv_events(self.kv_events_config)
@@ -87,7 +91,18 @@ class SchedulerKvEventsPublisher:
         )
 
         if not self.send_metrics_from_scheduler.closed:
-            sock_send(self.send_metrics_from_scheduler, kv_metrics)
+            # Auxiliary telemetry must not stall the scheduler when the receiver
+            # is unavailable or cannot keep up. KV events use a separate publisher.
+            try:
+                sock_send(
+                    self.send_metrics_from_scheduler, kv_metrics, flags=zmq.NOBLOCK
+                )
+            except zmq.Again:
+                if not self.metrics_drop_warned:
+                    logger.warning(
+                        "KV metrics receiver unavailable or queue full; dropping auxiliary metrics"
+                    )
+                    self.metrics_drop_warned = True
 
     def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
         if self.kv_event_publisher is None:
