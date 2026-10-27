@@ -55,7 +55,8 @@ def make_batch(tokens=2, rows=4, return_lse=False):
 @pytest.mark.parametrize("breakable", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("tokens", [0, 2, 4])
-def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
+@pytest.mark.parametrize("flat_q", [False, True])
+def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens, flat_q):
     layer = RadixAttention(2, 3, 1.0, 2, 7)
     batch = make_batch(tokens=tokens, return_lse=return_lse)
     original = batch.out_cache_loc, batch.positions
@@ -73,7 +74,7 @@ def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
             return out, torch.full((tokens, 2), 7.0)
         return out
 
-    q = torch.zeros(4, 2, 3)
+    q = torch.zeros(4, 6) if flat_q else torch.zeros(4, 2, 3)
     with (
         attention_scope(
             batch,
