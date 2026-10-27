@@ -815,7 +815,8 @@ class TestShardedDSAMetadata(unittest.TestCase):
         self.assertEqual(pool.begin_args[2], [128, 64, 192])
 
     def test_prefill_cp_shard_keeps_the_legacy_topk(self):
-        """The packed prefill top-k takes an unsharded batch, never a CP shard."""
+        """On CUDA the packed prefill top-k takes an unsharded batch, never a CP
+        shard. ROCm sends a CP shard to the packed kernel, as on main."""
         import sys
         import types
         from unittest.mock import MagicMock
@@ -837,8 +838,15 @@ class TestShardedDSAMetadata(unittest.TestCase):
                 torch.tensor([0, 1]),
             ),
         )
-        for cp_sharded, want_calls in ((False, (1, 0)), (True, (0, 1))):
-            with self.subTest(cp_sharded=cp_sharded):
+        # (is_hip, cp_sharded, (packed, legacy) calls). On main the packed branch
+        # was ROCm-only and had no CP check, so ROCm sends the CP shard there.
+        cases = (
+            (False, False, (1, 0)),
+            (False, True, (0, 1)),
+            (True, True, (1, 0)),
+        )
+        for is_hip, cp_sharded, want_calls in cases:
+            with self.subTest(is_hip=is_hip, cp_sharded=cp_sharded):
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.EXTEND,
                     batch_size=2,
@@ -884,6 +892,7 @@ class TestShardedDSAMetadata(unittest.TestCase):
                     envs.SGLANG_DSA_FUSE_TOPK.override(True),
                     envs.SGLANG_OPT_USE_TOPK_V2.override(True),
                     patch.dict(sys.modules, {"sgl_kernel": sgl_kernel}),
+                    patch.object(dsa_topk_backend, "_is_hip", is_hip),
                     patch.object(
                         dsa_topk_backend, "_topk_transform_v2_packed"
                     ) as packed,

@@ -7,10 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -153,8 +155,9 @@ class DSATopKBackend(Enum):
         # trtllm with an fp8 KV cache). Unsupported shapes fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
-        # Prefill CP (interleave) stays on legacy: its rows are the rank's token
-        # shard, a layout no packed-kernel test covers.
+        # Prefill CP (interleave) stays on legacy on CUDA: its rows are the rank's
+        # token shard, a layout no CUDA packed-kernel test covers. ROCm keeps
+        # main's packed path.
         if batch_idx_list is None:
             row_to_batch = attn_metadata.token_to_batch_idx
         elif isinstance(batch_idx_list, torch.Tensor):
@@ -165,7 +168,7 @@ class DSATopKBackend(Enum):
         if (
             self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
-            and not attn_metadata.prefill_cp_sharded
+            and (_is_hip or not attn_metadata.prefill_cp_sharded)
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0]
             and logits.dtype == torch.float32
