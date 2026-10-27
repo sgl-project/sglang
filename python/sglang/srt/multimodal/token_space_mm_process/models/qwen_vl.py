@@ -151,7 +151,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 * processor.video_processor.merge_size
             )
             pixel_limits = qwen3_vl_video_pixel_limits(image_factor)
-        video_config = {
+        item_video_config = {
             **self.video_config,
             **{
                 key: value
@@ -167,7 +167,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             return self._process_qwen3_vl_video(
                 video,
                 processor,
-                video_config,
+                item_video_config,
                 processor_kwargs,
                 image_factor=image_factor,
             )
@@ -175,11 +175,11 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             processor_kwargs.update(
                 {
                     key: value
-                    for key, value in video_config.items()
+                    for key, value in item_video_config.items()
                     if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
                 }
             )
-        frames, metadata = preprocess_video_sync(video, video_config=video_config)
+        frames, metadata = preprocess_video_sync(video, video_config=item_video_config)
         if metadata is None:
             metadata = video_metadata
         if metadata is not None:
@@ -212,7 +212,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             output["video_second_per_grid"] = torch.tensor(
                 [
                     processor.video_processor.temporal_patch_size
-                    / video_config.get("fps", 1.0)
+                    / item_video_config.get("fps", 1.0)
                 ],
                 dtype=torch.float32,
             )
@@ -260,7 +260,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         return options
 
     def _process_qwen3_vl_video(
-        self, video, processor, video_config, processor_kwargs, *, image_factor
+        self, video, processor, item_video_config, processor_kwargs, *, image_factor
     ):
         video_processor = processor.video_processor
         frames, metadata = preprocess_qwen3_vl_video_sync(
@@ -268,7 +268,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             image_factor=image_factor,
             video_config={
                 key: value
-                for key, value in video_config.items()
+                for key, value in item_video_config.items()
                 if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
             },
         )
