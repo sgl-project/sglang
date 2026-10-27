@@ -771,6 +771,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_parent_global_num_tokens_cpu: Optional[List[int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 

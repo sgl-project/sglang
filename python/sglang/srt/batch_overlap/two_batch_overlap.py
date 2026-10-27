@@ -851,6 +851,12 @@ class TboForwardBatchPreparer:
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
+                # The counts the parent published for its DP gather.
+                tbo_parent_global_num_tokens_cpu=(
+                    batch.global_num_tokens_padded_cpu
+                    if batch.global_num_tokens_padded_cpu is not None
+                    else batch.global_num_tokens_cpu
+                ),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,

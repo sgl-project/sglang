@@ -134,6 +134,9 @@ class _StageExecutor:
             child_ctx if child_ctx is not None else get_forward_context(),
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
             is_micro_batch=micro_batch,
+            dp_global_num_tokens_bound=(
+                forward_batch.tbo_parent_global_num_tokens_cpu if micro_batch else None
+            ),
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len

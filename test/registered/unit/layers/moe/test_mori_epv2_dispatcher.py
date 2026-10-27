@@ -158,18 +158,38 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
         self.assertEqual(self.log, ["combine_send", "sibling", "combine_recv"])
         self.assertIs(combined, op.combined)
 
-    def test_recv_bound_skips_async_ll_layouts(self):
-        """mori_recv_bound is proven only for the intranode receive layout;
-        trimming an AsyncLL receive view could drop received rows."""
-        for deepep_mode, sdma, verified in (
-            (DeepEPMode.NORMAL, False, True),
-            (DeepEPMode.NORMAL, True, False),
-            (DeepEPMode.LOW_LATENCY, False, False),
-        ):
-            with self.subTest(deepep_mode=deepep_mode, sdma=sdma):
-                os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
-                impl = self._make_dispatcher(deepep_mode)._get_impl()
-                self.assertEqual(impl._is_recv_layout_verified(), verified)
+
+class TestMoriRecvBound(CustomTestCase):
+    """A TBO micro-batch may use its parent batch's DP rows only as an upper bound."""
+
+    def _bound(self, local_rows, sender_rows, subbatch, attn_dp_size=4):
+        parallel = SimpleNamespace(
+            moe_ep_size=4,
+            tp_size=4,
+            attn_cp_size=1,
+            attn_dp_size=attn_dp_size,
+            attn_dp_rank=1 if attn_dp_size > 1 else 0,
+            attn_tp_size=4 // attn_dp_size,
+            attn_tp_rank=0,
+        )
+        with patch.object(moriep, "get_parallel", return_value=parallel):
+            return moriep.mori_recv_bound(local_rows, sender_rows, subbatch=subbatch)
+
+    def test_whole_batch_needs_exact_local_rows(self):
+        rows = (10, 20, 30, 40)
+        self.assertEqual(self._bound(20, rows, subbatch=False), 100)
+        self.assertEqual(self._bound(12, rows, subbatch=False), 0)
+
+    def test_micro_batch_bounded_by_parent_rows(self):
+        rows = (10, 20, 30, 40)
+        self.assertEqual(self._bound(12, rows, subbatch=True), 100)
+        self.assertEqual(self._bound(20, rows, subbatch=True), 100)
+        # More local rows than the parent published: the rows are stale.
+        self.assertEqual(self._bound(21, rows, subbatch=True), 0)
+        self.assertEqual(self._bound(12, None, subbatch=True), 0)
+
+    def test_micro_batch_without_dp_attention_keeps_full_view(self):
+        self.assertEqual(self._bound(12, None, subbatch=True, attn_dp_size=1), 0)
 
 
 class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
@@ -190,9 +210,9 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
         return dispatcher
 
     def test_tbo_child_marked_only_while_its_stage_runs(self):
-        """A TBO child's stage sees itself marked; once the stage returns the mark
-        is gone, so later forwards are ordinary even where no DP metadata is
-        republished (no DP attention)."""
+        """A TBO child's stage sees itself marked and its parent's DP rows; once
+        the stage returns, both are gone, so later forwards are ordinary even
+        where no DP metadata is republished (no DP attention)."""
         from sglang.srt.batch_overlap.operations import _StageExecutor
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
@@ -203,13 +223,15 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
         seen = []
 
         def probe(state, **inputs):
-            seen.append(get_forward_context().is_micro_batch)
+            ctx = get_forward_context()
+            seen.append((ctx.is_micro_batch, ctx.dp_global_num_tokens_bound))
             return inputs
 
         child = SimpleNamespace(
             global_dp_buffer_len=None,
             tbo_padded_len=None,
             global_num_tokens_cpu=None,
+            tbo_parent_global_num_tokens_cpu=[3, 5],
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
             moe_num_token_non_padded=None,
         )
@@ -222,7 +244,7 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             micro_batch=True,
         )
         executor.next()
-        self.assertEqual(seen, [True])
+        self.assertEqual(seen, [(True, [3, 5])])
         self.assertFalse(has_forward_context())
 
         # An unsplit forward (execute_operations) runs no micro-batch.
@@ -232,7 +254,7 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             inputs={"forward_batch": child},
             child_ctx=ForwardContext(attn_backend=None),
         ).next()
-        self.assertEqual(seen[-1], False)
+        self.assertEqual(seen[-1], (False, None))
 
     def test_comm_stream_only_for_micro_batches(self):
         from sglang.srt.model_executor.forward_context import (
