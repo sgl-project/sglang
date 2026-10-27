@@ -321,6 +321,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             RuntimeError, "Failed to clear Mooncake storage backend"
         ):
             store.clear()
+
     def test_dcp_shard_keys_and_replicas(self):
         base = replace(
             _make_config(is_mla_model=True, tp_size=4),
