@@ -1417,7 +1417,6 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
-        enable_mamba2_spec_replay: bool = False,
         mamba2_replay_dtype: Optional[torch.dtype] = None,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape=None,
@@ -1426,7 +1425,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec /
-        # enable_mamba2_spec_replay / mamba2_replay_dtype: accepted to match
+        # mamba2_replay_dtype: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
         if short_conv_layer_ids or ngram_context_len:

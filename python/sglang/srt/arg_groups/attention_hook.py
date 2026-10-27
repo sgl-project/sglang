@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.mamba_hook import mamba2_spec_replay_requested
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
     _attention_backend_fa3_fp8_fallback,
@@ -29,7 +30,6 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     use_mla_backend,
 )
-from sglang.srt.configs.mamba2_spec_replay import mamba2_spec_replay_enabled
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -448,8 +448,8 @@ def handle_linear_attn_backend(server_args: Any):
     # --linear-replayssm-cache-len window and folds via its own fused
     # verify ring-write + commit_kda_replayssm_after_verify.
     # Mamba2 uses FlashInfer checkpointing_ssu and has its own capability/dtype
-    # checks in handle_mamba_backend, not the GDN/KDA replay defaults below.
-    if cfg.enable_linear_replayssm_spec and not mamba2_spec_replay_enabled(
+    # checks before pool allocation, not the GDN/KDA replay defaults below.
+    if cfg.enable_linear_replayssm_spec and not mamba2_spec_replay_requested(
         cfg, model_config_of(server_args).hf_text_config.model_type
     ):
         if cfg.speculative_eagle_topk not in (None, 1):

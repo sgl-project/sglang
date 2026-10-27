@@ -1,6 +1,7 @@
 """Real pool/mixer/acceptance integration tests; no server or model load."""
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -58,6 +59,7 @@ class TestMamba2SpecReplay(CustomTestCase):
                 conv_kernel=4,
             ),
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float16),
+            is_mamba2=True,
             layers=list(range(layers)),
         )
 
@@ -70,7 +72,7 @@ class TestMamba2SpecReplay(CustomTestCase):
                 device="cuda",
                 speculative_num_draft_tokens=width,
                 speculative_eagle_topk=1,
-                enable_mamba2_spec_replay=replay,
+                enable_linear_replayssm_spec=replay,
                 mamba2_replay_dtype=torch.bfloat16,
             )
 
@@ -216,26 +218,20 @@ class TestMamba2SpecReplay(CustomTestCase):
         self.assertEqual(replay.mamba_cache.mamba2_replay_ring_start.count_nonzero(), 0)
 
     def test_pool_allocation_accounting(self):
-        from sglang.srt.configs.mamba2_spec_replay import Mamba2ReplaySizing
-        from sglang.srt.configs.mamba_utils import (
-            Mamba2CacheParams,
-            Mamba2StateDType,
-            Mamba2StateShape,
-        )
+        from sglang.srt.configs.mamba_utils import Mamba2ReplaySizing, Mamba2StateDType
+        from sglang.srt.configs.nemotron_h import NemotronHConfig
         from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.runtime_context import get_parallel
 
-        params = Mamba2CacheParams(
-            shape=Mamba2StateShape.create(
-                tp_world_size=1,
-                intermediate_size=8192,
+        # Use production model metadata so this checks model-to-pool dispatch.
+        with get_parallel().override(attn_tp_size=1):
+            params = NemotronHConfig(
+                layers_block_type=["mamba", "attention", "mamba"],
                 n_groups=8,
-                num_heads=128,
-                head_dim=64,
-                state_size=128,
-                conv_kernel=4,
-            ),
+            ).mamba2_cache_params
+        params = replace(
+            params,
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float16),
-            layers=[0, 2],
         )
         pool = MambaPool(
             size=32,
@@ -245,10 +241,23 @@ class TestMamba2SpecReplay(CustomTestCase):
             device="cuda",
             speculative_num_draft_tokens=4,
             speculative_eagle_topk=1,
-            enable_mamba2_spec_replay=True,
+            enable_linear_replayssm_spec=True,
             mamba2_replay_dtype=torch.bfloat16,
         )
         self.assertIsNone(pool.mamba_cache.intermediate_ssm)
+        # The shared flag must not allocate GDN/KDA rings or cursors for Mamba2.
+        for name in (
+            "replayssm_d",
+            "replayssm_k",
+            "replayssm_g",
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_beta",
+        ):
+            self.assertIsNone(getattr(pool.mamba_cache, name), name)
+        self.assertIsNone(pool.replayssm_spec_write_pos)
+        self.assertIsNone(pool.replayssm_cache_base)
+        self.assertIsNone(pool.replayssm_is_flush)
         costs = Mamba2ReplaySizing.from_params(
             params, layers=2, width=4, activation_bytes=2
         )

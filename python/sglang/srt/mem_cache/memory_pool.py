@@ -55,7 +55,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     saturate_to_fp8_range,
 )
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    mamba2_spec_replay_enabled,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
@@ -659,7 +662,6 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        enable_mamba2_spec_replay: bool = False,
         mamba2_replay_dtype: Optional[torch.dtype] = None,
     ):
         conv_state_shape = cache_params.shape.conv
@@ -679,25 +681,17 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-linear-replayssm-spec) uses compact replay for GDN and raw
-        # fold-every-commit for KDA. The shared g allocation gates on
-        # `_replayssm_on`.
+        # (--enable-linear-replayssm-spec) selects Mamba2 records, compact GDN
+        # replay, or KDA fold-every-commit from the cache metadata.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
-        self.enable_mamba2_spec_replay = enable_mamba2_spec_replay
-        if enable_mamba2_spec_replay:
-            assert speculative_num_draft_tokens == 4
-            assert speculative_eagle_topk == 1
-            assert not enable_linear_replayssm_spec and not enable_linear_replayssm
-            assert mamba2_replay_dtype == torch.bfloat16
-            assert cache_params.dtype.temporal == torch.float16
-            assert cache_params.shape.temporal[1:] == (64, 128)
-            from sglang.kernels.ops.mamba.mamba2_spec_replay import checkpointing_kernel
-
-            checkpointing_kernel()  # resolve the required API before allocation
-        self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+        mamba2_spec_replay = mamba2_spec_replay_enabled(
+            enable_linear_replayssm_spec, cache_params
         )
-        _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        linear_attn_spec_replay = (
+            enable_linear_replayssm_spec and not mamba2_spec_replay
+        )
+        self.replayssm_spec_fold = bool(linear_attn_spec_replay and cache_params.is_kda)
+        _replayssm_on = enable_linear_replayssm or linear_attn_spec_replay
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -837,7 +831,7 @@ class MambaPool:
                 )
                 # KDA still uses raw-input fold-every-commit. GDN materializes
                 # its compact d/k/g history directly and needs no duplicate ring.
-                if enable_linear_replayssm_spec and cache_params.is_kda:
+                if linear_attn_spec_replay and cache_params.is_kda:
                     if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
@@ -899,7 +893,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec or enable_mamba2_spec_replay:
+                if enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -986,7 +980,7 @@ class MambaPool:
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 mamba2_records = {}
-                if enable_mamba2_spec_replay:
+                if mamba2_spec_replay:
                     heads, dim, dstate = temporal_state_shape
                     groups = (conv_state_shape[0][0] - heads * dim) // (2 * dstate)
                     ring_len = 2 * speculative_num_draft_tokens
@@ -1132,17 +1126,17 @@ class MambaPool:
             )
             self.replayssm_spec_write_pos = (
                 torch.zeros((spec_state_size + 1,), dtype=torch.int32, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if linear_attn_spec_replay and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_cache_base = (
                 torch.zeros((spec_state_size + 1,), dtype=torch.int32, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if linear_attn_spec_replay and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
                 torch.zeros((spec_state_size + 1,), dtype=torch.int8, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if linear_attn_spec_replay and not self.replayssm_spec_fold
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
@@ -1480,7 +1474,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        enable_mamba2_spec_replay: bool = False,
         mamba2_replay_dtype: Optional[torch.dtype] = None,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
@@ -1521,7 +1514,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            enable_mamba2_spec_replay=enable_mamba2_spec_replay,
             mamba2_replay_dtype=mamba2_replay_dtype,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
@@ -1543,7 +1535,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        enable_mamba2_spec_replay: bool = False,
         mamba2_replay_dtype: Optional[torch.dtype] = None,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
@@ -1563,7 +1554,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            enable_mamba2_spec_replay=enable_mamba2_spec_replay,
             mamba2_replay_dtype=mamba2_replay_dtype,
         )
         self.mamba_allocator = MambaSlotAllocator(

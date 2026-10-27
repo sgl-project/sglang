@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,12 +9,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-from sglang.srt.configs.mamba2_spec_replay import (
-    Mamba2ReplaySizing,
-    validate_mamba2_spec_replay,
-)
+from sglang.srt.arg_groups.mamba_hook import validate_mamba2_spec_replay
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
+    Mamba2ReplaySizing,
     Mamba2StateDType,
     Mamba2StateShape,
 )
@@ -31,6 +30,7 @@ def mamba2_params():
             conv_kernel=4,
         ),
         dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float16),
+        is_mamba2=True,
         layers=list(range(40)),
     )
 
@@ -161,9 +161,9 @@ class TestMamba2ReplaySizing(CustomTestCase):
         )
         validate_mamba2_spec_replay(
             resolving_view(ServerArgs(model_path="dummy", **valid)),
-            "nemotron_h",
             is_cuda=True,
-            resolved=True,
+            cache_params=mamba2_params(),
+            activation_dtype=torch.bfloat16,
         )
         for change in (
             dict(speculative_eagle_topk=2),
@@ -175,49 +175,86 @@ class TestMamba2ReplaySizing(CustomTestCase):
             dict(enable_linear_replayssm=True),
             dict(speculative_adaptive=True),
             dict(mamba_backend="triton"),
-            dict(mamba_ssm_dtype="bfloat16"),
             dict(enable_int8_mamba_checkpoint=True),
             dict(enable_page_major_kv_layout=True),
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_mamba2_spec_replay(
                     resolving_view(ServerArgs(model_path="dummy", **(valid | change))),
-                    "nemotron_h",
                     is_cuda=True,
-                    resolved=True,
+                    cache_params=mamba2_params(),
+                    activation_dtype=torch.bfloat16,
                 )
-        for model, cuda in (("qwen3_next", True), ("nemotron_h", False)):
-            with self.assertRaises(ValueError):
-                validate_mamba2_spec_replay(
-                    resolving_view(ServerArgs(model_path="dummy", **valid)),
-                    model,
-                    is_cuda=cuda,
-                    resolved=True,
-                )
+        with self.assertRaises(ValueError):
+            validate_mamba2_spec_replay(
+                resolving_view(ServerArgs(model_path="dummy", **valid)),
+                is_cuda=False,
+                cache_params=mamba2_params(),
+                activation_dtype=torch.bfloat16,
+            )
+
+        params = mamba2_params()
+        for activation_dtype, state_dtype, shape in (
+            (torch.float16, torch.float16, params.shape),
+            (torch.bfloat16, torch.bfloat16, params.shape),
+            (
+                torch.bfloat16,
+                torch.float16,
+                replace(params.shape, temporal=(128, 32, 128)),
+            ),
+            (torch.bfloat16, torch.float16, replace(params.shape, conv=[])),
+            (torch.bfloat16, torch.float16, replace(params.shape, conv=[(8193, 3)])),
+        ):
+            with self.subTest(
+                activation=activation_dtype, state=state_dtype, shape=shape
+            ):
+                with self.assertRaises(ValueError):
+                    validate_mamba2_spec_replay(
+                        resolving_view(ServerArgs(model_path="dummy", **valid)),
+                        is_cuda=True,
+                        cache_params=replace(
+                            params,
+                            dtype=replace(params.dtype, temporal=state_dtype),
+                            shape=shape,
+                        ),
+                        activation_dtype=activation_dtype,
+                    )
 
     def test_global_flag_dispatch_excludes_drafts_and_other_families(self):
-        """A shared switch must not allocate Mamba2 scratch for GDN/KDA or drafts."""
+        """Runtime dispatch follows cache metadata, even if model labels differ."""
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
         configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        params = mamba2_params()
         for enabled in (False, True):
             with rc.get_context().override_server_args(
                 enable_linear_replayssm_spec=enabled
             ):
-                for model_type in ("nemotron_h", "qwen3_next", "kimi_linear", "other"):
-                    configurator.model_config = SimpleNamespace(
-                        hf_text_config=SimpleNamespace(model_type=model_type)
+                for is_mamba2 in (True, False, None):
+                    configurator.mambaish_config = (
+                        SimpleNamespace(
+                            mamba2_cache_params=replace(params, is_mamba2=is_mamba2)
+                        )
+                        if is_mamba2 is not None
+                        else None
                     )
-                    for draft in (False, True):
-                        configurator.is_draft_worker = draft
-                        with self.subTest(
-                            enabled=enabled, model=model_type, draft=draft
-                        ):
-                            self.assertEqual(
-                                configurator._mamba2_spec_replay_enabled,
-                                enabled and model_type == "nemotron_h" and not draft,
-                            )
+                    for model_type in ("nemotron_h", "qwen3_next"):
+                        configurator.model_config = SimpleNamespace(
+                            hf_text_config=SimpleNamespace(model_type=model_type)
+                        )
+                        for draft in (False, True):
+                            configurator.is_draft_worker = draft
+                            with self.subTest(
+                                enabled=enabled,
+                                is_mamba2=is_mamba2,
+                                model=model_type,
+                                draft=draft,
+                            ):
+                                self.assertEqual(
+                                    configurator._mamba2_spec_replay_enabled,
+                                    enabled and is_mamba2 is True and not draft,
+                                )
 
     def test_global_flag_preserves_model_specific_resolution(self):
         """Mamba2 must not inherit GDN/KDA's FP32 default or replay backend gate."""

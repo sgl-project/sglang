@@ -356,15 +356,15 @@ class KVCacheConfigurator:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         if self._mamba2_spec_replay_enabled:
-            from sglang.srt.configs.mamba2_spec_replay import (
+            from sglang.srt.arg_groups.mamba_hook import (
                 validate_mamba2_spec_replay,
             )
 
             validate_mamba2_spec_replay(
                 resolving_view(self.server_args),
-                self.model_config.hf_text_config.model_type,
                 is_cuda=self.device == "cuda",
-                resolved=True,
+                cache_params=self.mambaish_config.mamba2_cache_params,
+                activation_dtype=self.model_config.dtype,
             )
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self._resolve_kv_shard()
@@ -375,14 +375,15 @@ class KVCacheConfigurator:
 
     @property
     def _mamba2_spec_replay_enabled(self):
-        from sglang.srt.configs.mamba2_spec_replay import mamba2_spec_replay_enabled
+        from sglang.srt.configs.mamba_utils import mamba2_spec_replay_enabled
 
         return (
             not self.is_draft_worker
             and get_exec().mamba.enable_linear_replayssm_spec
+            and self.mambaish_config is not None
             and mamba2_spec_replay_enabled(
-                get_exec().mamba,
-                self.model_config.hf_text_config.model_type,
+                get_exec().mamba.enable_linear_replayssm_spec,
+                self.mambaish_config.mamba2_cache_params,
             )
         )
 
@@ -1708,7 +1709,6 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            enable_mamba2_spec_replay=self._mamba2_spec_replay_enabled,
             mamba2_replay_dtype=self.model_config.dtype,
             **self._get_ple_req_pool_kwargs(),
             speculative_num_draft_tokens=(
@@ -1722,14 +1722,12 @@ class KVCacheConfigurator:
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
-            # fold); activate the pool machinery only for those, so any other
-            # mamba-ish model stays on its own pool path. Mamba2's dispatch
-            # above must not also allocate a GDN/KDA replay ring.
+            # Pass one replay switch; cache metadata selects the pool layout.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
-                    self.hybrid_gdn_config is not None
+                    self._mamba2_spec_replay_enabled
+                    or self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
             ),
@@ -3088,7 +3086,7 @@ class KVCacheConfigurator:
 
         has_spec_dec = not self.spec_algorithm.is_none()
         if self._mamba2_spec_replay_enabled:
-            from sglang.srt.configs.mamba2_spec_replay import Mamba2ReplaySizing
+            from sglang.srt.configs.mamba_utils import Mamba2ReplaySizing
 
             width = get_spec().speculative_num_draft_tokens
             costs = Mamba2ReplaySizing.from_params(
