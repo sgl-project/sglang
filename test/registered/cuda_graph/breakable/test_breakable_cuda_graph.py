@@ -1,5 +1,3 @@
-"""Tests for the breakable CUDA graph (BCG) runner."""
-
 import unittest
 from unittest.mock import patch
 

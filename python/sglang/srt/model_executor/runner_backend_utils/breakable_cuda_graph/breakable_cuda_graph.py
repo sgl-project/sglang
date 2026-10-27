@@ -212,11 +212,11 @@ def eager_on_graph(
 ):
     """Record an eager call between captured segments.
 
-    The capture pass records the call without running it; ``capture_stub``
-    runs in its place for host setup a later captured segment reads. Tensor
-    arguments keep their capture-time identity and are held weakly, so a buffer
-    allocated outside the captured region needs an owner that outlives the
-    graph. Request-specific state is read inside the body when it runs.
+    The capture pass records the call without running it; ``capture_stub``, if
+    given, runs at that point for host setup a later captured segment reads.
+    Tensor arguments keep their capture-time identity and are held weakly, so a
+    buffer allocated outside the captured region needs an owner that outlives
+    the graph. Request-specific state is read inside the body when it runs.
 
     Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
     This explicit entry bypasses graph segmentation and capture stubs; methods

@@ -30,7 +30,7 @@ This mode is intended for debugging only — it eliminates the performance benef
 
 ### Selective Graph Breaks in Model Code
 
-For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
+For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside a breakable CUDA graph, they run as plain calls.
 
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
@@ -109,7 +109,7 @@ Begin capture (segment 1)
   @eager_on_graph function encountered:
     1. End current capture segment
     2. Record the function for later replay without running it; an optional
-       capture_stub runs host setup in its place
+       capture_stub runs host setup that later segments read
     3. Begin new capture segment
   ... more graphable ops ...
 End capture (segment N)
@@ -128,7 +128,7 @@ For each segment i:
 Launch final CUDA graph segment
 ```
 
-The non-graph functions are re-invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
+The non-graph functions are invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
 
 ### Outputs
 

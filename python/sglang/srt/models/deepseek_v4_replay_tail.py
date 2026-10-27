@@ -665,7 +665,7 @@ def _enter_eager_tail_in_prefill_graph(
     backend, graph_batch: ForwardBatch, source_kv_layer_id: Optional[int]
 ) -> Tuple[tuple, ForwardBatch]:
     """Switches onto exact-row tail metadata; returns the exit state and the
-    batch the tail runs on (the capture batch while the graph captures)."""
+    batch the tail runs on (the dummy batch during the graph warmup)."""
     forward_batch = _unpadded_batch(backend.prefill_graph_replay_batch or graph_batch)
     held = backend.tail_forward_metadata
     backend.tail_forward_metadata = backend._build_late_layer_tail_metadata(
@@ -713,8 +713,8 @@ def _tail_layers_in_prefill_graph(
         num_rows = tail.positions.shape[0]
         dp_rows = None
         if dp:
-            # Exchanged before the forward, except while the prefill graphs capture
-            # (every rank together), when it gathers here.
+            # Exchanged before the forward, except on the dummy batches the prefill
+            # graphs warm up on (every rank together), when it gathers here.
             dp_rows = forward_batch.global_late_layer_num_tokens_cpu
             if dp_rows is None:
                 counts = torch.empty(get_parallel().tp_size, dtype=torch.int64)

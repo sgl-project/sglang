@@ -942,8 +942,8 @@ def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
     get_attn_backend().tail_source_kv_layer_id = layer.layer_id
 
 
-# The capture pass sets only the layer id by which the tail's source layer skips
-# its compressor; the KV the break writes would come from uncomputed inputs.
+# The captured tail reads this layer id to skip the source layer's compressor,
+# so the id is also set while the graph captures.
 bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
     deepseek_v4_write_tail_source_kv,
     capture_stub=_write_tail_source_kv_capture_stub,
@@ -970,8 +970,7 @@ def _engram_image_token_id(config) -> Optional[int]:
 
 def deepseek_v4_enter_late_layer_tail() -> None:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
-    # backend onto the tail metadata of the *live* batch (the captured args hold
-    # the capture-time batch).
+    # backend onto the tail metadata of the *live* batch.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
 
