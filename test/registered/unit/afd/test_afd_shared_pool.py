@@ -29,7 +29,6 @@ def test_failed_second_bucket_keeps_first_program_and_shared_pool():
 def test_capture_growth_is_counted_once_and_not_refunded_by_single_bucket_release():
     class Driver(RecordingDriver):
         def memory_usage(self, *, device):
-            # The second shape reuses allocator space; no additional growth.
             return (1024, 2048) if self.programs else (0, 0)
 
     cfg, service = role_service(driver=Driver())

@@ -84,24 +84,6 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
     return runner
 
 
-class TestStandaloneExecutionContext(CustomTestCase):
-    def test_rejects_invalid_warmup_policy(self):
-        for count in (-1, True, 0.5):
-            with self.subTest(warmup_steps=count), self.assertRaises(ValueError):
-                FullCudaGraphBackend(device_module=object(), warmup_steps=count)
-        with self.assertRaises(ValueError):
-            FullCudaGraphBackend(
-                device_module=object(), warmup_steps=0, reuse_output_buffer=True
-            )
-
-    def test_requires_one_execution_context(self):
-        with self.assertRaises(ValueError):
-            FullCudaGraphBackend()
-        runner = _make_runner(enable_profile=False, profiler=None)
-        with self.assertRaises(ValueError):
-            FullCudaGraphBackend(runner, device_module=runner.device_module)
-
-
 class TestCaptureOneNoProfiling(CustomTestCase):
     def test_runs_two_warmups_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)

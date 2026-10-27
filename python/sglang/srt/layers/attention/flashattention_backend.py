@@ -1548,16 +1548,13 @@ class FlashAttentionBackend(AttentionBackend):
             and self.fa_impl_ver == 4
             and not self.use_mla
             and not self.fa_skip_kv_cache
-            and self.kv_cache_dtype
-            in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         )
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
-            and (
-                not is_prefill or self.fa_impl_ver != 4 or fa4_fp8_paged_prefill
-            )
+            and (not is_prefill or self.fa_impl_ver != 4 or fa4_fp8_paged_prefill)
         ):
             if layer.k_scale is not None:
                 descale_shape = (logical_batch_size, kv_head_num)

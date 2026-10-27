@@ -30,11 +30,3 @@ def _server_args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
-
-
-def _lane_server_args(*, role, lanes, attention_lanes=None, **overrides):
-    return _server_args(
-        afd_execution_mode=role,
-        afd_config=config.AFDConfig(lanes=lanes, attention_lanes=attention_lanes),
-        **overrides,
-    )

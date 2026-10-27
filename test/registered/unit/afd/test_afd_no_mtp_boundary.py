@@ -1,10 +1,5 @@
 """The MANF base admits native speculation only when AFD is off."""
 
-from sglang.test.afd.graph_fixtures import make_shape as planned_shape
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +7,10 @@ import pytest
 from sglang.srt.afd import config as afd_config
 from sglang.srt.afd import contracts as afd_contracts
 from sglang.test.afd.config_fixtures import _server_args
+from sglang.test.afd.graph_fixtures import make_shape as planned_shape
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_afd_rejects_speculation_before_runtime_construction():
@@ -45,7 +44,6 @@ def test_runtime_rejects_verify_rows_instead_of_treating_them_as_decode():
 
 @pytest.mark.parametrize("width", [0, -1, 2, 4, True, 1.0, "1"])
 def test_request_width_is_rejected_by_sender_receiver_and_shape(width):
-    """Keep the wire field but reject unsupported widths on both role boundaries."""
     contracts = afd_contracts
     descriptor = dict(
         kind="STEP",

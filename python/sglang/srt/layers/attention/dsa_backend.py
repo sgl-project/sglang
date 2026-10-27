@@ -1739,9 +1739,9 @@ class DeepseekSparseAttnBackend(
             batch_size=num_query_rows,
         )
         # Capacity is set before capture, so a grow here is a broken invariant.
-        assert (
-            counter is buffer or not torch.cuda.is_current_stream_capturing()
-        ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
+        assert counter is buffer or not torch.cuda.is_current_stream_capturing(), (
+            "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
+        )
         return counter
 
     def _ensure_multi_ctas_kv_counter_capacity(self, num_query_rows: int) -> None:

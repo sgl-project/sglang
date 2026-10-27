@@ -55,6 +55,7 @@ class _AFDControlChannels:
 
     def _channel(self, src: int, dst: int) -> Any:
         import torch
+
         from sglang.srt.distributed.utils import StatelessProcessGroup
 
         edge = (src, dst)
@@ -218,6 +219,7 @@ class AFDPairedP2PTransport:
         lane: int = 0,
     ) -> None:
         import torch
+
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )

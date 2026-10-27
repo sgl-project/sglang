@@ -63,6 +63,7 @@ def joint_rank(role: AFDRole, lane: int) -> int:
 
 def _packed_scale(weight: Any, scale: Any) -> Any:
     import torch
+
     from sglang.srt.layers.quantization.fp8_utils import transform_scale_ue8m0
 
     if scale.dtype == torch.int32 and getattr(scale, "format_ue8m0", False):
@@ -137,6 +138,7 @@ class AFDM2NDataPlane:
 
     def __init__(self, *, transport: Any, adapter: Any, config: Any, device: Any):
         import torch
+
         from sglang.srt.utils.common import init_custom_process_group
 
         # Torch NCCL eager initialization requires an explicit CUDA ordinal.

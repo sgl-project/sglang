@@ -12,6 +12,7 @@ import copy
 from typing import Any
 
 import msgspec
+
 from sglang.srt.model_executor.forward_batch_view import slice_batch_field
 from sglang.srt.runtime_context import get_parallel
 
@@ -565,6 +566,7 @@ class AFDDecoderAdapter:
         """
 
         import torch
+
         from sglang.srt.runtime_context import get_forward
 
         widths = stage.group_widths

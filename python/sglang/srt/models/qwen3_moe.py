@@ -23,6 +23,9 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.afd.config import AFDExecutionMode
 from sglang.srt.afd.model_hooks import (
     afd_a_router_enabled,
@@ -86,8 +89,6 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from torch import nn
-from transformers import PretrainedConfig
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()

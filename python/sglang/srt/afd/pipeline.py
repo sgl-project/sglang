@@ -93,6 +93,7 @@ class AFDAttentionPipeline:
     def capture_startup(self, runner: Any) -> None:
         """Reuse native dummy decode inputs; only coordinate the role captures."""
         import torch
+
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         graph = self._connector.graph_strategy

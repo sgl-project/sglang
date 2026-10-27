@@ -207,3 +207,7 @@ def test_backend_attention_preserves_layer_order_and_shared_output(shared_value)
         torch.testing.assert_close(
             stage.hidden_states, torch.full((16, 4), 10.0 + 3 * shared_value)
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v", "-x"]))

@@ -21,9 +21,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def test_two_microbatches_use_native_residuals_once_and_reset_each_invocation(
     monkeypatch, family, rows
 ):
-    from sglang.test.boundary_fixtures import Norm, parallel_of, planning
-
     from sglang.srt.models import glm4_moe, qwen3_moe
+    from sglang.test.boundary_fixtures import Norm, parallel_of, planning
 
     module = qwen3_moe if family == "qwen" else glm4_moe
     model_type = (
@@ -135,12 +134,11 @@ def test_two_microbatches_use_native_residuals_once_and_reset_each_invocation(
 def test_qwen_constructor_retains_router_without_native_expert_collectives(
     monkeypatch, mode
 ):
-    from sglang.test.boundary_fixtures import Norm, parallel_of, planning
-
-    from sglang.srt.layers.layer_boundary.factories import layer_stack
-    from sglang.srt.models import qwen3_moe
     from sglang.srt.afd import model_hooks
     from sglang.srt.afd.config import AFDConfig
+    from sglang.srt.layers.layer_boundary.factories import layer_stack
+    from sglang.srt.models import qwen3_moe
+    from sglang.test.boundary_fixtures import Norm, parallel_of, planning
 
     class Router(torch.nn.Module):
         def __init__(self, *args, **kwargs):
