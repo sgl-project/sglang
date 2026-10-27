@@ -68,9 +68,6 @@ def _fill_padded_rows(
     if num_token_non_padded.device != x.device:
         raise ValueError("num_token_non_padded and x must be on the same device")
     n_rows, n_cols = x.shape
-    # Empty idle ranks have no rows to fill; Ascend rejects a zero-sized grid.
-    if x.numel() == 0:
-        return
     _fill_padded_rows_kernel[(n_rows,)](
         x,
         num_token_non_padded,
