@@ -1,7 +1,8 @@
 """CPU tests for where compressed-tensors channel-wise FP8 experts run on ROCm.
 
 The experts are preshuffled for AITER's fused MoE only when that runner is used;
-the Triton runner reads them unshuffled.
+the Triton runner reads them unshuffled. Deterministic mode moves the automatic
+choice to the Triton runner.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,10 +30,26 @@ def _scheme(strategy):
     return scheme
 
 
+def _exec(deterministic):
+    return SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
+    )
+
+
 class TestChannelExpertsOnAiter(CustomTestCase):
-    def _on_aiter(self, runner, use_aiter=True, strategy=QuantizationStrategy.CHANNEL):
+    def _on_aiter(
+        self,
+        runner,
+        use_aiter=True,
+        strategy=QuantizationStrategy.CHANNEL,
+        deterministic=False,
+    ):
         a2a = SimpleNamespace(supports_aiter=lambda: True)
         with (
+            mock.patch.object(scheme_module, "_is_hip", True),
+            mock.patch.object(
+                scheme_module, "get_exec", return_value=_exec(deterministic)
+            ),
             mock.patch.object(scheme_module, "_use_aiter", use_aiter),
             mock.patch.object(
                 scheme_module, "get_moe_runner_backend", return_value=runner
@@ -50,6 +67,11 @@ class TestChannelExpertsOnAiter(CustomTestCase):
 
     def test_explicit_aiter_runner(self):
         self.assertTrue(self._on_aiter(MoeRunnerBackend.AITER))
+
+    def test_deterministic_mode_moves_auto_runner_to_triton(self):
+        self.assertFalse(self._on_aiter(MoeRunnerBackend.AUTO, deterministic=True))
+        # An explicitly requested runner is kept.
+        self.assertTrue(self._on_aiter(MoeRunnerBackend.AITER, deterministic=True))
 
     def test_other_strategies_are_not_channel_wise(self):
         self.assertFalse(
