@@ -14,13 +14,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -1021,14 +1021,14 @@ class SWAComponent(TreeComponent):
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
             return
-        free_swa_out_of_window_slots(
+        kv_storage_of(
+            self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
+        ).advance(
             req,
             pre_len,
-            sliding_window_size=self.sliding_window_size,
-            page_size=self.cache.page_size,
-            req_to_token_pool=self.cache.req_to_token_pool,
-            token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            window=self.sliding_window_size,
             retain_floor=self.cache.swa_retain_floor(req),
+            shares_prefixes=True,
         )
 
     def free_out_of_window_slots(

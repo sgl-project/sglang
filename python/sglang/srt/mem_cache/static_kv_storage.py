@@ -260,6 +260,30 @@ class StaticKVStorage:
     def free_tokens(self, ids: torch.Tensor) -> None:
         self._allocator.free(ids)
 
+    def advance(
+        self,
+        req: Req,
+        frontier: int,
+        *,
+        window: int,
+        retain_floor: Optional[int],
+        shares_prefixes: bool,
+        eviction_interval: int = 1,
+    ) -> None:
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            frontier,
+            sliding_window_size=window,
+            page_size=self._allocator.page_size,
+            req_to_token_pool=self.requests,
+            token_to_kv_pool_allocator=self._allocator,
+            supports_prefix_sharing=shares_prefixes,
+            retain_floor=retain_floor,
+            eviction_interval=eviction_interval,
+        )
+
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)

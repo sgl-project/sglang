@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
 )
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -2163,7 +2164,7 @@ class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
 
         # Decode advances past the last recurrent checkpoint. Its complete
         # draft history must remain until a newer checkpoint replaces it.
-        cache.evict_sliding_windows(req, 1040)
+        retire_window(req, 1040, cache)
         torch.testing.assert_close(mapping[needed], before)
         cache.sanity_check()
 
@@ -2288,7 +2289,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
 
         req.output_ids = tokens[prompt_len:]
         req.kv.kv_committed_len = owned
-        cache.evict_sliding_windows(req, owned - 1)
+        retire_window(req, owned - 1, cache)
         insert_boundary = (owned - 1) // page_size * page_size
         self.assertGreaterEqual(
             insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),

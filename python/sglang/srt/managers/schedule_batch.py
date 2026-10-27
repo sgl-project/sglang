@@ -103,7 +103,11 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+    retire_window,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -4135,8 +4139,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        self.tree_cache.evict_sliding_windows(
-            req, pre_len, eviction_interval=eviction_interval
+        retire_window(
+            req, pre_len, self.tree_cache, eviction_interval=eviction_interval
         )
 
     def __str__(self):

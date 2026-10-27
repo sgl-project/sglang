@@ -204,6 +204,34 @@ class KVStorage:
         """Give back owner token ids no request holds any more."""
         self._allocator.free(ids)
 
+    def advance(
+        self,
+        req: Req,
+        frontier: int,
+        *,
+        window: int,
+        retain_floor: Optional[int],
+        shares_prefixes: bool,
+        eviction_interval: int = 1,
+    ) -> None:
+        """Retire the window rows a running request no longer reads: those more
+        than ``window`` tokens behind ``frontier``, at most up to
+        ``retain_floor``, once ``eviction_interval`` of them have piled up. A
+        prefix tree that shares prefixes keeps a whole window of pages."""
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            frontier,
+            sliding_window_size=window,
+            page_size=self._allocator.page_size,
+            req_to_token_pool=self.requests,
+            token_to_kv_pool_allocator=self._allocator,
+            supports_prefix_sharing=shares_prefixes,
+            retain_floor=retain_floor,
+            eviction_interval=eviction_interval,
+        )
+
     def release_row(self, req: Req) -> None:
         """Give back the request's row; its ids went back before."""
         self.requests.free(req)
