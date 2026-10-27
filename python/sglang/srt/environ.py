@@ -524,6 +524,8 @@ class Envs:
     # ===================================================================
     # Runtime simulations
     # ===================================================================
+    # Benchmark mode: changes only the accepted length; verify still runs every op real
+    # serving runs, at real cost (SGLANG_SIMULATE_ACC_GREEDY is the opt-out).
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
