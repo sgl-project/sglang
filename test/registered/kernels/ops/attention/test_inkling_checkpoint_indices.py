@@ -750,10 +750,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 "require_mlp_tp_gather": False,
                 "require_mlp_sync": False,
                 "require_attn_tp_gather": False,
-                "resolve_decode_backend": SimpleNamespace(
-                    cache_loc_dtype=torch.int64,
-                    bind_decode_runner=lambda runner: None,
-                ),
+                "resolve_decode_backend": Mock(),
             }
             for name, result in replacements.items():
                 stack.enter_context(patch.object(eagle, name, return_value=result))
