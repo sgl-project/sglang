@@ -312,9 +312,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 bs=runner.bs,
                 raw_bs=runner.raw_bs,
                 num_tokens=runner.bs * runner.captured_req_width,
-                global_num_tokens_cpu=runner._global_num_tokens_for_graph(
-                    runner.bs * runner.captured_req_width
-                ),
                 seq_len_fill_value=runner.seq_len_fill_value,
                 capture_forward_mode=runner.capture_forward_mode,
                 is_encoder_decoder=runner.is_encoder_decoder,
