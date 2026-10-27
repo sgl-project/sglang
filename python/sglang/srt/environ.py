@@ -1117,7 +1117,7 @@ class Envs:
     # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
     # default CUTLASS path. Only takes effect on a GPU with a matching
     # dtype=fp8_w8a8_channelwise config JSON under
-    # kernels/ops/gemm/configs/ (currently L40S and H200), so it is a no-op on
+    # kernels/ops/gemm/configs/ (currently L40S, H200 and H20), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
