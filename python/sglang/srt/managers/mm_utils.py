@@ -266,7 +266,7 @@ def pad_mm_token_pairs(
     if data_start_token_ids is None:
         data_start_token_ids = [s for s, _e in data_token_pairs]
     assert_int64_array(input_ids, "input_ids")
-    pad_values = [item.pad_value for item in mm_inputs.mm_items]
+    pad_items = mm_inputs.mm_items
     mm_inputs.data_offsets = []
     if data_token_pairs is None:
         data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
@@ -295,13 +295,12 @@ def pad_mm_token_pairs(
             data_idx += 1
             mm_inputs.data_offsets += [start_idx]
 
-        if data_idx >= len(pad_values):
-            data_idx = len(pad_values) - 1
+        if data_idx >= len(pad_items):
+            data_idx = len(pad_items) - 1
 
         num_tokens = end_idx - start_idx - 1
-        pad_value = pad_values[data_idx]
         if num_tokens > 0:
-            padded_ids.extend(array("q", [pad_value]) * num_tokens)
+            padded_ids.extend(pad_items[data_idx].padding_sequence(num_tokens))
 
         last_idx = end_idx
 
@@ -340,8 +339,15 @@ def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
             continue
 
         for i, item in enumerate(items):
-            for offset in items[i].offsets:
-                input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+            for start, end in items[i].offsets:
+                # Auto-truncation can cut the prompt inside or before a span;
+                # pad only the part that is still in the prompt.
+                end = min(end + 1, len(padded_input_ids))
+                if start < end:
+                    input_ids_tensor[start:end] = torch.as_tensor(
+                        item.padding_sequence(end - start),
+                        dtype=input_ids_tensor.dtype,
+                    )
 
     return padded_input_ids
 
@@ -493,7 +499,10 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [item.pad_value for item in items]
+            # Sorted for the searchsorted lookup in _get_multimodal_mask.
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
@@ -1189,6 +1198,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # explicit None check, not `a or b`: the value is a multi-element
                 # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("grid_thws")
                 if image_grid_thw is None:
                     image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)

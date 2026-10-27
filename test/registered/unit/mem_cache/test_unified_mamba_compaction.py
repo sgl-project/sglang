@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestMambaCompaction(CustomTestCase):
@@ -179,6 +179,19 @@ class TestMambaCompaction(CustomTestCase):
         ]:
             self.assertTrue(torch.equal(tensor[:, src], tensor[:, dst]))
         self.assertTrue(torch.equal(f.ngram.context[src], f.ngram.context[dst]))
+        state_tensors = [
+            *f.kv.mamba_cache.conv,
+            f.kv.mamba_cache.temporal,
+            f.short.conv_state,
+        ]
+        sources = [t[:, src].clone() for t in state_tensors]
+        ngram_source = f.ngram.context[src].clone()
+        f.kv.clear_slots(dst)
+        for tensor, source in zip(state_tensors, sources):
+            self.assertEqual(torch.count_nonzero(tensor[:, dst]).item(), 0)
+            self.assertTrue(torch.equal(tensor[:, src], source))
+        self.assertEqual(torch.count_nonzero(f.ngram.context[dst]).item(), 0)
+        self.assertTrue(torch.equal(f.ngram.context[src], ngram_source))
         before_empty = f.pool._raw.clone()
         f.kv.move_kv_cache(f.ids[:0], f.ids[:0])
         self.assertTrue(torch.equal(f.pool._raw, before_empty))
