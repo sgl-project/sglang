@@ -97,6 +97,11 @@ export const config = {
       "gsm8k_pct",
       "GSM8K (1314 questions, 5-shot)",
       "%"
+    ],
+    [
+      "gsm8k_200_pct",
+      "GSM8K (200-question subset, 5-shot)",
+      "%"
     ]
   ],
   "benchmarkCommands": {
@@ -204,9 +209,9 @@ export const config = {
         "strategy": "high-throughput",
         "nodes": "single"
       },
-      "verified": false,
-      "verificationStatus": "unverified",
-      "warn": "Requires 1 A3 physical card on one node; uses 1 logical NPU device (TP=1). Performance is measured. The recorded GPQA score includes one context-limit rejection; a separate full evaluation with the corrected output budget remains pending on A3. See [Ascend reference workloads](#ascend-reference-workloads).",
+      "verified": true,
+      "verificationStatus": "verified",
+      "warn": "Requires 1 A3 physical card on one node; uses 1 logical NPU device (TP=1). Performance is measured. A separate full GPQA retest on 2026-10-21 scored 112/198 (56.57%) with a 38000-token output budget and 198 successful generations. See [Ascend reference workloads](#ascend-reference-workloads).",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_OP_EXPANSION_MODE=AIV",
@@ -434,7 +439,7 @@ export const config = {
       },
       "verified": false,
       "verificationStatus": "unverified",
-      "warn": "A2 validation candidate: 8 cards with 64 GB each on one node (TP=8). Uses the tutorial's recommended W8A8 device count, pure tensor parallelism, eight concurrent requests, and no EAGLE3 or graph capture. This is an untuned starting point; runtime, accuracy, and performance validation are pending. BF16 needs separate two-node resource validation and is not offered by this single-node selector.",
+      "warn": "A2 validation candidate: 8 cards with 64 GB each on one node (TP=8). Uses the tutorial's recommended W8A8 device count, pure tensor parallelism, eight concurrent requests, and no EAGLE3 or graph capture. Model loading, service health, first inference, and GSM8K 192/200 (96.0%) completed on A2 910B3 with SGLang b44e248. The 32-request performance workload timed out after 900 seconds without final metrics; full recipe verification remains incomplete. See the accuracy protocol below. BF16 needs separate two-node resource validation and is not offered by this single-node selector.",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",

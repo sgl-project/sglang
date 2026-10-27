@@ -1,5 +1,6 @@
 ---
 title: Qwen3
+description: "Deploy Qwen3 with SGLang, including measured Ascend A3 and A2 recipes and their validation scope."
 metatags:
     description: "Deploy Qwen3 series models with SGLang - featuring advanced reasoning, 256K context, and flexible Dense/MoE architectures for edge to cloud."
 ---
@@ -57,7 +58,7 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 Use the selector below for **single-node, PD co-located** deployment: the same
 SGLang service handles prefill and decode. Select **A3** for the measured 8B and
-30B-A3B recipes, or **A2** for 32B recipes and the pending 235B-A22B candidate.
+30B-A3B recipes, or **A2** for 32B recipes and the partially validated 235B-A22B recipe.
 Then select the model, quantization, and workload.
 
 An A3 physical card contains two 64 GB dies; an A2 card has one 64 GB device.
@@ -68,11 +69,11 @@ See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/referen
 | Model | Quantization | Workload | Hardware / physical cards | Logical devices / TP | Status |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3-8B | W8A8 | Low latency | A3 / 1 | 2 | Measured |
-| Qwen3-8B | W8A8 | High throughput | A3 / 1 allocated | 1 | Performance measured; accuracy includes one rejected request |
+| Qwen3-8B | W8A8 | High throughput | A3 / 1 allocated | 1 | Measured; GPQA retest 112/198 (56.57%) |
 | Qwen3-30B-A3B | W8A8 | Low latency / high throughput | A3 / 1 | 2 | Measured |
 | Qwen3-32B | BF16 | Low latency | A2 / 4 | 4 | Measured |
 | Qwen3-32B | W8A8 | High throughput | A2 / 4 | 4 | Measured |
-| Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Validation candidate |
+| Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Startup and GSM8K measured; performance incomplete |
 
 The 32B W8A8 recipe follows the command in the
 [A2 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series).
@@ -90,11 +91,14 @@ targets. The 32B W8A8 recipe passed startup, temperature-0/1 inference,
 its complete performance workload, and full GPQA evaluation with the corrected
 output budget. The 32B BF16
 recipe passed startup, temperature-0/1 inference, performance, and full GSM8K
-evaluation. The 235B W8A8 candidate still requires runtime validation.
+evaluation. The 235B W8A8 recipe passed model loading, service health, first
+inference, and the 200-question GSM8K evaluation described below. Its performance
+workload timed out and remains incomplete; this does not validate the A3 TP16/DP16 recipe.
 
 <Info>
 The [235B model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
-recommends 16 × 64 GB devices for BF16: two eight-card A2 nodes. That deployment
+recommends 16 × 64 GB devices for BF16. On eight-device A2 nodes, matching
+that device count requires two nodes. That deployment
 needs a separate distributed configuration and validation of communication
 between the nodes. It remains pending and is not offered by this single-node
 selector. Its approximately 470 GB checkpoint also exceeds a 300 GB local volume;
@@ -126,13 +130,17 @@ The A3 measurements and A2 32B validation use the following environments:
 | triton-ascend | `3.2.1.dev20260530` | `3.2.1.dev20260530` |
 | Transformers | `5.8.1` | `5.12.1` |
 
+The 2026-10-21 A3 8B TP1 GPQA retest used the same versions listed in the A3
+column, with Python 3.11.15, `memfabric-hybrid 1.0.8`, and `memfabric-zbal 1.1.1`.
+Its accuracy result is separate from the 2026-09-12 performance measurement.
+
 This records the tested platform environment. For a new installation, follow the
 linked dependency matrix and record any differences. EAGLE3 sampling at the A3
 measured commit requires `sgl_kernel_npu.sample.chain_speculative_sampling_triton`; the
 platform's older `2026.5.1` kernel failed on nonzero-temperature requests. The
 tested `2026.9.0` kernel provides that function.
 
-The A2 environment has four Ascend 910B3 devices and uses `memfabric-hybrid 1.1.4`
+The A2 32B environment has four Ascend 910B3 devices and uses `memfabric-hybrid 1.1.4`
 and `memfabric-zbal 1.1.2`. Install the CANN 9.0.0 / 910B custom-ops,
 ops-transformer, and kernel packages from the [matching official release](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0). The A2
 measurements use the selected recipe without additional host tuning; they do
@@ -226,9 +234,11 @@ request that returns `Paris` only checks that inference works.
 | Qwen3-32B W8A8 | `gpqa_diamond` | 38000 | 64 |
 | Qwen3-30B-A3B W8A8 | `aime25` | 32768 | 16 |
 
-The measured 8B and 32B checkpoints have a 40,960-token context limit. Their longest GPQA
-input uses 2,829 tokens, so a 40,000-token output budget causes that request to
-be rejected before generation. The initial 32B run scored 139/198 (70.20%), with
+The measured 8B and 32B checkpoints have a 40,960-token context limit. In the initial runs, one GPQA
+input was reported as 2,829 tokens, so the upstream 40,000-token output budget
+caused that request to be rejected before generation. Recheck input lengths for
+each model, template, and evaluator; the A3 8B retest below had a maximum of
+2,825 input tokens. The initial 32B run scored 139/198 (70.20%), with
 197 successful generations and one rejection retained as an incorrect answer.
 The recorded A3 8B run similarly scored 121/198 (61.11%), with 197 successful
 generations and the same rejected question retained in the denominator.
@@ -237,7 +247,14 @@ answers from different runs. The separate A2 32B run with this corrected budget
 scored **132/198 (66.67%)**, with 198 successful generations, no rejected requests,
 and no output-budget stops. Both attempts are retained; the revised budget and
 sampling mean the score difference is not a controlled regression comparison.
-The corresponding A3 8B corrected-budget retest remains pending.
+The separate A3 8B TP1 retest on 2026-10-21 scored **112/198 (56.57%)** at
+`c389dd086340878934bf96bc209534f1fbb8440c`, with 198 successful generations,
+no empty answers or extraction failures, and no reported output-budget stops.
+It used EvalScope 1.11.1, temperature 1.0, a 38,000-token output budget,
+configured client concurrency 64, and task seed 42; no per-request generation
+seed was supplied. This corrected-budget protocol differs from the upstream
+40,000-token protocol. The historical 121/198 result remains separate; neither
+run is spliced or averaged into the other.
 
 Install the evaluation tool in a separate environment. Set `EVAL_DATASET` and
 `EVAL_MAX_TOKENS` from the table and update `SERVICE_URL` if you changed the selector's host or port.
@@ -285,9 +302,9 @@ run_task(task_cfg=TaskConfig(
 PY
 ```
 
-The 8B low-latency recipe uses TP2 and different EAGLE3 settings. Evaluate it
-separately before assigning a verified status. Use the following protocol for
-that recipe and the A2 32B BF16 recipe. It uses the upstream
+The 8B low-latency recipe uses TP2 and different EAGLE3 settings; it was
+evaluated separately with GSM8K. Use the following protocol for that recipe
+and the A2 32B BF16 recipe. It uses the upstream
 NPU GSM8K completion protocol at temperature 0, with five examples and a
 512-token output budget. It scores all 1,314 remaining questions after the
 scorer excludes the five examples from the 1,319-row dataset.
@@ -308,6 +325,35 @@ The A2 BF16 run scored **1139/1314 (86.68%)** with all requests successful;
 GSM8K and GPQA measure different capabilities; report the dataset, prompt format,
 and question count with each score.
 
+The A2 235B W8A8 run on 2026-10-25 scored **192/200 (96.0%)** on GSM8K,
+using five demonstrations (rows 0–4) and the following 200 test rows (5–204).
+It used plain `Question:`/`Answer:` completion prompts, a 512-token output budget,
+temperature 0, top-p 1, and 128 client threads with at most eight server requests.
+All 200 responses finished with `stop`, with no recorded API errors or missing
+responses. This is a 200-question result, not a full GSM8K test-set result.
+The run used eight A2 910B3 devices, TP8, SGLang commit
+`b44e2486824e2fbde9cbcb09adad10bce5593c16`, and model revision
+`aa1470b37a666db251ef9bbc76256fa611a1d87c` of
+`vllm-ascend/Qwen3-235B-A22B-W8A8` on ModelScope; all 66 model files passed SHA256 checks.
+Reproduce this subset against the running TP8 service with the same dataset:
+
+```bash
+python -m sglang.test.run_eval \
+  --base-url http://127.0.0.1:6688 \
+  --model /models/Qwen3-235B-A22B-W8A8 \
+  --eval-name gsm8k --api completion \
+  --num-examples 200 --num-shots 5 --num-threads 128 \
+  --max-tokens 512 --temperature 0 --repeat 1 \
+  --gsm8k-data-path /datasets/gsm8k-test.jsonl
+```
+
+Replace the model path with the identifier returned by `/v1/models`. The raw
+GSM8K test file SHA256 was
+`3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`.
+The 235B performance attempt used 32 requests at concurrency 8 and a separate
+warmup. It exited with timeout code 124 after 900 seconds, without final metrics;
+no throughput or latency result is reported from that attempt.
+
 Record the report's score and evaluated question count, request failures, model
 and draft revisions, dataset revision, SGLang commit, and dependency versions.
 Keep every attempt's report. Compare against a baseline with the same checkpoint
@@ -319,7 +365,7 @@ for other datasets and evaluation methods.
 
 Linked rows use the workloads from the Ascend best practices. The other A2 rows
 define task-specific workloads, without a reference latency target. The 32B BF16
-workload is measured; the 235B workload remains pending. ISL and OSL are input and output token counts
+workload is measured; the 235B workload remains incomplete after a 900-second timeout. ISL and OSL are input and output token counts
 per request.
 
 | Hardware | Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
@@ -330,7 +376,7 @@ per request.
 | A3 | Qwen3-30B-A3B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) | 3500 | 1500 | 160 | 640 | 50 ms |
 | A2 | Qwen3-32B / BF16 | Low latency | 18000 | 4000 | 1 | 4 | No reference target |
 | A2 | Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) | 3584 | 1536 | 100 | 400 | 55 ms (source) |
-| A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Not measured |
+| A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Incomplete (timeout); no final metrics |
 
 The A2 32B reference's card-count inconsistency prevents treating its published
 55 ms as a matched-hardware baseline until the source topology is clarified.

@@ -1,4 +1,5 @@
-// A3 measured on 2026-09-12; original Qwen3 checkpoints, PD co-located.
+// A3 performance measured on 2026-09-12; 8B TP1 GPQA retested on 2026-10-21.
+// Original Qwen3 checkpoints, PD co-located.
 // A3 source: sgl-project/sglang c389dd086340878934bf96bc209534f1fbb8440c.
 // CANN 9.0.0, torch/torch-npu 2.10.0, sgl-kernel-npu 2026.9.0,
 // triton-ascend 3.2.1.dev20260530, transformers 5.8.1. This is the measured
@@ -26,6 +27,12 @@
 // Original test.jsonl SHA-256:
 // 3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14.
 export const benchmarks = [
+  {
+    match: { hw: "a2", variant: "235b-a22b", quant: "w8a8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "main @ b44e248682",
+    accuracy: { gsm8k_200_pct: 96.0 },
+    notes: "Measured on 2026-10-25: 8 Ascend 910B3 devices, 64 GiB each, TP8, no EAGLE3 or DP. GSM8K: 192/200 correct; 200 natural stops, no recorded API errors or missing responses. Five demonstration rows followed by 200 scored rows; raw completion, temperature 0, top-p 1, maximum output 512, 128 client threads and at most 8 server requests. This is a fixed subset, not full GSM8K. ModelScope revision aa1470b37a666db251ef9bbc76256fa611a1d87c of vllm-ascend/Qwen3-235B-A22B-W8A8. The 32-request performance attempt (3500 input/1500 output, concurrency 8) timed out after 900 seconds with no final metrics. No performance result or A3 equivalence is claimed; full recipe verification remains incomplete.",
+  },
   {
     match: { hw: "a2", variant: "32b", quant: "bf16", strategy: "low-latency", nodes: "single" },
     sglang_version: "main @ b44e248682",
@@ -83,8 +90,8 @@ export const benchmarks = [
         tokens_per_sec_per_gpu: 5927.99,
       },
     ],
-    accuracy: { gpqa_diamond_pct: 61.11 },
-    notes: "1 physical A3 card allocated, 1 logical NPU device used (TP1). 256/256 performance requests succeeded; output throughput 1778.40 tok/s for the service. Median TTFT 1840.44 ms and median TPOT 28.18 ms. GPQA Diamond: 121/198 correct, 197 successful generations and one context-limit rejection retained as an incorrect answer. One full 0-shot run at temperature 1.0 with a 40000-token output budget; the rejected request was not an output-budget truncation. A separate full run with a 38000-token budget remains pending on A3. Main checkpoint: vllm-ascend/Qwen3-8B-w8a8; draft: Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh.",
+    accuracy: { gpqa_diamond_pct: 56.57 },
+    notes: "1 physical A3 card allocated, 1 logical NPU device used (TP1). 256/256 performance requests succeeded; output throughput 1778.40 tok/s for the service. Median TTFT 1840.44 ms and median TPOT 28.18 ms. GPQA Diamond retested on 2026-10-21: 112/198 correct, 198/198 successful generations, no empty answers, extraction failures, or reported output-budget stops. One full 0-shot run at temperature 1.0 with a 38000-token output budget, configured client concurrency 64, and EvalScope task seed 42 (no per-request generation seed). This differs from the upstream 40000-token budget. The earlier 40000-token run scored 121/198 with one context-limit rejection counted incorrect; it is retained separately and is not combined with this result. Main checkpoint: vllm-ascend/Qwen3-8B-w8a8; draft: Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh.",
   },
   {
     match: { hw: "a3", variant: "30b-a3b", quant: "w8a8", strategy: "low-latency", nodes: "single" },
