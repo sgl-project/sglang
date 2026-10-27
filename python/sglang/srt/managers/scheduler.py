@@ -5329,6 +5329,13 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        # Paused loops skip the batch getters and process_decode_queue, where
+        # HiCache acks are reaped, so a pending one would block flush_cache.
+        if (
+            self.disaggregation_mode != DisaggregationMode.DECODE
+            or self.enable_decode_hicache
+        ):
+            self._process_hicache_events(should_retry_storage_prefetch=False)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
