@@ -17,13 +17,50 @@ from sglang.srt.weight_sync.gpu_delta.apply import (
     BLOCK,
     ByteApplyGroup,
     _compiled,
+    _compiled_status,
     _packed_row_start,
     plan_apply,
+    prepare_status_check,
 )
 from sglang.srt.weight_sync.gpu_delta.bindings import _direct_binding
 from sglang.srt.weight_sync.gpu_delta.receiver import PreparedDelta
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_runtime_status_counts_mask_tails_and_preserve_sticky_errors():
+    kernel = _compiled_status(torch.cuda.current_device())
+    misses = _compiled_status.cache_info().misses
+    for count in (1, 1023, 1024, 1025, 2049):
+        # Batch metadata rows and the second status slot need not be 16B aligned.
+        statuses = torch.zeros(count + 2, dtype=torch.int32, device="cuda")[1:]
+        expected = torch.full((count + 2,), 17, dtype=torch.int64, device="cuda")[1:]
+        actual = torch.full((count + 2,), 17, dtype=torch.int64, device="cuda")[1:]
+        # The extra invalid frame must remain outside the runtime count/tail.
+        statuses[count] = 9
+        actual[count] = 0
+        error = torch.zeros(1, dtype=torch.int32, device="cuda")
+        decoder = SimpleNamespace(
+            statuses=statuses[:count],
+            actual_sizes=actual[:count],
+            expected_sizes=expected[:count],
+        )
+        launch = prepare_status_check(decoder, error)
+        launch()
+        assert error.item() == 0
+        statuses[count - 1] = 3
+        launch()
+        assert error.item() == 1
+        statuses[count - 1] = 0
+        actual[count - 1] = 0
+        error.fill_(4)
+        launch()
+        assert error.item() == 5
+        actual[count - 1] = 17
+        launch()
+        assert error.item() == 5
+        assert _compiled_status(torch.cuda.current_device()) is kernel
+        assert _compiled_status.cache_info().misses == misses
 
 
 def test_runtime_geometry_word_units_tails_and_byte_fallback():

@@ -826,19 +826,27 @@ def decode_fixture(codec):
                 },
             }
         )
-    start = len(blob)
-    blob.extend(b"raw-target-value")
-    expected["raw"] = b"raw-target-value"
-    entries.append(
-        {
-            "name": "raw",
-            "encoding": "raw_bytes",
-            "nbytes": 16,
-            "changed_bytes": 16,
-            "frames": [],
-            "raw": {"file": "payload", "encoded_offset": start, "encoded_bytes": 16},
-        }
-    )
+    for name, value in (
+        ("raw", b"raw-target-value"),
+        ("raw-large", bytes(range(256)) * 256),
+    ):
+        start = len(blob)
+        blob.extend(value)
+        expected[name] = value
+        entries.append(
+            {
+                "name": name,
+                "encoding": "raw_bytes",
+                "nbytes": len(value),
+                "changed_bytes": len(value),
+                "frames": [],
+                "raw": {
+                    "file": "payload",
+                    "encoded_offset": start,
+                    "encoded_bytes": len(value),
+                },
+            }
+        )
     layout, size = host._tensor_layout(entries)
     return entries, layout, size, {"payload": memoryview(bytes(blob))}, expected
 
@@ -846,7 +854,8 @@ def decode_fixture(codec):
 @pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd", "lz4"])
 def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
     entries, layout, size, files, expected = decode_fixture(codec)
-    destination = bytearray(size)
+    backing = bytearray(b"left" + bytes(size) + b"right")
+    destination = memoryview(backing)[4:-5]
     metrics = {name: 0 for name in host._PREPARE_METRICS}
     pool = HostPayloadPool(2)
     try:
@@ -865,13 +874,14 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
         if codec == "lz4":
             decode.assert_not_called()
             assert metrics["host_rank_encoded_copy_bytes"] == sum(
-                len(v) for k, v in expected.items() if k != "raw"
+                len(v) for k, v in expected.items() if not k.startswith("raw")
             )
         for name, row in layout.items():
             assert (
                 destination[row["offset"] : row["offset"] + row["nbytes"]]
                 == expected[name]
             )
+        assert backing[:4] == b"left" and backing[-5:] == b"right"
     finally:
         pool.close()
 
@@ -930,7 +940,7 @@ def test_failed_tensor_drains_other_groups_before_releasing_views(codec):
     def copy(destination, source):
         decode(memoryview(source), None, memoryview(destination))
 
-    copy_patch = patch.object(host.np, "copyto", side_effect=copy)
+    copy_patch = patch.object(host, "copy_bytes", side_effect=copy)
     copy_patch.start()
     thread = threading.Thread(target=run)
     thread.start()

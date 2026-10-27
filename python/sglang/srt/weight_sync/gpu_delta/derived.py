@@ -163,12 +163,23 @@ def prepare_updates(plans, raw_copies):
             if not changed:
                 continue
             original = source_plan.source
-            complete = original.detach().clone()
+            # Admission proves the patches are disjoint and within this source.
+            # Read live values only when some elements remain unchanged.
+            complete = (
+                torch.empty_like(original)
+                if sum(target.numel() for target in changed) == original.numel()
+                else original.detach().clone()
+            )
+            destinations, values = [], []
             for target in changed:
                 value = incoming[id(target)]
                 _same_geometry(target, value, "raw source")
                 offset = target.storage_offset() - original.storage_offset()
-                complete.as_strided(target.shape, target.stride(), offset).copy_(value)
+                destinations.append(
+                    complete.as_strided(target.shape, target.stride(), offset)
+                )
+                values.append(value)
+            torch._foreach_copy_(destinations, values)
             overrides[id(original)] = complete
         if overrides:
             copies, predicates = plan.update._prepare(overrides)

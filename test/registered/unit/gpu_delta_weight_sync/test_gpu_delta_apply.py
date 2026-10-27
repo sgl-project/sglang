@@ -30,9 +30,7 @@ def planner(monkeypatch):
         run = None
 
         def __getitem__(self, grid):
-            return lambda pointers, metadata, error: launched.append(
-                (grid, pointers, metadata, error)
-            )
+            return lambda *args: launched.append((grid, *args))
 
     def warmup(*args, **kwargs):
         warmed.append((args, kwargs))
@@ -42,7 +40,9 @@ def planner(monkeypatch):
     # method below is the real imported implementation.
     language = SimpleNamespace(constexpr=object())
     triton = SimpleNamespace(
-        language=language, jit=lambda f: f, cdiv=lambda n, d: (n + d - 1) // d
+        language=language,
+        jit=lambda f=None, **_: f if f is not None else lambda f: f,
+        cdiv=lambda n, d: (n + d - 1) // d,
     )
     with monkeypatch.context() as imports:
         imports.setitem(sys.modules, "triton", triton)
@@ -56,11 +56,44 @@ def planner(monkeypatch):
         imports.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
     monkeypatch.setattr(module, "_xor_batch", SimpleNamespace(warmup=warmup))
+    monkeypatch.setattr(module, "_check_decode", SimpleNamespace(warmup=warmup))
     monkeypatch.setattr(module, "_resident_ctas", lambda *args: 2)
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
     module.warmed, module.launched = warmed, launched
     return module
+
+
+def test_status_preparation_reuses_one_module_across_counts_and_binds_current_inputs(
+    planner,
+):
+    error = object()
+    for count in (0, 1, 1023, 1024, 1025):
+        decoder = SimpleNamespace(
+            statuses=SimpleNamespace(
+                numel=lambda count=count: count, device=SimpleNamespace(index=0)
+            ),
+            actual_sizes=object(),
+            expected_sizes=object(),
+        )
+        launches_before = len(planner.launched)
+        launch = planner.prepare_status_check(decoder, error)
+        assert len(planner.launched) == launches_before
+        launch()
+        assert planner.launched[-1] == (
+            ((count + 1023) // 1024, 1, 1),
+            decoder.statuses,
+            decoder.actual_sizes,
+            decoder.expected_sizes,
+            error,
+            count,
+        )
+    assert len(planner.warmed) == 1
+    assert len(planner.launched) == 5
+    original = planner._compiled_status(0)
+    assert planner._compiled_status(1) is not original
+    assert planner._compiled_status(0) is original
+    assert len(planner.warmed) == 2
 
 
 def linear(size):

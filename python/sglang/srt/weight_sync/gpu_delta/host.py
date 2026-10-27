@@ -58,6 +58,17 @@ def configured_cpu_workers():
     return value
 
 
+def copy_bytes(destination, source):
+    """Copy between retained byte buffers without holding the GIL for large spans."""
+    if len(source) < 64 << 10:
+        destination[:] = source
+    else:
+        np.copyto(
+            np.frombuffer(destination, dtype=np.uint8),
+            np.frombuffer(source, dtype=np.uint8),
+        )
+
+
 class HostPayloadPool:
     """Reusable bounded CPU workers; no CUDA work or shared decoder contexts."""
 
@@ -319,17 +330,10 @@ def _copy_group(jobs, destination, files, pool):
         outer = entry["outer"]
         length = outer["encoded_bytes"]
         started = time.perf_counter()
-        # One GIL-releasing copy per tensor, directly between retained maps.
-        np.copyto(
-            np.frombuffer(
-                destination, dtype=np.uint8, count=length, offset=record["offset"]
-            ),
-            np.frombuffer(
-                files[outer["file"]],
-                dtype=np.uint8,
-                count=length,
-                offset=outer["encoded_offset"],
-            ),
+        start, offset = outer["encoded_offset"], record["offset"]
+        copy_bytes(
+            destination[offset : offset + length],
+            files[outer["file"]][start : start + length],
         )
         metrics["host_rank_encoded_copy_worker_sum_s"] += time.perf_counter() - started
         metrics["host_rank_encoded_copy_bytes"] += length
@@ -354,9 +358,10 @@ def _prepare_arena(destination, layout, files, entries, pool, metrics, codec):
                 raw = entry["raw"]
                 offset, count = record["offset"], record["nbytes"]
                 start = raw["encoded_offset"]
-                destination[offset : offset + count] = files[raw["file"]][
-                    start : start + count
-                ]
+                copy_bytes(
+                    destination[offset : offset + count],
+                    files[raw["file"]][start : start + count],
+                )
             else:
                 jobs.append((entry, record))
         count = min(4 * pool.workers, len(jobs))

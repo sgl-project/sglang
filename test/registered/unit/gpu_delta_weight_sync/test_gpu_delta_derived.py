@@ -345,31 +345,38 @@ class TestDerivedNvfp4(unittest.TestCase):
                         layer._cutedsl_input_scale,
                     )
 
-    def test_prepare_updates_overlays_partial_gate_up_scalars(self):
+    def test_prepare_updates_overlays_gate_up_scalars(self):
         layer = _layer("flashinfer_trtllm")
         update = derived.nvfp4_derived_update(layer, "trtllm")
         other = _layer("flashinfer_trtllm")
         unchanged = derived.nvfp4_derived_update(other, "trtllm")
         sources_before = [source.clone() for source in update.sources]
-        copies = _prepare_updates(
-            (update, unchanged),
-            {
-                torch.float32: (
-                    [
+        for complete in (False, True):
+            with self.subTest(complete=complete):
+                if complete:
+                    targets = [
+                        layer.w13_weight_scale_2[:, 0],
+                        layer.w13_weight_scale_2[:, 1],
+                    ]
+                    values = [torch.tensor([11.0, 17.0]), torch.tensor([13.0, 19.0])]
+                    expected_gate, expected_up = [44.0, 68.0], [52.0, 76.0]
+                else:
+                    targets = [
                         layer.w13_weight_scale_2[0, 1:2],
                         layer.w13_weight_scale_2[1, 0:1],
-                    ],
-                    [torch.tensor([11.0]), torch.tensor([17.0])],
+                    ]
+                    values = [torch.tensor([11.0]), torch.tensor([17.0])]
+                    expected_gate, expected_up = [8.0, 68.0], [44.0, 20.0]
+                copies = _prepare_updates(
+                    (update, unchanged), {torch.float32: (targets, values)}
                 )
-            },
-        )
-        torch.testing.assert_close(
-            _value(copies, layer.g1_alphas), torch.tensor([8.0, 68.0])
-        )
-        torch.testing.assert_close(
-            _value(copies, layer.g1_alphas_up), torch.tensor([44.0, 20.0])
-        )
-        self.assertEqual(len(copies), len(update.destinations))
+                torch.testing.assert_close(
+                    _value(copies, layer.g1_alphas), torch.tensor(expected_gate)
+                )
+                torch.testing.assert_close(
+                    _value(copies, layer.g1_alphas_up), torch.tensor(expected_up)
+                )
+                self.assertEqual(len(copies), len(update.destinations))
         self.assertEqual(_prepare_updates((update,), {}), ())
         for source, before in zip(update.sources, sources_before):
             torch.testing.assert_close(source, before)

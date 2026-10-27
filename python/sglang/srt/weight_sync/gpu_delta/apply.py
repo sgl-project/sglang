@@ -45,7 +45,15 @@ def _resident_ctas(kernel, device_index):
         )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["count"],
+    do_not_specialize_on_alignment=[
+        "statuses",
+        "actual_sizes",
+        "expected_sizes",
+        "count",
+    ],
+)
 def _check_decode(
     statuses, actual_sizes, expected_sizes, error, count, BLOCK: tl.constexpr
 ):
@@ -56,6 +64,24 @@ def _check_decode(
     expected = tl.load(expected_sizes + index, active, other=0)
     if tl.sum(((status != 0) | (actual != expected)).to(tl.int32), 0) != 0:
         tl.atomic_or(error, 1)
+
+
+@lru_cache(maxsize=None, typed=True)
+def _compiled_status(device_index):
+    """Load one status kernel per device; frame counts remain runtime values."""
+    with torch.cuda.device(device_index):
+        kernel = _check_decode.warmup(
+            torch.int32,
+            torch.int64,
+            torch.int64,
+            torch.int32,
+            0,
+            1024,
+            grid=(1, 1, 1),
+            num_warps=4,
+        )
+        _ = kernel.run
+        return kernel
 
 
 def prepare_status_check(decoder, error):
@@ -69,8 +95,7 @@ def prepare_status_check(decoder, error):
         count,
     )
     grid = (triton.cdiv(count, 1024), 1, 1)
-    kernel = _check_decode.warmup(*arguments, 1024, grid=grid, num_warps=4)
-    _ = kernel.run
+    kernel = _compiled_status(decoder.statuses.device.index)
     return partial(kernel[grid], *arguments)
 
 

@@ -234,7 +234,7 @@ class PreparedDelta:
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
         from pathlib import Path
 
-        from sglang.srt.weight_sync.gpu_delta.host import validate_codec
+        from sglang.srt.weight_sync.gpu_delta.host import copy_bytes, validate_codec
 
         self.stream = None
         self.de_stream = None
@@ -335,7 +335,10 @@ class PreparedDelta:
         )
         raw_view = memoryview(self.raw_pinned.numpy())
         for binding, position, size in raw_targets:
-            raw_view[position : position + size] = self.host_snapshot.get(binding.name)
+            copy_bytes(
+                raw_view[position : position + size],
+                self.host_snapshot.get(binding.name),
+            )
         if self.raw_ue8m0_bytes:
             validate_ue8m0_payload(self.raw_pinned[: self.raw_ue8m0_bytes])
         changed_storages = {
