@@ -211,6 +211,17 @@ def flash_attn_with_kvcache(
     )
 
 
+def _should_use_kvcache_for_extend(forward_batch: ForwardBatch) -> bool:
+    has_cached_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+        forward_batch.extend_prefix_lens_cpu
+    )
+    return (
+        has_cached_prefix
+        or forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    )
+
+
 class MusaFlashAttentionBackend(FlashAttentionBackend):
     def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__(model_runner, **kwargs)
@@ -425,10 +436,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
-            elif (
-                forward_batch.extend_prefix_lens_cpu is not None
-                and any(forward_batch.extend_prefix_lens_cpu)
-            ) or forward_batch.forward_mode.is_target_verify():
+            elif _should_use_kvcache_for_extend(forward_batch):
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
