@@ -626,7 +626,6 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         if (
             _is_cuda
             and layer_idx is not None
-            and not torch.compiler.is_compiling()
             and record_physical_counts(
                 topk_ids=topk_ids, load_buffer=self._data[layer_idx]
             )

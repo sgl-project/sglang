@@ -2629,7 +2629,7 @@ def _post_process_topk_ids(
             recorder_topk_ids = routed_cols
         else:
             fused_topk_ids = None
-            if layer_id is not None and not torch.compiler.is_compiling():
+            if layer_id is not None:
                 recorder = get_global_expert_distribution_recorder()
                 load_buffer = recorder.get_current_pass_count_buffer(layer_id)
                 if load_buffer is not None:
