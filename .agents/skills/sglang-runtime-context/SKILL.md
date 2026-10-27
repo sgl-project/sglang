@@ -509,8 +509,8 @@ Named slots + two keyed-lazy registries:
   side stream is `"lora_side"`. Two call sites may share a name only if their work belongs
   on one stream — sharing across roles serializes intended overlap.
 - `get_buffer(name, factory)` — get-or-create a named persistent buffer. Grow-only or
-  per-device semantics manage their `resources.buffers` entries directly (see tokenspeed /
-  SM120 split / Marlin workspace). Buffer names are per-backend today; do not silently
+  per-device semantics manage their `resources.buffers` entries directly (see SM120
+  split / Marlin workspace). Buffer names are per-backend today; do not silently
   share.
 - Singletons with manager semantics (EP dispatcher buffers, EPLB recorder/metadata, graph
   memory pool) keep their owning accessors/classes as facades; only the *state* lives in a

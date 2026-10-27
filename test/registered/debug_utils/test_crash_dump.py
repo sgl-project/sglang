@@ -22,6 +22,7 @@ register_amd_ci(est_time=40, suite="nightly-amd-1-gpu", nightly=True)
 
 
 class TestCrashDump(CustomTestCase):
+    expect_server_exit = True
     crash_dump_folder = None
     MAX_NEW_TOKENS = 4
     NUM_REQUESTS_BEFORE_CRASH = 5

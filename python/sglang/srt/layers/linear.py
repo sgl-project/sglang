@@ -265,6 +265,9 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
+        # A model sets this before weights load to ask for the DeepGEMM-packed
+        # MXFP8 input path; Fp8LinearMethod keeps it True only once prepared.
+        self.deepgemm_mxfp8_input = False
         if quant_config is None:
             from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
