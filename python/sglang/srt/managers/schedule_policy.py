@@ -1274,7 +1274,7 @@ class PrefillAdder:
             return True
         budget = allocator.c128_available_pages()
         tree_cache = self.tree_cache
-        if tree_cache is not None and not tree_cache.is_chunk_cache():
+        if tree_cache is not None and tree_cache.supports_prefix_sharing():
             # Same evictable source PrefillBudget._available_and_evictable
             # uses; one C128 page spans 128 * page_size full tokens.
             evictable_tokens = (
