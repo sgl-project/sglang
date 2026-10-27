@@ -681,6 +681,14 @@ def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     )
 
 
+def _mega_mhc_takes_extend(cfg: HcConfig, next: HcNextBoundary) -> bool:
+    return (
+        next.hc is not None
+        and _can_use_mega_mhc(cfg)
+        and (get_forward().is_extend_in_batch or is_in_prefill_graph_scope())
+    )
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -693,6 +701,33 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
+    if (
+        next is not None
+        and next.norm_fusable
+        and envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
+        and _can_use_decode_post_combine(cfg, y.shape[0])
+        and not _mega_mhc_takes_extend(cfg, next)
+    ):
+        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+            mhc_post_combine_norm_decode,
+        )
+
+        quant = next.accepts_mxfp8
+        updated, normalized, q, sf = mhc_post_combine_norm_decode(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+            quant=quant,
+        )
+        if quant:
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
+        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable
@@ -729,32 +764,6 @@ def _post_fusion(
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
-    if (
-        next is not None
-        and next.norm_fusable
-        and envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
-        and _can_use_decode_post_combine(cfg, y.shape[0])
-    ):
-        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
-            mhc_post_combine_norm_decode,
-        )
-
-        quant = next.accepts_mxfp8
-        updated, normalized, q, sf = mhc_post_combine_norm_decode(
-            y,
-            residual,
-            post_mix,
-            comb,
-            pre,
-            next.norm.weight,
-            next.norm.variance_epsilon,
-            quant=quant,
-        )
-        if quant:
-            return HcState(
-                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
-            )
-        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable
