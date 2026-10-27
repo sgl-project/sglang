@@ -164,7 +164,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --attn-dp-size 8 \
+        --enable-dp-attention --dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \
@@ -360,7 +360,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --attn-dp-size 8 \
+        --enable-dp-attention --dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \
@@ -555,7 +555,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --attn-dp-size 8 \
+        --enable-dp-attention --dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \
