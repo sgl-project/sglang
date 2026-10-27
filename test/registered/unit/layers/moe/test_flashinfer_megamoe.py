@@ -115,6 +115,24 @@ def _load_autotune_module(monkeypatch):
     return module
 
 
+# Deliberately not 1: FlashInfer main writes version 2 and sglang must follow it.
+_FAKE_KNOB_CACHE_VERSION = 2
+
+
+def _install_fake_knob_cache_version(monkeypatch, moe_ep, version=None):
+    version = _FAKE_KNOB_CACHE_VERSION if version is None else version
+    core = types.ModuleType("flashinfer.moe_ep.core")
+    tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
+    tuning.KNOB_CACHE_VERSION = version
+    for name, module in (
+        ("flashinfer", types.ModuleType("flashinfer")),
+        ("flashinfer.moe_ep", moe_ep),
+        ("flashinfer.moe_ep.core", core),
+        ("flashinfer.moe_ep.core.tuning", tuning),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
     from dataclasses import dataclass
 
@@ -245,7 +263,10 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    payload = {
+        "version": _FAKE_KNOB_CACHE_VERSION,
+        "entries": [{"knobs": {"native_tactic": 7}}],
+    }
     events = []
     staged = []
     native_paths = []
@@ -306,8 +327,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
         ),
     )
     fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
-    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
-    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+    _install_fake_knob_cache_version(monkeypatch, fake_moe)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 
@@ -972,3 +992,22 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_native_knob_cache_is_valid_only_at_the_flashinfer_format_version(monkeypatch):
+    """Startup autotune failed with "did not record its selected tactic" even
+    though FlashInfer had tuned: its cache is written at its own format
+    version, and a hard-coded one rejected the winner."""
+    module = _load_autotune_module(monkeypatch)
+    _install_fake_knob_cache_version(monkeypatch, types.ModuleType("flashinfer.moe_ep"))
+    entry = {"knobs": {"native_tactic": 7}}
+
+    assert module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [entry]}
+    )
+    assert not module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION - 1, "entries": [entry]}
+    )
+    assert not module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [{"knobs": {}}]}
+    )

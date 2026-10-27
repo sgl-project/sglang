@@ -137,7 +137,10 @@ def _profile_inputs(tensors, capacity: int, num_experts: int):
 
 
 def _valid_native_cache(payload) -> bool:
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    # FlashInfer owns the cache format and bumps this version with it.
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
+    if not isinstance(payload, dict) or payload.get("version") != KNOB_CACHE_VERSION:
         return False
     entries = payload.get("entries")
     return (
