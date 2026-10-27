@@ -139,6 +139,9 @@ message GenerateRequest {
   repeated string image_data = 19;
   repeated string video_data = 20;
   repeated string audio_data = 21;
+  // Hex hashes of at most 16 digits, one per image_data entry, in image-only requests.
+  // Each hash becomes the image's cache identity, so it must identify the image bytes.
+  repeated string mm_hashes = 22;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator.
