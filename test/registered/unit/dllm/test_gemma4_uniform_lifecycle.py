@@ -17,7 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Req:
@@ -387,6 +387,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.output_streamer = Mock()
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        scheduler.rust_server = None
         recv_req = MagicMock(
             session_params=None,
             session_id=None,
