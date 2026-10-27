@@ -132,6 +132,15 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
+    // Validated before anything is spawned, so a bad bucket list fails startup
+    // cleanly.
+    let metrics = match &cfg.server_args.metrics {
+        Some(config) => Some(Arc::new(crate::api_server::core::FrontendMetrics::new(
+            config,
+            cfg.server_args.disaggregation_mode,
+        )?)),
+        None => None,
+    };
 
     // --- rings (Rust ↔ Python) ---
     let (to_scheduler_tx, to_scheduler_rx): (ToSchedulerTx, ToSchedulerRx) =
@@ -171,21 +180,18 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
-    // The same instance is shared by the tokenizer pool (encode) and the detok
-    // shards (decode); `None` only under `skip_tokenizer_init`.
-    let dyn_tokenizer = tokenizer::load_tokenizer(
+    // The same instance is shared by the tokenizer pool (encode), the OpenAI chat
+    // layer and the detok shards (decode); `None` only under `skip_tokenizer_init`.
+    let tokenizer = tokenizer::load_tokenizer(
         // Empty only in standalone (test) configs (the Python handoff always
         // resolves it); empty → no tokenizer, allowed only under
         // `skip_tokenizer_init`.
         (!cfg.server_args.tokenizer_path.is_empty()).then_some(&*cfg.server_args.tokenizer_path),
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
-    )?;
-    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
-    // never tokenize: a multimodal text prompt passes through the pool first.
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    )?
+    .map(Arc::new);
+    let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -230,7 +236,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     // --- Tokenizer pool (pinned, CPU bound) ---
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and request never routes to the pool, so we skip it.
-    if let Some(tokenizer) = &text_tokenizer {
+    if let Some(tokenizer) = &tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
         let tokenizer = tokenizer.clone();
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
@@ -318,6 +324,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
             metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
+            metrics,
         },
     );
 
@@ -363,8 +370,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.server_args.clone(),
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
+                        cfg.generate_hook.clone(),
                         shutdown_rx.clone(),
                         hicache_manager,
+                        tokenizer.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
@@ -423,6 +432,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(test_server_args()),
+            generate_hook: None,
         }
     }
 
@@ -511,6 +521,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -547,6 +558,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -587,9 +599,7 @@ mod tests {
             let mut cfg = test_config(addr, None);
             cfg.rust_server_args.metrics_listener = metrics_listener;
             cfg.server_args = Arc::new(ServerArgs {
-                metrics: Some(crate::message::config::MetricsConfig {
-                    multiproc_dir: dir.to_string_lossy().into_owned(),
-                }),
+                metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
                 ..test_server_args()
             });
             let rt = start(cfg, None).expect("start runtime");
@@ -623,6 +633,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -726,6 +737,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
