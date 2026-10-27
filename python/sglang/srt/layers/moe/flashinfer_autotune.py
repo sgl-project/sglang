@@ -42,9 +42,7 @@ def flashinfer_moe_autotune(num_tokens: int, owner):
     buckets = getattr(owner, "_flashinfer_moe_tuning_buckets", None)
     if not buckets:
         return nullcontext()
-    if num_tokens > buckets[-1]:
-        if limits is not None:
-            raise ValueError("FlashInfer MoE startup input exceeds its profile ceiling")
+    if num_tokens > buckets[-1] and limits is None:
         # Do not clamp an oversized serving input to an undersized profile.
         return nullcontext()
 
@@ -53,6 +51,7 @@ def flashinfer_moe_autotune(num_tokens: int, owner):
     # False inherits the enclosing startup autotune(True), but never enables
     # profiling in serving. Both phases must use the same sparse ceil mapping:
     # every token count above decode and through prefill selects the one prefill.
+    # An opt-in EXTEND dummy can be padded above prefill; still tune only this set.
     return autotune(False, tuning_buckets=buckets, round_up=True)
 
 

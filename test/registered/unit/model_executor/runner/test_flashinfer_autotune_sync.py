@@ -251,7 +251,8 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
             with moe_autotune.flashinfer_moe_autotune_context(
                 decode_num_tokens=4, prefill_num_tokens=10
             ):
-                with moe_autotune.flashinfer_moe_autotune(4, target):
+                # Optional EXTEND may pad its dummy above the prefill limit.
+                with moe_autotune.flashinfer_moe_autotune(11, target):
                     pass
                 with moe_autotune.flashinfer_moe_autotune_context(
                     decode_num_tokens=0, prefill_num_tokens=0
