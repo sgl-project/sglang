@@ -28,8 +28,10 @@ def control_address(config, extra_config) -> tuple[str, int]:
     if type(base_port) is not int or not 0 < base_port <= 65535:
         raise ValueError("KVCR control_port must be a valid integer port")
     stride = config.tp_size * config.attn_cp_size * config.pp_size
-    port = base_port + config.dp_rank * stride + rank_offset(config)
-    if not 0 < port <= 65535:
+    first_port = base_port + config.dp_rank * stride
+    last_port = first_port + stride - 1
+    port = first_port + rank_offset(config)
+    if not 0 < first_port <= port <= last_port <= 65535:
         raise ValueError("KVCR control-port range is invalid")
     return host, port
 

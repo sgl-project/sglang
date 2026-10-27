@@ -14,6 +14,36 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKVCRRankEndpoints(CustomTestCase):
+    def test_control_address_checks_the_whole_tp_group(self):
+        config = SimpleNamespace(
+            tp_size=2,
+            tp_rank=0,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+        )
+        for dp_rank, base_port, valid in (
+            (0, 65534, True),
+            (0, 65535, False),
+            (1, 65532, True),
+            (1, 65533, False),
+        ):
+            with self.subTest(dp_rank=dp_rank, base_port=base_port):
+                config.dp_rank = dp_rank
+                extra = {
+                    "control_advertise_host": "source.example",
+                    "control_port": base_port,
+                }
+                if valid:
+                    self.assertEqual(
+                        endpoints.control_address(config, extra),
+                        ("source.example", 65534),
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "control-port range"):
+                        endpoints.control_address(config, extra)
+
     def test_shard_offsets_are_unique_within_one_replica(self):
         config = SimpleNamespace(tp_size=4, attn_cp_size=2)
         offsets = []
