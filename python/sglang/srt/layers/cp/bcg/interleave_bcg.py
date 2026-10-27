@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.layers.cp.async_projection import prepare_kda_cp_async_graph
 from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.interleave import run_indexer_with_kv_gather
 from sglang.srt.layers.cp.utils import cp_interleave_input_ids
@@ -76,6 +77,12 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         # Graphs must read the live count from the same address on each replay.
         result.moe_local_token_count = torch.zeros(
             (), dtype=torch.int32, device=runner.device
+        )
+        cp_size = get_parallel().attn_cp_size
+        prepare_kda_cp_async_graph(
+            (capacity + cp_size - 1) // cp_size,
+            runner.model_runner.model_config.hidden_size,
+            runner.device,
         )
         return result
 

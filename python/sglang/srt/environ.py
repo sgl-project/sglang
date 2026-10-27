@@ -512,6 +512,9 @@ class Envs:
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
+    # Overlap GLM KDA CP input gathering with the BF16 merged projection.
+    SGLANG_ENABLE_KDA_CP_ASYNC_TP = EnvBool(False)
+
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
     SGLANG_ENABLE_NAN_LOGITS_CHECK = EnvBool(False)
     # Signal level for value/index validity checks (nan/inf/oob/...); see

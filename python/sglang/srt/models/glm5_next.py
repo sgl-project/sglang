@@ -26,6 +26,10 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.async_projection import (
+    kda_cp_async_tp_enabled,
+    try_kda_cp_async_projection,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -616,9 +620,16 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
     def forward_qkvbfg_fused(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        projected_states: Optional[torch.Tensor] = None,
     ):
-        fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+        fused_states = (
+            self.fused_qkvbfg_a_proj(hidden_states)
+            if projected_states is None
+            else projected_states
+        )
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
@@ -643,16 +654,35 @@ class Glm5NextLinearAttention(nn.Module):
             return hidden_states
 
         from sglang.srt.layers.cp.interleave import (
+            attn_cp_interleave_gather,
             cp_interleave_to_sequence_order,
             cp_sequence_to_interleave_order,
+            is_interleave_extend,
         )
 
         gathered_rows = hidden_states.shape[0]
-        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+        projected_states = None
+        if kda_cp_async_tp_enabled() and is_interleave_extend(forward_batch):
+            gathered_rows *= get_parallel().attn_cp_size
+            if self.do_fuse_qkvbfg:
+                projected_states = try_kda_cp_async_projection(
+                    hidden_states, self.fused_qkvbfg_a_proj.weight
+                )
+            if projected_states is None:
+                hidden_states = attn_cp_interleave_gather(hidden_states)
+        if projected_states is None:
+            hidden_states = cp_interleave_to_sequence_order(
+                hidden_states, forward_batch
+            )
+        else:
+            # A bias-free row-wise projection commutes with the CP token reorder.
+            projected_states = cp_interleave_to_sequence_order(
+                projected_states, forward_batch
+            )
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states, forward_batch
+                hidden_states, forward_batch, projected_states=projected_states
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
@@ -837,6 +867,9 @@ class Glm5NextDecoderLayer(nn.Module):
             declare_attn(
                 read=residual.attn_readout,
                 update=residual.attn_update,
+                gathers_attn_cp_input=(
+                    config.is_kda_layer(layer_id) and kda_cp_async_tp_enabled()
+                ),
                 tp_group=SumGroup.TP
                 if config.is_kda_layer(layer_id)
                 and linear_attn_parallel_group() == "tp"
