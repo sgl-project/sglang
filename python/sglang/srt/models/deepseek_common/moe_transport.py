@@ -28,7 +28,7 @@ from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatt
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 from sglang.srt.layers.layer_boundary.row_transport import ComputeTransport
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -268,7 +268,14 @@ class MoeRowTransport(ComputeTransport):
     def scope(self):
         with (
             get_forward().scoped(
-                mlp_reduce_scatter=self.mlp_reduce_scatter, defer_moe_finalize=False
+                mlp_reduce_scatter=self.mlp_reduce_scatter,
+                defer_moe_finalize=False,
+                # the MLP runs on the rows gathered from every attention-DP rank
+                lora_batch_layout=(
+                    LoRABatchLayout.TP_GLOBAL
+                    if self._use_tp_moe_gather
+                    else get_forward().lora_batch_layout
+                ),
             ),
             self.gathered_rows,
         ):
@@ -446,7 +453,9 @@ def _tbo_run_moe(layer, hidden, batch, do_shared_local):
         # micro-batch together and no kernel launches on zero rows.
         return hidden
     global_ids = batch._tbo_global_input_ids
-    with get_forward().scoped(mlp_reduce_scatter=True):
+    with get_forward().scoped(
+        mlp_reduce_scatter=True, lora_batch_layout=LoRABatchLayout.TP_GLOBAL
+    ):
         return layer.mlp(
             hidden,
             batch,

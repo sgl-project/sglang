@@ -208,6 +208,7 @@ class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
     supports_dp_attention = True
     supports_prefill_cuda_graph = True
+    supports_grouped_lora = True
 
     def __init__(
         self,
@@ -276,6 +277,53 @@ class TritonLoRABackend(BaseLoRABackend):
         if batch_info is self.global_batch_info:
             return self.global_sgemm_batch_info or batch_info
         return self.sgemm_batch_info or batch_info
+
+    def grouped_sgemm_batch_infos(
+        self, num_groups: int, num_tokens: int
+    ) -> Tuple[LoRABatchInfo, LoRABatchInfo]:
+        """Segments for a grouped projection whose input rows are group-major, ``g * num_tokens + token``.
+
+        Every token segment repeats once per group. A keeps the segment's adapter; B routes it
+        to the composite weight ``adapter * num_groups + g`` of a ``[num_loras * num_groups, out, rank]`` view.
+        """
+        info = self._sgemm_info()
+        n = info.bs
+        groups = torch.arange(
+            num_groups, device=info.seg_indptr.device, dtype=info.seg_indptr.dtype
+        )
+        offsets = (groups * num_tokens).unsqueeze(1)
+        segments = dict(
+            bs=n * num_groups,
+            num_segments=n * num_groups,
+            seg_indptr=torch.cat(
+                (
+                    (info.seg_indptr[:n] + offsets).reshape(-1),
+                    info.seg_indptr[n : n + 1] + offsets[-1],
+                )
+            ),
+            seg_lens=info.seg_lens[:n].repeat(num_groups),
+            permutation=(
+                None
+                if info.permutation is None
+                else (info.permutation[:num_tokens] + offsets).reshape(-1)
+            ),
+            expected_tokens=num_groups * num_tokens,
+        )
+        weight_indices = info.weight_indices[:n]
+        a_info = dataclasses.replace(
+            info, weight_indices=weight_indices.repeat(num_groups), **segments
+        )
+        b_info = dataclasses.replace(
+            info,
+            weight_indices=(
+                weight_indices * num_groups
+                + groups.to(weight_indices.dtype).unsqueeze(1)
+            ).reshape(-1),
+            lora_ranks=info.lora_ranks.repeat_interleave(num_groups),
+            scalings=info.scalings.repeat_interleave(num_groups),
+            **segments,
+        )
+        return a_info, b_info
 
     def run_lora_a_sgemm(
         self,
