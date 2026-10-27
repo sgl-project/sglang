@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import functools
 from itertools import accumulate
-from typing import Optional
+from types import ModuleType
+from typing import Optional, Union
 
 import torch
 import triton
@@ -457,7 +458,9 @@ def can_use_gluon_prefill(
     )
 
 
-def _pair_prefill_module(q: torch.Tensor, k_cache: torch.Tensor | Nvfp4Cache):
+def _pair_prefill_module(
+    q: torch.Tensor, k_cache: Union[torch.Tensor, Nvfp4Cache]
+) -> Optional[ModuleType]:
     """The two-queries-per-program kernel module when it serves this forward, else None."""
     if gluon_prefill_pair_gfx950 is None:
         return None
@@ -486,7 +489,7 @@ def _gluon_sparse_prefill_group(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     out_quant: str = "",
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """gluon_sparse_prefill over one request group, its whole context gathered into the
     SHUFFLE scratch; raises GluonPrefillUnavailableError when the scratch cannot hold it."""
     if sm_scale is None:
@@ -596,8 +599,8 @@ def _gluon_sparse_prefill_group(
 
 def gluon_sparse_prefill(
     q: torch.Tensor,
-    k_cache: torch.Tensor | Nvfp4Cache,
-    v_cache: torch.Tensor | Nvfp4Cache,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     topk_idx: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -611,7 +614,7 @@ def gluon_sparse_prefill(
     v_scale: Optional[float] = None,
     out_quant: str = "",
     q_lens_cpu: Optional[list[int]] = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Run Gluon sparse prefill via the SHUFFLE scratch; raises GluonPrefillUnavailableError
     when the scratch cannot hold the context. An NVFP4 cache past the cap runs consecutive
     request groups of ``q_lens_cpu`` query rows instead, raising only for one oversized

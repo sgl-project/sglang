@@ -1,10 +1,11 @@
 """Prefill-side gather of the packed NVFP4 (MSA-v1) main K/V cache into the paged
 shuffle layout the Gluon sparse prefill reads, dequantized as it is gathered."""
 
+import torch
 import triton
 import triton.language as tl
 
-from ..common.nvfp4 import nvfp4_load_rows, nvfp4_slot_offsets
+from ..common.nvfp4 import Nvfp4Cache, nvfp4_load_rows, nvfp4_slot_offsets
 
 
 @triton.jit
@@ -69,15 +70,15 @@ def _gather_nvfp4_to_shuffle_kernel(
 
 def gather_nvfp4_to_shuffle(
     *,
-    k_cache,
-    v_cache,
-    k_out,
-    v_out,
-    req_to_token,
-    req_pool_indices,
-    seq_lens,
-    page_req,
-    page_pos,
+    k_cache: Nvfp4Cache,
+    v_cache: Nvfp4Cache,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_req: torch.Tensor,
+    page_pos: torch.Tensor,
     total_pages: int,
     page: int,
     x: int,

@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -608,7 +608,7 @@ def _index_block_score_only_kernel(
 
 def _use_fused_index_topk(
     q: torch.Tensor,
-    k_cache: torch.Tensor | Nvfp4Cache,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
     *,
     disable_index_value: bool,
     score_type: str,

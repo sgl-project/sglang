@@ -653,7 +653,7 @@ def fused_verify_topk_idx(
     local_blocks: int,
     sm_scale: float,
     k_scale: float,
-    out: torch.Tensor = None,  # [num_heads, rows, topk] int32
+    out: torch.Tensor | None = None,  # [num_heads, rows, topk] int32
 ) -> torch.Tensor:
     rows, num_heads, head_dim = q.shape
     k_fp4 = isinstance(k_cache, Nvfp4Cache)
