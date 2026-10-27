@@ -22,6 +22,7 @@ mod hf;
 mod metrics;
 mod request;
 mod run;
+mod timed_trace;
 use pyo3::prelude::*;
 
 pub use args::Args;

@@ -620,6 +620,7 @@ mod tests {
             output_len: 16,
             text_prompt_len: 7,
             vision_prompt_len: 0,
+            timestamp: None,
         }
     }
 
