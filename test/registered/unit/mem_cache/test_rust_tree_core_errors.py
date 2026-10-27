@@ -36,14 +36,14 @@ def _params(**overrides):
     return CacheInitParams(**params)
 
 
-def _raw_binding(core_class, is_eagle=False, component_types=(0,), **overrides):
+def _raw_binding(core_class, is_eagle=False, slots=((0, "token"),), **overrides):
     native = core_class._bindings
     binding_class = (
         native.RustBigramUnifiedTreeCoreBinding
         if is_eagle
         else native.RustUnifiedTreeCoreBinding
     )
-    return binding_class(native.TreeCoreInitParamsBinding(**overrides), component_types)
+    return binding_class(native.TreeCoreInitParamsBinding(**overrides), list(slots))
 
 
 @pytest.mark.parametrize("is_eagle", [False, True])
@@ -95,7 +95,10 @@ def test_actual_native_constructor_panic_is_runtime_error(core_class, is_eagle):
     # asserts positivity. Exercise that actual panic without a Python mock.
     with pytest.raises(RuntimeError, match="swa_sliding_window_size must be positive"):
         _raw_binding(
-            core_class, is_eagle, component_types=(0, 1), swa_sliding_window_size=0
+            core_class,
+            is_eagle,
+            slots=((0, "token"), (1, "window")),
+            swa_sliding_window_size=0,
         )
     assert _raw_binding(core_class, is_eagle).root_node_handle() == 0
 

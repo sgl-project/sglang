@@ -499,7 +499,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     else None
                 ),
             ),
-            [int(component) for component in self.tree_components],
+            # Each slot's id and family: the native core picks a slot's driver
+            # by its family.
+            [
+                (int(ComponentType[slot.component]), slot.family)
+                for slot in params.tree_slots
+            ],
         )
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding,

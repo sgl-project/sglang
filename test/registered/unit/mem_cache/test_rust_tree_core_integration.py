@@ -87,6 +87,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.tree_slots import FAMILY_OF, index_slots, slot_of, tree_slots_of
 
 
+def _slots(*components):
+    """The binding's slots (id, family) for a tree of ``components``."""
+    return [(int(ct), FAMILY_OF[ct]) for ct in components]
+
+
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
     params = dict(
         disable=False,
@@ -135,7 +140,7 @@ def _insert(core: RustUnifiedTreeCore, token_ids: list[int], indices: list[int])
 def _binding(**init_overrides):
     return mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(**init_overrides),
-        [int(ComponentType.FULL)],
+        _slots(ComponentType.FULL),
     )
 
 
@@ -2308,13 +2313,13 @@ def test_cuda_core_resolves_the_current_device():
 
 
 def test_unsupported_component_sets_are_rejected():
-    with pytest.raises(ValueError, match="component sets are supported"):
+    with pytest.raises(ValueError, match="slot families are supported"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(), [int(ComponentType.SWA)]
+            mem_cache.TreeCoreInitParamsBinding(), _slots(ComponentType.SWA)
         )
-    with pytest.raises(ValueError, match="component sets are supported"):
+    with pytest.raises(ValueError, match="slot families are supported"):
         mem_cache.RustUnifiedTreeCoreBinding(
-            mem_cache.TreeCoreInitParamsBinding(), [int(ComponentType.MAMBA)]
+            mem_cache.TreeCoreInitParamsBinding(), _slots(ComponentType.MAMBA)
         )
 
 
@@ -2322,21 +2327,21 @@ def test_swa_requires_the_sliding_window_size():
     with pytest.raises(ValueError, match="requires swa_sliding_window_size"):
         mem_cache.RustUnifiedTreeCoreBinding(
             mem_cache.TreeCoreInitParamsBinding(),
-            [int(ComponentType.FULL), int(ComponentType.SWA)],
+            _slots(ComponentType.FULL, ComponentType.SWA),
         )
 
 
 def test_enable_hicache_constructs():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(enable_hicache=True),
-        [int(ComponentType.FULL)],
+        _slots(ComponentType.FULL),
     )
 
 
 def test_is_write_back_constructs():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(is_write_back=True),
-        [int(ComponentType.FULL)],
+        _slots(ComponentType.FULL),
     )
 
 
@@ -4457,7 +4462,7 @@ def test_kv_canary_rows_exclude_mamba_slots():
 def test_component_set_guard_accepts_the_mamba_set():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(mamba_cache_chunk_size=256),
-        [int(ComponentType.FULL), int(ComponentType.MAMBA)],
+        _slots(ComponentType.FULL, ComponentType.MAMBA),
     )
 
 
@@ -4466,11 +4471,7 @@ def test_component_set_guard_accepts_the_hybrid_swa_mamba_set():
         mem_cache.TreeCoreInitParamsBinding(
             swa_sliding_window_size=8, mamba_cache_chunk_size=256
         ),
-        [
-            int(ComponentType.FULL),
-            int(ComponentType.SWA),
-            int(ComponentType.MAMBA),
-        ],
+        _slots(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
     )
 
 
@@ -4511,20 +4512,36 @@ def test_component_set_guard_still_rejects_invalid_sets():
         [ComponentType.SWA, ComponentType.MAMBA],
         [ComponentType.MAMBA, ComponentType.FULL],
     ):
-        with pytest.raises(ValueError, match="component sets"):
+        with pytest.raises(ValueError, match="slot families"):
             mem_cache.RustUnifiedTreeCoreBinding(
                 mem_cache.TreeCoreInitParamsBinding(
                     swa_sliding_window_size=8, mamba_cache_chunk_size=256
                 ),
-                [int(component) for component in components],
+                _slots(*components),
             )
+
+
+def test_a_slot_takes_the_driver_of_its_family():
+    # A family's native driver serves one slot id; a slot of another id under
+    # that family is refused rather than given the driver of its id.
+    with pytest.raises(ValueError, match="driver serves slot"):
+        mem_cache.RustUnifiedTreeCoreBinding(
+            mem_cache.TreeCoreInitParamsBinding(
+                swa_sliding_window_size=8, mamba_cache_chunk_size=256
+            ),
+            [(int(ComponentType.FULL), "token"), (int(ComponentType.MAMBA), "window")],
+        )
+    with pytest.raises(ValueError, match="unknown tree slot family"):
+        mem_cache.RustUnifiedTreeCoreBinding(
+            mem_cache.TreeCoreInitParamsBinding(), [(int(ComponentType.FULL), "full")]
+        )
 
 
 def test_mamba_requires_the_chunk_size_through_the_binding():
     with pytest.raises(ValueError, match="requires mamba_cache_chunk_size"):
         mem_cache.RustUnifiedTreeCoreBinding(
             mem_cache.TreeCoreInitParamsBinding(),
-            [int(ComponentType.FULL), int(ComponentType.MAMBA)],
+            _slots(ComponentType.FULL, ComponentType.MAMBA),
         )
 
 
@@ -5715,7 +5732,7 @@ def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
         mem_cache.TreeCoreInitParamsBinding(
             page_size=1, swa_sliding_window_size=8, enable_hicache=True
         ),
-        [0, 1],
+        _slots(ComponentType.FULL, ComponentType.SWA),
     )
     binding.set_has_swa_host_pool()
     key = array("q", range(5))
