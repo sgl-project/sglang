@@ -4,12 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import (
-    is_npu,
-)
-
-_is_npu = is_npu()
-
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(

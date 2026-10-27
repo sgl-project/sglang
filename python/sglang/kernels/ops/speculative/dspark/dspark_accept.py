@@ -24,9 +24,11 @@ if _is_npu:
         compute_dflash_correct_drafts_and_bonus,
     )
 else:
+    from sglang.kernels.ops.speculative.dflash import (
+        compute_dflash_correct_drafts_and_bonus,
+    )
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
-        compute_dflash_correct_drafts_and_bonus,
     )
 
 
@@ -309,6 +311,12 @@ class SoftmaxTemp:
     ) -> torch.Tensor:
         if _is_npu:
             from sgl_kernel_npu.sample import softmax_temp_triton
+
+            return softmax_temp_triton(
+                logits=logits,
+                temperatures=temperatures,
+                rows_per_request=rows_per_request,
+            )
         return softmax_temp_triton(
             logits=logits,
             temperatures=temperatures,
@@ -705,6 +713,7 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
         from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
         return row_argmax(logits)
+    return torch.argmax(logits, dim=-1)
 
 
 def accept_greedy_triton(
