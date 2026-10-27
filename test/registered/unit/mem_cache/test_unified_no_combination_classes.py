@@ -20,12 +20,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _COMBINATION = re.compile(r"^Unified(Draft)?(SWA|MambaSWA|SWAMamba|Hybrid)\w*")
 
-# Remaining classes that name a combination, with what removes them.
-_ALLOWED = {
-    # The request table of a plan with state: rows and slot-id columns of
-    # every sub-pool that holds per-request rows.
-    "UnifiedHybridReqToTokenPool",
-}
+# Classes that name a combination and still exist. None is left.
+_ALLOWED: set = set()
 
 
 def _combination_classes():

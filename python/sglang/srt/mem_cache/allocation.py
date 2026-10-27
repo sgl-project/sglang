@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.kv.lifecycle import acquire
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
@@ -304,7 +304,7 @@ def ensure_mamba_capacity(
     tree_cache: BasePrefixCache | None,
 ) -> bool:
     """Reclaim the Mamba slots needed before binding any request rows."""
-    if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+    if not req_to_token_pool.holds_state_slots:
         return True
 
     # Count the slots `acquire` will hand out for each request.

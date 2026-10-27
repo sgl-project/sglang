@@ -11,8 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The unified placement's per-layout views over a `KVArena`, its request
-table and the slot allocator of its state band.
+"""The unified placement's per-layout views over a `KVArena`, and the slot
+allocator of its state band.
 
 Every view below is a layout's per-layer tensors over one band of the arena;
 the arena owns the bytes and moves and zeroes their units. Everything above
@@ -36,11 +36,9 @@ from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    ReqToTokenPool,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -478,109 +476,6 @@ class UnifiedMambaSlotAllocator:
 
     def allocator_state_str(self) -> str:
         return self._multi_ended_allocator.allocator_state_str()
-
-
-class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
-    """The request table of a unified pool with a state sub-pool: request rows
-    and their slot-id columns only. The slot ids are VIRTUAL, which the
-    allocator's id space for `state_sub_pool` maps to physical slots; the
-    state itself (pool, slot allocator, layer map) is the allocator's
-    `state`, which the unified pool builder constructs."""
-
-    def __init__(
-        self,
-        *,
-        mamba_sub_pool_name: str,
-        size: int,
-        max_context_len: int,
-        device: str,
-        enable_memory_saver: bool,
-        enable_mamba_extra_buffer: bool,
-        enable_mamba_extra_buffer_lazy: bool,
-        enable_overlap_schedule: bool = True,
-        start_layer: Optional[int] = None,
-        pre_alloc_size: int = 0,
-    ):
-        self.state_sub_pool = mamba_sub_pool_name
-        super().__init__(
-            # `DecodeReqToTokenPool` semantics: rows cover the preallocated
-            # requests too, while `self.size` (rebound below) stays the
-            # running-request cap the scheduler and leak invariant expect.
-            size=size + pre_alloc_size,
-            # The state storage is not built here; `_init_mamba_pool` takes
-            # only what the id columns need.
-            mamba_size=0,
-            mamba_spec_state_size=0,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=enable_memory_saver,
-            cache_params=None,
-            mamba_layer_ids=[],
-            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
-            enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
-            enable_overlap_schedule=enable_overlap_schedule,
-            start_layer=start_layer,
-        )
-        self.size = size
-        self.pre_alloc_size = pre_alloc_size
-
-    def _init_mamba_pool(
-        self,
-        mamba_size: int,
-        mamba_spec_state_size: int,
-        cache_params,
-        mamba_layer_ids: List[int],
-        device: str,
-        enable_mamba_extra_buffer: bool,
-        speculative_num_draft_tokens: Optional[int] = None,
-        speculative_eagle_topk: Optional[int] = None,
-        mamba_envelope_layout: bool = False,
-        enable_linear_replayssm: bool = False,
-        linear_replayssm_cache_len: int = 16,
-        enable_linear_replayssm_spec: bool = False,
-        short_conv_layer_ids: Optional[List[int]] = None,
-        short_conv_state_shape=None,
-        ngram_context_len: int = 0,
-        ngram_eos_token_id: int = 0,
-    ):
-        # Only the slot-id columns; the storage arguments match the parent
-        # signature and are not read.
-        if short_conv_layer_ids or ngram_context_len:
-            raise ValueError(
-                "Qwen4-Exp PLE side states are not supported with "
-                "--enable-unified-memory"
-            )
-        self.device = device
-        # Sized by req_to_token's first dim (size + 1; row 0 is padding); self.size
-        # would under-size by one row.
-        req_pool_size = self.req_to_token.shape[0]
-        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            req_pool_size, dtype=torch.int32, device=self.device
-        )
-        if enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
-                torch.zeros(
-                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    # int64 to match the parent's uncast index_put source (int32 dest
-                    # would dtype-mismatch on the first radix prefill).
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            )
-
-    def clone_with_new_mamba(self, **kwargs) -> HybridReqToTokenPool:
-        raise ValueError(
-            "--enable-unified-memory: a draft head with its own recurrent state "
-            "binds it through the target's fused draft placement"
-        )
-
-    def clear(self):
-        logger.info("Reset HybridReqToTokenPool")
-        # The state slots are the allocator's: `ChainAllocator.clear` resets them.
-        ReqToTokenPool.clear(self)
-        self.req_index_to_mamba_index_mapping.zero_()
-        if self.enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 def _wire_mamba_slot_allocator(

@@ -1104,6 +1104,11 @@ class TestTriFactorySizing(unittest.TestCase):
                             forward_stream=None,
                             # Spec off: no draft region to fuse.
                             _fused_draft_for_mamba_factory=lambda: None,
+                            _unified_request_rows=lambda *, has_state: (
+                                cfg.KVCacheConfigurator._unified_request_rows(
+                                    configurator, has_state=has_state
+                                )
+                            ),
                             _unified_swa_head_geometry=lambda: (
                                 cfg.KVCacheConfigurator._unified_swa_head_geometry(
                                     configurator

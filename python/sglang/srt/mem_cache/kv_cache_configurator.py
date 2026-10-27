@@ -4,7 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import msgspec
 import torch
@@ -258,6 +258,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
     )
+
+
+def runner_state(table, allocator, *, table_owns_state: bool) -> Optional[StateStorage]:
+    """The recurrent state a runner binds to its KV pool's router. A draft head
+    that owns its depth keeps the private state its cloned table holds. A unified
+    allocator (it hands out virtual ids) carries its plan's state, None for a
+    plan without one, since its request table holds ids only. Otherwise a draft
+    shares the state of the static target whose allocator it shares, and a
+    static target builds its state with its table."""
+    if table_owns_state:
+        return table.state
+    if allocator is not None and allocator.hands_out_virtual_ids:
+        return allocator.state
+    if allocator is not None and allocator.state is not None:
+        return allocator.state
+    return table.state
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -713,6 +729,7 @@ class KVCacheConfigurator:
                 )
 
         # Initialize req_to_token_pool
+        draft_owns_state = False
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
                 max_num_reqs=sizes.max_running_requests
@@ -723,9 +740,10 @@ class KVCacheConfigurator:
             # Each multi-layer EAGLE MTP head owns one transformer block at
             # layer_id=draft_model_idx and needs its own sconv/mamba cache while
             # sharing the target's request-to-token mapping.
-            if self.draft_owns_its_depth and isinstance(
-                req_to_token_pool, HybridReqToTokenPool
-            ):
+            draft_owns_state = (
+                self.draft_owns_its_depth and req_to_token_pool.holds_state_slots
+            )
+            if draft_owns_state:
                 # speculative_num_draft_tokens=None: draft heads never run
                 # TARGET_VERIFY, so their pools skip the per-step intermediate
                 # (SpeculativeState) buffers only the target pool consumes.
@@ -739,12 +757,11 @@ class KVCacheConfigurator:
                     speculative_eagle_topk=get_spec().speculative_eagle_topk,
                 )
 
-        # The table's own state (static placement), else the state of the
-        # target whose allocator a draft shares: a unified table holds slot
-        # ids only.
-        state = req_to_token_pool.state
-        if state is None and token_to_kv_pool_allocator is not None:
-            state = token_to_kv_pool_allocator.state
+        state = runner_state(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            table_owns_state=draft_owns_state,
+        )
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -962,12 +979,6 @@ class KVCacheConfigurator:
         decls = self._kv_layer_decls()
         has_window, has_state = self._unified_window_and_state()
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        # A plan without state keeps a plain request table.
-        req_to_token_pool = (
-            None
-            if has_state
-            else self._build_req_to_token_pool(max_num_reqs=sizes.max_running_requests)
-        )
         if has_state:
             fused_draft = self._fused_draft_for_mamba_factory()
             # A draft worker sizes its own pool by token count; only the
@@ -988,15 +999,13 @@ class KVCacheConfigurator:
             if sizes.unified_total_bytes is not None and self.spec_algorithm.is_none():
                 token_budget_bytes = sizes.unified_total_bytes
             full_tokens = sizes.full_max_total_num_tokens
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
+        extra_max_context_len, decode_pre_alloc_size = self._unified_request_rows(
+            has_state=has_state
+        )
         storage = build_unified_pools(
             decls=decls,
             page_size=self.page_size,
             fused_draft=fused_draft,
-            requests=req_to_token_pool,
             sizing=KVSizingInputs(
                 token_budget_bytes=token_budget_bytes,
                 full_tokens=full_tokens,
@@ -1034,17 +1043,32 @@ class KVCacheConfigurator:
                 enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
                 speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
                 disable_overlap_schedule=get_schedule().disable_overlap_schedule,
-                # Decode nodes hand out request rows to PREALLOCATED transfers on
-                # top of the running set.
-                decode_pre_alloc_size=(
-                    get_disagg().disaggregation_decode_extra_slots
-                    if get_disagg().disaggregation_mode == "decode"
-                    else 0
-                ),
+                decode_pre_alloc_size=decode_pre_alloc_size,
                 mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             ),
         )
         return storage
+
+    def _unified_request_rows(self, *, has_state: bool) -> Tuple[int, int]:
+        """The request table's row headroom beyond the model context, and the
+        rows a decode node hands to PREALLOCATED transfers on top of the
+        running set, by the rules the static request pools follow."""
+        disagg = get_disagg()
+        if has_state:
+            extra_max_context_len = 4
+            if get_spec().speculative_num_draft_tokens is not None:
+                extra_max_context_len += get_spec().speculative_num_draft_tokens
+            pre_alloc_size = (
+                disagg.disaggregation_decode_extra_slots
+                if disagg.disaggregation_mode == "decode"
+                else 0
+            )
+            return extra_max_context_len, pre_alloc_size
+        pre_alloc_size = 0
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
+            # A flip-capable prefill needs the decode pool shape.
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
+        return get_req_to_token_extra_context_len(), pre_alloc_size
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""

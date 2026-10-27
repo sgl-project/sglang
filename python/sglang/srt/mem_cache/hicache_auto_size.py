@@ -9,7 +9,6 @@ import torch
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -91,7 +90,7 @@ def _estimate_hicache_bytes(
                 "set --hicache-ratio or --hicache-size explicitly."
             )
         total = _pool_bytes(pool)
-        if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
+        if params.req_to_token_pool.holds_state_slots:
             total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":

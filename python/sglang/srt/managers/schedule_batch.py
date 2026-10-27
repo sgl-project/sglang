@@ -118,7 +118,7 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2109,7 +2109,7 @@ class Req(ReqDllmMixin):
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
             return None
-        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+        if not req_to_token_pool.holds_state_slots:
             return None
         return allocator.state.pool
 
