@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
+from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,6 +99,34 @@ class TestDraftExtendLengths(CustomTestCase):
             backend._draft_block_extend_lens([6])
             with self.assertRaisesRegex(RuntimeError, "first seen inside"):
                 backend._draft_block_extend_lens([6, 6])
+
+
+class TestGlueCaptureFailure(CustomTestCase):
+    def _run_through_capture(self, glue):
+        backend = mock.Mock(attn_backend_list=None)
+        with (
+            mock.patch("torch.cuda.Stream"),
+            mock.patch("torch.cuda.CUDAGraph"),
+            mock.patch("torch.cuda.graph", side_effect=RuntimeError("host read")),
+        ):
+            for _ in range(glue.NUM_WARMUP + 1):
+                glue.run(backend, fb_view=None, key=1)
+        return backend
+
+    def test_lenient_falls_back_to_eager(self):
+        glue = MetadataGlueGraph("cpu")
+        backend = self._run_through_capture(glue)
+        self.assertTrue(glue.disabled)
+        # the warm-ups, then the failed step's prep run eagerly
+        self.assertEqual(
+            backend.init_forward_metadata_out_graph.call_count, glue.NUM_WARMUP + 1
+        )
+
+    def test_strict_raises(self):
+        glue = MetadataGlueGraph("cpu", strict=True)
+        with self.assertRaisesRegex(RuntimeError, "host read"):
+            self._run_through_capture(glue)
+        self.assertFalse(glue.disabled)
 
 
 def _runner(*, draft=True, backend=None):
