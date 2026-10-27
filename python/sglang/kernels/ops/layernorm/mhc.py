@@ -19,7 +19,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported, is_npu, is_npu_a5
+from sglang.srt.utils.common import is_gfx1250_supported, is_npu
 
 _is_hip = is_hip()
 if _is_hip:
@@ -1983,7 +1983,7 @@ def _mhc_pre_dispatch(
             post_mix, comb_mix, layer_input = result
             return post_mix, comb_mix, layer_input, norm_weight is not None
 
-    if is_npu_a5() or not _use_tilelang_mhc_pre():
+    if not _use_tilelang_mhc_pre():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -2036,7 +2036,7 @@ def _mhc_post_dispatch(
         return torch.ops.custom.npu_hc_post(
             x, residual, post_layer_mix.squeeze(-1), comb_res_mix
         )
-    if is_npu_a5() or not _use_tilelang_mhc_post():
+    if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
