@@ -15,6 +15,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -110,7 +111,14 @@ if is_flashinfer_available():
         max_heads = _merge_state_max_safe_num_heads(head_dim, v_a.element_size())
         if num_heads <= max_heads:
             return merge_state(v_a, s_a, v_b, s_b)
-        return merge_state_triton(v_a, s_a, v_b, s_b)
+        # FlashInfer's merge_state takes and returns base-2 log-sum-exp, but
+        # the Triton fallback uses natural log. Convert the inputs to natural
+        # log and the returned LSE back to base 2 so both branches agree on
+        # the LSE convention; without this the fallback weights each half
+        # with exp(delta / ln 2) instead of exp(delta).
+        ln2 = math.log(2)
+        v_merged, s_merged = merge_state_triton(v_a, s_a * ln2, v_b, s_b * ln2)
+        return v_merged, s_merged / ln2
 
 
 class WrapperDispatch(Enum):
