@@ -61,7 +61,7 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
-        rust_config._build_server_args(_scheduler_for_typed_config())
+        rust_config._build_server_args(**_launch_config())
 
     metrics = extension.ServerArgs.call_args.kwargs["metrics"]
     if enable_metrics:

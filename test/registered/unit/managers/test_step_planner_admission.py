@@ -71,7 +71,12 @@ def _req(rid, *, priority=0, max_new_tokens=8, holds_row=False):
             observe_storage_prefetch_ready=Mock(),
             observe_storage_staging_ready=Mock(),
         ),
-        kv=SimpleNamespace(holds_mamba=False, holds_kv=holds_row, kv_allocated_len=8),
+        kv=SimpleNamespace(
+            holds_mamba=False,
+            holds_kv=holds_row,
+            req_pool_idx=0 if holds_row else None,
+            kv_allocated_len=8,
+        ),
         init_next_round_input=Mock(),
     )
 
@@ -94,7 +99,10 @@ class _Adder(PrefillAdder):
             remaining_total=self.free_tokens, total_offset=0
         )
         self.req_to_token_pool = None
-        self.token_to_kv_pool_allocator = None
+        # No request-owned workspace beyond prefill.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            request_slot_reserve=lambda **_: 0
+        )
         self.tree_cache = None
         self.hisparse_coordinator = None
         self.can_run_list = []

@@ -45,6 +45,7 @@ def _prefill_req(rid):
         discard_output_reason=None,
         return_logprob=False,
         return_sampling_mask=False,
+        return_routed_experts=False,
         grammar=None,
         output_ids=[],
         time_stats=MagicMock(),
