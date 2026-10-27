@@ -183,7 +183,7 @@ jobs:
           - {
               stage: extra-b,
               runner_config: 8-gpu-h200,
-              timeout_per_file: '',
+              timeout_per_file: '1800',
               warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8',
               warmup_timeout: '60',
             }
