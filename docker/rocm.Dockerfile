@@ -433,8 +433,6 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
-# RCCL from source (BUILD_RCCL=1 stages only). The fetch is shallow by commit,
-# so a pin must be the full 40-character SHA.
 ARG RCCL_REPO="https://github.com/ROCm/rocm-systems.git"
 ARG RCCL_COMMIT=""
 ENV RCCL_COMMIT="${RCCL_COMMIT:-${RCCL_COMMIT_DEFAULT}}"
