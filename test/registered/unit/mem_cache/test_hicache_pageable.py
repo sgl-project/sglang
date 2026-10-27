@@ -107,18 +107,18 @@ class TestPageableHiCache(unittest.TestCase):
                 gdn.destroy()
                 host.destroy()
 
-    def test_rejects_token_granular_host_access(self):
+    def test_rejects_unsupported_dsv4_pageable_layout(self):
         from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 
         with patch.dict(os.environ, {"SGLANG_HICACHE_PAGEABLE": "1"}):
-            with self.assertRaisesRegex(ValueError, "whole-page"):
+            with self.assertRaisesRegex(ValueError, "page_first_direct"):
                 DeepSeekV4PagedHostPool(
                     pool_name="partial",
                     device_buffers=[],
                     item_bytes=4,
                     num_host_pages=4,
                     slot_page_size=4,
-                    layout="page_first_direct",
+                    layout="layer_first",
                     device="cpu",
                     pin_memory=True,
                 )

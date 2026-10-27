@@ -10,6 +10,61 @@ import triton
 import triton.language as tl
 
 
+def transfer_pageable_dsv4_tokens(
+    host, device_buffers, host_indices, device_indices, *, layer=None
+):
+    """Copy partial V4 rows through bounded, ordinary tensor copies.
+
+    ``layer=None`` backs up all layers; an integer restores that layer. Only
+    device tensors participate in GPU indexing. Blocking copies fence the CPU
+    gather/scatter, including when host registration is unavailable.
+    """
+    page_size, value_bytes, scale_bytes = 64, 576, 8
+    page_bytes = 37440
+    if host.device.type != "cpu" or host.shape[-1] != page_bytes:
+        raise ValueError("partial pageable transfers require the DSV4 V4 row layout")
+    if host_indices.numel() != device_indices.numel():
+        raise ValueError("partial pageable transfer index size mismatch")
+    host_rows = host.view(host.shape[0], host.shape[1], page_bytes)
+    hi = host_indices.to(device="cpu", dtype=torch.long)
+    device_cpu = device_indices.to(device="cpu", dtype=torch.long)
+    if hi.numel() and (int(hi.min()) < 0 or int(hi.max()) >= host.shape[0] * page_size):
+        raise ValueError("partial pageable host index out of bounds")
+    layers = range(len(device_buffers)) if layer is None else (layer,)
+    for l in layers:
+        buf = device_buffers[l]
+        if not buf.is_contiguous():
+            raise ValueError(
+                "partial pageable transfers require contiguous device rows"
+            )
+        dev = buf.view(torch.uint8).view(-1, page_bytes)
+        if device_cpu.numel() and (
+            int(device_cpu.min()) < 0
+            or int(device_cpu.max()) >= dev.shape[0] * page_size
+        ):
+            raise ValueError("partial pageable device index out of bounds")
+        di = device_cpu.to(device=buf.device)
+        # At most 1024 * 576 bytes of payload per layer/component per copy.
+        for begin in range(0, hi.numel(), 1024):
+            h = hi[begin : begin + 1024]
+            d = di[begin : begin + 1024]
+            for base, width in (
+                (0, value_bytes),
+                (page_size * value_bytes, scale_bytes),
+            ):
+                columns = torch.arange(width, device="cpu")
+                hc = base + (h % page_size)[:, None] * width + columns
+                dc = base + (d % page_size)[:, None] * width + columns.to(buf.device)
+                hr, dr = (h // page_size)[:, None], (d // page_size)[:, None]
+                if layer is None:
+                    host_rows[hr, l, hc] = dev[dr, dc].to("cpu", non_blocking=False)
+                else:
+                    dev[dr, dc] = host_rows[hr, l, hc].to(
+                        buf.device, non_blocking=False
+                    )
+        di.record_stream(torch.cuda.current_stream(buf.device))
+
+
 @triton.jit
 def _pack_pages(
     ptrs,

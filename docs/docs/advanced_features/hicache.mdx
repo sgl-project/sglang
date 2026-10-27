@@ -27,9 +27,13 @@ and QSA indexer host pools. It does not call `cudaHostRegister` or unregister
 those allocations during cleanup. Copies use the CUDA runtime rather than
 kernels that access host pointers. MLA and DSA pools use device staging for
 backup and CPU gathering followed by device scatter for load-back.
+DSV4 pools stage whole-page transfers on the device. Partial transfers in the
+V4 layout copy values and scales separately, preserving neighboring slots and
+page padding. These copies use bounded chunks and synchronize the submitting
+thread before CPU memory is read or written.
 
 Pageable mode supports the L2 host tier. Kernel I/O, unified memory, L3 storage,
-external cache linkers, HiSparse, and token-granular DSV4 host transfers are rejected.
+external cache linkers, and HiSparse are rejected.
 The L3 restriction also applies to runtime storage attachment. The host pool uses the
 existing HiCache sizing and eviction policies. Staging allocations are separate
 from the host pool; their size depends on the page geometry. Pageable copies
