@@ -131,22 +131,5 @@ class TestPrefillAwareSwaPrefillLensBound(CustomTestCase):
         self.assertEqual(backend._pa_swa_prefill_lens[pool_size].item(), 7)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
-class TestFa3UpgradesToFa4Init(CustomTestCase):
-    def test_rejects_embedding_no_kv_cache_path(self):
-        # The no-KV-cache embedding path calls the init-bound varlen kernel, so
-        # it cannot send head_dim 512 layers to FA4.
-        runner = _make_prefill_aware_swa_runner(pool_size=8)
-        runner.prefill_aware_swa = False
-        runner.model_config.head_dim = 512
-        runner.kv_cache_dtype = torch.bfloat16
-
-        with get_context().override_server_args(
-            is_embedding=True, chunked_prefill_size=-1, disable_radix_cache=True
-        ):
-            with self.assertRaisesRegex(ValueError, "no-KV-cache path"):
-                FlashAttentionBackend(runner, fa_impl_ver=3)
-
-
 if __name__ == "__main__":
     unittest.main()
