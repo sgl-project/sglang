@@ -256,6 +256,18 @@ class TestSingleItemScoringResults(CustomTestCase):
         counts = self.h._anchor_counts_per_item(delimiter_indices, anchor_positions)
         self.assertEqual(counts, [2, 1])
 
+    def test_anchor_counts_per_item_many_items_and_boundary_anchors(self):
+        delimiter_indices = [i * 10 for i in range(1, 502)]
+        anchor_positions = [
+            d + offset for d in delimiter_indices[:-1] for offset in (1, 5, 9)
+        ]
+        counts = self.h._anchor_counts_per_item(delimiter_indices, anchor_positions)
+        self.assertEqual(counts, [3] * 500)
+        with self.assertRaisesRegex(ValueError, "outside the candidate items"):
+            self.h._anchor_counts_per_item(
+                delimiter_indices, [delimiter_indices[0], *anchor_positions]
+            )
+
     def test_anchor_counts_per_item_rejects_item_without_anchor(self):
         delimiter_indices = [3, 8, 12]
         anchor_positions = [5, 7]  # nothing in item1
