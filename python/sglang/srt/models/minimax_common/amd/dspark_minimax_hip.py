@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """ROCm glue of dspark_minimax: the MiniMax DSpark draft writes every layer's context K/V
-through one block-fp8 GEMM and computes each markov step bias in one kernel on gfx950;
-bound as _hip."""
+through one block-fp8 GEMM on gfx950; bound as _hip."""
 
 from __future__ import annotations
 
@@ -22,25 +21,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     fp8_input_quant_format,
 )
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
-from sglang.srt.models.dspark import VanillaMarkov
-from sglang.srt.speculative.dspark_components.dspark_hip import FusedStepBiasMarkov
 from sglang.srt.utils import is_gfx95_supported
-
-
-def markov_head(head):
-    """The draft's markov head, a FusedStepBiasMarkov where gfx950 runs its kernel."""
-    if (
-        type(head) is not VanillaMarkov
-        or not is_gfx95_supported()
-        or head.markov_w2.weight.dtype != torch.bfloat16
-        # the kernel's rank tiles are 64 wide
-        or head.markov_rank % 64 != 0
-    ):
-        return head
-    weight = head.markov_w2.weight
-    return FusedStepBiasMarkov(
-        vocab_size=head.vocab_size, markov_rank=head.markov_rank
-    ).to(device=weight.device, dtype=weight.dtype)
 
 
 def ctx_kv_writer(model) -> Optional[BlockFp8CtxKvWriter]:
