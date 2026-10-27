@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 
 
+# Gemma (1 + weight) RMSNorm over strided rows; no other Triton RMSNorm covers that.
 @triton.jit
 def _gemma_rmsnorm_kernel(
     x_ptr,
