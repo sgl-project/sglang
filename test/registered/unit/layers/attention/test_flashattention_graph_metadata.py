@@ -5,8 +5,9 @@ import torch
 
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -264,6 +265,91 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
                         virtual = int(tokens[row, page * ps]) // ps
                         expected[lane, page] = max(0, int(physical[virtual]))
                 torch.testing.assert_close(table.cpu(), expected)
+
+
+class _WindowReader:
+    """A translator whose sliding-window write ids are the virtual ids times
+    ten, answering `write_ids` as the production translator does."""
+
+    write_ids = KVIndexTranslator.write_ids
+
+    def __init__(self):
+        self._spaces = {
+            IdSpaceKind.FULL: IdSpace(key="full"),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(key="swa", write=lambda ids: ids * 10),
+        }
+
+    def space(self, kind):
+        return self._spaces.get(kind)
+
+
+class TestDraftWindowWriteIds(CustomTestCase):
+    """A fused draft's window layers write where `_get_swa_write_locations`
+    says, derived from the whole draft window. A multi-step draft step must
+    keep its own columns (the window is laid out step-minor per row), and a
+    multi-layer draft's extend writes the whole window. The fused window-draft
+    gate admits fa3 and fa4 on this."""
+
+    def _write_ids(self, *, bs, topk, num_steps, window_cols, step, mode):
+        reader = _WindowReader()
+        plan = KVLocPlan(
+            source=reader,
+            req_pool_indices=torch.arange(bs),
+            seq_lens=torch.ones(bs, dtype=torch.int64),
+            seq_lens_cpu=None,
+            write_virtual=torch.arange(1, bs * topk * window_cols + 1),
+            read_extent=0,
+        )
+        # A chain draft (topk 1) inside a wider verify window writes its
+        # leading columns; otherwise the draft owns the whole window.
+        cols = None if window_cols == num_steps else slice(0, num_steps)
+        batch = SimpleNamespace(
+            batch_size=bs,
+            kv_loc_plan=plan,
+            kv_loc_cols=cols,
+            out_cache_loc=plan.write_ids(reader, cols=cols),
+            forward_mode=mode,
+            spec_info=object(),
+        )
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.kv_index_translator = reader
+        backend.topk = topk
+        backend.speculative_num_steps = num_steps
+        backend.speculative_step_id = step
+        window = plan.write_ids(reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=cols)
+        return backend._get_swa_write_locations(batch), window
+
+    def test_each_draft_step_writes_its_own_columns(self):
+        for bs, topk, num_steps, window_cols in (
+            (3, 1, 3, 3),
+            (2, 2, 3, 3),
+            (3, 1, 3, 5),
+        ):
+            per_step = None
+            for step in range(num_steps):
+                ids, window = self._write_ids(
+                    bs=bs,
+                    topk=topk,
+                    num_steps=num_steps,
+                    window_cols=window_cols,
+                    step=step,
+                    mode=ForwardMode.DECODE,
+                )
+                per_step = per_step_draft_out_cache_loc(window, bs, topk, num_steps)
+                torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
+            # Step 1's slots are not the window's leading ids.
+            self.assertFalse(torch.equal(window[: bs * topk], per_step[1]))
+
+    def test_a_multi_layer_draft_extend_writes_the_whole_window(self):
+        ids, window = self._write_ids(
+            bs=3,
+            topk=1,
+            num_steps=3,
+            window_cols=3,
+            step=1,
+            mode=ForwardMode.DRAFT_EXTEND_V2,
+        )
+        torch.testing.assert_close(ids, window, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -310,9 +310,9 @@ FULL_HOST = register_host_kind(
     DenseHostKind(name="full", serves=LAYER_FULL, family="dense")
 )
 
-# Multi-step draft backends that build the per-step sliding-window read and
-# write rails a fused window layer needs (TritonMultiStepDraftBackend).
-WINDOW_RAIL_BACKENDS = frozenset({"triton"})
+# Draft backends that give each draft step its own sliding-window reads and
+# writes: Triton builds per-step rails, FA (fa3, fa4) reads the plan's window table.
+WINDOW_RAIL_BACKENDS = frozenset({"triton", "fa3", "fa4"})
 
 
 class WindowHostKind(DenseHostKind):

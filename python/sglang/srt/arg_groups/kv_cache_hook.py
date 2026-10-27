@@ -487,14 +487,16 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
     }
 )
 
-_SPEC_MHA_AUDITED_BACKENDS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
+# fa4 builds its page tables and write locations on fa3's paths; only the
+# attention kernel differs.
+_SPEC_MHA_AUDITED_BACKENDS = frozenset(
+    {"triton", "flashinfer", "fa3", "fa4", "trtllm_mha"}
+)
 
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
 # draft runs only on these.
-# FA4 carries translated draft ids, but speculative admission is audited
-# per algorithm below; currently only DSPARK is validated with FA4.
-TRANSLATED_MHA_RAILS = _SPEC_MHA_AUDITED_BACKENDS | {"fa4"}
+TRANSLATED_MHA_RAILS = _SPEC_MHA_AUDITED_BACKENDS
 
 
 def _assert_spec_verify_backends(
@@ -835,7 +837,8 @@ def handle_page_major_kv_layout(server_args: Any):
     #   flashkda (the wrapper gathers/scatters a contiguous per-slot copy);
     #   helion; cutedsl (kernel_h compiles h0/ht with dynamic
     #   int64 strides), with the same KDA-only caveat.
-    # - mamba (mamba2/short-conv state): triton only.
+    # - mamba (mamba2/short-conv state): triton only. Inkling's fused fa4
+    #   attention prologue also updates its short-conv state, by its strides.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
     decode_allowed = {"triton", "flashinfer"}

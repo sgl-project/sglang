@@ -1194,7 +1194,10 @@ class UnifiedMambaPool(MambaPool):
         return entries.view(num_slots, entry_bytes)
 
     def clear_slots(self, indices: torch.Tensor):
-        self._entry_view()[indices] = 0
+        entries = self._entry_view()
+        # index_fill_ stays on the device; an indexed Python zero would be copied
+        # from the host, synchronizing the stream.
+        entries.index_fill_(0, indices.to(device=entries.device, dtype=torch.int64), 0)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
 
