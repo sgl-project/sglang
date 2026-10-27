@@ -106,17 +106,25 @@ def get_remote_instance_transfer_engine_info_per_rank(
         return None, None
 
 
-def register_memory_region(model, transfer_engine):
+def describe_weight_locations(model) -> dict[str, tuple[int, int, int]]:
+    """Where each weight of `model` lives: name -> (address, numel, element size). A peer writes or reads a weight
+    by these numbers, and a weight-update session must leave them unchanged."""
+    return {
+        name: (weight.data_ptr(), weight.numel(), weight.element_size())
+        for name, weight in model.named_parameters()
+    }
+
+
+def register_weight_memory(model, transfer_engine) -> None:
+    """Register the memory holding `model`'s weights with a Mooncake transfer engine."""
     if importlib.util.find_spec("torch") is None:
-        return register_memory_region_v1(model, transfer_engine)
+        _register_weight_memory_per_param(model, transfer_engine)
     else:
-        return register_memory_region_v2(model, transfer_engine)
+        _register_weight_memory_by_block(model, transfer_engine)
 
 
-def register_memory_region_v1(model, transfer_engine):
+def _register_weight_memory_per_param(model, transfer_engine) -> None:
     start_tic = time.time()
-
-    weight_mr_dict = {}
     for name, weight in model.named_parameters():
         ret = transfer_engine.register_memory(
             weight.data_ptr(), weight.numel() * weight.element_size()
@@ -125,29 +133,12 @@ def register_memory_region_v1(model, transfer_engine):
             raise RuntimeError(
                 f"register memory failed for weight {name}, error: {ret}"
             )
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
-
-    end_tic = time.time()
-    logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    logger.debug(f"Register memory region time: {(time.time() - start_tic):.4f}s")
 
 
-def register_memory_region_v2(model, transfer_engine):
+def _register_weight_memory_by_block(model, transfer_engine) -> None:
     start_tic = time.time()
-
-    weight_mr_dict = {}
-    weight_addr_set = set()
-    for name, weight in model.named_parameters():
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
-        weight_addr_set.add(weight.data_ptr())
+    weight_addr_set = {weight.data_ptr() for _, weight in model.named_parameters()}
 
     import torch
 
@@ -189,6 +180,4 @@ def register_memory_region_v2(model, transfer_engine):
                 f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
             )
 
-    end_tic = time.time()
-    logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    logger.debug(f"Register memory region v2 time: {(time.time() - start_tic):.4f}s")

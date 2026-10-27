@@ -43,7 +43,7 @@ def _start_bootstrap_server():
     raise TimeoutError(f"the bootstrap server on {url} did not start")
 
 
-def _publish(role, session_id, port):
+def _publish(role, session_id, port, with_transfer_engine=True):
     model_config = SimpleNamespace(
         remote_instance_weight_loader_backend=None, engine_info_bootstrap_port=port
     )
@@ -55,16 +55,21 @@ def _publish(role, session_id, port):
         ),
         patch.object(transporter_mod, "get_model", lambda: model_config),
         patch.object(
-            transporter_mod, "remote_instance_transfer_engine_enabled", lambda: True
+            transporter_mod,
+            "remote_instance_transfer_engine_enabled",
+            lambda: with_transfer_engine,
+        ),
+        patch.object(
+            transporter_mod, "register_weight_memory", lambda model, engine: None
         ),
         patch.object(
             transporter_mod,
-            "register_memory_region",
-            lambda model, engine: {f"{role}.weight": (1, 4, 2)},
+            "describe_weight_locations",
+            lambda model: {f"{role}.weight": (1, 4, 2)},
         ),
     ):
         transporter = RemoteInstanceWeightTransporter(
-            server_args=SimpleNamespace(registers_parallelism_config=lambda: True),
+            server_args=SimpleNamespace(publishes_rank_info=lambda: True),
             get_model=lambda: torch.nn.Module(),
             gpu_id=0,
         )
@@ -73,7 +78,7 @@ def _publish(role, session_id, port):
         transporter.parallelism_config = SimpleNamespace(
             to_dict=lambda: {"published_by": role}
         )
-        transporter.maybe_register_and_publish_weight_info(role=role)
+        transporter.publish_rank_info(role=role)
 
 
 class TestPublicationRoles(CustomTestCase):
@@ -101,6 +106,36 @@ class TestPublicationRoles(CustomTestCase):
         self.assertEqual(
             get("get_parallelism_config", role="draft"), {"published_by": "draft"}
         )
+        self.assertEqual(
+            get("get_rank_info"),
+            {
+                "parallelism_config": {"published_by": "target"},
+                "weight_locations": {"target.weight": [1, 4, 2]},
+                "transfer_session_id": "target-session",
+            },
+        )
+
+    def test_a_rank_without_a_transfer_engine_publishes_no_transfer_engine_info(self):
+        """Only a rank whose weights a transfer engine registered has a session to name; its layout still publishes."""
+        server, url = _start_bootstrap_server()
+        self.addCleanup(server.close)
+        _publish("target", None, server.port, with_transfer_engine=False)
+
+        def get(path):
+            return requests.get(f"{url}/{path}", params={"rank": 0})
+
+        self.assertEqual(get("get_transfer_engine_info").status_code, 404)
+        self.assertEqual(
+            get("get_parallelism_config").json(), {"published_by": "target"}
+        )
+        self.assertEqual(
+            get("get_rank_info").json(),
+            {
+                "parallelism_config": {"published_by": "target"},
+                "weight_locations": None,
+                "transfer_session_id": None,
+            },
+        )
 
     def test_drafts_publish_once_their_pools_bind_the_targets_embed_and_head(self):
         """EAGLE binds the target's embed and head into its draft while allocating the draft's pools; a table
@@ -108,7 +143,7 @@ class TestPublicationRoles(CustomTestCase):
         events = []
 
         class _Transporter:
-            def maybe_register_and_publish_weight_info(self, role):
+            def publish_rank_info(self, role):
                 events.append(("published", role))
 
         runner = SimpleNamespace(remote_instance_weight_transporter=_Transporter())
