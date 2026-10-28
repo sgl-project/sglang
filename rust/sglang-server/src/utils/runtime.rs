@@ -71,7 +71,10 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new(spec)?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
@@ -85,10 +88,10 @@ impl Runtime {
         workers: usize,
         feature_shm: bool,
     ) {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
-            processor,
-            feature_shm,
-        ));
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::with_processor(processor, feature_shm)
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
     }
 
@@ -399,6 +402,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
+            limits: tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
         },
         core,
         threads: Mutex::new(threads),

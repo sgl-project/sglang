@@ -169,6 +169,12 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                         controller.get_attn_cp_rank_and_size = lambda: (0, 1)
                         with (
                             mock.patch(
+                                "sglang.srt.managers.cache_controller.get_memory",
+                                return_value=SimpleNamespace(
+                                    hicache_storage_key_scheme="rank-suffix"
+                                ),
+                            ),
+                            mock.patch(
                                 "sglang.srt.managers.cache_controller.get_parallel",
                                 return_value=SimpleNamespace(
                                     tp_rank=tp_rank,
