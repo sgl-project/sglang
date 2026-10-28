@@ -952,7 +952,7 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def is_mooncake_pg(pg) -> bool:
+def _is_mooncake_pg(pg) -> bool:
     try:
         return torch.distributed.get_backend(pg) in ("mooncake", "mooncake-cpu")
     except Exception:
@@ -978,52 +978,9 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-# Mooncake raises refusals as plain RuntimeError. Reading its view instead would race:
-# the view can change between the refusal and the read, and a CUDA mirror lags it.
-_MOONCAKE_INACTIVE_REFUSAL = "invalid state: rank is not active in this group"
-
-
-# Well under --watchdog-timeout, so a view that never settles fails loudly before it.
-_GATHER_SETTLE_BUDGET_S = 20.0
-_GATHER_SETTLE_POLL_S = 0.05
-
-
-def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
-    """One mlp_sync gather, retried only while Mooncake refuses it as inactive (a bare
-    fault has no settle probe). Safe: the refusal precedes posting, so no peer completed
-    a gather this rank never sent. ``gather`` has ``all_gather_single``'s signature."""
-    deadline = time.monotonic() + _GATHER_SETTLE_BUDGET_S
-    waited_from = None
-    while True:
-        try:
-            gather(output, input_, group=group)
-            if waited_from is not None:
-                logger.warning(
-                    "[Elastic EP] mlp_sync gather settled after %.2fs",
-                    time.monotonic() - waited_from,
-                )
-            return
-        except RuntimeError as exc:
-            if _MOONCAKE_INACTIVE_REFUSAL not in str(exc):
-                raise
-            if waited_from is None:
-                waited_from = time.monotonic()
-                logger.warning(
-                    "[Elastic EP] Mooncake refused the mlp_sync gather as inactive, "
-                    "waiting up to %.0fs for its membership view to settle",
-                    _GATHER_SETTLE_BUDGET_S,
-                )
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "[Elastic EP] Mooncake refused the mlp_sync gather as inactive for "
-                    f"{_GATHER_SETTLE_BUDGET_S:.0f}s, so its membership view never "
-                    "settled after a rank fault."
-                ) from exc
-            time.sleep(_GATHER_SETTLE_POLL_S)
-
-
 # Local deadline is fine: each rank polls only its own view and votes exactly once.
 _SETTLE_BUDGET_S = 15.0
+_SETTLE_POLL_S = 0.05
 
 
 def mooncake_world_settle_probe(*, cohort_size: int) -> None:
@@ -1031,7 +988,7 @@ def mooncake_world_settle_probe(*, cohort_size: int) -> None:
     what it checks before accepting a collective, then vote so all ranks know. Warn-only:
     aborting strands the width; a cohort that cannot converge fails on the next tick."""
     world = torch.distributed.group.WORLD
-    if not torch.distributed.is_initialized() or not is_mooncake_pg(world):
+    if not torch.distributed.is_initialized() or not _is_mooncake_pg(world):
         return
     from mooncake.pg import get_active_ranks
 
@@ -1040,7 +997,7 @@ def mooncake_world_settle_probe(*, cohort_size: int) -> None:
     while not (active := bool(get_active_ranks(world)[rank])):
         if time.monotonic() >= deadline:
             break
-        time.sleep(_GATHER_SETTLE_POLL_S)
+        time.sleep(_SETTLE_POLL_S)
     # A vote timeout means a peer stopped voting: treat it as non-convergence.
     try:
         if cohort_vote_via_store(
@@ -1422,7 +1379,7 @@ def _mooncake_membership_targets(global_ranks: List[int]) -> List[tuple]:
     targets = []
     world_backend = torch.distributed.group.WORLD
     world_ranks = parallel_state.get_world_backend_ranks()
-    if world_ranks and is_mooncake_pg(world_backend):
+    if world_ranks and _is_mooncake_pg(world_backend):
         local = _map_global_to_group_local_ranks(world_ranks, global_ranks)
         if local:
             targets.append(("WORLD", world_backend, local))
@@ -1431,7 +1388,7 @@ def _mooncake_membership_targets(global_ranks: List[int]) -> List[tuple]:
         if not local:
             continue
         for pg in (group.device_group, group.cpu_group):
-            if pg is not None and pg is not world_backend and is_mooncake_pg(pg):
+            if pg is not None and pg is not world_backend and _is_mooncake_pg(pg):
                 targets.append((group.unique_name, pg, local))
     return targets
 
