@@ -668,6 +668,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     if _is_npu:
         maybe_write_dsv4_decode(
             batch,
+            batch.req_pool_indices_cpu,
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
