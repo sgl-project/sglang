@@ -208,6 +208,11 @@ class _FakeOwner(DisaggDecode):
             page_size=1, get_kvcache=lambda: SimpleNamespace()
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        self.prealloc_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(
+                should_verify_kv_checksum=lambda bootstrap_addr: True
+            )
+        )
         self.tree_cache = None
         self.request_retirer = SimpleNamespace(retire_finished=tree_release(self))
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
@@ -394,21 +399,22 @@ class TestAdmissionChecksum(unittest.TestCase):
         without a digest, decided per bootstrap address, and skipping it must not
         disturb the index-based filtering of a mismatching sibling."""
         sched = self._make_sched(_SENTINEL)
-        sched.disagg_decode_prealloc_queue.kv_manager.should_verify_kv_checksum = (
+        sched.prealloc_queue.kv_manager.should_verify_kv_checksum = (
             lambda bootstrap_addr: not bootstrap_addr.startswith("10.0.0.1:")
         )
         aborted = _make_req(0xDEADBEEF, self.num_pages, rid="aborted")
         skipped = _make_req(
             0xDEADBEEF, self.num_pages, rid="skipped", bootstrap_host="10.0.0.1"
         )
-        sched.waiting_queue = [aborted, skipped]
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ),
         ):
-            batch = self._run_once(sched)
-        self.assertEqual(batch.reqs, [skipped])
+            verified = sched._verify_kv_checksums([aborted, skipped])
+        self.assertEqual(verified, [skipped])
         self.assertEqual(sched.streamed_aborts, [aborted])
         mock_abort.assert_called_once()
 

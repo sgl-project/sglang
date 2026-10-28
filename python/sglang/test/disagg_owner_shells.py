@@ -34,7 +34,12 @@ def prefill_owner_shell(**attrs) -> DisaggPrefill:
 def decode_owner_shell(**attrs) -> DisaggDecode:
     owner = DisaggDecode.__new__(DisaggDecode)
     owner.prealloc_queue = SimpleNamespace(
-        queue=[], retracted_queue=[], held_rebootstrap_reqs=[]
+        queue=[],
+        retracted_queue=[],
+        held_rebootstrap_reqs=[],
+        kv_manager=SimpleNamespace(
+            should_verify_kv_checksum=lambda bootstrap_addr: True
+        ),
     )
     owner.transfer_queue = SimpleNamespace(queue=[])
     owner.ready = []

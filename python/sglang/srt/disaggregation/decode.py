@@ -3924,9 +3924,13 @@ class DisaggDecode:
         if computer is None:
             return reqs
 
+        kv_manager = self.prealloc_queue.kv_manager
         verified: List[Req] = []
         for req in reqs:
             if is_health_check_req(req):
+                verified.append(req)
+                continue
+            if not kv_manager.should_verify_kv_checksum(_bootstrap_addr(req)):
                 verified.append(req)
                 continue
             expected = req.disagg.expected_kv_checksum
