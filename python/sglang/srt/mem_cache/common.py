@@ -381,6 +381,24 @@ def restore_kv_cache(
     req.kv.retraction_backup = None
 
 
+def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """``restore_kv_cache`` from the host pool without ordering later work after
+    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed."""
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.kv.retraction_backup is not None
+    unified_cache.start_restore_kv_cache(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
+
+
+def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Return the host slots of ``req``'s restore once its copy has finished."""
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.finish_restore_kv_cache(req)
+
+
 def discard_kv_cache_backup(
     req: Req, tree_cache: BasePrefixCache, backend: str
 ) -> None:
@@ -408,7 +426,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
-            tree_cache.req_to_token_pool.mamba_allocator.free(
+            tree_cache.token_to_kv_pool_allocator.state_slots.free(
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None

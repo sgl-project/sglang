@@ -14,6 +14,8 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -30,6 +32,9 @@ def _full_attention_ids(*, num_layers: int, interval: int) -> list:
 def _hybrid_pool(*, start_layer: int) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
     pool.start_layer = start_layer
+    # The inner full-attention view its router reports as the wrapped view.
+    pool.full_kv_pool = object()
+    pool.full_attention_layer_id_mapping = {}
     return pool
 
 
@@ -256,9 +261,19 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
         self.assertEqual(pairs, [(0, 0), (1, 1), (2, 3), (3, 4)])
 
 
+def _plain_pool(*, layer_num: int) -> SimpleNamespace:
+    """A one-sub-pool pool that is its own view."""
+    pool = SimpleNamespace(layer_num=layer_num, start_layer=0)
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
-    pool.full_attention_layer_id_mapping = layer_ids
+    pool.full_kv_pool = object()
+    pool.full_attention_layer_id_mapping = {
+        layer_id: index for index, layer_id in enumerate(layer_ids)
+    }
     pool.use_mla = False
     return pool
 
@@ -291,7 +306,7 @@ class TestBuildKvLayerIds(CustomTestCase):
         with self.assertRaises(RuntimeError):
             build_kv_layer_ids(
                 token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
-                draft_token_to_kv_pool=SimpleNamespace(layer_num=2),
+                draft_token_to_kv_pool=_plain_pool(layer_num=2),
                 num_draft_entries=3,
                 num_hidden_layers=60,
             )

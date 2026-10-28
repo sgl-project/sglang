@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -215,7 +216,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def test_unified_radix_cache_with_mori_external_linker(self):
+    def _build_with_mori_linker(self, linker_pools):
         from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 
         ctx = _make_ctx(self)
@@ -234,6 +235,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         cache.components = ("full",)
         counter = MagicMock(name="layer_done_counter")
         cache.linker.layer_done_counter = counter
+        cache.linker.pools = linker_pools
         linker = MagicMock(name="linker")
 
         with (
@@ -260,13 +262,23 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         cache.init_cache_linker.assert_called_once_with(linker)
-        ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(
-            counter
-        )
+        kvcache = ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value
+        kvcache.register_layer_transfer_counter.assert_called_once_with(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
             counter
         )
         self.assertIs(result, cache)
+        return kvcache
+
+    def test_unified_radix_cache_with_mori_external_linker(self):
+        kvcache = self._build_with_mori_linker({PoolName.KV: object()})
+        kvcache.layer_router.load_parts_layer_wise.assert_not_called()
+
+    def test_external_linker_backing_state_makes_state_reads_wait(self):
+        kvcache = self._build_with_mori_linker(
+            {PoolName.KV: object(), PoolName.MAMBA: object()}
+        )
+        kvcache.layer_router.load_parts_layer_wise.assert_called_once_with()
 
     def test_custom_unified_cache_keeps_host_pool_setup(self):
         ctx = _make_ctx(self)

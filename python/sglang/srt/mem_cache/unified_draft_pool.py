@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
     DraftStateRegion,
@@ -27,10 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     write_loc_is_physical,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedHybridReqToTokenPool,
-    UnifiedKVPool,
-)
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
@@ -128,8 +127,8 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
 class UnifiedDraftSWAKVPool(SWAKVPool):
     """A draft's KV pool when it has sliding-window layers: one dense draft
     pool per host sub-pool it fuses into ("full" and/or "swa"), routed per
-    layer exactly like the target's `UnifiedSWAKVPool`, so the attention
-    backends run their swa rail for it. Inherits `SWAKVPool` for `isinstance`
+    layer like the target's pool, so the attention backends run their swa
+    rail for it. Inherits `SWAKVPool` for `isinstance`
     only; never calls its `__init__` (it would allocate static pools)."""
 
     requires_physical_write_loc = True
@@ -228,7 +227,9 @@ class UnifiedDraftSWAKVPool(SWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         """Virtual token ids -> swa-physical token ids, through the host."""
-        return self.host_allocator.translate_loc_from_full_to_swa(kv_indices)
+        return self.host_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            kv_indices
+        )
 
     def get_state_buf_infos(self):
         raise NotImplementedError(
@@ -465,11 +466,13 @@ def draft_state_layer_classes(model) -> List[str]:
 
 
 class FusedDraftBinding(msgspec.Struct, frozen=True, kw_only=True):
-    """What a draft runner binds: its KV pool over the fused lanes and the
-    request table it reads."""
+    """What a draft runner binds: its KV pool over the fused lanes, the
+    request table it reads (the target's), and the recurrent state its KV
+    pool routes (the target's, until a state binder gives it its own)."""
 
     token_to_kv_pool: Any = None
     req_to_token_pool: Any = None
+    state: Optional[StateStorage] = None
 
 
 class BindContext(msgspec.Struct, frozen=True, kw_only=True):
@@ -535,7 +538,9 @@ def bind_fused_draft(
         if family not in families and len(placement.lanes_for(runner, host)) > 0:
             families.append(family)
     assert families, f"draft runner {runner} holds no lane in any host"
-    binding = FusedDraftBinding(req_to_token_pool=req_to_token_pool)
+    binding = FusedDraftBinding(
+        req_to_token_pool=req_to_token_pool, state=host_allocator.state
+    )
     for family in families:
         assert family in DRAFT_BINDERS, (
             f"no draft binder is registered for host family {family!r}"
@@ -607,15 +612,37 @@ def _runner_state_layer_ids(ctx: BindContext) -> Tuple[int, ...]:
     return layer_ids
 
 
+def fused_draft_state(
+    *,
+    target: StateStorage,
+    unified_buffer: UnifiedKVPool,
+    layer_lanes: Mapping[int, int],
+) -> StateStorage:
+    """A draft runner's recurrent state over the draft block fused into the
+    target's state entries: the target's slots (the draft's slot ids ARE the
+    target's), and a view of the block keyed by the runner's own layer ids."""
+    return StateStorage(
+        sub_pool=target.sub_pool,
+        pool=UnifiedDraftMambaPool(
+            unified_buffer=unified_buffer,
+            sub_pool_name=target.sub_pool,
+            layer_lanes=layer_lanes,
+        ),
+        slots=target.slots,
+        layer_map={layer_id: idx for idx, layer_id in enumerate(sorted(layer_lanes))},
+        short_conv_pool=target.short_conv_pool,
+        ngram_pool=target.ngram_pool,
+    )
+
+
 def _bind_state(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBinding:
-    """This runner's recurrent-state block: its request table is the target's
-    (same request->slot mappings, same slot allocator) with a `mamba_pool`
-    view keyed by the runner's own state layer ids."""
+    """This runner's recurrent-state block, over the target's slots."""
     hosts = ctx.hosts_of("state")
     assert hosts == ("mamba",), (
         f"the state binder serves the 'mamba' host alone; got {hosts}"
     )
-    assert isinstance(binding.req_to_token_pool, UnifiedHybridReqToTokenPool), (
+    target = ctx.host_allocator.state
+    assert target is not None, (
         "a fused draft state block needs the target's unified state pool"
     )
     layer_ids = _runner_state_layer_ids(ctx)
@@ -624,10 +651,12 @@ def _bind_state(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         f"draft runner {ctx.runner}: state layers {list(layer_ids)} vs placed "
         f"lanes {list(lanes)}"
     )
-    req_to_token_pool = binding.req_to_token_pool.clone_for_fused_draft(
-        layer_lanes=dict(zip(layer_ids, lanes))
+    state = fused_draft_state(
+        target=target,
+        unified_buffer=ctx.unified_buffer,
+        layer_lanes=dict(zip(layer_ids, lanes)),
     )
-    return msgspec.structs.replace(binding, req_to_token_pool=req_to_token_pool)
+    return msgspec.structs.replace(binding, state=state)
 
 
 register_draft_binder("state", _bind_state)

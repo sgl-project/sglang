@@ -263,6 +263,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool()
         allocator = SimpleNamespace(
+            state=None,
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),

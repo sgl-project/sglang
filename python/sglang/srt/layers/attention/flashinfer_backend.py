@@ -30,13 +30,16 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    resolve_window_id_space,
+    resolve_window_kv_pool,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -338,8 +341,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
-        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
-            model_runner
+        self._swa_kv_pool = resolve_window_kv_pool(model_runner)
+        # The window id space of that pool, which these reads map through.
+        self._swa_space: Optional[IdSpace] = resolve_window_id_space(
+            model_runner, self._swa_kv_pool
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = get_exec().features.enable_mis
@@ -583,27 +588,6 @@ class FlashInferAttnBackend(AttentionBackend):
             f"KV cache method {method_name!r} does not support {phase} with "
             f"flashinfer attention backend. Available {phase} accesses: {available}."
         )
-
-    @staticmethod
-    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
-        """Return the SWA KV pool to translate against, or None for non-SWA models.
-
-        EAGLE-like draft workers share the target allocator for token bookkeeping,
-        but own a separate draft KV pool. Do not use the target allocator's SWA
-        mapping for that draft pool. FROZEN_KV MTP is the exception: its draft
-        path reads target KV directly, so it still needs the allocator pool when
-        the active pool is not SWA.
-        """
-        active_pool = model_runner.token_to_kv_pool
-        if isinstance(active_pool, BaseSWAKVPool):
-            return active_pool
-
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
-
-        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
-        return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -1610,6 +1594,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1814,11 +1799,7 @@ class FlashInferIndicesUpdaterDecode:
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
@@ -1900,6 +1881,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -2306,11 +2288,7 @@ class FlashInferIndicesUpdaterPrefill:
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         # cached part
         # Conditionally set multi-item parameters

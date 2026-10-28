@@ -18,10 +18,13 @@ The CUDA side is split into independent pieces:
 
 All storage is allocated and owned here, in Python.
 
-CUDA-graph inputs are exchanged from Python after capture (cudaIpc handles
-for cudaMalloc-backed pointers, fabric/posix-fd VMM mapping for expandable
-segments) and written into a device-side pointer table (``graph_params``);
-the kernel captured in the graph dereferences its row at replay time.
+On single-node groups, CUDA-graph inputs are exchanged from Python after
+capture (cudaIpc handles for cudaMalloc-backed pointers, FABRIC/POSIX-fd VMM mapping
+for expandable segments) and written into a device-side pointer table
+(``graph_params``); the kernel captured in the graph dereferences its row at
+replay time. Multi-node (MNNVL) groups skip direct graph-input registration
+and use the torch symmetric-memory workspace during capture and replay too.
+Their input tensors therefore do not require a VMM-backed caching allocator.
 """
 
 import logging
@@ -34,6 +37,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL
 from sglang.kernels.ops.communication.all_reduce import (
+    SUPPORTED_DTYPES,
     AllReduceAlgo,
     Communicator,
     IPCManager,
@@ -402,6 +406,8 @@ class CustomAllReduceV2:
         """Check if the input tensor is suitable for custom all-reduce."""
         if self.disabled:
             return False
+        if inp.dtype not in SUPPORTED_DTYPES:
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -573,12 +579,6 @@ class CustomAllReduceV2:
         self.close()
 
 
-def _is_vmm_backed_allocator(device: torch.device) -> bool:
-    """Check whether expandable-segments VMM backs the caching allocator."""
-    probe = torch.empty(1, dtype=torch.uint8, device=device)
-    return is_vmm_pointer(probe.data_ptr())
-
-
 def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
@@ -587,7 +587,7 @@ def can_use_custom_all_reduce_v2(
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
-        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
+        return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,

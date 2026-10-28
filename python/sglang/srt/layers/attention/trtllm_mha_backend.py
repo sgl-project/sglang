@@ -28,7 +28,10 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 )
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import (
+    SharedReadEnds,
+    resolve_window_kv_pool,
+)
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -36,6 +39,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -44,8 +48,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -108,15 +111,9 @@ def _native_fp4_prefill_output_capacity(
 
 def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
     """Return the pool-owned buffers in TRT-LLM GenMHA's native layout."""
-    pool = token_to_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        pool._wait_for_layer(layer_id)
-        layer_id = pool._transfer_full_attention_id(layer_id)
-        pool = pool.full_kv_pool
-    elif pool.layer_transfer_counter is not None:
-        pool.layer_transfer_counter.wait_until(layer_id - pool.start_layer)
-
-    local_layer_id = layer_id - pool.start_layer
+    kv = token_to_kv_pool.layer_router.read(layer_id)
+    pool = kv.view
+    local_layer_id = kv.view_layer_id - pool.start_layer
     if pool.native_k_scale_buffer is None or pool.native_v_scale_buffer is None:
         raise RuntimeError(
             "TRT-LLM native FP4 KV cache requested from a pool without native scales."
@@ -270,6 +267,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.is_draft_runner = model_runner.is_draft_worker
+        self._verify_mask: Optional[VerifyMask] = None
 
         self._nvfp4_fp8_output = None
         if self.uses_trtllm_gen_native_fp4:
@@ -329,7 +328,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
-        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self._swa_kv_pool = resolve_window_kv_pool(model_runner)
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
@@ -544,28 +543,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return model_output
         return output.to(self.q_data_type)
 
-    @staticmethod
-    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
-        """Return the SWAKVPool to translate against, or None for non-SWA models.
-
-        EAGLE draft workers share the target allocator for token bookkeeping,
-        but own a separate draft KV pool. Do not use the target allocator's
-        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
-        draft path reads target KV directly, so it still needs the allocator
-        pool when the active pool is not SWA.
-        """
-        active_pool = model_runner.token_to_kv_pool
-        if isinstance(active_pool, SWAKVPool):
-            return active_pool
-
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
-
-        allocator = model_runner.token_to_kv_pool_allocator
-        kvcache = allocator.get_kvcache()
-        return kvcache if isinstance(kvcache, SWAKVPool) else None
-
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
@@ -597,9 +574,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_table=metadata.page_table,
             page_size=self.page_size,
             swa_page_table=metadata.swa_page_table if has_swa else None,
-            full_to_swa=(
-                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
-            ),
+            full_to_swa=self._swa_full_to_swa_mapping if has_swa else None,
+        )
+
+    def _is_window_layer(self, layer: RadixAttention) -> bool:
+        return (
+            self._swa_kv_pool.layer_router.route(layer.layer_id).sub_pool
+            == IdSpaceKind.SLIDING_WINDOW
         )
 
     def _get_layer_cache_loc(
@@ -609,8 +590,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Return cache locations in the correct index space for the given layer."""
         if self._swa_kv_pool is not None:
-            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
-            if is_swa:
+            if self._is_window_layer(layer):
                 swa_loc = self.forward_metadata.swa_out_cache_loc
                 assert (
                     swa_loc is not None
@@ -640,8 +620,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Return the correct page_table for the given layer (SWA or full)."""
         swa_pt = self.forward_metadata.swa_page_table
         if swa_pt is not None:
-            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
-            if is_swa:
+            if self._is_window_layer(layer):
                 return swa_pt
         return self.forward_metadata.page_table
 
@@ -808,6 +787,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+        self._verify_mask = self._unread_verify_mask(max_bs)
+
+    def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
+        # Target verify runs the decode kernel, causal within each request's rows; a
+        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
+        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+            return None
+        return maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _build_cuda_graph_metadata(
         self,
@@ -1939,8 +1938,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     block_tables = self.forward_metadata.zigzag_page_table
                     zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
                     if zigzag_swa_pt is not None:
-                        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
-                        if is_swa:
+                        if self._is_window_layer(layer):
                             block_tables = zigzag_swa_pt
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,

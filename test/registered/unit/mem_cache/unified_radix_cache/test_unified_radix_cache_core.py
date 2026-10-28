@@ -25,6 +25,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -872,7 +874,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(swa_value)
         self.assertTrue(
             torch.equal(
-                allocator.translate_loc_from_full_to_swa(old_full_value),
+                allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(old_full_value),
                 swa_value,
             )
         )
@@ -1920,6 +1922,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
+        alloc.hands_out_virtual_ids = False
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
         swa_value = torch.tensor([7, 8], dtype=torch.int64)
@@ -2216,7 +2219,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         tokens = list(range(1, seq_len + 1))
         req.origin_input_ids = tokens
         req.output_ids = []
@@ -2269,7 +2272,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
                 temperature=0, max_new_tokens=owned - prompt_len
             ),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
         req.extend_end = prompt_len

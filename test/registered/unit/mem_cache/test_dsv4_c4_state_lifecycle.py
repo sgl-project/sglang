@@ -111,19 +111,19 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
         reused = _request()
 
         # First admission: a brand-new slot, so its C4 ring must be cleared.
-        (reused_idx,) = alloc_req_slots(req_pool, [reused], None)
+        (reused_idx,) = alloc_req_slots(req_pool, None, [reused], None)
         hook.assert_called_once_with([reused_idx])
 
         # Chunked continuation reuses the same slot -- clearing it here would
         # wipe the state captured by the previous chunk.
         hook.reset_mock()
         _mark_reused(reused)
-        self.assertEqual(alloc_req_slots(req_pool, [reused], None), [reused_idx])
+        self.assertEqual(alloc_req_slots(req_pool, None, [reused], None), [reused_idx])
         hook.assert_not_called()
 
         # Mixed batch: only the newly allocated slot is reported.
         fresh = _request()
-        indices = alloc_req_slots(req_pool, [reused, fresh], None)
+        indices = alloc_req_slots(req_pool, None, [reused, fresh], None)
         self.assertEqual(indices[0], reused_idx)
         self.assertNotEqual(indices[1], reused_idx)
         hook.assert_called_once_with([indices[1]])
@@ -154,7 +154,7 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
 
     def test_req_pool_without_hook_is_unchanged(self):
         req_pool = ReqToTokenPool(2, 16, "cpu", enable_memory_saver=False)
-        (idx,) = alloc_req_slots(req_pool, [_request()], None)
+        (idx,) = alloc_req_slots(req_pool, None, [_request()], None)
         self.assertGreater(idx, 0)
 
 

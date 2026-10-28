@@ -1,4 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: AMD lowers unified page zeroing through ROCm Triton,
@@ -12,21 +13,19 @@ import torch
 
 from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
-    init_unified_swa_pools,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 
@@ -34,7 +33,7 @@ BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 def _build(device, page_size=1):
     """A tiny MLA+mamba unified pool + full-side allocator.
 
-    Mirrors init_unified_mamba_pools' construction just enough for the
+    Mirrors the unified pool builder's full + state stack just enough for the
     allocator hand-out path (the piece under test)."""
     layer_num = 2
     full_spec = MLASubPoolSpec(
@@ -167,10 +166,15 @@ def _build_tri(device, page_size=4):
         ),
         attach_allocators=lambda **_: None,
     )
-    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=buf,
         kvcache=kvcache,
-        mamba_kvcache=SimpleNamespace(move_kv_cache=lambda dst, src: None),
+        views=stand_in_views(
+            ChainRoles(owner="full", window="swa", state="mamba"),
+            kvcache,
+            SimpleNamespace(move_kv_cache=lambda dst, src: None),
+        ),
         device=device,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -182,7 +186,7 @@ def _build_tri(device, page_size=4):
 def _build_swa_poisoned(device, page_size=4):
     """A full + SWA unified pool built under SGLANG_DEBUG_POISON_POOL."""
     with envs.SGLANG_DEBUG_POISON_POOL.override(True):
-        return init_unified_swa_pools(
+        return build_test_unified_pools(
             device=device,
             kv_cache_dtype=torch.bfloat16,
             head_num=2,
@@ -325,7 +329,7 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
             out=table,
         )
         self.assertEqual(table[0, :2].tolist(), [0, 0])  # freed: the sink
-        v = bundle.token_to_kv_pool.swa_kv_pool.v_buffer[0]
+        v = bundle.token_to_kv_pool.layer_router.view("swa").v_buffer[0]
         self.assertFalse(torch.isnan(v[:ps].float()).any().item())
 
 

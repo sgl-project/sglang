@@ -12,15 +12,16 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
     UnifiedHybridReqToTokenPool,
     UnifiedKVPool,
     UnifiedMambaPool,
-    UnifiedMambaSlotAllocator,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
@@ -86,19 +87,19 @@ class TestInklingCheckpointIndices(CustomTestCase):
         req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
         req_pool = req_type.__new__(req_type)
         req_pool.size = 4
-        req_pool.mamba_pool = pool
-        req_pool.mamba_allocator = UnifiedMambaSlotAllocator(
-            allocator, max_size=pool.size, device="cuda"
-        )
         req_pool.req_index_to_mamba_index_mapping = slots[1:2].to(torch.int32).repeat(4)
         backend = InklingShortConvAttnBackend.__new__(InklingShortConvAttnBackend)
         backend.req_to_token_pool = req_pool
+        backend.state_pool = pool
         backend.device = "cuda"
         backend.conv_state_len = 3
         backend._cache_indices_buf = None
-        backend._slot_gather_recordable = (
-            req_pool.mamba_translate_is_fusable if fused else static
+        backend._state_ids = (
+            IdSpace(key=("mamba", None))
+            if static
+            else slot_id_space(allocator, owner=None)
         )
+        backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(
             decode=SimpleNamespace(bs=[1, 2, 4], max_bs=4),
             prefill=SimpleNamespace(bs=[8]),
@@ -399,7 +400,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 ids = slots[-1:].clone() if tracking else None
                 with (
                     patch.object(
-                        backend.req_to_token_pool,
+                        backend.state_pool,
                         "get_speculative_mamba2_params_all_layers",
                         return_value=object(),
                     ),
@@ -684,6 +685,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         model_runner = SimpleNamespace(
             device="cuda",
             tp_size=1,
+            model=SimpleNamespace(),
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16, vocab_size=8, hf_config=SimpleNamespace()
             ),
@@ -698,6 +700,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
+            megakernel=None,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
@@ -801,6 +804,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
+        runner.megakernel = None
+        runner.megakernel_served = frozenset()
         runner.buffers = buffers
         runner.captured_req_width = 4
         runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
@@ -831,7 +836,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             kv_index_translator=KVIndexTranslator(
                 req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
                 token_to_kv_pool_allocator=None,
-                token_to_kv_pool=object(),
+                token_to_kv_pool=SimpleNamespace(
+                    id_spaces=lambda: {
+                        IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))
+                    }
+                ),
                 page_size=1,
                 device="cuda",
             ),
@@ -869,7 +878,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 backend.init_forward_metadata_in_graph(batch)
         pointer = backend._cache_indices_buf.data_ptr()
         track_pointer = backend._graph_track_indices.data_ptr()
-        table_pointer = pool.mamba_v2p_table.data_ptr()
+        table_pointer = backend._state_ids.read_v2p.data_ptr()
         before = backend._cache_indices.clone()
         # Free live physical holes and move both active and checkpoint states.
         for hole in (slots[:1], slots[5:6]):
@@ -895,9 +904,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             self.assertEqual(backend.sconv_metadata.track_cache_indices[-2].item(), -1)
             self.assertEqual(backend._cache_indices_buf.data_ptr(), pointer)
             self.assertEqual(backend._graph_track_indices.data_ptr(), track_pointer)
-            self.assertEqual(pool.mamba_v2p_table.data_ptr(), table_pointer)
+            self.assertEqual(backend._state_ids.read_v2p.data_ptr(), table_pointer)
             with (
-                patch.object(pool, "get_speculative_mamba2_params_all_layers"),
+                patch.object(
+                    backend.state_pool, "get_speculative_mamba2_params_all_layers"
+                ),
                 patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
             ):
                 backend.commit_conv_state_after_mtp_verify(

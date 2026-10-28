@@ -207,14 +207,14 @@ class MambaComponent(TreeComponent):
         req = params.req
         assert req is not None
         if not req.kv.holds_mamba:
-            dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            dst_index = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
             if dst_index is None:
                 # Pin the window via inc/dec_lock_ref so evict's SWA release
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
                 self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-                dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                dst_index = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
@@ -526,7 +526,7 @@ class MambaComponent(TreeComponent):
 
     def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
-        slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        slot = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
         if slot is None:
             if req is not None and get_exec().mamba.enable_mamba_extra_buffer_lazy:
                 lock = req.lock
@@ -548,13 +548,13 @@ class MambaComponent(TreeComponent):
                     )
                     lock.receipt.skipped_lock_components += (ct,)
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            slot = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
     def int8_ckpt_pool(self):
-        return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
+        return self.cache.token_to_kv_pool_allocator.state.ckpt_pool
 
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
         slot = self.int8_ckpt_pool.alloc(1)
@@ -567,7 +567,7 @@ class MambaComponent(TreeComponent):
     def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
         ckpt_slot = self._alloc_int8_ckpt_slot()
         self.int8_ckpt_pool.store_from_active(
-            self.cache.req_to_token_pool.mamba_pool,
+            self.cache.token_to_kv_pool_allocator.state.pool,
             active_slots.view(-1),
             ckpt_slot,
         )
@@ -577,7 +577,7 @@ class MambaComponent(TreeComponent):
         if self.int8_ckpt_pool is not None:
             self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
+            self.cache.token_to_kv_pool_allocator.state_slots.free(mamba_value)
 
     def _select_finished_checkpoint(
         self, req: Req, token_ids_len: int
@@ -619,7 +619,7 @@ class MambaComponent(TreeComponent):
             # its key length. page_size is asserted == 1, so no realign.
             if is_finished:
                 write_pos_buf = (
-                    self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+                    self.cache.token_to_kv_pool_allocator.state.pool.replayssm_write_pos
                 )
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
@@ -657,7 +657,7 @@ class MambaComponent(TreeComponent):
                         )
                     )
                     mamba_value_donated = self._commit_int8_checkpoint(src_active)
-                    self.cache.req_to_token_pool.mamba_allocator.free(src_active)
+                    self.cache.token_to_kv_pool_allocator.state_slots.free(src_active)
                 else:
                     mamba_value_donated = self._commit_int8_checkpoint(
                         req.kv.mamba_pool_idx.view(-1)
@@ -671,12 +671,15 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot(req)
-                # mamba_pool is a pure PHYSICAL store; translate both slot ids
-                # virtual->physical (identity for the non-unified memory pool) first.
-                translate = self.cache.req_to_token_pool.translate_mamba_indices
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    translate(req.kv.mamba_pool_idx.unsqueeze(0)),
-                    translate(mamba_value_donated),
+                # mamba_pool is a pure PHYSICAL store; map both slot ids into
+                # its id space (identity unless the slot ids are virtual) first.
+                req_pool = self.cache.req_to_token_pool
+                state_ids = self.cache.token_to_kv_pool_allocator.state_ids(
+                    req_pool.state_sub_pool
+                )
+                self.cache.token_to_kv_pool_allocator.state.pool.copy_from(
+                    state_ids.ids(req.kv.mamba_pool_idx.unsqueeze(0)),
+                    state_ids.ids(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
             return cache_len
@@ -702,7 +705,7 @@ class MambaComponent(TreeComponent):
                 )
                 if insert_value_unused:
                     self._free_mamba_value(insert_params.mamba_value)
-                pool.free_mamba_cache(req)
+                self.cache.token_to_kv_pool_allocator.state.release(pool, req)
                 return
 
             if self.cache.enable_mamba_extra_buffer:
@@ -711,13 +714,13 @@ class MambaComponent(TreeComponent):
                     insert_params.mamba_keep_idx if insert_params is not None else None
                 )
                 keep_idx = prepared_keep_idx if mamba_value_inserted else None
-                pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                self.cache.token_to_kv_pool_allocator.state.release(
+                    pool, req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
                 return
 
             if not mamba_value_inserted:
-                pool.free_mamba_cache(req)
+                self.cache.token_to_kv_pool_allocator.state.release(pool, req)
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
@@ -768,12 +771,16 @@ class MambaComponent(TreeComponent):
     ) -> Optional[PoolTransfer]:
         pool = self.cache.req_to_token_pool
         if phase == ExternalLinkerLoadPhase.ABORT:
-            pool.mamba_allocator.free(transfer.device_indices)
+            self.cache.token_to_kv_pool_allocator.state_slots.free(
+                transfer.device_indices
+            )
             return None
 
         assert phase == ExternalLinkerLoadPhase.PREPARE
         if req.kv.holds_mamba:
-            pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+            self.cache.token_to_kv_pool_allocator.state_slots.free(
+                req.kv.mamba_pool_idx.unsqueeze(0)
+            )
         # The layer-gated load writes the request's private state directly.
         req.kv.mamba_pool_idx = transfer.device_indices[0]
         self._adopt_loaded_state(req)
@@ -782,10 +789,13 @@ class MambaComponent(TreeComponent):
     def _adopt_loaded_state(self, req: Req) -> None:
         # A loaded state supersedes the replay cursor and the deferred CoW/clear.
         pool = self.cache.req_to_token_pool
-        write_pos = pool.mamba_pool.replayssm_write_pos
+        write_pos = self.cache.token_to_kv_pool_allocator.state.pool.replayssm_write_pos
         if write_pos is not None:
             slot = req.kv.mamba_pool_idx.unsqueeze(0)
-            write_pos[pool.translate_mamba_indices(slot)] = 0
+            state_ids = self.cache.token_to_kv_pool_allocator.state_ids(
+                pool.state_sub_pool
+            )
+            write_pos[state_ids.ids(slot)] = 0
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
 
@@ -810,10 +820,10 @@ class MambaComponent(TreeComponent):
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        dst = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
         if dst is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            dst = self.cache.token_to_kv_pool_allocator.state_slots.alloc(1)
         if dst is not None:
             req.kv.mamba_pool_idx = dst[0]
         return dst
@@ -823,7 +833,9 @@ class MambaComponent(TreeComponent):
     ) -> None:
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
         if not success and prep.allocated_mamba_slot is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
+            self.cache.token_to_kv_pool_allocator.state_slots.free(
+                prep.allocated_mamba_slot
+            )
             req.kv.mamba_pool_idx = None
 
     def prepare_buffer_load_back(

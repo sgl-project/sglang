@@ -69,18 +69,10 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            DeepSeekV4HiSparseTokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-
         # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
         # only frees through free_swa_segment / free / free_group_*, which the
         # HiSparse allocator defines.
-        assert isinstance(
-            params.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
-        ), (
+        assert params.token_to_kv_pool_allocator.has_window_pool, (
             f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         if params.sliding_window_size is None or params.sliding_window_size <= 0:
@@ -247,13 +239,9 @@ class SWAComponent(TreeComponent):
         return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
-        """The unified SWA composite, or None when running on the static pool."""
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-        )
-
+        """The unified pool's allocator, or None when running on the static pool."""
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWAAllocatorBase):
+        if allocator.hands_out_virtual_ids:
             return allocator
         return None
 
@@ -481,9 +469,12 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
-        window_start = params.get_evicted_seqlen(self.component_type)
-        if self._independent:
-            window_start = max(window_start, params.prev_prefix_len)
+        # Never recover below the request's protected prefix: the incoming row
+        # there holds the node's own canonical ids, so a lower window cursor
+        # would free pages the node keeps (mirrors the Rust core).
+        window_start = max(
+            params.get_evicted_seqlen(self.component_type), params.prev_prefix_len
+        )
         consumed_from = prefix_len
         for fragment, start, end in self._segments(
             node=node, start=total_prefix_len, end=total_prefix_len + prefix_len
@@ -1584,7 +1575,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._set_swa(action.kept_full, action.incoming_full)
             unified = self._unified_allocator()
             if unified is not None:
-                # The composite skips the detached SWA side and releases Full.
+                # The chain allocator skips the detached SWA side and releases Full.
                 unified.free(action.incoming_full)
             else:
                 alloc.free_full_segment(action.incoming_full, start_pos=0)

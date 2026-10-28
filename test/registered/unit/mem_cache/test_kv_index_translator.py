@@ -23,6 +23,7 @@ Triton kernel.
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -32,13 +33,12 @@ from types import SimpleNamespace
 import torch
 from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
 
@@ -74,9 +74,11 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
         page_size=ps,
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
+        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -86,8 +88,15 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     )
     # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
     # carries the pool-level full->swa translate, so the fake must too.
-    kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
+    kvcache.translate_loc_from_full_to_swa = allocator.id_spaces()[
+        IdSpaceKind.SLIDING_WINDOW
+    ].write
     return allocator
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 def _make_source(allocator, req_to_token, ps):
@@ -312,8 +321,8 @@ class TestCopyPageTable(unittest.TestCase):
         no plan table to copy and must fail loud, not fill garbage."""
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )
@@ -344,9 +353,9 @@ class TestPoolOwnership(unittest.TestCase):
         a factory returning a pool the allocator does not hold would silently
         disable the unified path for EVERY model. Pinned against the real
         factory, not this file's own construction."""
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        bundle = init_unified_swa_pools(
+        bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=2,
@@ -382,7 +391,9 @@ class TestPoolOwnership(unittest.TestCase):
         """Same allocator, different pool: must stay disabled."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.zeros((2, 8), dtype=torch.int32, device=_DEV)
-        own_pool = SimpleNamespace()  # a separate buffer, not the composite's
+        own_pool = SimpleNamespace(
+            id_spaces=_plain_id_spaces
+        )  # a separate buffer, not the composite's
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
@@ -401,7 +412,7 @@ class TestPoolOwnership(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )
@@ -464,7 +475,7 @@ class TestWriteIds(CustomTestCase):
         src = _make_source(allocator, req_to_token, ps)
         virt = allocator.alloc(-(-n // ps) * ps)[:n]
         want_full = allocator.translate_kv_loc(virt)
-        want_swa = allocator.translate_loc_from_full_to_swa(virt)
+        want_swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virt)
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
     def test_own_plan_translates_full_side_only(self):
@@ -482,10 +493,8 @@ class TestWriteIds(CustomTestCase):
 
     def test_capture_capacity_covers_dcp_widened_mamba_ids(self):
         """A capturer must store the highest virtual IDs issued under DCP."""
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
         from sglang.srt.runtime_context import get_parallel
 
         for dcp_size in (1, 2, 4):
@@ -518,11 +527,25 @@ class TestWriteIds(CustomTestCase):
                     enable_memory_saver=False,
                     page_size=4,
                 )
-                allocator = UnifiedMambaTokenToKVPoolAllocator(
+                allocator = ChainAllocator(
+                    roles=ChainRoles(owner="full", state="mamba"),
                     unified_buffer=pool,
                     kvcache=SimpleNamespace(
                         full_kv_pool=_FakeKVCache(pool.max_slots("full")),
                         mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                    ),
+                    views=stand_in_views(
+                        ChainRoles(owner="full", state="mamba"),
+                        SimpleNamespace(
+                            full_kv_pool=_FakeKVCache(pool.max_slots("full")),
+                            mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                        ),
+                        (
+                            SimpleNamespace(
+                                full_kv_pool=_FakeKVCache(pool.max_slots("full")),
+                                mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                            )
+                        ).mamba_pool,
                     ),
                     device="cpu",
                     page_size=4,
@@ -633,7 +656,7 @@ class TestWriteIds(CustomTestCase):
         pool.translate_loc_from_full_to_swa = lambda t: t + 100
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=pool,
             page_size=1,
             device=_DEV,
@@ -656,8 +679,8 @@ class TestWriteIds(CustomTestCase):
         # id space to derive into.
         plain = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )

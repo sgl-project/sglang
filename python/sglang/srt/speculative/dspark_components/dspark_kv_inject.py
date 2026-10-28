@@ -8,7 +8,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import compute_position
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
@@ -301,7 +301,9 @@ class TargetHiddenKvInjector:
                 cache_loc_2d.shape[1],
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            swa_loc = self.draft_model_runner.kv_index_translator.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, cache_loc
+            ).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
                 bs, verify_len = cache_loc_2d.shape
                 col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)

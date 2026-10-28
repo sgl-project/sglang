@@ -6,15 +6,14 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
+    stand_in_views,
     tri_sub_pool_specs,
 )
 
@@ -39,10 +38,13 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
     )
     kv = FakeUnifiedSWAKVPool(pool)
     mk = FakeKVCache(pool.max_slots("mamba"))
-    a = UnifiedMambaSWATokenToKVPoolAllocator(
+    a = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=pool,
         kvcache=kv,
-        mamba_kvcache=mk,
+        views=stand_in_views(
+            ChainRoles(owner="full", window="swa", state="mamba"), kv, mk
+        ),
         device="cpu",
         full_max_total_num_tokens=ps * 1000,
         swa_max_total_num_tokens=ps * 1000,
@@ -84,7 +86,7 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         a.mamba_allocator.free(states[1:4])
     if gate:
         for x in a._flush_targets():
-            x.disagg_move_gate = lambda: False
+            x.pin_sources = (lambda: True,)
     return (a, kv, mk)
 
 
@@ -143,8 +145,7 @@ class TestFloatMovementGate(CustomTestCase):
                 a, kv, mk = build_geometry(1, (1, 1), True, "swa_internal", False)
                 sa = a.swa_attn_allocator
                 saved = payload(a, kv, mk)
-                sa.disagg_move_gate = lambda: gates[0]
-                sa.host_transfer_move_gate = lambda: gates[1]
+                sa.pin_sources = (lambda: not gates[0], lambda: not gates[1])
                 before = snapshot(a)
                 low, high = sa._gap_pages()
                 gap = (low if side == "low" else high) * sa.entry_bytes_per_page
@@ -172,8 +173,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.assertEqual(settle.call_count, 0)
                 self.assertEqual(copies.call_count, 0)
                 self.assertEqual(snapshot(a), before)
-                sa.disagg_move_gate = lambda: True
-                sa.host_transfer_move_gate = lambda: True
+                sa.pin_sources = ()
                 with patch.object(
                     kv.swa_kv_pool,
                     "move_physical_pages",
@@ -211,7 +211,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.check_saved(a, saved)
                 if got is None:
                     for member in a._flush_targets():
-                        member.disagg_move_gate = None
+                        member.pin_sources = ()
                     a.ensure_capacity(demand, demand)
                     self.assertIsNotNone(a.alloc(demand))
                     self.check_saved(a, saved)
@@ -232,7 +232,7 @@ class TestFloatMovementGate(CustomTestCase):
         sa = a.swa_attn_allocator
         saved = payload(a, kv, mk)
         demand = ma.available_size() + 1
-        sa.disagg_move_gate = lambda: False
+        sa.pin_sources = (lambda: True,)
         with patch.object(
             kv.swa_kv_pool,
             "move_physical_pages",
@@ -241,7 +241,7 @@ class TestFloatMovementGate(CustomTestCase):
             self.assertIsNone(ma.alloc(demand))
         self.assertEqual(copies.call_count, 0)
         self.check_saved(a, saved)
-        sa.disagg_move_gate = lambda: True
+        sa.pin_sources = ()
         with patch.object(
             kv.swa_kv_pool,
             "move_physical_pages",

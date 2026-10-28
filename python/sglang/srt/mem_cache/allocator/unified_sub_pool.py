@@ -196,7 +196,7 @@ def _float_open_short_side(flt, demand) -> None:
 
 def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     """THE shortfall ladder: every allocation shortfall in the unified pool runs
-    exactly this, whether a single band's own alloc or a composite's coupled
+    exactly this, whether a single band's own alloc or the chain allocator's coupled
     multi-band alloc. The urgent flush is called unconditionally -- an eager END no-ops
     and a FLOAT always has boundary absorption to do -- so the ladder never
     branches on lazy mode, member kind, or layout.
@@ -251,31 +251,6 @@ def _full_tokens_before_mamba_recheck(
     return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
 
 
-def install_move_gate(
-    targets,
-    *,
-    slot: str,
-    gate: Callable[[], bool],
-    feature: str,
-    lazy_compaction: bool,
-) -> None:
-    """Point every member of a composite at one compaction gate.
-
-    A gate that reaches only some members is not a weaker gate, it is no gate:
-    the ungated end relocates its own pages under the same in-flight transfer.
-    So the member list is stated once per composite (`_move_gate_targets`) and
-    every gate installs over it, rather than each setter naming the members it
-    happens to remember.
-    """
-    assert lazy_compaction, (
-        f"{feature} with the unified memory pool requires lazy compaction "
-        "(eager free-path compaction moves pages under in-flight transfers)."
-    )
-    assert slot in ("disagg_move_gate", "host_transfer_move_gate"), slot
-    for target in targets:
-        setattr(target, slot, gate)
-
-
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`.
 
@@ -290,6 +265,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
     _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    # The owner's unminted virtual pages (None on a band that binds the owner's).
+    free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
     def __init__(
         self,
@@ -430,21 +407,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # RDMA and HiCache install independent gates to protect published device
-        # addresses. Either returning False blocks page relocation in `_flush`.
-        self.disagg_move_gate: Optional[Callable[[], bool]] = None
-        self.host_transfer_move_gate: Optional[Callable[[], bool]] = None
+        # Pin sources: DMA initiators (PD transfers, HiCache copies) whose queues
+        # outlive an iteration. While any reports busy, no page of this band
+        # relocates: the engine reads or writes the addresses it was handed.
+        self.pin_sources: Tuple[Callable[[], bool], ...] = ()
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
         # write-race check. Single slot: at most ONE forward in flight per call
         # site; `_flush` materializes the write-set lazily, avoiding a sync here.
         self._inflight_forward: Optional[Tuple[torch.cuda.Event, torch.Tensor]] = None
         self._hicache_transfer_done_events: Dict[Hashable, torch.cuda.Event] = {}
-        # HiCache reserves SWA physical pages during load-back, then binds them
-        # into the tree before the H2D copy is submitted.  Compaction must not
-        # move those pages in that interval because the queued PoolTransfer still
-        # carries the original physical ids.
-        self._pending_hicache_load_pages = 0
+        # A host load's explicit pin: HiCache reserves physical pages during
+        # load-back, then binds them into the tree before the H2D copy is
+        # submitted. Compaction must not move those pages in that interval because
+        # the queued PoolTransfer still carries the original physical ids.
+        self._load_pinned_pages = 0
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
@@ -558,7 +535,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._inflight_forward = None
         self._latest_forward_done_event = None
         self._hicache_transfer_done_events.clear()
-        self._pending_hicache_load_pages = 0
+        self._load_pinned_pages = 0
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
@@ -759,15 +736,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
+    def add_pin_source(self, busy: Callable[[], bool]) -> None:
+        """Keep this band's pages in place whenever ``busy()`` holds."""
+        self.pin_sources = (*self.pin_sources, busy)
+
+    def pinned_by_source(self) -> bool:
+        """Whether a pin source is busy now: its answer changes with no write
+        to the band, so capacity memos ask it each time."""
+        return any(busy() for busy in self.pin_sources)
+
     def moves_blocked(self) -> bool:
-        """Whether any installed gate currently forbids relocating pages."""
-        if self._pending_hicache_load_pages > 0:
+        """Whether a pin currently forbids relocating pages."""
+        if self._load_pinned_pages > 0:
             # Physical H2D reservations must stay put even before queueing.
             return True
-        for gate in (self.disagg_move_gate, self.host_transfer_move_gate):
-            if gate is not None and not gate():
-                return True
-        return False
+        return self.pinned_by_source()
 
     def _credit_neighbors(self) -> tuple:
         """Chain members whose holes `schedulable_available_size` credits. Which
@@ -1175,7 +1158,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def alloc_with_virtual(self, virtual_pages: torch.Tensor) -> None:
         """Take physical PAGES for caller-supplied virtual PAGE ids (not token
         ids), for a physical-holding non-owner such as the SWA `swa` sub-allocator.
-        The composite snapshots the virtual pages before the id-owner consumes them.
+        The chain allocator snapshots the virtual pages before the id-owner consumes them.
         """
         with record_function("MultiEndedAlloc.alloc_with_virtual"):
             if virtual_pages.numel() == 0:
@@ -1185,7 +1168,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
             assert phys_pages is not None, (
                 f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
-                "physical room (the composite's byte-budget check should have caught this)"
+                "physical room (the chain allocator's byte-budget check should have "
+                "caught this)"
             )
 
     # -- paged alloc surface --
@@ -1258,7 +1242,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if phys_pages is None:
                     return None  # defensive; pre-check should have prevented it
 
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            # A rebind moves the capacity epoch; a step within its pages takes none.
+            if num_new_pages > 0:
+                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
 
     def alloc_decode(
@@ -1312,7 +1298,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if phys_pages is None:
                     return None
 
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            # A rebind moves the capacity epoch; a step within its pages takes none.
+            if num_new_pages > 0:
+                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
 
     # -- free with eager compaction --
@@ -1440,9 +1428,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        assert self.disagg_move_gate is None and self.host_transfer_move_gate is None, (
+        assert not self.pin_sources, (
             f"_compact_pending({self.sub_pool_name!r}): eager compaction ran "
-            "with a move gate installed; PD disaggregation and HiCache both "
+            "with a pin source registered; PD disaggregation and HiCache both "
             "require lazy_compaction."
         )
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
@@ -1511,7 +1499,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         vacated-region clearing. Returns the moved virtual page ids.
         """
         assert not self.moves_blocked(), (
-            f"[{self.sub_pool_name}] page copy while a move gate is closed"
+            f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
         v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
         self._move_pages(src_pages, dst_pages)
@@ -1993,7 +1981,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if not srcs:
             return
         assert not self.moves_blocked(), (
-            f"[{self.sub_pool_name}] page copy while a move gate is closed"
+            f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
         with record_function("MultiEndedAlloc._commit_move_batch"):
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
@@ -2080,7 +2068,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.size = self.max_slots
         self.clear()
 
-    _pending_hicache_load_pages: _CapacityField[int] = _CapacityField()
+    _load_pinned_pages: _CapacityField[int] = _CapacityField()
 
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
         self._hicache_transfer_done_events[transfer_key] = event
@@ -2089,7 +2077,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ):
             # The H2D copy is now ordered before this event.  Future compaction
             # may proceed after _wait_hicache_transfers() waits on it.
-            self._pending_hicache_load_pages = 0
+            self._load_pinned_pages = 0
 
     def _wait_hicache_transfers(self) -> None:
         """Order the current stream after outstanding HiCache copies. Only moves
@@ -2126,7 +2114,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if physical_pages is None:
             return None
         # Blocks page moves (`moves_blocked`) until the H2D is queued or cancelled.
-        self._pending_hicache_load_pages += int(physical_pages.shape[0])
+        self._load_pinned_pages += int(physical_pages.shape[0])
         return self._expand_pages_to_tokens(physical_pages)
 
     def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
@@ -2134,11 +2122,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if free_index is None or free_index.numel() == 0:
             return
         num_pages = free_index.numel() // self.page_size
-        assert num_pages <= self._pending_hicache_load_pages, (
+        assert num_pages <= self._load_pinned_pages, (
             f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
-            f"HiCache pages with only {self._pending_hicache_load_pages} pending"
+            f"HiCache pages with only {self._load_pinned_pages} pending"
         )
-        self._pending_hicache_load_pages -= num_pages
+        self._load_pinned_pages -= num_pages
         self.free_physical(free_index)
 
     def free_physical(self, free_index: torch.Tensor) -> None:
@@ -2463,7 +2451,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
             # identity, then dedup. No stale-slot assert -- callers must not
             # double-free (a tombstoned page would join the hole list); the
-            # composite's filters uphold it and the byte verifier catches a miss.
+            # chain allocator's filters uphold it and the byte verifier catches a miss.
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if _pages is not None:
                 free_v_pages = _pages

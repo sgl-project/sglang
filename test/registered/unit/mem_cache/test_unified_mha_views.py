@@ -30,12 +30,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
 )
@@ -444,9 +444,9 @@ class TestFactoryViews(unittest.TestCase):
     def _bundle(self):
         # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
         # 8/8 dims, ps = 1) -- small enough that per-layer views build on CPU.
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        return init_unified_swa_pools(
+        return build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=2,
@@ -469,14 +469,18 @@ class TestFactoryViews(unittest.TestCase):
     def test_factory_builds_per_layer_views(self):
         b = self._bundle()
         # Sub-pools expose stock 3-D per-layer views.
-        self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
-        self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("full").k_buffer[0].dim(), 3
+        )
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("swa").k_buffer[0].dim(), 3
+        )
 
     @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
     def test_swa_factory_preserves_fp8_logical_dtype(self):
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        b = init_unified_swa_pools(
+        b = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float8_e4m3fn,
             head_num=2,
@@ -497,7 +501,7 @@ class TestFactoryViews(unittest.TestCase):
         )
 
         self.assertEqual(b.token_to_kv_pool.dtype, torch.float8_e4m3fn)
-        for pool in (b.token_to_kv_pool.full_kv_pool, b.token_to_kv_pool.swa_kv_pool):
+        for pool in map(b.token_to_kv_pool.layer_router.view, ("full", "swa")):
             self.assertEqual(pool.dtype, torch.float8_e4m3fn)
             self.assertEqual(pool.store_dtype, torch.uint8)
             self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)

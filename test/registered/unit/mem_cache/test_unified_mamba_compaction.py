@@ -275,7 +275,7 @@ class TestMambaCompaction(CustomTestCase):
                 observed[i].copy_(f.pool._raw[p * n : (p + 1) * n])
             done.record()
         self.assertFalse(done.query())
-        f.alloc.host_transfer_move_gate = lambda: False
+        f.alloc.pin_sources = (lambda: True,)
         calls = f.move.call_count
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
         self.assertFalse(done.query(), "pending retention was not observed")

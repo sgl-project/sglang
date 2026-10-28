@@ -180,10 +180,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_exact_extend_demand_preserves_other_allocator_dispatch(self):
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedMambaSWATokenToKVPoolAllocator,
-            UnifiedSWAAllocatorBase,
-        )
 
         allocator, _ = self.build_cache(occupancy=0, page_size=4)
         prefix = torch.tensor([1, 4, 7])
@@ -198,16 +194,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             ),
             31,
         )
-        self.assertIs(
-            UnifiedSWAAllocatorBase.get_extend_allocation_demand,
-            BaseTokenToKVPoolAllocator.get_extend_allocation_demand,
-        )
-        self.assertEqual(
-            UnifiedMambaSWATokenToKVPoolAllocator.get_extend_allocation_demand(
-                allocator, prefix, seq, **kwargs
-            ),
-            8,
-        )
         self.assertEqual(
             BaseTokenToKVPoolAllocator.get_extend_allocation_demand(
                 allocator, prefix, seq, **kwargs
@@ -217,9 +203,6 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
     def test_page128_partial_extend_and_conservative_fallback(self):
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedMambaSWATokenToKVPoolAllocator,
-        )
 
         allocator, _ = self.build_cache(occupancy=0, page_size=128)
         for prefix, seq, expected in (
@@ -232,22 +215,18 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         ):
             with self.subTest(prefix=prefix, seq=seq):
                 p, q = torch.tensor(prefix), torch.tensor(seq)
-                for query in (
-                    type(allocator).get_extend_allocation_demand,
-                    UnifiedMambaSWATokenToKVPoolAllocator.get_extend_allocation_demand,
-                ):
-                    self.assertEqual(
-                        query(
-                            allocator, p, q, conservative_num_tokens=1024, shard_size=1
-                        ),
-                        expected,
-                    )
-                    self.assertEqual(
-                        query(
-                            allocator, p, q, conservative_num_tokens=1024, shard_size=2
-                        ),
-                        1024,
-                    )
+                self.assertEqual(
+                    allocator.get_extend_allocation_demand(
+                        p, q, conservative_num_tokens=1024, shard_size=1
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    allocator.get_extend_allocation_demand(
+                        p, q, conservative_num_tokens=1024, shard_size=2
+                    ),
+                    1024,
+                )
                 self.assertEqual(
                     BaseTokenToKVPoolAllocator.get_extend_allocation_demand(
                         allocator, p, q, conservative_num_tokens=1024, shard_size=1
@@ -283,7 +262,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         # Asymmetric SWA restore demand fits bytes/physical SWA slots, but
         # cannot address more virtual pages than its FULL ID owner provides.
         self.assertLess(
-            demand * sa.entry_bytes_per_page, allocator._empty_shared_gap_bytes
+            demand * sa.entry_bytes_per_page, allocator._policy._empty_shared_gap_bytes
         )
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
         self.assertIsNone(allocator.reclaim_plan(0, demand, empty_pool=True))
@@ -404,12 +383,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         before = snapshot()
         for gate in (False, True):
             for member in allocator._flush_targets():
-                member.disagg_move_gate = lambda: gate
+                member.pin_sources = (lambda: not gate,)
             for _ in range(20):
                 allocator.reclaim_plan(4, 4)
             self.assertEqual(snapshot(), before)
         for member in allocator._flush_targets():
-            member.disagg_move_gate = None
+            member.pin_sources = ()
         self.assertTrue(evict_from_tree_cache(cache, 4))
         self.assertIsNotNone(allocator.alloc(4))
         self.assertEqual(cache.full_evictable_size(), 94)
