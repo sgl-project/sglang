@@ -187,7 +187,7 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1010 \
-            --build-arg ENABLE_MORI=0 \
+            --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
