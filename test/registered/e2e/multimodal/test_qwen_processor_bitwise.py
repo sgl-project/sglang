@@ -246,6 +246,9 @@ async def _capture(checkout, manifest_path, route):
         from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import (
             QwenTokenSpaceProcessStrategy,
         )
+        from sglang.srt.multimodal.token_space_mm_process.registry import (
+            serving_spec_for,
+        )
         from sglang.srt.multimodal.token_space_mm_process.sglang import (
             TokenSpaceSGLangProcessor,
         )
@@ -253,8 +256,10 @@ async def _capture(checkout, manifest_path, route):
         processor = get_mm_processor(
             hf_config, server_args, hf_processor, None, skip_mm_pool=True
         )
-        assert type(processor) is TokenSpaceSGLangProcessor.for_strategy(
-            QwenTokenSpaceProcessStrategy
+        assert type(
+            processor
+        ) is TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            QwenTokenSpaceProcessStrategy, serving_spec_for(hf_config)
         )
     else:
         processor = QwenVLImageProcessor(
