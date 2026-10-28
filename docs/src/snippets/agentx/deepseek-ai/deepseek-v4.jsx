@@ -29,9 +29,9 @@ export const agentx = {
     "status": "in-progress"
    },
    "4556": {
-    "run": null,
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/40604858012",
     "sha": "99b6f1bcb99134ace8f2a681025bfee46c9808a5",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "4524": {
     "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/40345805111",
@@ -4766,9 +4766,9 @@ export const agentx = {
    "detail": "DSpark 6 · dsv4-fp4-b200-dynamo-sglang-agentic-agg",
    "gpus": 8,
    "configKey": "dsv4-fp4-b200-dynamo-sglang-agentic-agg",
-   "image": "lmsysorg/sglang:nightly-dev-20260916-c9a8fba9",
-   "imageStatus": "pruned",
-   "imageCommit": "c9a8fba9",
+   "image": "lmsysorg/sglang:v0.5.22-cu130@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae",
+   "imageStatus": "ok",
+   "imageCommit": null,
    "submitted": "dynamo",
    "setup": [],
    "disclosures": ["synthetic-acceptance"],
@@ -4788,11 +4788,13 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "1d0716bb364d49a450386c867d632f7409ff7ced",
-    "run": "35345548475/attempts/1",
-    "pr": "3257",
-    "status": "verified",
-    "date": "2026-09-22"
+    "sha": "99b6f1bcb99134ace8f2a681025bfee46c9808a5",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/agg-variants.yaml",
+    "run": "40604858012/attempts/1",
+    "pr": "4556",
+    "comment": "6474564697",
+    "status": "verified-pr",
+    "date": "2026-10-28"
    },
    "points": [
     {
@@ -4800,7 +4802,8 @@ export const agentx = {
      "item": 0,
      "goldenAL": "3.77",
      "kv": "hicache",
-     "recipe": "benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/agg-b200-tp8-c1-mtp-hicache.yaml"
+     "override": "override_c1",
+     "job": "40604858012/job/122543547213"
     },
     {
      "concs": [4],
@@ -4829,7 +4832,8 @@ export const agentx = {
        null
       ]
      },
-     "recipe": "benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/agg-b200-tp8-c4-mtp-hicache.yaml"
+     "override": "override_c4",
+     "job": "40604858012/job/122581882650"
     },
     {
      "concs": [8],
@@ -4858,7 +4862,8 @@ export const agentx = {
        null
       ]
      },
-     "recipe": "benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/agg-b200-tp8-c8-mtp-hicache.yaml"
+     "override": "override_c8",
+     "job": "40604858012/job/122581882746"
     }
    ],
    "routers": {
@@ -5361,8 +5366,11 @@ export const agentx = {
    "prov": {
     "sha": "99b6f1bcb99134ace8f2a681025bfee46c9808a5",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/disagg-dspark6-variants.yaml",
+    "run": "40604858012/attempts/1",
     "pr": "4556",
-    "status": "in-progress"
+    "comment": "6474564697",
+    "status": "verified-pr",
+    "date": "2026-10-28"
    },
    "points": [
     {
@@ -5370,7 +5378,8 @@ export const agentx = {
      "item": 3,
      "override": "override_1p1d_dspark6_c16",
      "goldenAL": "3.77",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "40604858012/job/122581882659"
     },
     {
      "concs": [32],
@@ -5402,7 +5411,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "job": "40604858012/job/122581882853"
     },
     {
      "concs": [64],
@@ -5434,7 +5444,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "job": "40604858012/job/122581882791"
     },
     {
      "concs": [128],
@@ -5466,7 +5477,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "job": "40604858012/job/122581882869"
     },
     {
      "concs": [160],
@@ -5498,7 +5510,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "job": "40604858012/job/122581882688"
     }
    ],
    "routers": {
@@ -6043,8 +6056,11 @@ export const agentx = {
    "prov": {
     "sha": "99b6f1bcb99134ace8f2a681025bfee46c9808a5",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/disagg-variants.yaml",
+    "run": "40604858012/attempts/1",
     "pr": "4556",
-    "status": "in-progress"
+    "comment": "6474564697",
+    "status": "verified-pr",
+    "date": "2026-10-28"
    },
    "points": [
     {
@@ -6052,7 +6068,8 @@ export const agentx = {
      "item": 0,
      "override": "override_1p1d_c64",
      "goldenAL": "3.77",
-     "kv": "hicache"
+     "kv": "hicache",
+     "job": "40604858012/job/122581882804"
     },
     {
      "concs": [128],
@@ -6082,7 +6099,8 @@ export const agentx = {
        },
        null
       ]
-     }
+     },
+     "job": "40604858012/job/122581882822"
     }
    ],
    "routers": {
@@ -6299,8 +6317,12 @@ export const agentx = {
    "prov": {
     "sha": "99b6f1bcb99134ace8f2a681025bfee46c9808a5",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/b200-fp4/agentx/disagg-variants.yaml",
+    "run": "40604858012/attempts/2",
+    "job": "40604858012/job/122773602246",
     "pr": "4556",
-    "status": "in-progress"
+    "comment": "6474564697",
+    "status": "verified-pr",
+    "date": "2026-10-28"
    },
    "points": [
     {
