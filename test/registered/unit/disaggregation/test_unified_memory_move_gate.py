@@ -263,6 +263,69 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 )
                 self.assertTrue(all(m.moves_blocked() for m in alloc.members))
 
+    def test_role_switch_keeps_current_pd_pins_and_independent_hicache_pins(self):
+        """Role changes must release old queues without losing protection for
+        new PD transfers or an independent HiCache transfer."""
+        for chain in self._CHAINS:
+            with self.subTest(chain=chain):
+                alloc = self._chain(chain)
+                scheduler = _FakeScheduler(DisaggregationMode.DECODE)
+                storage = alloc.storage
+                storage.add_pin_source(
+                    storage.sub_pool_names(), disagg_transfers_in_flight(scheduler)
+                )
+                hicache = SimpleNamespace(busy=False)
+                storage.add_pin_source(storage.sub_pool_names(), lambda: hicache.busy)
+
+                def capacity_keys():
+                    return tuple(m._schedulable_capacity_key() for m in alloc.members)
+
+                idle_keys = capacity_keys()
+
+                def check_pins(blocked):
+                    self.assertEqual(
+                        [m.moves_blocked() for m in alloc.members],
+                        [blocked] * len(alloc.members),
+                    )
+                    if blocked:
+                        self.assertNotEqual(capacity_keys(), idle_keys)
+                    else:
+                        self.assertEqual(capacity_keys(), idle_keys)
+
+                scheduler.disagg_decode_prealloc_queue.note_destinations_published()
+                check_pins(True)
+                scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
+                check_pins(False)
+
+                # Role teardown removes the decode queues; the pool survives.
+                scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+                scheduler.disagg_decode_transfer_queue = None
+                scheduler.disagg_decode_prealloc_queue = None
+                check_pins(False)
+                scheduler.disagg_prefill_pending_chunk_rids.add("prefill")
+                check_pins(True)
+                scheduler.disagg_prefill_pending_chunk_rids.clear()
+                hicache.busy = True
+                check_pins(True)
+                hicache.busy = False
+                check_pins(False)
+
+                scheduler.disaggregation_mode = DisaggregationMode.DECODE
+                scheduler.disagg_prefill_inflight_queue = None
+                scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
+                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
+                check_pins(False)
+                scheduler.disagg_decode_transfer_queue.queue.append(object())
+                check_pins(True)
+                scheduler.disagg_decode_transfer_queue.queue.clear()
+                offload = SimpleNamespace(busy=True)
+                scheduler.decode_offload_manager = SimpleNamespace(
+                    has_inflight_device_transfer=lambda: offload.busy
+                )
+                check_pins(True)
+                offload.busy = False
+                check_pins(False)
+
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves
         wait on: a member that misses a HiCache copy's event may move a page the

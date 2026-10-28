@@ -692,6 +692,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_disaggregation_pin_source()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1646,15 +1647,6 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
-        if (
-            self.enable_unified_memory
-            and self.disaggregation_mode != DisaggregationMode.NULL
-        ):
-            storage = self.token_to_kv_pool_allocator.storage
-            storage.add_pin_source(
-                storage.sub_pool_names(), disagg_transfers_in_flight(self)
-            )
-
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
             "zmq_to_scheduler",
@@ -1665,6 +1657,17 @@ class Scheduler(
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
+            )
+
+    def maybe_init_disaggregation_pin_source(self):
+        # A role switch rebuilds PD queues, but the allocator keeps its pins.
+        if (
+            self.enable_unified_memory
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            storage = self.token_to_kv_pool_allocator.storage
+            storage.add_pin_source(
+                storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
 
     def init_overlap(self):

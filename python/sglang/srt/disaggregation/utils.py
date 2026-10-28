@@ -180,19 +180,15 @@ def disagg_transfers_in_flight(scheduler):
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
     """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
 
-        def prefill_busy() -> bool:
+    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
+    def busy() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             return bool(
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
             )
-
-        return prefill_busy
-
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-
-        def decode_busy() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
                 scheduler.disagg_decode_transfer_queue.queue
@@ -202,13 +198,12 @@ def disagg_transfers_in_flight(scheduler):
                     and decode_offload_manager.has_inflight_device_transfer()
                 )
             )
+        raise ValueError(
+            "disagg_transfers_in_flight: scheduler is not a PD node "
+            f"(mode={scheduler.disaggregation_mode})"
+        )
 
-        return decode_busy
-
-    raise ValueError(
-        "disagg_transfers_in_flight: scheduler is not a PD node "
-        f"(mode={scheduler.disaggregation_mode})"
-    )
+    return busy
 
 
 #########################
