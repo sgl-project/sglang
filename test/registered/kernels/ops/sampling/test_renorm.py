@@ -10,7 +10,8 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 if is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
@@ -122,6 +123,47 @@ def test_top_p_renorm_probs_peaked(batch_size, vocab_size, scale, ties):
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+@pytest.mark.skipif(not is_hip(), reason="checks the HIP Triton pivot search")
+@pytest.mark.parametrize("batch_size", [1, 48])
+@pytest.mark.parametrize("vocab_size", [4096, 154880])
+@pytest.mark.parametrize("scale", [0.0, 0.01, 1.0, 4.0])
+@pytest.mark.parametrize("top_p", [1e-7, 1e-5, 1e-4, 1e-2, 0.5, 0.95])
+def test_top_p_renorm_probs_support_and_sum(batch_size, vocab_size, scale, top_p):
+    """Rows sum to 1 and keep exactly the reference tokens.
+
+    A small top_p keeps a few tokens out of a cumulative mass near 1, so the
+    denominator must come from the kept tokens, not from a difference of two
+    sums near 1.
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * scale
+    probs = torch.softmax(logits, dim=-1)
+    top_ps = torch.full((batch_size,), top_p, device="cuda:0")
+
+    renorm_prob = top_p_renorm_prob(probs, top_ps)
+
+    torch.testing.assert_close(
+        renorm_prob.double().sum(dim=-1),
+        torch.ones(batch_size, dtype=torch.float64, device="cuda:0"),
+        rtol=0,
+        atol=1e-5,
+    )
+
+    sorted_prob = torch.sort(probs.double(), dim=-1).values
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    target = 1.0 - top_ps.double().unsqueeze(1)
+    cutoff = torch.searchsorted(cdf, target).clamp_(max=vocab_size - 1)
+    pivot = sorted_prob.gather(1, cutoff)
+    # Within fp32 rounding of a cdf step the kept set may differ by one token.
+    margin = torch.minimum(
+        (cdf.gather(1, cutoff) - target).abs(),
+        (cdf.gather(1, (cutoff - 1).clamp(min=0)) - target).abs(),
+    ).squeeze(1)
+    clear = margin > 1e-5
+    expected = probs.double() >= pivot
+    assert torch.equal((renorm_prob > 0)[clear], expected[clear])
 
 
 if __name__ == "__main__":

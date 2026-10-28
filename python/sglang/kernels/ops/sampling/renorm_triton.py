@@ -66,8 +66,8 @@ def _top_p_pass_kernel(
     top_ps_ptr,
     out_ptr,
     part_ptr,
+    tail_ptr,
     bounds_ptr,
-    below_ptr,
     num_rows,
     vocab_size,
     num_tiles,
@@ -85,8 +85,11 @@ def _top_p_pass_kernel(
     # the keys with FANOUT candidates per pass. Each launch is one pass over
     # (row, tile) programs. Passes 0..PASSES-1 store per-tile candidate masses in
     # part[pass, row, tile, :]; from pass 1 on, every program of a row first folds
-    # the previous pass's masses into the same next [lo, hi] (bounds) and
-    # mass(key < lo) (below). Pass PASSES writes the renormalized row.
+    # the previous pass's masses into the same next [lo, hi] (bounds). Pass
+    # PASSES writes the renormalized row.
+    # The denominator is summed from the kept probabilities (tail) rather than
+    # taken as total - mass(key < pivot): for small top_p both terms are near 1
+    # and the difference loses most of its precision.
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     j = tl.arange(0, FANOUT)
@@ -103,11 +106,9 @@ def _top_p_pass_kernel(
         if PASS == 1:
             lo = 0
             hi = ONE_KEY
-            below = 0.0
         else:
             lo = tl.load(bounds_ptr + ((PASS - 1) * num_rows + row) * 2)
             hi = tl.load(bounds_ptr + ((PASS - 1) * num_rows + row) * 2 + 1)
-            below = tl.load(below_ptr + (PASS - 1) * num_rows + row)
         step = (hi - lo + FANOUT) // FANOUT
         cand = tl.minimum(lo + (j + 1) * step - 1, hi)
         prev = part_ptr + (PASS - 1) * stride_pass + row * stride_row
@@ -123,36 +124,40 @@ def _top_p_pass_kernel(
             tl.min(tl.where(mass >= target, j, FANOUT), axis=0), FANOUT - 1
         )
         prev_cand = tl.sum(tl.where(j == first - 1, cand, 0), axis=0)
-        prev_mass = tl.sum(tl.where(j == first - 1, mass, 0.0), axis=0)
         hi = tl.sum(tl.where(j == first, cand, 0), axis=0)
         lo = tl.where(first == 0, lo, prev_cand + 1)
-        below = tl.where(first == 0, below, prev_mass)
         if tile == 0:
             tl.store(bounds_ptr + (PASS * num_rows + row) * 2, lo)
             tl.store(bounds_ptr + (PASS * num_rows + row) * 2 + 1, hi)
-            tl.store(below_ptr + PASS * num_rows + row, below)
 
     if PASS < PASSES:
         step = (hi - lo + FANOUT) // FANOUT
         cand = tl.minimum(lo + (j + 1) * step - 1, hi)
+        # Candidate j's interval starts at cand[j - 1] + 1 (lo for j = 0); the
+        # next fold makes that start the new lo.
+        cand_lo = tl.minimum(lo + j * step, hi + 1)
         mass_acc = tl.zeros([BLOCK, FANOUT], dtype=tl.float32)
+        if PASS == PASSES - 1:
+            tail_acc = tl.zeros([BLOCK, FANOUT], dtype=tl.float32)
         for start in range(0, CHUNK, BLOCK):
             idx = tile * CHUNK + start + offs
             p = tl.load(tile_ptr + start + offs, mask=idx < vocab_size, other=0.0)
             key = p.to(tl.int32, bitcast=True)
             mass_acc += tl.where(key[:, None] <= cand[None, :], p[:, None], 0.0)
+            if PASS == PASSES - 1:
+                tail_acc += tl.where(key[:, None] >= cand_lo[None, :], p[:, None], 0.0)
         out_part = part_ptr + PASS * stride_pass + row * stride_row + tile * FANOUT
         tl.store(out_part + j, tl.sum(mass_acc, axis=0))
+        if PASS == PASSES - 1:
+            out_tail = tail_ptr + row * stride_row + tile * FANOUT
+            tl.store(out_tail + j, tl.sum(tail_acc, axis=0))
     else:
-        # Pass 0's last candidate is ONE_KEY, so its mass is the row total.
-        first_part = part_ptr + row * stride_row
-        total = tl.sum(
-            tl.load(
-                first_part + t * FANOUT + FANOUT - 1, mask=t < num_tiles, other=0.0
-            ),
-            axis=0,
+        tail = tl.load(
+            tail_ptr + row * stride_row + t * FANOUT + first,
+            mask=t < num_tiles,
+            other=0.0,
         )
-        kept_sum = total - below
+        kept_sum = tl.sum(tail, axis=0)
         out_tile_ptr = out_ptr + row * vocab_size + tile * CHUNK
         for start in range(0, CHUNK, BLOCK):
             idx = tile * CHUNK + start + offs
@@ -242,11 +247,11 @@ def top_p_renorm_probs_triton(
         dtype=torch.float32,
         device=device,
     )
+    tail = torch.empty(
+        (batch_size, num_chunks, _TOP_P_FANOUT), dtype=torch.float32, device=device
+    )
     bounds = torch.empty(
         (_TOP_P_PASSES + 1, batch_size, 2), dtype=torch.int32, device=device
-    )
-    below = torch.empty(
-        (_TOP_P_PASSES + 1, batch_size), dtype=torch.float32, device=device
     )
     top_ps = top_ps.contiguous()
     num_tiles = triton.cdiv(vocab_size, _TOP_P_CHUNK)
@@ -257,8 +262,8 @@ def top_p_renorm_probs_triton(
             top_ps,
             out,
             part,
+            tail,
             bounds,
-            below,
             batch_size,
             vocab_size,
             num_tiles,
