@@ -85,7 +85,7 @@ class RoutedKVCache(KVCache):
     def id_spaces(self):
         raise NotImplementedError(
             "a unified pool's sub-pools name slots through its allocator's "
-            "tables: read them from the allocator or the runner's translator"
+            "tables: read them from the allocator or the runner's `RunnerIds`"
         )
 
     # -- the arena --

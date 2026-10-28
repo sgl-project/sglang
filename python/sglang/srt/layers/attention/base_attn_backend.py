@@ -130,11 +130,11 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
-    # The runner's KVIndexTranslator; backends that read through it set the
+    # The runner's RunnerIds; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
-    kv_index_translator = None
+    runner_ids = None
 
     @property
     def kv_layers(self) -> KVLayerRouter:

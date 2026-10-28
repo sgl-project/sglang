@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`KVLocPlan`: one iteration's KV ids, translated once.
+"""`IterationIds`: one iteration's KV ids, translated once.
 
 - the target and a fused draft get the same physical write ids, a
   pass-through reader (a private draft pool, a static pool) the virtual
@@ -29,7 +29,7 @@
 - a runner's own write buffer and a replayed graph's padded buffer are used
   as they are, the sliding-window ids naming the sink past the plan's.
 
-  python -m pytest test/registered/unit/mem_cache/test_kv_loc_plan.py -v
+  python -m pytest test/registered/unit/mem_cache/test_iteration_ids.py -v
 """
 
 import unittest
@@ -39,12 +39,12 @@ from unittest.mock import patch
 import msgspec
 import torch
 
-from sglang.srt.mem_cache import kv_index_translator
+from sglang.srt.mem_cache.kv.alloc import runner_ids
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import TokenSpan
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import TokenSpan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -147,9 +147,9 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-class TestKVLocPlan(CustomTestCase):
+class TestIterationIds(CustomTestCase):
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)
@@ -208,9 +208,9 @@ class TestKVLocPlan(CustomTestCase):
         # Every runner of one server shares the target's req_to_token.
         self.req_to_token = torch.zeros((4, 16), dtype=torch.int32)
         self.draft_pool = draft_pool
-        self.target = self._translator(kvcache)
-        self.fused_draft = self._translator(draft_pool)
-        self.private_draft = self._translator(_FakeKVCache(64))
+        self.target = self._runner_ids(kvcache)
+        self.fused_draft = self._runner_ids(draft_pool)
+        self.private_draft = self._runner_ids(_FakeKVCache(64))
 
         # Two requests, two pages each; the second page of each is this
         # iteration's write window (one token per request).
@@ -222,8 +222,8 @@ class TestKVLocPlan(CustomTestCase):
         self.seq_lens = torch.tensor([3, 3], dtype=torch.int64)
         self.window = self.req_to_token[self.rpi, 2:4].to(torch.int64).reshape(-1)
 
-    def _translator(self, pool):
-        return KVIndexTranslator(
+    def _runner_ids(self, pool):
+        return RunnerIds(
             req_to_token=self.req_to_token,
             token_to_kv_pool_allocator=self.allocator,
             token_to_kv_pool=pool,
@@ -313,7 +313,7 @@ class TestKVLocPlan(CustomTestCase):
     def test_one_iteration_translates_once(self):
         writes, builds = [], []
         real_write = self.allocator.translate_write_loc
-        real_build = kv_index_translator.build_kv_read_table
+        real_build = runner_ids.build_kv_read_table
 
         swa_writes = []
         real_swa_write = self.allocator.id_spaces()[_SWA].write
@@ -330,9 +330,9 @@ class TestKVLocPlan(CustomTestCase):
             builds.append(kwargs["v2p"])
             return real_build(**kwargs)
 
-        with patch.object(kv_index_translator, "build_kv_read_table", counting_build):
+        with patch.object(runner_ids, "build_kv_read_table", counting_build):
             # The spaces hold the allocator's translates from when the
-            # translator was built; count through them. The fused draft's full
+            # `RunnerIds` was built; count through them. The fused draft's full
             # space is the target's, so it counts there too.
             for reader, kind, write in (
                 (self.target, _FULL, counting_write),
@@ -411,15 +411,15 @@ class TestKVLocPlan(CustomTestCase):
 
             return wrapped
 
-        # A runner of rows no other translator here reads.
+        # A runner of rows no other runner_ids here reads.
         self.req_to_token = self.req_to_token.clone()
-        solo = self._translator(self.allocator.get_kvcache())
+        solo = self._runner_ids(self.allocator.get_kvcache())
         bs = int(self.rpi.numel())
         lens = torch.tensor([3, 2], dtype=torch.int64)
         indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
 
-        def pack(translator, plan, out, kind=_FULL):
-            return translator.pack_read_stream(
+        def pack(runner_ids, plan, out, kind=_FULL):
+            return runner_ids.pack_read_stream(
                 plan,
                 req_pool_indices=self.rpi,
                 seq_lens=lens,
@@ -430,17 +430,17 @@ class TestKVLocPlan(CustomTestCase):
 
         with (
             patch.object(
-                kv_index_translator,
+                runner_ids,
                 "build_kv_read_table_packed",
-                counting("packed", kv_index_translator.build_kv_read_table_packed),
+                counting("packed", runner_ids.build_kv_read_table_packed),
             ),
             patch.object(
-                kv_index_translator,
+                runner_ids,
                 "build_kv_read_table",
-                counting("table", kv_index_translator.build_kv_read_table),
+                counting("table", runner_ids.build_kv_read_table),
             ),
             patch.object(
-                kv_index_translator,
+                runner_ids,
                 "create_flashinfer_kv_indices_triton",
                 _HostStreamGather(),
             ),
@@ -486,7 +486,7 @@ class TestKVLocPlan(CustomTestCase):
 
             # Another stream reader of the same rows (a fused draft): still no
             # table -- each translates its own gather.
-            peer = self._translator(self.draft_pool)
+            peer = self._runner_ids(self.draft_pool)
             for seq_lens_cpu in (self.seq_lens.clone(), None):
                 both = solo.plan(
                     req_pool_indices=self.rpi,
@@ -513,7 +513,7 @@ class TestKVLocPlan(CustomTestCase):
         captured reader copies it rather than building again; an eager reader
         of the batch takes the batch's rows of it."""
         builds = []
-        real = kv_index_translator.build_kv_read_table
+        real = runner_ids.build_kv_read_table
 
         def counting(**kwargs):
             builds.append(kwargs["out"])
@@ -521,7 +521,7 @@ class TestKVLocPlan(CustomTestCase):
 
         bs = int(self.rpi.numel())
         captured = torch.full((bs + 1, 8), 7, dtype=torch.int32)
-        with patch.object(kv_index_translator, "build_kv_read_table", counting):
+        with patch.object(runner_ids, "build_kv_read_table", counting):
             plan = self._plan(read_extent=1)
             self.target.copy_page_table(plan, out=captured)
             self.assertEqual(len(builds), 1)
@@ -556,7 +556,7 @@ class TestKVLocPlan(CustomTestCase):
         """Without host lengths, a captured first reader narrower than a row
         has the table built in its own buffer, to its width."""
         builds = []
-        real = kv_index_translator.build_kv_read_table
+        real = runner_ids.build_kv_read_table
 
         def counting(**kwargs):
             builds.append(kwargs["out"])
@@ -565,7 +565,7 @@ class TestKVLocPlan(CustomTestCase):
         bs = int(self.rpi.numel())
         row_pages = -(-self.req_to_token.shape[1] // _PS)
         captured = torch.full((bs + 1, row_pages // 2), 7, dtype=torch.int32)
-        with patch.object(kv_index_translator, "build_kv_read_table", counting):
+        with patch.object(runner_ids, "build_kv_read_table", counting):
             plan = self.target.plan(
                 req_pool_indices=self.rpi,
                 seq_lens=self.seq_lens,
@@ -589,13 +589,13 @@ class TestKVLocPlan(CustomTestCase):
 
     def test_read_table_is_built_once_and_padded_by_copy(self):
         builds = []
-        real = kv_index_translator.build_kv_read_table
+        real = runner_ids.build_kv_read_table
 
         def counting(**kwargs):
             builds.append(kwargs["v2p"])
             return real(**kwargs)
 
-        with patch.object(kv_index_translator, "build_kv_read_table", counting):
+        with patch.object(runner_ids, "build_kv_read_table", counting):
             plan = self._plan(read_extent=1)
             table = plan.read_table()
             self.assertIs(plan.read_table(), table)
@@ -625,7 +625,7 @@ class TestKVLocPlan(CustomTestCase):
         self.assertTrue(plan.is_read_by(self.target))
         self.assertTrue(plan.is_read_by(self.fused_draft))
         self.assertFalse(plan.is_read_by(self.private_draft))
-        compact = KVIndexTranslator(
+        compact = RunnerIds(
             req_to_token=self.req_to_token.clone(),
             token_to_kv_pool_allocator=self.allocator,
             token_to_kv_pool=self.draft_pool,
@@ -651,7 +651,7 @@ class TestKVLocPlan(CustomTestCase):
     def test_a_compact_draft_reads_its_own_rows_over_the_shared_writes(self):
         plan = self._plan()
         compact_rows = self.req_to_token.clone()
-        compact = KVIndexTranslator(
+        compact = RunnerIds(
             req_to_token=compact_rows,
             token_to_kv_pool_allocator=self.allocator,
             token_to_kv_pool=self.draft_pool,
@@ -684,8 +684,8 @@ class TestKVLocPlan(CustomTestCase):
         first = slice(0, 1)
         fused = SimpleNamespace()
         plan.bind(fused, self.fused_draft, cols=first)
-        self.assertIs(fused.kv_loc_plan, plan)
-        self.assertEqual(fused.kv_loc_cols, first)
+        self.assertIs(fused.iteration_ids, plan)
+        self.assertEqual(fused.iteration_cols, first)
         self.assertTrue(
             torch.equal(
                 fused.out_cache_loc,
@@ -715,11 +715,11 @@ class TestKVLocPlan(CustomTestCase):
             dcp_enabled=True, dcp_size=2, dcp_rank=1, attn_dcp_size=1
         )
         with (
-            patch.object(kv_index_translator, "_is_npu", True),
-            patch.object(kv_index_translator, "get_parallel", return_value=parallel),
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(runner_ids, "get_parallel", return_value=parallel),
         ):
             target, draft = (
-                KVIndexTranslator(
+                RunnerIds(
                     req_to_token=self.req_to_token,
                     token_to_kv_pool_allocator=self.allocator,
                     token_to_kv_pool=_FakeKVCache(64),
@@ -758,10 +758,10 @@ class TestKVLocPlan(CustomTestCase):
         pool = SWAKVPool.__new__(SWAKVPool)
         pool.full_to_swa_index_mapping = torch.arange(100, 132)
         with (
-            patch.object(kv_index_translator, "_is_npu", True),
-            patch.object(kv_index_translator, "get_parallel", return_value=parallel),
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(runner_ids, "get_parallel", return_value=parallel),
         ):
-            target = KVIndexTranslator(
+            target = RunnerIds(
                 req_to_token=self.req_to_token,
                 token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
                 token_to_kv_pool=pool,
@@ -782,7 +782,7 @@ class TestKVLocPlan(CustomTestCase):
         )
 
     def test_runner_slots_are_used_as_they_are(self):
-        for translator, writes_swa in (
+        for runner_ids, writes_swa in (
             (self.target, True),
             (self.private_draft, False),
         ):
@@ -793,12 +793,12 @@ class TestKVLocPlan(CustomTestCase):
                 seq_lens_cpu=self.seq_lens.clone(),
                 out_cache_loc=slots,
             )
-            translator.bind_runner_slots(batch)
+            runner_ids.bind_runner_slots(batch)
             # Kept by address: a captured graph writes this buffer on replay.
             self.assertIs(batch.out_cache_loc, slots)
             self.assertIsNone(batch.out_cache_loc_virtual)
             self.assertTrue(batch.out_cache_loc_is_physical)
-            swa = translator.write_ids(batch, _SWA)
+            swa = runner_ids.write_ids(batch, _SWA)
             if writes_swa:
                 # The sink in the sliding-window sub-pool too.
                 self.assertTrue(torch.equal(swa, torch.zeros_like(slots)))
@@ -812,7 +812,7 @@ class TestKVLocPlan(CustomTestCase):
         slots[:n].copy_(plan.write_physical)
         batch = SimpleNamespace()
         plan.bind_replay(batch, self.target, slots=slots)
-        self.assertIs(batch.kv_loc_plan, plan)
+        self.assertIs(batch.iteration_ids, plan)
         self.assertIs(batch.out_cache_loc, slots)
         self.assertIsNone(batch.out_cache_loc_virtual)
         swa = self.target.write_ids(batch, _SWA)

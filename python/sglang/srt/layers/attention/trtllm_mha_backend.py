@@ -337,10 +337,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
-        if (
-            self._swa_kv_pool is not None
-            and not self.kv_index_translator.is_translating
-        ):
+        if self._swa_kv_pool is not None and not self.runner_ids.is_translating:
             self._swa_full_to_swa_mapping = self._swa_kv_pool.full_to_swa_index_mapping
             assert self._swa_full_to_swa_mapping is not None, (
                 "SWA pool must register full_to_swa_index_mapping before "
@@ -1015,7 +1012,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
-        unified = self.kv_index_translator.is_translating
+        unified = self.runner_ids.is_translating
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -1143,7 +1140,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
-        if self.kv_index_translator.is_translating:
+        if self.runner_ids.is_translating:
             # Unified pool: refill this mode's own page table (this runs
             # out-of-graph on BOTH capture and every replay-prep; the recorded
             # fused kernel skips its page-table writes so the graph reads the
@@ -1152,12 +1149,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # The kernels bound their page-table reads by `cache_seqlens_int32`
             # (the fused metadata call above wrote it); the plan's table
             # reaches that far, a target verify's draft tail included.
-            self.kv_index_translator.copy_page_table(
-                forward_batch.kv_loc_plan, out=metadata.page_table[:bs]
+            self.runner_ids.copy_page_table(
+                forward_batch.iteration_ids, out=metadata.page_table[:bs]
             )
             if metadata.swa_page_table is not None:
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan,
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids,
                     out=metadata.swa_page_table[:bs],
                     kind=IdSpaceKind.SLIDING_WINDOW,
                 )
@@ -1173,7 +1170,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                        self.kv_index_translator.write_ids(
+                        self.runner_ids.write_ids(
                             forward_batch, IdSpaceKind.SLIDING_WINDOW
                         )
                     )
@@ -1224,9 +1221,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.write_ids(
-                        forward_batch, IdSpaceKind.SLIDING_WINDOW
-                    )
+                    self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -1342,20 +1337,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if self.use_fmha_v2 and not forward_batch.forward_mode.is_draft_extend_v2():
                 self._init_fmha_v2_batch_pages(metadata, forward_batch)
 
-        kv_view = self.kv_index_translator.read_table(
-            forward_batch.kv_loc_plan, rows=forward_batch.batch_size
+        kv_view = self.runner_ids.read_table(
+            forward_batch.iteration_ids, rows=forward_batch.batch_size
         )
         if kv_view.is_translated:
             # No fill kernel: the kernels bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
             metadata.swa_page_table = (
-                self.kv_index_translator.read_table(
-                    forward_batch.kv_loc_plan,
+                self.runner_ids.read_table(
+                    forward_batch.iteration_ids,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                     rows=forward_batch.batch_size,
                 ).ids
-                if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
-                is not None
+                if self.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None
                 else None
             )
             # XQA and fmha_v2 take a page table's row length from its width and
@@ -1395,7 +1389,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = self.kv_index_translator.write_ids(
+            metadata.swa_out_cache_loc = self.runner_ids.write_ids(
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 

@@ -674,14 +674,14 @@ class DeepseekMHAForwardMixin:
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             # Read door: the pool never translates, so the production site does.
-            # Only the FlashAttention/FlashInfer backends bind a translator; the
+            # Only the FlashAttention/FlashInfer backends bind a `RunnerIds`; the
             # base class documents its None default as "no translate", and the DSA
             # backend the EAGLE draft model runs on keeps that default. With no
-            # translator the ids never went VIRTUAL, so there is nothing to
+            # `RunnerIds` the ids never went VIRTUAL, so there is nothing to
             # collapse.
-            translator = get_attn_backend().kv_index_translator
-            if translator is not None:
-                kv_indices = translator.translate_dcp_read_ids(kv_indices)
+            runner_ids = get_attn_backend().runner_ids
+            if runner_ids is not None:
+                kv_indices = runner_ids.translate_dcp_read_ids(kv_indices)
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)

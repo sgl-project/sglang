@@ -44,7 +44,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -416,7 +416,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -535,7 +535,7 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
@@ -2307,8 +2307,8 @@ class AiterAttnBackend(AttentionBackend):
                         req_pool_indices=forward_batch.req_pool_indices,
                         paged_kernel_lens=forward_batch.seq_lens,
                         paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                        translator=self.kv_index_translator,
-                        plan=forward_batch.kv_loc_plan,
+                        runner_ids=self.runner_ids,
+                        plan=forward_batch.iteration_ids,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -2555,7 +2555,7 @@ class AiterAttnBackend(AttentionBackend):
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
-                    plan=forward_batch.kv_loc_plan,
+                    plan=forward_batch.iteration_ids,
                 )
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -2596,7 +2596,7 @@ class AiterAttnBackend(AttentionBackend):
                     prefix_lens,
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
-                    plan=forward_batch.kv_loc_plan,
+                    plan=forward_batch.iteration_ids,
                 )
 
                 if self.use_sliding_window_kv_pool:
@@ -2684,10 +2684,10 @@ class AiterAttnBackend(AttentionBackend):
         # The planner leaves the compacted ids WIDENED (see its docstring), and
         # mla_gluon indexes the pool directly, so collapse them once per forward
         # -- the same contract flashinfer_mla_backend.py follows.
-        translator = self.kv_index_translator
-        if total_local_len > 0 and translator.needs_read_translate:
+        runner_ids = self.runner_ids
+        if total_local_len > 0 and runner_ids.needs_read_translate:
             valid = kv_indices[:total_local_len]
-            valid.copy_(translator.translate_dcp_read_ids(valid))
+            valid.copy_(runner_ids.translate_dcp_read_ids(valid))
 
     def _build_dcp_local_kv_lens(
         self,
@@ -2735,8 +2735,8 @@ class AiterAttnBackend(AttentionBackend):
 
         # Write each request's row 0 in place: the row stride handed to the
         # kernel spans that request's whole block of q_len rows.
-        translator = self.kv_index_translator
-        v2p = translator.full_v2p_table
+        runner_ids = self.runner_ids
+        v2p = runner_ids.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (bs, triton.cdiv(num_cols, _DCP_VERIFY_TABLE_COLS_PER_BLOCK))
         ](
@@ -4910,7 +4910,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -4926,7 +4926,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -4940,7 +4940,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         kv_start_idx = None
         kv_indptr = self.kv_indptr
@@ -4989,7 +4989,7 @@ class AiterIndicesUpdaterPrefill:
                     req_pool_indices=req_pool_indices,
                     paged_kernel_lens=paged_kernel_lens,
                     paged_kernel_lens_sum=paged_kernel_lens_sum,
-                    translator=self.kv_index_translator,
+                    runner_ids=self.runner_ids,
                     plan=plan,
                 )
             )
@@ -5004,7 +5004,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -5024,7 +5024,7 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -5039,7 +5039,7 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         bs = len(req_pool_indices)
 
@@ -5073,7 +5073,7 @@ class AiterMlaIndicesUpdaterPrefill:
                     req_pool_indices=req_pool_indices,
                     paged_kernel_lens=kv_lens,
                     paged_kernel_lens_sum=kv_lens_sum,
-                    translator=self.kv_index_translator,
+                    runner_ids=self.runner_ids,
                     plan=plan,
                 )
             )
@@ -5128,7 +5128,7 @@ class AiterMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
@@ -5144,8 +5144,8 @@ class AiterMultiStepDraftBackend:
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
             context_len=self.max_context_len,
         )
-        src = self.kv_index_translator.read_source(
-            forward_batch.kv_loc_plan,
+        src = self.runner_ids.read_source(
+            forward_batch.iteration_ids,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
         )

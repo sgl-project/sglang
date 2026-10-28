@@ -90,7 +90,7 @@ def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
         forward_metadata=SimpleNamespace(page_table_1_flattened=page_table)
     )
     outer = SimpleNamespace(
-        full_attn_backend=child, forward_metadata=None, kv_index_translator=None
+        full_attn_backend=child, forward_metadata=None, runner_ids=None
     )
     read_indices = []
 

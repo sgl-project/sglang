@@ -441,7 +441,7 @@ class TestFusedMLAHost(unittest.TestCase):
     host/draft parts within every slot."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)
@@ -506,7 +506,7 @@ class TestFusedMLAHost(unittest.TestCase):
         the mamba allocator's full-side v2p, as on the SWA host; a passthrough
         here would write raw virtual ids into the views."""
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
         pool = self._pool()
 
@@ -534,16 +534,16 @@ class TestFusedMLAHost(unittest.TestCase):
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        translator = KVIndexTranslator(
+        runner_ids = RunnerIds(
             req_to_token=torch.zeros((2, 8), dtype=torch.int32),
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=dp,
             page_size=self.PS,
             device=_DEV,
         )
-        self.assertTrue(translator.is_translating)
+        self.assertTrue(runner_ids.is_translating)
         self.assertIs(
-            translator.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
+            runner_ids.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
         )
 
     def test_draft_pool_binds_over_the_mla_host(self):

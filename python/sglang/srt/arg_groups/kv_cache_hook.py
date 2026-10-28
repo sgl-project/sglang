@@ -733,7 +733,7 @@ def handle_page_major_kv_layout(server_args: Any):
         "--enable-page-major-kv-layout."
     )
     model_config = model_config_of(server_args)
-    # Allow-list. Every backend below reads through the translator, so what
+    # Allow-list. Every backend below reads through the `RunnerIds`, so what
     # gates one is only whether its kernels address the per-layer views by
     # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64

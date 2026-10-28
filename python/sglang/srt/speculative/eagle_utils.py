@@ -91,7 +91,7 @@ def draft_step_writes(
     iteration's write window, while a per-step backend derives its write
     targets (the window ids included) from the batch. A no-op unless
     ``enabled`` (the step's backend writes a window sub-pool)."""
-    loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
+    loc, cols = forward_batch.out_cache_loc, forward_batch.iteration_cols
     if loc is None or not enabled:
         yield
         return
@@ -107,11 +107,11 @@ def draft_step_writes(
     forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
         loc, forward_batch.batch_size, topk, num_steps
     )[step].contiguous()
-    forward_batch.kv_loc_cols = step_cols
+    forward_batch.iteration_cols = step_cols
     try:
         yield
     finally:
-        forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
+        forward_batch.out_cache_loc, forward_batch.iteration_cols = loc, cols
 
 
 def _eagle_prefill_tail_tokens(
@@ -428,7 +428,7 @@ def eagle_prepare_for_verify(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
-        kv_loc_plan=verify_input.kv_loc_plan,
+        iteration_ids=verify_input.iteration_ids,
     )
 
     # Run attention backend plan and cuda graph preparation

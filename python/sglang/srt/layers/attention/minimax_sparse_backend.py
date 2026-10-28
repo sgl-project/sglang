@@ -1867,7 +1867,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
-        self.kv_index_translator = dense_backend.kv_index_translator
+        self.runner_ids = dense_backend.runner_ids
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend

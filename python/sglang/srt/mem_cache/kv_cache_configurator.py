@@ -1154,7 +1154,7 @@ class KVCacheConfigurator:
             draft_backend = get_spec().speculative_draft_attention_backend
         # Under DCP each rank's host rows hold only its share of the widened
         # id space, while the draft never joins the DCP group and needs every
-        # token; its translator also leaves the read ids widened for a DCP
+        # token; its `RunnerIds` also leaves the read ids widened for a DCP
         # index kernel that a draft's backend never runs.
         if get_parallel().attn_dcp_size > 1:
             return FusedDraftDecision(

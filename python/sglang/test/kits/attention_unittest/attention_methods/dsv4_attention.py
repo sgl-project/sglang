@@ -23,7 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -427,7 +427,7 @@ class MockDSV4ModelRunner:
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
         )
-        self.kv_index_translator = KVIndexTranslator(
+        self.runner_ids = RunnerIds(
             req_to_token=self.req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -677,7 +677,7 @@ def _make_forward_batch(
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
     # Production batches take their KV ids from a plan (`init_new`).
-    runner.kv_index_translator.bind_own_plan(batch)
+    runner.runner_ids.bind_own_plan(batch)
     # extend_* fields are only populated for extend-shaped modes. DECODE leaves
     # them at their defaults; the flash_mla path reads metadata directly from
     # DSV4AttnMetadata so the extend fields are unused for the compress_ratio=0

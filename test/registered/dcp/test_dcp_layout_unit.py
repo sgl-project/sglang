@@ -66,7 +66,7 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def _owner_rule(self, kv, dcp_size, dcp_rank):
         # Selection only: the filters leave ids WIDENED and the collapse now
-        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        # happens once, in RunnerIds.translate_dcp_read_ids.
         return kv[kv % dcp_size == dcp_rank]
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):

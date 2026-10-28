@@ -426,7 +426,7 @@ class TestFactoryViews(unittest.TestCase):
     the rebind must emit BOTH write locs."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `RunnerIds.__init__` asks the parallel context for
         # `attn_dcp_size`, which is a quotient of the configured leaves and is
         # computed at publish. A bare process has none, so state one the way a
         # real process does.
@@ -507,7 +507,7 @@ class TestFactoryViews(unittest.TestCase):
         out_cache_loc to FULL-side physical ids and derives the SWA write ids
         from the virtual window -- both checked against the v2p tables over
         the VIRTUAL ids."""
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.runtime_context import get_parallel
 
         b = self._bundle()
@@ -529,7 +529,7 @@ class TestFactoryViews(unittest.TestCase):
         # published in a unit test, so state both and hold the scope across
         # every call that translates.
         with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
-            source = KVIndexTranslator(
+            source = RunnerIds(
                 req_to_token=torch.zeros((2, 8), dtype=torch.int64),
                 token_to_kv_pool_allocator=alloc,
                 token_to_kv_pool=b.token_to_kv_pool,

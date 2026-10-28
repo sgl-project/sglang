@@ -166,7 +166,7 @@ class XPUAttentionBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -640,11 +640,11 @@ class XPUAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             # flash_attn_with_kvcache requires int32 page tables; the SWA index
             # mapping is int64, so cast (matches flashattention_backend.py).
-            metadata.swa_page_table = self.kv_index_translator.ids_in(
+            metadata.swa_page_table = self.runner_ids.ids_in(
                 IdSpaceKind.SLIDING_WINDOW, metadata.page_table
             ).to(torch.int32)
             if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = self.kv_index_translator.ids_in(
+                metadata.swa_out_cache_loc = self.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
 
@@ -818,7 +818,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.kv_index_translator.ids_in(
+                    page_table = self.runner_ids.ids_in(
                         IdSpaceKind.SLIDING_WINDOW, metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
@@ -1528,7 +1528,7 @@ class XPUAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = self.kv_index_translator.ids_in(
+                        page_table = self.runner_ids.ids_in(
                             IdSpaceKind.SLIDING_WINDOW, metadata.page_table
                         ).to(torch.int32)
 
@@ -1828,7 +1828,7 @@ class XPUAttentionBackend(AttentionBackend):
             n = forward_batch.out_cache_loc.shape[0]
             swa_out_cache_loc[n:].zero_()
             swa_out_cache_loc[:n].copy_(
-                self.kv_index_translator.ids_in(
+                self.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
             )

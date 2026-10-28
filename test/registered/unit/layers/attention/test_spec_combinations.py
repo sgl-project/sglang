@@ -69,7 +69,7 @@ def _runner(
     """A runner with sliding-window layers on translated storage."""
     return SimpleNamespace(
         sliding_window_size=128,
-        kv_index_translator=SimpleNamespace(is_translating=True),
+        runner_ids=SimpleNamespace(is_translating=True),
         is_draft_worker=draft,
         spec_algorithm=algorithm,
         draft_attention_backend=None,

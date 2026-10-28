@@ -31,8 +31,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
@@ -51,7 +51,7 @@ _DTYPE = torch.float16
 
 
 def _plain_translator():
-    return KVIndexTranslator(
+    return RunnerIds(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
         token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
         token_to_kv_pool=SimpleNamespace(

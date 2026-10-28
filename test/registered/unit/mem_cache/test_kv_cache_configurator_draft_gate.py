@@ -132,15 +132,13 @@ def _bare(cls, **attrs):
 def _multi_layer_worker(pools_and_windows, *, front):
     """A multi-layer MTP worker whose draft runners hold these (pool, window)
     pairs and whose draft extend is widened by `front` rows."""
-    # A draft runner's translator calls its pool fused when the pool's writes
+    # A draft runner's `RunnerIds` calls its pool fused when the pool's writes
     # take the shared allocator's physical ids.
     runners = [
         SimpleNamespace(
             token_to_kv_pool=pool,
             sliding_window_size=window,
-            kv_index_translator=SimpleNamespace(
-                is_fused_draft=pool.requires_physical_write_loc
-            ),
+            runner_ids=SimpleNamespace(is_fused_draft=pool.requires_physical_write_loc),
         )
         for pool, window in pools_and_windows
     ]
@@ -165,7 +163,7 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
 
 class TestDraftBindingDispatch(CustomTestCase):
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)

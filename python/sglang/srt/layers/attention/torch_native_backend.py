@@ -25,7 +25,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.use_sliding_window_kv_pool = self.token_to_kv_pool.layer_router.routes_to(
             IdSpaceKind.SLIDING_WINDOW
         )
@@ -50,7 +50,7 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            self.swa_out_cache_loc = self.kv_index_translator.ids_in(
+            self.swa_out_cache_loc = self.runner_ids.ids_in(
                 IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
             )
         else:

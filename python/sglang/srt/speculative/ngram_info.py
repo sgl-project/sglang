@@ -5,8 +5,8 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -64,13 +64,13 @@ class NgramVerifyInput(SpecInput):
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        translator: KVIndexTranslator,
-        plan: KVLocPlan,
+        runner_ids: RunnerIds,
+        plan: IterationIds,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         window: Optional[WindowRead] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
-        is widened here; the translator packs the read ids straight into
+        is widened here; the `RunnerIds` packs the read ids straight into
         ``kv_indices``. Under a ``window`` read, the mask carries the window."""
         bs = req_pool_indices.numel()
 
@@ -87,7 +87,7 @@ class NgramVerifyInput(SpecInput):
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * bs
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=self.device)
 
-        translator.pack_read_stream(
+        runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
             seq_lens=paged_kernel_lens,

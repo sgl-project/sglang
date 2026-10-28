@@ -881,7 +881,7 @@ class Dots3AttentionMLA(nn.Module):
                     )
                 else:
                     out_cache_loc = forward_batch.out_cache_loc
-                swa_loc = backend.kv_index_translator.ids_in(
+                swa_loc = backend.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
         return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)

@@ -18,9 +18,9 @@ from sglang.srt.layers.attention import trtllm_mha_backend as tm
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_FULL,
     LAYER_WINDOW,
@@ -147,7 +147,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             req_to_token_pool=req,
             page_size=1,
         )
-        reader = KVIndexTranslator(
+        reader = RunnerIds(
             req_to_token=req.req_to_token,
             token_to_kv_pool_allocator=allocator,
             token_to_kv_pool=bound.token_to_kv_pool,
@@ -161,7 +161,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             model_config=SimpleNamespace(get_max_num_attention_heads=lambda: 1),
             server_args=self.args,
             sliding_window_size=window,
-            kv_index_translator=reader,
+            runner_ids=reader,
             token_to_kv_pool=bound.token_to_kv_pool,
             page_size=1,
         )
@@ -207,7 +207,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             seq_lens_cpu=None,
             req_pool_indices=rows,
             positions=seq_lens.to(torch.int64),
-            kv_loc_plan=plan,
+            iteration_ids=plan,
             spec_info=SimpleNamespace(
                 window_kv_indices=None,
                 window_kv_indptr=None,
@@ -286,7 +286,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         updater.data_type = updater.q_data_type = torch.bfloat16
         updater.sliding_window_size = window
         updater.attn_backend = SimpleNamespace(
-            kv_index_translator=reader, dq_paged_kernel_lens=None
+            runner_ids=reader, dq_paged_kernel_lens=None
         )
         updater.kv_indptr = [
             torch.zeros(2, dtype=torch.int32, device="cuda") for _ in range(2)
@@ -472,7 +472,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             read_extent=0,
         )
         backend = object.__new__(tm.TRTLLMHAAttnBackend)
-        backend.kv_index_translator = reader
+        backend.runner_ids = reader
         backend.use_sliding_window_kv_pool = False
         metadata = SimpleNamespace(
             page_table=torch.full((1, 512), -1, dtype=torch.int32, device="cuda"),
@@ -483,7 +483,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             batch_size=1,
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             spec_info=None,
-            kv_loc_plan=plan,
+            iteration_ids=plan,
             out_cache_loc=None,
         )
         backend.init_forward_metadata_out_graph(batch, in_capture=False)
