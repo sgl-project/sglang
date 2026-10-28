@@ -691,7 +691,6 @@ def test_legacy_mxfp8_stays_native_with_sdk_installed(
     qc = type(kind, (), {"use_offline_qk_rotation": offline})()
     impl = build(num_heads=6, quant_config=qc)
     assert impl._quant_scheme == "MXFP8" and impl._sd_executor is None
-    assert impl.supports_pipelined_attention
     query = torch.randn(128, 6, 64)
     original = query.clone()
     if packed:
@@ -889,16 +888,34 @@ def test_early_config_parsing_supports_all_cli_forms(monkeypatch, form):
     loader.assert_called_once()
 
 
-def test_h3_sd_provider_disables_pipeline(monkeypatch):
+def test_h3_npu_pipeline_falls_back(adapter, monkeypatch):
     from sglang.multimodal_gen import envs
+    from sglang.multimodal_gen.runtime import platforms
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+        ipc_a2a_multi,
+    )
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
         _minimax_h3_pipelined_dense_attention,
     )
 
+    _, sd, build = adapter
     monkeypatch.setattr(envs, "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 2)
+    monkeypatch.setattr(platforms, "current_platform", NPUPlatformBase())
+    group = object()
+    monkeypatch.setattr(
+        parallel_state, "get_sp_group", lambda: SimpleNamespace(ulysses_group=group)
+    )
+    monkeypatch.setattr(
+        ipc_a2a_multi, "IPC_A2A_MULTI", ipc_a2a_multi.IpcA2AMultiState()
+    )
+    ready = Mock(wraps=ipc_a2a_multi.ipc_a2a_multi_ready)
+    monkeypatch.setattr(ipc_a2a_multi, "ipc_a2a_multi_ready", ready)
+    cuda_capture = Mock(side_effect=AssertionError("NPU must not query CUDA"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", cuda_capture)
     attention = SimpleNamespace(
         _attention_backend_enum=AttentionBackendEnum.FA,
-        _attention_impl=SimpleNamespace(supports_pipelined_attention=False),
+        _attention_impl=build(),
     )
     query = torch.zeros(4, 4, 64)
     assert (
@@ -913,6 +930,9 @@ def test_h3_sd_provider_disables_pipeline(monkeypatch):
         )
         is None
     )
+    ready.assert_called_once_with(group, enabled=True)
+    cuda_capture.assert_not_called()
+    sd.assert_not_called()
 
 
 # Startup integration: exercise the real ServerArgs lifecycle without loading models.

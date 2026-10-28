@@ -300,10 +300,6 @@ class AscendFAImpl(AttentionImpl):
             return {}, None
         return server_args.attention_backend_config or {}, server_args
 
-    @property
-    def supports_pipelined_attention(self) -> bool:
-        return self._sd_executor is None
-
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
         if head_size in cls._rot_matrices:
