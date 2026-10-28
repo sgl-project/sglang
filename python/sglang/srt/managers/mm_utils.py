@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
@@ -42,6 +41,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
@@ -897,64 +897,33 @@ def data_hash(data) -> int:
 
 
 def tensor_hash(tensor_list) -> int:
-    """
-    hash a tensor or a tensor list
-    """
-    tensor = tensor_list
-    if isinstance(tensor_list, list):
-        tensor_list = flatten_nested_list(tensor_list)
-        tensors = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        # GPU path: concat + triton hash (unchanged)
-        if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-            tensor = torch.concat(tensors)
-            return gpu_tensor_hash(tensor.cuda())
-        # CPU path: hash each tensor incrementally without concat
-        hasher = hashlib.sha256()
-        for t in tensors:
-            t = t.detach().cpu().contiguous()
-            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-
-    # Single tensor
-    if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().cpu().contiguous()
-    hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    """Compatibility scalar; cache identities must use hash_feature_digest."""
+    return int.from_bytes(structured_digest(tensor_list)[:8], "big")
 
 
-def hash_feature(f):
-    if isinstance(f, list):
-        # A list may mix ShmPointerMMData and plain tensors, since wrapping
-        # falls back to inline transport per element when shm allocation fails.
-        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
-            return tensor_hash(
-                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
-            )
-        if len(f) > 0 and isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        hasher = hashlib.sha256()
-        hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-    elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    elif isinstance(f, ShmPointerMMData):
-        if f.precomputed_hash is not None:
-            return f.precomputed_hash
-        return tensor_hash([f.tensor])
-    return data_hash(f)
+def _identity_data(value):
+    if isinstance(value, ShmPointerMMData):
+        # Reading must not consume the handle needed by the encoder later.
+        return value.tensor
+    if isinstance(value, CudaIpcTensorTransportProxy):
+        return value.reconstruct_on_target_device(torch.cuda.current_device())
+    if isinstance(value, list):
+        return [_identity_data(part) for part in value]
+    if isinstance(value, tuple):
+        return tuple(_identity_data(part) for part in value)
+    if isinstance(value, dict):
+        return {key: _identity_data(part) for key, part in value.items()}
+    return value
+
+
+def hash_feature_digest(value) -> bytes:
+    """Hash actual transport contents, never its address or a scalar hint."""
+    return structured_digest(_identity_data(value))
+
+
+def hash_feature(value) -> int:
+    """Legacy scalar hash. Embedding and prefix caches use the full digest."""
+    return int.from_bytes(hash_feature_digest(value)[:8], "big")
 
 
 def extend_mrope_positions_for_retracted_request(
@@ -1177,7 +1146,7 @@ def _try_simple_split(item, num_items, expanded_mm_items):
         new_item.model_specific_data = _split_model_data_for_item(
             item.model_specific_data, i, num_items, patch_slices, total_num_patches
         )
-        new_item.hash = None
+        new_item.clear_identity()
         expanded_mm_items.append(new_item)
     return True
 
@@ -1259,7 +1228,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_items,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():
@@ -1345,7 +1314,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_videos,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
             else:
                 if not _try_simple_split(item, num_items, expanded_mm_items):

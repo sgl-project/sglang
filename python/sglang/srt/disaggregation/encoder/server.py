@@ -976,7 +976,7 @@ class MMEncoder:
 
     def _calculate_hashes_from_features(
         self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
-    ) -> List[int]:
+    ) -> List[bytes]:
         """CPU Task: Compute hashes based on processed feature patches."""
         preprocessed_items = (
             get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
@@ -990,7 +990,7 @@ class MMEncoder:
             hashes = []
             for item in preprocessed_items:
                 item.set_pad_value()
-                hashes.append(item.hash)
+                hashes.append(item.cache_key)
             return hashes
 
         hashes = []
@@ -998,7 +998,7 @@ class MMEncoder:
             for feature in mm_feature:
                 tmp_item = MultimodalDataItem(modality=modality, feature=feature)
                 tmp_item.set_pad_value()
-                hashes.append(tmp_item.hash)
+                hashes.append(tmp_item.cache_key)
             return hashes
 
         offset = 0
@@ -1008,7 +1008,7 @@ class MMEncoder:
             feature_slice = mm_feature[offset : offset + num_patches]
             tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
             tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
+            hashes.append(tmp_item.cache_key)
             offset += num_patches
         return hashes
 
@@ -1201,14 +1201,13 @@ class MMEncoder:
                             f"count {n} for req {req['req_id']}; hashes must be "
                             f"grid-space (1 per encoder grid entry)."
                         )
-                mm_hashes = [h for hashes in per_req_hashes for h in hashes]
             if self.rank == 0:
-                if mm_hashes is None:
-                    mm_hashes = self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality, mm_inputs
-                    )
+                # Caller hints cannot replace the actual encoder-input identity.
+                mm_hashes = self._calculate_hashes_from_features(
+                    mm_feature, grid_thw, modality, mm_inputs
+                )
                 # Embedding stores use string cache keys.
-                str_mm_hashes = [str(h) for h in mm_hashes]
+                str_mm_hashes = [h.hex() for h in mm_hashes]
 
         return EncodeContext(
             req_id=requests[0]["req_id"],
@@ -1749,7 +1748,7 @@ class MMEncoder:
             if use_mm_cache:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
-                mm_hashes = [mm_item.hash for mm_item in mm_items]
+                mm_hashes = [mm_item.cache_key for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
                     mm_cache = self.mm_cache.get(mm_hashes)

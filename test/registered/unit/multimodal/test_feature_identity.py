@@ -1,0 +1,180 @@
+"""Default VLM identity contract, independent of any model-specific opt-in."""
+
+import itertools
+import pickle
+import unittest
+from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
+    _insert,
+    _key,
+    _tree_core,
+)
+from unittest.mock import patch
+
+import msgspec
+import torch
+
+from sglang.srt.managers import mm_schedule
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items, hash_feature_digest
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+)
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+def _item(value, **kwargs):
+    return MultimodalDataItem(
+        modality=Modality.IMAGE, feature=value, offsets=[(0, 0)], **kwargs
+    )
+
+
+class TestFeatureIdentity(CustomTestCase):
+    def test_structure_is_not_flattened(self):
+        x = torch.arange(16, dtype=torch.uint8)
+        pairs = [
+            (x, x.reshape(4, 4)),
+            (x, x.view(torch.int32)),
+            ([x[:4], x[4:]], [x[:8], x[8:]]),
+            ([x], [[x]]),
+            ([x], (x,)),
+            (
+                torch.tensor([42], dtype=torch.uint8),
+                torch.tensor([42, 0, 0, 0], dtype=torch.uint8),
+            ),
+        ]
+        for a, b in pairs:
+            with self.subTest(a=type(a), b=type(b)):
+                self.assertNotEqual(hash_feature_digest(a), hash_feature_digest(b))
+        self.assertEqual(
+            structured_digest(x.reshape(4, 4).T),
+            structured_digest(x.reshape(4, 4).T.contiguous()),
+        )
+
+    def test_content_not_caller_hash_is_authoritative(self):
+        a, b = _item(torch.zeros(8), hash=7), _item(torch.ones(8), hash=7)
+        self.assertNotEqual(a.cache_key, b.cache_key)
+        self.assertNotEqual(a.padding_values(), b.padding_values())
+        a.set_hash(17)
+        b.set_hash(17)
+        self.assertNotEqual(a.cache_key, b.cache_key)
+
+    def test_modality_format_geometry_and_processor_are_scoped(self):
+        keys = []
+        for modality, fmt, grid, namespace in itertools.product(
+            Modality.all(),
+            (MultimodalInputFormat.NORMAL, MultimodalInputFormat.PRECOMPUTED_EMBEDDING),
+            ([1, 2, 4], [1, 4, 2]),
+            ("11", "22"),
+        ):
+            item = MultimodalDataItem(
+                modality=modality,
+                feature=torch.ones(8),
+                format=fmt,
+                model_specific_data={"image_grid_thw": torch.tensor([grid])},
+            )
+            item.bind_processor_fingerprint("sha256:" + namespace * 32)
+            keys.append(item.cache_key)
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_full_identity_and_combined_keys(self):
+        a, b = _item(None), _item(None)
+        a.set_identity(b"samehead" + b"A" * 24)
+        b.set_identity(b"samehead" + b"B" * 24)
+        self.assertEqual(a.hash, b.hash)  # Fault injection, not a digest collision.
+        cache = MultiModalStaticCache(4096)
+        cache.set(a.cache_key, EmbeddingResult(embedding=torch.tensor([17.0])))
+        self.assertIsNone(cache.get_single(b.cache_key))
+        cache.set(
+            cache.combine_hashes([a.cache_key]),
+            EmbeddingResult(embedding=torch.tensor([17.0])),
+        )
+        self.assertIsNone(cache.get([b.cache_key]))
+        x, y = 1, 1 + (2**61 - 1)
+        self.assertEqual(hash(x), hash(y))
+        cache.set(
+            cache.combine_hashes([x]), EmbeddingResult(embedding=torch.tensor([17.0]))
+        )
+        self.assertIsNone(cache.get([y]))
+
+    def test_scheduler_same_batch_and_a_b_a(self):
+        a, b = _item(torch.tensor([17.0])), _item(torch.tensor([23.0]))
+        a.set_identity(b"samehead" + b"A" * 24)
+        b.set_identity(b"samehead" + b"B" * 24)
+
+        def encode(items):
+            return [item.feature.reshape(1, 1) for item in items]
+
+        with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(4096)):
+            for item in (a, b, a, b):
+                output = mm_schedule._get_chunked_embedding_by_item(
+                    encode, [item], 0, 1, torch.device("cpu")
+                )[0]
+                self.assertTrue(torch.equal(output, item.feature.reshape(1, 1)))
+        with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(4096)):
+            reqs = [
+                mm_schedule.PerImageRequestInfo(i, [item], [(0, 0)], 0, 1)
+                for i, item in enumerate((a, b, a))
+            ]
+            result = mm_schedule._batch_encode_per_image_misses(
+                encode, reqs, torch.device("cpu")
+            )
+            self.assertTrue(
+                torch.equal(result[(b.cache_key, 1)], b.feature.reshape(1, 1))
+            )
+            self.assertEqual(len(result), 2)
+
+    def test_split_invalidates_parent_identity(self):
+        item = _item(torch.tensor([[1.0], [2.0]]))
+        item.offsets = [(0, 0), (2, 2)]
+        item.set_pad_value()
+        parts = get_new_expanded_mm_items([item])
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(len({item.cache_key, *(part.cache_key for part in parts)}), 3)
+
+    def test_identity_survives_wire_without_rehash(self):
+        item = _item(torch.arange(8))
+        expected = item.cache_key
+        for restored in (
+            pickle.loads(pickle.dumps(item)),
+            msgspec.msgpack.decode(
+                msgspec.msgpack.encode(
+                    MultimodalDataItem(
+                        modality=item.modality,
+                        hash=item.hash,
+                        identity=item.identity,
+                        pad_values=item.pad_values,
+                        pad_value=item.pad_value,
+                    )
+                ),
+                type=MultimodalDataItem,
+            ),
+        ):
+            with patch(
+                "sglang.srt.managers.mm_utils.hash_feature_digest",
+                side_effect=AssertionError("already hashed"),
+            ):
+                self.assertEqual(restored.cache_key, expected)
+
+    def test_python_and_rust_prefix_trees(self):
+        a, b = _item(torch.zeros(32)), _item(torch.ones(32))
+        a.set_pad_value()
+        b.set_pad_value()
+        for backend, page_size in itertools.product(("python", "rust"), (1, 16)):
+            with self.subTest(backend=backend, page_size=page_size):
+                core = _tree_core(backend, page_size=page_size)
+                first = [1] * 16 + a.padding_sequence(32) + [2] * 16
+                second = [1] * 16 + b.padding_sequence(32) + [2] * 16
+                _insert(core, first, list(range(len(first))))
+                match = core.match_prefix(MatchPrefixParams(key=_key(second)))
+                self.assertEqual(match.device_prefix_len, 16)
+
+
+if __name__ == "__main__":
+    unittest.main()

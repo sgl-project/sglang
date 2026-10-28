@@ -317,8 +317,7 @@ class BaseMultimodalProcessor(ABC):
             max_entries=8192,
         )
         self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
-        # The fingerprint is needed only to build artifact keys. Avoid inspecting
-        # processor state when this processor will never retain artifacts.
+        # Compute lazily once for both preprocess and encoder-cache identities.
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
@@ -1663,6 +1662,9 @@ class BaseMultimodalProcessor(ABC):
                 "modality",
                 "hash",
                 "pad_value",
+                "pad_values",
+                "identity",
+                "processor_fingerprint",
                 "offsets",
             ):
                 # metadata fields need explicit handling, skip generic item.set
@@ -2041,8 +2043,29 @@ class BaseMultimodalProcessor(ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        """Apply model-specific item reshaping while features are still tensors."""
+        """Bind model configuration before optional model-specific reshaping."""
+        self._bind_cache_namespaces(mm_items)
         return mm_items
+
+    def _bind_cache_namespaces(self, mm_items: List[MultimodalDataItem]) -> bool:
+        if self.processor_fingerprint is None:
+            self.processor_fingerprint = build_processor_fingerprint(
+                self, self.hf_config
+            )
+        changed = False
+        for item in mm_items:
+            changed |= item.bind_processor_fingerprint(self.processor_fingerprint)
+        return changed
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        """Common frontend boundary, including model-specific processor paths."""
+        if (
+            self._bind_cache_namespaces(output.mm_items)
+            and output.padded_input_ids is not None
+        ):
+            output.padded_input_ids = output.build_padded_input_ids(
+                output.input_ids, output.mm_items
+            )
 
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
@@ -2050,6 +2073,11 @@ class BaseMultimodalProcessor(ABC):
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
+
+        self._bind_cache_namespaces(mm_items)
+        for item in mm_items:
+            # Never reconstruct/consume an IPC lease merely to hash its contents.
+            item.set_pad_value()
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
