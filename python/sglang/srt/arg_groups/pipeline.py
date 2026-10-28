@@ -63,10 +63,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
+        handle_watermark_config,
     )
 
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
+    run_hook(handle_watermark_config, server_args)
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
@@ -78,6 +80,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_offload_compatibility, server_args)
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
+        handle_aux_hidden_state_capture,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_response_store,
@@ -87,6 +90,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
+    # Before any reader of speculative_algorithm: the flag may reset it.
+    run_hook(handle_aux_hidden_state_capture, server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
@@ -109,6 +114,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_source_paths, server_args)
+
+    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
+    # whose heuristic reads the post-capture KV sizing switch.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
 
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
@@ -165,6 +176,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.cuda_graph_hook import (
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+        apply_prefill_cp_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -264,6 +276,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+    if cfg.enable_prefill_cp:
+        run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.
@@ -272,6 +286,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        resolve_ascend_ops_speculative_draft,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
         validate_flashinfer_a2a_token_budget,
@@ -290,6 +305,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_post_process_pass(server_args, resolve_ascend_ops_speculative_draft)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
@@ -336,6 +352,18 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
+
+    # needs the resolved CUDA-graph, attention-backend and speculative settings
+    from sglang.srt.kernel_plugins.amd.binding import (
+        handle_amd_monokernel,
+    )
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        handle_nvidia_megakernel,
+    )
+
+    # first, so a server with both kernel flags gets every reason in one error
+    run_hook(handle_nvidia_megakernel, server_args)
+    run_hook(handle_amd_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 

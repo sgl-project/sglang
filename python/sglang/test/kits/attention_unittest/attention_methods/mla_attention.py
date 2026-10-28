@@ -228,8 +228,8 @@ class MockMLAModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         # `kv_cache_dtype` is the dtype the *storage* uses. For FP8 KV
-        # cache (the production deployment dtype for tokenspeed_mla and
-        # some trtllm_mla configs), the pool stores quantized bytes
+        # cache (the production deployment dtype for some trtllm_mla
+        # configs), the pool stores quantized bytes
         # while the model still projects K/V in bf16; `set_mla_kv_buffer`
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
@@ -243,6 +243,8 @@ class MockMLAModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        # FlashInfer MLA __init__ scans model.modules() for attn_type.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)

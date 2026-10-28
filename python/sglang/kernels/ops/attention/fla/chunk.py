@@ -45,6 +45,8 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    chunk_offsets: torch.LongTensor | None = None,
+    o_chunk_indices: torch.LongTensor | None = None,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
 ):
@@ -72,6 +74,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        chunk_offsets=chunk_offsets,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
     )
@@ -83,6 +86,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_indices=o_chunk_indices,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -107,6 +111,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        chunk_indices: Optional[torch.LongTensor] = None,
+        chunk_offsets: Optional[torch.LongTensor] = None,
         track_state: Optional[torch.Tensor] = None,
         track_chunk_idx: Optional[torch.Tensor] = None,
     ):
@@ -117,11 +123,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
-        chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-            if cu_seqlens is not None
-            else None
-        )
+        # Caller-built tables (CUDA-graph capture) also serve chunk_fwd_o; without
+        # them chunk_fwd_o derives its own for its token-count dependent chunk size.
+        o_chunk_indices = chunk_indices
+        if chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
         g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -134,6 +140,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            chunk_offsets=chunk_offsets,
+            o_chunk_indices=o_chunk_indices,
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
         )
@@ -154,6 +162,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    chunk_indices: Optional[torch.LongTensor] = None,
+    chunk_offsets: Optional[torch.LongTensor] = None,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
 ):
@@ -278,6 +288,8 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        chunk_indices,
+        chunk_offsets,
         track_state,
         track_chunk_idx,
     )
