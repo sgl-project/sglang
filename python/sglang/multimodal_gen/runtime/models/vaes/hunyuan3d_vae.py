@@ -634,15 +634,9 @@ class VanillaVolumeDecoder:
 
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
         grid_size = [int(octree_resolution) + 1] * 3
-        x = np.linspace(
-            bbox_min[0], bbox_max[0], grid_size[0], dtype=np.float32
-        )
-        y = np.linspace(
-            bbox_min[1], bbox_max[1], grid_size[1], dtype=np.float32
-        )
-        z = np.linspace(
-            bbox_min[2], bbox_max[2], grid_size[2], dtype=np.float32
-        )
+        x = np.linspace(bbox_min[0], bbox_max[0], grid_size[0], dtype=np.float32)
+        y = np.linspace(bbox_min[1], bbox_max[1], grid_size[1], dtype=np.float32)
+        z = np.linspace(bbox_min[2], bbox_max[2], grid_size[2], dtype=np.float32)
         x = torch.from_numpy(x).to(device, dtype=dtype)
         y = torch.from_numpy(y).to(device, dtype=dtype)
         z = torch.from_numpy(z).to(device, dtype=dtype)
