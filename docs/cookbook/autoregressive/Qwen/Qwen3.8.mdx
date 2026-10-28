@@ -54,7 +54,7 @@ For how to launch either image, see [Install → Method 3: Using Docker](../../.
 <Tab title="NPU">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
 ```
 
 For host and platform setup, see the
@@ -224,7 +224,7 @@ Recommended: **MI355X + MXFP4, single node, TP8**. MI350X emits the identical co
 
 The Atlas 800I A3 recipe deploys the W4A8 quantized checkpoint across **4 nodes (32 cards / 64 dies)** in unified PD mixed mode:
 
-- **Tensor Parallelism & Data Parallelism**: Runs `--tp-size 64` across all 64 dies (16 dies per node), combined with DP attention (`--enable-dp-attention --dp-size 4 --enable-dp-lm-head`) for balanced prefill and decode throughput.
+- **Tensor Parallelism & Data Parallelism**: Runs `--tp-size 64` across all 64 dies (16 dies per node), combined with DP attention (`--attn-dp-size 4 --enable-dp-lm-head`) for balanced prefill and decode throughput.
 - **MoE Communication**: Uses DeepEP in auto mode (`--moe-a2a-backend deepep --deepep-mode auto`) with INT8 dispatch quantization (`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`) for high-bandwidth NPU-to-NPU all-to-all communication.
 - **Overlap Scheduling**: Enables plan stream overlap (`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`) and static ragged verify mode (`SGLANG_RAGGED_VERIFY_MODE=static`) for reduced execution jitter.
 - **Multi-Node Networking**: Multi-node NPU collectives use HCCL and Gloo. Pin the network interface on each node with `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME`.

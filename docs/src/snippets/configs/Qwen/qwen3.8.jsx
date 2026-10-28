@@ -130,7 +130,7 @@ export const config = {
     mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
     mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
     mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
-    a3:     "quay.io/ascend/sglang:main-cann9.0.0-a3",
+    a3:     "quay.io/ascend/sglang:main-cann9.1.0-a3",
   },
 
   // Per-hardware notes shown above a multi-node command. Every multi-node recipe
@@ -1004,8 +1004,7 @@ export const config = {
         "--quantization modelslim",
         "--dtype bfloat16",
         "--tp-size 64",
-        "--enable-dp-attention",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.8",
         "--chunked-prefill-size 8192",
