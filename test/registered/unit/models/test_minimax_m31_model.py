@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     is_dspark_draft,
     uses_minimax_m3_packed_nvfp4_kv,
 )
+from sglang.srt.distributed.device_communicators import custom_all_reduce_ops
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -456,6 +457,23 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 _minimax_m3_overrides(rocm_server_args(dtype=dtype), NVFP4)
                 self.assertNotIn(jit, os.environ)
                 self.assertNotIn(cap, os.environ)
+
+    def test_jit_quick_reduce_is_gfx950_only(self):
+        """The JIT build is validated on gfx950 only; a user-set flag elsewhere keeps
+        sgl-kernel's quick all-reduce."""
+        uses_jit = custom_all_reduce_ops._uses_jit_quick_all_reduce
+        with (
+            patch.object(custom_all_reduce_ops, "_is_hip", True),
+            envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.override(True),
+        ):
+            for gfx95, expected in ((True, True), (False, False)):
+                with (
+                    self.subTest(gfx95=gfx95),
+                    patch.object(
+                        custom_all_reduce_ops, "is_gfx95_supported", return_value=gfx95
+                    ),
+                ):
+                    self.assertEqual(uses_jit(), expected)
 
 
 class TestMiniMaxM31DSparkDraft(CustomTestCase):
