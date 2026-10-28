@@ -286,6 +286,7 @@ class DeferredAbortAckState(msgspec.Struct):
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
+    _next_decode_connection_check: float = 0.0
     _staging_ctx = None
 
     # Wire layout of the prefill->decode terminal status message. The legacy
@@ -1661,27 +1662,26 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
+    def _drop_if_disconnected(self, endpoint: str) -> bool:
+        """Close a cached socket whose peer went away. Caller holds _socket_lock."""
+        monitor = self._monitor_cache.get(endpoint)
+        if monitor is None:
+            return False
+        try:
+            monitor.recv_multipart(zmq.NOBLOCK)
+        except zmq.Again:
+            return False
+        except zmq.ZMQError:
+            pass
+        self._socket_cache.pop(endpoint).close(linger=0)
+        self._monitor_cache.pop(endpoint).close()
+        return True
+
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
-            if sock is not None:
-                monitor = self._monitor_cache.get(endpoint)
-                disconnected = False
-                if monitor is not None:
-                    try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
-                    except zmq.Again:
-                        pass
-                    except zmq.ZMQError:
-                        disconnected = True
-                if not disconnected:
-                    return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                self._socket_cache.pop(endpoint, None)
-                self._monitor_cache.pop(endpoint, None)
+            if sock is not None and not self._drop_if_disconnected(endpoint):
+                return sock
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -1700,8 +1700,10 @@ class CommonKVManager(BaseKVManager):
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
             sock.connect(endpoint)
             self._socket_cache[endpoint] = sock
+            # With reconnects disabled, CLOSED is a connect that failed for good:
+            # sends still succeed but queue into a socket that never delivers.
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
+                zmq.EVENT_DISCONNECTED | zmq.EVENT_CLOSED
             )
             self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
@@ -2105,6 +2107,50 @@ class CommonKVManager(BaseKVManager):
             f"{len(affected_rooms)} requests affected"
         )
 
+    def check_decode_connections(self) -> None:
+        """Fail rooms parked for a decode whose status connection is gone.
+
+        Prefill connects when it first reports one of the decode's rooms ready; the
+        connection drops when that process exits or TCP keepalive gives up on its host.
+        """
+        now = time.monotonic()
+        if now < self._next_decode_connection_check:
+            return
+        # Arbitrary; bounds monitor polling, since every parked sender calls this.
+        self._next_decode_connection_check = now + 1.0
+        with self._socket_lock:
+            lost = {
+                endpoint
+                for endpoint in list(self._monitor_cache)
+                if self._drop_if_disconnected(endpoint)
+            }
+        if not lost:
+            return
+        rooms = self.deferred_bootstrap.live_rooms_bound_to(
+            lambda endpoint: NetworkAddress(*endpoint).to_tcp() in lost
+        )
+        affected_rooms = []
+        for room, endpoint in rooms:
+            status = self.request_status.get(room)
+            if status not in (None, KVPoll.Bootstrapping):
+                # Decode already sent destinations; the transfer path owns failures.
+                continue
+            # Fail the table entry first so update_status does not notify the lost peer.
+            self.deferred_bootstrap.fail(room)
+            if status is not None:
+                self.record_failure(
+                    room,
+                    f"Lost connection with decode instance (endpoint: "
+                    f"{NetworkAddress(*endpoint)}) while waiting for its KV destinations",
+                )
+                self.update_status(room, KVPoll.Failed)
+            affected_rooms.append(room)
+        if affected_rooms:
+            logger.error(
+                f"Lost connection with decode instance (endpoints: {sorted(lost)}), "
+                f"{len(affected_rooms)} requests affected"
+            )
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -2365,6 +2411,12 @@ class CommonKVSender(BaseKVSender):
             )
         ):
             return KVPoll.Transferring
+        if (
+            status == KVPoll.Bootstrapping
+            and self.kv_mgr.deferred_bootstrap is not None
+        ):
+            self.kv_mgr.check_decode_connections()
+            status = check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             timeout_status = self._check_bootstrap_timeout()
             if timeout_status is not None:

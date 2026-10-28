@@ -7,10 +7,16 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import zmq
+
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
@@ -111,6 +117,8 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.enable_staging = False
         mgr.is_dummy_cp_rank = False
         mgr._staging_outstanding = {}
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache, mgr._monitor_cache, mgr._socket_send_locks = {}, {}, {}
         mgr._prefill_unique_rank = Mock(return_value=0)
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
@@ -166,6 +174,56 @@ class TestAllocationIntegration(CustomTestCase):
         with patch.object(receiver, "_setup_bootstrap_infos"):
             receiver.init(0)
         return receiver
+
+    def use_real_status_channel(self):
+        mgr = self.prefill
+        del mgr._send_multipart_locked
+        mgr._zmq_ctx = zmq.Context()
+        self.addCleanup(mgr._zmq_ctx.destroy, linger=0)
+        # Only a lost connection, never the timeout, may fail a room in these tests.
+        mgr.bootstrap_timeout = 300
+
+    def decode_endpoint(self):
+        sock = self.prefill._zmq_ctx.socket(zmq.PULL)
+        return sock, sock.bind_to_random_port("tcp://127.0.0.1")
+
+    def register(self, room, port):
+        self.prefill._handle_bootstrap_message(
+            [b"BOOTSTRAP", str(room).encode(), b"127.0.0.1", str(port).encode()]
+        )
+
+    def test_lost_decode_fails_its_rooms_before_bootstrap_timeout(self):
+        """Rooms bound to a decode whose connection drops fail at once, parked or
+        still queued for prefill; a room bound to a live decode keeps waiting."""
+        self.use_real_status_channel()
+        lost, lost_port = self.decode_endpoint()
+        live, live_port = self.decode_endpoint()
+        parked, queued, other = self.sender(1), self.sender(2), self.sender(3)
+        self.register(1, lost_port)
+        self.register(2, lost_port)
+        self.register(3, live_port)
+        parked.mark_prefill_complete()
+        other.mark_prefill_complete()
+        self.assertTrue(lost.poll(5000) and live.poll(5000))
+        lost.close(linger=0)
+        self.prefill._monitor_cache[f"tcp://127.0.0.1:{lost_port}"].poll(5000)
+        self.assertEqual(parked.poll(), KVPoll.Failed)
+        self.assertEqual(queued.poll(), KVPoll.Failed)
+        self.assertEqual(other.poll(), KVPoll.Bootstrapping)
+        with self.assertRaisesRegex(KVTransferError, "Lost connection with decode"):
+            parked.failure_exception()
+
+    def test_decode_gone_before_first_ready_fails_room(self):
+        """A decode that died before prefill first connected to it must not swallow
+        the ready message and leave the room parked until the bootstrap timeout."""
+        self.use_real_status_channel()
+        gone, port = self.decode_endpoint()
+        gone.close(linger=0)
+        sender = self.sender()
+        self.register(1, port)
+        sender.mark_prefill_complete()
+        self.prefill._monitor_cache[f"tcp://127.0.0.1:{port}"].poll(5000)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
 
     def test_receiver_hides_allocatable_status_until_source_finishes(self):
         sender, receiver = self.sender(), self.receiver()
