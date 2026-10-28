@@ -396,6 +396,49 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "and cannot be used at the same time. Please use only one of them."
         )
 
+    if cfg.enable_prefill_weight_versions:
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-unified-memory"
+            )
+        if cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-encoder-swa-bounded-replay"
+            )
+        if cfg.enable_lmcache or cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-lmcache or --enable-unified-cache-external-linker"
+            )
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with SGLANG_RUST_SERVER"
+            )
+        if cfg.enable_pdmux or cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-pdmux or --dllm-algorithm"
+            )
+        if cfg.speculative_algorithm not in {None, "EAGLE", "EAGLE3", "DFLASH"}:
+            raise ValueError(
+                "--enable-prefill-weight-versions supports speculative algorithms "
+                f"EAGLE, EAGLE3, and DFLASH, got {cfg.speculative_algorithm!r}"
+            )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "The argument enable-prefill-weight-versions cannot be combined with "
+                "enable-hierarchical-cache: KV restored from the host or storage tiers carries "
+                "no weight version, so the reported prompt versions would be wrong."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "The argument enable-prefill-weight-versions is not supported in disaggregation "
+                f"mode {cfg.disaggregation_mode!r}: prefill workers do not report prompt weight "
+                "versions yet."
+            )
+
     if cfg.disaggregation_decode_enable_offload_kvcache:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(
