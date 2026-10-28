@@ -1,7 +1,7 @@
 //! OpenAI endpoints served through SGLang's native `/generate`, matching the
 //! Python server's OpenAI layer (`python/sglang/srt/entrypoints/openai/`).
 //!
-//! A host lowers the OpenAI body into a `/generate` body, sends it, and feeds
+//! A host lowers the OpenAI body into a typed `/generate` request, sends it, and feeds
 //! the engine's response back to the returned responder. Requests whose
 //! behavior is not reproduced here come back as [`Unsupported`], and the host
 //! sends them to the engine's own OpenAI route.
@@ -14,10 +14,12 @@ mod request;
 mod wire;
 
 use serde::Deserialize;
+use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 
 pub use chat::{ChatModel, ChatResponder, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
+pub use sglang_api_types::api::v1::GenerateRequest;
 pub use wire::Reply;
 
 /// Builds the OpenAI response of a lowered request from the engine's `/generate` output.
@@ -28,19 +30,37 @@ pub enum Responder {
 
 impl Responder {
     /// The buffered `/generate` response; `None` passes the engine's reply through.
-    pub fn unary(self, body: &[u8]) -> Option<Reply> {
+    pub fn unary(
+        self,
+        output: Vec<Result<GenerateResponse, GenerateStreamError>>,
+    ) -> Option<Reply> {
+        let output = match output.into_iter().collect::<Result<Vec<_>, _>>() {
+            Ok(output) => output,
+            Err(error) => return Some(Self::rejected(error)),
+        };
         match self {
-            Self::Completion(responder) => responder.unary(body),
-            Self::Chat(responder) => responder.unary(body),
+            Self::Completion(responder) => responder.unary(output),
+            Self::Chat(responder) => responder.unary(output),
         }
     }
 
-    /// One `/generate` SSE `data:` payload. `Err` replaces the whole stream,
+    /// One decoded `/generate` stream item. `Err` replaces the whole stream,
     /// before anything was sent.
-    pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
+    pub fn stream_data(
+        &mut self,
+        data: Result<GenerateResponse, GenerateStreamError>,
+    ) -> Result<Vec<String>, Reply> {
         match self {
             Self::Completion(responder) => responder.stream_data(data),
             Self::Chat(responder) => responder.stream_data(data),
+        }
+    }
+
+    /// Finish the OpenAI stream after the engine's `[DONE]` marker.
+    pub fn stream_end(&mut self) -> Vec<String> {
+        match self {
+            Self::Completion(responder) => responder.stream_end(),
+            Self::Chat(responder) => responder.stream_end(),
         }
     }
 
@@ -53,8 +73,13 @@ impl Responder {
     }
 
     /// A `/generate` response with an error status.
-    pub fn rejected(body: &[u8]) -> Option<Reply> {
-        wire::engine_error_reply(body)
+    pub fn rejected(error: GenerateStreamError) -> Reply {
+        wire::engine_error_reply(error)
+    }
+
+    /// The engine returned an output missing a field required by OpenAI.
+    pub fn malformed_output(missing: &str) -> Reply {
+        wire::malformed_output_reply(missing)
     }
 }
 
@@ -73,6 +98,8 @@ pub struct OpenAiSettings {
     pub return_input_ids: bool,
     pub return_output_ids: bool,
     pub sampling_defaults: Option<String>,
+    /// `--served-model-name`, which a `model:adapter` request may contain.
+    pub served_model_name: Option<String>,
     pub stream_response_default_include_usage: bool,
     pub tokenizer_metrics_custom_labels_header: Option<String>,
     pub tokenizer_metrics_allowed_custom_labels: Option<Vec<String>>,
