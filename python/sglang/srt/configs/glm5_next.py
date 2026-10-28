@@ -271,7 +271,7 @@ class Glm5NextTextConfig(PretrainedConfig):
 class Glm5NextVisionConfig(GlmOcrVisionConfig):
     def __init__(
         self,
-        swiglu_limit: float = 10.0,
+        swiglu_limit: float,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -319,10 +319,6 @@ class Glm5NextConfig(PretrainedConfig):
                 vision_config = dict(vision_config)
             else:
                 vision_config = vision_config.to_dict()
-            if "swiglu_limit" not in vision_config:
-                text_swiglu_limit = getattr(self.text_config, "swiglu_limit", None)
-                if text_swiglu_limit is not None:
-                    vision_config["swiglu_limit"] = text_swiglu_limit
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
 
         self.image_token_id = image_token_id
