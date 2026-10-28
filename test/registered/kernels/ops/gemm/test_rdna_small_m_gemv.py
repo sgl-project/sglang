@@ -44,6 +44,12 @@ class TestGate(unittest.TestCase):
         # Wide layers already saturate the bus; split-K loses there.
         self.assertFalse(use_rdna_splitk_gemv(1, 151936, 1024, torch.bfloat16))
 
+    def test_accepts_large_split_k(self):
+        from sglang.kernels.ops.gemm.rdna_small_m_gemv import use_rdna_splitk_gemv
+
+        # 5120x17408 is a 27B down_proj: split_k=34, measured 1.37x over rocBLAS.
+        self.assertTrue(use_rdna_splitk_gemv(1, 5120, 17408, torch.bfloat16))
+
     def test_rejects_unsupported_dtype_and_shape(self):
         from sglang.kernels.ops.gemm.rdna_small_m_gemv import use_rdna_splitk_gemv
 
