@@ -62,6 +62,49 @@ class TestMLAKVGather(CustomTestCase):
                                 compact, full[rows], rtol=0, atol=0, equal_nan=True
                             )
 
+    def test_eager_peak_memory_is_bounded_by_full_pool_cast(self):
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+            FlashInferMLAAttnBackend,
+            _Fp8KvRowReader,
+        )
+
+        pool_rows = 65536
+        data = torch.zeros(
+            (pool_rows, 1, 576), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        pool = SimpleNamespace(
+            dtype=data.dtype,
+            size=pool_rows - 64,
+            page_size=64,
+            get_key_buffer=lambda layer_id: data,
+        )
+        backend = FlashInferMLAAttnBackend.__new__(FlashInferMLAAttnBackend)
+        backend.token_to_kv_pool = pool
+        backend.fp8_kv_reader = _Fp8KvRowReader(pool)
+        layer = SimpleNamespace(layer_id=0)
+
+        def peak_bytes(operation):
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            result = operation()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() - before
+            del result
+            return peak
+
+        # Warm allocator/conversion state before comparing live allocations.
+        peak_bytes(lambda: data.to(torch.bfloat16))
+        full_peak = peak_bytes(lambda: data.to(torch.bfloat16))
+        for count in (43690, 43691, 58982, pool_rows, pool_rows + 1):
+            with self.subTest(count=count):
+                rows = torch.arange(count, dtype=torch.int32, device="cuda") % pool_rows
+                kv_rows = rows if backend.fp8_kv_reader.use_compact(count) else None
+                peak = peak_bytes(
+                    lambda: backend._mla_kv_buffer(layer, kv_rows, torch.bfloat16)
+                )
+                self.assertLessEqual(peak, full_peak)
+
     def test_graph_replay_refreshes_new_rows_and_reuses_shadow_across_layers(self):
         from sglang.srt.layers.attention.flashinfer_mla_backend import _Fp8KvRowReader
 

@@ -84,7 +84,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             )
         )
 
-    def _backend(self, dtype=torch.float8_e4m3fn, page_size=1):
+    def _backend(self, dtype=torch.float8_e4m3fn, page_size=1, rows=None):
         backend = self.module.FlashInferMLAAttnBackend.__new__(
             self.module.FlashInferMLAAttnBackend
         )
@@ -102,6 +102,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             else None
         )
         backend.skip_prefill = False
+        backend.causal = True
         backend.decode_wrapper = Mock()
         backend.prefill_wrapper_paged = Mock()
         backend.prefill_wrapper_ragged = Mock()
@@ -111,10 +112,10 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
         backend.q_indptr_decode = torch.arange(5, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(5, dtype=torch.int32)
         backend.cuda_graph_kv_indices = torch.zeros(32, dtype=torch.int32)
+        if rows is None:
+            rows = torch.tensor([7, 2, 7, 0, 19], dtype=torch.int32)
         backend.kv_index_translator = SimpleNamespace(
-            pack_read_stream=lambda *args, out, **kwargs: (
-                out.copy_(torch.tensor([7, 2, 7, 0, 19], dtype=torch.int32)) is not None
-            ),
+            pack_read_stream=lambda *args, out, **kwargs: out.copy_(rows) is not None,
             needs_read_translate=False,
         )
         config = SimpleNamespace(
@@ -209,6 +210,46 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
         self.assertIsNone(result)
         self.assertIs(backend.decode_wrapper.plan.call_args.args[2], rows)
 
+    def test_compact_memory_boundary_preserves_plan_and_forward_rows(self):
+        for decode in (False, True):
+            for count in (170, 171):
+                with self.subTest(decode=decode, count=count):
+                    rows = torch.arange(count, dtype=torch.int32).remainder(23)
+                    backend = self._backend(rows=rows)
+                    batch = self._batch(decode=decode)
+                    batch.seq_lens = torch.tensor([count - 2, 2], dtype=torch.int32)
+                    batch.seq_lens_sum = count
+                    original_empty = torch.empty
+
+                    def cpu_empty(*args, **kwargs):
+                        kwargs["device"] = "cpu"
+                        return original_empty(*args, **kwargs)
+
+                    with patch.object(torch, "empty", side_effect=cpu_empty):
+                        backend.init_forward_metadata(batch)
+                    compact = backend.forward_metadata.kv_rows
+                    wrapper = (
+                        backend.decode_wrapper
+                        if decode
+                        else backend.prefill_wrapper_paged
+                    )
+                    plan_ids = wrapper.plan.call_args.args[2]
+                    if count == 170:
+                        torch.testing.assert_close(compact, rows)
+                        torch.testing.assert_close(
+                            plan_ids, torch.arange(count, dtype=torch.int32)
+                        )
+                    else:
+                        self.assertIsNone(compact)
+                        torch.testing.assert_close(plan_ids, rows)
+                    kv = backend._mla_kv_buffer(
+                        SimpleNamespace(layer_id=0), compact, torch.bfloat16
+                    )
+                    full = backend.token_to_kv_pool.get_key_buffer(0).to(torch.bfloat16)
+                    torch.testing.assert_close(
+                        kv[plan_ids.long()], full[rows.long()], rtol=0, atol=0
+                    )
+
     def test_dtype_and_capacity_guards(self):
         reader_type = self.module._Fp8KvRowReader
         for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -221,8 +262,12 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                 reader_type.enabled(SimpleNamespace(dtype=dtype), torch.bfloat16)
             )
         reader = self._backend(page_size=64).fp8_kv_reader
-        self.assertTrue(reader.use_compact(256))
-        self.assertFalse(reader.use_compact(257))
+        self.assertTrue(reader.use_compact(170))
+        self.assertFalse(reader.use_compact(171))
+        self.assertFalse(reader.use_compact(256))
+        reader.pool_rows = 255
+        self.assertTrue(reader.use_compact(170))
+        self.assertFalse(reader.use_compact(171))
         reader.pool_rows = 0
         self.assertFalse(reader.use_compact(1))
 
