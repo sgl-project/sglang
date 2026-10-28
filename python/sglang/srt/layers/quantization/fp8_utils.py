@@ -1766,6 +1766,29 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
+    if _is_xpu:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        q_input = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale_u8 = torch.empty(
+            (x.shape[0], k // 32), device=x.device, dtype=torch.uint8
+        )
+        if x.shape[0] > 0:
+            sgl_per_token_group_quant_8bit(
+                x,
+                q_input,
+                scale_u8,
+                32,
+                1e-10,
+                -fp8_max,
+                fp8_max,
+                True,
+                False,
+                None,
+                False,
+            )
+        return q_input, scale_u8
     downcast_to_mxfp = _get_triton_mxfp8_downcast()
     q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
     return q_input.contiguous(), scale_u8.contiguous()

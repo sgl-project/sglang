@@ -2059,8 +2059,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
-            if _is_xpu:
-                return
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
@@ -2251,10 +2249,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (
-            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100)
+            or (_is_hip and _is_gfx95_supported)
+            or _is_xpu
         ):
             raise RuntimeError(
-                "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
+                "MXFP8 MoE quantization requires SM100, ROCm gfx95, or Intel XPU "
                 "(gfx942 converts MXFP8 to block-fp8 at load instead)."
             )
 
@@ -2396,7 +2396,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return _pack_moe_scale_for_deepgemm(scale_fp32)
 
         if quantize:
-            if _is_hip:
+            if _is_hip or _is_xpu:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
                     layer.w13_weight.data.contiguous().view(
                         -1, layer.w13_weight.data.shape[-1]
@@ -2446,7 +2446,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data
                 )
         else:
-            if _is_hip:
+            if _is_hip or _is_xpu:
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -3066,6 +3066,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights)
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
@@ -3082,17 +3085,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=(
                     layer.w13_weight_scale_inv
-                    if self.block_quant
+                    if self.block_quant or self.is_fp4_expert
                     else layer.w13_weight_scale
                 ),
                 w2_scale=(
                     layer.w2_weight_scale_inv
-                    if self.block_quant
+                    if self.block_quant or self.is_fp4_expert
                     else layer.w2_weight_scale
                 ),
                 block_shape=(
-                    getattr(self.quant_config, "weight_block_size", None)
-                    if self.block_quant
+                    self.weight_block_size
+                    if self.block_quant and use_fp8_w8a8
                     else None
                 ),
                 activation=moe_runner_config.activation,

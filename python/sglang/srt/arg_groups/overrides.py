@@ -1479,13 +1479,14 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "flashinfer_megamoe requires --moe-a2a-backend flashinfer_megamoe "
                 "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
-    # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
-    # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
-    # FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31") and its
-    # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
-    # load with gate and up exchanged. Leave the backend at "auto" and let
-    # create_moe_runner resolve it to ASCEND.
-    if view.quantization == "mxfp8" and not get_platform().is_npu:
+    # Ascend and Intel XPU run MXFP8 MoE on their own native paths; every backend
+    # selected below is CUDA/ROCm-only. Forcing one here would not merely pick the
+    # wrong runner: FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31")
+    # and its 128-alignment round-up off flashinfer_trtllm, so the experts would
+    # silently load with gate and up exchanged.
+    if view.quantization == "mxfp8" and not (
+        get_platform().is_npu or get_platform().is_xpu
+    ):
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()

@@ -352,6 +352,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif (
+            moe_runner_backend.is_intel_xpu()
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        ):
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_aiter()
@@ -375,12 +380,19 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         moe_runner_config = self.moe_runner_config
 
-        if is_xpu() and not get_moe_runner_backend().is_triton():
+        if (
+            is_xpu()
+            and not get_moe_runner_backend().is_triton()
+            and self.weight_quant.strategy != QuantizationStrategy.CHANNEL
+        ):
             from sgl_kernel import fused_experts
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             topk_weights, topk_ids, _ = topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights)
             is_block = self.weight_quant.strategy == QuantizationStrategy.BLOCK
             output = fused_experts(
                 x,

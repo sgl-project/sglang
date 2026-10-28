@@ -20,8 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsW8A8Fp8MoE,
     QuantizationStrategy,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -319,53 +318,61 @@ class TestXpuMoeWna16(CustomTestCase):
         output = method.apply(layer, dispatch_output)
         self._assert_output_matches_reference(output, reference)
 
-    def test_w8a8_fp8_moe_method(self):
+    def test_mxfp8_moe_method_online_quant_full_lifecycle(self):
         dispatch_output = self._create_dispatch_output()
-        quant_config = MagicMock(
-            is_checkpoint_fp8_serialized=False,
-            is_fp4_experts=False,
-            use_mxfp8=False,
-            weight_block_size=None,
-        )
-        method = W8A8FP8MoEMethod(quant_config)
+        quant_config = Fp8Config(is_checkpoint_fp8_serialized=False, use_mxfp8=True)
+        method = Fp8MoEMethod(quant_config)
         layer = nn.Module()
+        layer.moe_tp_size = 1
+        layer.moe_runner_config = MoeRunnerConfig()
+        layer.num_local_experts = self.num_experts
+
+        method.create_weights(
+            layer,
+            num_experts=self.num_experts,
+            hidden_size=self.hidden,
+            intermediate_size_per_partition=self.intermediate,
+            params_dtype=torch.bfloat16,
+        )
         method.create_moe_runner(layer, MoeRunnerConfig())
 
-        layer.w13_weight = (
+        w13_bf16 = (
             torch.randn(
                 self.num_experts,
                 2 * self.intermediate,
                 self.hidden,
                 dtype=torch.bfloat16,
-                device=self.device,
             )
-            .mul_(0.1)
-            .to(torch.float8_e4m3fn)
+            * 0.1
         )
-        layer.w2_weight = (
+        w2_bf16 = (
             torch.randn(
                 self.num_experts,
                 self.hidden,
                 self.intermediate,
                 dtype=torch.bfloat16,
-                device=self.device,
             )
-            .mul_(0.1)
-            .to(torch.float8_e4m3fn)
+            * 0.1
         )
-        layer.w13_weight_scale = torch.linspace(
-            0.75, 1.25, self.num_experts, dtype=torch.float32, device=self.device
-        ).view(-1, 1)
-        layer.w2_weight_scale = torch.linspace(
-            1.25, 0.75, self.num_experts, dtype=torch.float32, device=self.device
-        ).view(-1, 1)
+        layer.w13_weight.data.copy_(w13_bf16)
+        layer.w2_weight.data.copy_(w2_bf16)
+
+        layer.to(self.device)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.w2_weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.w13_weight_scale_inv.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight_scale_inv.dtype, torch.uint8)
 
         reference = self._reference_moe(
             dispatch_output,
             layer.w13_weight,
             layer.w2_weight,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            block_shape=[1, 32],
+            mxfp8=True,
         )
         output = method.apply(layer, dispatch_output)
         self._assert_output_matches_reference(output, reference)
@@ -452,14 +459,96 @@ class TestXpuMoeWna16(CustomTestCase):
         output = method.apply(layer, dispatch_output)
         self._assert_output_matches_reference(output, reference)
 
+    def test_fp8_moe_method_apply_router_weight_on_input(self):
+        x = (
+            torch.randn(
+                self.num_tokens, self.hidden, dtype=torch.bfloat16, device=self.device
+            )
+            * 0.5
+        )
+        topk_weights = torch.tensor(
+            [[0.3], [0.7], [0.4], [0.9]], dtype=torch.float32, device=self.device
+        )
+        topk_ids = torch.tensor(
+            [[0], [1], [2], [3]], dtype=torch.int32, device=self.device
+        )
+        dispatch_output = StandardDispatchOutput(
+            x, None, StandardTopKOutput(topk_weights, topk_ids, None)
+        )
+        scaled_dispatch_output = StandardDispatchOutput(
+            x * topk_weights.to(x.dtype),
+            None,
+            StandardTopKOutput(torch.ones_like(topk_weights), topk_ids, None),
+        )
+
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+        )
+        method = Fp8MoEMethod(quant_config)
+        layer = nn.Module()
+        method.create_moe_runner(
+            layer, MoeRunnerConfig(top_k=1, apply_router_weight_on_input=True)
+        )
+
+        layer.w13_weight = (
+            torch.randn(
+                self.num_experts,
+                2 * self.intermediate,
+                self.hidden,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            .mul_(0.1)
+            .to(torch.float8_e4m3fn)
+        )
+        layer.w2_weight = (
+            torch.randn(
+                self.num_experts,
+                self.hidden,
+                self.intermediate,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            .mul_(0.1)
+            .to(torch.float8_e4m3fn)
+        )
+        layer.w13_weight_scale_inv = torch.linspace(
+            0.75,
+            1.25,
+            self.num_experts * 4 * 2,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(self.num_experts, 4, 2)
+        layer.w2_weight_scale_inv = torch.linspace(
+            1.25,
+            0.75,
+            self.num_experts * 2 * 2,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(self.num_experts, 2, 2)
+
+        orig_topk = self.topk
+        self.topk = 1
+        try:
+            reference = self._reference_moe(
+                scaled_dispatch_output,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                block_shape=[128, 128],
+            )
+        finally:
+            self.topk = orig_topk
+        output = method.apply(layer, dispatch_output)
+        self._assert_output_matches_reference(output, reference)
+
     def test_fp8_moe_method_full_lifecycle(self):
         dispatch_output = self._create_dispatch_output()
-        quant_config = MagicMock(
+        quant_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
-            is_fp4_experts=False,
-            use_mxfp8=False,
             weight_block_size=[128, 128],
-            activation_scheme="dynamic",
         )
         method = Fp8MoEMethod(quant_config)
         layer = nn.Module()
@@ -486,25 +575,37 @@ class TestXpuMoeWna16(CustomTestCase):
                 torch.float8_e4m3fn
             )
         )
-        layer.w13_weight_scale_inv.data.fill_(1.0)
-        layer.w2_weight_scale_inv.data.fill_(1.0)
+        layer.w13_weight_scale_inv.data.copy_(
+            torch.linspace(
+                0.75, 1.25, layer.w13_weight_scale_inv.numel(), dtype=torch.float32
+            ).view_as(layer.w13_weight_scale_inv)
+        )
+        layer.w2_weight_scale_inv.data.copy_(
+            torch.linspace(
+                1.25, 0.75, layer.w2_weight_scale_inv.numel(), dtype=torch.float32
+            ).view_as(layer.w2_weight_scale_inv)
+        )
 
         layer.to(self.device)
         method.process_weights_after_loading(layer)
 
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            block_shape=[128, 128],
+        )
         output = method.apply(layer, dispatch_output)
-        self.assertIsInstance(output, StandardCombineInput)
-        self.assertEqual(output.hidden_states.shape, (self.num_tokens, self.hidden))
-        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self._assert_output_matches_reference(output, reference)
 
     def test_mxfp8_moe_method_full_lifecycle(self):
         dispatch_output = self._create_dispatch_output()
-        quant_config = MagicMock(
+        quant_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
-            is_fp4_experts=False,
             use_mxfp8=True,
             weight_block_size=[1, 32],
-            activation_scheme="dynamic",
         )
         method = Fp8MoEMethod(quant_config)
         layer = nn.Module()
@@ -531,16 +632,30 @@ class TestXpuMoeWna16(CustomTestCase):
                 torch.float8_e4m3fn
             )
         )
-        layer.w13_weight_scale_inv.data.fill_(127)
-        layer.w2_weight_scale_inv.data.fill_(127)
+        scale_pattern = torch.tensor(
+            [126, 127, 128, 127, 126, 128, 127, 126], dtype=torch.uint8
+        )
+        layer.w13_weight_scale_inv.data.copy_(
+            scale_pattern.view(1, 1, -1).expand_as(layer.w13_weight_scale_inv)
+        )
+        layer.w2_weight_scale_inv.data.copy_(
+            scale_pattern.view(1, 1, -1).expand_as(layer.w2_weight_scale_inv)
+        )
 
         layer.to(self.device)
         method.process_weights_after_loading(layer)
 
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            block_shape=[1, 32],
+            mxfp8=True,
+        )
         output = method.apply(layer, dispatch_output)
-        self.assertIsInstance(output, StandardCombineInput)
-        self.assertEqual(output.hidden_states.shape, (self.num_tokens, self.hidden))
-        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self._assert_output_matches_reference(output, reference)
 
     def test_compressed_tensors_w8a8_fp8_moe_tensor(self):
         dispatch_output = self._create_dispatch_output()
@@ -645,6 +760,119 @@ class TestXpuMoeWna16(CustomTestCase):
             layer.w13_weight_scale,
             layer.w2_weight_scale,
             block_shape=[128, 128],
+        )
+        output = scheme.apply_weights(layer, dispatch_output)
+        self._assert_output_matches_reference(output, reference)
+
+    def test_compressed_tensors_w8a8_fp8_moe_block_full_lifecycle(self):
+        dispatch_output = self._create_dispatch_output()
+        weight_quant = MagicMock(
+            strategy=QuantizationStrategy.BLOCK,
+            block_structure=[128, 128],
+            dynamic=False,
+        )
+        input_quant = MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True)
+        scheme = CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        scheme.moe_runner_config = MoeRunnerConfig()
+        layer = nn.Module()
+        layer.moe_tp_size = 1
+        layer.num_local_experts = self.num_experts
+        layer.intermediate_size_per_partition = self.intermediate
+
+        scheme.create_weights(
+            layer,
+            num_experts=self.num_experts,
+            hidden_size=self.hidden,
+            intermediate_size_per_partition=self.intermediate,
+            params_dtype=torch.float8_e4m3fn,
+        )
+        scheme.create_moe_runner(layer, MoeRunnerConfig())
+
+        layer.w13_weight.data.copy_(
+            (torch.randn_like(layer.w13_weight.data.float()) * 0.1).to(
+                torch.float8_e4m3fn
+            )
+        )
+        layer.w2_weight.data.copy_(
+            (torch.randn_like(layer.w2_weight.data.float()) * 0.1).to(
+                torch.float8_e4m3fn
+            )
+        )
+        layer.w13_weight_scale.data.copy_(
+            torch.linspace(
+                0.75, 1.25, layer.w13_weight_scale.numel(), dtype=torch.float32
+            ).view_as(layer.w13_weight_scale)
+        )
+        layer.w2_weight_scale.data.copy_(
+            torch.linspace(
+                1.25, 0.75, layer.w2_weight_scale.numel(), dtype=torch.float32
+            ).view_as(layer.w2_weight_scale)
+        )
+
+        layer.to(self.device)
+        scheme.process_weights_after_loading(layer)
+
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            block_shape=[128, 128],
+        )
+        output = scheme.apply_weights(layer, dispatch_output)
+        self._assert_output_matches_reference(output, reference)
+
+    def test_compressed_tensors_w8a8_fp8_moe_tensor_full_lifecycle(self):
+        dispatch_output = self._create_dispatch_output()
+        weight_quant = MagicMock(strategy=QuantizationStrategy.TENSOR)
+        input_quant = MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True)
+        scheme = CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        scheme.moe_runner_config = MoeRunnerConfig()
+        layer = nn.Module()
+        layer.moe_tp_size = 1
+        layer.num_local_experts = self.num_experts
+        layer.intermediate_size_per_partition = self.intermediate
+
+        scheme.create_weights(
+            layer,
+            num_experts=self.num_experts,
+            hidden_size=self.hidden,
+            intermediate_size_per_partition=self.intermediate,
+            params_dtype=torch.float8_e4m3fn,
+        )
+        scheme.create_moe_runner(layer, MoeRunnerConfig())
+
+        layer.w13_weight.data.copy_(
+            (torch.randn_like(layer.w13_weight.data.float()) * 0.1).to(
+                torch.float8_e4m3fn
+            )
+        )
+        layer.w2_weight.data.copy_(
+            (torch.randn_like(layer.w2_weight.data.float()) * 0.1).to(
+                torch.float8_e4m3fn
+            )
+        )
+        layer.w13_weight_scale.data.copy_(
+            torch.linspace(
+                0.75, 1.25, layer.w13_weight_scale.numel(), dtype=torch.float32
+            ).view_as(layer.w13_weight_scale)
+        )
+        layer.w2_weight_scale.data.copy_(
+            torch.linspace(
+                1.25, 0.75, layer.w2_weight_scale.numel(), dtype=torch.float32
+            ).view_as(layer.w2_weight_scale)
+        )
+
+        layer.to(self.device)
+        scheme.process_weights_after_loading(layer)
+
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
         )
         output = scheme.apply_weights(layer, dispatch_output)
         self._assert_output_matches_reference(output, reference)
