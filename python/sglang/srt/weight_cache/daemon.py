@@ -454,6 +454,8 @@ class WeightCacheDaemon:
 
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name, entry in self.state_entries.items():
+            entry["persistent"] = name in state_dict_names
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
