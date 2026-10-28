@@ -521,9 +521,14 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        per_config = self.quant_config.convert_mxfp8_to_block_fp8
         self.convert_mxfp8_to_block = self.use_mxfp8 and (
-            _mxfp8_to_block_fp8_required
-            or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
+            (
+                _mxfp8_to_block_fp8_required
+                or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
+            )
+            if per_config is None
+            else per_config
         )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
@@ -787,18 +792,26 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
-        elif _is_npu and is_npu_arch35():
+        elif (
+            _is_npu
+            and is_npu_arch35()
+            and (
+                # UE8M0 checkpoints: lossless MXFP8 re-layout. Plain block-FP8
+                # (fp32 scales): lossy requant, opt-in via
+                # SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8=1. Otherwise the generic
+                # path below keeps the checkpoint layout and numerics.
+                self.quant_config.scale_fmt == "ue8m0"
+                or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+            )
+        ):
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
 
-            # UE8M0 checkpoints only need re-layout; plain block-FP8 ones
-            # (fp32 block scales) get requantized inside. Either way the
-            # layer ends up in the MXFP8 layout for npu_w8a8_mxfp8_linear.
             process_npu_arch35_mxfp8_linear_weights(
                 layer,
                 self.weight_block_size,
-                scale_fmt=getattr(self.quant_config, "scale_fmt", None),
+                scale_fmt=self.quant_config.scale_fmt,
             )
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -1480,7 +1493,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        per_config = self.quant_config.convert_mxfp8_to_block_fp8
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _mxfp8_to_block_fp8_required if per_config is None else per_config
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
@@ -2736,8 +2752,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
+            # Execution kernels may declare the dispatch wire format they
+            # need (DISPATCHER_QUANT_CONFIG, e.g. the NPU W4A8 MXFP GMMs
+            # consume MXFP8 activations); otherwise report the checkpoint
+            # dtype and let the dispatcher pick.
+            kernel_quant_config = getattr(
+                getattr(layer, "w13_kernel", None), "DISPATCHER_QUANT_CONFIG", None
+            )
             layer.dispatcher.set_quant_config(
-                {
+                kernel_quant_config
+                if kernel_quant_config is not None
+                else {
                     "weight_dtype": layer.w13_weight.dtype,
                     "use_mxfp8": self.use_mxfp8,
                 }

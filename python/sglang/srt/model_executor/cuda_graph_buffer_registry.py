@@ -828,7 +828,8 @@ def build_decode_registry(
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
                     # .get(): a proxy entry can be absent (e.g. topk_indices
-                    # when a DSA model runs a dense attention backend);
+                    # when a DSA model runs a dense attention backend, or
+                    # residual when a model folds it into hidden_states);
                     # returning None skips the copy for that slot.
                     return None if ppx is None else ppx.tensors.get(key)
 

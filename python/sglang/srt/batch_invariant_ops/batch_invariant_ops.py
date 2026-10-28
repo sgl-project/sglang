@@ -3,7 +3,7 @@
 import contextlib
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import triton
@@ -1202,6 +1202,147 @@ def rms_norm_batch_invariant(
         RMS normalized tensor
     """
     return rms_norm(input, weight, eps=eps)
+
+
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    input_ptr,
+    residual_ptr,
+    addend_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_out_ptr,
+    input_row_stride: tl.constexpr,
+    residual_row_stride: tl.constexpr,
+    addend_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    residual_out_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps,
+    HAS_ADDEND: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Add the residual (and an optional addend) to the input in float32, store the
+    sum as the new residual, and RMS-normalize the sum.
+    Each block handles one row, so a row's result does not depend on the others.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    input_row = input_ptr + row_idx * input_row_stride
+    residual_row = residual_ptr + row_idx * residual_row_stride
+    addend_row = addend_ptr + row_idx * addend_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+    residual_out_row = residual_out_ptr + row_idx * residual_out_row_stride
+
+    # Step 1: Sum in float32, store the new residual, accumulate the sum of squares
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals_f32 = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        vals_f32 += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADDEND:
+            vals_f32 += tl.load(addend_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        tl.store(
+            residual_out_row + col_idx,
+            vals_f32.to(residual_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        sum_sq += tl.sum(tl.where(mask, vals_f32 * vals_f32, 0.0))
+
+    # Step 2: Compute RMS (root mean square) in float32
+    mean_sq = sum_sq / n_cols
+    rms = tl.sqrt(mean_sq + eps)
+    inv_rms = 1.0 / rms
+
+    # Step 3: Recompute the float32 sum, normalize and apply weight
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals_f32 = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        vals_f32 += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADDEND:
+            vals_f32 += tl.load(addend_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        weight_f32 = tl.load(weight_ptr + col_idx, mask=mask, other=1.0).to(tl.float32)
+        output_f32 = vals_f32 * inv_rms * weight_f32
+        tl.store(
+            output_row + col_idx,
+            output_f32.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def fused_add_rms_norm_batch_invariant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    addend: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    residual_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batch-invariant fused residual add and RMS normalization.
+
+    sum = input + residual (+ addend), computed in float32
+    output = sum / sqrt(mean(sum^2) + eps) * weight
+
+    Args:
+        input: Input tensor of shape (..., hidden_size)
+        residual: Residual tensor of the same shape
+        weight: Weight tensor of shape (hidden_size,)
+        eps: Small constant for numerical stability
+        addend: Optional tensor of the same shape, added after the residual
+        out_dtype: dtype of the output (default: input's dtype)
+        residual_dtype: dtype of the new residual (default: input's dtype)
+
+    Returns:
+        (output, new residual), both of the input's shape
+    """
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+    assert residual.shape == input.shape, "Residual must match the input's shape"
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    residual_2d = residual.reshape(-1, input.shape[-1]).contiguous()
+    addend_2d = (
+        addend.reshape(-1, input.shape[-1]).contiguous()
+        if addend is not None
+        else input_2d
+    )
+    weight = weight.contiguous()
+
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d, dtype=out_dtype or input.dtype)
+    residual_out = torch.empty_like(input_2d, dtype=residual_dtype or input.dtype)
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    _fused_add_rms_norm_kernel[grid](
+        input_2d,
+        residual_2d,
+        addend_2d,
+        weight,
+        output,
+        residual_out,
+        input_2d.stride(0),
+        residual_2d.stride(0),
+        addend_2d.stride(0),
+        output.stride(0),
+        residual_out.stride(0),
+        n_cols,
+        eps,
+        HAS_ADDEND=addend is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output.reshape(original_shape), residual_out.reshape(original_shape)
 
 
 _ONES_CACHE: dict[Tuple, torch.Tensor] = {}

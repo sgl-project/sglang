@@ -149,7 +149,7 @@ class DecoderReplayTail:
             row_step=row_step, max_rows=max_rows, label="Decoder tail graph"
         )
         self._static_ids_global: dict[torch.dtype, torch.Tensor] = {}
-        # Older, smaller sets stay alive for the graphs that read them.
+        # Older, smaller sets stay alive for the graphs that write and read them.
         self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
 
     @classmethod
@@ -477,48 +477,69 @@ class DecoderReplayTail:
         block_rows: int,
         source_kv_layer_id: Optional[int],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """Runs the tail in one break of the outer prefill graph, bridged into its
-        ``block_rows`` block."""
-        leaves, _, rebuild = _flatten_state(state)
-        residual, pre, *aux = bcg_tail_layers_in_prefill_graph(
+        """Runs the tail in one break of the outer prefill graph and returns views of
+        the bridge over its ``block_rows`` block, which the break fills."""
+        leaves, has_pre, rebuild = _flatten_state(state)
+        bridge_key = (capture_dspark, has_pre)
+        bridge = self._bridge(bridge_key, block_rows)
+        # A capture records the bridge it is given; the warmup before it allocates one.
+        assert bridge is not None or bcg_module._current_capture_var.get() is None, (
+            "tail bridge not allocated before capture"
+        )
+        bcg_tail_layers_in_prefill_graph(
             self,
             rebuild,
             capture_dspark,
             block_rows,
             source_kv_layer_id,
             get_parallel().attn_dp_size > 1,
+            bridge_key,
+            bridge,
             leaves,
             positions,
             input_ids,
             input_ids if input_ids_global is None else input_ids_global,
         )
+        if bridge is None:  # first run: the break allocated the bridge
+            bridge = self._bridge(bridge_key, block_rows)
+        residual, pre, *aux = bridge
         return residual, pre, aux
 
-    def _bridge_outputs(
-        self, block_rows: int, outputs: List[Optional[torch.Tensor]]
-    ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Block-sized bridge views of the tail rows. Rows past the tail hold stale
-        values, which reach only rows that _scatter_tail_rows and the
-        real_rows_count cut drop."""
-        key = tuple(None if t is None else (t.dtype, t.shape[1:]) for t in outputs)
-        sets = self._bridge_buffers.setdefault(key, [])
+    def _bridge(
+        self, key: Tuple[bool, bool], block_rows: int
+    ) -> Optional[List[Optional[torch.Tensor]]]:
+        """The newest bridge buffers for ``key`` cut to ``block_rows`` rows, or None
+        when there are none yet or they are too small."""
+        sets = self._bridge_buffers.get(key)
         if not sets or sets[0][0].shape[0] < block_rows:
-            sets.insert(
-                0,
-                [
-                    None if t is None else t.new_zeros((block_rows, *t.shape[1:]))
-                    for t in outputs
-                ],
-            )
-        views = []
-        for buf, t in zip(sets[0], outputs):
+            return None
+        return [None if buf is None else buf[:block_rows] for buf in sets[0]]
+
+    def _write_bridge(
+        self,
+        key: Tuple[bool, bool],
+        block_rows: int,
+        bridge: Optional[List[Optional[torch.Tensor]]],
+        outputs: List[Optional[torch.Tensor]],
+    ) -> None:
+        """Copies the tail rows into ``bridge``, allocating a new one for ``key`` when
+        it is None. Rows past the tail keep stale values, which flow only into rows
+        that _scatter_tail_rows and the real_rows_count cut drop."""
+        if bridge is None:
+            bridge = [
+                None if t is None else t.new_zeros((block_rows, *t.shape[1:]))
+                for t in outputs
+            ]
+            self._bridge_buffers.setdefault(key, []).insert(0, bridge)
+        for buf, t in zip(bridge, outputs, strict=True):
             if t is None:
-                views.append(None)
+                assert buf is None, "tail outputs differ within one bridge key"
                 continue
-            view = buf[:block_rows]
-            view[: t.shape[0]].copy_(t)
-            views.append(view)
-        return tuple(views)
+            assert (buf.dtype, buf.shape[1:]) == (t.dtype, t.shape[1:]), (
+                (buf.dtype, buf.shape),
+                (t.dtype, t.shape),
+            )
+            buf[: t.shape[0]].copy_(t)
 
     def _ids_global_buffer(self, dtype: torch.dtype, dp_size: int) -> torch.Tensor:
         buf = self._static_ids_global.get(dtype)
@@ -644,7 +665,7 @@ def _enter_eager_tail_in_prefill_graph(
     backend, graph_batch: ForwardBatch, source_kv_layer_id: Optional[int]
 ) -> Tuple[tuple, ForwardBatch]:
     """Switches onto exact-row tail metadata; returns the exit state and the
-    batch the tail runs on (the capture batch while the graph captures)."""
+    batch the tail runs on (the dummy batch during the graph warmup)."""
     forward_batch = _unpadded_batch(backend.prefill_graph_replay_batch or graph_batch)
     held = backend.tail_forward_metadata
     backend.tail_forward_metadata = backend._build_late_layer_tail_metadata(
@@ -665,20 +686,19 @@ def _tail_layers_in_prefill_graph(
     block_rows: int,
     source_kv_layer_id: Optional[int],
     dp: bool,
+    bridge_key: Tuple[bool, bool],
+    bridge: Optional[List[Optional[torch.Tensor]]],
     leaves: List[torch.Tensor],
     positions: torch.Tensor,
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
-) -> Tuple[Optional[torch.Tensor], ...]:
+) -> None:
     # The tail captures its row-bucket graphs on first use.
     note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
     )
-    # Runs between the outer graph's segments, also while it captures, so the
-    # inner breaks must run directly.
-    capture_token = bcg_module._current_capture_var.set(None)
     try:
         tail = backend.forward_metadata.late_layer_tail
         # The graph's rows are padded to its shape; the tail indexes live rows.
@@ -690,8 +710,8 @@ def _tail_layers_in_prefill_graph(
         num_rows = tail.positions.shape[0]
         dp_rows = None
         if dp:
-            # Exchanged before the forward, except while the prefill graphs capture
-            # (every rank together), when it gathers here.
+            # Exchanged before the forward, except on the dummy batches the prefill
+            # graphs warm up on (every rank together), when it gathers here.
             dp_rows = forward_batch.global_late_layer_num_tokens_cpu
             if dp_rows is None:
                 counts = torch.empty(get_parallel().tp_size, dtype=torch.int64)
@@ -731,9 +751,10 @@ def _tail_layers_in_prefill_graph(
             residual, pre, aux = tail_layers.run(**kwargs)
         else:
             residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
-        return tail_layers._bridge_outputs(block_rows, [residual, pre, *aux])
+        tail_layers._write_bridge(
+            bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
+        )
     finally:
-        bcg_module._current_capture_var.reset(capture_token)
         backend.exit_late_layer_tail(saved, forward_batch)
         backend.prefill_graph_replay_batch = None
 
