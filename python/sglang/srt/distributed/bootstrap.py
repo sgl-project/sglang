@@ -114,6 +114,12 @@ def init_parallel_runtime(
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
 
+    # NPU: install transfer_to_npu to route torch.cuda.* to torch.npu.*
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+        init_npu_backend()
+
     backend = _resolve_backend(device=device)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
@@ -402,8 +408,8 @@ def _prewarm_tp_lm_head_all_to_all() -> None:
     """Materialize PyNCCL P2P resources before model-memory accounting."""
     warmup_start = time.perf_counter()
     tp_group = get_tp_group()
-    pynccl_comm = tp_group.pynccl_comm
-    if pynccl_comm is None or not pynccl_comm.available:
+    pynccl_comm = tp_group.get_available_pynccl_comm()
+    if pynccl_comm is None:
         raise RuntimeError(
             "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
             "communicator for CUDA graph capture."
