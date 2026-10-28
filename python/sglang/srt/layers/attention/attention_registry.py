@@ -562,7 +562,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             # SSM/conv intermediate caches on every device. In particular, it
             # must not inherit the Ascend GDN wrapper's expanded-window rollback.
             hybrid_backend_cls = CommunityHybridLinearAttnBackend
-            logger.info("Using community hybrid linear attention backend for KDA.")
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

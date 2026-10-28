@@ -1371,15 +1371,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        """Why this checkpoint cannot fuse its shared expert, or ``None``.
-
-        The loader evaluates this gate before constructing any layers.  GLM5
-        Next is a multimodal wrapper, so use the same text config that is later
-        passed to ``Glm5NextModel``.
-        """
+        # Kept in lockstep with the wrapper gate below: a divergence drops the
+        # shared-expert weights and runs the fused slot uninitialized.
         text_config = getattr(hf_config, "text_config", hf_config)
-        n_shared_experts = getattr(text_config, "n_shared_experts", None)
-        if not n_shared_experts:
+        if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
         if getattr(text_config, "n_shared_experts", None) != 1:
             return "Shared experts fusion requires exactly one shared expert."

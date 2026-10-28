@@ -20,7 +20,6 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -895,10 +894,6 @@ def init_kpool_extend_metadata_npu(
         or forward_batch.extend_seq_lens_cpu is None
         or forward_batch.seq_lens_cpu is None
     ):
-        rank0_log(
-            f"===<<<< {forward_batch.extend_seq_lens_cpu=}, "
-            f"{forward_batch.seq_lens_cpu=}"
-        )
         return metadata
 
     cpu = _kpool_cpu_plan(forward_batch, pool_size, slots_per_page)
@@ -1011,10 +1006,7 @@ def init_kpool_extend_metadata_npu(
         ragged_paged_page_table_row_index=None,
         cp=None,
     )
-    # rank0_log(f"===>init_kpool_extend_metadata_npu: {plan=}")
     metadata.kpool_extend_plan = plan
-    # data_ret = dataclasses.replace(metadata, kpool_extend_plan=plan)
-    # rank0_log(f"===>init_kpool_extend_metadata_npu: {metadata.kpool_extend_plan=}")
     return
 
 
