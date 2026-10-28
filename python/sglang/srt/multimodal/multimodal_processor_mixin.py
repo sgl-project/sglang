@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import os
 from contextlib import contextmanager
 from typing import Any, List, Optional, Tuple
 
@@ -46,9 +45,7 @@ class MultimodalProcessorMixin:
     precompute_hash_before_cpu_transfer = False
     keep_mm_features_on_device = False
 
-    def _initialize_processor(
-        self, hf_config, _processor, *, processor_config, **kwargs
-    ):
+    def _initialize_processor(self, hf_config, _processor, *, processor_config):
         self.hf_config = hf_config
         self._processor = _processor
 
@@ -85,13 +82,9 @@ class MultimodalProcessorMixin:
             self._tokenizer_auto_adds_specials = False
 
         requested_mm_io_worker_num = processor_config.mm_io_worker_num
-        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
         if requested_mm_io_worker_num:
             self.mm_io_worker_num = requested_mm_io_worker_num
             io_worker_source = "explicit"
-        elif env_mm_io_worker_num is not None:
-            self.mm_io_worker_num = int(env_mm_io_worker_num)
-            io_worker_source = "environment"
         else:
             self.mm_io_worker_num = self.auto_mm_io_worker_num
             io_worker_source = "auto"
@@ -105,12 +98,9 @@ class MultimodalProcessorMixin:
                 self.mm_io_worker_num,
                 io_worker_source,
             )
-        skip_mm_pool = kwargs.get("skip_mm_pool", False)
         requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
         self.mm_processor_worker_num = (
-            1
-            if skip_mm_pool
-            else requested_mm_processor_worker_num
+            requested_mm_processor_worker_num
             or self._resolve_auto_mm_processor_worker_num()
         )
         if (

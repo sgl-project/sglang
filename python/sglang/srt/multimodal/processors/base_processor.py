@@ -265,13 +265,19 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             image_processor_backend=get_mm().image_processor_backend,
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
-            mm_processor_worker_num=get_mm().mm_processor_worker_num,
-            mm_io_worker_num=get_mm().mm_io_worker_num,
+            # A processor built without the feature pool runs its calls synchronously.
+            mm_processor_worker_num=(
+                1
+                if kwargs.get("skip_mm_pool", False)
+                else get_mm().mm_processor_worker_num
+            ),
+            mm_io_worker_num=get_mm().mm_io_worker_num
+            or int(os.environ.get("SGLANG_IO_WORKERS", 0)),
             allowed_media_domains=get_mm().allowed_media_domains,
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
         )
         MultimodalProcessorMixin._initialize_processor(
-            self, hf_config, _processor, processor_config=processor_config, **kwargs
+            self, hf_config, _processor, processor_config=processor_config
         )
         self._cpu_executor_lock = threading.Lock()
         self.cpu_executor = self._create_cpu_executor()
