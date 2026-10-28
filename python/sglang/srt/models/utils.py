@@ -549,6 +549,112 @@ def apply_qk_norm(
     return q, k
 
 
+def can_use_jit_qk_norm_rope(
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: torch.nn.Module,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether ``apply_qk_norm_rope`` may fuse QK-norm and RoPE into the JIT
+    qknorm_rope kernel (ROCm only). Call it at init: it builds the kernel, which
+    must not happen for the first time inside CUDA graph capture."""
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+
+    if not (
+        _is_hip
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and get_exec().deterministic.rl_on_policy_target is None
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
+        and dtype in (torch.bfloat16, torch.float16)
+        # Scaled-RoPE subclasses (YaRN, Llama3, MRoPE, ...) stay on the unfused path.
+        and type(rotary_emb) is RotaryEmbedding
+        and not rotary_emb._force_native
+        and rotary_emb.head_size == head_dim
+        and rotary_emb.cos_sin_cache.dtype == torch.float32
+        and type(q_norm) is RMSNorm
+        and type(k_norm) is RMSNorm
+        and q_norm.variance_epsilon == k_norm.variance_epsilon
+    ):
+        return False
+    for norm in (q_norm, k_norm):
+        if (
+            not norm.has_weight
+            or norm.cast_x_before_out_mul
+            or norm.variance_size_override is not None
+            or norm.weight.dtype != dtype
+        ):
+            return False
+
+    from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+        can_use_fused_inplace_qknorm_rope,
+    )
+
+    return can_use_fused_inplace_qknorm_rope(
+        head_dim,
+        rotary_emb.rotary_dim,
+        rotary_emb.is_neox_style,
+        dtype,
+        torch.float32,
+        round_norm_before_rope=True,
+    )
+
+
+def apply_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: torch.nn.Module,
+    positions: torch.Tensor,
+    head_dim: int,
+    alt_stream: Optional[torch.cuda.Stream] = None,
+    use_jit: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """QK-norm followed by RoPE. With ``use_jit`` (from ``can_use_jit_qk_norm_rope``)
+    both run in place as one kernel; otherwise ``apply_qk_norm`` then ``rotary_emb``."""
+    num_tokens = q.size(0)
+    if (
+        use_jit
+        and positions.dim() == 1
+        # A dtype other than the one checked at init would build a new kernel here.
+        and q.dtype == q_norm.weight.dtype
+    ):
+        if num_tokens == 0:
+            # HIP rejects a zero-size grid.
+            return q, k
+        from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+            fused_inplace_qknorm_rope,
+        )
+
+        rotary_emb._match_cos_sin_cache_dtype(q)
+        fused_inplace_qknorm_rope(
+            q.view(num_tokens, -1, head_dim),
+            k.view(num_tokens, -1, head_dim),
+            q_norm.weight,
+            k_norm.weight,
+            rotary_emb.cos_sin_cache,
+            positions,
+            is_neox=rotary_emb.is_neox_style,
+            eps=q_norm.variance_epsilon,
+            head_dim=head_dim,
+            rope_dim=rotary_emb.rotary_dim,
+            round_norm_before_rope=True,
+        )
+        return q, k
+
+    q, k = apply_qk_norm(
+        q=q,
+        k=k,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        alt_stream=alt_stream,
+    )
+    return rotary_emb(positions, q, k)
+
+
 # ---------------------------------------------------------------------------
 # Fused QK GemmaRMSNorm Triton kernel
 # grid = q_rows (the larger dimension in GQA).  Every block computes Q norm
