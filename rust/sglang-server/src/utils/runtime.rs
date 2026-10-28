@@ -45,7 +45,7 @@ pub struct Runtime {
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
     /// The shared core, which runs the MM pool processor's media hooks.
-    core: crate::api_server::core::CoreHandle,
+    core: crate::api_server::handlers::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -71,7 +71,10 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new(spec)?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
@@ -85,10 +88,10 @@ impl Runtime {
         workers: usize,
         feature_shm: bool,
     ) {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
-            processor,
-            feature_shm,
-        ));
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::with_processor(processor, feature_shm)
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
     }
 
@@ -314,16 +317,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // One transport-neutral entrance to the runtime. Each configured listener
     // receives a clone; no listener owns or reconstructs scheduler wiring.
-    let core = crate::api_server::core::CoreHandle::new(
+    let core = crate::api_server::handlers::CoreHandle::new(
         senders.tok_manager_tx.clone(),
         senders.abort_tx.clone(),
-        crate::api_server::core::CoreConfig {
+        crate::api_server::handlers::CoreConfig {
             response_capacity: cfg.rust_server_args.stage_channel_cap,
             response_activity: response_activity.clone(),
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
-            metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
+            peer_endpoints: crate::api_server::core::peer_endpoints(
+                &cfg.server_args.deployment_info,
+                cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+            )?,
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
         },
     );
@@ -334,7 +341,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let core = core.clone();
-        let hicache_manager = Arc::new(api_server::core::HiCacheManager::new(
+        let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
             core.clone(),
             &cfg.server_args,
         ));
@@ -395,6 +402,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
+            limits: tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
         },
         core,
         threads: Mutex::new(threads),
@@ -677,6 +685,73 @@ mod tests {
         );
 
         rt.request_shutdown();
+    }
+
+    /// Media the processor refuses fails `/generate` as the client's error with
+    /// the processor's message, as Python answers its processor's `ValueError`:
+    /// a 400, or for a stream an error event with code 400. The processor's own
+    /// failure (Python's `RuntimeError`, e.g. an allocation failure) stays a 500.
+    #[test]
+    fn refused_media_is_a_bad_request() {
+        use crate::multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+        use std::io::{Read, Write};
+
+        struct FailingProcessor(MediaError);
+        impl MmProcessor for FailingProcessor {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
+                Err(self.0.clone())
+            }
+        }
+
+        for (error, status) in [
+            (
+                MediaError::Client("image decode failed: CRC error".into()),
+                400,
+            ),
+            (
+                MediaError::Server("audio decode: Cannot allocate memory".into()),
+                500,
+            ),
+        ] {
+            let message = error.to_string();
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            let mut server_args = test_server_args();
+            server_args.model_config.is_multimodal = true;
+            cfg.server_args = Arc::new(server_args);
+            let rt = start(cfg, None).expect("start runtime");
+            rt.start_mm_workers_with_processor(Arc::new(FailingProcessor(error)), 1, false);
+            for stream in [false, true] {
+                let body = format!(
+                    r#"{{"input_ids":[1,2,3],"image_data":"data:image/png;base64,AAAA","stream":{stream}}}"#
+                );
+                let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+                conn.write_all(
+                    format!(
+                        "POST /generate HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let mut response = String::new();
+                conn.read_to_string(&mut response).unwrap();
+                let http_status = response.split(' ').nth(1).unwrap_or_default();
+                let expected = if stream { "200" } else { &status.to_string() };
+                assert_eq!(http_status, expected, "{response}");
+                assert!(
+                    response.contains(&format!(r#""message":"{message}""#))
+                        && response.contains(&format!(r#""code":{status}"#)),
+                    "{response}"
+                );
+            }
+            rt.request_shutdown();
+        }
     }
 
     /// An embedding package's `http_layer` wraps the served app: its own route
