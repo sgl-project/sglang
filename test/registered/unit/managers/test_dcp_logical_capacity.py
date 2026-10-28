@@ -22,7 +22,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 PHYSICAL = 690240
 CONTEXT = 1048576
@@ -32,6 +32,7 @@ def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    configurator.model_config = NS(hf_config=NS(architectures=["LlamaForCausalLM"]))
     return configurator
 
 

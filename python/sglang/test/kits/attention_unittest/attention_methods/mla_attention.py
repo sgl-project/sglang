@@ -243,6 +243,8 @@ class MockMLAModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        # FlashInfer MLA __init__ scans model.modules() for attn_type.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)

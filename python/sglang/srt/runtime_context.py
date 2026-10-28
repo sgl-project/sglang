@@ -569,6 +569,7 @@ class MoeFlags(_FlagGroupBase):
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
     deepep_config: str | None = None
+    moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None

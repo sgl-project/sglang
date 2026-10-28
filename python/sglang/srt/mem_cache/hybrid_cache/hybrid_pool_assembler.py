@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
@@ -33,6 +34,10 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import (
+    PageInterleaveHostPool,
+)
+from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -185,7 +190,22 @@ def build_kv_host_pool(
         check_packed_kv_rows(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
+    parallel = get_parallel()
+    geometry = resolve_kv_host_geometry(
+        kv_pool,
+        page_size=page_size // parallel.attn_dcp_size
+        if use_mla and parallel.dcp_enabled
+        else page_size,
+        layout=get_memory().hicache_mem_layout,
+        use_mla=use_mla,
+        draft_layer_num=len(mtp_draft_device_pools),
+        override_kv_cache_dim=override_kv_cache_dim,
+    )
     kwargs = {}
+    if geometry.page_unified_layout is not None:
+        kwargs["page_unified_layout"] = geometry.page_unified_layout
+        if not use_mla:
+            kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -200,16 +220,11 @@ def build_kv_host_pool(
                 for pool in mtp_draft_device_pools
             ),
             layer_shard_enabled=kv_pool.layer_shard_enabled,
-            target_layer_num=(
-                (kv_pool.layer_num + kv_pool.layer_shard_size - 1)
-                // kv_pool.layer_shard_size
-                if kv_pool.layer_shard_enabled
-                else kv_pool.layer_num
-            ),
+            write_back_staging=kv_pool.hicache_write_back_staging,
+            target_layer_num=geometry.target_layer_num,
         )
     else:
         kwargs.update(mha_kwargs)
-    parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
@@ -217,7 +232,7 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
-    return kv_host_pool_cls(
+    host_pool = kv_host_pool_cls(
         host_input,
         get_memory().hicache_ratio,
         get_memory().hicache_size if host_size is None else host_size,
@@ -227,6 +242,9 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+        return PageInterleaveHostPool(host_pool, kv_pool.placement)
+    return host_pool
 
 
 def _split_hicache_size(
@@ -1574,6 +1592,7 @@ def _build_mha_mla_host_pool(
     layout: str,
     allocator_type: str,
     pool_label: str,
+    host_token_capacity: int | None = None,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -1590,6 +1609,7 @@ def _build_mha_mla_host_pool(
         layout=layout,
         allocator_type=allocator_type,
         pool_label=pool_label,
+        host_token_capacity=host_token_capacity,
     )
     if isinstance(pool, MHATokenToKVPool):
         host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
@@ -1603,6 +1623,7 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
 
@@ -1625,6 +1646,8 @@ def build_full_draft_pools(
 
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
+    if pool.layer_num > controller.transfer_layer_id_max:
+        raise ValueError("Draft HiCache layers exceed the target transfer stages")
 
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
@@ -1635,6 +1658,7 @@ def build_full_draft_pools(
         layout=get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
         pool_label="draft",
+        host_token_capacity=host_pool_group.logical_size,
     )
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
@@ -2491,6 +2515,13 @@ def _apply_stack_result(
         cache.register_sidecar_pool(sidecar)
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
+    if isinstance(kvcache, PageInterleaveKVPoolMixin):
+        # Packed draft KV and indexer loads finish before target layer zero is
+        # ready. Their independent gather streams must consume that same event.
+        for draft_pool in params.mtp_draft_device_pools:
+            draft_pool.register_layer_transfer_counter(
+                result.cache_controller.layer_done_counter
+            )
     if result.register_req_to_token_counter:
         params.req_to_token_pool.register_layer_transfer_counter(
             result.cache_controller.layer_done_counter
@@ -2563,6 +2594,58 @@ def build_minimax_sparse_hicache_stack(
             "index_kv_pool (value-bearing) layers are not cached/restored yet."
         )
     main_pool = sparse_pool.main_pool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    nvfp4 = isinstance(sparse_pool, MiniMaxM3Nvfp4KVPool)
+    host_size = get_memory().hicache_size
+    if nvfp4:
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+        from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
+            MiniMaxM3Nvfp4IndexKPoolHost,
+            MiniMaxM3Nvfp4MainKVPoolHost,
+        )
+
+        if get_memory().hicache_io_backend not in ("kernel", "direct"):
+            raise ValueError("M3.1 NVFP4 HiCache requires kernel or direct IO")
+        if get_memory().hicache_mem_layout not in (
+            "layer_first",
+            "page_first",
+            "page_first_direct",
+        ):
+            raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
+        index_pool = sparse_pool.index_k_pool
+        main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
+        index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
+        draft_bytes = 0
+        for draft_pool in params.sidecar_draft_device_pools:
+            if (
+                type(draft_pool) is not MHATokenToKVPool
+                or draft_pool.size != main_pool.size
+                or draft_pool.page_size != params.page_size
+                or draft_pool.start_layer != 0
+                or draft_pool.layer_num > main_pool.layer_num
+            ):
+                raise ValueError(
+                    "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
+                    "token capacity/page size and at most as many layers as the target"
+                )
+            draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
+                draft_pool.size + draft_pool.page_size
+            )
+        total_bytes = main_bytes + index_bytes + draft_bytes
+        # --hicache-size covers main KV, index payload/scales and draft sidecars.
+        host_size *= main_bytes / total_bytes
+        slots = (
+            int(host_size * 1e9 // main_bytes)
+            if host_size > 0
+            else int(main_pool.size * get_memory().hicache_ratio)
+        )
+        slots = (slots // params.page_size + 1) * params.page_size
+        if slots * total_bytes > host_memory_budget_bytes():
+            raise ValueError(
+                "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
+            )
     start_layer = main_pool.start_layer
     transfer_layer_id_max = main_pool.layer_num
     # Stage-local keys (0..transfer_layer_id_max) match the controller's per-layer
@@ -2571,11 +2654,25 @@ def build_minimax_sparse_hicache_stack(
         layer_id: layer_id for layer_id in range(transfer_layer_id_max)
     }
 
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=main_pool,
-        page_size=params.page_size,
-        use_mla=False,
-    )
+    if nvfp4:
+        kv_host_pool = MiniMaxM3Nvfp4MainKVPoolHost(
+            main_pool.get_device_pool_infos()[0].buffer_info,
+            get_memory().hicache_ratio,
+            host_size,
+            params.page_size,
+            get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            device_capacity_tokens=main_pool.size,
+            start_layer=main_pool.start_layer,
+            end_layer=main_pool.end_layer,
+        )
+    else:
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=main_pool,
+            page_size=params.page_size,
+            use_mla=False,
+            host_size=host_size,
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -2589,12 +2686,22 @@ def build_minimax_sparse_hicache_stack(
 
     index_k_pool = sparse_pool.index_k_pool
     if index_k_pool is not None:
-        index_host_pool = MHATokenToKOnlyPoolHost(
-            index_k_pool,
-            kv_host_pool,
-            get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
-        )
+        if nvfp4:
+            index_host_pool = MiniMaxM3Nvfp4IndexKPoolHost(
+                index_k_pool.get_device_pool_infos()[0].buffer_info,
+                kv_host_pool,
+                get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                start_layer=index_k_pool.start_layer,
+                end_layer=index_k_pool.end_layer,
+            )
+        else:
+            index_host_pool = MHATokenToKOnlyPoolHost(
+                index_k_pool,
+                kv_host_pool,
+                get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            )
         entries.append(
             build_pool_entry(
                 name=PoolName.INDEXER,

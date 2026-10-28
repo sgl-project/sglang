@@ -6,13 +6,14 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
+use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
@@ -70,12 +71,12 @@ impl MambaComponent {
     fn emit_excess_path_states_eviction_(
         &self,
         tail_node_id: NodeId,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if self.mamba_max_states_per_path.is_none() {
             return;
         }
-        cache_actions.push(CacheAction::MambaEvictExcessPathStates { tail_node_id });
+        cache_actions.push(Box::new(MambaEvictExcessPathStates { tail_node_id }));
     }
 }
 
@@ -160,7 +161,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let mamba_value = params
             .mamba_value
@@ -200,7 +201,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tail_node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let Some(cap) = self.mamba_max_states_per_path else {
             return;
@@ -282,7 +283,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = MAMBA;
@@ -348,7 +349,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = MAMBA;
         assert!(
@@ -636,7 +637,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -696,12 +697,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 let Some(target) = attach_target else {
                     // The buffer cannot attach: free it and let the caller keep
                     // its own donated slot bookkeeping.
-                    cache_actions.push(CacheAction::FreeComponentHostSlot {
+                    cache_actions.push(Box::new(FreeComponentHostSlot {
                         component_type: MAMBA,
                         host_indices: host_indices
                             .map(|host| vec![host.shallow_clone()])
                             .unwrap_or_default(),
-                    });
+                    }));
                     if let Some(insert_result) = insert_result {
                         insert_result.mamba_exist = true;
                     }
@@ -733,7 +734,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = MAMBA;
         let mut x = tree_core
