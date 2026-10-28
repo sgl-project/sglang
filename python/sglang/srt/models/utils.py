@@ -300,7 +300,21 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+    ) or (
+        _is_hip
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+        and not _window_writes_translated(pool)
+    )
+
+
+def _window_writes_translated(pool) -> bool:
+    """Whether the pool's window layers write at ids of their own that only the
+    pool's write door derives (a unified pool's window view). The fused store
+    maps window slots through `full_to_swa_index_mapping`, which such a pool
+    does not have, so it would write window layers at the owner's ids."""
+    router = pool.layer_router
+    window = router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+    return window is not None and router.view(window.name).requires_physical_write_loc
 
 
 def create_fused_set_kv_buffer_arg(
