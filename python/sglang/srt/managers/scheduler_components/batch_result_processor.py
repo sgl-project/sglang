@@ -241,7 +241,9 @@ class SchedulerBatchResultProcessor:
                 if isinstance(v, TokenCustomizedInfo):
                     num_visible = self._visible_output_len(req) - output_start
                     if num_visible > 0:
-                        _record_token_values(req, k, v.rows[i], output_start, num_visible)
+                        _record_token_values(
+                            req, k, v.rows[i], output_start, num_visible
+                        )
                     continue
                 if isinstance(v, RequestCustomizedInfo):
                     # A re-prefill after retraction, or a running request in a
