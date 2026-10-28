@@ -247,19 +247,37 @@ import { agentx } from "/src/snippets/agentx/Qwen/qwen3.5.jsx";
 
 <AgentX data={agentx} />
 
-#### 3.3.1 AMD MI355X: Qwen3.5-397B-A17B-FP8 with MTP
+#### 3.3.1 Agentic Long-Context on MI355X (FP8, MTP)
 
-The table above lists NVIDIA configurations. This is the AMD MI355X recipe for the FP8 checkpoint with MTP, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) with the `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261020` image. Concurrency counts live sessions, not requests. Every point runs on 4 GPUs (TP4).
+Agentic replay on MI355X serves `Qwen/Qwen3.5-397B-A17B-FP8` with MTP on four GPUs (TP4), benchmarked on the `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261020` image. Concurrency below counts live sessions, not requests.
 
-- **Concurrency 1-14** keeps the KV cache on the GPU. The sessions fit the device pool, so no HiCache tier is added.
-- **Concurrency 16-80** adds a host-DRAM tier below the GPU KV cache (HiCache), which keeps more prefix cached and reaches higher concurrency than the device pool alone. It is the **Host DRAM (HiCache)** selection in the Playground.
+**Concurrency 1-14, GPU-resident:** the sessions fit the device KV pool, so no HiCache tier is added.
 
-Both bands share one command. The braced values follow concurrency:
+**Concurrency 16-80, HiCache:** a host-DRAM tier below the GPU KV cache keeps more prefix cached and reaches higher concurrency than the device pool alone. This is the **Host DRAM (HiCache)** selection in the Playground. From concurrency 32 up, the host tier is pinned with `--hicache-size` (GB per rank), which overrides `--hicache-ratio`, so make sure the node has that much free CPU DRAM per server on top of the model weights.
 
-| Value | Rule |
-|---|---|
-| `--max-running-requests` | 2 x concurrency (2, 8, 16, 24, 28 at concurrency 1, 4, 8, 12, 14) |
-| `--cuda-graph-max-bs-decode` | The same value as `--max-running-requests`, capped at 128 |
+The braced values in the command follow concurrency:
+
+| Concurrency | `--max-running-requests` | `--cuda-graph-max-bs-decode` | `--hicache-size` |
+|---|---|---|---|
+| 1 | 2 | 2 | no HiCache |
+| 4 | 8 | 8 | no HiCache |
+| 8 | 16 | 16 | no HiCache |
+| 12 | 24 | 24 | no HiCache |
+| 14 | 28 | 28 | no HiCache |
+| 16 | 32 | 32 | not set (ratio 1.5) |
+| 18 | 36 | 36 | not set (ratio 1.5) |
+| 20 | 40 | 40 | not set (ratio 1.5) |
+| 22 | 44 | 44 | not set (ratio 1.5) |
+| 24 | 48 | 48 | not set (ratio 1.5) |
+| 28 | 56 | 56 | not set (ratio 1.5) |
+| 32 | 64 | 64 | 253 |
+| 36 | 72 | 72 | 253 |
+| 40 | 80 | 80 | 253 |
+| 48 | 96 | 96 | 253 |
+| 56 | 112 | 112 | 253 |
+| 64 | 128 | 128 | 374 |
+| 72 | 144 | 128 | 374 |
+| 80 | 160 | 128 | 374 |
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -291,7 +309,7 @@ sglang serve \
   --cuda-graph-max-bs-decode {cuda-graph-max-bs-decode}
 ```
 
-For **concurrency 16-80**, add the HiCache flags to the command above:
+For **concurrency 16-80**, add the HiCache flags to the command above, and `--hicache-size {hicache-size}` where the table gives one:
 
 ```bash HiCache flags
   --enable-hierarchical-cache \
@@ -301,22 +319,12 @@ For **concurrency 16-80**, add the HiCache flags to the command above:
   --hicache-mem-layout page_first
 ```
 
-From concurrency 32 up, the benchmarked points also pin the host tier with `--hicache-size` (GB per rank), which overrides `--hicache-ratio`. Make sure the node has that much free CPU DRAM per server on top of the model weights.
-
-| Concurrency | `--hicache-size` |
-|---|---|
-| 16-28 | not set (`--hicache-ratio 1.5`) |
-| 32-56 | 253 |
-| 64-80 | 374 |
-
 A few notes on the command:
 
 - `--speculative-algorithm EAGLE` is the same algorithm the Playground emits as `NEXTN`; SGLang resolves `NEXTN` to `EAGLE`.
 - AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe.
 - Weights load with multiple threads by default, so `--model-loader-extra-config '{"enable_multithread_load": true}'` is not needed.
 - `--kv-cache-dtype fp8_e4m3` carries the same accuracy caveat as the FP8 KV cache warning in section 3.2.
-
-The InferenceX recipe also sets `--enable-metrics`, `--enable-cache-report`, `SGLANG_TIMEOUT_KEEP_ALIVE` and `PYTHONNOUSERSITE`. These only serve the benchmark harness (metrics collection, outlasting the load generator's client connection pool, container hygiene) and are not part of a production deployment.
 
 ## 4. Model Invocation
 
