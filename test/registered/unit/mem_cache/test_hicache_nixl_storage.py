@@ -267,8 +267,7 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -789,8 +788,7 @@ class TestNixlDirectIO(CustomTestCase):
     """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
 
     def setUp(self):
-        self.test_dir = "/tmp/test_nixl_direct_io"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_direct_io_")
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
