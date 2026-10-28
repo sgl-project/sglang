@@ -203,15 +203,21 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
-# SM107 (Rubin, VR)
+# SM107 (Rubin, VR). World 2 / 4 / 8 / 16 tuned on VR;
 @cache
 def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {4: 128, 5: 128, 6: 128, 7: 128, 8: 96, 16: 32}
 
-    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+    def config(
+        world_size: int, *, graph: tuple, eager: tuple, two_shot_push: int = 0
+    ) -> AllReduceConfig:
         return AllReduceConfig(
-            graph=_pack_heuristic(*graph),
-            eager=_pack_heuristic(*eager),
+            graph=_pack_heuristic(*graph)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
+            eager=_pack_heuristic(*eager)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
             num_push_blocks=num_sm,
             num_pull_blocks=min(192, num_sm),
             num_mc_blocks=mc_blocks.get(world_size),
@@ -230,8 +236,9 @@ def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         4: config(
             4,
-            graph=(6.938 * MB, 6.938 * MB, 128.0 * MB),
-            eager=(9.812 * MB, 9.812 * MB, 128.0 * MB, Range(9.812 * MB, 128 * MB)),
+            graph=(1.000 * MB, 1.000 * MB, 128.0 * MB),
+            eager=(1.000 * MB, 1.000 * MB, 128.0 * MB, Range(9.812 * MB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
         5: config(
             5,
@@ -250,13 +257,15 @@ def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
-            eager=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            graph=(384 * KB, 384 * KB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            eager=(384 * KB, 384 * KB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
         16: config(
             16,
-            graph=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
-            eager=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
     }
 

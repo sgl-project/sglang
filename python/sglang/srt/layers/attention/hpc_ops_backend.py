@@ -671,7 +671,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
 
         Like ``RadixAttention._eager_attention``, this runs eagerly between captured
-        prefill-graph segments (at capture and at every replay), so the Python
+        prefill-graph segments (at every replay), so the Python
         hand-off of the dynamic Q scales to the following attention op stays
         alive. ``out_q`` is preallocated by the captured segment and mutated in
         place, which is what stitches the surrounding graph segments together.
