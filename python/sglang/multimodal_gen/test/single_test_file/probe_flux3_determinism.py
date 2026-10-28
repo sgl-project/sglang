@@ -14,6 +14,7 @@ import json
 import os
 import re
 from io import BytesIO
+from pathlib import Path
 
 import requests
 from PIL import Image
@@ -56,7 +57,9 @@ def _hash_lines(log_path) -> list[tuple]:
 
 class ProbeFlux3EditStages(CustomTestCase):
     def test_edit_stage_hashes(self):
-        hash_file = tds._LOG_DIR / "flux3_hashes.txt"
+        hash_file = Path("/tmp/flux3_hashes.txt")
+        marker = Path("/tmp/flux3_probe_import.txt")
+        marker.unlink(missing_ok=True)
         hash_file.unlink(missing_ok=True)
         os.environ["SGLANG_FLUX3_HASH_PROBE_FILE"] = str(hash_file)
         cluster = tds.DisaggCluster(
@@ -102,6 +105,11 @@ class ProbeFlux3EditStages(CustomTestCase):
         finally:
             cluster.stop()
 
+        print(
+            "[flux3-probe] import markers: "
+            + (marker.read_text() if marker.exists() else "none"),
+            flush=True,
+        )
         lines = _hash_lines(hash_file)
         runs = [lines[marks[i] : marks[i + 1]] for i in range(1, len(marks) - 1)]
         print(

@@ -20,9 +20,17 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
 
 # PROBE (not for merge): log a content hash of each stage boundary.
+_PROBE_FILE = os.environ.get("SGLANG_FLUX3_HASH_PROBE_FILE") or "/tmp/flux3_hashes.txt"
+with open("/tmp/flux3_probe_import.txt", "a") as _fh:
+    _fh.write(
+        f"{__file__} pid={os.getpid()} "
+        f"env={os.environ.get('SGLANG_FLUX3_HASH_PROBE_FILE')}" + chr(10)
+    )
+
+
 def _probe_hash(tag, t):
-    path = os.environ.get("SGLANG_FLUX3_HASH_PROBE_FILE")
-    if not path or t is None:
+    path = _PROBE_FILE
+    if t is None:
         return
     if isinstance(t, (list, tuple)):
         for i, x in enumerate(t):
@@ -627,9 +635,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             return batch
         references, reference_size, crop = load_references(_image_paths(batch))
         _probe_hash("1_reference_pixels", references)
-        if os.environ.get("SGLANG_FLUX3_HASH_PROBE_FILE") and not getattr(
-            self.vae, "_probe_hooked", False
-        ):
+        if not getattr(self.vae, "_probe_hooked", False):
             # Every leaf layer of the VAE encoder, in execution order.
             for _name, _mod in self.vae.encoder.named_modules():
                 if not list(_mod.children()):
