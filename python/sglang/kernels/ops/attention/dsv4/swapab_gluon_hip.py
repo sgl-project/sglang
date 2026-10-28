@@ -108,6 +108,15 @@ def _load_kv(
 
 
 @gluon.jit
+def _load_q(
+    Q, QS: gl.constexpr, QH: gl.constexpr, H: gl.constexpr, Q_LAYOUT: gl.constexpr
+):
+    qh = gl.arange(0, H, gl.SliceLayout(1, Q_LAYOUT))
+    qd = gl.arange(0, 512, gl.SliceLayout(0, Q_LAYOUT))
+    return gl.load(Q + gl.program_id(0) * QS + qh[:, None] * QH + qd[None, :])
+
+
+@gluon.jit
 def partial_gluon(
     Q,
     K,
@@ -153,6 +162,7 @@ def partial_gluon(
         at = t * BT + n
         length = gl.load(L + b)
         ids = gl.amd.cdna4.buffer_load(IDX + b * IS, at, at < NK)
+        q = _load_q(Q, QS, QH, H, q_layout)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
         kv = _load_kv(
             K,
@@ -170,6 +180,7 @@ def partial_gluon(
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
         ids = gl.amd.cdna4.buffer_load(EI + b * EIS, at, at < NE)
+        q = _load_q(Q, QS, QH, H, q_layout)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
         kv = _load_kv(
             E,
@@ -183,9 +194,6 @@ def partial_gluon(
             SCALE_BYTES,
             TILE,
         )
-    qh = gl.arange(0, H, gl.SliceLayout(1, q_layout))
-    qd = gl.arange(0, 512, gl.SliceLayout(0, q_layout))
-    q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
     # transposed=False: a lane holds 4 consecutive d of one head in the PV result,
     # so `value` stores to PART [h, d] without an LDS relayout
     mf: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -202,10 +210,16 @@ def partial_gluon(
         gl.PaddedSharedLayout.with_identity_for([[128, 8]], [BT, 512], [1, 0]),
         kv,
     )
+    q_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [H, 512],
+        gl.PaddedSharedLayout.with_identity_for([[128, 8]], [H, 512], [1, 0]),
+        q,
+    )
     scores = (
         gl.amd.cdna4.mfma(
             kv_smem.load(gl.DotOperandLayout(0, mf, 8)),
-            gl.convert_layout(q.permute((1, 0)), gl.DotOperandLayout(1, mf, 8)),
+            q_smem.permute((1, 0)).load(gl.DotOperandLayout(1, mf, 8)),
             gl.zeros((BT, H), gl.float32, mf),
         )
         * SCALE
