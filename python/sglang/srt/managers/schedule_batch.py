@@ -1027,6 +1027,9 @@ class ReqKvInfo:
     def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
         self.component_evicted_seqlens[component_type] = length
 
+    def copy_evicted_seqlens(self) -> dict[ComponentType, int]:
+        return self.component_evicted_seqlens.copy()
+
     def clamp_evicted_seqlens(self, length: int) -> None:
         for component, cursor in self.component_evicted_seqlens.items():
             self.component_evicted_seqlens[component] = min(cursor, length)

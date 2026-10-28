@@ -808,7 +808,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
+                component_evicted_seqlens=req.kv.copy_evicted_seqlens(),
                 inserted_len=len(key),
                 priority=req.priority or 0,
             )
