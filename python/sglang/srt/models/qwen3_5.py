@@ -1056,7 +1056,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda
+                (_is_cuda or _is_hip)
                 and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
