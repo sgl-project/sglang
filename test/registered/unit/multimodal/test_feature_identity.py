@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
     MultimodalInputs,
+    MultimodalProcessorOutput,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -34,6 +35,10 @@ from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.cache.identity import (
     build_artifact_key,
     media_preprocess_kwargs,
+)
+from sglang.srt.multimodal.processors.llava import (
+    LlavaImageProcessor,
+    LlavaMultimodalProcessor,
 )
 from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -50,6 +55,21 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_composite_processor_uses_inner_identity_namespace(self):
+        inner = LlavaImageProcessor.__new__(LlavaImageProcessor)
+        inner.processor_fingerprint = "sha256:" + "12" * 32
+        outer = LlavaMultimodalProcessor.__new__(LlavaMultimodalProcessor)
+        outer.inner = inner
+        item = _item(torch.arange(8))
+        output = MultimodalProcessorOutput(mm_items=[item])
+        original = item.cache_key
+        outer.finalize_cache_identities(output)
+        self.assertNotEqual(original, item.cache_key)
+        self.assertEqual(item.processor_fingerprint, inner.processor_fingerprint)
+        expected = item.cache_key
+        outer.finalize_cache_identities(output)
+        self.assertEqual(expected, item.cache_key)
+
     def test_dataclass_metadata_keeps_tensor_storage_and_nested_types(self):
         @dataclass(slots=True)
         class Settings:
