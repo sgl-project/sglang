@@ -68,7 +68,8 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         and backend.qk_rope_head_dim == 64
         and q.dtype in (torch.bfloat16, torch.float16)
         and normalize_batch_topk_indices(topk_indices).shape[1] == 2048
-        and manager.cache_capacity in (2048, 4096, 8192)
+        and 2048 <= manager.cache_capacity <= 32640
+        and manager.cache_capacity % 128 == 0
         and manager.sparse_context_len == 2048
         and q.shape[0] == forward_batch.batch_size
     )

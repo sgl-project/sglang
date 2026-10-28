@@ -73,8 +73,13 @@ def resolve_sparse_kv_budget(
     if indexer_impl not in ("legacy", "li_reference", "lim"):
         raise ValueError(f"Unknown sparse indexer implementation: {indexer_impl}.")
     if copy_sfa:
-        if top_k != 2048 or cache_tokens not in (0, 2048, 4096, 8192):
-            raise ValueError("Copy-SFA requires K=2048 and C in {2048,4096,8192}.")
+        if top_k != 2048 or (
+            cache_tokens != 0
+            and (cache_tokens < 2048 or cache_tokens > 32640 or cache_tokens % 128)
+        ):
+            raise ValueError(
+                "Copy-SFA requires K=2048 and C in [2048,32640], aligned to 128."
+            )
         if cache_tokens > top_k and indexer_impl != "lim":
             raise ValueError("Copy-SFA with C>K requires the native LIM indexer.")
         if copy_sfa_query_heads <= 0 or copy_sfa_query_heads > 128:

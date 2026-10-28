@@ -96,6 +96,25 @@ class TestSparseKVBudget(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeding"):
             self.resolve(hbm_budget_bytes=minimum.managed_hbm_bytes - 1)
 
+    def test_copy_sfa_capacity_range(self):
+        for capacity in (2048, 6144, 12288, 16384, 32640):
+            with self.subTest(capacity=capacity):
+                result = self.resolve(
+                    cache_tokens=capacity,
+                    copy_sfa=True,
+                    indexer_impl="lim",
+                    copy_sfa_query_heads=16,
+                )
+                self.assertEqual(result.cache_tokens, capacity)
+        for capacity in (1920, 2049, 32768):
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                self.resolve(
+                    cache_tokens=capacity,
+                    copy_sfa=True,
+                    indexer_impl="lim",
+                    copy_sfa_query_heads=16,
+                )
+
     def test_long_output_increases_host_and_metadata_not_hot_kv(self):
         short, long = self.resolve(context_len=32768), self.resolve(context_len=131072)
         self.assertEqual(short.device_kv_bytes, long.device_kv_bytes)

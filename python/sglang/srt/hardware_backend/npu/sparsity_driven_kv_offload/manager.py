@@ -11,6 +11,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
     slot_map_lookup,
     unidex_copy_inplace,
 )
+
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
@@ -50,6 +51,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     import torch.npu
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
 
@@ -181,11 +183,12 @@ class SparseKVCacheManager:
         )
         self.cache_capacity = self.device_cache_size
         if self.copy_sfa_enabled and (
-            self.cache_capacity not in (2048, 4096, 8192)
+            not 2048 <= self.cache_capacity <= 32640
+            or self.cache_capacity % 128
             or copy_sfa_padded_query_heads is None
         ):
             raise ValueError(
-                "Copy-SFA requires C in {2048,4096,8192} and a padded query head count."
+                "Copy-SFA requires C in [2048,32640], aligned to 128, and a padded query head count."
             )
         if self.copy_sfa_enabled:
             if (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64):
