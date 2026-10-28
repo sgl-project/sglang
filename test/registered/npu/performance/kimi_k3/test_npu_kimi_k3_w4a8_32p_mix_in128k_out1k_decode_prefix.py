@@ -68,9 +68,12 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "HCCL_BUFFSIZE": "200",
-    "DEEPEP_HCCL_BUFFSIZE": "1800",
-    "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
+    # CI-proven values (runs 11-15). The dev bare-metal pair (HCCL_BUFFSIZE
+    # 200 + DEEPEP_HCCL_BUFFSIZE 1800, LONG_SEQ_ROUND 2) crashed the DeepEP
+    # low_latency_combine tiling during decode graph capture in the CI pod
+    # (run 40507429709, EZ1008 on MoeLowLatencyCombineV2).
+    "HCCL_BUFFSIZE": "2000",
+    "DEEP_NORMAL_LONG_SEQ_ROUND": "64",
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ASCEND_USE_FIA": "1",
