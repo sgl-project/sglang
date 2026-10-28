@@ -856,7 +856,7 @@ def _moss_image_norm_eager(x, weight):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+@pytest.mark.parametrize("epilogue", ["modulate", "rope", "rope_packed"])
 @pytest.mark.parametrize("batch,seq", [(1, 16), (2, 17), (1, 3643)])
 @pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
 def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
@@ -867,7 +867,11 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
 
     torch.manual_seed(0)
     shape = (batch, seq, 3072) if epilogue == "modulate" else (batch, seq, 24, 128)
+    if epilogue == "rope_packed":
+        shape = (batch, seq, 3, 24, 128)
     x = (torch.randn(shape, device="cuda") * amplitude).bfloat16()
+    if epilogue == "rope_packed":
+        x = x[:, :, 1]
     weight = torch.randn(shape[-1], device="cuda", dtype=torch.bfloat16)
     norm = _moss_image_norm_eager(x, weight)
     if epilogue == "modulate":
@@ -936,6 +940,13 @@ def test_moss_image_norm_epilogue_guards(epilogue):
     )
     with pytest.raises(ValueError, match="Unsupported MOSSImage"):
         kernel(x, weight, a, a)
+
+    if epilogue == "rope":
+        packed = torch.randn(4, 17, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
+        for x in (packed[::2, :, 1], packed[:, :, 1, ::2]):
+            a = torch.randn(x.shape[0] * x.shape[1], 128, device="cuda", dtype=x.dtype)
+            with pytest.raises(ValueError, match="Unsupported MOSSImage"):
+                kernel(x, weight, a, a)
 
 
 if __name__ == "__main__":

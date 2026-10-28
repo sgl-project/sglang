@@ -135,7 +135,10 @@ def monokernel_disable_reasons(
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
     spec, why = find_spec(
-        backend=BACKEND, architectures=hf_config.architectures, isa=isa
+        backend=BACKEND,
+        architectures=hf_config.architectures,
+        isa=isa,
+        model_type=getattr(hf_config, "model_type", None),
     )
     if spec is None:
         return None, [why]
@@ -274,7 +277,10 @@ def monokernel_weights_iterator(
     if backend is None:
         return weights
     spec, _ = find_spec(
-        backend=backend, architectures=model.config.architectures, isa=device_isa()
+        backend=backend,
+        architectures=model.config.architectures,
+        isa=device_isa(),
+        model_type=getattr(model.config, "model_type", None),
     )
     if spec is None or spec.load_tensor is None:
         return weights
@@ -324,14 +330,19 @@ def install_monokernel_forward(
         return
     isa = device_isa()
     archs = hf_config.architectures
-    spec, why = find_spec(backend=backend, architectures=archs, isa=isa)
+    model_type = getattr(hf_config, "model_type", None)
+    spec, why = find_spec(
+        backend=backend, architectures=archs, isa=isa, model_type=model_type
+    )
     is_load_observed = "_mono_copies" in model.__dict__
     copies = model.__dict__.pop("_mono_copies", {})
     # Ranks branch together; one skipping the collectives below would hang its peers.
     lookups = _gather_tp(
         (
             spec is not None,
-            spec_registered(backend=backend, architectures=archs),
+            spec_registered(
+                backend=backend, architectures=archs, model_type=model_type
+            ),
             why,
             None if spec is None else (spec.name, spec.api_version),
         )
