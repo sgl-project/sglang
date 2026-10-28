@@ -282,29 +282,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # Dedicated re-run suite for the 2-NPU cases that failed on 2026-10-26:
-  # test_npu_qwen3_6_35b_a3b_1p_aime26.py, test_npu_mla_fia_hicache_bf16.py,
-  # test_npu_moe_dense_tp_size.py; plus test_npu_qwen3_6_27b_1p_gpqa.py and
-  # test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py.
-  nightly-rerun-2-npu-a3:
-    name: nightly-rerun-2-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-2-
-      test_type: 'accuracy'
-      test_suite: nightly-rerun-2-npu-a3
-      is_nightly_pipeline_job: true
-      # est_time sum is ~23200s (~387 min) after adding the two 27B cases,
-      # so the 300-min template default would kill the job mid-run.
-      test_timeout_minutes: '600'
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   # Single-point validation for the 7 NPU unit tests registered to
   # `stage-a-unit-test-npu` (that suite used to be orphaned: no job dispatched
   # it, so the files never ran). Those registrations are nightly=False, so this
@@ -436,7 +413,6 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
-      - nightly-rerun-2-npu-a3
       - stage-a-unit-test-npu
 #       - nightly-acc-4-npu-a5 # TEMP: disabled with job above (A5 power maintenance)
       - nightly-poc-multi-node-tests
@@ -461,7 +437,6 @@ jobs:
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "${{ needs.nightly-rerun-2-npu-a3.result }}" \
             "${{ needs.stage-a-unit-test-npu.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
@@ -495,7 +470,6 @@ jobs:
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "nightly-rerun-2-npu-a3:${{ needs.nightly-rerun-2-npu-a3.result }}" \
             "stage-a-unit-test-npu:${{ needs.stage-a-unit-test-npu.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
