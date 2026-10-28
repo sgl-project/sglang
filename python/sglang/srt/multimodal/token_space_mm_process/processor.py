@@ -86,7 +86,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         video_device=None,
         compute_mrope_positions=False,
         package_output=None,
-        **kwargs,
     ):
         """Process media and expand the caller's IDs, like processor(text, media).
 
@@ -99,7 +98,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             compute_mrope_positions: Also return M-RoPE positions; off for trainers
                 such as Megatron Bridge that compute them themselves.
             package_output: Runs on the BatchFeature in the same worker task.
-            **kwargs: Request kwargs for the strategy and its output builder.
 
         Returns:
             The BatchFeature with `mm_modalities` and `mm_spans`, or what
@@ -116,9 +114,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         image_device, video_device = self._media_devices(
             videos, image_device, video_device
         )
-        request_options = dict(
-            image_device=image_device, video_device=video_device, **kwargs
-        )
+        request_options = dict(image_device=image_device, video_device=video_device)
         media_items = self._list_media_items(sources, loaded, video_metadata)
         item_features = await self._process_items(media_items, request_options)
         return await self._run_mm_processor(
@@ -127,7 +123,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             item_features=item_features,
             input_ids=input_ids,
             mm_token_expansion_start_len=mm_token_expansion_start_len,
-            request_kwargs=kwargs,
             compute_mrope_positions=compute_mrope_positions,
             package_output=package_output,
         )
@@ -234,7 +229,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         item_features,
         input_ids,
         mm_token_expansion_start_len,
-        request_kwargs,
         compute_mrope_positions,
         processor,
         package_output=None,
@@ -255,7 +249,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             expanded_input_ids, media_items, mm_token_expansion_spec
         )
         output = self.strategy.build_processor_output(
-            media_features, expanded_input_ids, processor=processor, **request_kwargs
+            media_features, expanded_input_ids, processor=processor
         )
         # Where each media's tower output goes, aligned with media_items.
         output["mm_modalities"] = [modality for modality, *_ in media_items]
