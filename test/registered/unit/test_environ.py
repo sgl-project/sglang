@@ -47,6 +47,11 @@ NV_MEGA_RUNTIME_CHILDREN = (
 
 class TestEnvField(unittest.TestCase):
     def setUp(self):
+        self.env_fields = {
+            name: field
+            for name, field in vars(type(envs)).items()
+            if isinstance(field, EnvField)
+        }
         envs.SGLANG_TEST_RETRACT.clear()
         self.addCleanup(envs.SGLANG_TEST_RETRACT.clear)
 
@@ -131,14 +136,12 @@ class TestEnvField(unittest.TestCase):
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
-            for field in vars(type(envs)).values():
-                if isinstance(field, EnvField):
-                    stack.enter_context(field.override(False))
-                    field.clear()
+            for field in self.env_fields.values():
+                stack.enter_context(field.override(False))
+                field.clear()
             defaults = {
                 name: field.get()
-                for name, field in vars(type(envs)).items()
-                if isinstance(field, EnvField)
+                for name, field in self.env_fields.items()
             }
             master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
             self.assertIs(master.get(), False)
@@ -148,10 +151,10 @@ class TestEnvField(unittest.TestCase):
                         if name == master.name or name in NV_MEGA_RUNTIME_CHILDREN:
                             expected = master_value
                         with self.subTest(master=master_value, name=name):
-                            self.assertEqual(getattr(envs, name).get(), expected)
+                            self.assertEqual(self.env_fields[name].get(), expected)
                     for name in NV_MEGA_RUNTIME_CHILDREN:
                         with self.subTest(master=master_value, child=name):
-                            child = getattr(envs, name)
+                            child = self.env_fields[name]
                             self.assertIs(child.get(), master_value)
                             self.assertFalse(child.is_set())
 
@@ -160,7 +163,7 @@ class TestEnvField(unittest.TestCase):
         for master_value, child_value in ((True, "0"), (True, "false"), (False, "1")):
             with master.override(master_value):
                 for name in NV_MEGA_RUNTIME_CHILDREN:
-                    child = getattr(envs, name)
+                    child = self.env_fields[name]
                     with self.subTest(
                         master=master_value, child=name, value=child_value
                     ):
@@ -174,7 +177,7 @@ class TestEnvField(unittest.TestCase):
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
             for name in NV_MEGA_RUNTIME_CHILDREN:
                 with self.subTest(child=name):
-                    child = getattr(envs, name)
+                    child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
 
