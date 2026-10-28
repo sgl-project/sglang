@@ -415,7 +415,7 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    jit_pre_dispatch = mma_type not in ("nvfp4xnvfp4", "mxf4xmxf4")
+    jit_pre_dispatch = mma_type == "fp8xfp4"
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         if not jit_pre_dispatch:
