@@ -1,4 +1,4 @@
-"""Unit tests for srt/sampling/watermarking — no server, no model loading."""
+"""Unit tests for srt/sampling/watermarking - no server, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,7 +42,9 @@ class TestParseWatermarkKey(CustomTestCase):
         self.assertEqual(parse_watermark_key("DEADBEEF"), 3735928559)
 
     def test_case_insensitive(self):
-        self.assertEqual(parse_watermark_key("deadbeef"), parse_watermark_key("DEADBEEF"))
+        self.assertEqual(
+            parse_watermark_key("deadbeef"), parse_watermark_key("DEADBEEF")
+        )
 
     def test_single_digit(self):
         self.assertEqual(parse_watermark_key("0x1"), 1)
@@ -106,7 +108,9 @@ class TestLoadWatermarkConfigInline(CustomTestCase):
 
     def test_context_window_boundary_values(self):
         load_watermark_config(json.dumps({"context_window": 1}))
-        load_watermark_config(json.dumps({"context_window": MAX_WATERMARK_CONTEXT_WINDOW}))
+        load_watermark_config(
+            json.dumps({"context_window": MAX_WATERMARK_CONTEXT_WINDOW})
+        )
 
     def test_rejects_context_window_zero(self):
         with self.assertRaises(WatermarkConfigError):
@@ -267,7 +271,9 @@ class TestWatermarkStatistics(CustomTestCase):
         scores = [0.5, 1.0, 1.5, 2.0]
         stats = WatermarkStatistics.from_scores(scores)
         if stats.p_value > 0:
-            self.assertAlmostEqual(stats.log_p_value, math.log(stats.p_value), places=10)
+            self.assertAlmostEqual(
+                stats.log_p_value, math.log(stats.p_value), places=10
+            )
 
     def test_p_value_in_unit_interval(self):
         for scores in ([0.1], [1.0, 2.0], [0.01, 0.01, 0.01]):
