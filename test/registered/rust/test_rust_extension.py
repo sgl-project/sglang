@@ -637,17 +637,47 @@ crate-type = ["cdylib"]
             started = time.monotonic()
             with (
                 mock.patch.dict(os.environ, {"PATH": path}),
-                mock.patch.object(
-                    rust_extension, "_TOOLCHAIN_PROBE_TIMEOUT_SECONDS", 0.5
-                ),
                 self.assertRaisesRegex(
-                    RuntimeError, "failed to query the Rust toolchain"
+                    RuntimeError,
+                    r"timed out after 0\.5 s waiting for `cargo --version --verbose`",
                 ),
             ):
-                rust_extension._command_version(
-                    "cargo", "--version", "--verbose", cwd=root
-                )
+                rust_extension.probe_rust_toolchain(root, timeout=0.5)
             self.assertLess(time.monotonic() - started, 10)
+
+    def test_toolchain_probe_timeout_includes_the_wait_for_the_lock(self):
+        # While another process holds the lock, the probe gives up at its own
+        # deadline instead of waiting for the holder and then querying.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            queried = root / "queried"
+            path = _fake_toolchain(root, f'touch "{queried}"\necho stand-in 1.0\n')
+            lock_path = root / "locks" / "toolchain.lock"
+            context = multiprocessing.get_context("fork")
+            ready = context.Event()
+            release = context.Event()
+            holder = context.Process(
+                target=_hold_filesystem_lock,
+                args=(os.fspath(lock_path), ready, release),
+            )
+            holder.start()
+            try:
+                self.assertTrue(ready.wait(timeout=5))
+                started = time.monotonic()
+                with (
+                    mock.patch.dict(os.environ, {"PATH": path}),
+                    self.assertRaisesRegex(
+                        RuntimeError, r"timed out after 0\.5 s waiting for the lock"
+                    ),
+                ):
+                    rust_extension.probe_rust_toolchain(
+                        root, lock_path=lock_path, timeout=0.5
+                    )
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertFalse(queried.exists())
+            finally:
+                release.set()
+                holder.join(timeout=5)
 
     def test_failed_import_does_not_poison_sys_modules(self):
         module_name = "demo._broken_core"
