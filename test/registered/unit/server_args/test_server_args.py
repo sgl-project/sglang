@@ -2358,6 +2358,34 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_hicache_mamba_size_must_leave_a_kv_share(self):
+        """A Mamba pin must leave --hicache-size a KV share and cannot be negative."""
+        for hicache_size, mamba_size in ((192, 192), (192, 250), (0, 70), (192, -1)):
+            with self.subTest(hicache_size=hicache_size, mamba_size=mamba_size):
+                args = ServerArgs(
+                    model_path="dummy",
+                    hicache_size=hicache_size,
+                    hicache_mamba_size=mamba_size,
+                )
+                with self.assertRaises(ValueError):
+                    handle_hicache_ratio_default(args)
+        handle_hicache_ratio_default(
+            ServerArgs(model_path="dummy", hicache_size=192, hicache_mamba_size=70)
+        )
+
+    def test_hicache_mamba_size_rejects_unified_memory(self):
+        """The unified host stack splits --hicache-size by sub-pool size;
+        a Mamba pin there must fail at startup instead of being ignored."""
+        args = ServerArgs(
+            model_path="dummy",
+            hicache_size=192,
+            hicache_mamba_size=70,
+            enable_unified_memory=True,
+        )
+        with self.assertRaises(ValueError) as context:
+            handle_hicache_ratio_default(args)
+        self.assertIn("--enable-unified-memory", str(context.exception))
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (

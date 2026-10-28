@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _split_hicache_size_with_mamba,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
@@ -1711,6 +1712,30 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
 
 
 class TestMambaHostShare(CustomTestCase):
+    @staticmethod
+    def _pool(nbytes):
+        return SimpleNamespace(get_kv_size_bytes=lambda: nbytes)
+
+    def test_pinned_mamba_share_ignores_device_kv_growth(self):
+        mamba = self._pool(6 << 30)
+        for kv_bytes in (8 << 30, 12 << 30):
+            kv_gb, mamba_gb = _split_hicache_size_with_mamba(
+                hicache_size=192,
+                hicache_mamba_size=70,
+                kv_pools=(self._pool(kv_bytes),),
+                mamba_pool=mamba,
+            )
+            self.assertEqual((kv_gb, mamba_gb), (122, 70))
+
+    def test_unset_keeps_proportional_split(self):
+        kv_gb, mamba_gb = _split_hicache_size_with_mamba(
+            hicache_size=192,
+            hicache_mamba_size=0,
+            kv_pools=(self._pool(10 << 30),),
+            mamba_pool=self._pool(6 << 30),
+        )
+        self.assertEqual((kv_gb, mamba_gb), (120.0, 72.0))
+
     def test_host_capacity_excludes_speculative_scratch(self):
         """Spec verify scratch is device-only; counting it inflated the Mamba host share."""
         pool = MambaPool(

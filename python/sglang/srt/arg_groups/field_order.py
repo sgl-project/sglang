@@ -557,5 +557,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "hicache_mamba_size",
 )
 # fmt: on

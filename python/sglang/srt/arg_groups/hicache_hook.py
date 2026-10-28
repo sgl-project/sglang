@@ -118,6 +118,16 @@ def handle_hicache_ratio_default(server_args: Any):
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:
         raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")
+    if cfg.hicache_mamba_size and not 0 < cfg.hicache_mamba_size < cfg.hicache_size:
+        raise ValueError(
+            "--hicache-mamba-size must be in (0, --hicache-size); "
+            "the host KV pools get the rest of --hicache-size."
+        )
+    if cfg.hicache_mamba_size and cfg.enable_unified_memory:
+        raise ValueError(
+            "--hicache-mamba-size is not supported with --enable-unified-memory, "
+            "whose host pools split --hicache-size by sub-pool size."
+        )
     fields = {}
     if cfg.hicache_ratio is None and cfg.disaggregation_mode != "decode":
         fields["hicache_ratio"] = (
