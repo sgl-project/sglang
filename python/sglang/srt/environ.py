@@ -1593,7 +1593,7 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Qwen3.5 MTP runtime optimizations; explicit values override the master default.
+    # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
