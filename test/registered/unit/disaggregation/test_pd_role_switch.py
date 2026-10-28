@@ -75,7 +75,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def test_preflight_checks_graph_headroom_without_releasing_resources(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
-        s.device = "cuda"
+        s.parts.streams = SimpleNamespace(device="cuda")
         cases = (
             ("missing", None, [], 2.0, False, "is required"),
             ("negative", -1.0, [], 2.0, False, "non-negative"),
@@ -93,7 +93,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         for name, budget, captured_bs, memory, success, message in cases:
             with self.subTest(name=name):
-                s.tp_worker.get_decode_cuda_graph_bs.return_value = captured_bs
+                s.parts.workers.tp_worker.get_decode_cuda_graph_bs.return_value = (
+                    captured_bs
+                )
                 with patch.object(
                     role_switch, "get_available_gpu_memory"
                 ) as memory_probe:
@@ -116,7 +118,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
                         memory_probe.assert_called_once()
                     else:
                         memory_probe.assert_not_called()
-                s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+                s.parts.workers.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
                 s.teardown_disaggregation.assert_not_called()
                 s.init_disaggregation.assert_not_called()
                 self.assertEqual(rc.get_disagg().disaggregation_mode, "prefill")
@@ -699,22 +701,21 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
         schedulers = [fixture._scheduler(DisaggregationMode.PREFILL) for _ in range(2)]
         available_memory = [2.0, 2.0]
         for scheduler in schedulers:
-            scheduler.device = "cuda"
-            scheduler.tp_worker.get_decode_cuda_graph_bs.return_value = (
+            scheduler.parts.streams = SimpleNamespace(device="cuda")
+            scheduler.parts.workers.tp_worker.get_decode_cuda_graph_bs.return_value = (
                 [] if insufficient_memory else [1]
             )
-            scheduler.init_disaggregation.side_effect = lambda s=scheduler: setattr(
-                s,
-                "disaggregation_mode",
-                DisaggregationMode(rc.get_disagg().disaggregation_mode),
+            scheduler.init_disaggregation.side_effect = lambda: DisaggregationMode(
+                rc.get_disagg().disaggregation_mode
             )
 
         async def fanout(req):
             results = []
             for index, scheduler in enumerate(schedulers):
-                rc.get_context().set_server_args(scheduler.server_args)
+                rc.get_context().set_server_args(scheduler.parts.server_args)
                 rc.get_context().override(
-                    "test.role", disaggregation_mode=scheduler.disaggregation_mode.value
+                    "test.role",
+                    disaggregation_mode=scheduler.mode.disaggregation_mode.value,
                 )
                 with patch.object(
                     role_switch,
@@ -750,7 +751,7 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
             if insufficient_memory:
                 available_memory[1] = 0.5
             else:
-                schedulers[1].is_fully_idle.return_value = False
+                schedulers[1].hub.request_registry.is_fully_idle.return_value = False
             out = await control.TokenizerControlMixin.pd_role_switch(manager, req)
             self.assertFalse(out.success)
             self.assertTrue(out.safe_to_restore)
@@ -766,18 +767,22 @@ class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
                 scheduler.init_disaggregation.assert_not_called()
                 scheduler.teardown_disaggregation.assert_not_called()
                 self.assertEqual(
-                    scheduler.disaggregation_mode, DisaggregationMode.PREFILL
+                    scheduler.mode.disaggregation_mode, DisaggregationMode.PREFILL
                 )
 
             available_memory[1] = 2.0
-            schedulers[1].is_fully_idle.return_value = True
+            schedulers[1].hub.request_registry.is_fully_idle.return_value = True
             out = await control.TokenizerControlMixin.pd_role_switch(manager, req)
             self.assertTrue(out.success)
             self.assertEqual(manager.disaggregation_mode, DisaggregationMode.DECODE)
+            # The rebuild step is patched on the assembly module, so the last
+            # double's mock is the one every scheduler's switch calls.
+            self.assertEqual(
+                schedulers[-1].init_disaggregation.call_count, len(schedulers)
+            )
             for scheduler in schedulers:
-                scheduler.init_disaggregation.assert_called_once()
                 self.assertEqual(
-                    scheduler.disaggregation_mode, DisaggregationMode.DECODE
+                    scheduler.mode.disaggregation_mode, DisaggregationMode.DECODE
                 )
 
 
