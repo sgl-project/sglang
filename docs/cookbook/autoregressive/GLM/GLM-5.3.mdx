@@ -133,7 +133,7 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 
-MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4575](https://github.com/SemiAnalysisAI/InferenceX/pull/4575)): TP4·EP4 with HiCache at concurrency 4–16, and TP8·EP1 with GPU-resident KV at concurrency 1–4.
+MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4593](https://github.com/SemiAnalysisAI/InferenceX/pull/4593)): TP4·EP4 with HiCache at concurrency 4–16, and TP8·EP1 with GPU-resident KV at concurrency 1–4.
 
 - **Container image.** `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025`. The checkpoint needs [#40776](https://github.com/sgl-project/sglang/pull/40776) to load, which `v0.5.22` does not include.
 - **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency. The commands below use concurrency 10 for TP4·EP4 and 4 for TP8·EP1.
