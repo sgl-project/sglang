@@ -1438,19 +1438,17 @@ class SchedulerMetricsReporter:
 
         mamba_host_pool = None
         if (
-            isinstance(self.scheduler.tree_cache, UnifiedRadixCache)
-            and self.scheduler.tree_cache.host_pool_group is not None
+            isinstance(self.kv.tree_cache, UnifiedRadixCache)
+            and self.kv.tree_cache.host_pool_group is not None
         ):
-            entry = self.scheduler.tree_cache.host_pool_group.entry_map.get(
-                PoolName.MAMBA
-            )
+            entry = self.kv.tree_cache.host_pool_group.entry_map.get(PoolName.MAMBA)
             mamba_host_pool = None if entry is None else entry.host_pool
         if mamba_host_pool is not None:
             mamba_total = mamba_host_pool.logical_size
-            self.stats.hicache_host_mamba_used_states = (
+            self.metrics_sink.stats.hicache_host_mamba_used_states = (
                 mamba_total - mamba_host_pool.available_size()
             )
-            self.stats.hicache_host_mamba_total_states = mamba_total
+            self.metrics_sink.stats.hicache_host_mamba_total_states = mamba_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
@@ -1552,4 +1550,7 @@ class SchedulerMetricsReporter:
             self.mode_owners.disagg_decode.report_queue_stats(
                 self.metrics_sink.stats, priority_enabled
             )
+        # Host pools change without a batch (e.g. /flush_cache); refresh before
+        # publishing so the gauges do not hold the last batch's values.
+        self._log_hicache_stats()
         self.metrics_sink.metrics_collector.log_stats(self.metrics_sink.stats)
