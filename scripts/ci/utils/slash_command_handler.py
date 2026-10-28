@@ -380,6 +380,19 @@ def _latest_run_per_workflow(runs):
     return list(latest.values())
 
 
+def _pr_workflow_runs(gh_repo, pr):
+    """Keep target-event runs scoped to this PR's source repository and branch."""
+    for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha):
+        if run.event == "pull_request_target" and (
+            run.head_branch != pr.head.ref
+            or run.head_repository is None
+            or pr.head.repo is None
+            or run.head_repository.id != pr.head.repo.id
+        ):
+            continue
+        yield run
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
@@ -460,7 +473,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
+    runs = _latest_run_per_workflow(_pr_workflow_runs(gh_repo, pr))
 
     rerun_count = 0
     for run in runs:
@@ -544,7 +557,7 @@ def _rerun_tier_workflows(gh_repo, pr, workflow_files, *, skip_missing=False):
     """
     runs = [
         run
-        for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha)
+        for run in _pr_workflow_runs(gh_repo, pr)
         if _workflow_file(run) in workflow_files
     ]
     # Same newest-wins rule handle_rerun_failed_ci uses: older runs at this SHA
