@@ -57,7 +57,6 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
         "handle_mamba_backend",
         "handle_int8_mamba_checkpoint",
-        "handle_mamba_host_only_checkpoint",
         "handle_linear_attn_backend",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",

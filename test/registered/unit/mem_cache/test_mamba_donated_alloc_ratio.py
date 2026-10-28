@@ -133,12 +133,15 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         )
         from sglang.srt import runtime_context as rc
 
-        with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
+        with (
+            envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(host_only),
+        ):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
                 mamba_radix_cache_strategy=strategy,
-                enable_mamba_host_only_checkpoint=host_only,
+                enable_hierarchical_cache=host_only,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 

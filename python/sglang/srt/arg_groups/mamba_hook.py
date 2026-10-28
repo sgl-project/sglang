@@ -72,25 +72,6 @@ def handle_mamba_backend(server_args: Any):
             raise ValueError(flashinfer_error)
 
 
-def handle_mamba_host_only_checkpoint(server_args: Any):
-    # Off by default. When on, checkpoints are copied into the hicache host
-    # pool and the radix node keeps no GPU slot, so the pool must exist.
-    cfg = resolving_view(server_args)
-    if not cfg.enable_mamba_host_only_checkpoint:
-        return
-    if not cfg.enable_hierarchical_cache:
-        raise ValueError(
-            "--enable-mamba-host-only-checkpoint requires "
-            "--enable-hierarchical-cache: the checkpoint is stored in the "
-            "host mamba pool."
-        )
-    if cfg.enable_int8_mamba_checkpoint:
-        raise ValueError(
-            "--enable-mamba-host-only-checkpoint is not supported together "
-            "with --enable-int8-mamba-checkpoint."
-        )
-
-
 def handle_int8_mamba_checkpoint(server_args: Any):
     # The host-offload path (enabled by --enable-hierarchical-cache) and
     # custom radix-cache backends are NOT int8-aware: they would read int8

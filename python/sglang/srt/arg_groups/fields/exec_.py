@@ -538,14 +538,6 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
     ] = False
-    enable_mamba_host_only_checkpoint: A[
-        bool,
-        "Store radix mamba checkpoints only in the hicache host pool. "
-        "Matched prefixes and donated checkpoints then occupy no GPU mamba slot, "
-        "so the mamba/max-running ratio drops to 1 active slot plus the ping-pong "
-        "slots extra-buffer still writes (3 with overlap). Requires "
-        "--enable-hierarchical-cache.",
-    ] = False
     int8_mamba_ckpt_size: A[
         Optional[int],
         "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",

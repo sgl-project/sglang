@@ -246,12 +246,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.mamba_hook import (
         handle_int8_mamba_checkpoint,
         handle_mamba_backend,
-        handle_mamba_host_only_checkpoint,
     )
 
     run_hook(handle_mamba_backend, server_args)
     run_hook(handle_int8_mamba_checkpoint, server_args)
-    run_hook(handle_mamba_host_only_checkpoint, server_args)
     run_hook(handle_linear_attn_backend, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)

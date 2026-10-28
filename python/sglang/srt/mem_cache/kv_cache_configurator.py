@@ -345,6 +345,28 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     unified_total_bytes: Optional[int] = None
 
 
+def host_only_mamba_checkpoint() -> bool:
+    """Radix mamba checkpoints stay in the hicache host pool.
+
+    Set ``SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT``. Off keeps the donated GPU slot.
+    """
+    enabled = envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
+    if not enabled:
+        return False
+    if not get_memory().enable_hierarchical_cache:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires "
+            "--enable-hierarchical-cache: the checkpoint is stored in the "
+            "host mamba pool."
+        )
+    if get_exec().mamba.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported together "
+            "with --enable-int8-mamba-checkpoint."
+        )
+    return True
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -1502,8 +1524,7 @@ class KVCacheConfigurator:
                 )
             ),
             replayssm_request_ring=(
-                get_exec().mamba.enable_mamba_host_only_checkpoint
-                and self.hybrid_kda_config is not None
+                host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
         )
         return req_to_token_pool
@@ -1584,8 +1605,7 @@ class KVCacheConfigurator:
                 )
             ),
             replayssm_request_ring=(
-                get_exec().mamba.enable_mamba_host_only_checkpoint
-                and self.hybrid_kda_config is not None
+                host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
         )
         return req_to_token_pool
@@ -2904,7 +2924,7 @@ class KVCacheConfigurator:
 
         # Host-only checkpoints keep the live slot plus the ping-pong slots
         # the extra-buffer kernel writes. They do not keep a donate slot.
-        if get_exec().mamba.enable_mamba_host_only_checkpoint:
+        if host_only_mamba_checkpoint():
             if not get_exec().mamba.enable_mamba_extra_buffer:
                 return 1
             return 1 + get_mamba_tracking_slots(
@@ -3132,7 +3152,7 @@ class KVCacheConfigurator:
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
         request_scoped = replayssm_active and (
             self.hybrid_kda_config is None
-            or get_exec().mamba.enable_mamba_host_only_checkpoint
+            or host_only_mamba_checkpoint()
         )
         replayssm_fixed_bytes, replayssm_ring_per_slot = replayssm_ring_memory_charge(
             replayssm_ring_per_req,

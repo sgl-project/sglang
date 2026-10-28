@@ -86,9 +86,11 @@ class MambaComponent(TreeComponent):
             slot.checkpoint_interval, params.page_size
         )
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
-        self.host_only_checkpoint = bool(
-            get_exec().mamba.enable_mamba_host_only_checkpoint
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            host_only_mamba_checkpoint,
         )
+
+        self.host_only_checkpoint = host_only_mamba_checkpoint()
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -242,7 +244,7 @@ class MambaComponent(TreeComponent):
         host_pool = self._mamba_pool_host
         if host_pool is None:
             raise RuntimeError(
-                "--enable-mamba-host-only-checkpoint requires "
+                "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires "
                 "--enable-hierarchical-cache"
             )
         host_indices = host_pool.alloc(1)
@@ -270,7 +272,7 @@ class MambaComponent(TreeComponent):
         controller = self.cache.cache_controller
         if controller is None or controller.l2_transfer_engine is None:
             raise RuntimeError(
-                "--enable-mamba-host-only-checkpoint requires the hicache "
+                "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires the hicache "
                 "transfer engine"
             )
         transfer = PoolTransfer(
