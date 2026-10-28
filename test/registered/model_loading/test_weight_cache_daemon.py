@@ -230,9 +230,9 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
 
         Without this, the test would still pass if the IPC path silently
         regressed to disk loading (the daemon would just sit unused), because
-        generation output looks identical either way. The daemon-side loader
-        logs "[WeightCacheModelLoader] Loaded model via IPC" on every rank, so its
-        presence in the captured server logs is our proof the IPC path ran.
+        generation output looks identical either way. The engine-side loader
+        logs "[WeightCacheModelLoader] Loaded model via IPC" on every rank, so
+        its presence in the captured server logs is our proof the IPC path ran.
         """
         for stream in (getattr(self, "stdout", None), getattr(self, "stderr", None)):
             if stream is not None:

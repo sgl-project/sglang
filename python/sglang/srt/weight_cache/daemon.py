@@ -151,7 +151,9 @@ class WeightCacheDaemon:
     """Persistent GPU weight cache for a single TP rank.
 
     Holds the complete post-quantization state_dict in GPU memory and
-    serves CUDA IPC handles to engine processes via Unix socket.
+    serves it to engine processes over a Unix socket, through the selected
+    transport: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed as
+    file descriptors (vmm_fd).
     """
 
     def __init__(
@@ -398,8 +400,8 @@ class WeightCacheDaemon:
         )
 
         # Ensure every post-processing kernel has retired before we export the
-        # memory: clients map these tensors read-only via IPC and would otherwise
-        # risk observing half-written weights.
+        # memory: clients map these tensors (and must treat them as read-only)
+        # and would otherwise risk observing half-written weights.
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
@@ -654,9 +656,10 @@ class WeightCacheDaemon:
                 conn,
                 config=self.config.to_dict(),
                 entries=self.state_entries,
-                # PID so the client can watch daemon liveness: if this
-                # process dies while clients hold IPC mappings, their
-                # param.data (and any CUDA-graph-captured addresses) dangle.
+                # PID so the client can watch daemon liveness: with
+                # torch_ipc, if this process dies while clients hold IPC
+                # mappings, their param.data (and any CUDA-graph-captured
+                # addresses) dangle.
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
             )

@@ -49,11 +49,13 @@ logger = logging.getLogger(__name__)
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
-# Transport backends that hold the mappings of a loaded model. The imported
-# tensors do not own those mappings (vmm_fd builds them on non-owning storages),
-# and a parameter or view can outlive the model object, so nothing unmaps them
-# while this process runs: they stay here until it exits, when the driver
-# releases them.
+# Transport backends of loaded models, kept until the process exits. For
+# vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
+# sit on non-owning storages and a parameter or view can outlive the model
+# object, so a loaded model's mappings must never be unmapped while this process
+# runs. Keeping the backends here keeps the owner of those mappings reachable;
+# nothing unmaps them on garbage collection, and the driver releases this
+# process's mappings and address reservation when it exits.
 _LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
 
 
@@ -215,9 +217,10 @@ class WeightCacheModelLoader(BaseModelLoader):
     ) -> None:
         """Fail loud if the serving daemon dies while we hold its weights.
 
-        In both client and (engine-spawned) daemon mode, the model's param.data
-        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
-        capture those addresses. If the daemon exits, the pointers dangle:
+        With torch_ipc (``fatal=True``), in both client and (engine-spawned)
+        daemon mode, the model's param.data points into the daemon's GPU memory
+        via CUDA IPC, and CUDA graphs may capture those addresses. If the daemon
+        exits, the pointers dangle:
         forward passes would read freed GPU memory -> illegal-address crashes or
         silent garbage. There is no safe in-place recovery, so a background
         thread polls the daemon PID and, on death, SIGKILLs this process with a
@@ -256,9 +259,9 @@ class WeightCacheModelLoader(BaseModelLoader):
                     logger.critical(
                         f"[WeightCacheModelLoader] Weight cache daemon "
                         f"(pid={daemon_pid}) died while this engine holds its "
-                        f"weights via CUDA IPC. "
-                        f"The mapped weight pointers are now dangling; continuing "
-                        f"would read freed GPU memory. Terminating this process."
+                        f"weights via CUDA IPC. The mapped weight pointers are "
+                        f"now dangling; continuing would read freed GPU memory. "
+                        f"Terminating this process."
                     )
                     os.kill(os.getpid(), signal.SIGKILL)
                     return
@@ -334,8 +337,9 @@ class WeightCacheModelLoader(BaseModelLoader):
             obj = getattr(obj, part)
         leaf_name = parts[-1]
         if is_param:
-            # requires_grad=False: the IPC memory is shared/read-only and SGLang
-            # is inference-only, so autograd must never write into it.
+            # requires_grad=False: the memory is shared with the daemon and must
+            # be treated as read-only, and SGLang is inference-only, so autograd
+            # must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
         else:
@@ -356,11 +360,12 @@ class WeightCacheModelLoader(BaseModelLoader):
         entries,
         quant_config,
     ) -> nn.Module:
-        """Zero-copy load: map IPC tensors directly as param.data.
+        """Zero-copy load: use the daemon's tensors as the model's weights.
 
         The model is initialized on the meta device (no memory allocation),
-        then each parameter's data is replaced with the IPC-mapped GPU tensor.
-        The engine and daemon share the same physical GPU memory via CUDA IPC.
+        then each parameter and buffer is replaced with, or registered as, the
+        tensor imported through the selected transport. The engine and daemon
+        share the same physical GPU memory.
         """
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -434,12 +439,12 @@ class WeightCacheModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"[WeightCacheModelLoader] {len(mismatched)} tensor(s) have "
                 f"shape/dtype mismatch between the IPC daemon and the "
-                f"meta-initialized model. "
-                f"The quantization method passed the IPC allowlist gate "
-                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
-                f"case — it indicates the daemon's weight fingerprint is "
-                f"incomplete or the daemon/client configs drifted (a bug to fix), "
-                f"not merely uninitialized weights:\n" + "\n".join(mismatched)
+                f"meta-initialized model. The quantization method passed the "
+                f"IPC allowlist gate (check_ipc_quant_support), so this is NOT an "
+                f"unsupported-quant case — it indicates the daemon's weight "
+                f"fingerprint is incomplete or the daemon/client configs drifted "
+                f"(a bug to fix), not merely uninitialized weights:\n"
+                + "\n".join(mismatched)
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
@@ -479,7 +484,9 @@ class WeightCacheModelLoader(BaseModelLoader):
 
         map_elapsed = time.perf_counter() - map_tic
 
-        # Stash IPC refs on the model to prevent GC (which would unmap the memory)
+        # Keep the imported tensors referenced from the model. With torch_ipc
+        # each one owns its IPC mapping, which GC would close; vmm_fd mappings
+        # are owned by the transport backend kept below.
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
         # Keep transport backend alive for the model lifetime (VMM backend owns
