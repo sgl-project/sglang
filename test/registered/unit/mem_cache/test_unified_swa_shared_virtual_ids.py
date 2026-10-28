@@ -28,7 +28,8 @@ end of the table: an unchecked write, not a raised index.
 import unittest
 
 import torch
-from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
+from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
+from test_swa_locked_full_recover_unified import _DEV
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec

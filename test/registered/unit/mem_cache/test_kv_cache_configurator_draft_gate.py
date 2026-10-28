@@ -78,6 +78,7 @@ from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleDraftWorker,
     MultiLayerEagleWorkerV2,
 )
+from sglang.test.tree_slots import tree_slots_of
 
 
 class _FakeKVCache:
@@ -551,7 +552,10 @@ class TestSWARetainWindow(CustomTestCase):
                 page_size=1,
                 sliding_window_size=_WINDOW,
                 draft_swa_window=draft_swa_window,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA),
+                    window=max(_WINDOW, draft_swa_window),
+                ),
             )
         )
         req = Req(

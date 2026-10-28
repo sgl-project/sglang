@@ -41,6 +41,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 
@@ -438,7 +439,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
                 enable_mamba_extra_buffer=True,
-                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
             )
         )
         return tree, allocator, req_to_token_pool
