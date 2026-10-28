@@ -36,8 +36,9 @@ pub struct RustServerServerArgs {
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
     pub stage_channel_cap: usize,
-    /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
-    /// the scheduler's reserved launch cores). `None` → run unpinned.
+    /// CPU core ids every frontend thread is pinned to, as one shared set (e.g.
+    /// this rank's NUMA-local cores minus the scheduler's reserved launch
+    /// cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
     /// This listener serves the node's `/metrics` (when metrics are on). Only
     /// the base port does: every listener would render the same node-wide
