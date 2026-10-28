@@ -40,6 +40,7 @@ class HiCacheStorageConfig:
     should_split_heads: bool = False
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
+    dp_size: int = 1
     extra_config: Optional[dict] = None
     dcp_size: int = 1
     dcp_rank: int = 0

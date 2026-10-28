@@ -446,7 +446,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             rank_scale_factor = (
                 1
                 if storage_config is None
-                else (storage_config.tp_size * storage_config.pp_size)
+                else (
+                    storage_config.tp_size
+                    * storage_config.pp_size
+                    * storage_config.dp_size
+                )
             )
 
             per_rank_global_segment_size = (

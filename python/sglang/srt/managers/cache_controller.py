@@ -758,10 +758,12 @@ class HiCacheController:
             tp_rank = parallel.attn_tp_rank
             tp_size = parallel.attn_tp_size
             dp_rank = parallel.attn_dp_rank
+            dp_size = parallel.attn_dp_size
         else:
             tp_rank = parallel.tp_rank
             tp_size = parallel.tp_size
             dp_rank = 0
+            dp_size = 1
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -806,6 +808,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
+            dp_size=dp_size,
             extra_config=storage_backend_extra_config,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
