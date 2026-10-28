@@ -773,6 +773,7 @@ struct alignas(128) SplitCounters {
   uint32_t count_eq;
   uint32_t arrive;
   uint32_t tie_nonzero;
+  uint32_t barrier;  ///< the one-launch path's histogram-to-select barrier (topk_split_fused)
 };
 
 struct SplitWorkspace {
@@ -1030,6 +1031,73 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
   }
 }
 
+/// topk_split_hist then topk_split_select in one launch: a row's ``split`` blocks are
+/// resident at once (the dispatch keeps the grid within the CUs), so they meet at a
+/// barrier where the launch boundary was, and a short row costs one launch, not two.
+/// The last block out of a row zeroes its counters for the next launch.
+template <TopKMode kMode>
+TOPK_KERNEL void topk_split_fused(const __grid_constant__ TopKPagedParams params, const SplitWorkspace ws) {
+  device::enable_smem_spilling();
+  const auto row = blockIdx.x;
+  const auto rank = blockIdx.y;
+  auto problem = params.problem(row);
+  constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
+  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, TopKSplit::Smem> smem;
+
+  // too short to split: rank 0 alone on the one-block paths, as topk_split_select
+  if (problem.seq_len <= ws.floor) {
+    if (rank != 0) return;
+    __shared__ int32_t s_topk_indices[kNeedStaging ? kMaxTopK : 1];
+    if (problem.seq_len <= problem.topk) {
+      return trivial_transform<false, kMode>(problem, params.template get_transform<kMode>(row));
+    }
+    if constexpr (kNeedStaging) problem.out = s_topk_indices;
+    if (problem.seq_len <= kReg4MaxSeqLen) {
+      Register4::forward<false>(problem, &smem);
+    } else {
+      Streaming::forward<false>(problem, &smem);
+    }
+    if constexpr (kNeedStaging) {
+      __syncthreads();
+      paged_transform<kMode>(problem, params.get_output_ptr(row), params.template get_transform<kMode>(row));
+    }
+    return;
+  }
+
+  auto* const split_smem = reinterpret_cast<TopKSplit::Smem*>(&smem);
+  auto* const ctr = &ws.ctr[row];
+  auto* const ties = ws.ties + static_cast<size_t>(row) * TopKSplit::kMaxNumTie;
+  const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, ws.split);
+  auto* const row_hist = ws.hist + static_cast<size_t>(row) * TopKSplit::kHistSize;
+
+  TopKSplit::histogram_chunk(problem, chunk, row_hist, split_smem);
+  // every chunk's histogram counted before any block selects (thread 0 fences for
+  // the block, as arrive_last does)
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();  // release: this block's histogram adds land before its arrival
+    atomicAdd(&ctr->barrier, 1u);
+    while (atomicAdd(&ctr->barrier, 0u) < ws.split) __builtin_amdgcn_s_sleep(1);
+    __threadfence();  // acquire the other blocks' adds
+  }
+  __syncthreads();
+
+  TopKSplit::select_chunk(problem, chunk, row_hist, ctr, ties, split_smem);
+  if (!TopKSplit::arrive_last(ctr, ws.split, split_smem)) return;
+
+  TopKSplit::clear_row(row_hist);
+  TopKSplit::finish_ties(problem, ties, split_smem);
+  if constexpr (kNeedStaging) {
+    __syncthreads();
+    paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(row));
+  }
+  // every block of the row has arrived: its counters are free for the next launch
+  __syncthreads();
+  if (threadIdx.x < sizeof(SplitCounters) / sizeof(uint32_t)) {
+    atomicExch(reinterpret_cast<uint32_t*>(ctr) + threadIdx.x, 0u);
+  }
+}
+
 /// Per-device scratch for the split path, sized for the worst case and never
 /// freed: HIP graphs bake the address into their kernel arguments. The gate
 /// bounds it by the CU count, not the batch -- about 2 MB on a 256-CU part.
@@ -1201,12 +1269,10 @@ struct TopKKernel {
     // PDL stays off: the hist -> select kernel boundary is the barrier.
     if constexpr (kMode != TopKMode::KPOOL) {
       if (const auto [split, split_ws] = split_plan(batch_size, max_seq_len, device); split >= kSplitMin) {
+        // batch * split <= kSplitBlocks: every block resident, so one launch with a barrier
         LaunchKernel({batch_size, split}, kBlockSize, device)
             .config({.use_pdl = false})
-            .launch(topk_split_hist, params, split_ws);
-        LaunchKernel({batch_size, split}, kBlockSize, device)
-            .config({.use_pdl = false})
-            .launch(topk_split_select<kMode>, params, split_ws);
+            .launch(topk_split_fused<kMode>, params, split_ws);
         return;
       }
     }
