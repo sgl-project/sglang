@@ -1003,9 +1003,11 @@ class Envs:
     # Batches of at least SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS tokens run aiter.fused_moe
     # (FlyDSL a8w4, MXFP8 activations); smaller ones run the gluon moe_gemm_a8w4 over a
     # zero-copy view of the same weights (dims rounded up to 128). Off: the path above,
-    # unchanged.
+    # unchanged. MIN_TOKENS: decode batches (up to 64) must stay on gluon, prefill chunks
+    # on FlyDSL; anything in between serves the same (per-layer crossover ~450 tokens
+    # at TP1, flat 320-768), and 16 put decode on FlyDSL (-19% throughput).
     SGLANG_GFX1250_W4A8_FLYDSL = EnvBool(False)
-    SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS = EnvInt(16)
+    SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS = EnvInt(384)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
