@@ -592,7 +592,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             get_prefill_num_tokens_to_capture,
         )
 
-        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        mamba_cache = self.state_pool.mamba_cache
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
@@ -1141,7 +1141,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
         meta = self.prefill_graph_metadata
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         if meta.track:
