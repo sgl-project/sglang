@@ -938,7 +938,7 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     )
 
 
-def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
+def _write_tail_source_kv_on_capture(layer, x, positions) -> None:
     get_attn_backend().tail_source_kv_layer_id = layer.layer_id
 
 
@@ -946,7 +946,7 @@ def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
 # so the id is also set while the graph captures.
 bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
     deepseek_v4_write_tail_source_kv,
-    capture_stub=_write_tail_source_kv_capture_stub,
+    on_capture=_write_tail_source_kv_on_capture,
 )
 
 
@@ -984,11 +984,11 @@ def deepseek_v4_exit_late_layer_tail() -> None:
 # while the graph captures.
 bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(
     deepseek_v4_enter_late_layer_tail,
-    capture_stub=deepseek_v4_enter_late_layer_tail,
+    on_capture=deepseek_v4_enter_late_layer_tail,
 )
 bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(
     deepseek_v4_exit_late_layer_tail,
-    capture_stub=deepseek_v4_exit_late_layer_tail,
+    on_capture=deepseek_v4_exit_late_layer_tail,
 )
 
 
