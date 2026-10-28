@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 try:
     from torch.nn.attention.varlen import varlen_attn as torch_varlen_attn
@@ -101,7 +102,10 @@ class SDPAImpl(AttentionImpl):
         is_causal = self.causal
         if self.causal and query.shape[-2] != key.shape[-2]:
             is_causal = False
-            if query.shape[-2] > 1:
+            if query.shape[-2] > 1 and not torch.compiler.is_compiling():
+                attn_mask = causal_lower_right(query.shape[-2], key.shape[-2])
+            # Dynamo cannot construct CausalBias as of torch 2.14 (graph break).
+            elif query.shape[-2] > 1:
                 query_length = query.shape[-2]
                 key_length = key.shape[-2]
                 attn_mask = torch.ones(

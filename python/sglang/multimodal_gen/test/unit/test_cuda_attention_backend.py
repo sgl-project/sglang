@@ -6,6 +6,9 @@ from types import ModuleType
 from unittest.mock import Mock, patch
 
 import torch
+import torch.nn.functional as F
+from torch.nn.attention.bias import CausalBias
+from torch.overrides import TorchFunctionMode
 
 from sglang.multimodal_gen.runtime.layers.attention.backends import flash_attn
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
@@ -464,6 +467,44 @@ class TestForwardIntoDefault(unittest.TestCase):
         impl = SDPAImpl(num_heads=2, head_size=64, causal=False, softmax_scale=0.125)
         q = torch.zeros(1, 8, 2, 64)
         self.assertFalse(impl.forward_into(q, q, q, None, None))
+
+
+class _RecordSDPAMasks(TorchFunctionMode):
+    def __init__(self):
+        super().__init__()
+        self.masks = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is F.scaled_dot_product_attention:
+            self.masks.append(kwargs.get("attn_mask"))
+        return func(*args, **kwargs)
+
+
+class TestSDPACausalShorterQuery(unittest.TestCase):
+    def test_lower_right_causal_without_dense_mask(self):
+        """Causal SDPA with Sq < Sk stays lower-right aligned and hands SDPA a lazy
+        causal bias, not a dense Sq x Sk mask that blocks the fused CUDA kernels."""
+        torch.manual_seed(0)
+        impl = SDPAImpl(num_heads=4, head_size=16, causal=True, softmax_scale=0.25)
+        q = torch.randn(1, 8, 4, 16)
+        k, v = torch.randn(2, 1, 32, 2, 16).unbind(0)
+
+        with _RecordSDPAMasks() as recorder:
+            out = impl.forward(q, k, v, None)
+
+        self.assertEqual(len(recorder.masks), 1)
+        self.assertIsInstance(recorder.masks[0], CausalBias)
+        lower_right = torch.ones(8, 32, dtype=torch.bool).tril(diagonal=32 - 8)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=lower_right,
+            scale=0.25,
+            enable_gqa=True,
+        ).transpose(1, 2)
+        torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":
