@@ -1,4 +1,5 @@
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -71,10 +72,11 @@ class TokenSpaceSGLangProcessor:
         strategy_class = self._strategy_class
         self._server_args = server_args
         mm = get_mm()
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
         self._feature_transport = MultimodalFeatureTransport(
             mm.mm_feature_transport,
             base_gpu_id=server_args.base_gpu_id,
-            skip_mm_pool=kwargs.get("skip_mm_pool", False),
+            skip_mm_pool=skip_mm_pool,
         )
         self._disable_fast_image_processor = (
             mm.disable_fast_image_processor or mm.image_processor_backend == "pil"
@@ -83,7 +85,10 @@ class TokenSpaceSGLangProcessor:
             image_processor_backend=mm.image_processor_backend,
             disable_fast_image_processor=mm.disable_fast_image_processor,
             mm_process_config=mm.mm_process_config,
-            mm_processor_worker_num=mm.mm_processor_worker_num
+            # As in legacy: a processor built without the feature pool runs synchronously.
+            mm_processor_worker_num=1
+            if skip_mm_pool
+            else mm.mm_processor_worker_num
             or resolve_auto_mm_processor_worker_num(
                 competes_with_the_scheduler=preprocessing_competes_with_the_scheduler(
                     _processor,
@@ -91,7 +96,8 @@ class TokenSpaceSGLangProcessor:
                 ),
                 declared=None,
             ),
-            mm_io_worker_num=mm.mm_io_worker_num,
+            mm_io_worker_num=mm.mm_io_worker_num
+            or int(os.environ.get("SGLANG_IO_WORKERS", 0)),
             allowed_media_domains=mm.allowed_media_domains,
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
@@ -103,7 +109,6 @@ class TokenSpaceSGLangProcessor:
             compute_mrope_positions=True,
             # Decode where the legacy processors do.
             pin_io_threads_to_current_device=False,
-            **kwargs,
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
