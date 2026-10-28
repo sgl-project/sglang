@@ -43,7 +43,7 @@ def _start_bootstrap_server():
     raise TimeoutError(f"the bootstrap server on {url} did not start")
 
 
-def _publish(role, session_id, port):
+def _publish(role, session_id, port, nixl_agent=None):
     model_config = SimpleNamespace(
         remote_instance_weight_loader_backend=None, engine_info_bootstrap_port=port
     )
@@ -66,14 +66,68 @@ def _publish(role, session_id, port):
         transporter = RemoteInstanceWeightTransporter(
             server_args=SimpleNamespace(registers_parallelism_config=lambda: True),
             get_model=lambda: torch.nn.Module(),
-            gpu_id=0,
+            gpu_id=3,
         )
-        transporter.engine = object()
-        transporter.session_id = session_id
+        if nixl_agent is None:
+            transporter.engine = object()
+            transporter.session_id = session_id
+        else:
+            transporter.nixl_agent = nixl_agent
         transporter.parallelism_config = SimpleNamespace(
             to_dict=lambda: {"published_by": role}
         )
         transporter.maybe_register_and_publish_weight_info(role=role)
+
+
+class TestTransports(CustomTestCase):
+    def _init_transports(self, *, loads_over_mooncake, seeds_via_nixl):
+        built = []
+        with (
+            patch.object(
+                transporter_mod,
+                "get_parallel",
+                lambda: SimpleNamespace(tp_rank=0, dist_init_addr=None),
+            ),
+            patch.object(
+                transporter_mod,
+                "get_model",
+                lambda: SimpleNamespace(
+                    remote_instance_weight_loader_start_seed_via_nixl=seeds_via_nixl
+                ),
+            ),
+            patch.object(
+                transporter_mod,
+                "remote_instance_transfer_engine_enabled",
+                lambda load_format=None: loads_over_mooncake,
+            ),
+            patch.object(
+                RemoteInstanceWeightTransporter,
+                "_init_mooncake_engine",
+                lambda self: built.append("mooncake"),
+            ),
+            patch.object(
+                RemoteInstanceWeightTransporter,
+                "_init_nixl_agent",
+                lambda self: built.append("nixl"),
+            ),
+        ):
+            RemoteInstanceWeightTransporter(
+                server_args=SimpleNamespace(), get_model=torch.nn.Module, gpu_id=0
+            ).init_transports()
+        return built
+
+    def test_a_runner_loading_over_mooncake_and_seeding_via_nixl_gets_both(self):
+        """With only the NIXL agent, the remote loader got no transfer engine and aborted."""
+        self.assertEqual(
+            self._init_transports(loads_over_mooncake=True, seeds_via_nixl=True),
+            ["mooncake", "nixl"],
+        )
+
+    def test_a_nixl_seed_alone_starts_no_mooncake_engine(self):
+        self.assertEqual(
+            self._init_transports(loads_over_mooncake=False, seeds_via_nixl=True),
+            ["nixl"],
+        )
 
 
 class TestPublicationRoles(CustomTestCase):
@@ -89,17 +143,59 @@ class TestPublicationRoles(CustomTestCase):
 
         self.assertEqual(
             get("get_transfer_engine_info")["remote_instance_transfer_engine_info"],
-            ["target-session", {"target.weight": [1, 4, 2]}],
+            {
+                "transport": "mooncake",
+                "session_id": "target-session",
+                "weights_info_dict": {"target.weight": [1, 4, 2]},
+            },
         )
         self.assertEqual(
             get("get_transfer_engine_info", role="draft")[
                 "remote_instance_transfer_engine_info"
             ],
-            ["draft-session", {"draft.weight": [1, 4, 2]}],
+            {
+                "transport": "mooncake",
+                "session_id": "draft-session",
+                "weights_info_dict": {"draft.weight": [1, 4, 2]},
+            },
         )
         self.assertEqual(get("get_parallelism_config"), {"published_by": "target"})
         self.assertEqual(
             get("get_parallelism_config", role="draft"), {"published_by": "draft"}
+        )
+
+    def test_a_nixl_runner_publishes_its_agent_after_registering_its_weights(self):
+        """A peer writes through the agent metadata: taken before registration, it lacks the weights' remote keys."""
+        server, url = _start_bootstrap_server()
+        self.addCleanup(server.close)
+        events = []
+
+        class _FakeNixlAgent:
+            def get_agent_metadata(self):
+                events.append("metadata")
+                return b"keys"
+
+        def register_memory_region_nixl(model, nixl_agent, gpu_id):
+            events.append(("registered", gpu_id))
+            return {"target.weight": (1, 4, 2)}, "registration"
+
+        with patch.object(
+            transporter_mod, "register_memory_region_nixl", register_memory_region_nixl
+        ):
+            _publish("target", None, server.port, nixl_agent=_FakeNixlAgent())
+
+        info = requests.get(
+            f"{url}/get_transfer_engine_info", params={"rank": 0}
+        ).json()["remote_instance_transfer_engine_info"]
+        self.assertEqual(events, [("registered", 3), "metadata"])
+        self.assertEqual(
+            info,
+            {
+                "transport": "nixl",
+                "agent_metadata": "a2V5cw==",
+                "gpu_id": 3,
+                "weights_info_dict": {"target.weight": [1, 4, 2]},
+            },
         )
 
     def test_drafts_publish_once_their_pools_bind_the_targets_embed_and_head(self):

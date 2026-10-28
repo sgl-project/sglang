@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -11,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
+    register_memory_region_nixl,
 )
 from sglang.srt.runtime_context import (
     get_model,
@@ -32,15 +35,38 @@ class RemoteInstanceWeightTransporter:
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""
+    nixl_agent: Optional[Any] = None
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
     parallelism_config: Optional[RankParallelismConfig] = None
-    _nixl_manager: Optional[Any] = None
+    _nixl_registration: Optional[Any] = None
 
     @property
     def model(self) -> torch.nn.Module:
         return self.get_model()
 
-    def init_engine(self):
+    def init_transports(self, load_format: Optional[str] = None) -> None:
+        """Loading from a seed and publishing for peers each pick their own transport, so a runner may need both."""
+        if remote_instance_transfer_engine_enabled(load_format=load_format):
+            self._init_mooncake_engine()
+        if get_model().remote_instance_weight_loader_start_seed_via_nixl:
+            self._init_nixl_agent()
+
+    def _init_nixl_agent(self) -> None:
+        from nixl._api import nixl_agent, nixl_agent_config
+
+        backend = envs.SGLANG_REMOTE_INSTANCE_NIXL_BACKEND.get()
+        # target and draft runners of a rank each publish their own agent
+        agent = nixl_agent(
+            f"sglang-weights-tp{self.tp_rank}-{uuid.uuid4()}",
+            nixl_agent_config(backends=[backend]),
+        )
+        if backend not in agent.get_plugin_list():
+            raise ValueError(
+                f"NIXL has no {backend} plugin (SGLANG_REMOTE_INSTANCE_NIXL_BACKEND); installed: {agent.get_plugin_list()}"
+            )
+        self.nixl_agent = agent
+
+    def _init_mooncake_engine(self) -> None:
         try:
             from mooncake.engine import TransferEngine
         except ImportError:
@@ -70,18 +96,22 @@ class RemoteInstanceWeightTransporter:
         """Registers this runner's weights with its transfer engine and publishes them, with its parallelism
         config, under `role`: ``target``, or the draft role `weight_update_runners()` names."""
         if (
-            remote_instance_transfer_engine_enabled()
+            (
+                remote_instance_transfer_engine_enabled()
+                or get_model().remote_instance_weight_loader_start_seed_via_nixl
+            )
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
             and get_model().remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-            and self.engine is not None
+            and (self.engine is not None or self.nixl_agent is not None)
             and self.weight_info is None
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
-            self.weight_info = register_memory_region(self.model, self.engine)
-            self._register_to_engine_info_bootstrap(role)
+            self._register_to_engine_info_bootstrap(
+                role, self._register_weights_for_peer_writes()
+            )
 
         # The P2P weight-update client needs each rank's parallelism layout to
         # map training-side parameters onto this rank's shards.
@@ -90,6 +120,28 @@ class RemoteInstanceWeightTransporter:
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap(role)
+
+    def _register_weights_for_peer_writes(self) -> dict:
+        """Registers the weights with this runner's transport; returns what a peer needs to write them."""
+        if self.nixl_agent is not None:
+            self.weight_info, self._nixl_registration = register_memory_region_nixl(
+                self.model, self.nixl_agent, self.gpu_id
+            )
+            return {
+                "transport": "nixl",
+                # taken after registration: it carries the registered memory's remote keys
+                "agent_metadata": base64.b64encode(
+                    self.nixl_agent.get_agent_metadata()
+                ).decode("ascii"),
+                "gpu_id": self.gpu_id,
+                "weights_info_dict": self.weight_info,
+            }
+        self.weight_info = register_memory_region(self.model, self.engine)
+        return {
+            "transport": "mooncake",
+            "session_id": self.session_id,
+            "weights_info_dict": self.weight_info,
+        }
 
     def _bootstrap_url(self) -> str:
         if get_parallel().dist_init_addr:
@@ -130,7 +182,7 @@ class RemoteInstanceWeightTransporter:
             )
 
     def _register_to_engine_info_bootstrap(
-        self: RemoteInstanceWeightTransporter, role: str
+        self: RemoteInstanceWeightTransporter, role: str, transfer_engine_info: dict
     ):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
@@ -155,10 +207,7 @@ class RemoteInstanceWeightTransporter:
         payload = {
             "role": role,
             "tp_rank": self.tp_rank,
-            "transfer_engine_info": {
-                "session_id": self.session_id,
-                "weights_info_dict": self.weight_info,
-            },
+            "transfer_engine_info": transfer_engine_info,
         }
 
         try:
