@@ -14,10 +14,11 @@ from sglang.srt.mem_cache.kv.layout.base import (
     _store_dtype_for,
     check_physical_id_bound,
     dense_rows,
+    fused_draft_lanes,
 )
 from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion, LatentDraftRegion
 from sglang.srt.mem_cache.layout.token_major import (
     DenseEntryLayout,
     DensePart,
@@ -46,8 +47,9 @@ class MLASubPoolSpec(SubPoolSpec):
     One latent row (``kv_lora_rank + qk_rope_head_dim``) per token per layer; V
     is a prefix slice of the same row, so there is no separate V region. Not a
     subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
-    invariant there do not apply. With `draft_region` set, the draft's K and V
-    parts follow the latent rows inside every slot's entry, as on an MHA host.
+    invariant there do not apply. With `draft_region` set, an MHA draft's K and
+    V parts, or an MLA draft's latent rows, follow the host's latent rows inside
+    every slot's entry.
     """
 
     zero_units_on_handout: ClassVar[bool] = True
@@ -65,8 +67,11 @@ class MLASubPoolSpec(SubPoolSpec):
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
         if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
-                "dense entries carry dense draft K/V rows, never a state region"
+            assert isinstance(
+                self.draft_region, (DenseDraftRegion, LatentDraftRegion)
+            ), (
+                "MLA entries carry dense draft K/V rows or latent draft rows, "
+                "never a state region"
             )
             self.draft_region.validate()
 
@@ -132,6 +137,17 @@ class MLASubPoolSpec(SubPoolSpec):
             for part in ("draft_k", "draft_v")
         )
 
+    def latent_draft_views(self, arena) -> List[torch.Tensor]:
+        """Per-lane views of an MLA draft's latent rows fused into this
+        sub-pool's entries: the same rows, the same ids."""
+        assert isinstance(self.draft_region, LatentDraftRegion), (
+            f"sub-pool {self.name!r} carries no fused latent draft region"
+        )
+        rows = dense_rows(arena, self.name)
+        return build_dense_views(
+            arena.raw, layout=self.layout(), part_name="draft_kv", num_slots=rows
+        )
+
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
 
@@ -145,7 +161,7 @@ class MLAView(MLAKVView):
     translation.
 
     Its per-layer methods take the view's layer index (the router's
-    ``KVLayer.view_layer_id``).
+    ``KVLayer.view_layer_id``) offset by ``start_layer``.
     """
 
     requires_physical_write_loc = True
@@ -183,25 +199,52 @@ class MLAView(MLAKVView):
             f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
             f"match kv cache dtype {kv_cache_dtype}"
         )
+        self._bind(
+            arena=arena,
+            sub_pool=spec.name,
+            kv_buffer=spec.views(arena),
+            kv_lora_rank=spec.kv_lora_rank,
+            qk_rope_head_dim=spec.qk_rope_head_dim,
+            dtype=kv_cache_dtype,
+            page_size=page_size,
+            entry_bytes=spec.entry_bytes(),
+            # Addressed by the 0..N-1 index of its layers.
+            model_layer_ids=tuple(range(spec.layer_num)),
+            start_layer=0,
+        )
+
+    def _bind(
+        self,
+        *,
+        arena: "KVArena",
+        sub_pool: str,
+        kv_buffer: List[torch.Tensor],
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        dtype: torch.dtype,
+        page_size: int,
+        entry_bytes: int,
+        model_layer_ids: Tuple[int, ...],
+        start_layer: int,
+    ) -> None:
         self._arena = arena
-        self._sub_pool_name = spec.name
-        self.kv_buffer = spec.views(arena)
-        self.num_pages = arena.extent_entries(spec.name) // page_size
-        self.page_bytes = page_size * spec.entry_bytes()
+        self._sub_pool_name = sub_pool
+        self.kv_buffer = kv_buffer
+        self.num_pages = arena.extent_entries(sub_pool) // page_size
+        self.page_bytes = page_size * entry_bytes
         # Rows 0..page_size-1 are the padding sink; physical ids run to the rows.
         self.size = self.num_pages * page_size - page_size
         self.page_size = page_size
-        self.dtype = kv_cache_dtype
-        self.store_dtype = spec.store_dtype
+        self.dtype = dtype
+        self.store_dtype = _store_dtype_for(dtype)
         self.device = arena.device
-        self.kv_lora_rank = spec.kv_lora_rank
-        self.qk_rope_head_dim = spec.qk_rope_head_dim
-        self.kv_cache_dim = spec.kv_cache_dim
-        self.layer_num = spec.layer_num
-        # Addressed by the 0..N-1 index of its layers.
-        self.start_layer = 0
-        self.end_layer = spec.layer_num - 1
-        self.model_layer_ids = tuple(range(spec.layer_num))
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        self.layer_num = len(kv_buffer)
+        self.start_layer = start_layer
+        self.end_layer = start_layer + len(kv_buffer) - 1
+        self.model_layer_ids = model_layer_ids
         self.layer_transfer_counter: Optional[LayerDoneCounter] = None
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -229,6 +272,10 @@ class MLAView(MLAKVView):
     def get_kv_cache_quant_method(self):
         return None  # MLA rows carry no KV quantization method
 
+    def get_v_head_dim(self) -> int:
+        # V is the leading kv_lora_rank values of each latent row.
+        return self.kv_lora_rank
+
     def get_kv_size_bytes(self) -> int:
         return 0  # the arena logs the total; per-sub-pool would double-count
 
@@ -248,13 +295,15 @@ class MLAView(MLAKVView):
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
-        return self._typed(self.kv_buffer[layer_id])
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._typed(self.kv_buffer[layer_id - self.start_layer])
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
-        return self._typed(self.kv_buffer[layer_id][..., : self.kv_lora_rank])
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._typed(
+            self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+        )
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -320,7 +369,7 @@ class MLAView(MLAKVView):
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
-        self.kv_buffer[layer_id][loc] = cache_k
+        self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -345,7 +394,7 @@ class MLAView(MLAKVView):
             if cache_k_rope is not None and cache_k_rope.numel() > 0:
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
         set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -426,3 +475,54 @@ class MLAView(MLAKVView):
                     self.kv_buffer[0].device, non_blocking=True
                 )
         current_platform.synchronize()
+
+
+class DraftMLAView(MLAView):
+    """A fused MLA draft runner's latent rows: views of the latent draft part
+    inside every slot entry of its MLA host sub-pool, one region lane per draft
+    layer. Ids are the target's physical token ids in the host sub-pool's
+    space; the host's unit moves carry the draft bytes, so the draft has no
+    transfer or copy of its own. Its methods take the draft's model layer ids."""
+
+    def __init__(
+        self,
+        *,
+        arena: "KVArena",
+        host_spec: MLASubPoolSpec,
+        layer_lanes: "dict[int, int]",
+        page_size: int,
+    ):
+        region = host_spec.draft_region
+        assert isinstance(region, LatentDraftRegion), (
+            f"sub-pool {host_spec.name!r} carries no fused latent draft region"
+        )
+        layer_ids, lanes = fused_draft_lanes(layer_lanes, lane_num=region.lane_num)
+        views = host_spec.latent_draft_views(arena)
+        self.layer_lanes = dict(layer_lanes)
+        self._bind(
+            arena=arena,
+            sub_pool=host_spec.name,
+            kv_buffer=[views[lane] for lane in lanes],
+            kv_lora_rank=region.kv_lora_rank,
+            qk_rope_head_dim=region.qk_rope_head_dim,
+            # The KV dtype, not its storage: stores cast to it and view the
+            # result as the storage dtype (bytes for FP8).
+            dtype=region.resolved_kv_dtype(),
+            page_size=page_size,
+            entry_bytes=host_spec.entry_bytes(),
+            model_layer_ids=tuple(layer_ids),
+            start_layer=layer_ids[0],
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft KV has no region of its own; KV transfer is unsupported"
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV")
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV")

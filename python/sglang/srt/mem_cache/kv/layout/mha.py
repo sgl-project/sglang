@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.kv.layout.base import (
     _store_dtype_for,
     check_physical_id_bound,
     dense_rows,
+    fused_draft_lanes,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
@@ -588,16 +589,8 @@ class DraftMHAView(MHAView):
         assert region is not None, (
             f"sub-pool {host_spec.name!r} carries no fused draft region"
         )
-        layer_ids = sorted(layer_lanes)
-        assert layer_ids, "a fused draft view binds at least one layer"
+        layer_ids, lanes = fused_draft_lanes(layer_lanes, lane_num=region.lane_num)
         start_layer = layer_ids[0]
-        assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
-            f"fused draft layer ids must be contiguous; got {layer_ids}"
-        )
-        lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
-        assert len(set(lanes)) == len(lanes) and all(
-            0 <= lane < region.lane_num for lane in lanes
-        ), f"draft lanes {lanes} must be distinct and within range({region.lane_num})"
         k_views, v_views = host_spec.draft_views(arena)
         self.layer_lanes = dict(layer_lanes)
         self._bind(

@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Optional, Tuple
+from typing import ClassVar, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -36,6 +36,25 @@ def dense_rows(arena, name: str) -> int:
     """Token rows a dense view of band ``name`` spans: whole units only."""
     unit = arena.band(name).unit_entries
     return arena.extent_entries(name) // unit * unit
+
+
+def fused_draft_lanes(
+    layer_lanes: Mapping[int, int], *, lane_num: int
+) -> Tuple[List[int], List[int]]:
+    """A fused draft view's model layer ids in order, and each one's region
+    lane. The ids must be contiguous (the view indexes them from the first)
+    and the lanes distinct and inside the region."""
+    layer_ids = sorted(layer_lanes)
+    assert layer_ids, "a fused draft view binds at least one layer"
+    start_layer = layer_ids[0]
+    assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
+        f"fused draft layer ids must be contiguous; got {layer_ids}"
+    )
+    lanes = [layer_lanes[layer_id] for layer_id in layer_ids]
+    assert len(set(lanes)) == len(lanes) and all(
+        0 <= lane < lane_num for lane in lanes
+    ), f"draft lanes {lanes} must be distinct and within range({lane_num})"
+    return layer_ids, lanes
 
 
 def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:

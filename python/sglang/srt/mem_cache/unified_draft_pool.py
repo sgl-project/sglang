@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import msgspec
 
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
 from sglang.srt.mem_cache.kv.layout.state import DraftStateView, MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
     LAYER_WINDOW,
     FusedDraftPlacement,
+    LatentDraftRegion,
     draft_state_layer_ids,
     draft_swa_layer_ids,
 )
@@ -151,8 +153,8 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
 
     Reject count mismatches to prevent aliasing. Window layers use their host's
     lanes when present, otherwise full storage whose lifetime covers the window.
-    Owner-only drafts use that view directly; other drafts route each layer to
-    its host view and id space.
+    Owner-only drafts use that view directly, an MLA draft its latent view of
+    the owner; other drafts route each layer to its host view and id space.
     """
     hosts = ctx.hosts_of("dense")
     kv_layer_ids = draft_kv_layer_ids(ctx.model)
@@ -177,6 +179,16 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         f"draft runner {ctx.runner}: layers {layers_by_host} vs placed lanes "
         f"{ {host: list(lanes) for host, lanes in lanes_by_host.items()} }"
     )
+    if isinstance(ctx.placement.region(ctx.owner), LatentDraftRegion):
+        assert hosts == (ctx.owner,), (
+            f"an MLA draft's latent rows ride in the {ctx.owner!r} sub-pool "
+            f"alone; draft runner {ctx.runner} holds lanes in {hosts}"
+        )
+        pool = _latent_draft_view(
+            ctx,
+            layer_lanes=dict(zip(layers_by_host[ctx.owner], lanes_by_host[ctx.owner])),
+        )
+        return msgspec.structs.replace(binding, token_to_kv_pool=pool)
     if hosts == (ctx.owner,):
         pool = DraftMHAView(
             arena=ctx.arena,
@@ -195,6 +207,29 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         },
     )
     return msgspec.structs.replace(binding, token_to_kv_pool=pool)
+
+
+def _latent_draft_view(
+    ctx: BindContext, *, layer_lanes: Mapping[int, int]
+) -> DraftMLAView:
+    """The MLA draft's view over its latent lanes in the owner's entries. The
+    region was sized from the draft config at target boot; the built draft
+    must write rows that wide."""
+    host_spec = ctx.plan.sub_pool(ctx.owner).spec
+    region = host_spec.draft_region
+    mc = ctx.model_config
+    width = int(mc.kv_lora_rank) + int(mc.qk_rope_head_dim)
+    if width != region.kv_cache_dim:
+        raise ValueError(
+            f"Fused draft KV: the draft writes {width}-wide latent rows, but its "
+            f"region inside the target's pages holds {region.kv_cache_dim}-wide ones."
+        )
+    return DraftMLAView(
+        arena=ctx.arena,
+        host_spec=host_spec,
+        layer_lanes=layer_lanes,
+        page_size=ctx.page_size,
+    )
 
 
 def routed_draft_pool(

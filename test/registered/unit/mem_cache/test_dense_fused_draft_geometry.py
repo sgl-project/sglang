@@ -3,10 +3,11 @@ host slot's entry,
 
     [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
 
-the draft parts starting at the aligned end of the host parts. Host and draft
-views share the slot stride and are indexed by the same physical token id;
-writes through either family's views land inside their own part of their own
-slot, and a host page move carries the draft bytes with it.
+the draft parts starting at the aligned end of the host parts (an MLA draft's
+latent rows are one part on an MLA host). Host and draft views share the slot
+stride and are indexed by the same physical token id; writes through either
+family's views land inside their own part of their own slot, and a host page
+move carries the draft bytes with it.
 
     python -m pytest test/registered/unit/mem_cache/test_dense_fused_draft_geometry.py -v
 """
@@ -18,8 +19,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
+from sglang.srt.mem_cache import unified_draft_pool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.layout import mla as mla_layout
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView, MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import (
     DraftStateView,
     MambaSubPoolSpec,
@@ -30,18 +35,23 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftStateGeometry,
     DraftStateRegion,
     FusedDraftPlacement,
+    LatentDraftRegion,
 )
 from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
+    bind_fused_draft,
     routed_draft_pool,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
     arena_of,
+    build_unified_bundle,
     plan_stand_in,
+    setup_allocator_context,
     stand_in_views,
 )
 
@@ -560,6 +570,213 @@ class TestFusedMLAHost(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), entry
         )
+
+
+def _latent_region(lane_num=2):
+    # 32 B latent rows, the host's own width.
+    return LatentDraftRegion(
+        lane_num=lane_num, kv_lora_rank=8, qk_rope_head_dim=8, store_dtype=_DTYPE
+    )
+
+
+class TestLatentDraftOnMLAHost(unittest.TestCase):
+    """An MLA draft's latent rows are one more part of an MLA host's entries,
+    read and written through a `DraftMLAView` over its own lanes, addressed by
+    the draft's model layer ids."""
+
+    PS = 2
+    PAGES = 8
+
+    def setUp(self):
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived parallel width
+        # that only exists once a config is published.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
+    def _pool(self):
+        full = _mla_host_spec(_latent_region())
+        mamba = _mamba_filler_spec()
+        total = self.PAGES * self.PS * full.entry_bytes() + 4 * mamba.entry_bytes()
+        return arena_of(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=_placement(full.draft_region),
+        )
+
+    def _draft_view(self, pool, layer_lanes):
+        return DraftMLAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
+            layer_lanes=layer_lanes,
+            page_size=self.PS,
+        )
+
+    def test_fused_entry_appends_one_latent_part(self):
+        f = _mla_host_spec(_latent_region())
+        self.assertEqual(f.draft_offset_in_entry(), 64)
+        self.assertEqual(f.entry_bytes(), align_entry_bytes(64 + 2 * 32))
+        layout = f.layout()
+        self.assertEqual([p.name for p in layout.parts], ["kv", "draft_kv"])
+        part = layout.part("draft_kv")
+        self.assertEqual(
+            (part.offset_bytes, part.layer_stride_bytes, part.layer_num),
+            (64, 32, 2),
+        )
+        self.assertEqual(part.row_shape, (1, 16))
+
+    def test_an_mha_host_refuses_a_latent_region(self):
+        with self.assertRaises(AssertionError):
+            _host_spec(_latent_region())
+
+    def test_draft_writes_stay_in_their_lane(self):
+        """A write through the draft view lands in its own lane of the slot:
+        not in the host's rows, not in the other runner's lane."""
+        pool = self._pool()
+        spec = pool.spec("full")
+        dp = self._draft_view(pool, {7: 1})
+        entry = spec.entry_bytes()
+        view = dp.get_key_buffer(7)
+        self.assertEqual(view.shape[1:], (1, 16))
+        self.assertEqual(view.stride(0) * view.element_size(), entry)
+        raw = pool.raw
+        t = 2 * self.PS + 1
+        raw.zero_()
+        dp.set_kv_buffer(
+            SimpleNamespace(layer_id=7),
+            KVWriteLoc(torch.tensor([t]), physical=True),
+            torch.full((1, 1, 16), 3.0, dtype=_DTYPE),
+            None,
+        )
+        nz = raw.nonzero().flatten()
+        lane_lo = t * entry + spec.draft_offset_in_entry() + 32
+        self.assertEqual(int(nz.min()), lane_lo)
+        self.assertEqual(int(nz.max()), lane_lo + 32 - 1)
+        self.assertEqual(dp.get_value_buffer(7).shape[-1], 8)
+
+    def test_every_door_takes_the_drafts_model_layer_ids(self):
+        """An MTP head's layers sit at model layer ids past its trunk's, while
+        the view holds one buffer per lane: each per-layer door, as attention
+        backends reach it through the layer router, must address the lane of
+        that model layer."""
+        pool = self._pool()
+        dp = self._draft_view(pool, {30: 0, 31: 1})
+        lanes = pool.spec("full").latent_draft_views(pool)
+        layer = SimpleNamespace(layer_id=31)
+        loc = torch.tensor([3])
+        handed = []
+
+        def _record(kv_buffer, *args, **kwargs):
+            handed.append(kv_buffer.data_ptr())
+
+        with (
+            patch.object(mla_layout, "set_mla_kv_buffer_triton", _record),
+            patch.object(mla_layout, "get_mla_kv_buffer_triton", _record),
+        ):
+            dp.layer_router.layer(31).store_mla(
+                layer,
+                KVWriteLoc(loc, physical=True),
+                torch.zeros((1, 1, 8), dtype=_DTYPE),
+                torch.zeros((1, 1, 8), dtype=_DTYPE),
+            )
+            dp.layer_router.read(31).read_mla(layer, loc)
+        self.assertEqual(handed, [lanes[1].data_ptr()] * 2)
+        self.assertEqual(dp.layer_router.read(30).key().data_ptr(), lanes[0].data_ptr())
+        self.assertEqual(dp.layer_router.route(31).index, 1)
+
+    def test_reports_the_value_width_a_hybrid_host_draft_pool_reports(self):
+        """BUG REGRESSION: on a hybrid-linear host the triton backend asks the
+        draft's pool for its value head dim at startup, as it does the default
+        pool's draft pool; the fused MLA draft view must answer with its value
+        rows' width, or the draft worker fails to start on triton."""
+        dp = self._draft_view(self._pool(), {7: 1})
+        self.assertEqual(dp.get_v_head_dim(), dp.get_value_buffer(7).shape[-1])
+
+    def test_a_host_page_move_carries_the_latent_rows(self):
+        pool = self._pool()
+        dp = self._draft_view(pool, {0: 0, 1: 1})
+        src_page, dst_page = 3, 5
+        src, dst = src_page * self.PS, dst_page * self.PS
+        dp.get_key_buffer(1)[src] = 7.0
+        pool.move_units("full", torch.tensor([dst_page]), torch.tensor([src_page]))
+        self.assertEqual(float(dp.get_key_buffer(1)[dst].float().sum()), 7.0 * 16)
+        with self.assertRaises(NotImplementedError):
+            dp.move_kv_cache(torch.tensor([dst]), torch.tensor([src]))
+
+    def test_a_built_pool_binds_the_latent_view_in_the_targets_slots(self):
+        """Through the production builders: the latent region rides in the full
+        entries of an MLA + state pool, the binder hands the draft runner a
+        latent view over its lane, its runner ids take the fused disposition,
+        and a token's draft row shares the target's slot without touching the
+        target's rows. A built draft wider than its region refuses to bind."""
+        region = LatentDraftRegion(
+            lane_num=1, kv_lora_rank=16, qk_rope_head_dim=8, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = build_unified_bundle(
+            UnifiedGeometry(
+                chain="mamba",
+                full_layer_ids=(0,),
+                state_layer_ids=(1,),
+                mla=True,
+                page_size=self.PS,
+                fused_draft=placement,
+            )
+        )
+        alloc = bundle.token_to_kv_pool_allocator
+        bind = dict(
+            placement=placement,
+            runner=0,
+            arena=alloc.arena,
+            plan=alloc.storage.plan,
+            owner=alloc.roles.owner,
+            target_state=alloc.state,
+            model=None,
+            req_to_token_pool=bundle.req_to_token_pool,
+            page_size=self.PS,
+        )
+        with patch.object(unified_draft_pool, "draft_kv_layer_ids", return_value=[2]):
+            draft = bind_fused_draft(
+                model_config=SimpleNamespace(kv_lora_rank=16, qk_rope_head_dim=8),
+                **bind,
+            ).token_to_kv_pool
+            with self.assertRaisesRegex(ValueError, "holds 24-wide ones"):
+                bind_fused_draft(
+                    model_config=SimpleNamespace(kv_lora_rank=32, qk_rope_head_dim=8),
+                    **bind,
+                )
+        self.assertIsInstance(draft, DraftMLAView)
+        runner_ids = RunnerIds(
+            req_to_token=bundle.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=draft,
+            page_size=self.PS,
+            device=_DEV,
+        )
+        self.assertTrue(runner_ids.is_fused_draft)
+        self.assertIs(
+            runner_ids.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
+        )
+        slot = int(runner_ids.ids_in(IdSpaceKind.FULL, alloc.alloc(self.PS))[0])
+        target = alloc.storage.view("full")
+        offset = alloc.storage.plan.sub_pool("full").spec.draft_offset_in_entry()
+        self.assertEqual(
+            draft.kv_buffer[0][slot].data_ptr() - target.kv_buffer[0][slot].data_ptr(),
+            offset,
+        )
+        target_rows = target.kv_buffer[0][slot].clone()
+        draft.set_kv_buffer(
+            SimpleNamespace(layer_id=2),
+            KVWriteLoc(torch.tensor([slot]), physical=True),
+            torch.full((1, 1, 24), 5.0, dtype=torch.float16),
+            None,
+        )
+        self.assertEqual(float(draft.get_key_buffer(2)[slot].float().sum()), 5.0 * 24)
+        torch.testing.assert_close(target.kv_buffer[0][slot], target_rows)
 
 
 class TestRoutedDraftPool(unittest.TestCase):

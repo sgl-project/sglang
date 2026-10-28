@@ -1184,13 +1184,9 @@ class KVCacheConfigurator:
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
-        if aux.draft_model_config.attention_arch != AttentionArch.MHA:
-            return FusedDraftDecision(
-                declined=(
-                    f"the draft's attention is {aux.draft_model_config.attention_arch.name}; "
-                    "the fused region holds dense MHA K/V rows"
-                )
-            )
+        declined = self._fused_draft_rows_declined(aux.draft_model_config)
+        if declined is not None:
+            return FusedDraftDecision(declined=declined)
         # The draft runner's backend, resolved as its worker will, enters the
         # worker's own KV dtype rules below. The published draft backend
         # carries model-hook declarations.
@@ -1289,6 +1285,34 @@ class KVCacheConfigurator:
             store_dtype=_store_dtype_for(region_kv_dtype),
             kv_dtype=region_kv_dtype,
         )
+
+    def _fused_draft_rows_declined(self, draft_model_config) -> Optional[str]:
+        """Why the host's entries cannot carry the draft's attention rows, or
+        None. An MHA draft's K/V rows fuse into any host; an EAGLE-family MLA
+        draft's latent rows fuse into an MLA host's full entries."""
+        from sglang.srt.mem_cache.layout.fused_draft import draft_swa_layer_ids
+
+        arch = draft_model_config.attention_arch
+        if arch == AttentionArch.MHA:
+            return None
+        if arch != AttentionArch.MLA or not self.use_mla_backend:
+            host = "an MLA" if self.use_mla_backend else "an MHA"
+            return (
+                f"the draft's attention is {arch.name}, which {host} host's "
+                "entries do not hold"
+            )
+        if self.spec_algorithm.is_dflash_family():
+            return (
+                "only EAGLE-family MLA drafts fuse: a DFLASH-family MLA draft "
+                "commits its context rows through prefix-valid latent writes, "
+                "which the fused latent view does not provide"
+            )
+        if draft_swa_layer_ids(draft_model_config):
+            return (
+                "the MLA draft has sliding-window layers, which no MLA host "
+                "sub-pool carries"
+            )
+        return None
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +
