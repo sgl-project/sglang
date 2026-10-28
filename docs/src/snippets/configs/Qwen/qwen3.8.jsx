@@ -130,7 +130,7 @@ export const config = {
     mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
     mi350x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
     mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
-    a3:     "quay.io/ascend/sglang:main-cann9.0.0-a3",
+    a3:     "quay.io/ascend/sglang:main-cann9.1.0-a3",
   },
 
   // Per-hardware notes shown above a multi-node command. Every multi-node recipe
@@ -990,7 +990,6 @@ export const config = {
         "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
-        "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
       ],
       flags: [
@@ -1002,8 +1001,7 @@ export const config = {
         "--quantization modelslim",
         "--dtype bfloat16",
         "--tp-size 64",
-        "--enable-dp-attention",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.8",
         "--chunked-prefill-size 8192",
