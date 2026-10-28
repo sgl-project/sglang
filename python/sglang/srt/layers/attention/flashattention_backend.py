@@ -2987,8 +2987,7 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
-        *,
-        ragged_verify_layout: Optional[RaggedVerifyLayout],
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 

@@ -814,7 +814,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
-        *,
         ragged_verify_layout: Optional[RaggedVerifyLayout],
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
@@ -944,8 +943,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
-        *,
-        ragged_verify_layout: Optional[RaggedVerifyLayout],
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
