@@ -127,7 +127,7 @@ This section provides deployment configurations optimized for different hardware
 - **H100 / B200 / B300 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings. It only helps when tp > 1, so on B200/B300 it applies to the 397B-A17B FP8 recipe (tp=4); the 122B-A10B and 35B-A3B FP8 recipes are single-GPU there.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32). For the **MXFP4 checkpoint on MI355X**, set `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` to route multi-GPU collectives through INT4-quantized ROCm quick all-reduce, and drop `--enable-aiter-allreduce-fusion` (the two are mutually exclusive; quick all-reduce is preferred for this recipe). If the MXFP4 checkpoint keeps its shared expert unquantized, `--enforce-shared-experts-fusion` quantizes it to MXFP4 at load time so it can be fused into the routed experts; an already-MXFP4 shared expert is fused without the flag, so there it changes nothing. The fused slot runs through the routed experts' W4A4 grouped GEMM, so the shared expert's weights and its input activations are both quantized to MXFP4, where the standalone path it replaces ran in BF16; validate accuracy before using it.
 - **KV cache offloading (MXFP4 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. It emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
-- **KV cache offloading (397B FP8 on MI355X):** A separate recipe from the MXFP4 one above, for long-context agentic serving of the FP8 checkpoint. Selecting **Host DRAM (HiCache)** emits `--tp 4` instead of the tp=2 that merely fits the weights, `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`, `--kv-cache-dtype fp8_e4m3` to halve device KV bytes, and the scheduler and tokenizer tuning `--chunked-prefill-size 16384 --max-prefill-tokens 16384 --scheduler-recv-interval 60 --stream-interval 50 --tokenizer-worker-num 6`. `write_through` mirrors every page to the host tier as it is written. `--hicache-ratio 1.5` is the default sizing; the benchmarked high-concurrency points instead pin `--hicache-size` per rank (253 GB at concurrency 32-56, 374 GB at 64-80), which overrides the ratio — add it if you want a fixed host tier. This arm keeps `--enable-aiter-allreduce-fusion` and does not set `ROCM_QUICK_REDUCE_QUANTIZATION`; the MXFP4 recipe does the opposite. Read the FP8 KV cache warning below before using it for reasoning-heavy work.
+- **KV cache offloading (397B FP8 on MI355X):** A separate recipe from the MXFP4 one above, for long-context agentic serving of the FP8 checkpoint. Selecting **Host DRAM (HiCache)** emits `--tp 4` instead of the tp=2 that merely fits the weights, `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`, `--kv-cache-dtype fp8_e4m3` to halve device KV bytes, and the scheduler and tokenizer tuning `--chunked-prefill-size 16384 --max-prefill-tokens 16384 --scheduler-recv-interval 60 --stream-interval 50 --tokenizer-worker-num 6`. `write_through` mirrors every page to the host tier as it is written. `--hicache-ratio 1.5` is the default sizing; the benchmarked high-concurrency points instead pin `--hicache-size` per rank (253 GB at concurrency 32-56, 374 GB at 64-80), which overrides the ratio — add it if you want a fixed host tier. This arm keeps `--enable-aiter-allreduce-fusion` and does not set `ROCM_QUICK_REDUCE_QUANTIZATION`; the MXFP4 recipe does the opposite. The full agentic recipe, including the GPU-resident concurrency 1-14 band that runs without HiCache, is in section 3.3.1. Read the FP8 KV cache warning below before using it for reasoning-heavy work.
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
@@ -227,7 +227,7 @@ This section provides deployment configurations optimized for different hardware
 </table>
 
 <Warning>
-**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is emitted for the MXFP4-on-MI355X recipe and for the 397B FP8-on-MI355X agentic recipe (Host DRAM / HiCache selected), where it is part of the tuned configuration; for every other combination the generated commands leave it out, so add it manually only if memory constraints require the trade-off.
+**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is emitted for the MXFP4-on-MI355X recipe and for the 397B FP8-on-MI355X agentic recipe (see section 3.3.1; the command generator in section 3.1 emits it when Host DRAM / HiCache is selected), where it is part of the tuned configuration; for every other combination the generated commands leave it out, so add it manually only if memory constraints require the trade-off.
 </Warning>
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
@@ -246,6 +246,85 @@ import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/Qwen/qwen3.5.jsx";
 
 <AgentX data={agentx} />
+
+#### 3.3.1 Agentic Long-Context on MI355X (FP8, MTP)
+
+Agentic replay on MI355X serves `Qwen/Qwen3.5-397B-A17B-FP8` with MTP on four GPUs (TP4), benchmarked on the `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261020` image. Concurrency below counts live sessions, not requests.
+
+**Concurrency 1-14, GPU-resident:** the sessions fit the device KV pool, so no HiCache tier is added.
+
+**Concurrency 16-80, HiCache:** a host-DRAM tier below the GPU KV cache keeps more prefix cached and reaches higher concurrency than the device pool alone. This is the **Host DRAM (HiCache)** selection in the command generator in section 3.1. From concurrency 32 up, the host tier is pinned with `--hicache-size` (GB per rank), which overrides `--hicache-ratio`, so make sure the node has that much free CPU DRAM per server on top of the model weights.
+
+The braced values in the command follow concurrency. **Max running** is `--max-running-requests`, **Graph max batch** is `--cuda-graph-max-bs-decode`, and **HiCache GB** is `--hicache-size`:
+
+| Concurrency | Max running | Graph max batch | HiCache GB |
+|---|---|---|---|
+| 1 | 2 | 2 | no HiCache |
+| 4 | 8 | 8 | no HiCache |
+| 8 | 16 | 16 | no HiCache |
+| 12 | 24 | 24 | no HiCache |
+| 14 | 28 | 28 | no HiCache |
+| 16 | 32 | 32 | not set (ratio 1.5) |
+| 18 | 36 | 36 | not set (ratio 1.5) |
+| 20 | 40 | 40 | not set (ratio 1.5) |
+| 22 | 44 | 44 | not set (ratio 1.5) |
+| 24 | 48 | 48 | not set (ratio 1.5) |
+| 28 | 56 | 56 | not set (ratio 1.5) |
+| 32 | 64 | 64 | 253 |
+| 36 | 72 | 72 | 253 |
+| 40 | 80 | 80 | 253 |
+| 48 | 96 | 96 | 253 |
+| 56 | 112 | 112 | 253 |
+| 64 | 128 | 128 | 374 |
+| 72 | 144 | 128 | 374 |
+| 80 | 160 | 128 | 374 |
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+AITER_FLYDSL_FORCE=1 \
+SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+sglang serve \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tp 4 \
+  --attention-backend aiter \
+  --page-size 16 \
+  --enable-aiter-allreduce-fusion \
+  --mem-fraction-static 0.8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
+  --scheduler-recv-interval 60 \
+  --stream-interval 50 \
+  --tokenizer-worker-num 6 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --watchdog-timeout 1200 \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {cuda-graph-max-bs-decode}
+```
+
+For **concurrency 16-80**, add the HiCache flags to the command above, and `--hicache-size {hicache-size}` where the table gives one:
+
+```bash HiCache flags
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
+A few notes on the command:
+
+- `--speculative-algorithm EAGLE` is the same algorithm the command generator in section 3.1 emits as `NEXTN`; SGLang resolves `NEXTN` to `EAGLE`.
+- AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe.
+- Weights load with multiple threads by default, so `--model-loader-extra-config '{"enable_multithread_load": true}'` is not needed.
+- `--kv-cache-dtype fp8_e4m3` carries the same accuracy caveat as the FP8 KV cache warning in section 3.2.
 
 ## 4. Model Invocation
 
