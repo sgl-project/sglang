@@ -541,7 +541,12 @@ impl WorkerPrefixScanner {
                 contiguous: true,
                 saw_components: false,
             },
-            Some(spec) if spec.components == 0 || spec.version > SUPPORTED_SPEC_VERSION => {
+            Some(spec)
+                if spec.components & COMPONENT_FULL == 0
+                    || spec.components & !(COMPONENT_FULL | COMPONENT_SWA | COMPONENT_MAMBA)
+                        != 0
+                    || spec.version > SUPPORTED_SPEC_VERSION =>
+            {
                 PrefixScanState::Invalid
             }
             Some(spec) if spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0 => {
@@ -1051,13 +1056,14 @@ mod tests {
     #[test]
     fn unusable_specs_are_excluded() {
         // Each of these declared specs is unusable and must fail closed: an empty
-        // component set, a future/unsupported version, and SWA without a window.
+        // component set, an unsupported component/version, and SWA without a window.
         let blocks = vec![blk(&[(hbm(), COMPONENT_FULL | COMPONENT_SWA)], 16)];
         let empty = spec(0, 0, &[hbm()], &[], &[]);
         let mut future = spec(COMPONENT_FULL, 0, &[hbm()], &[], &[]);
         future.version = SUPPORTED_SPEC_VERSION + 1;
         let swa_no_window = spec(COMPONENT_FULL | COMPONENT_SWA, 0, &[hbm()], &[hbm()], &[]);
-        for s in [empty, future, swa_no_window] {
+        let unknown_component = spec(COMPONENT_FULL | 8, 0, &[hbm()], &[], &[]);
+        for s in [empty, future, swa_no_window, unknown_component] {
             assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
         }
     }

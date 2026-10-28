@@ -332,17 +332,17 @@ async fn run_session(
 ) -> Result<(), BridgeError> {
     // Tracked only to log a discontinuity. Nothing acts on it.
     let mut last_seq: Option<u64> = None;
-    // Join the pool before the first event so the worker is matchable at once.
-    if !config.dram_pool_id.is_empty() {
-        let request = build_apply_request(config, 0, EventActions::default());
-        client
-            .apply_external_kv_batch(request)
-            .await
-            .map_err(classify_rpc)?;
-    }
+    // The first tick joins immediately; later ticks repair idle bindings after restart.
+    let mut binding_refresh = tokio::time::interval(Duration::from_secs(30));
+    binding_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let message = tokio::select! {
+            _ = binding_refresh.tick(), if !config.dram_pool_id.is_empty() => {
+                client.apply_external_kv_batch(build_apply_request(config, 0, EventActions::default()))
+                    .await.map_err(classify_rpc)?;
+                continue;
+            }
             result = tokio::task::unconstrained(subscriber.recv()) => result?,
             _ = tokio::signal::ctrl_c() => {
                 info!("received ctrl-c; shutting down bridge");

@@ -20,7 +20,7 @@ enum TierType {
 //                             `swa_window_tokens` tokens ending at the boundary,
 //                             or in an unbroken run from the head.
 //   MAMBA (bit 2, value 4) -- resident on the boundary block only.
-// Carried as a bitmask; FULL is always present on a stored block.
+// FULL is required by the cache spec; individual tiers may hold partial components.
 
 // A worker's versioned cache spec: which components its cache holds and the
 // parameters the fixed rules need. Absent means legacy / full-only behaviour.

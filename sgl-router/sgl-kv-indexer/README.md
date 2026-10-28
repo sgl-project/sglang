@@ -69,6 +69,7 @@ whole-block events. `REPORT` replaces the component snapshot for one
 For shared DRAM, members set `KV_INDEXER_DRAM_POOL_ID` and a cache spec; the
 owner reports DRAM once with that pool id and no worker identity. A member's
 prefix combines its HBM with the pool's DRAM under its own spec.
+Members refresh bindings every 30s; the owner must replay residency after restart.
 
 ## Build
 
