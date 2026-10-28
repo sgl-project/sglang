@@ -228,20 +228,19 @@ def create_unified_radix_cache(
             get_startup_linker_config,
         )
 
-        cache.init_cache_linker(
-            create_unified_cache_linker(
-                server_args,
-                params,
-                backend=get_memory().unified_cache_external_linker_backend,
-                config=get_startup_linker_config(),
-                components=set(cache.components),
-                forward_stream=ctx.tp_worker.model_runner.forward_stream,
-            )
+        linker = create_unified_cache_linker(
+            server_args,
+            params,
+            backend=get_memory().unified_cache_external_linker_backend,
+            config=get_startup_linker_config(),
+            components=set(cache.components),
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
-        counter = cache.linker.layer_done_counter
+        cache.init_cache_linker(linker)
+        counter = linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
-        if PoolName.MAMBA in cache.linker.pools:
+        if PoolName.MAMBA in linker.pools:
             kvcache.layer_router.load_parts_layer_wise()
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
