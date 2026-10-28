@@ -11,7 +11,9 @@ try:
     from torchcodec.decoders import VideoDecoder
 
     _BACKEND = "torchcodec"
-except (ImportError, RuntimeError):
+except (ImportError, OSError, RuntimeError):
+    # OSError: torchcodec installed but its native library fails to load
+    # (e.g. FFmpeg version mismatch); fall back to decord as well.
     _BACKEND = "decord"
 
 
