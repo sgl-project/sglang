@@ -13,6 +13,7 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.serving_preprocessing import (
+    apply_npu_image_preprocess_patches,
     fast_image_processor_device,
     preprocessing_competes_with_the_scheduler,
     resolve_auto_mm_processor_worker_num,
@@ -22,7 +23,7 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
 from sglang.srt.multimodal.transport.feature_transport import MultimodalFeatureTransport
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_exec, get_mm
 
 # MultimodalProcessorOutput token-ID field -> mm_token_expansion_params key.
 _OUTPUT_TOKEN_ID_PARAMS = {
@@ -81,6 +82,7 @@ class TokenSpaceSGLangProcessor:
         self._disable_fast_image_processor = (
             mm.disable_fast_image_processor or mm.image_processor_backend == "pil"
         )
+        self._rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=mm.image_processor_backend,
             disable_fast_image_processor=mm.disable_fast_image_processor,
@@ -93,6 +95,7 @@ class TokenSpaceSGLangProcessor:
                 competes_with_the_scheduler=preprocessing_competes_with_the_scheduler(
                     _processor,
                     disable_fast_image_processor=self._disable_fast_image_processor,
+                    rl_on_policy_target=self._rl_on_policy_target,
                 ),
                 declared=None,
             ),
@@ -126,9 +129,14 @@ class TokenSpaceSGLangProcessor:
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self._disable_fast_image_processor
         ):
-            return fast_image_processor_device(
-                processor, base_gpu_id=self._server_args.base_gpu_id
+            device = fast_image_processor_device(
+                processor,
+                base_gpu_id=self._server_args.base_gpu_id,
+                rl_on_policy_target=self._rl_on_policy_target,
             )
+            if device == "npu":
+                apply_npu_image_preprocess_patches(processor)
+            return device
         return None
 
     async def process_mm_data_async(
