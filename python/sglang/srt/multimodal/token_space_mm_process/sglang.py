@@ -213,7 +213,7 @@ class TokenSpaceSGLangProcessor:
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         mm_items = get_new_expanded_mm_items(mm_items)
-        # Before transport, which may replace features with CUDA IPC handles.
+        # Hash the feature tensors themselves: transport may swap them for CUDA IPC handles.
         self._set_item_hashes(mm_items)
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
         input_ids_list = input_ids.tolist()
