@@ -713,7 +713,7 @@ class TestNixlNodeFailure(CustomTestCase):
         mgr.heartbeat_failures = {}
         mgr.session_pool_lock = threading.Lock()
         probes = ["miss", "miss", "miss", 200, "miss", 200]
-        ok = SimpleNamespace(status_code=200)
+        ok = SimpleNamespace(status_code=200, headers={})
 
         def get(*_args, **_kwargs):
             if probes.pop(0) == "miss":

@@ -466,6 +466,7 @@ class CommonKVManager(BaseKVManager):
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
+            self._bootstrap_epochs: Dict[str, str] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
@@ -2012,6 +2013,7 @@ class CommonKVManager(BaseKVManager):
 
                 for bootstrap_addr in addresses:
                     session = None
+                    epoch = None
                     try:
                         with self.session_pool_lock:
                             session = self.session_pool[bootstrap_addr]
@@ -2022,6 +2024,7 @@ class CommonKVManager(BaseKVManager):
                         )
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
+                            epoch = response.headers.get("X-Bootstrap-Epoch")
                             self._on_heartbeat_success(bootstrap_addr)
                         else:
                             logger.info(
@@ -2035,6 +2038,8 @@ class CommonKVManager(BaseKVManager):
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
+
+                    self._check_bootstrap_epoch(bootstrap_addr, epoch)
 
                     if (
                         self.heartbeat_failures.get(bootstrap_addr, 0)
@@ -2056,6 +2061,15 @@ class CommonKVManager(BaseKVManager):
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
+
+    def _check_bootstrap_epoch(self, bootstrap_addr: str, epoch: Optional[str]):
+        # A new epoch means the prefill's KV manager was rebuilt and lost our kv_args.
+        if epoch is None:
+            return
+        last = self._bootstrap_epochs.get(bootstrap_addr, epoch)
+        self._bootstrap_epochs[bootstrap_addr] = epoch
+        if last != epoch:
+            self._handle_node_failure(bootstrap_addr)
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Handle failure of a prefill node."""
@@ -3041,6 +3055,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
+        # Reported on /health; goes up when a rank registers again (rebuilt KV manager).
+        self._reregistrations = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -3073,7 +3089,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.Response(
+            text="OK",
+            status=200,
+            headers={"X-Bootstrap-Epoch": str(self._reregistrations)},
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -3169,6 +3189,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
+            if pp_rank in tp_group_table:
+                self._reregistrations += 1
 
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
