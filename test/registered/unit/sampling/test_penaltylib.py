@@ -549,7 +549,7 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         batch_a.reqs = []
         orch_a.filter(torch.tensor([], dtype=torch.long))
         self.assertFalse(orch_a.is_required)
-        self.assertIsNone(orch_a.batch)
+        self.assertIs(orch_a.batch, batch_a)
         self.assertEqual(orch_a.reqs(), [])
 
         orch_a.merge(orch_b)
@@ -560,6 +560,14 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertAlmostEqual(freq_pen.frequency_penalties[0, 0].item(), 2.0, places=5)
         self.assertEqual(min_pen.min_new_tokens.shape[0], 1)
         self.assertEqual(min_pen.min_new_tokens[0, 0].item(), 3)
+
+        batch_a.reqs = list(reqs_b)
+        orch_a.filter(torch.tensor([0], dtype=torch.long))
+        self.assertTrue(orch_a.is_required)
+        self.assertTrue(freq_pen.is_prepared())
+        self.assertTrue(min_pen.is_prepared())
+        self.assertEqual(freq_pen.frequency_penalties.shape[0], 1)
+        self.assertEqual(min_pen.min_new_tokens.shape[0], 1)
 
     def test_min_new_tokens_with_none_tokenizer(self):
         """Test that BatchedMinNewTokensPenalizer handles req.tokenizer=None."""

@@ -115,8 +115,9 @@ class BatchedPenalizerOrchestrator:
             return
 
         if len(keep_indices) == 0:
-            # No requests left in the batch, fully release orchestrator resources
-            self.release()
+            for penalizer in self.penalizers.values():
+                penalizer.teardown()
+            self.is_required = False
             return
 
         is_required = False
@@ -162,8 +163,6 @@ class BatchedPenalizerOrchestrator:
 
         self.is_required = True
         for penalizer, their_penalizer in their.penalizers.items():
-            if penalizer not in self.penalizers:
-                self.penalizers[penalizer] = penalizer(self)
             self.penalizers[penalizer].merge(their_penalizer)
 
 
