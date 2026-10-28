@@ -43,7 +43,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _accepts(
@@ -98,13 +98,12 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         "trtllm_mla",
         "flashinfer",
         "cutedsl_mla",
-        "tokenspeed_mla",
         "flashmla",
     )
     # Wired for the per-layer MHA/SWA views.
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
-    MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
+    MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "flashmla")
     # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
     UNWIRED_BACKENDS = ("aiter",)
 

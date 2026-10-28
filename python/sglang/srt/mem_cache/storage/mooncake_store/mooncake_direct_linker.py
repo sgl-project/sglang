@@ -5,6 +5,7 @@ import logging
 import threading
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from copy import deepcopy
 from queue import Empty, Queue
 
 import torch
@@ -12,11 +13,9 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -29,7 +28,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -59,8 +57,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -80,9 +81,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        extra_config = deepcopy(extra_config or {})
         self.load_layer_group = max(
             1,
             int(extra_config.get("linker_load_layer_group", DEFAULT_LOAD_LAYER_GROUP)),
@@ -158,9 +157,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, list[object], str | None] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_io_executor = ThreadPoolExecutor(
@@ -428,7 +427,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"transferred={result}, expected={expected}"
             )
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: str | None = None
+    ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -438,9 +439,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
-        ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event))
+        ready_events = self.record_offload_ready()
+        self.offload_queue.put((expanded, tokens, ready_events, session_id))
         return True
 
     def offload_thread_func(self) -> None:
@@ -449,9 +449,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event = task
-                ready_event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
+                expanded, tokens, ready_events, session_id = task
+                for event in ready_events:
+                    event.synchronize()
+                extra_info = (
+                    HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
+                    if session_id
+                    else None
+                )
+                results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
