@@ -32,14 +32,10 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
     @classmethod
     @functools.cache
     def for_strategy(cls, strategy_class):
-        # The media loader reads these attributes from the class, not the instance.
         return type(
             f"{cls.__name__}[{strategy_class.__name__}]",
             (cls,),
-            {
-                "strategy_class": strategy_class,
-                **strategy_class.processor_class_attributes,
-            },
+            {"strategy_class": strategy_class},
         )
 
     def __init__(

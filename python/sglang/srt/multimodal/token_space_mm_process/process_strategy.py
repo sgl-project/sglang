@@ -1,6 +1,5 @@
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
 
 import torch
 from transformers import BatchFeature
@@ -54,8 +53,6 @@ class TokenSpaceProcessStrategy:
     mm_item_fields: Mapping[str, Modality] = MappingProxyType({})
     # The fields of mm_item_fields that hold an item's primary feature tensor.
     mm_feature_fields: frozenset[str] = frozenset()
-    # Processor class attributes for media loading, e.g. {"gpu_image_decode": False}.
-    processor_class_attributes: Mapping[str, Any] = MappingProxyType({})
     # Media loading options; None keeps the loader's 16 kHz audio default.
     audio_sample_rate: int | None = None
     discard_alpha_channel: bool = True
