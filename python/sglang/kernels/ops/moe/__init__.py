@@ -21,6 +21,18 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.clover_block_coreset",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.clover_coreset_triton:clover_block_coreset_triton",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
+        ),
+        description="Clover preview block coreset for 256 experts and top-k=8.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shared_expert_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",

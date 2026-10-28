@@ -161,3 +161,27 @@ register_kernel(
         ),
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="mamba.clover_local_memory_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.clover_conv_triton:clover_local_memory_conv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
+        ),
+        format_signature=FormatSignature(supported_dtypes=("bfloat16", "float16")),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="mamba.clover_parallel_causal_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.clover_verify_conv:clover_parallel_causal_conv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(supported_dtypes=("bfloat16",)),
+    )
+)

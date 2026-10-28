@@ -421,3 +421,16 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.clover_local_memory_triton",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.clover_gdn_triton:clover_local_memory_triton",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
+        ),
+        format_signature=FormatSignature(supported_dtypes=("bfloat16", "float16")),
+    )
+)

@@ -103,6 +103,20 @@ def top_p_renorm_probs(
 __all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
 
 
+register_kernel(
+    KernelSpec(
+        op="sampling.clover_penalty",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.clover_penalty:clover_penalty",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32",),
+            description="In-place Clover [width<=128,vocab] penalties using committed response counts only.",
+        ),
+    )
+)
+
+
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
 register_kernel(
     KernelSpec(
