@@ -1,10 +1,5 @@
-"""The recurrent state each runner binds: a static target with several
-multi-layer MTP draft depths.
-
-Each draft depth owns one block and clones the target's request table with a
-private state; that private state, not the target's, is what its KV pool's
-router must reach, or the draft's clears and copies write the target's state.
-A draft that does not own its depth shares the target's state."""
+"""Each MTP draft depth owns private state; its clears and copies must leave
+the target unchanged. Drafts without a private depth share the target state."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
