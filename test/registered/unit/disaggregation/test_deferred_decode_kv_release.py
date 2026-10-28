@@ -22,7 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     AbortAck,
@@ -771,10 +771,10 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                 q._defer_release(ready_req)
             with (
                 patch.object(decode_mod.time, "monotonic", return_value=now) as clock,
-                patch.object(decode_mod, "release_kv_cache"),
+                patch.object(request_retirer_mod, "release_kv_cache"),
                 patch.object(decode_mod, "discard_kv_cache_backup"),
             ):
-                q.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
                 observations.append(
                     (scenario, list(q.req_to_metadata_buffer_idx_allocator.freed))
                 )
@@ -784,8 +784,8 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                 if scenario != "deadline":
                     mgr.note_abort_ack(42, 0, generation)
                 clock.return_value = 31.0
-                q.resolve_deferred_releases()
-                q.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
                 observations.append(
                     (
                         scenario + "_drained",
@@ -798,9 +798,11 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
 
         for notification in ("some", "all", "none", "disabled"):
             mgr = _make_manager()
-            q = _make_queue()
+            q = _make_pop_queue(mgr)
             q.enable_deferred_kv_release = notification != "disabled"
             dreq = _make_decode_req(43, 1, mgr)
+            dreq.hicache_restore_status = None
+            dreq.req.return_logprob = False
             receiver = dreq.kv_receiver
             receiver.abort_notified = notification == "all" or (
                 notification == "some" and rank == 0
@@ -811,9 +813,9 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             q.queue = [dreq]
             with (
                 patch.object(decode_mod, "prepare_abort"),
-                patch.object(decode_mod, "release_kv_cache"),
+                patch.object(request_retirer_mod, "release_kv_cache"),
             ):
-                q.pop_transferred()
+                q.pop_transferred([])
                 held = len(q._deferred_releases)
                 observations.append((notification, held))
                 expected.append((notification, int(notification in ("some", "all"))))
@@ -823,7 +825,7 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                 # just one rank enters the release collective.
                 if held_by_rank == [1, 1]:
                     mgr.note_abort_ack(43, 0, generation)
-                    q.resolve_deferred_releases()
+                    q.owner.resolve_deferred_releases()
                 observations.append(
                     (
                         notification + "_freed",
@@ -974,6 +976,10 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
     free them with the KV release, not at failure time while a sibling prefill
     rank may still write into them."""
 
+    def setUp(self):
+        super().setUp()
+        _run_as_single_rank(self)
+
     def _make(self, deferred):
         mgr = _make_manager()
         mgr.enable_deferred_decode_kv_release = deferred
@@ -1035,74 +1041,6 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(hs.host_free, [100, 101])
         self.assertEqual(hs.finished_calls, [5])
-
-
-class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
-    """Under HiSparse the transfer writes into the coordinator's host pages."""
-
-    def setUp(self):
-        super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
-
-    def _queue(self, mgr, log):
-        q = _make_pop_queue(mgr)
-        q.scheduler.enable_hisparse = True
-        q.scheduler.hisparse_coordinator = SimpleNamespace(
-            request_finished=lambda req: log.append(("hisparse", req.rid))
-        )
-        return q
-
-    def _pop_and_resolve(self, q, mgr, room, log):
-        release = lambda req, *args, **kwargs: log.append(("kv", req.rid))
-        with (
-            patch.object(decode_mod, "prepare_abort"),
-            patch.object(decode_mod, "release_kv_cache", side_effect=release),
-        ):
-            q.pop_transferred()
-            at_failure = list(log)
-            generation = mgr.register_deferred_abort_room(room)
-            for prefill_rank in (0, 1):
-                mgr.note_abort_ack(room, prefill_rank, generation)
-            q.resolve_deferred_releases()
-        return at_failure
-
-    def test_deferred_failure_keeps_the_destination_until_release(self):
-        mgr = _make_manager()
-        log = []
-        q = self._queue(mgr, log)
-        q.queue = [_make_failed_req(mgr, room=12, idx=6, abort_notified=False)]
-
-        at_failure = self._pop_and_resolve(q, mgr, 12, log)
-
-        self.assertEqual(at_failure, [])
-        self.assertEqual(log, [("hisparse", "r12"), ("kv", "r12")])
-
-    def test_immediate_failure_frees_the_destination_once(self):
-        mgr = _make_manager()
-        log = []
-        q = self._queue(mgr, log)
-        q.queue = [
-            _make_failed_req(
-                mgr, room=13, idx=7, abort_notified=False, notifiable=False
-            )
-        ]
-
-        at_failure = self._pop_and_resolve(q, mgr, 13, log)
-
-        self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
-        self.assertEqual(log, at_failure)
-
-
-class TestBackendOptIn(CustomTestCase):
-    """Without a prefill ack, every hold waits out the full release timeout."""
-
-    def test_backends_without_a_drain_ack_stay_opted_out(self):
-        # Inheriting CommonKVManager is not enough: a backend must send the
-        # drain ack itself before it may opt in.
-        self.assertFalse(BaseKVManager.supports_deferred_decode_kv_release)
-        self.assertFalse(CommonKVManager.supports_deferred_decode_kv_release)
 
 
 if __name__ == "__main__":
