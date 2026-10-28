@@ -133,6 +133,7 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
         input_ids=[1, 101, 2],
         package_output=wrapper._package_output,
         image_device="image device",
+        compute_mrope_positions=True,
     )
 
 
