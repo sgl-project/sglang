@@ -207,7 +207,6 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
-
           if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
             bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
 
@@ -243,15 +242,14 @@ jobs:
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
-          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple")
-          PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn
+          PIP_INDEXES=("https://repo.huaweicloud.com/repository/pypi/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple")
           install_pkg() {
             local pkg="$1"
             ok=0
             for index in "${PIP_INDEXES[@]}"; do
               echo "${pkg}: try via ${index}"
               if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
-                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                  -i "${index}"; then
                 ok=1; break
               fi
             done

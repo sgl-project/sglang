@@ -109,7 +109,6 @@ jobs:
         env:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
       - name: Generate outputs
@@ -172,7 +171,6 @@ jobs:
         env:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
       - name: Generate outputs

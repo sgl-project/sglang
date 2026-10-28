@@ -293,9 +293,8 @@ jobs:
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
           PIP_FOR_SGLANG="pip"
-          # Shared pip index list (public PyPI, then the tsinghua mirror).
-          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple")
-          PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn
+          # Shared pip index list (huaweicloud mirror, then the tsinghua mirror).
+          PIP_INDEXES=("https://repo.huaweicloud.com/repository/pypi/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple")
 
           # Shared pip installer: try each index until one succeeds, fail the job if all fail.
           install_pkg() {
@@ -304,7 +303,7 @@ jobs:
             for index in "${PIP_INDEXES[@]}"; do
               echo "${pkg}: try via ${index}"
               if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
-                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                  -i "${index}"; then
                 ok=1; break
               fi
             done

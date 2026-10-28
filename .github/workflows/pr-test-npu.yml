@@ -362,7 +362,6 @@ jobs:
         env:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -503,7 +502,6 @@ jobs:
         env:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -926,8 +924,9 @@ jobs:
 
           if ! python3 -c "import regex" 2>/dev/null; then
             python3 -m pip install regex \
-              -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
-              --retries 3 --timeout 60
+              -i https://repo.huaweicloud.com/repository/pypi/simple \
+              --retries 3 --timeout 60 \
+              || python3 -m pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
 
           python3 scripts/ci/npu/precise-test/test_selector.py \
@@ -975,8 +974,9 @@ jobs:
           # their SQLite data.
           if ! python3 -c "import coverage" 2>/dev/null; then
             python3 -m pip install coverage==7.8.* \
-              -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
-              --retries 3 --timeout 60
+              -i https://repo.huaweicloud.com/repository/pypi/simple \
+              --retries 3 --timeout 60 \
+              || python3 -m pip install coverage==7.8.* -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
 
           # Alias runner-specific source paths onto covstub; first entry must
