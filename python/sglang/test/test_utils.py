@@ -35,7 +35,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.benchmark.serving import run_benchmark
 from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -50,6 +49,16 @@ from sglang.srt.utils import (
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
+
+
+def __getattr__(name: str) -> Any:
+    if name == "run_benchmark":
+        from sglang.benchmark.serving import run_benchmark
+
+        globals()[name] = run_benchmark
+        return run_benchmark
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -1049,6 +1058,8 @@ def run_bench_serving(
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
 ):
+    run_benchmark = getattr(sys.modules[__name__], "run_benchmark")
+
     if device == "auto":
         device = auto_config_device()
     # Launch the server
@@ -1435,6 +1446,8 @@ def run_bench_serving_multi(
     need_warmup=False,
     pd_separated=False,
 ):
+    run_benchmark = getattr(sys.modules[__name__], "run_benchmark")
+
     # Launch the server
     process = popen_launch_server(
         model,
