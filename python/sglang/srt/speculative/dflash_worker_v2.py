@@ -640,7 +640,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return (
             sampling_info.is_all_greedy
             and not sampling_info.has_custom_logit_processor
-            and getattr(sampling_info, "acc_linear_penalties", None) is None
+            and sampling_info.acc_additive_penalties is None
+            and sampling_info.acc_scaling_penalties is None
             and (penalizer is None or not penalizer.is_required)
             and getattr(sampling_info, "grammar_mask", None) is None
             and getattr(sampling_info, "logit_bias", None) is None

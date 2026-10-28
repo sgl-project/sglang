@@ -97,7 +97,10 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+    if (
+        sampling_info.acc_additive_penalties is not None
+        or sampling_info.acc_scaling_penalties is not None
+    ):
         return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
