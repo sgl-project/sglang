@@ -19,7 +19,7 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -62,7 +62,7 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
-    kv_loc_plan: KVLocPlan
+    iteration_ids: IterationIds
 
 
 class DSparkVerifyPlanner:
@@ -801,7 +801,7 @@ def alloc_verify_window(
         positions_2d = torch.empty(
             (bs, verify_w), dtype=torch.int64, device=prefix_lens.device
         )
-    plan = model_runner.kv_index_translator.plan_uniform_extend(
+    plan = model_runner.runner_ids.plan_uniform_extend(
         req_pool_indices=batch.req_pool_indices,
         seq_lens=prefix_lens,
         seq_lens_cpu=seq_lens_cpu,
@@ -817,7 +817,7 @@ def alloc_verify_window(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
-        kv_loc_plan=plan,
+        iteration_ids=plan,
     )
 
 

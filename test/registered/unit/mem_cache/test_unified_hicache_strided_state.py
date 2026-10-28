@@ -1,4 +1,4 @@
-"""Cover strided Mamba state staging and shared allocator wiring for HiCache."""
+"""Cover strided Mamba state detection and staging for HiCache."""
 
 import unittest
 
@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestStridedStateDetection(CustomTestCase):
@@ -51,64 +51,6 @@ class TestStridedStateDetection(CustomTestCase):
         # A partial transfer must leave unselected slots untouched.
         for slot in set(range(num_slots)) - set(indices.tolist()):
             self.assertTrue(torch.all(dst_view[slot] == 0))
-
-
-class TestMambaSlotWiringIsShared(CustomTestCase):
-    """Both Mamba factories must install slot allocation and transfer translation.
-
-    Inspect the AST so this check does not need GPU-backed pools.
-    """
-
-    @staticmethod
-    def _assignments_to(attr: str):
-        """Find functions assigning the attribute, excluding None initialization."""
-        import ast
-        import inspect
-
-        from sglang.srt.mem_cache import unified_memory_pool
-
-        tree = ast.parse(inspect.getsource(unified_memory_pool))
-        found = []
-        for fn in ast.walk(tree):
-            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in ast.walk(fn):
-                if not isinstance(node, ast.Assign):
-                    continue
-                if isinstance(node.value, ast.Constant) and node.value.value is None:
-                    continue
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Attribute) and tgt.attr == attr:
-                        found.append(fn.name)
-        return found
-
-    def test_only_the_shared_hook_wraps_the_slot_allocator(self):
-        self.assertEqual(
-            sorted(set(self._assignments_to("mamba_allocator"))),
-            ["_wire_mamba_slot_allocator"],
-            "a factory wraps the mamba end itself; it will miss "
-            "host_transfer_translate exactly as the tri-pool factory did",
-        )
-
-    def test_every_unified_mamba_factory_calls_the_shared_hook(self):
-        import ast
-        import inspect
-
-        from sglang.srt.mem_cache import unified_memory_pool
-
-        tree = ast.parse(inspect.getsource(unified_memory_pool))
-        # Factories whose composite holds a mamba end.
-        expected = {"init_unified_mamba_pools", "init_unified_mamba_swa_pools"}
-        callers = {
-            fn.name
-            for fn in ast.walk(tree)
-            if isinstance(fn, ast.FunctionDef)
-            for node in ast.walk(fn)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_wire_mamba_slot_allocator"
-        }
-        self.assertEqual(expected, expected & callers, f"missing: {expected - callers}")
 
 
 if __name__ == "__main__":

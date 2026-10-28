@@ -22,6 +22,8 @@
 #   than the flavor name.
 #   GPU_ARCH=*-rocm1010 is ROCm 10.1 + torch 2.12 off the same channel, and
 #   keeps the SDK's Triton instead of building one.
+#   GPU_ARCH=gfx1250-rocm1010 also replaces the SDK's RCCL with a newer build
+#   from rocm-systems; see BUILD_RCCL.
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -366,6 +368,10 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV BUILD_RCCL="1"
+# Head of ROCm/rocm-systems#14254: develop plus a fix for a hang in the first
+# all-reduce on gfx1250. Not merged yet; move to develop once it is.
+ENV RCCL_COMMIT_DEFAULT="1c0ab425abda9d1fd80fa977c253556b14eb140b"
 # hipBLASLt 10.1 looks for TensileLibrary_lazy_gfx1250.dat directly under
 # library/, not library/<arch>/, and every GEMM fails without this.
 ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
@@ -427,6 +433,10 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
+ARG RCCL_REPO="https://github.com/ROCm/rocm-systems.git"
+ARG RCCL_COMMIT=""
+ENV RCCL_COMMIT="${RCCL_COMMIT:-${RCCL_COMMIT_DEFAULT}}"
+
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
@@ -441,7 +451,7 @@ ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 
-# sgl-amd-mono: the AMD monokernel plugin (--monokernel-backend amd). Pure Python
+# sgl-amd-mono: the AMD monokernel plugin (--enable-amd-monokernel). Pure Python
 # on top of AITER / FlyDSL; it registers its specs lazily, so it is inert unless a
 # server selects the backend. Installed on gfx950 images only (its kernels are
 # gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
@@ -1095,6 +1105,41 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
   ln -sfn nixl_rocm "$SITE/nixl"; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
+
+# -----------------------
+# RCCL (BUILD_RCCL=1 stages only): build RCCL from rocm-systems and overwrite
+# the SDK's librccl.so.1. The SDK loads that file by full path, so
+# LD_LIBRARY_PATH has no effect on it.
+# Keep the old RPATH on the new file. Without it, a second copy of libamd_smi
+# gets loaded and torch.cuda.device_count() returns 0.
+RUN if [ "${BUILD_RCCL:-0}" = "1" ]; then \
+        set -eux; \
+        echo "[RCCL] building ${RCCL_COMMIT} for ${GPU_ARCH_LIST}"; \
+        pip install --no-cache-dir patchelf; \
+        SP="$VIRTUAL_ENV/lib/python3.12/site-packages"; \
+        RPATH="$(patchelf --print-rpath "$SP/_rocm_sdk_libraries/lib/librccl.so.1")"; \
+        mkdir -p /sgl-workspace/rocm-systems && cd /sgl-workspace/rocm-systems; \
+        git init -q; \
+        git remote add origin "${RCCL_REPO}"; \
+        git sparse-checkout init --cone; \
+        git sparse-checkout set projects/rccl; \
+        git fetch --depth 1 --filter=blob:none origin "${RCCL_COMMIT}"; \
+        git checkout -q FETCH_HEAD; \
+        cd projects/rccl; \
+        CMAKE_PREFIX_PATH="${ROCM_HOME}" ./install.sh --amdgpu_targets "${GPU_ARCH_LIST}" \
+            --prefix /opt/rccl -i -j "$(nproc)"; \
+        cp /opt/rccl/lib/librccl.so.1.0 /tmp/librccl.so.1; \
+        patchelf --force-rpath --set-rpath "${RPATH}" /tmp/librccl.so.1; \
+        for d in "$SP/_rocm_sdk_libraries/lib" "$SP/_rocm_sdk_devel/lib"; do \
+            rm -f "$d/librccl.so.1" "$d/librccl.so.1.0"; \
+            cp /tmp/librccl.so.1 "$d/librccl.so.1"; \
+            ln -sf librccl.so.1 "$d/librccl.so.1.0"; \
+            # _rocm_sdk_devel also ships librccl.so as a hard link to the stock file
+            if [ -e "$d/librccl.so" ]; then ln -sf librccl.so.1 "$d/librccl.so"; fi; \
+        done; \
+        cd / && rm -rf /sgl-workspace/rocm-systems /opt/rccl /tmp/librccl.so.1; \
+        python3 -c "import ctypes, torch; v = ctypes.c_int(); ctypes.CDLL('librccl.so.1').ncclGetVersion(ctypes.byref(v)); maps = sorted({l.split()[-1] for l in open('/proc/self/maps') if 'librccl' in l}); print('[RCCL] ncclGetVersion', v.value, maps); assert len(maps) == 1, maps"; \
+    fi
 
 # -----------------------
 # Hot patch: torch-ROCm

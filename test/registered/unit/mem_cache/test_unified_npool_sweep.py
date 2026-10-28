@@ -26,17 +26,15 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
-)
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
 # Hermetic convention of this directory's pool tests: plain unittest.TestCase,
 # only ci_register imported (no heavy sglang.test.test_utils chain).
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -83,7 +81,7 @@ def _mamba(name: str, grow_direction: str, *, layer_num: int = 2) -> MambaSubPoo
 
 
 def _make_pool(specs, *, total_bytes: int = 1 << 20, page_size: int = 1):
-    return UnifiedKVPool(
+    return arena_of(
         total_bytes=total_bytes,
         sub_pool_specs=specs,
         device=_DEV,
@@ -92,8 +90,8 @@ def _make_pool(specs, *, total_bytes: int = 1 << 20, page_size: int = 1):
     )
 
 
-def _chain_names(pool: UnifiedKVPool):
-    return [s.name for s in pool.sub_pool_specs]
+def _chain_names(arena):
+    return [band.name for band in arena.bands]
 
 
 class TestNPoolCanonicalOrder(unittest.TestCase):
@@ -145,10 +143,10 @@ class TestNPoolCanonicalOrder(unittest.TestCase):
         )
         for name in ("full", "mamba"):
             self.assertEqual(
-                two.max_slots(name),
+                two.num_entries(name),
                 two.total_bytes // two.spec(name).entry_bytes(),
             )
-            self.assertEqual(two.max_slots(name), three.max_slots(name))
+            self.assertEqual(two.num_entries(name), three.num_entries(name))
 
 
 class TestNPoolValidation(unittest.TestCase):
@@ -157,7 +155,7 @@ class TestNPoolValidation(unittest.TestCase):
             _make_pool([_mha("x", "down"), _mamba("x", "up")])
 
     def test_fewer_than_two_specs_rejected(self):
-        with self.assertRaisesRegex(AssertionError, ">= 2 sub-pools"):
+        with self.assertRaisesRegex(AssertionError, ">= 2 bands"):
             _make_pool([_mha("full", "down")])
 
     def test_end_direction_counts_rejected(self):
@@ -195,12 +193,12 @@ class TestReservedFloorWithFloats(unittest.TestCase):
         )
         for s in specs:
             e = s.entry_bytes()
-            self.assertEqual(pool.min_slot_index(s.name), (floor + e - 1) // e)
+            self.assertEqual(pool.first_entry(s.name), (floor + e - 1) // e)
 
     def test_too_small_buffer_fails_loud(self):
         # 2048 B with page_size=16 and 128 B/entry MHA specs: the page-0 sink
         # (16*128 = 2048 B) consumes the whole buffer, leaving no slot.
-        with self.assertRaisesRegex(RuntimeError, "no room"):
+        with self.assertRaisesRegex(RuntimeError, "fits only"):
             _make_pool(
                 [_mamba("state", "up"), _mha("swa", "float"), _mha("full", "down")],
                 total_bytes=2048,
