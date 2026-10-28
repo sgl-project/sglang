@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import os
 from typing import Optional
 
@@ -8,6 +9,10 @@ from transformers import BaseImageProcessor, BatchFeature
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
+)
+from sglang.srt.multimodal.cache import (
+    CONTENT_HASH_PREFIX,
+    resolve_multimodal_item_hash,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
@@ -208,6 +213,8 @@ class TokenSpaceSGLangProcessor:
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         mm_items = get_new_expanded_mm_items(mm_items)
+        # Before transport, which may replace features with CUDA IPC handles.
+        self._set_item_hashes(mm_items)
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
         input_ids_list = input_ids.tolist()
         params = self._core.strategy.mm_token_expansion_params
@@ -223,6 +230,25 @@ class TokenSpaceSGLangProcessor:
             },
             **{field: output[field] for field in _OUTPUT_FIELDS if field in output},
         )
+
+    def _set_item_hashes(self, mm_items: list[MultimodalDataItem]) -> None:
+        """Hash each item's feature scoped by its other strategy fields, e.g. grids.
+
+        Features carry no layout: a solid 448x896 and 896x448 image give equal
+        patches and differ only in image_grid_thw, so a feature-only hash would let
+        one reuse the other's embedding and KV cache.
+        """
+        strategy = self._core.strategy
+        layout_fields = sorted(
+            set(strategy.mm_item_fields) - strategy.mm_feature_fields
+        )
+        for item in mm_items:
+            item.set_hash(
+                resolve_multimodal_item_hash(
+                    feature=item.feature,
+                    namespace=_layout_digest(item, layout_fields),
+                )
+            )
 
     # Adapted from sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor.collect_mm_items_from_processor_output.
     def _collect_mm_items(self, output: BatchFeature) -> list[MultimodalDataItem]:
@@ -275,3 +301,21 @@ class TokenSpaceSGLangProcessor:
     def shutdown(self) -> None:
         self.hash_executor.shutdown()
         self._core.shutdown()
+
+
+def _layout_digest(item: MultimodalDataItem, field_names: list[str]) -> str:
+    """SHA-256 identity of the named fields an item holds, in the given order."""
+    hasher = hashlib.sha256()
+    for name in field_names:
+        if name not in item.model_specific_data:
+            continue
+        value = torch.as_tensor(item.model_specific_data[name]).detach().cpu()
+        for part in (
+            name.encode(),
+            str(value.dtype).encode(),
+            str(tuple(value.shape)).encode(),
+            value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
+        ):
+            hasher.update(len(part).to_bytes(8, "big"))
+            hasher.update(part)
+    return CONTENT_HASH_PREFIX + hasher.hexdigest()

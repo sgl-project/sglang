@@ -27,6 +27,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   adjacent images -> two offsets from mm_spans, not one scanned run
+  equal features, different grids -> different item hashes
 """
 
 import asyncio
@@ -529,6 +530,49 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         )
         self.assertEqual(output.input_ids, [1] + [IMAGE] * 5 + [2])
         self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2), (3, 5)]])
+
+    def test_items_with_equal_features_but_different_grids_hash_apart(self):
+        """Equal patches with different grids must not share an embedding or KV cache key."""
+
+        class _GridStrategy(_ImageWidthStrategy):
+            mm_item_fields = {
+                "pixel_values": Modality.IMAGE,
+                "image_grid_thw": Modality.IMAGE,
+            }
+
+            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
+                # Two patches whatever the size, as a solid image gives.
+                return {
+                    "pixel_values": torch.zeros(2, 1),
+                    "image_grid_thw": torch.tensor([[1, image.height, image.width]]),
+                    "num_image_tokens": [2],
+                }
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            _GridStrategy, TokenSpaceServingSpec
+        )(None, server_args, _bare_tokenizer(), None)
+        self.addCleanup(processor.shutdown)
+
+        def item_hash(size):
+            output = asyncio.run(
+                processor.process_mm_data_async(
+                    image_data=[Image.new("RGB", size)], input_ids=[1, IMAGE, 2]
+                )
+            )
+            return output.mm_items[0].hash
+
+        self.assertNotEqual(item_hash((1, 2)), item_hash((2, 1)))
+        self.assertEqual(item_hash((1, 2)), item_hash((1, 2)))
 
 
 if __name__ == "__main__":
