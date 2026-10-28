@@ -74,6 +74,132 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## GLM DSA KV sharding with CPU HiCache
+
+On prefill workers, `--enable-kv-cache-sharding` distributes cached pages across
+the attention-CP group. Each owner stores and transfers its target/draft latent
+KV and DSA indexer pages. Optional CPU HiCache retains the same page ownership
+during backup and reload. Decode workers receive complete caches and do not
+enable KV sharding.
+
+Use this combination on Linux with NVIDIA CUDA and hardware supported by the
+TRTLLM DSA backends. The `nvidia/GLM-5.2-NVFP4` example requires Blackwell GPUs
+with enough memory for both target and draft weights on each side.
+
+| Setting | Supported configuration |
+| --- | --- |
+| Prefill parallelism | Interleave CP greater than one; pipeline parallel size one |
+| Attention and KV | TRTLLM DSA prefill/decode, `fp8_e4m3`, page size 64 |
+| DSA indexer | Uncompressed `index_kpool=1`; no cache layer splitting |
+| P/D transfer | Mooncake, with staging buffers disabled |
+| Optional MTP | GLM DSA single-layer NextN, EAGLE, top-k one |
+| Optional CPU HiCache | `cache` mode, `kernel` I/O, `layer_first` or `page_first` |
+
+KV-sharded serving selects the Python radix tree when no tree backend is
+explicitly configured. L3 storage (including runtime attachment), external cache
+linkers, HiSparse and two-batch overlap are unsupported. Prefill CUDA graphs,
+P-side speculative graphs and generic FlashInfer autotuning are disabled for
+this path. Scratch buffers for target and draft are charged against the KV
+memory budget, so the usable cache capacity also depends on context length.
+
+The following single-host GB300/NVL72 example uses GPUs 0–1 for prefill and 2–3
+for decode. Install the [Mooncake transfer engine](#requirements) first. Both
+workers use fabric NVLink with Mooncake's NVLink allocator, which makes their
+KV buffers exportable. Enabling fabric transport alone does not make ordinary
+CUDA allocations remotely accessible. For other hardware, configure the
+appropriate [RDMA or NVLink transport](#nvlink-transport-configuration).
+
+Run prefill and decode in separate terminals on the same host.
+
+### Prefill worker (GPUs 0–1)
+
+```bash
+export SGLANG_DISAGG_STAGING_BUFFER=0
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export MC_FORCE_MNNVL=true
+
+python3 -m sglang.launch_server \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp-size 2 \
+  --context-length 16384 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --enable-metrics \
+  --enable-cache-report \
+  --disaggregation-mode prefill \
+  --port 30001 \
+  --nccl-port 29501 \
+  --enable-kv-cache-sharding \
+  --enable-prefill-cp \
+  --attn-cp-size 2 \
+  --cp-strategy interleave \
+  --chunked-prefill-size 2048 \
+  --max-total-tokens 4096 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
+### Decode worker (GPUs 2–3)
+
+```bash
+export SGLANG_DISAGG_STAGING_BUFFER=0
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export MC_FORCE_MNNVL=true
+
+python3 -m sglang.launch_server \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp-size 2 \
+  --context-length 16384 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --enable-metrics \
+  --enable-cache-report \
+  --disaggregation-mode decode \
+  --port 30002 \
+  --nccl-port 29502 \
+  --base-gpu-id 2 \
+  --max-total-tokens 16384 \
+  --cuda-graph-max-bs-decode 1
+```
+
+Connect the two endpoints through the [P/D router](#router-integration).
+To check CPU-cache reuse, repeat a prompt after enough unrelated requests have
+evicted its GPU prefix: `cached_tokens_details.host` and the prefill
+`sglang:load_back_tokens_total` counter must increase. A device-cache hit alone
+does not exercise the host reload path.
+
+When comparing with replicated or deduplicated KV, keep the model revision,
+hardware, P/D topology, memory budget, request order, concurrency and warm-up
+policy fixed. Report device/host cache-hit tokens, TTFT percentiles, throughput,
+peak memory and answer correctness. Additional cache capacity alone does not
+establish a latency or throughput gain; use a representative replay and the
+[benchmarking guide](/docs/developer_guide/benchmark_and_profiling).
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
@@ -584,6 +710,14 @@ python -m sglang.launch_server \
   --disaggregation-transfer-backend nixl \
   --port 30000
 ```
+
+#### UCX device selection
+
+For NVIDIA CUDA and AMD ROCm deployments using NIXL UCX, `--disaggregation-ib-device` accepts a shared HCA list or a per-GPU JSON/file mapping. Mapping keys are process-visible GPU IDs; use HCA names without port suffixes, such as `mlx5_0`.
+
+A non-empty `UCX_NET_DEVICES` takes precedence over this CLI option. SGLang leaves the environment variable unchanged and skips the CLI mapping, including per-GPU mappings, with a warning. This preserves interfaces such as `lo` in an existing configuration like `rdma0:1,rdma4:1,lo`, which some RoCE hosts need for NIXL's self-endpoint.
+
+To use per-GPU CLI selection, unset `UCX_NET_DEVICES`; keep it configured on hosts that require the loopback entry. An explicit `device_list` in `SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS` is left unchanged and still overrides `UCX_NET_DEVICES`; do not set it if you rely on the environment's complete device list.
 
 ## ASCEND
 

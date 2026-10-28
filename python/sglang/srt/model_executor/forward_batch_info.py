@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -633,6 +634,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # A one-request batch's committed KV length, which can lag one verify: a host-side
+    # lower bound attention graph variants select on; None for several requests
+    attention_kv_len_lower_bound: Optional[int] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
@@ -722,6 +726,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # shape from the live batch. None preserves eager/default graph behavior.
     max_seq_len_override: Optional[int] = None
 
+    # Host-side max of the allocated seq lens (spec decode, mirrorless
+    # opt-out); NPU attention metadata prep sizes the graph block-table
+    # gather from it without a device sync.
+    max_seq_len_host: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
@@ -790,6 +799,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
     engram_history: Optional[torch.Tensor] = None
+    engram_staged_rows: Optional[StagedRows] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -1040,6 +1050,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            max_seq_len_host=getattr(batch, "max_seq_len_host", None),
             req_pool_indices_cpu=(
                 getattr(batch, "req_pool_indices_cpu", None)
                 if batch.forward_mode.is_extend_without_speculative()
@@ -1048,6 +1059,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
+            engram_staged_rows=batch.engram_staged_rows,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -1091,6 +1103,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            attention_kv_len_lower_bound=(
+                batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
+            ),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
                 if watermark_state is not None
@@ -1166,6 +1181,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.model_config.model_is_mrope:
+                # DP padding can turn an idle rank into a target verify batch.
+                ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -1789,6 +1807,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+            # Keep every DP rank on the same captured token bucket. The raw
+            # global maximum can sit between buckets, while the BCG replay
+            # requires a common padded shape for MoE collectives and attention.
+            bucket = min(
+                size for size in prefill_cg.bs if size >= max(global_num_tokens)
+            )
+            global_num_tokens = [bucket] * sync_group_size
         if self.dp_spec_prefill_coordination_applied:
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN
@@ -1958,9 +1983,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # function is refactored and merged into the Scheduler.
         if self.tbo_children:
             for child in self.tbo_children:
-                child._pad_inputs_to_size(
-                    model_runner, child.tbo_padded_len, child.batch_size
-                )
+                child._pad_tbo_child_inputs(model_runner)
+
+    def _pad_tbo_child_inputs(self, model_runner: ModelRunner):
+        """A decode child pads its requests with its tokens, as the decode arm of
+        ``prepare_mlp_sync_batch`` does for the whole batch."""
+        bs = self.batch_size
+        if self.forward_mode.is_decode() and self.spec_info is None:
+            bs = self.batch_size = self.tbo_padded_len
+        self._pad_inputs_to_size(model_runner, self.tbo_padded_len, bs)
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
@@ -2059,16 +2090,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_prefix_lens = self._pad_tensor_to_size(
                 self.extend_prefix_lens, bs
             )
+        # Rebind, never extend in place: pre-pad attention plans hold these lists,
+        # and extend_logprob_start_lens_cpu aliases the ScheduleBatch's list.
         if self.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu.extend(
-                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            self.extend_seq_lens_cpu = self.extend_seq_lens_cpu + [dummy_extend_len] * (
+                bs - len(self.extend_seq_lens_cpu)
             )
         if self.extend_prefix_lens_cpu is not None:
-            self.extend_prefix_lens_cpu.extend(
-                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            self.extend_prefix_lens_cpu = self.extend_prefix_lens_cpu + [0] * (
+                bs - len(self.extend_prefix_lens_cpu)
             )
         if self.extend_logprob_start_lens_cpu is not None:
-            self.extend_logprob_start_lens_cpu.extend(
+            self.extend_logprob_start_lens_cpu = self.extend_logprob_start_lens_cpu + (
                 [0] * (bs - len(self.extend_logprob_start_lens_cpu))
             )
 
@@ -2227,6 +2260,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
+        # Full aux capture keeps both outputs on the same token rows.
+        if (
+            logits_output.hidden_states is not None
+            and logits_output.last_hidden_states is not None
+        ):
+            logits_output.last_hidden_states = logits_output.last_hidden_states[
+                : logits_output.hidden_states.shape[0]
+            ]
+
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
@@ -2303,6 +2345,8 @@ def build_inner_fb_view(
         kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # A caller may hand in another view that does not carry this field.
+        max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
     )
 
