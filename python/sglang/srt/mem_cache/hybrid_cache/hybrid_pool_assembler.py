@@ -1776,36 +1776,37 @@ def validate_fused_hicache_draft(
 ) -> None:
     """Validate fusion at sizing, draft binding, and host registration.
 
-    Sizing supplies only the target config. Draft binding also supplies the
-    device pools; registration supplies the pools and the completed cache so
-    its page envelopes and shared buffer can be checked.
+    A fused draft's KV lives inside the target's pages, and the target's L2
+    page envelopes copy whole pages, so HiCache keeps the draft's rows without
+    a host pool of its own. Sizing supplies only the target config. Draft
+    binding also supplies the device pools; registration supplies the pools
+    and the completed cache so its page envelopes and shared buffer can be
+    checked.
     """
     if target_config is not None and not (
-        target_config.spec_algorithm.is_dflash()
-        and target_config.is_hybrid_swa
+        target_config.is_hybrid_swa
         and target_config.mambaish_config is None
+        and not target_config.use_mla_backend
         and get_memory().hicache_storage_backend is None
     ):
         raise NotImplementedError(
-            "--enable-hierarchical-cache fused draft KV requires DFLASH, a "
-            "hybrid-SWA target without Mamba, and L2-only storage."
+            "--enable-hierarchical-cache keeps fused draft KV in the target's page "
+            "envelopes, which needs a hybrid-SWA MHA target without Mamba and "
+            "L2-only storage."
         )
 
+    dense_pools = None
     if draft_device_pools is not None:
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-
-        if not (
-            len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], UnifiedDraftKVPool)
-            and draft_device_pools[0]._host_sub_pool_name == "full"
-        ):
+        dense_pools = _fused_dense_draft_pools(draft_device_pools)
+        if dense_pools is None:
             raise NotImplementedError(
-                "HiCache fused draft KV requires a full-attention DFLASH draft."
+                "HiCache fused draft KV requires dense MHA draft pools fused into "
+                "the target's pages."
             )
 
     if tree_cache is None:
         return
-    assert draft_device_pools is not None
+    assert dense_pools is not None
 
     entries = tree_cache.cache_controller.mem_pool_host.entry_map
     if any(
@@ -1814,13 +1815,33 @@ def validate_fused_hicache_draft(
         for name in (PoolName.KV, PoolName.SWA)
     ):
         raise NotImplementedError(
-            "Fused DFLASH HiCache requires unified hybrid-SWA page-envelope host "
+            "Fused draft HiCache requires unified hybrid-SWA page-envelope host "
             "pools; the selected storage backend or host layout does not preserve "
             "the fused draft bytes."
         )
     target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._unified_buffer is not target._unified_buffer:
-        raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
+    if any(pool._unified_buffer is not target._unified_buffer for pool in dense_pools):
+        raise ValueError("A fused HiCache draft must share the target's unified pool.")
+
+
+def _fused_dense_draft_pools(draft_device_pools: tuple[Any, ...]):
+    """The dense MHA pools the fused draft pools write, or None when one of them
+    is not a fused dense pool. A draft with window layers holds one per host
+    sub-pool."""
+    from sglang.srt.mem_cache.unified_draft_pool import (
+        UnifiedDraftKVPool,
+        UnifiedDraftSWAKVPool,
+    )
+
+    dense = []
+    for pool in draft_device_pools:
+        if isinstance(pool, UnifiedDraftSWAKVPool):
+            dense += [p for p in (pool.full_kv_pool, pool.swa_kv_pool) if p is not None]
+        elif isinstance(pool, UnifiedDraftKVPool):
+            dense.append(pool)
+        else:
+            return None
+    return tuple(dense)
 
 
 def build_hicache_draft_sidecars(

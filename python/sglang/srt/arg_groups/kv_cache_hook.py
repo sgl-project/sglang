@@ -633,9 +633,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         draft_backends = {draft_backend} if draft_backend else eagle_backends
         assert draft_backends <= _SPEC_MHA_AUDITED_BACKENDS, (
             "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
-            f"{sorted(draft_backends)}, but a fused draft is MHA-shaped and "
-            "reads its KV through the translated MHA rails "
-            f"{sorted(_SPEC_MHA_AUDITED_BACKENDS)}. "
+            f"{sorted(draft_backends)}, but a fused draft reads its KV through "
+            "the KV-index translator, which only "
+            f"{sorted(_SPEC_MHA_AUDITED_BACKENDS)} carry on every draft path. "
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
@@ -674,15 +674,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
         "the draft's host pool off the draft's own device pool, which a fused "
         "EAGLE draft does not have."
-    )
-    assert not (
-        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
-        and cfg.enable_hierarchical_cache
-    ), (
-        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
-        "--enable-hierarchical-cache: HiCache keeps the draft on a private "
-        "pool, and would pack an MTP head's KV into the target's "
-        "page-envelope host pool, which refuses per-layer draft loads."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -761,10 +752,32 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     )
 
 
-# Unified-memory backends that carry v_head_dim through to the kernel, so a
-# V row narrower than K (MiMoV2: 192 / 128) reads correctly. FlashInfer's
-# paged_kv_t compiles ONE head_dim for both; trtllm_mha refuses unequal dims.
+# The attention backends that read the unified pool. Each reads through the
+# translator, so what admits one is whether its kernels address the per-layer
+# views by their strides (the slot stride is the whole entry, not one row).
+# Names are the RESOLVED ids from attention_backends_of.
+#   * MLA: the paged MLA family, incl. flashmla (ps=64 snap).
+#   * MHA/SWA: fa3 / fa4 / flashinfer / trtllm_mha alongside Triton (fa4 is the
+#     fa3 class).
+#   * MHA/SWA with asymmetric K/V rows: only the backends that carry v_head_dim
+#     through to the kernel, so a V row narrower than K (MiMoV2: 192 / 128)
+#     reads correctly. FlashInfer's paged_kv_t compiles ONE head_dim for both;
+#     trtllm_mha refuses unequal dims.
+_UNIFIED_MLA_BACKENDS = frozenset(
+    {"triton", "fa3", "trtllm_mla", "flashinfer", "cutedsl_mla", "flashmla"}
+)
+_UNIFIED_MHA_BACKENDS = frozenset({"triton", "fa3", "fa4", "flashinfer", "trtllm_mha"})
 ASYMMETRIC_KV_BACKENDS = frozenset({"triton", "fa3", "fa4"})
+
+
+def unified_memory_attention_backends(
+    *, mla: bool, asymmetric_kv: bool = False
+) -> frozenset:
+    """The attention backends that may read the unified pool for this attention,
+    the target's and a fused draft's alike."""
+    if mla:
+        return _UNIFIED_MLA_BACKENDS
+    return ASYMMETRIC_KV_BACKENDS if asymmetric_kv else _UNIFIED_MHA_BACKENDS
 
 
 def handle_page_major_kv_layout(server_args: Any):
@@ -788,35 +801,10 @@ def handle_page_major_kv_layout(server_args: Any):
         "--enable-page-major-kv-layout."
     )
     model_config = model_config_of(server_args)
-    # Allow-list. Every backend below reads through the translator, so what
-    # gates one is only whether its kernels address the per-layer views by
-    # their strides (the slot stride is the whole entry, not one row):
-    #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
-    #     snap).
-    #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
-    #     Triton. fa4 is the fa3 class.
-    #   * MHA/SWA models with asymmetric K/V rows: only the backends that
-    #     carry v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS).
-    # Names are the RESOLVED ids from attention_backends_of.
-    if use_mla_backend(server_args):
-        allowed_full = {
-            "triton",
-            "fa3",
-            "trtllm_mla",
-            "flashinfer",
-            "cutedsl_mla",
-            "flashmla",
-        }
-    elif model_config.has_asymmetric_kv:
-        allowed_full = set(ASYMMETRIC_KV_BACKENDS)
-    else:
-        allowed_full = {
-            "triton",
-            "fa3",
-            "fa4",
-            "flashinfer",
-            "trtllm_mha",
-        }
+    allowed_full = unified_memory_attention_backends(
+        mla=use_mla_backend(server_args),
+        asymmetric_kv=model_config.has_asymmetric_kv,
+    )
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (

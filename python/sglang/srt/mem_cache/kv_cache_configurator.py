@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import TRANSLATED_MHA_RAILS
+from sglang.srt.arg_groups.kv_cache_hook import (
+    TRANSLATED_MHA_RAILS,
+    unified_memory_attention_backends,
+)
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
@@ -1085,10 +1088,10 @@ class KVCacheConfigurator:
         Asymmetric K/V rows fuse only on backends that carry v_head_dim through
         to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
-            LAYER_FULL,
             FusedDraftDecision,
             PlacementContext,
             draft_kv_profile,
+            draft_swa_layer_ids,
             place_fused_draft,
         )
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
@@ -1108,11 +1111,23 @@ class KVCacheConfigurator:
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
-        if aux.draft_model_config.attention_arch != AttentionArch.MHA:
+        draft_arch = aux.draft_model_config.attention_arch
+        if draft_arch == AttentionArch.MHA:
+            draft_mla = False
+        elif draft_arch == AttentionArch.MLA and self.use_mla_backend:
+            # The draft's latent rows join the host's own MLA rows; a window
+            # layer would need an MLA sliding-window sub-pool, which none builds.
+            if draft_swa_layer_ids(aux.draft_model_config):
+                return FusedDraftDecision(
+                    declined="the MLA draft has sliding-window layers"
+                )
+            draft_mla = True
+        else:
+            host_arch = "MLA" if self.use_mla_backend else "MHA"
             return FusedDraftDecision(
                 declined=(
-                    f"the draft's attention is {aux.draft_model_config.attention_arch.name}; "
-                    "the fused region holds dense MHA K/V rows"
+                    f"the draft's attention is {draft_arch.name}, which an "
+                    f"{host_arch} host's entries do not hold"
                 )
             )
         # The draft runner's backend, resolved as its worker will: an EAGLE
@@ -1131,12 +1146,23 @@ class KVCacheConfigurator:
         )
         # A fused draft reads its rows through the KV-index translator, which
         # other backends miss on some draft path.
-        if not draft_backends <= TRANSLATED_MHA_RAILS:
+        if not draft_mla and not draft_backends <= TRANSLATED_MHA_RAILS:
             return FusedDraftDecision(
                 declined=(
                     f"the draft runs on {', '.join(sorted(draft_backends))}, "
                     "off the translated MHA rails "
                     f"({', '.join(sorted(TRANSLATED_MHA_RAILS))})"
+                )
+            )
+        # An MLA draft's latent rows are read like the host's own, on any
+        # backend the unified pool supports for MLA attention.
+        mla_backends = unified_memory_attention_backends(mla=True)
+        if draft_mla and not draft_backends <= mla_backends:
+            return FusedDraftDecision(
+                declined=(
+                    f"the draft runs on {', '.join(sorted(draft_backends))}, which "
+                    "the unified pool does not support for MLA attention "
+                    f"({', '.join(sorted(mla_backends))})"
                 )
             )
         # Under DCP each rank's host rows hold only its share of the widened
@@ -1150,28 +1176,14 @@ class KVCacheConfigurator:
                     "rows, but the replicated draft reads every token"
                 )
             )
-        # DFLASH's dense full-attention rows can ride in the target's L2
-        # page envelopes. Other HiCache paths still build a separate draft
-        # host pool, as does host-pool decode retraction.
-        fused_hicache = get_memory().enable_hierarchical_cache
-        if fused_hicache:
-            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-                validate_fused_hicache_draft,
-            )
-
-            try:
-                validate_fused_hicache_draft(target_config=self)
-            except NotImplementedError as exc:
-                return FusedDraftDecision(declined=str(exc))
+        # Host-pool retraction builds the draft's host pool off its own device
+        # pool, which a fused draft does not have. The external linker would
+        # too; the gate refuses it on the unified pool.
         if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
-            host_pool_flag = "--disaggregation-decode-retraction-backup=host_pool"
-        else:
-            host_pool_flag = None
-        if host_pool_flag is not None:
             return FusedDraftDecision(
                 declined=(
-                    f"{host_pool_flag} builds the draft's host pool off a device "
-                    "pool of its own"
+                    "--disaggregation-decode-retraction-backup=host_pool builds "
+                    "the draft's host pool off a device pool of its own"
                 )
             )
         profile = draft_kv_profile(
@@ -1182,10 +1194,6 @@ class KVCacheConfigurator:
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
         )
-        if fused_hicache and set(profile.kinds) != {LAYER_FULL}:
-            return FusedDraftDecision(
-                declined="HiCache fused DFLASH requires a full-attention-only draft"
-            )
         num_runners = (
             int(get_spec().speculative_num_steps)
             if self.model_config.is_multi_layer_eagle
@@ -1228,7 +1236,7 @@ class KVCacheConfigurator:
                             f"from the host's ({self.kv_cache_dtype})"
                         )
                     )
-        return place_fused_draft(
+        decision = place_fused_draft(
             profile=profile,
             num_runners=num_runners,
             ctx=PlacementContext(
@@ -1239,6 +1247,72 @@ class KVCacheConfigurator:
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
             kv_dtype=region_kv_dtype,
+        )
+        if decision.placement is not None and get_memory().enable_hierarchical_cache:
+            declined = self._hicache_fused_draft_decline(decision.placement, profile)
+            if declined is not None:
+                return FusedDraftDecision(declined=declined)
+        return decision
+
+    def _hicache_fused_draft_decline(self, placement, profile) -> Optional[str]:
+        """Why HiCache would drop the fused draft's rows on a reload, or None
+        when its host pools keep them. A two-pool hybrid-SWA host's L2 page
+        envelopes carry whole pages, draft parts included. Every other host
+        pool copies rows layer by layer, and a draft's rows ride along only as
+        layers packed after the target's: one NEXTN layer per draft runner, in
+        the target's row shape."""
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            validate_fused_hicache_draft,
+        )
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            LAYER_FULL,
+            LatentDraftRegion,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            MLASubPoolSpec,
+        )
+        from sglang.srt.speculative.base_spec_worker import can_pack_hicache_mtp
+
+        if self.is_hybrid_swa and self.mambaish_config is None:
+            try:
+                validate_fused_hicache_draft(target_config=self)
+            except NotImplementedError as exc:
+                return str(exc)
+            if self.spec_algorithm.is_dflash() and set(profile.kinds) != {LAYER_FULL}:
+                return "HiCache fused DFLASH requires a full-attention-only draft"
+            return None
+        packs = (
+            not self.is_hybrid_swa
+            and placement.hosts() == ("full",)
+            and all(
+                len(placement.lanes_for(runner, "full")) == 1
+                for runner in range(len(placement.runners))
+            )
+            and can_pack_hicache_mtp(
+                self.spec_algorithm, (self.spec_aux_config.draft_model_config,)
+            )
+        )
+        if packs:
+            region = placement.region("full")
+            host = self._full_host_spec(None)
+            if isinstance(region, LatentDraftRegion):
+                packs = isinstance(host, MLASubPoolSpec) and (
+                    region.kv_lora_rank,
+                    region.qk_rope_head_dim,
+                ) == (host.kv_lora_rank, host.qk_rope_head_dim)
+            else:
+                packs = isinstance(host, MHASubPoolSpec) and (
+                    region.head_num,
+                    region.head_dim,
+                    region.resolved_v_head_dim(),
+                ) == (host.head_num, host.head_dim, host.v_head_dim)
+        if packs:
+            return None
+        return (
+            "HiCache copies this host's rows layer by layer and packs a draft's "
+            "only for a NEXTN head with one layer per runner in the target's "
+            "row shape"
         )
 
     def _draft_attention_backends(self) -> tuple:

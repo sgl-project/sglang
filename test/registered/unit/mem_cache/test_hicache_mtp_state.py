@@ -2,12 +2,17 @@
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache import unified_draft_pool
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
@@ -25,6 +30,7 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
     target = SimpleNamespace(
         spec_algorithm=SpeculativeAlgorithm.EAGLE,
         req_to_token_pool=SimpleNamespace(mamba_pool=target_pool),
+        kv_cache_configurator=SimpleNamespace(),
     )
     runners = tuple(
         SimpleNamespace(
@@ -126,6 +132,119 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
 
 
+def _fused_plan(monkeypatch, *, swa_target, nextn=True):
+    """The plan for draft runners whose KV the binder fused into the target."""
+    monkeypatch.setattr(
+        unified_draft_pool, "fused_draft_host_allocator", lambda pool: object()
+    )
+    draft_config = SimpleNamespace(num_nextn_predict_layers=1 if nextn else None)
+    worker, target, runners = _worker(monkeypatch, draft_config, None, (None, None))
+    target.token_to_kv_pool = MagicMock(spec=BaseSWAKVPool) if swa_target else object()
+    return spec.BaseSpecWorker._build_hicache_draft_plan(worker), target, runners
+
+
+def test_page_envelopes_carry_a_fused_draft(monkeypatch):
+    """A hybrid-SWA target's page envelopes copy whole pages, draft parts
+    included: the plan backs up nothing of its own, once the shared check
+    passes. Packed layers would turn the envelopes into per-layer pools."""
+    checks = []
+    monkeypatch.setattr(
+        hybrid_pool_assembler,
+        "validate_fused_hicache_draft",
+        lambda **kwargs: checks.append(kwargs),
+    )
+    plan, target, runners = _fused_plan(monkeypatch, swa_target=True)
+    pools = tuple(r.token_to_kv_pool for r in runners)
+    assert plan.mode == spec.HiCacheDraftMode.FUSED
+    assert plan.device_pools == pools
+    assert checks == [
+        dict(target_config=target.kv_cache_configurator, draft_device_pools=pools)
+    ]
+    assert target.mtp_draft_device_pools == ()
+
+
+def test_a_fused_nextn_head_packs_after_the_target(monkeypatch):
+    plan, target, runners = _fused_plan(monkeypatch, swa_target=False)
+    assert plan.mode == spec.HiCacheDraftMode.PACKED
+    assert target.mtp_draft_device_pools == tuple(r.token_to_kv_pool for r in runners)
+
+
+def test_a_fused_draft_that_does_not_pack_is_refused(monkeypatch):
+    """The boot gate admits a fused draft under HiCache only where its rows
+    pack or ride in page envelopes; anything else is refused, not sidecarred."""
+    with pytest.raises(AssertionError, match="lose its rows"):
+        _fused_plan(monkeypatch, swa_target=False, nextn=False)
+
+
 if __name__ == "__main__":
     args = [arg for arg in sys.argv[1:] if arg != "-f"]
     raise SystemExit(pytest.main([__file__, "-v", "-x", *args]))
+
+
+def _dense_draft(buffer):
+    pool = unified_draft_pool.UnifiedDraftKVPool.__new__(
+        unified_draft_pool.UnifiedDraftKVPool
+    )
+    pool._unified_buffer = buffer
+    return pool
+
+
+def _windowed_draft(buffer):
+    pool = unified_draft_pool.UnifiedDraftSWAKVPool.__new__(
+        unified_draft_pool.UnifiedDraftSWAKVPool
+    )
+    pool.full_kv_pool = None
+    pool.swa_kv_pool = _dense_draft(buffer)
+    return pool
+
+
+def _registered_cache(buffer, *, envelopes=True):
+    host = (
+        UnifiedPageEnvelopeHostPool.__new__(UnifiedPageEnvelopeHostPool)
+        if envelopes
+        else object()
+    )
+    entries = {
+        name: SimpleNamespace(
+            host_pool=host, device_pool=SimpleNamespace(_unified_buffer=buffer)
+        )
+        for name in (
+            hybrid_pool_assembler.PoolName.KV,
+            hybrid_pool_assembler.PoolName.SWA,
+        )
+    }
+    return SimpleNamespace(
+        cache_controller=SimpleNamespace(
+            mem_pool_host=SimpleNamespace(entry_map=entries)
+        )
+    )
+
+
+def test_page_envelopes_take_every_dense_fused_draft():
+    """Every dense draft pool fused into the target's pages rides in its page
+    envelopes: full-attention ones and window ones, one pool per runner."""
+    buffer = object()
+    hybrid_pool_assembler.validate_fused_hicache_draft(
+        draft_device_pools=(_dense_draft(buffer), _windowed_draft(buffer)),
+        tree_cache=_registered_cache(buffer),
+    )
+
+
+def test_page_envelopes_refuse_what_they_do_not_carry():
+    buffer = object()
+    latent = unified_draft_pool.UnifiedDraftMLAKVPool.__new__(
+        unified_draft_pool.UnifiedDraftMLAKVPool
+    )
+    for pools in ((latent,), (_dense_draft(buffer), object())):
+        with pytest.raises(NotImplementedError, match="dense MHA draft pools"):
+            hybrid_pool_assembler.validate_fused_hicache_draft(draft_device_pools=pools)
+    with pytest.raises(NotImplementedError, match="page-envelope host pools"):
+        hybrid_pool_assembler.validate_fused_hicache_draft(
+            draft_device_pools=(_dense_draft(buffer),),
+            tree_cache=_registered_cache(buffer, envelopes=False),
+        )
+    with pytest.raises(ValueError, match="share the target's unified pool"):
+        hybrid_pool_assembler.validate_fused_hicache_draft(
+            draft_device_pools=(_windowed_draft(object()),),
+            tree_cache=_registered_cache(buffer),
+        )

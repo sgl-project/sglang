@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftRegion,
     DraftStateRegion,
     FusedDraftPlacement,
+    LatentDraftRegion,
 )
 from sglang.srt.mem_cache.layout.token_major import (
     ROW_ALIGN_BYTES,
@@ -250,7 +251,8 @@ class MLASubPoolSpec(SubPoolSpec):
     is a prefix slice of the same row, so there is no separate V region. Not a
     subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
     invariant there do not apply. With `draft_region` set, the draft's K and V
-    parts follow the latent rows inside every slot's entry, as on an MHA host.
+    parts (an MHA draft) or its latent rows (an MLA draft) follow the host's
+    latent rows inside every slot's entry.
     """
 
     kv_lora_rank: int
@@ -266,8 +268,11 @@ class MLASubPoolSpec(SubPoolSpec):
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
         if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
-                "dense entries carry dense draft K/V rows, never a state region"
+            assert isinstance(
+                self.draft_region, (DenseDraftRegion, LatentDraftRegion)
+            ), (
+                "MLA entries carry dense draft K/V rows or latent draft rows, "
+                "never a state region"
             )
             self.draft_region.validate()
 
@@ -748,6 +753,24 @@ class UnifiedKVPool:
             for name in ("draft_k", "draft_v")
         )
         return k_views, v_views
+
+    def build_latent_draft_views(self, sub_pool_name: str) -> List[torch.Tensor]:
+        """Per-lane latent views of an MLA draft's rows fused into
+        ``sub_pool_name``'s entries: same pages, same slot ids, same v2p table
+        as the host."""
+        spec = self.require_draft_host_spec(sub_pool_name)
+        assert isinstance(spec.draft_region, LatentDraftRegion), (
+            f"sub-pool {sub_pool_name!r} carries no fused latent draft region"
+        )
+        page_size = self._page_size
+        num_slots = self.max_slots(sub_pool_name) // page_size * page_size
+        return build_dense_views(
+            self._raw,
+            layout=spec.layout(),
+            part_name="draft_kv",
+            num_slots=num_slots,
+            anchor_bytes=self._anchor_bytes[sub_pool_name],
+        )
 
     def _build_mla_views(
         self,
