@@ -14,8 +14,9 @@ offload -- goes through the regular transformer load path.
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     inspect_minimax_h3_safetensors,
     resolve_minimax_h3_checkpoint_quantization,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -115,8 +117,78 @@ def get_registered_comfyui_pipeline_names() -> list[str]:
 
 
 def is_comfyui_single_file(model_path: str) -> bool:
-    """ComfyUI ships DiTs as one safetensors file with no model_index.json."""
-    return os.path.isfile(model_path) and model_path.endswith(".safetensors")
+    """ComfyUI ships DiTs as one safetensors or GGUF file with no model_index.json."""
+    return os.path.isfile(model_path) and model_path.endswith((".safetensors", ".gguf"))
+
+
+def _gguf_runtime_layout(tensor_meta: dict, mapping: dict) -> tuple[dict, dict]:
+    """Key GGUF metadata by runtime names; return it with the fused-shard plan.
+
+    Shards of one fused runtime layer (Z-Image w1/w3 -> w13) keep their own
+    entries and are concatenated on load, under the fused name quant lookup uses.
+    """
+    from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+        remap_gguf_tensor_meta,
+    )
+
+    map_name = get_param_names_mapping(mapping)
+    plain, fused = {}, defaultdict(dict)
+    for name, meta in tensor_meta.items():
+        target, index, _ = map_name(name)
+        if index is None:
+            plain[name] = meta
+        else:
+            fused[target][index] = (name, meta)
+
+    layout = remap_gguf_tensor_meta(plain, lambda name: map_name(name)[0])
+    shard_plan = {}
+    for target, parts in fused.items():
+        metas = [parts[i][1] for i in sorted(parts)]
+        first = metas[0]
+        if len({(m.ggml_type, m.is_packed, m.logical_shape[1:]) for m in metas}) > 1:
+            raise ValueError(f"GGUF shards of {target} differ in type or width")
+        param_name = (
+            f"{target.removesuffix('.weight')}.qweight" if first.is_packed else target
+        )
+        layout[target] = replace(
+            first,
+            logical_shape=(
+                sum(m.logical_shape[0] for m in metas),
+                *first.logical_shape[1:],
+            ),
+            stored_shape=(
+                sum(m.stored_shape[0] for m in metas),
+                *first.stored_shape[1:],
+            ),
+            param_name=param_name,
+        )
+        for index, (name, meta) in parts.items():
+            layout[name] = meta
+            shard_plan[meta.param_name] = (param_name, index, len(parts))
+    return layout, shard_plan
+
+
+def _runtime_gguf_weights(weights, layout: dict, shard_plan: dict, quant_config):
+    """Fuse planned shards; dequantize packed tensors whose layer built without
+    GGUF (e.g. Z-Image adaLN ReplicatedLinear). Runs after model construction,
+    so quant_config.selected is final."""
+    import gguf
+
+    packed_types = {m.param_name: m.weight_type for m in layout.values() if m.is_packed}
+    pending = defaultdict(dict)
+    for name, tensor in weights:
+        if name in shard_plan:
+            name, index, total = shard_plan[name]
+            pending[name][index] = tensor
+            if len(pending[name]) < total:
+                continue
+            parts = pending.pop(name)
+            tensor = torch.cat([parts[i] for i in range(total)])
+        prefix = name.removesuffix(".qweight")
+        if name in packed_types and prefix not in quant_config.selected:
+            value = gguf.dequantize(tensor.numpy(), packed_types[name])
+            name, tensor = f"{prefix}.weight", torch.from_numpy(value).bfloat16()
+        yield name, tensor
 
 
 def _load_comfyui_gguf_transformer(
@@ -146,7 +218,10 @@ def _load_comfyui_gguf_transformer(
             [gguf_file], str(server_args.model_variant or "fl2va")
         )
 
-    tensor_meta = read_gguf_tensor_meta(gguf_file)
+    # Quant lookup and weight loading must both see runtime names.
+    tensor_meta, shard_plan = _gguf_runtime_layout(
+        read_gguf_tensor_meta(gguf_file), mapping
+    )
     curve = tensor_meta.get("adaln_t_table")
     if curve is not None:
         if curve.is_quantized or len(curve.logical_shape) != 2:
@@ -188,7 +263,12 @@ def _load_comfyui_gguf_transformer(
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
-            weights_iterator=gguf_weights_iterator(gguf_file, tensor_meta),
+            weights_iterator=_runtime_gguf_weights(
+                gguf_weights_iterator(gguf_file, tensor_meta),
+                tensor_meta,
+                shard_plan,
+                quant_config,
+            ),
         )
     finally:
         model_cls.param_names_mapping = original_mapping
@@ -283,6 +363,9 @@ def load_comfyui_transformer(
     )
 
     gguf_file = resolve_transformer_gguf_to_load(server_args, "transformer")
+    if gguf_file is None and model_path.endswith(".gguf"):
+        # A GGUF unet picked in ComfyUI is the model path itself.
+        gguf_file = model_path
     if gguf_file is not None:
         model = _load_comfyui_gguf_transformer(
             model_cls=model_cls,
