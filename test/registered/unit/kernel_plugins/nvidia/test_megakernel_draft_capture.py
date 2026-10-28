@@ -39,7 +39,12 @@ class DraftBuilt:
     """Covers draft decode steps of up to max_bs rows: one row a request, so off the
     width grid."""
 
+    # the EAGLE entries and graph variants it does not offer
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, widths, max_bs):
         self.widths, self.max_bs = widths, max_bs
