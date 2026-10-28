@@ -231,15 +231,18 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
     const int64_t* src_indices,
     const int64_t* dst_indices,
     uint32_t num_items,
-    uint32_t num_layers) {
+    uint32_t num_layers,
+    int64_t src_layer_stride,
+    int64_t dst_layer_stride) {
   const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   const int total_warps = gridDim.x * NUM_WARPS;
 
   for (uint32_t i = global_tid / WARP_SIZE; i < num_items; i += total_warps) {
-    const int32_t src_index = static_cast<int32_t>(src_indices[i]);
-    const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
     for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      const int32_t src_index = static_cast<int32_t>(src_indices[layer_id * src_layer_stride + i]);
+      const int32_t dst_index = static_cast<int32_t>(dst_indices[layer_id * dst_layer_stride + i]);
+      if (src_index < 0 || dst_index < 0) continue;
       device::hisparse::transfer_item(
           /*dst_cache=*/dst_caches[layer_id],
           /*src_cache=*/src_caches[layer_id],
@@ -261,7 +264,18 @@ void transfer_cache_dsv4_mla(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
   TensorMatcher({L}).with_dtype<uint64_t>().with_device(device).verify(src_ptrs).verify(dst_ptrs);
-  TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices).verify(dst_indices);
+  // Existing 1D indices are shared across layers; 2D indices retain each
+  // layer's physical slot ownership after speculative cache rotation.
+  if (src_indices.ndim() == 1) {
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices);
+  } else {
+    TensorMatcher({L, N}).with_dtype<int64_t>().with_device(device).verify(src_indices);
+  }
+  if (dst_indices.ndim() == 1) {
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(dst_indices);
+  } else {
+    TensorMatcher({L, N}).with_dtype<int64_t>().with_device(device).verify(dst_indices);
+  }
 
   const auto num_items = static_cast<uint32_t>(N.unwrap());
   if (num_items == 0) {
@@ -277,7 +291,9 @@ void transfer_cache_dsv4_mla(
       static_cast<const int64_t*>(src_indices.data_ptr()),
       static_cast<const int64_t*>(dst_indices.data_ptr()),
       num_items,
-      num_layers);
+      num_layers,
+      src_indices.ndim() == 2 ? src_indices.strides()[0] : 0,
+      dst_indices.ndim() == 2 ? dst_indices.strides()[0] : 0);
 }
 
 __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {

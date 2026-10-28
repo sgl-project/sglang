@@ -2486,7 +2486,9 @@ class DeepseekV4AttnBackend(
             return
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
+        verify_prefix_lens = None
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            verify_prefix_lens = self.forward_metadata.seq_lens
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
@@ -2501,6 +2503,24 @@ class DeepseekV4AttnBackend(
             self.tail_forward_metadata = None
 
         metadata = self.forward_metadata
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.spec_swap.enabled
+        ):
+            assert isinstance(metadata, DSV4Metadata)
+            # C4 write locations are produced during metadata materialization.
+            # Bind completed compression blocks before any layer writes KV;
+            # recording this here also refreshes their mapping on graph replay.
+            self.hisparse_coordinator.spec_swap.prepare_compressed_verify(
+                req_pool_indices=forward_batch.req_pool_indices,
+                prefix_lens=(
+                    verify_prefix_lens
+                    if verify_prefix_lens is not None
+                    else forward_batch.seq_lens
+                ),
+                compressed_out_locs=metadata.core_metadata.c4_out_loc,
+            )
         if isinstance(metadata, DSV4Metadata):
             core = metadata.core_metadata
             for ratio in core.low_ratios:
@@ -4451,6 +4471,12 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if compress_ratio == 4 and self.hisparse_coordinator is not None:
+                flat_token_ids = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        flat_token_ids
+                    )
+                )
             n_compressed = flat_token_ids.shape[0]
             # Layers sharing a kv_source reuse its dequant: no later layer writes
             # that cache, and graph replay keeps the layer order.
@@ -4633,6 +4659,12 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if compress_ratio == 4 and self.hisparse_coordinator is not None:
+                flat_token_ids = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        flat_token_ids
+                    )
+                )
 
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_kv_buffer.get(
