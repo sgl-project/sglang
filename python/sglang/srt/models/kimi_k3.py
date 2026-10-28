@@ -371,12 +371,14 @@ _SHARDED_UP_PROJ_MIN_TOKENS = 1024
 def _sharded_up_proj_eligible(
     up_proj: Optional[nn.Module], tp_size: int, *, on_hip: bool
 ) -> bool:
-    """ROCm, and a dense bf16/fp16 up_proj weight whose output rows split evenly
-    over TP."""
+    """ROCm, and a dense bias-free bf16/fp16 up_proj weight whose output rows
+    split evenly over TP. The sharded tail calls the GEMM directly, so any
+    bias would be dropped."""
     weight = getattr(up_proj, "weight", None)
     return (
         on_hip
         and tp_size > 1
+        and getattr(up_proj, "bias", None) is None
         and isinstance(weight, torch.Tensor)
         and type(weight.data) is torch.Tensor
         and weight.dtype in (torch.bfloat16, torch.float16)
