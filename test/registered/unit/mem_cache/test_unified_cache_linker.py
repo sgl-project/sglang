@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -59,6 +60,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
@@ -182,9 +184,11 @@ def test_cache_linker_attachment_is_backend_independent():
         write_through_threshold=256,
     )
     cache.tree_components = (ComponentType.FULL,)
+    index_slots(cache, cache.tree_components)
     cache.linker = None
     cache._components_tuple = ()
     cache.components = {}
+    index_slots(cache, cache.components)
     linker = _FakeLinker()
 
     cache.init_cache_linker(linker)
@@ -672,7 +676,9 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(set(load_by_pool), {PoolName.KV, PoolName.SWA})
         for transfer in load_by_pool.values():
             self.assertEqual(transfer.keys, all_keys[2:4])
-        translated = consumer_allocator.translate_loc_from_full_to_swa(loaded)
+        translated = consumer_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            loaded
+        )
         self.assertTrue(
             torch.equal(translated, load_by_pool[PoolName.SWA].device_indices)
         )
@@ -1261,6 +1267,7 @@ def test_split_action_retargets_pending_external_offload():
             apply_component_action=lambda action: calls.append(("full", action))
         )
     }
+    index_slots(cache, cache.components)
     action = UpdatePendingBackupOnNodeSplit(
         ack_id=7,
         old_node_id=7,
@@ -1374,6 +1381,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
+    index_slots(cache, cache.components)
     cache.cache_controller = object() if enable_hicache else None
     cache.decoder_swa_bounded_replay = False
     cache.tree_core = SimpleNamespace(
@@ -1397,6 +1405,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
 def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
+    index_slots(cache, cache.components)
     assert cache.swa_reprefill_tail_tokens() == 0
 
 

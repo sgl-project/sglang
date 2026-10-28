@@ -19,8 +19,8 @@ from sglang.srt.layers.attention.local_attention import (
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -166,6 +166,7 @@ class XPUAttentionBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.runner_ids = model_runner.runner_ids
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -174,8 +175,9 @@ class XPUAttentionBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            model_runner.token_to_kv_pool.layer_router.routes_to(
+                IdSpaceKind.SLIDING_WINDOW
+            )
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -263,7 +265,7 @@ class XPUAttentionBackend(AttentionBackend):
         v: torch.Tensor,
     ):
         if self.dcp_size == 1:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                 k,
@@ -273,7 +275,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             return
 
-        self.token_to_kv_pool.set_kv_buffer(
+        self.kv_layers.layer(layer.layer_id).store(
             layer,
             KVWriteLoc(
                 self.dcp_metadata.local_cache_loc,
@@ -638,16 +640,12 @@ class XPUAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             # flash_attn_with_kvcache requires int32 page tables; the SWA index
             # mapping is int64, so cast (matches flashattention_backend.py).
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
+            metadata.swa_page_table = self.runner_ids.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+            ).to(torch.int32)
             if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                metadata.swa_out_cache_loc = self.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
 
         if self.use_mla:
@@ -714,12 +712,8 @@ class XPUAttentionBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
     ):
         if k is None and v is None:
-            # Cross-layer KV sharing (Gemma 4): the layer reuses another
-            # layer's KV cache. The paged kernel reads K/V directly via
-            # page_table, and pool.get_kv_buffer(layer.layer_id) routes
-            # to the correct sub-pool because RadixAttention is initialized
-            # with layer_id=kv_shared_layer_index for shared layers. No
-            # materialization needed; just skip the write path.
+            # Shared-KV RadixAttention uses kv_shared_layer_index as layer_id,
+            # so the router reads the source layer directly; skip only the write.
             pass
         elif k is None or v is None:
             raise ValueError("Both k and v should be None or not None")
@@ -733,7 +727,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     self._set_kv_buffer_mha(layer, forward_batch, cache_loc, k, v)
                 else:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         cache_loc,
                         k,
@@ -820,8 +814,8 @@ class XPUAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        metadata.page_table
+                    page_table = self.runner_ids.ids_in(
+                        IdSpaceKind.SLIDING_WINDOW, metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -835,7 +829,7 @@ class XPUAttentionBackend(AttentionBackend):
             # chunked-prefix varlen kernels there keep their own default.
             kwargs["num_splits"] = self.num_splits
 
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -1018,9 +1012,7 @@ class XPUAttentionBackend(AttentionBackend):
                 assert not layer.logit_cap, "MLA prefill does not support logit_cap"
 
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
-                )
+                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
 
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1214,7 +1206,7 @@ class XPUAttentionBackend(AttentionBackend):
                 q.new_full((tokens, heads), -float("inf"), dtype=torch.float32),
             )
 
-        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
         out, softmax_lse, *_ = flash_attn_with_kvcache(
             q=q,
             k_cache=key_cache.view(
@@ -1389,7 +1381,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     # Pass k_rope as-is like forward_extend: when rope is folded into
                     # k (k_rope is None), set_mla_kv_buffer stores the whole kv row.
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         cache_loc,
                         k,
@@ -1455,7 +1447,7 @@ class XPUAttentionBackend(AttentionBackend):
             # (no split-KV), so it needs no deterministic override here.
             kwargs["num_splits"] = self.num_splits
 
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -1532,11 +1524,9 @@ class XPUAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
+                        page_table = self.runner_ids.ids_in(
+                            IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+                        ).to(torch.int32)
 
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -1592,7 +1582,7 @@ class XPUAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
             assert not use_cascade_attn, "Cascade attention is not supported with MLA"
 
             if q_rope is not None:
@@ -1834,8 +1824,8 @@ class XPUAttentionBackend(AttentionBackend):
             n = forward_batch.out_cache_loc.shape[0]
             swa_out_cache_loc[n:].zero_()
             swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                self.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
             )
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
