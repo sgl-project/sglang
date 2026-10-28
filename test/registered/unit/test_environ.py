@@ -139,10 +139,7 @@ class TestEnvField(unittest.TestCase):
             for field in self.env_fields.values():
                 stack.enter_context(field.override(False))
                 field.clear()
-            defaults = {
-                name: field.get()
-                for name, field in self.env_fields.items()
-            }
+            defaults = {name: field.get() for name, field in self.env_fields.items()}
             master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
             self.assertIs(master.get(), False)
             for master_value in (False, True, False):
