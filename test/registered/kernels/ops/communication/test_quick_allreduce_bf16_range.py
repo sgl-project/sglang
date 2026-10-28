@@ -131,6 +131,7 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
         # (requested level, level it runs): asked for INT4, the JIT build runs INT8 below 64 MiB;
         # at 32 KB a tile, the sizes past the first have more tiles than blocks (grid-stride loop)
         for numel, level, runs in (
+            (171 * 6144, _INT4, _INT8),  # a partial last tile
             (384 * 6144, _INT4, _INT8),
             (4096 * 6144, _INT4, _INT8),
             (6144 * 6144, _INT4, _INT4),
@@ -138,6 +139,8 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
         ):
             inp = torch.randn(numel, device=device, generator=generator).bfloat16()
             inp[::4099] *= 64
+            # past fp16's range, where the bf16 -> fp16 cast must saturate as sgl-kernel's does
+            inp[1::65537] = 80000.0
             expected, out = torch.empty_like(inp), torch.empty_like(inp)
             for _ in range(2):
                 aot.qr_all_reduce(aot_comm, inp, expected, runs, True)
