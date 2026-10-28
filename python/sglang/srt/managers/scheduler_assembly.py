@@ -1224,12 +1224,15 @@ def init_disaggregation() -> DisaggregationMode:
     """The configured disaggregation mode."""
     disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
 
-    # In rust-server mode the KV bootstrap registry is already serving on
-    # the rust api listener (the rust server launches before this runs —
-    # the PrefillBootstrapQueue's KVManager below registers to it
-    # synchronously, and a failed registration only retries ~60s then logs,
-    # leaving every PD request unroutable). Only the ascend config store,
-    # which start_disagg_service would otherwise create, is left to do.
+    # In rust-server mode the KV bootstrap server is already up before the
+    # PrefillBootstrapQueue's KVManager registers to it (synchronously; a
+    # failed registration only retries ~60s then logs, leaving every PD
+    # request unroutable): either the rust api listener serves the HTTP
+    # registry (the rust server launches before this runs), or, for a
+    # transfer backend with its own bootstrap server, the main process has
+    # started that server (start_disagg_service_for_rust_server). Only the
+    # ascend config store, which start_disagg_service would otherwise
+    # create, is left to do here.
     if disaggregation_mode == DisaggregationMode.PREFILL and _hosts_rust_server():
         maybe_create_ascend_config_store(
             transfer_backend=TransferBackend(
