@@ -185,3 +185,43 @@ def engram_gather_peer(
             num_warps=4,
         )
     return out
+
+
+@triton.jit
+def _engram_rows_to_token_major_kernel(
+    src_ptr,
+    dst_ptr,
+    n,
+    WORLD: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per (token, source rank): move that rank's CHUNK values.
+    pid = tl.program_id(0).to(tl.int64)
+    token, rank = pid // WORLD, pid % WORLD
+    src = src_ptr + (rank * n + token) * CHUNK
+    dst = dst_ptr + (token * WORLD + rank) * CHUNK
+    for start in range(0, CHUNK, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < CHUNK
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+
+def engram_rows_to_token_major(recv: torch.Tensor, world: int) -> torch.Tensor:
+    """Reorder an all-to-all's output, ``recv`` ([world * n, chunk], contiguous,
+    one block of n rows per source rank), into [n, world * chunk]: each token's
+    chunks in source-rank order. Several times faster than transpose + reshape."""
+    assert recv.dim() == 2 and recv.is_contiguous(), (recv.shape, recv.stride())
+    assert recv.shape[0] % world == 0, (recv.shape, world)
+    n, chunk = recv.shape[0] // world, recv.shape[1]
+    out = recv.new_empty((n, world * chunk))
+    if n and chunk:
+        _engram_rows_to_token_major_kernel[(n * world,)](
+            recv,
+            out,
+            n,
+            WORLD=world,
+            CHUNK=chunk,
+            BLOCK=min(1024, triton.next_power_of_2(chunk)),
+        )
+    return out
