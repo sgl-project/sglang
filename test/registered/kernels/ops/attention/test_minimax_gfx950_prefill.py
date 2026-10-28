@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill import (
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops import minimax_sparse
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import msa_v1_page_row_bytes
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -313,6 +314,44 @@ def test_gluon_prefill_on_fp8_kv_matches_triton(
     # both widen the same fp8 values to bf16; outputs differ by bf16 rounding
     torch.testing.assert_close(out, ref, atol=4e-2 * kv_scale, rtol=2e-2)
     assert (out - ref).abs().mean() < 1e-3
+
+
+@pytest.mark.skipif(
+    gluon_prefill.pa_decode_gluon is None, reason="aiter Gluon paged attention"
+)
+def test_sparse_prefill_hands_fp8_kv_scales_to_gluon(monkeypatch):
+    """The model's sparse prefill must run the fp8 pool its Gluon gate admits at the
+    pool's k/v scales, not at unit scale."""
+    gluon_calls = []
+    gluon = gluon_prefill.gluon_sparse_prefill
+    monkeypatch.setattr(
+        gluon_prefill,
+        "gluon_sparse_prefill",
+        lambda **kwargs: gluon_calls.append(kwargs) or gluon(**kwargs),
+    )
+    monkeypatch.setattr(minimax_sparse, "_use_aiter_gfx95", True)
+    prefix, q_len, kv_scale = 20000, 300, 0.5
+    seq, b = _extend(prefix, q_len)
+    topk = _topk(q_len, seq, b)
+    q = torch.randn(q_len, NUM_Q_HEADS, 128, device=DEVICE, dtype=torch.bfloat16)
+    k = (torch.randn(seq + 256, 1, 128, device=DEVICE) * 2).to(FP8)
+    v = (torch.randn(seq + 256, 1, 128, device=DEVICE) * 2).to(FP8)
+    idx_q = torch.randn(q_len, 1, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    _, out = minimax_sparse.minimax_sparse_prefill(
+        q, k, v, None, idx_q, None, None, None, b["r2t"], b["slot_ids"], b["cu"],
+        b["seq_lens"], b["prefix"], q_len, seq, 1, BLOCK, TOPK, 0, 1,
+        disable_index_value=True, cu_seqblocks_q=b["cu_b"], max_seqblock_q=b["max_b"],
+        all_seqblock_q=b["all_b"], k_scale=kv_scale, v_scale=kv_scale,
+        cached_topk_idx=topk, page_size=BLOCK, seq_lens_cpu=torch.tensor([seq]),
+    )  # fmt: skip
+    ref = flash_prefill_with_gqa_share_sparse(
+        q, k, v, None, b["r2t"], b["slot_ids"], topk, 1, BLOCK, b["cu"], b["seq_lens"],
+        b["prefix"], q_len, cu_seqblocks_q=b["cu_b"], max_seqblock_q=b["max_b"],
+        k_scale=kv_scale, v_scale=kv_scale,
+    ).float()  # fmt: skip
+    assert len(gluon_calls) == 1
+    torch.testing.assert_close(out.float(), ref, atol=4e-2 * kv_scale, rtol=2e-2)
 
 
 @pytest.mark.skipif(
