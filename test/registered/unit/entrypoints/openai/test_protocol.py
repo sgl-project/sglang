@@ -560,6 +560,64 @@ class TestChatCompletionRequest(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "stop_token_ids"):
                     sampling_params.verify(vocab_size=32)
 
+    def _chat_request(self, **params):
+        return ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            **params,
+        )
+
+    def _assert_rejected_field(self, field, **params):
+        with self.assertRaises(ValidationError) as ctx:
+            self._chat_request(**params)
+        self.assertEqual([error["loc"] for error in ctx.exception.errors()], [(field,)])
+
+    def test_out_of_range_sampling_params_are_rejected(self):
+        """Out-of-range sampling values previously passed validation and reached serving."""
+        for field, value in (
+            ("n", -1),
+            ("n", 0),
+            ("n", MAX_N + 1),
+            ("top_logprobs", -1),
+            ("temperature", -0.1),
+            ("temperature", float("inf")),
+        ):
+            with self.subTest(field=field, value=value):
+                self._assert_rejected_field(field, **{field: value}, logprobs=True)
+
+    def test_negative_output_limits_are_rejected(self):
+        """A preferred completion limit previously hid a negative legacy limit."""
+        for params, field in (
+            ({"max_tokens": -1}, "max_tokens"),
+            ({"max_completion_tokens": -1}, "max_completion_tokens"),
+            ({"max_tokens": -1, "max_completion_tokens": 1}, "max_tokens"),
+        ):
+            with self.subTest(params=params):
+                self._assert_rejected_field(field, **params)
+
+    def test_sampling_param_boundaries_are_accepted(self):
+        for params in (
+            {"n": 1, "logprobs": True, "top_logprobs": 0},
+            {"n": MAX_N, "logprobs": True, "top_logprobs": 20},
+            {"temperature": None},
+            {"temperature": 0.0},
+        ):
+            with self.subTest(params=params):
+                request = self._chat_request(**params)
+                for field, value in params.items():
+                    self.assertEqual(getattr(request, field), value)
+
+    def test_openai_limits_are_deliberately_not_enforced(self):
+        """The engine applies these values as expected, so they must not be rejected."""
+        for params in (
+            {"temperature": 3.0},
+            {"logprobs": True, "top_logprobs": 50},
+            {"top_logprobs": 3},
+            {"logit_bias": {"1": -1000, "2": 1e4}},
+        ):
+            with self.subTest(params=params):
+                self._chat_request(**params)
+
 
 class TestAudioContentParts(CustomTestCase):
     """Test audio content parts and the input_audio conversion"""
