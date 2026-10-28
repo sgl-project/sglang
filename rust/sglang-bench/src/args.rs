@@ -255,6 +255,13 @@ pub struct Args {
     /// Free-form label recorded in the result line.
     #[arg(long)]
     pub tag: Option<String>,
+
+    /// Report the prefix-cache hits the server attributes to each request
+    /// (`meta_info.cached_tokens` on `/generate`, `sglext.cached_tokens_details`
+    /// on the OpenAI routes): the "Cache Hit Details" block, the `cache_report`
+    /// result key, and per-request columns under `--output-details`.
+    #[arg(long)]
+    pub cache_report: bool,
 }
 
 /// The defaults are clap's, read back from an empty command line, so the two

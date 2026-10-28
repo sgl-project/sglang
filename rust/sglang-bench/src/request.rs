@@ -53,6 +53,11 @@ pub struct RequestOutput {
     pub dataset_prompt_len: usize,
     pub dataset_text_prompt_len: usize,
     pub dataset_vision_prompt_len: usize,
+    /// Prompt tokens the server served from its prefix cache, when it reports
+    /// them; `None` where it reports nothing, which is not a miss.
+    pub cached_tokens: Option<usize>,
+    /// The same hits by tier (`device`, `host`, `storage`), when reported.
+    pub cached_tokens_details: Option<Value>,
 }
 
 /// Everything about a request body that does not vary per prompt.
@@ -379,6 +384,7 @@ impl StreamState {
     fn feed_value(&mut self, data: &Value, start: Instant, output: &mut RequestOutput) {
         self.latency = Some(start.elapsed().as_secs_f64());
         record_server_prompt_len(data, output);
+        record_cache_hits(data, output);
         match self.api {
             Api::SglangGenerate => self.feed_generate(data, start, output),
             Api::OpenaiCompletions => self.feed_completions(data, start, output),
@@ -523,6 +529,7 @@ impl StreamState {
 /// arriving as `delta` frames. TTFT is the whole latency, as in Python.
 fn finish_non_streaming_chat(data: &Value, latency: f64, output: &mut RequestOutput) {
     record_server_prompt_len(data, output);
+    record_cache_hits(data, output);
     let message = data
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -576,6 +583,32 @@ fn record_server_prompt_len(data: &Value, output: &mut RequestOutput) {
     if tokens > 0 {
         output.prompt_len = tokens as usize;
     }
+}
+
+/// Prefix-cache hits as the Python `--cache-report` reads them: the native
+/// route reports `meta_info.cached_tokens` (and `cached_tokens_details` by
+/// tier), the OpenAI routes only the tiers under `sglext`, summed here. They
+/// arrive on every frame; the last value wins.
+fn record_cache_hits(data: &Value, output: &mut RequestOutput) {
+    if let Some(meta) = data.get("meta_info") {
+        if let Some(tokens) = meta.get("cached_tokens").and_then(Value::as_u64) {
+            output.cached_tokens = Some(tokens as usize);
+        }
+        if let Some(details) = meta.get("cached_tokens_details").filter(|d| d.is_object()) {
+            output.cached_tokens_details = Some(details.clone());
+        }
+        return;
+    }
+    let Some(details) = data
+        .get("sglext")
+        .and_then(|ext| ext.get("cached_tokens_details"))
+        .filter(|d| d.is_object())
+    else {
+        return;
+    };
+    let tier = |name: &str| details.get(name).and_then(Value::as_u64).unwrap_or(0) as usize;
+    output.cached_tokens = Some(tier("device") + tier("host") + tier("storage"));
+    output.cached_tokens_details = Some(details.clone());
 }
 
 fn trim(line: &[u8]) -> &[u8] {
@@ -780,6 +813,43 @@ mod tests {
     /// An empty body and a 200 that generated nothing are both failures: the
     /// first has no latency to report, the second no TTFT, and counting either
     /// as a success would pull every percentile toward zero.
+    /// The native route reports hits in `meta_info`, the OpenAI routes under
+    /// `sglext`; a server that reports neither leaves `None`, not a zero that
+    /// would read as a miss.
+    #[test]
+    fn cache_hits_are_read_from_meta_info_and_sglext() {
+        let native = feed_all(
+            Api::SglangGenerate,
+            &[
+                r#"data: {"text":"a","meta_info":{"completion_tokens":1,"cached_tokens":64}}"#,
+                r#"data: {"text":"ab","meta_info":{"completion_tokens":2,"cached_tokens":64,"cached_tokens_details":{"device":64,"host":0,"storage":0}}}"#,
+            ],
+        );
+        assert_eq!(native.cached_tokens, Some(64));
+        assert_eq!(
+            native
+                .cached_tokens_details
+                .as_ref()
+                .and_then(|d| d["device"].as_u64()),
+            Some(64)
+        );
+
+        let oai = feed_all(
+            Api::OpenaiCompletions,
+            &[
+                r#"data: {"choices":[{"text":"He"}],"usage":{"prompt_tokens":4},"sglext":{"cached_tokens_details":{"device":128,"host":64,"storage":0}}}"#,
+            ],
+        );
+        assert_eq!(oai.cached_tokens, Some(192));
+
+        let silent = feed_all(
+            Api::SglangGenerate,
+            &[r#"data: {"text":"a","meta_info":{"completion_tokens":1}}"#],
+        );
+        assert_eq!(silent.cached_tokens, None);
+        assert_eq!(silent.cached_tokens_details, None);
+    }
+
     #[test]
     fn a_response_without_tokens_is_a_failure() {
         let empty = feed_all(Api::SglangGenerate, &[]);
