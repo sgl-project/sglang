@@ -388,6 +388,10 @@ class TestGLM52PDShardedHiCacheAccuracyMixedMoE(TestGLM52PDShardedHiCacheAccurac
     gsm8k_num_questions = 32
     gsm8k_num_threads = 32
     extra_decode_args = TestGLM52PDShardedHiCacheAccuracy.extra_decode_args + [
+        # DP2/EP2 target + TP-only draft weights exceed the 0.85 budget on
+        # GB300 (measured minimum 0.870). Keep the inherited KV-token cap.
+        "--mem-fraction-static",
+        "0.90",
         "--attn-dp-size",
         "2",
         "--enable-dp-lm-head",
