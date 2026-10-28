@@ -113,8 +113,7 @@ class TokenSpaceSGLangProcessor:
             ),
             mm_io_worker_num=mm.mm_io_worker_num
             or int(os.environ.get("SGLANG_IO_WORKERS", 0))
-            or serving_spec.auto_mm_io_worker_num
-            or 0,
+            or serving_spec.auto_mm_io_worker_num,
             allowed_media_domains=mm.allowed_media_domains,
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
