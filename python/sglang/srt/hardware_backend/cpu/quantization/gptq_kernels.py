@@ -23,10 +23,12 @@ class GPTQIntelAMXLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.quant_config.is_sym:
-            layer.qzeros.data.fill_(0x77777777)
         _amx_process_weight_after_loading(
-            layer, ["qweight", "qzeros", "scales"], None, "gptq"
+            layer,
+            ["qweight", "qzeros", "scales"],
+            None,
+            "gptq",
+            gptq_is_symmetric=self.quant_config.is_sym,
         )
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
@@ -58,14 +60,19 @@ class GPTQIntelAMXMoEKernel:
         self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.quant_config.is_sym:
-            layer.w13_qzeros.data.fill_(0x77777777)
-            layer.w2_qzeros.data.fill_(0x77777777)
         _amx_process_weight_after_loading(
-            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
+            layer,
+            ["w13_qweight", "w13_qzeros", "w13_scales"],
+            None,
+            "gptq",
+            gptq_is_symmetric=self.quant_config.is_sym,
         )
         _amx_process_weight_after_loading(
-            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
+            layer,
+            ["w2_qweight", "w2_qzeros", "w2_scales"],
+            None,
+            "gptq",
+            gptq_is_symmetric=self.quant_config.is_sym,
         )
 
     def apply(
