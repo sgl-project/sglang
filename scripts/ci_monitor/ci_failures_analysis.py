@@ -369,15 +369,73 @@ class SGLangFailuresAnalyzer:
         # Pattern matches: "Test Summary: 7/8 passed"
         summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
         if not summary_match:
-            # No summary found - try to find last running test
-            last_test = self.find_last_running_test(logs)
-            if last_test:
-                return {
+            pytest_lines = []
+            pytest_failures = {}
+            completed_pytest_failures = {}
+            has_pytest_summary = False
+            in_pytest_tail = False
+            for line in logs.splitlines():
+                # Accept both the logs API and `gh run view --log` prefixes.
+                line = re.sub(r"^(?:.*\t)?\d{4}-\d{2}-\d{2}T\S+Z ?", "", line).strip()
+                # The runner reprints failures from every attempt here, including
+                # attempts that passed on retry. Only use the original output.
+                if re.fullmatch(r"=+\s*Pytest Tail Summary\s*=+", line):
+                    # Later standalone invocations must retain this result.
+                    completed_pytest_failures.update(pytest_failures)
+                    pytest_failures = {}
+                    in_pytest_tail = True
+                if in_pytest_tail:
+                    if re.fullmatch(r"=+", line):
+                        in_pytest_tail = False
+                    continue
+                if re.fullmatch(r"=+\s*test session starts\s*=+", line):
+                    pytest_lines = []
+                    pytest_failures = {}
+                    has_pytest_summary = False
+                pytest_lines.append(line)
+                if re.fullmatch(r"=+\s*short test summary info\s*=+", line):
+                    pytest_failures = {}
+                    has_pytest_summary = True
+                failure = re.match(r"(?:FAILED|ERROR)\s+(\S+?\.py)(?=::|\s|$)", line)
+                if failure:
+                    full_path = failure.group(1)
+                    pytest_failures[full_path] = {
+                        "test_file": full_path.rsplit("/", 1)[-1],
+                        "full_path": full_path,
+                    }
+                    has_pytest_summary = True
+                elif re.match(
+                    r"^(?:=+\s*)?(?:(?:\d+\s+(?:failed|passed|skipped|errors?|"
+                    r"deselected|xfailed|xpassed|warnings?|rerun|subtests passed)"
+                    r"(?:,\s*|\s+))+|no tests ran\s+)in\s+\d",
+                    line,
+                ):
+                    has_pytest_summary = True
+                    if not re.search(r"\b[1-9]\d*\s+(?:failed|errors?)\b", line):
+                        pytest_failures = {}
+
+            completed_pytest_failures.update(pytest_failures)
+            last_test = None
+            if not has_pytest_summary:
+                # Infer only from the current attempt, retaining known failures
+                # from earlier invocations if this one did not finish.
+                last_test = self.find_last_running_test("\n".join(pytest_lines))
+                if last_test:
+                    completed_pytest_failures.setdefault(
+                        last_test["full_path"], last_test
+                    )
+
+            if has_pytest_summary or completed_pytest_failures:
+                summary = {
+                    # Pytest counts test cases, not the files counted by the
+                    # custom summary. Leave file totals unknown.
                     "passed": 0,
                     "total": 0,
-                    "failed_tests": [last_test],
-                    "incomplete": True,  # Mark that this is incomplete/inferred
+                    "failed_tests": list(completed_pytest_failures.values()),
                 }
+                if last_test:
+                    summary["incomplete"] = True
+                return summary
             return None
 
         try:
