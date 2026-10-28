@@ -117,15 +117,15 @@ def prepare_decode_context_parallel_metadata(
         parallel.dcp_size,
     )
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-    translator = get_attn_backend().kv_index_translator
+    runner_ids = get_attn_backend().runner_ids
     if interleave_size == 1:
         # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-        dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
+        dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
             dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         )
     else:
-        # Interleaved pools are written rank-local, never through a translator.
-        assert translator is None or not translator.is_translating
+        # Interleaved pools are written rank-local, never through translated ids.
+        assert runner_ids is None or not runner_ids.is_translating
         owned_kv_indices = filter_dcp_local_chunk_kv_indices(
             dcp_prefix_kv_indices,
             torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),
@@ -168,7 +168,7 @@ def plan_dcp_decode_metadata(
     `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
     rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
     `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
-    prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
+    prefix the caller hands to `RunnerIds.translate_dcp_read_ids`.
     """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()

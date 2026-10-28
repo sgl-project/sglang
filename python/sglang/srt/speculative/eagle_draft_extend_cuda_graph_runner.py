@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -138,7 +139,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
-        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -295,6 +295,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
+        # the batch sizes whose graphs run the draft megakernel's draft_extend,
+        # captured once per label of the graph variants it offers this runner
+        self.megakernel = self.eagle_worker.megakernel
+        self.megakernel_served = (
+            frozenset()
+            if self.megakernel is None
+            else self.megakernel.bind_extend_graphs(self)
+        )
+        self.attention_graph_variants = megakernel_graph_variants(
+            model_runner.model, "draft_extend", batch_sizes=self.megakernel_served
+        )
+        self.attention_variant_sizes = self.megakernel_served
 
         self.backend = resolve_decode_backend(self)
 
@@ -313,8 +325,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return ShapeKey(size=bs)
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
+        return ShapeKey(size=bs, attention_variant=attention_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -335,7 +349,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs,
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -448,12 +470,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens
             ]
+        served = bs in self.megakernel_served
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -467,6 +490,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            if served:
+                return self.megakernel.run_draft_extend(
+                    runner=self, forward_batch=forward_batch
+                )
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
@@ -495,7 +522,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs)
+                shape_key = self._make_graph_key(
+                    bs, attention_variant=attention_variant
+                )
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -652,8 +681,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            kv_loc_plan=forward_batch.kv_loc_plan,
-            kv_loc_cols=forward_batch.kv_loc_cols,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
@@ -672,7 +701,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.raw_bs = raw_bs
         self.bs = bs
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs, attention_variant=self._resolve_attention_variant(forward_batch, bs)
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
@@ -682,7 +713,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            # None when the megakernel's draft_extend kept the logits
+            next_token_logits=(
+                None
+                if out.next_token_logits is None
+                else out.next_token_logits[:raw_bs]
+            ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=out.hidden_states[:raw_bs].clone(),

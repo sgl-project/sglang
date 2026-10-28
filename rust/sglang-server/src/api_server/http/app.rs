@@ -10,8 +10,9 @@ use axum::Router;
 use super::generate_hook::GenerateHook;
 use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
-use crate::api_server::core::{CoreHandle, FLUSH_INTERVAL, HiCacheManager};
+use crate::api_server::core::FLUSH_INTERVAL;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
+use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerationPolicy;
@@ -30,6 +31,8 @@ pub(super) struct AppState {
     pub(super) generation_policy: GenerationPolicy,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
     pub(super) generate_hook: Option<Arc<dyn GenerateHook>>,
+    /// The processor's chat layer, tried before the Dynamo-typed chat handler.
+    pub(super) openai_chat: Option<openai::OpenAiChat>,
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
@@ -73,8 +76,16 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
     hicache_manager: Arc<HiCacheManager>,
+    tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    // Legacy conversation templates add stop strings `lower_chat` never sees;
+    // they stay on the typed handler.
+    let openai_chat = chat_formatter
+        .as_ref()
+        .filter(|formatter| !matches!(formatter, openai::ChatFormatter::Legacy(_)))
+        .zip(tokenizer)
+        .map(|(formatter, tokenizer)| openai::OpenAiChat::new(&server_args, formatter, tokenizer));
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
@@ -82,6 +93,7 @@ pub async fn serve(
         generation_policy,
         chat_formatter,
         generate_hook,
+        openai_chat,
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
