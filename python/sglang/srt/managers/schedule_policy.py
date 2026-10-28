@@ -137,8 +137,6 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
 # Bound the walk cost using scheduling passes, which agree across TP ranks.
 WAITING_PREFIX_REFRESH_INTERVAL = 32
-# PD prefill: bootstrap-queued requests the waiting-prefix refresh also touches.
-WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = 512
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -290,9 +288,10 @@ class SchedulePolicy:
     ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
+        bootstrap_max = envs.SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX.get()
         if (
             isinstance(policy, CacheAwarePolicy)
-            or not (waiting_queue or bootstrap_queue)
+            or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
             or get_memory().radix_eviction_policy.lower() != "lru"
@@ -307,7 +306,7 @@ class SchedulePolicy:
         if not refresh:
             return
         # Bootstrap-queued requests run after the waiting queue, so touch them first.
-        for r in reversed(bootstrap_queue[:WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX]):
+        for r in reversed(bootstrap_queue[:bootstrap_max]):
             touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
