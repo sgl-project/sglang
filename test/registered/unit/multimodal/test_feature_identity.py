@@ -1,17 +1,19 @@
 """Default VLM identity contract, independent of any model-specific opt-in."""
 
+import asyncio
 import itertools
 import pickle
 import unittest
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
     _insert,
     _key,
     _pump_insert,
     _tree_core,
 )
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import msgspec
 import numpy as np
@@ -36,10 +38,15 @@ from sglang.srt.multimodal.cache.identity import (
     build_artifact_key,
     media_preprocess_kwargs,
 )
+from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
 from sglang.srt.multimodal.processors.llava import (
     LlavaImageProcessor,
     LlavaMultimodalProcessor,
 )
+from sglang.srt.multimodal.processors.muse_spark_omni import (
+    MuseSpark1xOmniMultimodalProcessor,
+)
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,6 +62,99 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_qwen_artifacts_keep_typed_identity_without_feature_storage(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor._processor = SimpleNamespace(image_processor=Mock())
+        processor._tokenizer = None
+        processor.image_config = {}
+        processor.mm_preprocess_cache = SimpleNamespace(enabled=True)
+        processor.precompute_hash_before_cpu_transfer = False
+        processor.mm_feature_transport = "cpu"
+        processor.use_cuda_ipc = False
+        processor.vision_start_token_id, processor.vision_end_token_id = 1, 3
+        processor.mm_tokens = SimpleNamespace(
+            image_token_id=2, video_token_id=4, audio_token_id=5
+        )
+        key_a, key_b = "sha256:" + "aa" * 32, "sha256:" + "bb" * 32
+        entry = MediaArtifactInput(key_a, key_a, Modality.IMAGE, None)
+        feature = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        artifacts = []
+        for value, grid, key in (
+            (feature, [1, 2, 2], key_a),
+            (feature + 1, [1, 2, 2], key_a),
+            (feature.to(torch.float64), [1, 2, 2], key_a),
+            (feature.reshape(4, 1, 2), [1, 2, 2], key_a),
+            (feature, [1, 1, 4], key_a),
+            (feature, [1, 2, 2], key_b),
+        ):
+            processor._processor.image_processor.return_value = {
+                "pixel_values": value,
+                "image_grid_thw": torch.tensor([grid]),
+            }
+            artifacts.extend(
+                processor.prepare_artifact_batch([replace(entry, artifact_key=key)])
+            )
+        self.assertEqual(len({a.feature_hash for a in artifacts}), len(artifacts))
+        template = ([1, 2, 2, 2, 2, 3], [(1, 4)], torch.zeros(3, 6), torch.zeros(1))
+        with (
+            patch.object(
+                processor, "_build_image_prompt_template", return_value=template
+            ),
+            patch.object(
+                processor, "_mark_cuda_ipc_features_for_deferred_reconstruction"
+            ),
+            patch.object(
+                MultimodalDataItem, "_input_identity", side_effect=AssertionError
+            ),
+        ):
+            full = processor.compose_image_artifacts([1, 2, 3], artifacts[:1])
+            cached = processor.compose_image_artifacts(
+                [1, 2, 3], [replace(artifacts[0], feature=None)]
+            )
+        self.assertEqual(full.mm_items[0].cache_key, cached.mm_items[0].cache_key)
+        self.assertEqual(len(full.mm_items[0].cache_key), 32)
+        self.assertEqual(full.padded_input_ids, cached.padded_input_ids)
+
+    def test_muse_artifact_identity_is_adopted_before_transport(self):
+        processor = MuseSpark1xOmniMultimodalProcessor.__new__(
+            MuseSpark1xOmniMultimodalProcessor
+        )
+        processor.preprocess_config = SimpleNamespace(use_gpu_preprocess=False)
+        processor.mm_feature_transport = "cuda_ipc"
+        processor.use_cuda_ipc = True
+        processor.image_start_id, processor.image_end_id = 1, 3
+        processor.patch_id, processor.video_id, processor.audio_id = 2, 4, 5
+        processor.audio_start_id = processor.audio_end_id = None
+        processor._tokenizer = Mock()
+        processor._tokenizer.encode.return_value = [1, 2, 2, 3]
+        key = "sha256:" + "aa" * 32
+        entry = MediaArtifactInput(key, key, Modality.IMAGE, None)
+        feature = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        artifacts = []
+        for value in (feature, feature + 1, feature.to(torch.float64)):
+            with patch(
+                "sglang.srt.multimodal.processors.muse_spark_omni.preprocess_image",
+                return_value=(value, 2),
+            ):
+                artifacts.extend(processor.prepare_artifact_batch([entry]))
+        self.assertEqual(len({a.feature_hash for a in artifacts}), len(artifacts))
+        processor.preprocess_config.use_gpu_preprocess = True
+        processor.prepare_media_artifacts = AsyncMock(return_value=artifacts[:1])
+        with (
+            patch.object(
+                processor, "_wrap_tensor_for_cuda_ipc", side_effect=lambda t: t
+            ),
+            patch.object(
+                MultimodalDataItem, "_input_identity", side_effect=AssertionError
+            ),
+        ):
+            output = asyncio.run(
+                processor._process_cached_images([b"image"], "<image>", None)
+            )
+        self.assertEqual(
+            output.mm_items[0].cache_key, artifacts[0].feature_hash.to_bytes(32, "big")
+        )
+
     def test_transport_preserves_padding_until_frontend_finalization(self):
         processor = LlavaImageProcessor.__new__(LlavaImageProcessor)
         processor.processor_fingerprint = "sha256:" + "12" * 32
