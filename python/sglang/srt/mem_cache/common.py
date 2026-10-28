@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -457,10 +458,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
-            tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.kv.mamba_pool_idx.unsqueeze(-1)
-            )
-            req.kv.mamba_pool_idx = None
+            kv_storage_of(
+                tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            ).release_state_slot(req)
         return
     if tree_cache.claim_kv_row(req):
         # A streaming session detached the kv record to keep the row.
@@ -487,9 +487,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     )
     tree_cache.on_release(req, checkpointed=checkpoint)
 
-    # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
-    # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
-    tree_cache.req_to_token_pool.free(req)
+    kv_storage_of(
+        tree_cache.req_to_token_pool,
+        tree_cache.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+    ).release_row(req)
     req.kv.mark_kv_released()
 
 

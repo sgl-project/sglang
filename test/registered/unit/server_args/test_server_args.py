@@ -50,7 +50,10 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_int8_mamba_checkpoint,
+    handle_mamba_backend,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
@@ -1110,6 +1113,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
+    def test_rejects_unified_memory(self):
+        """The unified pool has no int8 checkpoint pool; the flag used to be
+        accepted and then silently ignored."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            enable_unified_memory=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_int8_mamba_checkpoint(server_args)
+
+    def test_unified_memory_alone_is_accepted(self):
+        """An inverted condition here would reject every unified launch."""
+        handle_int8_mamba_checkpoint(
+            ServerArgs(model_path="dummy", enable_unified_memory=True)
+        )
 
 
 class TestKV4Compatibility(unittest.TestCase):

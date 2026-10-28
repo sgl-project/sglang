@@ -714,7 +714,7 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
-        mr.kv_index_translator.bind_runner_slots(forward_batch)
+        mr.runner_ids.bind_runner_slots(forward_batch)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
