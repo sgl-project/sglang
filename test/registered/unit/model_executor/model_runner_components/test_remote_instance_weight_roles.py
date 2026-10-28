@@ -79,6 +79,57 @@ def _publish(role, session_id, port, nixl_agent=None):
         transporter.maybe_register_and_publish_weight_info(role=role)
 
 
+class TestTransports(CustomTestCase):
+    def _init_transports(self, *, loads_over_mooncake, seeds_via_nixl):
+        built = []
+        with (
+            patch.object(
+                transporter_mod,
+                "get_parallel",
+                lambda: SimpleNamespace(tp_rank=0, dist_init_addr=None),
+            ),
+            patch.object(
+                transporter_mod,
+                "get_model",
+                lambda: SimpleNamespace(
+                    remote_instance_weight_loader_start_seed_via_nixl=seeds_via_nixl
+                ),
+            ),
+            patch.object(
+                transporter_mod,
+                "remote_instance_transfer_engine_enabled",
+                lambda load_format=None: loads_over_mooncake,
+            ),
+            patch.object(
+                RemoteInstanceWeightTransporter,
+                "_init_mooncake_engine",
+                lambda self: built.append("mooncake"),
+            ),
+            patch.object(
+                RemoteInstanceWeightTransporter,
+                "_init_nixl_agent",
+                lambda self: built.append("nixl"),
+            ),
+        ):
+            RemoteInstanceWeightTransporter(
+                server_args=SimpleNamespace(), get_model=torch.nn.Module, gpu_id=0
+            ).init_transports()
+        return built
+
+    def test_a_runner_loading_over_mooncake_and_seeding_via_nixl_gets_both(self):
+        """With only the NIXL agent, the remote loader got no transfer engine and aborted."""
+        self.assertEqual(
+            self._init_transports(loads_over_mooncake=True, seeds_via_nixl=True),
+            ["mooncake", "nixl"],
+        )
+
+    def test_a_nixl_seed_alone_starts_no_mooncake_engine(self):
+        self.assertEqual(
+            self._init_transports(loads_over_mooncake=False, seeds_via_nixl=True),
+            ["nixl"],
+        )
+
+
 class TestPublicationRoles(CustomTestCase):
     def test_a_draft_publishing_for_the_same_rank_keeps_its_target(self):
         """Keyed by rank alone, the draft replaced the target, and p2p wrote target weights by the draft's table."""
@@ -120,8 +171,6 @@ class TestPublicationRoles(CustomTestCase):
         events = []
 
         class _FakeNixlAgent:
-            name = "agent-tp0"
-
             def get_agent_metadata(self):
                 events.append("metadata")
                 return b"keys"
@@ -143,7 +192,6 @@ class TestPublicationRoles(CustomTestCase):
             info,
             {
                 "transport": "nixl",
-                "agent_name": "agent-tp0",
                 "agent_metadata": "a2V5cw==",
                 "gpu_id": 3,
                 "weights_info_dict": {"target.weight": [1, 4, 2]},

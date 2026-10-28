@@ -44,11 +44,12 @@ class RemoteInstanceWeightTransporter:
     def model(self) -> torch.nn.Module:
         return self.get_model()
 
-    def init_engine(self):
+    def init_transports(self, load_format: Optional[str] = None) -> None:
+        """Loading from a seed and publishing for peers each pick their own transport, so a runner may need both."""
+        if remote_instance_transfer_engine_enabled(load_format=load_format):
+            self._init_mooncake_engine()
         if get_model().remote_instance_weight_loader_start_seed_via_nixl:
             self._init_nixl_agent()
-        else:
-            self._init_mooncake_engine()
 
     def _init_nixl_agent(self) -> None:
         from nixl._api import nixl_agent, nixl_agent_config
@@ -95,7 +96,10 @@ class RemoteInstanceWeightTransporter:
         """Registers this runner's weights with its transfer engine and publishes them, with its parallelism
         config, under `role`: ``target``, or the draft role `weight_update_runners()` names."""
         if (
-            remote_instance_transfer_engine_enabled()
+            (
+                remote_instance_transfer_engine_enabled()
+                or get_model().remote_instance_weight_loader_start_seed_via_nixl
+            )
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
@@ -125,7 +129,6 @@ class RemoteInstanceWeightTransporter:
             )
             return {
                 "transport": "nixl",
-                "agent_name": self.nixl_agent.name,
                 # taken after registration: it carries the registered memory's remote keys
                 "agent_metadata": base64.b64encode(
                     self.nixl_agent.get_agent_metadata()

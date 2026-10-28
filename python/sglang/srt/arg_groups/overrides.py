@@ -255,10 +255,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
     ``--speculative-draft-load-format`` needs its own transfer engine. Every
     input is a ``model`` leaf, so this serves both the pre-publish member and
     the post-publish accessor."""
-    if (
-        cfg.remote_instance_weight_loader_start_seed_via_transfer_engine
-        or cfg.remote_instance_weight_loader_start_seed_via_nixl
-    ):
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         return True
     if (load_format or cfg.load_format) != "remote_instance":
         return False

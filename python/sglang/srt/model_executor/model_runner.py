@@ -197,7 +197,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
-    remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -741,8 +740,9 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
-            self.remote_instance_weight_transporter.init_engine()
+        self.remote_instance_weight_transporter.init_transports(
+            load_format=self.draft_load_format
+        )
         self.remote_instance_weight_transporter.maybe_init_parallelism_config()
 
     def maybe_init_expert_location_metadata(self):

@@ -1075,9 +1075,6 @@ class _FakeResolvedArgs:
     remote_instance_weight_loader_start_seed_via_transfer_engine: A[
         bool, Arg(help="rs"), NS("model")
     ] = False
-    remote_instance_weight_loader_start_seed_via_nixl: A[
-        bool, Arg(help="rn"), NS("model")
-    ] = False
     modelexpress_config: A[str | None, Arg(help="mx"), NS("model")] = None
     disaggregation_mode: A[str, Arg(help="dm"), NS("disagg")] = "null"
     max_running_requests: A[int | None, Arg(help="mrr"), NS("schedule")] = None

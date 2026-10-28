@@ -515,6 +515,7 @@ class ServerArgs:
         """Whether this rank publishes its parallelism config to the bootstrap server."""
         return (
             self.remote_instance_weight_loader_use_transfer_engine()
+            or resolving_view(self).remote_instance_weight_loader_start_seed_via_nixl
             or self.enable_engine_info_bootstrap
         )
 
