@@ -564,8 +564,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
     )
     if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
-        _mc = model_config_of(server_args)
-        assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
+        from sglang.srt.mem_cache.kv.decl import declares_lifetime_beside_full
+
+        # A unified target: its plan has a sub-pool beside the full one.
+        assert declares_lifetime_beside_full(model_config_of(server_args)), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
             "fused inside the target's sub-pool entries."

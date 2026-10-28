@@ -81,6 +81,7 @@ from sglang.srt.mem_cache.kv_loc_plan import (
     IdSpaceKind,
     KVLocPlan,
     pad_with_sink,
+    state_id_space,
     window_read_extent,
 )
 from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
@@ -189,6 +190,8 @@ class KVIndexTranslator:
                     for name, space in self._spaces.items()
                 }
 
+        self._token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
         self._rows: Optional[torch.Tensor] = (
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
             if self.is_translating
@@ -207,6 +210,19 @@ class KVIndexTranslator:
         a transfer). Reads inside an iteration take the plan's tables."""
         spaces = self._spaces if self._call_spaces is None else self._call_spaces
         return spaces[kind].ids(virtual_ids)
+
+    @functools.cached_property
+    def _state_spaces(self) -> Dict[str, IdSpace]:
+        # State slots live in the request table every runner of the scheduler
+        # shares, handed out by the allocator they share, whatever pool this
+        # runner's token reads go through.
+        alloc = self._token_to_kv_pool_allocator
+        return {} if alloc is None else alloc.state_id_spaces()
+
+    def state_ids(self, sub_pool: str) -> IdSpace:
+        """How the state sub-pool ``sub_pool`` indexes the slot ids the
+        request table holds: identity, or one gather through its ``read_v2p``."""
+        return state_id_space(self._state_spaces, sub_pool)
 
     @property
     def window_kv_kind(self) -> IdSpaceKind:

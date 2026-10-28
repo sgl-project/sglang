@@ -73,7 +73,7 @@ def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) 
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
     available_size = (
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
+        cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
     )
     shortfall = max(0, required_size - available_size)
     if shortfall > 0:
@@ -1315,7 +1315,7 @@ def build_hybrid_mamba_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
-    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
     config = prepare_host_pool_config(
         decls=decls,
@@ -1463,7 +1463,7 @@ def build_hybrid_mamba_swa_stack(
         + 1
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
-    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
@@ -1634,13 +1634,14 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
+    inner = pool.layer_router.wrapped_view()
+    if inner is not None:
         # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = pool.full_kv_pool
+        pool = inner
     if pool.layer_num == 0:
         return [], []
 
@@ -1841,13 +1842,15 @@ def build_hicache_draft_sidecars(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
     builder = (
         build_swa_draft_pools
-        if isinstance(draft_kv_pool, BaseSWAKVPool)
+        if draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         else build_full_draft_pools
     )
     return builder(
@@ -1870,9 +1873,9 @@ class StackBuildResult:
     cache_controller: HybridCacheController
     component_host_pools: dict[ComponentType, Any]
     sidecars: list[SidecarPoolSpec] = field(default_factory=list)
-    # Mamba state lives in req_to_token_pool, not in kvcache, so its
-    # layer_transfer_counter has to be wired separately.
-    register_req_to_token_counter: bool = False
+    # The stack restores Mamba state layer by layer too, so state reads wait
+    # on the KV pool's load-back counter as KV reads do.
+    loads_state_layer_wise: bool = False
     pools_desc: str = ""
     pool_declarations: Optional[tuple[HostPoolDecl, ...]] = None
 
@@ -2033,9 +2036,7 @@ class _DeepSeekV4Strategy(StackStrategy):
 
 class _MambaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-        return isinstance(kvcache, HybridLinearKVPool) and components == {
+        return kvcache.layer_router.wrapped_view() is not None and components == {
             ComponentType.FULL,
             ComponentType.MAMBA,
         }
@@ -2070,7 +2071,7 @@ class _MambaStrategy(StackStrategy):
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             decls=kvcache.host_pool_decls(),
-            mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
             full_layer_mapping=full_layer_mapping,
             start_layer=kvcache.start_layer,
             load_cache_event=load_cache_event,
@@ -2100,7 +2101,7 @@ class _MambaStrategy(StackStrategy):
                 else []
             ),
             pool_declarations=tuple(c.decl for c in config.pools),
-            register_req_to_token_counter=True,
+            loads_state_layer_wise=True,
             pools_desc=" + ".join(
                 [c.decl.pool_name.value.upper() for c in config.pools]
                 + ["MAMBA"]
@@ -2125,14 +2126,11 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
-        return (
-            isinstance(kvcache, SWAKVPool)
-            and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
-            and components == {ComponentType.FULL, ComponentType.SWA}
-        )
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {ComponentType.FULL, ComponentType.SWA}
 
     def build(
         self,
@@ -2180,15 +2178,15 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
-        return (
-            isinstance(kvcache, SWAKVPool)
-            and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
-            and components
-            == {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
-        )
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
@@ -2218,7 +2216,7 @@ class _MambaSwaStrategy(StackStrategy):
             params=params,
             full_kv_pool=kvcache.full_kv_pool,
             swa_kv_pool=kvcache.swa_kv_pool,
-            mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
             full_layer_mapping=full_layer_mapping,
             swa_layer_mapping=swa_layer_mapping,
             start_layer=kvcache.start_layer,
@@ -2246,7 +2244,7 @@ class _MambaSwaStrategy(StackStrategy):
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
-            register_req_to_token_counter=True,
+            loads_state_layer_wise=True,
             pools_desc="KV + SWA + MAMBA",
             sidecars=_mtp_swa_sidecar_specs(host_pool_group),
         )
@@ -2310,20 +2308,16 @@ class _PlainKvStrategy(StackStrategy):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.memory_pool import (
             DSATokenToKVPool,
-            HybridLinearKVPool,
             MiniMaxSparseKVPool,
         )
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
+        # A pool wrapping sub-pool views has a strategy of its own.
+        router = kvcache.layer_router
+        if len(router.sub_pools()) > 1 or router.wrapped_view() is not None:
+            return False
         if isinstance(
             kvcache,
-            (
-                SWAKVPool,
-                HybridLinearKVPool,
-                DSATokenToKVPool,
-                MiniMaxSparseKVPool,
-                DeepSeekV4TokenToKVPool,
-            ),
+            (DSATokenToKVPool, MiniMaxSparseKVPool, DeepSeekV4TokenToKVPool),
         ):
             return False
         return components == {ComponentType.FULL}
@@ -2522,10 +2516,8 @@ def _apply_stack_result(
             draft_pool.register_layer_transfer_counter(
                 result.cache_controller.layer_done_counter
             )
-    if result.register_req_to_token_counter:
-        params.req_to_token_pool.register_layer_transfer_counter(
-            result.cache_controller.layer_done_counter
-        )
+    if result.loads_state_layer_wise:
+        kvcache.layer_router.load_parts_layer_wise()
 
     logger.info(
         "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_id_max=%s",

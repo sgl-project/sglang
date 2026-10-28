@@ -37,7 +37,7 @@ def _views(bundle, allocator, slots, states):
                 buf = kv.get_value_buffer(layer) if value else kv.get_key_buffer(layer)
                 result.append((member, buf, slots, layer * 2 + int(value)))
     if states is not None:
-        cache = bundle.req_to_token_pool.mamba_pool.mamba_cache
+        cache = allocator.state.pool.mamba_cache
         result.extend(
             (allocator.mamba_allocator, view[0], states, 4 + index)
             for index, view in enumerate([*cache.conv, cache.temporal])

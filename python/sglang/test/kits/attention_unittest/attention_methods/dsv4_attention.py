@@ -425,6 +425,7 @@ class MockDSV4ModelRunner:
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
         )
         self.kv_index_translator = KVIndexTranslator(
             req_to_token=self.req_to_token_pool.req_to_token,

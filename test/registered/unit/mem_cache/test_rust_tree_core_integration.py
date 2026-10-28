@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
@@ -2873,7 +2874,7 @@ def _swa_mamba_cache(
 
     _, allocator = _swa_cache(window=window, backend=backend)
     request_pool = Mock(spec=HybridReqToTokenPool)
-    request_pool.mamba_allocator = Mock()
+    allocator.state = Mock()
     with (
         get_context().override_server_args(
             _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -3822,7 +3823,7 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
     else:
         allocator = TokenToKVPoolAllocator(64, torch.bfloat16, "cpu", None, False)
         request_pool = Mock(spec=HybridReqToTokenPool)
-        request_pool.mamba_allocator = Mock()
+        allocator.state = Mock()
         with (
             get_context().override_server_args(
                 _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -5590,7 +5591,7 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
     )
     req.output_ids = array("q", [4, 5])
     req.finished_reason = "finished"
-    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    (req.kv.req_pool_idx,) = acquire(req_to_token_pool, req_to_token_pool.state, [req])
     req.lock = cache.lock(cache.root_node_handle())
     indices = allocator.alloc(5)
     assert indices is not None

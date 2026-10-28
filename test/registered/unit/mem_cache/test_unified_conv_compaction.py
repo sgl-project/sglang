@@ -60,7 +60,7 @@ class TestConvCompaction(CustomTestCase):
         bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
         pool = bundle.unified_memory_pool
         composite = bundle.token_to_kv_pool_allocator
-        state = bundle.req_to_token_pool.mamba_pool
+        state = composite.state.pool
         alloc = composite.mamba_allocator
         self.assertEqual(state.mamba_cache.temporal.numel(), 0)
         self.assertFalse(state._should_fuse_slot_ops())

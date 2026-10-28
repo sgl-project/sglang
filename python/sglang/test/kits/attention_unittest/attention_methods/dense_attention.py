@@ -406,6 +406,7 @@ class MockModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
             hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
         )
         self.init_kv_index_translator()
         self.attention_chunk_size = None

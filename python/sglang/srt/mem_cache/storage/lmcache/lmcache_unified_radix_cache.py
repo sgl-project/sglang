@@ -403,7 +403,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                             flow.load.device_indices[flow.released_skip_tokens :]
                         )
                     if flow.mamba_value is not None:
-                        self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+                        self.token_to_kv_pool_allocator.state_slots.free(
+                            flow.mamba_value
+                        )
                         flow.mamba_value = None
                     self._release_flow_anchor(flow)
             for pending in list(self._pending_stores):
@@ -444,13 +446,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def _allocate_external_mamba_slot(self) -> Optional[torch.Tensor]:
         if self._mamba_component is None:
             return None
-        allocator = self.req_to_token_pool.mamba_allocator
+        allocator = self.token_to_kv_pool_allocator.state_slots
         slot = allocator.alloc(1)
         if slot is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = allocator.alloc(1)
         if slot is not None:
-            physical = self.req_to_token_pool.translate_mamba_indices(slot)
+            physical = self.token_to_kv_pool_allocator.state_ids(
+                self.req_to_token_pool.state_sub_pool
+            ).ids(slot)
             self.lmcache_connector.reset_mamba_checkpoint_metadata(physical)
         return slot
 
@@ -565,9 +569,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if device_indices is not None:
                 self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(mamba_value)
+                self.token_to_kv_pool_allocator.state_slots.free(mamba_value)
             if allocated_request_mamba_for_load and request_mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(request_mamba_value)
+                self.token_to_kv_pool_allocator.state_slots.free(request_mamba_value)
             self._release_flow_anchor(flow)
             logger.debug(
                 "LMCache retrieve declined for %s: a parallel rank cannot allocate "
@@ -613,9 +617,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         except Exception:
             self.token_to_kv_pool_allocator.free(device_indices)
             if allocated_mamba_for_load and mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(mamba_value)
+                self.token_to_kv_pool_allocator.state_slots.free(mamba_value)
             if allocated_request_mamba_for_load and request_mamba_value is not None:
-                self.req_to_token_pool.mamba_allocator.free(request_mamba_value)
+                self.token_to_kv_pool_allocator.state_slots.free(request_mamba_value)
                 req.kv.mamba_pool_idx = None
             if req.kv.mamba_cow_src_index is mamba_value:
                 req.kv.mamba_cow_src_index = None
@@ -663,7 +667,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 flow.load.device_indices[flow.released_skip_tokens :]
             )
         if flow.free_mamba_after_load and flow.mamba_value is not None:
-            self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+            self.token_to_kv_pool_allocator.state_slots.free(flow.mamba_value)
             if (
                 flow.load_req is not None
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
@@ -679,7 +683,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             and int(flow.load_req.kv.mamba_pool_idx.item())
             == int(flow.request_mamba_value[0].item())
         ):
-            self.req_to_token_pool.mamba_allocator.free(flow.request_mamba_value)
+            self.token_to_kv_pool_allocator.state_slots.free(flow.request_mamba_value)
             flow.load_req.kv.mamba_pool_idx = None
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
@@ -712,7 +716,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 and flow.load_req.kv.mamba_cow_src_index is flow.mamba_value
             ):
                 flow.load_req.kv.mamba_cow_src_index = None
-            self.req_to_token_pool.mamba_allocator.free(flow.mamba_value)
+            self.token_to_kv_pool_allocator.state_slots.free(flow.mamba_value)
             flow.mamba_value = None
             flow.free_mamba_after_load = False
         flow.request_mamba_value = None
@@ -813,7 +817,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         # Free our checkpoint if a concurrent insertion already owns this boundary.
         if result.mamba_exist:
-            self.req_to_token_pool.mamba_allocator.free(checkpoint)
+            self.token_to_kv_pool_allocator.state_slots.free(checkpoint)
         flow.mamba_value = None
         flow.free_mamba_after_load = False
 

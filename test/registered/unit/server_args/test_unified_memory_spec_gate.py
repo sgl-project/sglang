@@ -27,7 +27,7 @@ from unittest.mock import patch
 
 import msgspec
 
-import sglang.srt.arg_groups.kv_cache_hook as kv_cache_hook
+import sglang.srt.configs.hybrid_arch as hybrid_arch
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
@@ -143,7 +143,8 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
         is MHA-shaped: an MLA-only draft backend is refused whether named or
         inherited."""
         mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
-        with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
+        # The gate reads the lifetimes the model declares, its state from here.
+        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
             for backend in _MLA_VERIFY:
                 self.assertTrue(
                     _accepts("EAGLE", backend=backend, draft_backend="triton", **mla),

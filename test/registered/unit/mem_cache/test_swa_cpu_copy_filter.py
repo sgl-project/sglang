@@ -79,6 +79,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 manager = object.__new__(DecodeKVCacheOffloadManager)
                 manager.token_to_kv_pool_allocator = allocator
                 manager.kv_cache = bundle.token_to_kv_pool
+                manager._unified_window = True
                 full, transfers = manager._resolve_offload_transfers(indices)
                 self.assertTrue(torch.equal(full, indices))
                 if tombstone_tokens == len(indices):

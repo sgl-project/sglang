@@ -18,6 +18,8 @@ Data copies go through a fake kvcache and the view math is pure torch, so the
 suite runs on CPU apart from the cases that skip themselves without CUDA.
 """
 
+from types import SimpleNamespace
+
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
@@ -3272,8 +3274,9 @@ class TestDcpWidening(unittest.TestCase):
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
+        allocator.state = SimpleNamespace(slots=mamba_slot_allocator)
         cache.token_to_kv_pool_allocator = allocator
-        cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_slot_allocator)
+        cache.req_to_token_pool = MagicMock()
 
         tree_core = MagicMock()
         full_evictable = sum(int(indices.numel()) for indices in full_leaves)

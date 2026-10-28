@@ -86,6 +86,14 @@ class IdSpace(msgspec.Struct, frozen=True):
         return virtual_ids if self.write is None else self.write(virtual_ids)
 
 
+def state_id_space(spaces: Dict[str, IdSpace], sub_pool: str) -> IdSpace:
+    """How a recurrent-state sub-pool names the slots the request table holds:
+    through its allocator's table when the allocator hands out virtual slot ids,
+    else as they are."""
+    space = spaces.get(sub_pool)
+    return IdSpace(key=(sub_pool, None)) if space is None else space
+
+
 def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> int:
     """How far past ``seq_lens`` a forward reads: the window it writes, when
     its ``seq_lens`` do not count that window yet. A verify reads at most

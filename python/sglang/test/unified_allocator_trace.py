@@ -118,7 +118,7 @@ class BuilderAdapter:
         self.bundle = build_unified_bundle(trace_geometry(config))
         self.allocator = self.bundle.token_to_kv_pool_allocator
         self.state_allocator = (
-            self.bundle.req_to_token_pool.mamba_allocator
+            self.bundle.token_to_kv_pool_allocator.state_slots
             if config.chain in STATE_CHAINS
             else None
         )

@@ -38,16 +38,12 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     prepare_page_unified_write_back_staging,
@@ -55,7 +51,6 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -91,11 +86,15 @@ def prepare_hicache_staging(
         return
 
     def prepare(pool, packed_drafts=(), *, sidecar=False):
-        if isinstance(pool, SWAKVPool):
-            prepare(pool.full_kv_pool)
-            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
-        elif isinstance(pool, HybridLinearKVPool):
-            prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
+        router = pool.layer_router
+        if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+            prepare(router.view(IdSpaceKind.FULL))
+            prepare(
+                router.view(IdSpaceKind.SLIDING_WINDOW),
+                tuple(p.swa_kv_pool for p in packed_drafts),
+            )
+        elif router.wrapped_view() is not None:
+            prepare(router.wrapped_view(), packed_drafts, sidecar=sidecar)
         elif isinstance(pool, (MHATokenToKVPool, MLATokenToKVPool)):
             is_mla = isinstance(pool, MLATokenToKVPool)
             if pool.layer_num == 0 or (
@@ -156,10 +155,11 @@ def prepare_hicache_staging(
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
             # SWA sidecars follow only the draft's SWA component.
-            prepare(
-                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
-                sidecar=True,
-            )
+            if pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                pool = pool.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            elif isinstance(pool, DeepSeekV4TokenToKVPool):
+                pool = pool.swa_kv_pool
+            prepare(pool, sidecar=True)
 
 
 def maybe_register_hicache_draft(
@@ -259,7 +259,11 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)
-                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+                or (
+                    kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+                    is not None
+                    and full_tokens_per_layer > 0
+                )
             )
         )
         schedule = get_schedule()

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
@@ -47,6 +48,7 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.kv.state_storage import StateStorage
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +299,7 @@ def _kv_shard_rotation_bases(
 
 def ensure_mamba_capacity(
     req_to_token_pool: ReqToTokenPool,
+    state: Optional[StateStorage],
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
 ) -> bool:
@@ -304,7 +307,7 @@ def ensure_mamba_capacity(
     if not isinstance(req_to_token_pool, HybridReqToTokenPool):
         return True
 
-    # Count the slots HybridReqToTokenPool.alloc will allocate for each request.
+    # Count the slots `acquire` will hand out for each request.
     needed = 0
     for req in reqs:
         if not req.kv.holds_mamba:
@@ -314,7 +317,7 @@ def ensure_mamba_capacity(
             needed += req_to_token_pool.mamba_initial_tracking_slots
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
-    allocator = req_to_token_pool.mamba_allocator
+    allocator = state.slots
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
     available = allocator.schedulable_available_size()
     if available < needed and supports_mamba:
@@ -326,6 +329,7 @@ def ensure_mamba_capacity(
 
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
+    state: Optional[StateStorage],
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
 ) -> list[int]:
@@ -338,8 +342,8 @@ def alloc_req_slots(
     num_reqs = len(reqs)
     # Keep combined serving's existing behavior: try cache eviction, then let
     # the pool allocate. A failed precheck need not mean allocation will fail.
-    ensure_mamba_capacity(req_to_token_pool, reqs, tree_cache)
-    req_pool_indices = req_to_token_pool.alloc(reqs)
+    ensure_mamba_capacity(req_to_token_pool, state, reqs, tree_cache)
+    req_pool_indices = acquire(req_to_token_pool, state, reqs)
     if req_pool_indices is None:
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
@@ -403,7 +407,10 @@ def alloc_for_extend(
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool,
+        batch.token_to_kv_pool_allocator.state,
+        batch.reqs,
+        batch.tree_cache,
     )
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory

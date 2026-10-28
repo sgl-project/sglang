@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
@@ -2218,7 +2219,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         tokens = list(range(1, seq_len + 1))
         req.origin_input_ids = tokens
         req.output_ids = []
@@ -2271,7 +2272,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
                 temperature=0, max_new_tokens=owned - prompt_len
             ),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
         req.extend_end = prompt_len

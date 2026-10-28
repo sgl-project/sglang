@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
@@ -21,7 +22,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedHybridReqToTokenPool,
     UnifiedKVPool,
     UnifiedMambaPool,
-    UnifiedMambaSlotAllocator,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
@@ -87,19 +87,19 @@ class TestInklingCheckpointIndices(CustomTestCase):
         req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
         req_pool = req_type.__new__(req_type)
         req_pool.size = 4
-        req_pool.mamba_pool = pool
-        req_pool.mamba_allocator = UnifiedMambaSlotAllocator(
-            allocator, max_size=pool.size, device="cuda"
-        )
         req_pool.req_index_to_mamba_index_mapping = slots[1:2].to(torch.int32).repeat(4)
         backend = InklingShortConvAttnBackend.__new__(InklingShortConvAttnBackend)
         backend.req_to_token_pool = req_pool
+        backend.state_pool = pool
         backend.device = "cuda"
         backend.conv_state_len = 3
         backend._cache_indices_buf = None
-        backend._slot_gather_recordable = (
-            req_pool.mamba_translate_is_fusable if fused else static
+        backend._state_ids = (
+            IdSpace(key=("mamba", None))
+            if static
+            else slot_id_space(allocator, owner=None)
         )
+        backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(
             decode=SimpleNamespace(bs=[1, 2, 4], max_bs=4),
             prefill=SimpleNamespace(bs=[8]),
@@ -400,7 +400,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 ids = slots[-1:].clone() if tracking else None
                 with (
                     patch.object(
-                        backend.req_to_token_pool,
+                        backend.state_pool,
                         "get_speculative_mamba2_params_all_layers",
                         return_value=object(),
                     ),
@@ -878,7 +878,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 backend.init_forward_metadata_in_graph(batch)
         pointer = backend._cache_indices_buf.data_ptr()
         track_pointer = backend._graph_track_indices.data_ptr()
-        table_pointer = pool.mamba_v2p_table.data_ptr()
+        table_pointer = backend._state_ids.read_v2p.data_ptr()
         before = backend._cache_indices.clone()
         # Free live physical holes and move both active and checkpoint states.
         for hole in (slots[:1], slots[5:6]):
@@ -904,9 +904,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             self.assertEqual(backend.sconv_metadata.track_cache_indices[-2].item(), -1)
             self.assertEqual(backend._cache_indices_buf.data_ptr(), pointer)
             self.assertEqual(backend._graph_track_indices.data_ptr(), track_pointer)
-            self.assertEqual(pool.mamba_v2p_table.data_ptr(), table_pointer)
+            self.assertEqual(backend._state_ids.read_v2p.data_ptr(), table_pointer)
             with (
-                patch.object(pool, "get_speculative_mamba2_params_all_layers"),
+                patch.object(
+                    backend.state_pool, "get_speculative_mamba2_params_all_layers"
+                ),
                 patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
             ):
                 backend.commit_conv_state_after_mtp_verify(

@@ -60,7 +60,7 @@ class TestTriJointReclaim(CustomTestCase):
             values = slots.to(torch.float16).view(-1, 1, 1) + layer * 100
             kv.get_key_buffer(layer)[ids] = values
             kv.get_value_buffer(layer)[ids] = values + 500
-        mc = b.req_to_token_pool.mamba_pool.mamba_cache
+        mc = b.token_to_kv_pool_allocator.state.pool.mamba_cache
         for j, view in enumerate([*mc.conv, mc.temporal]):
             if view.numel():
                 mids = a.mamba_allocator.translate_kv_loc(states)
@@ -86,7 +86,7 @@ class TestTriJointReclaim(CustomTestCase):
                 kv.get_value_buffer(layer)[ids],
                 (values + 500).expand_as(kv.get_value_buffer(layer)[ids]),
             )
-        mc = b.req_to_token_pool.mamba_pool.mamba_cache
+        mc = b.token_to_kv_pool_allocator.state.pool.mamba_cache
         self.assertTrue(torch.all(a.mamba_allocator.virtual_to_physical[states] > 0))
         for j, view in enumerate([*mc.conv, mc.temporal]):
             if view.numel():
@@ -117,7 +117,7 @@ class TestTriJointReclaim(CustomTestCase):
                 with self.subTest(lazy=lazy, occupancy=occupancy, states=count):
                     b, a, c = self.build(lazy=lazy, temporal=temporal)
                     slots = a.alloc(occupancy)
-                    states = b.req_to_token_pool.mamba_allocator.alloc(count)
+                    states = b.token_to_kv_pool_allocator.state_slots.alloc(count)
                     outside = a.alloc(outside_count)
                     self.assertIsNotNone(slots)
                     self.assertIsNotNone(states)
@@ -157,7 +157,7 @@ class TestTriJointReclaim(CustomTestCase):
                 with self.subTest(lazy=lazy, locked=locked):
                     b, a, c = self.build(lazy=lazy)
                     slots = a.alloc(96)
-                    states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                    states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                     self.stamp(b, a, slots, states)
                     records = self.insert_parts(c, slots, states)
                     receipts = []
@@ -191,7 +191,7 @@ class TestTriJointReclaim(CustomTestCase):
 
     def test_state_phase_preserves_locked_token_bindings(self):
         b, a, c = self.build(temporal=(1, 4, 8))
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         slots = a.alloc(96)
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
@@ -257,7 +257,7 @@ class TestTriJointReclaim(CustomTestCase):
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
                 b, a, c = self.build(page_size=4, state_cache=False)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
                 slots = a.alloc(occupancy * 4)
                 self.assertIsNotNone(slots)
@@ -300,7 +300,7 @@ class TestTriJointReclaim(CustomTestCase):
             with self.subTest(grouped=grouped):
                 b, a, c = self.build()
                 slots = a.alloc(96)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
                 pending = a.alloc(2)
@@ -340,7 +340,7 @@ class TestTriJointReclaim(CustomTestCase):
     def test_session_cursor_joint_reclaim(self):
         b, a, c = self.build(sessions=True)
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         records = self.insert_parts(c, slots, states)
         evict_from_tree_cache(c, 4)
@@ -403,7 +403,7 @@ class TestTriJointReclaim(CustomTestCase):
     def test_ready_and_no_progress_skip_repeated_preparation(self):
         b, a, c = self.build()
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         self.insert_parts(c, slots, states)
         with (
@@ -435,7 +435,7 @@ class TestTriJointReclaim(CustomTestCase):
 
         b, a, c = self.build()
         slots = a.alloc(96)
-        states = b.req_to_token_pool.mamba_allocator.alloc(8)
+        states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
         self.stamp(b, a, slots, states)
         records = self.insert_parts(c, slots, states)
         batch = object.__new__(ScheduleBatch)
@@ -599,7 +599,7 @@ class TestTriJointReclaim(CustomTestCase):
         ):
             with self.subTest(lazy=lazy, demand=demand):
                 b, a, c = self.build(lazy=lazy, state_cache=False)
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 keys = [RadixKey(array("q", [i])) for i in range(96)]
@@ -627,7 +627,7 @@ class TestTriJointReclaim(CustomTestCase):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
                 b, a, c = self.build(temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
                 records = []
@@ -698,7 +698,7 @@ class TestTriJointReclaim(CustomTestCase):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
                 b, a, c = self.build(lazy=lazy, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
@@ -782,7 +782,7 @@ class TestTriJointReclaim(CustomTestCase):
         ):
             with self.subTest(owner=owner, gate=gate_attr):
                 b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 self.insert_parts(c, slots, states)
@@ -899,7 +899,7 @@ class TestTriJointReclaim(CustomTestCase):
         for full, swa in ((4, 0), (4, 2), (2, 4), (0, 4)):
             with self.subTest(full=full, swa=swa):
                 b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
-                states = b.req_to_token_pool.mamba_allocator.alloc(8)
+                states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 self.insert_parts(c, slots, states)

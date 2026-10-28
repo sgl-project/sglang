@@ -38,6 +38,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_host_pool_group,
     build_hybrid_swa_group,
 )
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -119,11 +121,10 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         use_mla=False,
                         host_pool_decls=lambda: (),
                     )
-                    req_pool = SimpleNamespace(
-                        mamba_pool=object(),
-                    )
+                    state = SimpleNamespace(pool=object())
                     params = SimpleNamespace(
-                        req_to_token_pool=req_pool,
+                        req_to_token_pool=SimpleNamespace(),
+                        token_to_kv_pool_allocator=SimpleNamespace(state=state),
                         tp_cache_group=None,
                         pp_cache_group=None,
                     )
@@ -222,10 +223,7 @@ class TestMambaInfoRouting(CustomTestCase):
                             mtp_draft_device_pools=(),
                             mtp_draft_mamba_pools=drafts,
                             token_to_kv_pool_allocator=SimpleNamespace(
-                                swa_attn_allocator=allocator
-                            ),
-                            req_to_token_pool=SimpleNamespace(
-                                mamba_allocator=allocator
+                                swa_attn_allocator=allocator, state_slots=allocator
                             ),
                             tp_cache_group=None,
                             pp_cache_group=None,
@@ -352,6 +350,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         full = SimpleNamespace(layer_num=0)
         full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
         draft_kv_pool.full_kv_pool = full
+        draft_kv_pool.full_attention_layer_id_mapping = {}
 
         specs, entries = build_full_draft_pools(
             draft_kv_pool=draft_kv_pool,
@@ -362,7 +361,8 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool = SimpleNamespace(layer_num=1, size=800, start_layer=0)
+        draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_kv_pool.host_pool_decls = lambda: (make_kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
@@ -407,6 +407,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
+        draft_kv_pool.start_layer = 0
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64
@@ -949,16 +950,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             page_size=64,
             mtp_draft_device_pools=(),
             mtp_draft_mamba_pools=(),
-            token_to_kv_pool_allocator=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state_slots=SimpleNamespace(alloc=lambda n: None, free=lambda x: None)
+            ),
             tp_cache_group=None,
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
             pp_cache_group=None,
-            req_to_token_pool=SimpleNamespace(
-                mamba_allocator=SimpleNamespace(
-                    alloc=lambda n: None, free=lambda x: None
-                )
-            ),
         )
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 

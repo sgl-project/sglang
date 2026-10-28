@@ -95,7 +95,7 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
 
     def test_only_the_shared_hook_wraps_the_slot_allocator(self):
         self.assertEqual(
-            sorted(set(self._assignments_to("mamba_allocator"))),
+            sorted(set(self._assignments_to("slots"))),
             ["_wire_mamba_slot_allocator"],
             "a factory wraps the mamba end itself; it will miss "
             "host_transfer_translate exactly as the tri-pool factory did",

@@ -113,13 +113,14 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -185,6 +186,11 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    # No recurrent state (`ReqToTokenPool.mamba_pool`, `ReqToTokenPool.state`).
+    state = None
+    mamba_pool = None
+    mamba_allocator = None
+    mamba_ckpt_pool = None
 
     def __init__(
         self,
@@ -337,7 +343,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
-        self.layer_transfer_counter = None
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
@@ -358,7 +363,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.mamba_allocator.clear()
+        self.state.slots.clear()
 
 
 @dataclass
@@ -497,7 +502,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            (
+                self.token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+                is not None
+                or isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            )
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
@@ -676,12 +685,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
+        state = self.token_to_kv_pool_allocator.state
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            state_pool=None if state is None else state.pool,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -781,9 +791,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
-            kv_pool_for_heads = self.token_to_kv_pool
-            if hasattr(kv_pool_for_heads, "full_kv_pool"):
-                kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+            kv_pool_for_heads = self.token_to_kv_pool.layer_router.view(
+                IdSpaceKind.FULL
+            )
             per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
             if per_rank_kv_heads > 0:
                 kv_args.kv_head_num = per_rank_kv_heads
@@ -1047,7 +1057,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             if not ensure_mamba_capacity(
-                self.req_to_token_pool, [req], self.tree_cache
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator.state,
+                [req],
+                self.tree_cache,
             ):
                 break
 
@@ -1487,7 +1500,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Reserve enough Mamba capacity for radix COW and tracking buffers
             # before prefix matching can bind state or lock cached entries.
             if not ensure_mamba_capacity(
-                self.req_to_token_pool, [decode_req.req], self.tree_cache
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator.state,
+                [decode_req.req],
+                self.tree_cache,
             ):
                 break
 
@@ -1663,8 +1679,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             seq_len = origin_input_len
 
             def _mamba_payload():
+                state_ids = self.token_to_kv_pool_allocator.state_ids(
+                    self.req_to_token_pool.state_sub_pool
+                )
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
+                    state_ids.ids(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
                             decode_req.req.kv.req_pool_idx
                         ]
@@ -2257,7 +2276,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
+        req_pool_indices = acquire(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator.state, [req]
+        )
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."

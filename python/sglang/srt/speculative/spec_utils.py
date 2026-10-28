@@ -41,6 +41,7 @@ from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -1132,7 +1133,7 @@ def commit_mamba_states_after_verify(
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
-    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
@@ -1143,8 +1144,8 @@ def commit_mamba_states_after_verify(
     # track slot, so no SSM scatter or force-flush is needed here.
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and not mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -1152,7 +1153,7 @@ def commit_mamba_states_after_verify(
             commit_gdn_replayssm_fold_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
@@ -1179,8 +1180,8 @@ def commit_mamba_states_after_verify(
 
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_cache_base is not None
+        and not mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -1192,7 +1193,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
@@ -1264,8 +1265,8 @@ def commit_mamba_states_after_verify(
     # never allocated under fold, so they cannot serve as the signal).
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -1273,7 +1274,7 @@ def commit_mamba_states_after_verify(
             commit_kda_replayssm_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,

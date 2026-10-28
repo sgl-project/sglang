@@ -229,7 +229,8 @@ class TestDraftBindingDispatch(CustomTestCase):
         req_to_token_pool="shared",
     ):
         if req_to_token_pool == "shared":
-            req_to_token_pool = object()
+            # The target's table: slot ids only, no recurrent state.
+            req_to_token_pool = SimpleNamespace(state=None)
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -237,7 +238,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         cfg.spec_algorithm = algorithm
         cfg.page_size = _PS
         cfg.is_hybrid_swa = False
-        cfg.is_hybrid_swa_mtp_draft = False
+        cfg.draft_owns_its_depth = False
         cfg.model = object()
         cfg.model_config = SimpleNamespace(hf_config=None, is_hybrid_swa=False)
         sizes = kcc._PoolSizes(
@@ -256,7 +257,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         def _capture(self, *, sizes, **kw):
             raise _CapturedSizes(sizes)
 
-        built_req_pool = SimpleNamespace(kind="private-compact")
+        built_req_pool = SimpleNamespace(kind="private-compact", state=None)
 
         with (
             patch.object(

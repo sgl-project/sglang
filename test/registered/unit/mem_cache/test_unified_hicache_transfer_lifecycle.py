@@ -241,7 +241,7 @@ class TestFloatSwaReservation(_ConfigCase):
     ):
         bundle, allocator = build_tri_pool(page_size=PAGE)
         full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        states = bundle.req_to_token_pool.mamba_allocator
+        states = allocator.state_slots
         mamba = allocator.mamba_allocator
         resident = allocator.alloc(4 * PAGE)
         # The Mamba end is full: its next slot needs the float to move.

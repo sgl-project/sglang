@@ -136,10 +136,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
-        if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.load_queue: Queue[

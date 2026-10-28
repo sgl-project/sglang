@@ -91,6 +91,7 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
         ):
             with self.subTest(full=full_quantized, swa=swa_quantized):
                 target = object.__new__(SWAKVPool)
+                target.layers_mapping = {}
                 for name, quantized, scale_infos in (
                     ("full_kv_pool", full_quantized, full_scale_infos),
                     ("swa_kv_pool", swa_quantized, swa_scale_infos),
