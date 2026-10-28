@@ -264,7 +264,9 @@ def moe_sort_quant_large_supported(
 ) -> bool:
     m, topk = topk_ids.shape
     return (
+        # sorted ids keep the token in 24 bits; x and moe_buf offsets are int32
         0 < m < (1 << 24)
+        and m * x.shape[1] < (1 << 31)
         # measured against aiter on MiniMax-M3.1's routing (128 experts, top-4,
         # hidden 6144) only
         and num_experts == 128
