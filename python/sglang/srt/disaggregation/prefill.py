@@ -1392,7 +1392,7 @@ class DisaggPrefill:
                 return suffix_page_indices(
                     self.req_to_token_pool.req_to_token,
                     req.kv.req_pool_idx,
-                    req.disagg_decode_prefix_len,
+                    req.disagg.decode_prefix_len,
                     seq_len,
                     page_size,
                 )
