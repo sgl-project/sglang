@@ -110,11 +110,22 @@ class Lfm3VlImageProcessor(SGLangBaseProcessor):
             video_data=video_data,
             multimodal_tokens=self.mm_tokens,
         )
-        return await asyncio.get_running_loop().run_in_executor(
-            self.io_executor, self._process_media, base_output
+        processor_kwargs = await asyncio.get_running_loop().run_in_executor(
+            self.io_executor, self._decode_media, base_output
         )
 
-    def _process_media(self, base_output):
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+            base_output, self.mm_tokens, **processor_kwargs
+        )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.IMAGE_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
+        )
+
+    def _decode_media(self, base_output):
         processor_kwargs: dict = {}
         if base_output.videos:
             base_output.videos, video_metadata = self._decode_videos(
@@ -125,13 +136,4 @@ class Lfm3VlImageProcessor(SGLangBaseProcessor):
                 "do_sample_frames": False,
             }
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens, **processor_kwargs
-        )
-
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=mm_items,
-            im_token_id=self.IMAGE_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
-        )
+        return processor_kwargs

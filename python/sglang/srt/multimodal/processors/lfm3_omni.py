@@ -102,7 +102,7 @@ class Lfm3OmniMultimodalProcessor(Lfm3AudioMultimodalProcessor):
             )
         return items
 
-    def _process_media(self, base, use_audio_in_video):
+    def _decode_media(self, base, use_audio_in_video):
         video_handles = base.videos
         processor_kwargs = {}
         if base.videos:
@@ -152,16 +152,7 @@ class Lfm3OmniMultimodalProcessor(Lfm3AudioMultimodalProcessor):
                     pieces.append(self.mm_tokens.audio_token)
             base.audios = clips
             base.input_text = "".join(pieces)
-        items, input_ids, _ = self.process_and_combine_mm_data(
-            base, self.mm_tokens, **processor_kwargs
-        )
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=items,
-            audio_token_id=self.audio_token_id,
-            im_token_id=self.image_token_id,
-            video_token_id=self.video_token_id,
-        )
+        return processor_kwargs
 
     async def process_mm_data_async(
         self, audio_data, input_text, image_data=None, request_obj=None, **kwargs
@@ -189,9 +180,20 @@ class Lfm3OmniMultimodalProcessor(Lfm3AudioMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
             audio_sample_rate=self.feature_extractor.sampling_rate,
         )
-        return await asyncio.get_running_loop().run_in_executor(
+        processor_kwargs = await asyncio.get_running_loop().run_in_executor(
             self.io_executor,
-            self._process_media,
+            self._decode_media,
             base,
             use_audio_in_video,
+        )
+
+        items, input_ids, _ = await self.process_and_combine_mm_data_async(
+            base, self.mm_tokens, **processor_kwargs
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=items,
+            audio_token_id=self.audio_token_id,
+            im_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
         )
