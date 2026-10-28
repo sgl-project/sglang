@@ -20,7 +20,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_amd_ci(
-    est_time=3600,
+    est_time=1800,
     suite="nightly-amd-4-gpu-mi35x-minimax-m31-flash-mxfp4",
     nightly=True,
 )
@@ -64,9 +64,9 @@ class TestMiniMaxM31FlashMXFP4MI35x(GSM8KMixin, DefaultServerBase):
     gsm8k_max_tokens = 8192
     gsm8k_temperature = 1.0
     gsm8k_top_p = 0.95
+    # Measured 0.9575 and accept length 4.21 on 4x MI355X (rocm720).
     gsm8k_score_threshold = 0.93
-    # DSpark accept length is printed but not gated until it is measured on
-    # this checkpoint.
+    gsm8k_accept_length_thres = 3.8
 
 
 if __name__ == "__main__":
