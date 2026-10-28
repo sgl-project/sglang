@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-import itertools
 from abc import ABC
 from enum import Enum
-from typing import TYPE_CHECKING, FrozenSet, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, Optional
 
-import msgspec
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -22,6 +18,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -80,65 +77,6 @@ class SharedReadEnds(Enum):
         return max(items, key=lambda x: x.value)
 
 
-class SpecMode(Enum):
-    """A speculative forward a runner builds an attention backend for."""
-
-    DRAFT_DECODE = "multi-step draft decode"
-    DRAFT_EXTEND = "draft extend"
-    TARGET_VERIFY = "target verify"
-
-
-class SpecCombination(msgspec.Struct, frozen=True, kw_only=True):
-    """How a speculative forward reaches an attention backend: its mode,
-    whether the runner's model has sliding-window layers, whether the runner
-    captures CUDA graphs, and whether its KV storage is translated (the
-    unified pool, or a draft fused into it) rather than static."""
-
-    mode: SpecMode
-    window: bool
-    cuda_graph: bool
-    translated: bool
-
-    @classmethod
-    def of_runner(cls, model_runner: ModelRunner, mode: SpecMode) -> SpecCombination:
-        window = model_runner.sliding_window_size
-        return cls(
-            mode=mode,
-            window=window is not None and window > 0,
-            cuda_graph=(
-                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
-            ),
-            translated=model_runner.kv_index_translator.is_translating,
-        )
-
-    def describe(self) -> str:
-        return (
-            f"{self.mode.value} "
-            f"{'with' if self.window else 'without'} sliding-window layers, "
-            f"{'with' if self.cuda_graph else 'without'} CUDA graphs, on "
-            f"{'translated (unified)' if self.translated else 'static'} KV storage"
-        )
-
-
-def spec_combinations(
-    *modes: SpecMode,
-    window: Tuple[bool, ...] = (False, True),
-    cuda_graph: Tuple[bool, ...] = (False, True),
-    translated: Tuple[bool, ...] = (False, True),
-) -> FrozenSet[SpecCombination]:
-    """Every combination of ``modes`` with the given values of the other
-    dimensions."""
-    return frozenset(
-        SpecCombination(mode=mode, window=w, cuda_graph=g, translated=t)
-        for mode, w, g, t in itertools.product(modes, window, cuda_graph, translated)
-    )
-
-
-# What a backend implements unless it declares more: every speculative forward
-# on static storage, and none on translated storage.
-STATIC_SPEC_COMBINATIONS = spec_combinations(*SpecMode, translated=(False,))
-
-
 class AttentionBackend(ABC):
     """The base class of attention backends.
 
@@ -171,11 +109,6 @@ class AttentionBackend(ABC):
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.
     supports_dcp_target_verify: bool = False
-    # The speculative combinations this backend implements. A runner that
-    # builds it for a speculative forward refuses any other
-    # (`require_spec_mode`); a backend declares a translated combination only
-    # once its reads and writes of that combination are implemented.
-    implemented_spec_combinations: FrozenSet[SpecCombination] = STATIC_SPEC_COMBINATIONS
     # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
     # skips cached-row compression for replay rows folded into the extend.
     folds_encoder_swa_replay: bool = False
@@ -197,24 +130,18 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
-    # The runner's KVIndexTranslator; backends that read through it set the
+    # The runner's RunnerIds; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
-    kv_index_translator = None
+    runner_ids = None
 
-    def require_spec_mode(self, model_runner: ModelRunner, mode: SpecMode) -> None:
-        """Refuse to run ``mode`` for ``model_runner`` unless this backend
-        declares the combination that makes."""
-        combination = SpecCombination.of_runner(model_runner, mode)
-        if combination not in self.implemented_spec_combinations:
-            raise ValueError(
-                f"The {type(self).__name__} attention backend does not implement "
-                f"{combination.describe()}. Choose another attention backend for "
-                "this runner (--attention-backend, --prefill-attention-backend or "
-                "--decode-attention-backend, or --speculative-draft-attention-backend "
-                "for a draft)."
-            )
+    @property
+    def kv_layers(self) -> KVLayerRouter:
+        """Per-layer KV of ``token_to_kv_pool``, derived on every access: a
+        frozen-KV MTP draft swaps its backend's pool for the target's, and its
+        reads and writes must follow the swap."""
+        return self.token_to_kv_pool.layer_router
 
     def get_fused_kv_write_buffers(
         self, layer: RadixAttention, forward_batch: ForwardBatch

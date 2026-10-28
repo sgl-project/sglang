@@ -159,7 +159,7 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
             model_config=types.SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
-            kv_index_translator=MagicMock(),
+            runner_ids=MagicMock(),
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=types.SimpleNamespace(enabled=False),
             lora_manager=None,

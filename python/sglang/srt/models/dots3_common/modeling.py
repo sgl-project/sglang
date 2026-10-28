@@ -107,7 +107,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    get_token_to_kv_pool,
+    get_kv_layers,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
@@ -881,7 +881,7 @@ class Dots3AttentionMLA(nn.Module):
                     )
                 else:
                     out_cache_loc = forward_batch.out_cache_loc
-                swa_loc = backend.kv_index_translator.ids_in(
+                swa_loc = backend.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
         return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
@@ -982,7 +982,7 @@ class Dots3AttentionMLA(nn.Module):
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store(
             self.attn_mha,
             self._get_kv_write_loc(forward_batch),
             latent_cache,
@@ -1095,7 +1095,7 @@ class Dots3AttentionMLA(nn.Module):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1111,7 +1111,7 @@ class Dots3AttentionMLA(nn.Module):
                 or topk_indices is not None
                 or forward_batch.forward_mode.is_idle()
             ), "NSA attention requires topk_indices from indexer."
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1132,7 +1132,7 @@ class Dots3AttentionMLA(nn.Module):
             k_input = torch.cat([k_nope, k_pe], dim=-1)
             v_input = k_nope.contiguous()
 
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1168,9 +1168,7 @@ class Dots3AttentionMLA(nn.Module):
             forward_batch.set_prefix_chunk_idx(i)
 
             # Fetch latent cache from memory pool with precomputed chunked kv indices
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
 
             latent_cache = latent_cache_buf[
                 forward_batch.prefix_chunk_kv_indices[i]
@@ -1289,7 +1287,7 @@ class Dots3AttentionMLA(nn.Module):
         latent_cache[..., self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store(
             self.attn_mha,
             self._get_kv_write_loc(forward_batch),
             latent_cache,

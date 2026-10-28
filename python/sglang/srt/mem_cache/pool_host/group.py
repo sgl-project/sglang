@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
@@ -115,7 +115,7 @@ class HostPoolGroup:
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
-                    isinstance(pool, MHATokenToKVPool)
+                    isinstance(pool, MHAKVView)
                     and pool.kv_cache_layout == "nhd"
                     and pool.v_head_dim == pool.head_dim
                 )

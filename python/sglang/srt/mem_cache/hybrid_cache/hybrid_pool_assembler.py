@@ -1828,12 +1828,12 @@ def _build_mha_mla_host_pool(
     pool_label: str,
     host_token_capacity: int | None = None,
 ):
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if isinstance(pool, MHATokenToKVPool) and layout == "page_first_kv_split":
+    if isinstance(pool, MHAKVView) and layout == "page_first_kv_split":
         layout = "page_first_direct"
 
     kwargs = dict(
@@ -1845,7 +1845,7 @@ def _build_mha_mla_host_pool(
         pool_label=pool_label,
         host_token_capacity=host_token_capacity,
     )
-    if isinstance(pool, MHATokenToKVPool):
+    if isinstance(pool, MHAKVView):
         host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
         return host_cls(host_input, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
@@ -2039,12 +2039,12 @@ def validate_fused_hicache_draft(
         )
 
     if draft_device_pools is not None:
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 
         if not (
             len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], UnifiedDraftKVPool)
-            and draft_device_pools[0]._host_sub_pool_name == "full"
+            and isinstance(draft_device_pools[0], DraftMHAView)
+            and draft_device_pools[0]._sub_pool_name == "full"
         ):
             raise NotImplementedError(
                 "HiCache fused draft KV requires a full-attention DFLASH draft."

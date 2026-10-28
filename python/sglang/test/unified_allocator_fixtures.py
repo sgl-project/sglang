@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateGeometry,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import ArenaBand, KVArena
@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -776,7 +775,7 @@ def _pool_summary(pool, raw_base: int) -> dict:
         ),
         "host_capacity": (pool.host_capacity_tokens, pool.host_capacity_bytes),
     }
-    if isinstance(pool, UnifiedMHATokenToKVPool):
+    if isinstance(pool, MHAView):
         out["page_envelope"] = tuple(pool.get_page_envelope_buffer().shape)
     return out
 

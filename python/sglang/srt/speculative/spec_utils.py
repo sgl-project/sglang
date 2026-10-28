@@ -359,7 +359,7 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
 
 
 def fill_draft_window_rail(
-    translator,
+    runner_ids,
     forward_batch,
     window_kv_indices: torch.Tensor,
     window_kv_indptr: torch.Tensor,
@@ -372,7 +372,7 @@ def fill_draft_window_rail(
     """Emit every draft step's window-clipped read ids into the per-step rows
     of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
     i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
-    tokens, from the storage window layers use (``translator.window_kv_kind``).
+    tokens, from the storage window layers use (``runner_ids.window_kv_kind``).
     ``window`` is the number of tokens the backend's window layers attend."""
     num_seqs = forward_batch.batch_size
     width = num_seqs * topk * window
@@ -380,11 +380,11 @@ def fill_draft_window_rail(
         f"window rail row {window_kv_indices.shape[1]} < "
         f"{num_seqs * topk} branch(es) x window {window}"
     )
-    src = translator.read_source(
-        forward_batch.kv_loc_plan,
+    src = runner_ids.read_source(
+        forward_batch.iteration_ids,
         req_pool_indices=forward_batch.req_pool_indices,
         bs=num_seqs,
-        kind=translator.window_kv_kind,
+        kind=runner_ids.window_kv_kind,
     )
     generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
         src.row_ids,
@@ -407,13 +407,13 @@ def fill_draft_window_rail(
     )
     if (
         not src.is_translated
-        and translator.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
+        and runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
     ):
         # Static pool: the legacy full->swa translate, as the target's window
         # reads apply it.
         for i in range(num_steps):
             row = window_kv_indices[i][:width]
-            row.copy_(translator.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
+            row.copy_(runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
 
 
 def record_stream_each(tensors, stream):

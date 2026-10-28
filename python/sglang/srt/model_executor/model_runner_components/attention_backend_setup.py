@@ -10,7 +10,6 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.base_attn_backend import SpecMode
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
@@ -218,13 +217,14 @@ def _build_resolved_backend(
     init_new_workspace: bool,
 ) -> AttentionBackend:
     if resolved.is_draft_override:
-        full = _build_full_attention_backend_from_str(
-            model_runner=model_runner,
-            backend_str=resolved.prefill,
-            init_new_workspace=init_new_workspace,
+        attn_backend = attn_backend_wrapper(
+            model_runner,
+            _build_full_attention_backend_from_str(
+                model_runner=model_runner,
+                backend_str=resolved.prefill,
+                init_new_workspace=init_new_workspace,
+            ),
         )
-        _require_spec_mode(model_runner, full)
-        attn_backend = attn_backend_wrapper(model_runner, full)
     elif resolved.decode != resolved.prefill:
         from sglang.srt.layers.attention.hybrid_attn_backend import (
             HybridAttnBackend,
@@ -250,7 +250,6 @@ def _build_resolved_backend(
             ),
         )
         _require_dcp_target_verify(model_runner, hybrid.target_verify_backend())
-        _require_spec_mode(model_runner, hybrid)
         attn_backend = attn_backend_wrapper(model_runner, hybrid)
         logger.info(
             f"Using hybrid attention backend for decode and prefill: "
@@ -268,22 +267,8 @@ def _build_resolved_backend(
             init_new_workspace=init_new_workspace,
         )
         _require_dcp_target_verify(model_runner, full)
-        _require_spec_mode(model_runner, full)
         attn_backend = attn_backend_wrapper(model_runner, full)
     return attn_backend
-
-
-def _require_spec_mode(model_runner: ModelRunner, backend: AttentionBackend) -> None:
-    """Require the speculative forward this runner executes."""
-    if model_runner.spec_algorithm.is_none():
-        return
-    backend.require_spec_mode(
-        model_runner,
-        SpecMode.DRAFT_EXTEND
-        if model_runner.is_draft_worker
-        and not model_runner.spec_algorithm.supports_target_verify_for_draft()
-        else SpecMode.TARGET_VERIFY,
-    )
 
 
 def _require_dcp_target_verify(

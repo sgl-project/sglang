@@ -32,13 +32,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-)
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -314,15 +311,16 @@ def _layer(l):
 
 def _make_pool_and_kv(ps, device=_DEV):
     kv = _make_pool(ps=ps, device=device)
-    return kv, UnifiedMHATokenToKVPool(
+    return kv, MHAView(
         arena=kv,
         spec=kv.spec("full"),
         page_size=ps,
+        model_layer_ids=tuple(range(kv.spec("full").layer_num)),
         enable_alt_stream=False,
     )
 
 
-class TestUnifiedMHATokenToKVPool(unittest.TestCase):
+class TestMHAView(unittest.TestCase):
     def test_size_is_slot_bound(self):
         """`size` drives BOTH the python OOB check and the store kernel's
         device-side size_limit; `size + page_size` must be the view row count."""
@@ -406,10 +404,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         self.assertEqual(len(item_lens), 1)
         self.assertEqual(ptrs[0], kv.raw.data_ptr())
         self.assertEqual(lens[0], kv.raw.numel())
-        self.assertEqual(item_lens[0], pool._page_bytes)
+        self.assertEqual(item_lens[0], pool.page_bytes)
         # The whole addressable page range must fit the registered region, or
         # the last page's write would run off the end of the RDMA mapping.
-        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
+        self.assertLessEqual(pool.num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
@@ -428,7 +426,7 @@ class TestFactoryViews(unittest.TestCase):
     the rebind must emit BOTH write locs."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `RunnerIds.__init__` asks the parallel context for
         # `attn_dcp_size`, which is a quotient of the configured leaves and is
         # computed at publish. A bare process has none, so state one the way a
         # real process does.
@@ -509,7 +507,7 @@ class TestFactoryViews(unittest.TestCase):
         out_cache_loc to FULL-side physical ids and derives the SWA write ids
         from the virtual window -- both checked against the v2p tables over
         the VIRTUAL ids."""
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.runtime_context import get_parallel
 
         b = self._bundle()
@@ -531,7 +529,7 @@ class TestFactoryViews(unittest.TestCase):
         # published in a unit test, so state both and hold the scope across
         # every call that translates.
         with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
-            source = KVIndexTranslator(
+            source = RunnerIds(
                 req_to_token=torch.zeros((2, 8), dtype=torch.int64),
                 token_to_kv_pool_allocator=alloc,
                 token_to_kv_pool=b.token_to_kv_pool,

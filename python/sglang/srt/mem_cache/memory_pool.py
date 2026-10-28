@@ -521,7 +521,7 @@ class MambaPool:
     conv_window_axis = -1
 
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
-    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
+    # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
 
     def register_slot_state(self, state) -> None:
@@ -1116,7 +1116,7 @@ class MambaPool:
 
     # Pool-stable (conv tensors don't move after allocation) so cached per instance
     # on first use. A cached_property rather than set in __init__ because
-    # UnifiedMambaPool skips super().__init__.
+    # Subclasses may skip super().__init__.
     @cached_property
     def _conv_fuse_ok(self) -> bool:
         """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.
@@ -1707,10 +1707,10 @@ class KVWriteLoc:
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
       PHYSICAL on every pool: by allocation on non-unified pools, the
-      iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
+      iteration's plan's write ids on the unified pool (``IterationIds.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
       otherwise): the same plan's write ids in the sliding-window sub-pool
-      (``KVIndexTranslator.write_ids``).
+      (``RunnerIds.write_ids``).
     - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
       space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
@@ -1741,7 +1741,7 @@ class KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
         physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
         the same mark, so it must come from the same plan (as
-        ``KVIndexTranslator.write_ids`` does); a loc produced separately states
+        ``RunnerIds.write_ids`` does); a loc produced separately states
         its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
@@ -1955,7 +1955,7 @@ class KVCache(abc.ABC):
             raise ValueError(
                 f"{where}: write loc is not marked physical. Hand the pool "
                 "KVWriteLoc.for_batch(forward_batch) for a batch bound to a "
-                "plan (KVLocPlan.bind), or KVWriteLoc(loc, physical=True) for "
+                "plan (IterationIds.bind), or KVWriteLoc(loc, physical=True) for "
                 "ids translated separately."
             )
 
@@ -4118,7 +4118,7 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         self.use_dsa = use_dsa
         if full_kv_pool is not None:
-            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
+            # Shared-KV-pool path: the caller built an MHA view
             # aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:

@@ -46,8 +46,8 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     normalize_dtype,
     plan_unified_kv,
 )
+from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -779,12 +779,11 @@ class HiCacheController:
             tp_size = parallel.tp_size
             dp_rank = 0
 
-        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        is_mla_model = isinstance(self.mem_pool_device, MLAKVView)
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )

@@ -407,7 +407,7 @@ class DSAMockModelRunner(ModelRunner):
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
         )
-        self.init_kv_index_translator()
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

@@ -856,9 +856,9 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 
-    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+    return isinstance(target_kv_pool, (MLAKVView, DeepSeekV4TokenToKVPool))
 
 
 def should_send_replicated_state(
@@ -1207,7 +1207,7 @@ def build_staging_slot_metadata(
     Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
     no contiguous K/V tensors to stage.
     """
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 
     # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
     # pool, and the draft pool is wrapped the same way.
@@ -1218,7 +1218,7 @@ def build_staging_slot_metadata(
         inner = draft_kv_pool.layer_router.wrapped_view()
         if inner is not None:
             draft_kv_pool = inner
-    if not isinstance(kv_pool, MHATokenToKVPool):
+    if not isinstance(kv_pool, MHAKVView):
         return None
 
     ids = list(kv_layer_ids or [])
@@ -1229,7 +1229,7 @@ def build_staging_slot_metadata(
 
     draft_half = num_draft_entries // 2
     if draft_half:
-        if not isinstance(draft_kv_pool, MHATokenToKVPool):
+        if not isinstance(draft_kv_pool, MHAKVView):
             # An empty id list puts the sender back on kv_data_ptrs order, which
             # is what staging did before draft KV existed.
             return k_buffers, v_buffers, []
