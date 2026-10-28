@@ -80,7 +80,8 @@ class TestRustServerIdlePark(CustomTestCase):
                 s = Scheduler.__new__(Scheduler)
                 s._engine_paused = False
                 s.get_rust_server_class = lambda: SimpleNamespace(
-                    launch=lambda _scheduler: ring
+                    launch=lambda _scheduler: ring,
+                    gather_server_endpoints=lambda _hosts_listener: [],
                 )
                 parallel = SimpleNamespace(
                     pp_rank=0,
