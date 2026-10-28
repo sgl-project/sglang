@@ -409,13 +409,16 @@ Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/sl
 ### Opt-in CI tiers (pr-test-extra and friends)
 
 The registry contains `extra`, including both `pr-test-extra.yml` (NVIDIA) and
-`pr-test-amd-extra.yml` (AMD), and `nv`, selecting NVIDIA base/shared checks.
+`pr-test-amd-extra.yml` (AMD), `nv`, selecting NVIDIA base/shared checks, and
+`mlu`, selecting `pr-test-mlu.yml` with `run-ci-mlu`.
 The shared extra label remains `run-ci-extra`; splitting hardware extra tiers
 is deferred. Other hardware selections such as `amd` and `ppu` are not registered.
 `/run-extra-ci amd` still runs the shared extra tier because `amd-extra` is absent.
 
 A selection with `label: null`, such as `nv`, adds only `run-ci` and leaves existing
 workflow gates intact. It selects existing runs for the current commit, skipping workflows with no run.
+For `pull_request_target` reruns, selection also matches the PR source repository
+and branch.
 Future pushes follow the existing workflow gates.
 These selections retain existing event/path conditions, including any limitations
 of rerunning old labeled events. Use `/run-ci nv` to select NVIDIA; legacy
