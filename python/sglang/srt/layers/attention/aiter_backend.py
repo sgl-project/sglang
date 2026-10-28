@@ -91,6 +91,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
@@ -509,6 +510,12 @@ class AiterAttnBackend(AttentionBackend):
         # SWA mapping must still come from the target allocator. Mirrors
         # TRTLLMHAAttnBackend._resolve_swa_kv_pool.
         self.swa_kv_pool = self._resolve_swa_kv_pool(model_runner)
+        # The window id space of that pool, which these reads map through.
+        self.swa_space = (
+            None
+            if self.swa_kv_pool is None
+            else self.swa_kv_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+        )
         self.use_sliding_window_kv_pool = (
             self.swa_kv_pool is not None and self.swa_kv_pool.swa_layer_nums > 0
         )
@@ -2019,9 +2026,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.swa_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                    self.swa_space.ids(forward_batch.out_cache_loc)
                 )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
@@ -2050,9 +2055,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
+            swa_out_cache_loc = self.swa_space.ids(forward_batch.out_cache_loc)
         # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
         # verify sizes from its page table instead.
         if forward_batch.seq_lens_cpu is not None:
@@ -2120,11 +2123,7 @@ class AiterAttnBackend(AttentionBackend):
                     if self.use_sliding_window_kv_pool:
                         # AITER attention kernels require int32 page indices;
                         # full_to_swa_index_mapping is stored as int64.
-                        swa_page_table = (
-                            self.swa_kv_pool.translate_loc_from_full_to_swa(
-                                kv_indices
-                            ).to(torch.int32)
-                        )
+                        swa_page_table = self.swa_space.ids(kv_indices).to(torch.int32)
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
@@ -2581,7 +2580,7 @@ class AiterAttnBackend(AttentionBackend):
                     # AITER attention kernels (e.g. mha_batch_prefill_func)
                     # require int32 page indices; full_to_swa_index_mapping is
                     # stored as int64.
-                    swa_page_table = self.swa_kv_pool.translate_loc_from_full_to_swa(
+                    swa_page_table = self.swa_space.ids(
                         self.indices_updater_prefill.kv_indices
                     ).to(torch.int32)
 
@@ -3036,10 +3035,8 @@ class AiterAttnBackend(AttentionBackend):
                         if self.use_sliding_window_kv_pool:
                             # AITER attention kernels require int32 page indices;
                             # full_to_swa_index_mapping is stored as int64.
-                            swa_page_indices = (
-                                self.swa_kv_pool.translate_loc_from_full_to_swa(
-                                    page_indices
-                                ).to(torch.int32)
+                            swa_page_indices = self.swa_space.ids(page_indices).to(
+                                torch.int32
                             )
 
                             page_indices = self._transform_table_1_to_real(page_indices)

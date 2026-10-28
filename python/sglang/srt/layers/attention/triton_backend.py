@@ -2712,7 +2712,9 @@ class TritonMultiStepDraftBackend:
             # update_sliding_window_buffer applies it to the target's window.
             for i in range(self.speculative_num_steps):
                 row = window_kv_indices_buffer[i][:width]
-                row.copy_(self.token_to_kv_pool.translate_loc_from_full_to_swa(row))
+                row.copy_(
+                    self.kv_index_translator.ids_in(IdSpaceKind.SLIDING_WINDOW, row)
+                )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -2894,9 +2896,7 @@ def update_sliding_window_buffer(
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
-            )
+        window_kv_indices[:kv_last_index] = translator.ids_in(
+            IdSpaceKind.SLIDING_WINDOW, window_kv_indices[:kv_last_index]
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx

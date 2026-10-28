@@ -63,6 +63,10 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Whether target verify runs correctly under decode context parallelism:
+    # each rank reads its shard of the DCP-widened pages with the global causal
+    # bound and returns its LSE for the cross-rank merge.
+    supports_dcp_target_verify: bool = False
     # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
     # skips cached-row compression for replay rows folded into the extend.
     folds_encoder_swa_replay: bool = False

@@ -33,7 +33,7 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -57,6 +57,9 @@ class _FakeKVCache:
     def __init__(self, max_slots):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
         self.allocator = None
+
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
     def attach_allocator(self, allocator):
         self.allocator = allocator

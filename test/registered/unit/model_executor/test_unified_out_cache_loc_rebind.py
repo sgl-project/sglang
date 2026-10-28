@@ -63,7 +63,9 @@ def _armed_source(v2p, swa_map):
     src = KVIndexTranslator(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
         token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device=_DEV,
     )

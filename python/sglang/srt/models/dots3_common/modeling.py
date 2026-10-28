@@ -102,6 +102,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -880,8 +881,8 @@ class Dots3AttentionMLA(nn.Module):
                     )
                 else:
                     out_cache_loc = forward_batch.out_cache_loc
-                swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
-                    out_cache_loc
+                swa_loc = backend.kv_index_translator.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
         return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
 

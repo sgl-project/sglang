@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -92,6 +93,9 @@ class _FakeKVCache:
     def __init__(self, max_slots: int):
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
     def move_physical_pages(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int

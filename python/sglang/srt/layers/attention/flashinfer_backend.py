@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -340,6 +340,12 @@ class FlashInferAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
             model_runner
+        )
+        # The window id space of that pool, which these reads map through.
+        self._swa_space: Optional[IdSpace] = (
+            None
+            if self._swa_kv_pool is None
+            else self._swa_kv_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = get_exec().features.enable_mis
@@ -1610,6 +1616,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1814,11 +1821,7 @@ class FlashInferIndicesUpdaterDecode:
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
@@ -1900,6 +1903,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -2306,11 +2310,7 @@ class FlashInferIndicesUpdaterPrefill:
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         # cached part
         # Conditionally set multi-item parameters

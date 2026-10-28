@@ -11,7 +11,7 @@ What still differs between chain shapes is the interim capacity policy in
 from __future__ import annotations
 
 import logging
-from typing import Callable, Hashable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
     interim_policy_for,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages
@@ -452,6 +453,30 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def swa_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the window."""
         return self.swa_attn_allocator.virtual_to_physical
+
+    def id_spaces(self, *, defer_reads: bool = False) -> Dict[str, IdSpace]:
+        """Every token sub-pool's id space, keyed by sub-pool name, in chain
+        order: the owner's and each window's virtual ids map through that
+        band's page table. ``defer_reads`` keeps reads virtual (DCP selects a
+        rank's share where it builds them); writes always translate."""
+        owner = self.full_attn_allocator
+        spaces = {
+            owner.sub_pool_name: IdSpace(
+                key=(owner.sub_pool_name, id(self)),
+                # The WRITE loc is the one id that arrives DCP-widened.
+                write=self.translate_write_loc,
+                read_v2p=None if defer_reads else owner.virtual_to_physical,
+                table=owner.virtual_to_physical,
+            )
+        }
+        for window in self._windows:
+            spaces[window.sub_pool_name] = IdSpace(
+                key=(window.sub_pool_name, id(self)),
+                write=window.translate_kv_loc,
+                read_v2p=None if defer_reads else window.virtual_to_physical,
+                table=window.virtual_to_physical,
+            )
+        return spaces
 
     def translate_write_loc(
         self,

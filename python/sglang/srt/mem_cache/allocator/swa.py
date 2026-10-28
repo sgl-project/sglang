@@ -1,4 +1,5 @@
 import logging
+from typing import Dict
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import async_h2d, get_num_new_pages
@@ -267,6 +269,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def id_spaces(self) -> Dict[str, IdSpace]:
+        """Full ids index the full sub-pool as they are; the window maps them."""
+        return {
+            IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, id(self))),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(
+                key=(IdSpaceKind.SLIDING_WINDOW, id(self)),
+                write=self.translate_loc_from_full_to_swa,
+            ),
+        }
 
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor

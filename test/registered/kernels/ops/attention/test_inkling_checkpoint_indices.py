@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedHybridReqToTokenPool,
@@ -835,7 +836,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             kv_index_translator=KVIndexTranslator(
                 req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
                 token_to_kv_pool_allocator=None,
-                token_to_kv_pool=object(),
+                token_to_kv_pool=SimpleNamespace(
+                    id_spaces=lambda: {
+                        IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))
+                    }
+                ),
                 page_size=1,
                 device="cuda",
             ),

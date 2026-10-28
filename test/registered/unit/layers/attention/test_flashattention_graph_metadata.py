@@ -13,6 +13,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+
 class TestFlashAttentionGraphMetadata(CustomTestCase):
     def test_full_prefill_swa_buffer_uses_capture_token_capacity(self):
         backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
@@ -32,7 +37,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token,
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=backend.page_size,
             device="cpu",
         )
@@ -64,7 +69,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device="cpu",
         )

@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_hybrid_swa_stack,
     build_kv_host_pool,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -169,9 +170,9 @@ class DecodeKVCacheOffloadManager:
         if not isinstance(self.kv_cache, UnifiedSWAKVPool):
             return full_indices, []
 
-        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            virtual_indices
-        )
+        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[
+            IdSpaceKind.SLIDING_WINDOW
+        ].ids(virtual_indices)
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
         if live_swa_indices.numel() == 0:

@@ -32,7 +32,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,6 +67,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -2055,6 +2056,11 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def id_spaces(self) -> Dict[str, IdSpace]:
+        """How each token sub-pool of this pool names a slot when no allocator
+        translates: by the pool's own id, keyed by sub-pool name."""
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Persistent buffers for migrated host consumers; see device_pool_info.py.
