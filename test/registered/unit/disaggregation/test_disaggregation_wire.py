@@ -812,6 +812,201 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
             )
 
 
+class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
+    """KV sharding on a CP-TP group sharing prefill: every decode rank pulls
+    its KV pages from all prefill ranks, its state from the rank-matched one."""
+
+    @staticmethod
+    def _resolve(prefill_tp, decode_tp, dst_rank):
+        decode = object.__new__(CommonKVManager)
+        decode.attn_tp_size = decode_tp
+        decode.kv_args = SimpleNamespace(engine_rank=dst_rank)
+        decode.is_mla_backend = decode.is_hybrid_mla_backend = False
+        decode.attn_cp_size, decode.attn_cp_rank = 1, 0
+        decode.pp_size, decode.pp_rank = 1, 0
+        # register_to_bootstrap advertises CP rank r as TP rank r of a CP-1
+        # prefill.
+        info = SimpleNamespace(
+            attn_tp_size=prefill_tp,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_kv_cache_sharding=True,
+        )
+        decode._resolve_rank_mapping(info)
+        return info
+
+    def test_decode_pulls_kv_from_every_prefill_rank(self):
+        for dst_rank in range(4):
+            with self.subTest(dst_rank=dst_rank):
+                info = self._resolve(prefill_tp=4, decode_tp=4, dst_rank=dst_rank)
+                self.assertIsNone(info.target_tp_rank)
+                self.assertEqual(info.target_tp_ranks, [0, 1, 2, 3])
+                self.assertEqual(info.target_cp_ranks, [0])
+                self.assertEqual(info.required_dst_info_num, 4)
+                self.assertEqual(info.required_prefill_response_num, 4)
+
+    def test_unequal_tp_sizes_are_rejected(self):
+        # The GDN head shard pairs prefill rank r with decode rank r.
+        with self.assertRaisesRegex(AssertionError, "equal prefill/decode attn TP"):
+            self._resolve(prefill_tp=4, decode_tp=2, dst_rank=0)
+
+    @staticmethod
+    def _prefill(rank, n):
+        """CP-TP prefill rank ``rank`` of ``n``: attention TP 1, and the CP,
+        KV-shard and GDN widths all ``n``."""
+        prefill = object.__new__(MooncakeKVManager)
+        prefill.attn_tp_size, prefill.attn_tp_rank = 1, 0
+        prefill.attn_cp_size, prefill.attn_cp_rank = n, rank
+        prefill.kv_shard_size, prefill.kv_shard_rank = n, rank
+        prefill.state_tp_size = n
+        prefill.kv_shard_state_peer_only = True
+        prefill.is_mla_backend = prefill.is_hybrid_mla_backend = False
+        prefill.kv_args = SimpleNamespace(engine_rank=rank)
+        return prefill
+
+    def test_each_decode_rank_has_exactly_one_request_peer(self):
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            for n in (4, 8):
+                prefills = [self._prefill(rank, n) for rank in range(n)]
+                for dst_rank in range(n):
+                    with self.subTest(n=n, dst_rank=dst_rank):
+                        # The GDN head shard index matches on both sides.
+                        self.assertEqual(
+                            [
+                                p.attn_cp_rank
+                                for p in prefills
+                                if p._is_request_peer(dst_rank)
+                            ],
+                            [dst_rank],
+                        )
+                        # The CP-replicated skip is off, so no rank drops the
+                        # state for another reason.
+                        info = SimpleNamespace(dst_tp_rank=dst_rank, dst_attn_tp_size=n)
+                        for prefill in prefills:
+                            self.assertEqual(
+                                prefill._get_dsa_cache_transfer_skip_flags(info),
+                                (False, False),
+                            )
+
+    def test_prefill_rejects_a_decode_of_another_width(self):
+        prefill = self._prefill(rank=1, n=4)
+        prefill.kv_args.state_types = []
+        for dst_attn_tp_size in (2, 4, 8):
+            with self.subTest(dst_attn_tp_size=dst_attn_tp_size):
+                registration = SimpleNamespace(
+                    dst_attn_tp_size=dst_attn_tp_size,
+                    mooncake_session_id="decode",
+                )
+                with get_context().override_server_args(enable_unified_memory=False):
+                    fully_checked, mismatch = prefill._validate_peer_state_layout(
+                        registration
+                    )
+                if dst_attn_tp_size == 4:
+                    self.assertIsNone(mismatch)
+                else:
+                    self.assertFalse(fully_checked)
+                    self.assertIn(f"prefill=4 decode={dst_attn_tp_size}", mismatch)
+
+    def _run_room(self, prefill, dst_ranks, required_dst_info_num):
+        """One last chunk with state through ``transfer_worker`` to the given
+        decode attention-TP ranks; returns the ``_transfer_data`` mock, which
+        sees the aux writes (the state send is mocked)."""
+        prefill.kv_args.kv_data_ptrs = []
+        prefill.kv_args.aux_data_ptrs = [0x5000]
+        prefill.kv_args.aux_item_lens = [8]
+        prefill.pp_size, prefill.pp_rank = 1, 0
+        prefill.enable_deferred_decode_kv_release = False
+        prefill.enable_trace = prefill.enable_staging = False
+        prefill.enable_custom_mem_pool = False
+        prefill.max_transfer_batch_indices = 0
+        prefill.bootstrap_port = 1234
+        prefill.session_lock = threading.Lock()
+        prefill.failure_lock = threading.Lock()
+        prefill.failed_sessions = set()
+        prefill.session_failures = defaultdict(int)
+        prefill.failed_session_probes = {}
+        prefill.state_layout_rejections = {}
+        prefill.state_strides_validated = set()
+        prefill.failure_records = {}
+        prefill._staging_outstanding = defaultdict(int)
+        prefill.request_status = {42: KVPoll.Transferring}
+        prefill.req_to_decode_prefix_len = {42: 0}
+        prefill.transfer_infos = {42: {}}
+        prefill.decode_kv_args_table = {}
+        for dst_rank in dst_ranks:
+            session = f"decode:{dst_rank}"
+            prefill.transfer_infos[42][session] = TransferInfo(
+                room=42,
+                endpoint="127.0.0.1",
+                dst_port=1000 + dst_rank,
+                mooncake_session_id=session,
+                dst_kv_indices=np.array([], dtype=np.int32),
+                dst_aux_index=5,
+                dst_state_indices=[[5]],
+                required_dst_info_num=required_dst_info_num,
+                is_dummy=False,
+            )
+            prefill.decode_kv_args_table[session] = SimpleNamespace(
+                requires_dcp_relayout=False,
+                dst_tp_rank=dst_rank,
+                dst_attn_tp_size=prefill.state_tp_size,
+                dst_aux_ptrs=[0x6000],
+            )
+            # What the bootstrap thread does with each TransferInfo.
+            prefill._reject_decode_without_fan_in(session, required_dst_info_num)
+        queue = FastQueue()
+        queue.put(
+            TransferKVChunk(
+                room=42,
+                prefill_kv_indices=np.array([], dtype=np.int32),
+                index_slice=slice(0, 0),
+                is_last_chunk=True,
+                prefill_aux_index=2,
+                state_indices=[[2]],
+            )
+        )
+        queue.put(None)
+        prefill._send_multipart_locked = Mock()
+        prefill._transfer_data = Mock(return_value=0)
+        prefill.maybe_send_extra = Mock(return_value=0)
+        with (
+            get_context().override_server_args(
+                enable_cp_tp_group_sharing=True, enable_unified_memory=False
+            ),
+            patch.object(envs.SGLANG_MOONCAKE_SEND_AUX_TCP, "get", return_value=False),
+        ):
+            prefill.transfer_worker(queue, executor=None)
+        return prefill._transfer_data
+
+    def test_mooncake_sends_state_and_aux_to_the_peer_only(self):
+        prefill = self._prefill(rank=1, n=4)
+        transfer_data = self._run_room(
+            prefill, dst_ranks=range(4), required_dst_info_num=4
+        )
+        self.assertEqual(prefill.request_status[42], KVPoll.Success)
+        # Every decode rank hears Success; only decode rank 1 gets the state
+        # and the aux.
+        self.assertEqual(prefill._send_multipart_locked.call_count, 4)
+        prefill.maybe_send_extra.assert_called_once()
+        self.assertEqual(
+            prefill.maybe_send_extra.call_args.args[0].mooncake_session_id,
+            "decode:1",
+        )
+        self.assertEqual(
+            transfer_data.call_args_list,
+            [call("decode:1", [(0x5000 + 2 * 8, 0x6000 + 5 * 8, 8)])],
+        )
+
+    def test_mooncake_fails_a_room_whose_decode_does_not_pull_from_every_rank(self):
+        # A decode without the CP-TP fan-in pulls only from its matched rank.
+        prefill = self._prefill(rank=1, n=4)
+        transfer_data = self._run_room(prefill, dst_ranks=[1], required_dst_info_num=1)
+        self.assertEqual(prefill.request_status[42], KVPoll.Failed)
+        self.assertIn("1 of 4 decode ranks", prefill.failure_records[42])
+        prefill.maybe_send_extra.assert_not_called()
+        transfer_data.assert_not_called()
+
+
 class TestQwen4StateWire(unittest.TestCase):
     @staticmethod
     def _qsa_pool(layer_id: int):
@@ -1179,7 +1374,12 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         decode.is_mla_backend = decode.is_hybrid_mla_backend = False
         decode.attn_cp_size, decode.attn_cp_rank = 1, 0
         decode.pp_size, decode.pp_rank = 1, 0
-        info = SimpleNamespace(attn_tp_size=prefill_tp, attn_cp_size=1, pp_size=1)
+        info = SimpleNamespace(
+            attn_tp_size=prefill_tp,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_kv_cache_sharding=False,
+        )
         decode._resolve_rank_mapping(info)
         return info.target_tp_ranks
 

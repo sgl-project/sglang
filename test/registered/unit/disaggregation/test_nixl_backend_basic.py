@@ -428,6 +428,136 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    @staticmethod
+    def _make_cp_tp_prefill(mgr, room, *, peer_only, n=4):
+        """Prefill TP rank 1 under CP-TP group sharing: attention TP 1, and
+        the CP, KV-shard and GDN widths all ``n``."""
+        mgr.kv_shard_state_peer_only = peer_only
+        mgr.attn_tp_size = 1
+        mgr.attn_cp_size = mgr.kv_shard_size = mgr.state_tp_size = n
+        mgr.kv_args.engine_rank = 1
+        mgr.transfer_infos[room]["agent"].required_dst_info_num = n
+        mgr.decode_kv_args_table["agent"].decode_tp_size = n
+
+    def test_kv_sharded_completion_waits_for_handles(self):
+        for peer_only, decode_tp_rank, is_peer in (
+            (True, 1, True),
+            (True, 2, False),
+            (False, 2, True),
+        ):
+            # A non-peer sends no state or aux, so it has no handle to fail.
+            for final_state in ("DONE", "ERR") if is_peer else ("DONE",):
+                with self.subTest(
+                    peer_only=peer_only,
+                    decode_tp_rank=decode_tp_rank,
+                    final_state=final_state,
+                ):
+                    room = 24
+                    mgr = self._make_manager(room)
+                    self._make_cp_tp_prefill(mgr, room, peer_only=peer_only)
+                    mgr.transfer_infos[room]["agent"].dst_state_indices = [[2]]
+                    dst_info = mgr.decode_kv_args_table["agent"]
+                    dst_info.decode_tp_rank = decode_tp_rank
+                    dst_info.dst_state_data_ptrs = [[0]]
+                    dst_info.dst_state_item_lens = [[4]]
+                    dst_info.dst_state_dim_per_tensor = [[1]]
+                    dst_info.dst_state_layer_ids = [0]
+                    mgr.maybe_send_extra = MagicMock(return_value=["state_handle"])
+                    mgr.send_aux = MagicMock(return_value="aux_handle")
+                    mgr.conclude_transfer = MagicMock(wraps=mgr.conclude_transfer)
+                    mgr.conclude_failure = MagicMock(wraps=mgr.conclude_failure)
+                    mgr._reload_invalidated_peers = MagicMock()
+                    mgr.agent = MagicMock()
+                    polls = defaultdict(int)
+                    notification_counts_at_poll = []
+
+                    def check_xfer_state(handle):
+                        notification_counts_at_poll.append(
+                            mgr.send_kv_status_message.call_count
+                        )
+                        mgr.conclude_transfer.assert_not_called()
+                        polls[handle] += 1
+                        # State may still be writing after the aux handle fails.
+                        if polls[handle] < (3 if handle == "state_handle" else 2):
+                            return "PROC"
+                        return final_state if handle == "aux_handle" else "DONE"
+
+                    mgr.agent.check_xfer_state.side_effect = check_xfer_state
+                    chunk = self._make_chunk(room, [], is_last_chunk=True)
+                    chunk.state_indices = [[1]]
+
+                    self._run_worker_once(mgr, chunk)
+
+                    # Only the rank-matched peer sends state and aux.
+                    self.assertEqual(mgr.maybe_send_extra.call_count, int(is_peer))
+                    self.assertEqual(mgr.send_aux.call_count, int(is_peer))
+                    self.assertEqual(
+                        set(polls),
+                        {"aux_handle", "state_handle"} if is_peer else set(),
+                    )
+                    self.assertTrue(all(count >= 2 for count in polls.values()))
+                    self.assertEqual(
+                        notification_counts_at_poll, [0] * sum(polls.values())
+                    )
+                    expected_status = (
+                        KVPoll.Success if final_state == "DONE" else KVPoll.Failed
+                    )
+                    mgr.conclude_transfer.assert_called_once()
+                    self.assertEqual(
+                        mgr.conclude_transfer.call_args.kwargs["status"],
+                        expected_status,
+                    )
+                    mgr.send_kv_status_message.assert_called_once_with(
+                        targets=[("127.0.0.1", 5555)],
+                        bootstrap_room=room,
+                        status=expected_status,
+                        failure_reason=None
+                        if final_state == "DONE"
+                        else f"NIXL transfer encountered ERR room={room}",
+                    )
+                    self.assertEqual(mgr.request_status[room], expected_status)
+                    if final_state == "DONE":
+                        mgr.conclude_failure.assert_not_called()
+                    else:
+                        mgr.conclude_failure.assert_called_once()
+
+    def test_kv_sharded_pairing_mismatch_fails_the_room_on_every_rank(self):
+        # Prefill rank 1 is not decode rank 0's peer, so it would send nothing
+        # but KV pages; it must still fail the room.
+        for decode_tp_size, required_dst_info_num, message in (
+            (2, 2, "prefill=4 decode=2"),
+            (4, 1, "1 of 4 decode ranks"),
+        ):
+            with self.subTest(
+                decode_tp_size=decode_tp_size,
+                required_dst_info_num=required_dst_info_num,
+            ):
+                room = 25
+                mgr = self._make_manager(room)
+                self._make_cp_tp_prefill(mgr, room, peer_only=True)
+                info = mgr.transfer_infos[room]["agent"]
+                info.required_dst_info_num = required_dst_info_num
+                dst_info = mgr.decode_kv_args_table["agent"]
+                dst_info.decode_tp_size = decode_tp_size
+                dst_info.decode_tp_rank = 0
+                mgr.send_kvcache = MagicMock(return_value="kv_handle")
+                mgr.send_aux = MagicMock(return_value="aux_handle")
+                mgr.maybe_send_extra = MagicMock(return_value=["state_handle"])
+                mgr._reload_invalidated_peers = MagicMock()
+
+                self._run_worker_once(mgr, self._make_chunk(room, [1], True))
+
+                self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+                self.assertIn(message, mgr.failure_records[room])
+                mgr.send_kv_status_message.assert_called_once()
+                self.assertEqual(
+                    mgr.send_kv_status_message.call_args.kwargs["status"],
+                    KVPoll.Failed,
+                )
+                mgr.send_kvcache.assert_not_called()
+                mgr.send_aux.assert_not_called()
+                mgr.maybe_send_extra.assert_not_called()
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
         room = 23
         mgr = self._make_manager(room)

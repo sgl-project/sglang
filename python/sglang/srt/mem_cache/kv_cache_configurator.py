@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import gc
 import logging
 import math
@@ -782,7 +783,13 @@ class KVCacheConfigurator:
         )
 
         if self.kv_shard_rank is not None:
-            if not isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin):
+            # Hybrid pools stripe their inner full-attention pool.
+            sharded_pool = (
+                token_to_kv_pool.full_kv_pool
+                if isinstance(token_to_kv_pool, HybridLinearKVPool)
+                else token_to_kv_pool
+            )
+            if not isinstance(sharded_pool, PageInterleaveKVPoolMixin):
                 raise ValueError(
                     "--enable-kv-cache-sharding does not support this model "
                     f"family (pool {type(token_to_kv_pool).__name__})."
@@ -2670,6 +2677,32 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if self.kv_shard_rank is not None:
+            # Only the compressed-QSA backend reads full-attention K/V through
+            # the shard scratch (Qwen4-Exp under CP-TP group sharing).
+            if qsa_profile is None:
+                raise ValueError(
+                    "--enable-kv-cache-sharding supports hybrid linear-attention "
+                    "models only with compressed QSA (Qwen4-Exp)."
+                )
+            # The striped pool replaces the full-attention pool class below, so
+            # reject what it cannot carry rather than silently dropping it
+            # (same rules as _build_mha_kv_pool).
+            if full_pool_class is not MHATokenToKVPool:
+                raise ValueError(
+                    "--enable-kv-cache-sharding is incompatible with the "
+                    f"{full_pool_class.__name__} pool for the full-attention layers."
+                )
+            if quant_method is not None:
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support specialized KV-cache "
+                    "quantization methods (e.g. FP4); ordinary CUDA FP8 is supported."
+                )
+            full_pool_class = functools.partial(
+                PageInterleaveMHATokenToKVPool,
+                shard_spec=self.kv_shard_spec,
+                shard_group=self.kv_shard_group,
+            )
         qsa_indexer_dtype = get_model().qsa_indexer_dtype
         if qsa_indexer_dtype != "auto" and qsa_profile is None:
             raise ValueError(

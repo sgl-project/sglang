@@ -1681,6 +1681,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+                    if self.kv_shard_state_peer_only:
+                        # Every prefill rank checks, not only the state peer:
+                        # a decode that cannot pair would otherwise finish
+                        # without its state or with only some KV pages.
+                        kv_shard_mismatch = self._kv_shard_peer_mismatch(
+                            decode_tp_size
+                        ) or self._kv_shard_fan_in_mismatch(req.required_dst_info_num)
+                        if kv_shard_mismatch is not None:
+                            raise RuntimeError(kv_shard_mismatch)
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -1846,6 +1855,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
+                        if kv_chunk.prefill_aux_index is None:
+                            raise RuntimeError("Missing aux index for last chunk")
+                        if self.kv_shard_state_peer_only and not self._is_request_peer(
+                            dst_info.decode_tp_rank
+                        ):
+                            # KV pages only; the peer sends state and aux.
+                            continue
                         if kv_chunk.state_indices:
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
@@ -1862,8 +1878,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             for state_xfer_handle in state_xfer_handles:
                                 handles.append(state_xfer_handle)
 
-                        if kv_chunk.prefill_aux_index is None:
-                            raise RuntimeError("Missing aux index for last chunk")
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,

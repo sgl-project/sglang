@@ -4345,6 +4345,30 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     validate_kv_shard_attention_backend(args, view)
 
+    def test_qsa_requires_cp_tp_group_sharing_whatever_the_backend(self):
+        # QwenSparseAttnBackend serves every Qwen4-Exp full-attention layer, so
+        # the --attention-backend string does not gate it.
+        hf_config = SimpleNamespace(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            indexer_n_heads=32,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+        )
+        for sharing in (True, False):
+            with self.subTest(enable_cp_tp_group_sharing=sharing):
+                args = self._args(attention_backend="triton")
+                args._model_config.hf_config = hf_config
+                view = SimpleNamespace(enable_cp_tp_group_sharing=sharing)
+                if sharing:
+                    validate_kv_shard_attention_backend(args, view)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "requires CP-TP group sharing"
+                    ):
+                        validate_kv_shard_attention_backend(args, view)
+
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)
 

@@ -307,6 +307,10 @@ class CommonKVManager(BaseKVManager):
     # shard group. Each rank owns a subset of logical KV pages.
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
+    # Prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
+    # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
+    # one (see _is_request_peer).
+    kv_shard_state_peer_only: bool = False
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -389,6 +393,7 @@ class CommonKVManager(BaseKVManager):
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
         )
+        self.kv_shard_state_peer_only = self.kv_shard_size > 1 and cp_tp_group_sharing
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -526,6 +531,49 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
+        )
+
+    # The three helpers below hold under ``kv_shard_state_peer_only`` only;
+    # callers check that flag first, so unsharded transfers read nothing new.
+
+    def _is_request_peer(self, dst_tp_rank: int) -> bool:
+        """Whether this prefill rank sends the per-request state and aux to
+        decode attention-TP rank ``dst_tp_rank``.
+
+        Under KV sharding with CP-TP group sharing every prefill rank sends its
+        KV pages to every decode rank, but only one sends the rest. The GDN
+        heads are split over the TP group here and over attention TP on decode,
+        so head shard r lives on prefill TP rank r (``engine_rank``) and on
+        decode attention-TP rank r. QSA and PLE state and the aux are identical
+        on every rank and travel with it, so each decode slot has one writer.
+        ``_kv_shard_peer_mismatch`` rejects decode peers of another width, so
+        the ranks pair one to one.
+        """
+        return dst_tp_rank == self.kv_args.engine_rank
+
+    def _kv_shard_peer_mismatch(self, dst_attn_tp_size: int) -> Optional[str]:
+        """Why a decode peer cannot pair with this prefill, if it cannot. Every
+        prefill rank checks it, not only the state peer, so it holds even
+        without the decode-side assert in ``_resolve_rank_mapping``."""
+        if dst_attn_tp_size == self.state_tp_size:
+            return None
+        return (
+            "KV cache sharding sends the request state from prefill rank r to "
+            "decode attention-TP rank r, so the sizes must match: "
+            f"prefill={self.state_tp_size} decode={dst_attn_tp_size}"
+        )
+
+    def _kv_shard_fan_in_mismatch(self, required_dst_info_num: int) -> Optional[str]:
+        """Why a decode cannot read this prefill's KV pages, if it cannot:
+        each prefill rank owns only a subset of them, so every decode
+        attention-TP rank must pull from every prefill rank."""
+        if required_dst_info_num == self.kv_shard_size:
+            return None
+        return (
+            "KV cache sharding needs every decode attention-TP rank to pull "
+            f"from every prefill rank, but {required_dst_info_num} of "
+            f"{self.kv_shard_size} decode ranks registered for a request; the "
+            "decode may predate KV-shard fan-in for CP-TP group sharing"
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -1433,16 +1481,11 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
-        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
-        if (
-            self.is_mla_backend
-            and info.enable_kv_cache_sharding
-            and info.attn_cp_size == 1
-        ):
-            # MLA KV sharded across prefill attn-TP: every decode rank pulls
-            # from all prefill TP ranks (None marks them all as real senders).
+        if info.attn_cp_size == 1 and info.enable_kv_cache_sharding:
+            # KV pages striped over the registered TP ranks (MLA attn-TP, or CP-TP
+            # group sharing's CP ranks): pull from all (None marks every real sender).
             assert self.attn_tp_size == info.attn_tp_size, (
-                "MLA KV cache sharding requires equal prefill/decode attn TP "
+                "KV cache sharding requires equal prefill/decode attn TP "
                 f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
             )
             target_tp_rank = None
