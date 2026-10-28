@@ -282,11 +282,12 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # Single-point validation for the 7 NPU unit tests registered to
-  # `stage-a-unit-test-npu` (that suite used to be orphaned: no job dispatched
-  # it, so the files never ran). Those registrations are nightly=False, so this
-  # job must keep is_nightly_pipeline_job: false -- with --nightly,
-  # filter_tests (t.nightly == nightly) would drop every case in the suite.
+  # Single-point validation for the 4 CPU-mock NPU unit tests that used to be
+  # registered to `base-a-test-cpu`, a suite the PR pipeline no longer runs:
+  # test_npu_dcp, test_npu_cudagraph_backend, test_npu_graph_runner and
+  # test_npu_gemma_rmsnorm. Those registrations are nightly=False, so this job
+  # must keep is_nightly_pipeline_job: false -- with --nightly, filter_tests
+  # (t.nightly == nightly) would drop every case in the suite.
   stage-a-unit-test-npu:
     name: stage-a-unit-test-npu
     if: ${{ !cancelled() }}
