@@ -55,6 +55,33 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_transport_preserves_padding_until_frontend_finalization(self):
+        processor = LlavaImageProcessor.__new__(LlavaImageProcessor)
+        processor.processor_fingerprint = "sha256:" + "12" * 32
+        processor.use_cuda_ipc = True
+        item = _item(torch.arange(8))
+        item.offsets = [(1, 8)]
+        item.set_pad_value()
+        input_ids = array("q", [1] + [2] * 8 + [3])
+        padded = MultimodalProcessorOutput.build_padded_input_ids(input_ids, [item])
+        output = MultimodalProcessorOutput(
+            input_ids=input_ids, padded_input_ids=padded, mm_items=[item]
+        )
+        # Model fast paths may build padding before wrapping transport storage.
+        with patch.object(
+            processor, "_wrap_tensor_for_cuda_ipc", side_effect=lambda t: t
+        ):
+            processor._prepare_mm_items_for_transport([item])
+        processor.finalize_cache_identities(output)
+        self.assertEqual(
+            output.padded_input_ids,
+            output.build_padded_input_ids(input_ids, [item]),
+        )
+        self.assertNotEqual(output.padded_input_ids, padded)
+        expected = output.padded_input_ids
+        processor.finalize_cache_identities(output)
+        self.assertIs(output.padded_input_ids, expected)
+
     def test_composite_processor_uses_inner_identity_namespace(self):
         inner = LlavaImageProcessor.__new__(LlavaImageProcessor)
         inner.processor_fingerprint = "sha256:" + "12" * 32

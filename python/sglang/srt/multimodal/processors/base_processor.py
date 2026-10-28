@@ -2074,9 +2074,10 @@ class BaseMultimodalProcessor(ABC):
         if not self.use_cuda_ipc:
             return mm_items
 
-        self._bind_cache_namespaces(mm_items)
         for item in mm_items:
             # Never reconstruct/consume an IPC lease merely to hash its contents.
+            # Leave namespace binding to finalization: fast paths may have
+            # already built padding, which must change together with identity.
             item.set_pad_value()
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
