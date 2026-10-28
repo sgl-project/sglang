@@ -20,9 +20,12 @@ RAGGED = TopkTransformMethod.RAGGED
 PAGED = TopkTransformMethod.PAGED
 
 
-def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
+def _make_backend(
+    prefill_impl: str, *, fp8_kv_cache: bool, nvfp4_kv_cache: bool = False
+):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
     backend.dsa_kv_cache_store_fp8 = fp8_kv_cache
+    backend.dsa_kv_cache_store_nvfp4 = nvfp4_kv_cache
     backend.dsa_prefill_impl = prefill_impl
     return backend
 
@@ -43,6 +46,22 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
 )
 def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expected):
     backend = _make_backend(prefill_impl, fp8_kv_cache=fp8_kv_cache)
+    assert backend.get_topk_transform_method(forward_mode) == expected
+
+
+@pytest.mark.parametrize(
+    "prefill_impl,forward_mode,expected",
+    [
+        ("flashmla_sparse", ForwardMode.EXTEND, RAGGED),
+        ("triton_sparse_mla", ForwardMode.EXTEND, RAGGED),
+        ("tilelang", ForwardMode.EXTEND, PAGED),
+        ("flashmla_sparse", ForwardMode.DECODE, PAGED),
+        ("flashmla_sparse", ForwardMode.TARGET_VERIFY, PAGED),
+        ("flashmla_sparse", ForwardMode.DRAFT_EXTEND_V2, PAGED),
+    ],
+)
+def test_nvfp4_topk_transform_method(prefill_impl, forward_mode, expected):
+    backend = _make_backend(prefill_impl, fp8_kv_cache=False, nvfp4_kv_cache=True)
     assert backend.get_topk_transform_method(forward_mode) == expected
 
 

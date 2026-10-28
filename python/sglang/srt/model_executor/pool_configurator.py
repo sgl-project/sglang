@@ -376,6 +376,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
+            is_dsa_model = is_deepseek_dsa(model_config.hf_config)
             cell_size = (
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
@@ -384,7 +385,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if is_float4_e2m1fn_x2(kv_cache_dtype) and not is_dsa_model:
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (

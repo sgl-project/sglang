@@ -440,6 +440,38 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
         return head_num * head_dim * num_layers * kv_size * 2
 
 
+def get_kv_scale_attention_layers(model_or_runner) -> list:
+    """Return attention modules carrying per-layer KV calibration scales."""
+    from sglang.srt.model_loader.utils import resolve_language_model
+
+    model = getattr(model_or_runner, "model", model_or_runner)
+    language_model = (
+        model if hasattr(model, "layers") else resolve_language_model(model)
+    )
+    layers = getattr(language_model, "layers", None)
+    if layers is None:
+        decoder = getattr(language_model, "decoder", None)
+        layers = getattr(decoder, "layers", (decoder,)) if decoder is not None else ()
+
+    attention_layers = []
+    for layer in layers:
+        if hasattr(layer, "self_attn"):
+            attention = getattr(
+                layer.self_attn,
+                "attn",
+                getattr(layer.self_attn, "attn_mqa", None),
+            )
+        elif hasattr(layer, "attn"):
+            attention = layer.attn
+        elif hasattr(layer, "attention"):
+            attention = getattr(layer.attention, "attn", None)
+        else:
+            attention = None
+        if attention is not None:
+            attention_layers.append(attention)
+    return attention_layers
+
+
 class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
@@ -488,26 +520,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         return torch.float8_e4m3fn
 
     def load_scales_from_model(self, model_runner) -> None:
-        from sglang.srt.model_loader.utils import resolve_language_model
-
-        model = getattr(model_runner, "model", model_runner)
-        language_model = (
-            model if hasattr(model, "layers") else resolve_language_model(model)
-        )
-
-        attention_layers = []
-        for layer in language_model.layers:
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    attention_layers.append(layer.self_attn.attn)
-                elif hasattr(layer.self_attn, "attn_mqa"):
-                    attention_layers.append(layer.self_attn.attn_mqa)
-            elif hasattr(layer, "attn"):
-                attention_layers.append(layer.attn)
-            elif hasattr(layer, "attention"):
-                if hasattr(layer.attention, "attn"):
-                    attention_layers.append(layer.attention.attn)
-
+        attention_layers = get_kv_scale_attention_layers(model_runner)
         if not attention_layers:
             return
 

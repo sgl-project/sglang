@@ -1,5 +1,6 @@
 import unittest
 from itertools import product
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -1433,6 +1434,183 @@ class TestDSAIndexer(CustomTestCase):
                     backend.decode_cuda_graph_metadata["page_table"] is None,
                     should_use_topk_v2,
                 )
+
+    def test_nvfp4_prefill_uses_ragged_indices_for_materialized_prefix(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_kv_cache_store_fp8 = False
+        backend.dsa_kv_cache_store_nvfp4 = True
+        backend.dsa_prefill_impl = "flashmla_sparse"
+        self.assertEqual(
+            backend.get_topk_transform_method(ForwardMode.EXTEND),
+            TopkTransformMethod.RAGGED,
+        )
+
+        # The legacy FP8 sparse-prefill fallback materializes a logical
+        # contiguous cache and therefore still requires RAGGED offsets.
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_kv_cache_store_nvfp4 = False
+        self.assertEqual(
+            backend.get_topk_transform_method(ForwardMode.EXTEND),
+            TopkTransformMethod.RAGGED,
+        )
+
+    def test_flashmla_sparse_prefill_padding_is_independent_of_cache_format(self):
+        q = torch.randn(2, 64, 576, dtype=torch.bfloat16, device=self.device)
+        kv = torch.randn(4, 1, 576, dtype=torch.bfloat16, device=self.device)
+        indices = torch.zeros(2, 2048, dtype=torch.int32, device=self.device)
+        for nvfp4 in (False, True):
+            with self.subTest(nvfp4=nvfp4):
+                backend = object.__new__(DeepseekSparseAttnBackend)
+                backend.device_sm_major = 10
+                backend.dsa_kv_cache_store_nvfp4 = nvfp4
+                backend.dsa_kv_cache_store_fp8 = not nvfp4
+                output = torch.randn(
+                    2, 128, 512, dtype=torch.bfloat16, device=self.device
+                )
+                with patch(
+                    "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
+                    return_value=(output, None, None),
+                ) as fused:
+                    actual = backend._forward_flashmla_sparse(
+                        q_all=q,
+                        kv_cache=kv,
+                        v_head_dim=512,
+                        page_table_1=indices,
+                        sm_scale=1.0,
+                    )
+                padded_q = fused.call_args.kwargs["q"]
+                self.assertEqual(padded_q.shape, (2, 128, 576))
+                torch.testing.assert_close(padded_q[:, :64], q)
+                self.assertEqual(torch.count_nonzero(padded_q[:, 64:]).item(), 0)
+                torch.testing.assert_close(actual, output[:, :64])
+
+    def test_nvfp4_flashmla_dispatch_keeps_packed_cache(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_kv_cache_store_nvfp4 = True
+        backend.physical_page_size = 64
+        backend.kv_cache_dim = 416
+        global_scale = torch.tensor([1.375], device=self.device)
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool.get_mla_kv_global_scale.return_value = global_scale
+
+        q = torch.randn(2, 64, 576, dtype=torch.bfloat16, device=self.device)
+        packed_kv = torch.zeros(64, 1, 416, dtype=torch.uint8, device=self.device)
+        indices = torch.zeros(2, 2048, dtype=torch.int32, device=self.device)
+        lengths = torch.full((2,), 2048, dtype=torch.int32, device=self.device)
+        scheduler_metadata = torch.zeros(1, 8, dtype=torch.int32, device=self.device)
+        num_splits = torch.ones(3, dtype=torch.int32, device=self.device)
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=lengths,
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=scheduler_metadata,
+                num_splits=num_splits,
+            ),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=64,
+            head_dim=576,
+            layer_id=0,
+        )
+        output = torch.zeros(2, 1, 64, 512, dtype=torch.bfloat16, device=self.device)
+
+        with patch(
+            "sgl_kernel.flash_mla.flash_mla_with_kvcache_nvfp4",
+            return_value=(output, None, None, None),
+            create=True,
+        ) as fused:
+            actual = backend._forward_flashmla_kv(
+                q_all=q,
+                kv_cache=packed_kv,
+                v_head_dim=512,
+                sm_scale=1.0,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=indices,
+            )
+
+        self.assertIs(actual, output)
+        kwargs = fused.call_args.kwargs
+        self.assertEqual(kwargs["q"].dtype, torch.bfloat16)
+        self.assertEqual(kwargs["q"].shape, (2, 1, 64, 576))
+        self.assertEqual(kwargs["k_cache"].shape, (1, 64, 1, 416))
+        self.assertEqual(kwargs["k_cache"].data_ptr(), packed_kv.data_ptr())
+        self.assertEqual(kwargs["indices"].shape, (2, 1, 2048))
+        self.assertIsNone(kwargs["topk_length"])
+        self.assertIs(kwargs["kv_global_scale"], global_scale)
+
+    def test_nvfp4_dsa_pool_moves_main_and_index_cache_together(self):
+        for index_kpool in (1, 2):
+            with self.subTest(index_kpool=index_kpool):
+                pool = DSATokenToKVPool(
+                    size=128,
+                    page_size=64 * index_kpool,
+                    kv_lora_rank=512,
+                    dtype=torch.float4_e2m1fn_x2,
+                    qk_rope_head_dim=64,
+                    layer_num=2,
+                    device=self.device,
+                    index_head_dim=128,
+                    enable_memory_saver=False,
+                    kv_cache_dim=416,
+                    index_kpool=index_kpool,
+                )
+                source = torch.tensor([69], dtype=torch.int64, device=self.device)
+                target = torch.tensor([128], dtype=torch.int64, device=self.device)
+                if index_kpool > 1:
+                    # Tokenwise moves cannot regroup pooled keys safely.
+                    with self.assertRaisesRegex(AssertionError, "requires regrouping"):
+                        pool.index_key_cache.move(target, source)
+                    continue
+                page_size = pool.index_page_size
+                key_bytes = pool.index_head_dim
+                scale_bytes = key_bytes // pool.quant_block_size * 4
+
+                index_source = (
+                    69 // pool.page_size * page_size
+                    + 69 % pool.page_size // index_kpool
+                )
+                index_target = (
+                    128 // pool.page_size * page_size
+                    + 128 % pool.page_size // index_kpool
+                )
+                source_slot = divmod(index_source, page_size)
+                target_slot = divmod(index_target, page_size)
+                expected_keys = []
+                expected_scales = []
+                for layer in range(pool.layer_num):
+                    pool.kv_buffer[layer][source] = layer + 17
+                    index_buffer = pool.index_k_with_scale_buffer[layer]
+                    key_pages = index_buffer[:, : page_size * key_bytes].view(
+                        -1, page_size, key_bytes
+                    )
+                    scale_pages = index_buffer[:, page_size * key_bytes :].view(
+                        -1, page_size, scale_bytes
+                    )
+                    key_pages[source_slot] = layer + 29
+                    scale_pages[source_slot] = layer + 47
+                    expected_keys.append(key_pages[source_slot].clone())
+                    expected_scales.append(scale_pages[source_slot].clone())
+                expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
+
+                pool.move_kv_cache(target, source)
+
+                for layer in range(pool.layer_num):
+                    self.assertTrue(
+                        torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
+                    )
+                    index_buffer = pool.index_k_with_scale_buffer[layer]
+                    key_pages = index_buffer[:, : page_size * key_bytes].view(
+                        -1, page_size, key_bytes
+                    )
+                    scale_pages = index_buffer[:, page_size * key_bytes :].view(
+                        -1, page_size, scale_bytes
+                    )
+                    self.assertTrue(
+                        torch.equal(key_pages[target_slot], expected_keys[layer])
+                    )
+                    self.assertTrue(
+                        torch.equal(scale_pages[target_slot], expected_scales[layer])
+                    )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

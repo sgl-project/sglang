@@ -529,6 +529,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_nvfp4 = (
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_nvfp4
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
@@ -675,6 +678,43 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if self.dsa_kv_cache_store_nvfp4:
+            expected = {
+                "device_sm_major": (self.device_sm_major, 10),
+                "local_q_heads": (self.num_q_heads, 64),
+                "kv_lora_rank": (self.kv_lora_rank, 512),
+                "qk_rope_head_dim": (self.qk_rope_head_dim, 64),
+                "index_topk": (self.dsa_index_topk, 2048),
+                "page_size": (self.physical_page_size, 64),
+            }
+            mismatches = [
+                f"{name}={actual} (expected {wanted})"
+                for name, (actual, wanted) in expected.items()
+                if actual != wanted
+            ]
+            if mismatches:
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA native kernel shape mismatch: "
+                    + ", ".join(mismatches)
+                )
+            if self.dsa_decode_impl != "flashmla_kv":
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA requires --dsa-decode-backend=flashmla_kv"
+                )
+            if self.dsa_prefill_impl != "flashmla_sparse":
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA requires "
+                    "--dsa-prefill-backend=flashmla_sparse"
+                )
+            from sgl_kernel.flash_mla import is_flash_mla_nvfp4_available
+
+            if not is_flash_mla_nvfp4_available():
+                raise RuntimeError(
+                    "sglang-kernel is missing sparse_decode_fwd_nvfp4; rebuild "
+                    "the SM100 flashmla_ops extension from this source tree"
+                )
+            logger.info("Enabled GLM-5.2 SM100 NVFP4-to-BF16 fused FlashMLA decode")
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
@@ -2444,9 +2484,23 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged_dsa(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.dsa_kv_cache_store_nvfp4:
+                        from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+                            dequantize_nvfp4_k_cache_paged,
+                        )
+
+                        kv_cache = dequantize_nvfp4_k_cache_paged(
+                            kv_cache,
+                            page_table_1_flattened,
+                            self.token_to_kv_pool.get_mla_kv_global_scale(
+                                layer.layer_id
+                            ),
+                            dtype=torch.bfloat16,
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged_dsa(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
@@ -3325,7 +3379,36 @@ class DeepseekSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        q_input = q_all
         num_q_heads = q_all.shape[2]
+
+        if self.dsa_kv_cache_store_nvfp4:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+
+            if num_q_heads != 64:
+                raise ValueError(
+                    f"native GLM-5.2 NVFP4 decode requires Hq=64, got {num_q_heads}"
+                )
+            packed_kv = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
+            indices = page_table_1.unsqueeze(1).contiguous()
+            # Keep the graph schedule at its captured 2048-slot width; padded
+            # -1 indices are masked before cache loads.
+            topk_length = None
+            global_scale = self.token_to_kv_pool.get_mla_kv_global_scale(layer.layer_id)
+            o, _, _, _ = flash_mla_with_kvcache_nvfp4(
+                q=q_input,
+                k_cache=packed_kv,
+                kv_global_scale=global_scale,
+                indices=indices,
+                topk_length=topk_length,
+                attn_sink=None,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+            )
+            return o
+
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
@@ -4109,12 +4192,11 @@ class DeepseekSparseAttnBackend(
             # disable for MTP
             (
                 self.dsa_kv_cache_store_fp8
+                or self.dsa_kv_cache_store_nvfp4
                 or self.dsa_prefill_impl == "flashmla_sparse_q8"
             )
-            # flashmla_sparse_q8 always gathers KV into a contiguous fp8 buffer;
-            # it is RAGGED whatever the pool dtype, since its dispatch lives there.
-            # triton_sparse_mla is listed for an fp8 pool: its dispatch also
-            # dequantizes inside the RAGGED branch and its kernel is bf16-only.
+            # Packed caches need RAGGED prefill for dequantization; q8 prefill
+            # always gathers into a contiguous FP8 buffer regardless of pool dtype.
             and self.dsa_prefill_impl
             in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
             and forward_mode == ForwardMode.EXTEND

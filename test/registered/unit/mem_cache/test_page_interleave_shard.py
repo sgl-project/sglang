@@ -1731,6 +1731,45 @@ class TestScratchTranslation(CustomTestCase):
 
 
 class TestWritePlan(CustomTestCase):
+    def test_mla_staging_forwards_layer_id_to_base_writer(self):
+        for override in (None, 8):
+            with self.subTest(layer_id_override=override):
+                writes = []
+                loc, rows, nope, rope = (object() for _ in range(4))
+                slots = [
+                    SimpleNamespace(tensors={"kv": object()}),
+                    SimpleNamespace(tensors={"kv": object()}),
+                ]
+
+                def write(layer_id, dst, actual_rows, actual_nope, actual_rope):
+                    writes.append(
+                        (layer_id, dst, actual_rows, actual_nope, actual_rope)
+                    )
+
+                pool = SimpleNamespace(
+                    _shard_extend_active=True,
+                    _slots=slots,
+                    _translate_loc_cached=lambda _: rows,
+                    _get_write_plan=lambda _: (SimpleNamespace(numel=lambda: 0), None),
+                    _write_mla_kv_buffer=write,
+                )
+                PageInterleaveMLATokenToKVPool.set_mla_kv_buffer(
+                    pool,
+                    SimpleNamespace(layer_id=7),
+                    loc,
+                    nope,
+                    rope,
+                    layer_id_override=override,
+                )
+
+                expected_layer = 7 if override is None else override
+                self.assertEqual(len(writes), 1)
+                self.assertEqual(writes[0][0], expected_layer)
+                self.assertIs(writes[0][1], slots[expected_layer % 2].tensors["kv"])
+                self.assertIs(writes[0][2], rows)
+                self.assertIs(writes[0][3], nope)
+                self.assertIs(writes[0][4], rope)
+
     def test_owner_filter_cached_per_loc_tensor(self):
         spec = _make_spec(shard_rank=2)
         stub = SimpleNamespace()

@@ -374,7 +374,10 @@ def _get_k_and_s_triton_kernel(
 
     pre_batch_idx = tl.arange(0, seq_len_num_pow)
     mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
+    # Masked lanes must load 0; tl.sum adds them into the K/S store offset.
+    prev_seq_lens = tl.load(
+        seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx, other=0
+    )
     batch_token_offset = tl.sum(prev_seq_lens)
 
     # Batch calculate the page index and in-page offset of each token.
