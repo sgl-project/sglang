@@ -26,7 +26,12 @@ import torch
 
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    STATIC_SPEC_COMBINATIONS,
+    AttentionBackend,
+    SpecMode,
+    spec_combinations,
+)
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -235,6 +240,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     # Verify metadata is ragged-layout aware via generate_attn_arg_prefill;
     # graphs key their wrappers by token tier (_verify_graph_key).
     supports_ragged_verify_graph: bool = True
+
+    # On translated storage, for this family (trtllm_mla, cutedsl_mla and
+    # flashmla derive from it): target verify of the unified MLA pool, which
+    # has no window layers. A fused draft is MHA, so no draft forward reads
+    # translated storage here.
+    implemented_spec_combinations = STATIC_SPEC_COMBINATIONS | spec_combinations(
+        SpecMode.TARGET_VERIFY, window=(False,), translated=(True,)
+    )
 
     def __init__(
         self,

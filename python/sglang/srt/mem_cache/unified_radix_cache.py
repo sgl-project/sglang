@@ -68,10 +68,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -745,7 +745,7 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_id_shortfall = max(
                 0,
                 mamba_target[1]
-                - self.req_to_token_pool.mamba_allocator.available_size(),
+                - self.token_to_kv_pool_allocator.state_slots.available_size(),
             )
             initial_params = EvictParams(
                 num_tokens=params.num_tokens,
@@ -756,7 +756,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if mamba_target is not None and mamba_full_donor is not None:
             mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
-            mamba_free_ids = self.req_to_token_pool.mamba_allocator.available_size()
+            mamba_free_ids = (
+                self.token_to_kv_pool_allocator.state_slots.available_size()
+            )
             mamba_capacity = self._component_available_size(ComponentType.MAMBA)
 
             if mamba_free_ids >= mamba_target[1] and mamba_capacity < mamba_target[1]:
@@ -811,7 +813,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if component_type == ComponentType.SWA:
             return self.token_to_kv_pool_allocator.swa_available_size()
         if component_type == ComponentType.MAMBA:
-            return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
+            return (
+                self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
+            )
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
@@ -1469,7 +1473,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, SWAKVPool):
+        if kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
             return (
                 self.supports_swa()
                 and {
@@ -3942,7 +3946,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
             elif ct.is_mamba:
-                available_size = self.req_to_token_pool.mamba_allocator.available_size()
+                available_size = (
+                    self.token_to_kv_pool_allocator.state_slots.available_size()
+                )
             else:
                 continue
 

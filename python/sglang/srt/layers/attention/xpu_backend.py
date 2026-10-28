@@ -19,8 +19,8 @@ from sglang.srt.layers.attention.local_attention import (
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -166,6 +166,7 @@ class XPUAttentionBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -174,8 +175,9 @@ class XPUAttentionBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            model_runner.token_to_kv_pool.layer_router.routes_to(
+                IdSpaceKind.SLIDING_WINDOW
+            )
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -638,16 +640,12 @@ class XPUAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             # flash_attn_with_kvcache requires int32 page tables; the SWA index
             # mapping is int64, so cast (matches flashattention_backend.py).
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
+            metadata.swa_page_table = self.kv_index_translator.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+            ).to(torch.int32)
             if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                metadata.swa_out_cache_loc = self.kv_index_translator.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
 
         if self.use_mla:
@@ -820,8 +818,8 @@ class XPUAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        metadata.page_table
+                    page_table = self.kv_index_translator.ids_in(
+                        IdSpaceKind.SLIDING_WINDOW, metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -1532,11 +1530,9 @@ class XPUAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
+                        page_table = self.kv_index_translator.ids_in(
+                            IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+                        ).to(torch.int32)
 
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -1834,8 +1830,8 @@ class XPUAttentionBackend(AttentionBackend):
             n = forward_batch.out_cache_loc.shape[0]
             swa_out_cache_loc[n:].zero_()
             swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                self.kv_index_translator.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
             )
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]

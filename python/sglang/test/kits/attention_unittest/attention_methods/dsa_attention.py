@@ -401,7 +401,12 @@ class DSAMockModelRunner(ModelRunner):
             enable_memory_saver=False,
             kv_cache_dim=pool_kv_cache_dim,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
         self.init_kv_index_translator()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

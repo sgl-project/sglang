@@ -20,7 +20,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -45,34 +47,38 @@ def _backend(cls, **fields):
 
 class KvPool:
     start_layer, layer_num = 3, 2
+    layer_transfer_counter = None
 
     def __init__(self):
-        self.k = {i: torch.zeros(4, 2) for i in (3, 4)}
+        layer_ids = (7, 3)
+        self.k = {i: torch.zeros(4, 2) for i in layer_ids}
+        self.v = {i: torch.ones(4, 2) for i in layer_ids}
+        view = SimpleNamespace(
+            get_key_buffer=lambda index: self.k[layer_ids[index]],
+            get_value_buffer=lambda index: self.v[layer_ids[index]],
+        )
+        self.layer_router = KVLayerRouter.from_layer_maps(
+            self, (("full", view, {3: 1, 7: 0}),)
+        )
 
-    def get_key_buffer(self, layer_id):
-        return self.k[layer_id]
 
-    def get_value_buffer(self, layer_id):
-        return self.k[layer_id]
-
-
-def _req_pool():
-    tensor = torch.zeros(2)
+def _state_pool():
     state = SimpleNamespace(
-        conv=[tensor],
-        temporal=tensor,
-        intermediate_conv_window=[tensor],
-        intermediate_ssm=tensor,
-        **{f"replayssm_{n}": None for n in ("d", "k", "g", "rawv", "rawk", "beta")},
+        conv=[torch.zeros(2, 2)],
+        temporal=torch.ones(2, 2),
+        intermediate_conv_window=[torch.full((2, 2), 2.0)],
+        intermediate_ssm=torch.full((2, 2), 3.0),
+        **{
+            f"replayssm_{name}": torch.full((2, 2), float(i + 4))
+            for i, name in enumerate(("d", "k", "g", "rawv", "rawk", "beta"))
+        },
     )
     return SimpleNamespace(
-        mamba_map={0: 0, 2: 1},
+        mamba_cache=state,
         get_speculative_mamba2_params_all_layers=lambda: state,
-        mamba_pool=SimpleNamespace(
-            replayssm_spec_write_pos=None,
-            replayssm_cache_base=None,
-            replayssm_is_flush=None,
-        ),
+        replayssm_spec_write_pos=torch.zeros(2, dtype=torch.int32),
+        replayssm_cache_base=torch.ones(2, dtype=torch.int32),
+        replayssm_is_flush=torch.zeros(2, dtype=torch.bool),
     )
 
 
@@ -95,6 +101,9 @@ def _trtllm(pool):
 
 def _hybrid():
     pool = KvPool()
+    pool.layer_router.bind_part(
+        sub_pool="mamba", part=STATE_PART, view=_state_pool(), indices={0: 1, 2: 0}
+    )
     gdn = _backend(
         GDNAttnBackend,
         forward_metadata=SimpleNamespace(
@@ -110,7 +119,7 @@ def _hybrid():
         full_attn_backend=_trtllm(pool),
         linear_attn_backend=gdn,
         token_to_kv_pool=pool,
-        req_to_token_pool=_req_pool(),
+        req_to_token_pool=SimpleNamespace(),
     )
 
 
@@ -282,10 +291,26 @@ class TestEagleBinding(CustomTestCase):
         self.assertIs(
             view.gdn.intermediate_indices, gdn.verify_intermediate_state_indices
         )
-        self.assertEqual(view.kv.layer_ids, (3, 4))
-        self.assertIs(view.kv.k[1], backend.token_to_kv_pool.k[4])
+        self.assertEqual(view.kv.layer_ids, (3, 7))
+        self.assertIs(view.kv.k[1], backend.token_to_kv_pool.k[7])
+        self.assertIs(view.kv.v[1], backend.token_to_kv_pool.v[7])
         self.assertEqual(view.kv.k_scale, (1.0, 1.0))
-        self.assertEqual(view.mamba.layer_ids, (0, 2))
+        self.assertEqual(view.mamba.layer_ids, (2, 0))
+        state_pool = backend.token_to_kv_pool.layer_router.part_view(STATE_PART)
+        state = state_pool.mamba_cache
+        self.assertIs(view.mamba.conv[0], state.conv[0])
+        self.assertIs(view.mamba.temporal, state.temporal)
+        self.assertIs(
+            view.mamba.intermediate_conv_window[0], state.intermediate_conv_window[0]
+        )
+        self.assertIs(view.mamba.intermediate_ssm, state.intermediate_ssm)
+        for name in ("d", "k", "g", "rawv", "rawk", "beta"):
+            self.assertIs(
+                getattr(view.mamba, f"ring_{name}"), getattr(state, f"replayssm_{name}")
+            )
+        self.assertIs(view.mamba.ring_write_pos, state_pool.replayssm_spec_write_pos)
+        self.assertIs(view.mamba.ring_cache_base, state_pool.replayssm_cache_base)
+        self.assertIs(view.mamba.ring_is_flush, state_pool.replayssm_is_flush)
         # a model without GDN layers, such as the MTP draft
         draft = _view(eb.EagleBinding(model=torch.nn.Module()), _trtllm(KvPool()))
         self.assertIsNone(draft.gdn)
@@ -299,6 +324,43 @@ class TestEagleBinding(CustomTestCase):
             owner, _, attr = name.partition(".")
             if owner in members:
                 self.assertIn(attr, members[owner], name)
+
+    def test_pool_views_keep_layer_offsets_and_fp8_scales(self):
+        """Routed views use local indices; plain pools use model layer IDs.
+        Neither choice may change which layer's FP8 scales accompany its KV."""
+        keys = {i: torch.zeros(4, 2) for i in (3, 4)}
+        values = {i: torch.ones(4, 2) for i in (3, 4)}
+        plain = SimpleNamespace(
+            start_layer=3,
+            layer_num=2,
+            layer_transfer_counter=None,
+            get_key_buffer=keys.__getitem__,
+            get_value_buffer=values.__getitem__,
+        )
+        plain.layer_router = PlainPoolRouter(plain, "full")
+        for pool, layer_ids, expected_keys, expected_values in (
+            (plain, (3, 4), keys, values),
+            (KvPool(), (3, 7), None, None),
+        ):
+            with self.subTest(layer_ids=layer_ids):
+                if expected_keys is None:
+                    expected_keys, expected_values = pool.k, pool.v
+                model = torch.nn.ModuleList()
+                for i, layer_id in enumerate(layer_ids):
+                    layer = RadixAttention.__new__(RadixAttention)
+                    torch.nn.Module.__init__(layer)
+                    layer.layer_id = layer_id
+                    layer.k_scale_float, layer.v_scale_float = 0.25 + i, 0.5 + i
+                    model.append(layer)
+                backend = _trtllm(pool)
+                backend.data_type = torch.float8_e4m3fn
+                view = eb.kv_pool_buffers(pool=pool, backend=backend, model=model)
+                self.assertEqual(view.layer_ids, layer_ids)
+                self.assertEqual(view.k_scale, (0.25, 1.25))
+                self.assertEqual(view.v_scale, (0.5, 1.5))
+                for index, layer_id in enumerate(layer_ids):
+                    self.assertIs(view.k[index], expected_keys[layer_id])
+                    self.assertIs(view.v[index], expected_values[layer_id])
 
     def test_a_reallocated_pool_fails_assert_live_by_name(self):
         backend = _hybrid()

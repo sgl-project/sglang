@@ -24,6 +24,8 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -36,7 +38,7 @@ PAGE_SIZE = 128
 
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args):
+    def parent_init(self, *args, **kwargs):
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -46,7 +48,9 @@ def make_xqa_backend(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
-    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "resolve_window_kv_pool", lambda *args: None
+    )
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -514,8 +518,10 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     # matching the real __init__'s parent binding.
     backend.kv_index_translator = KVIndexTranslator(
         req_to_token=backend.req_to_token,
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=PAGE_SIZE,
         device="cpu",
     )
@@ -622,8 +628,8 @@ def _translate_through_a_moving_page_map(backend):
     """Give the backend a translating pool whose virtual->physical page map the
     test rewrites before every replay, so a page-table column the refill missed
     still holds an earlier replay's page."""
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 
     rows, width = backend.req_to_token.shape
     # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
@@ -1064,10 +1070,11 @@ def test_swa_cache_write_uses_metadata_slot_snapshot():
         raise AssertionError("cache writes must not read the live SWA mapping")
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend._swa_kv_pool = SimpleNamespace(
-        layers_mapping={1: (0, True)},
-        translate_loc_from_full_to_swa=translate_live_mapping,
+    swa_pool = SimpleNamespace(translate_loc_from_full_to_swa=translate_live_mapping)
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(IdSpaceKind.SLIDING_WINDOW, None, {1: 0})]
     )
+    backend._swa_kv_pool = swa_pool
     backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
     forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
 

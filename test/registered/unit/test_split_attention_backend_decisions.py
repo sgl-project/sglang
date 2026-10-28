@@ -204,33 +204,49 @@ class TestDraftFactoryStamping(CustomTestCase):
         runner = SimpleNamespace(draft_attention_backend=draft_backend)
         return DraftBackendFactory(runner, topk=1, speculative_num_steps=2)
 
+    def _backend(self, **fields):
+        """A built backend: it records the speculative mode the factory checks
+        it for (`AttentionBackend.require_spec_mode`)."""
+        from types import SimpleNamespace
+
+        backend = SimpleNamespace(checked=[], **fields)
+        backend.require_spec_mode = lambda runner, mode: backend.checked.append(mode)
+        return backend
+
     def test_a_decode_container_stamps_its_per_step_children(self):
         from types import SimpleNamespace
 
+        from sglang.srt.layers.attention.base_attn_backend import SpecMode
+
         self._publish(attention_backend="triton")
-        children = [SimpleNamespace(), SimpleNamespace()]
+        children = [self._backend(), self._backend()]
         container = SimpleNamespace(attn_backends=children)
         product = self._factory()._create_backend(
             "decode_attention_backend",
             {"triton": lambda: ("triton", container)},
             "unsupported {backend_type}",
-            stamps_children=True,
+            mode=SpecMode.DRAFT_DECODE,
         )
         # EAGLE's eager loop puts the children into the ForwardContext
         # directly, so an unstamped child answers with the target pair.
         for obj in [product, *children]:
             self.assertEqual(obj.prefill_attention_backend_str, "triton")
             self.assertEqual(obj.decode_attention_backend_str, "triton")
+        # Each step backend is checked for the draft decode it runs.
+        for child in children:
+            self.assertEqual(child.checked, [SpecMode.DRAFT_DECODE])
 
     def test_the_draft_override_wins_over_the_published_pair(self):
         from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.base_attn_backend import SpecMode
 
         self._publish(attention_backend="triton")
         product = self._factory(draft_backend="trtllm_mha")._create_backend(
             "decode_attention_backend",
             {"trtllm_mha": lambda: ("trtllm_mha", SimpleNamespace(attn_backends=[]))},
             "unsupported {backend_type}",
-            stamps_children=True,
+            mode=SpecMode.DRAFT_DECODE,
         )
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mha")
 
@@ -244,10 +260,11 @@ class TestDraftFactoryStamping(CustomTestCase):
         from unittest import mock
 
         from sglang.srt.layers.attention import attention_registry
+        from sglang.srt.layers.attention.base_attn_backend import SpecMode
 
         self._publish(attention_backend="triton")
         factory = self._factory(draft_backend="cutedsl_mla")
-        built = SimpleNamespace()
+        built = self._backend()
         factory._create_trtllm_mla_prefill_backend = lambda: ("trtllm_mla", built)
         wrapper = SimpleNamespace()
         with mock.patch.object(
@@ -257,6 +274,7 @@ class TestDraftFactoryStamping(CustomTestCase):
         ):
             product = factory.create_draft_extend_backend()
         self.assertIs(product, wrapper)
+        self.assertEqual(built.checked, [SpecMode.DRAFT_EXTEND])
         self.assertEqual(built.prefill_attention_backend_str, "trtllm_mla")
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mla")
         self.assertEqual(product.decode_attention_backend_str, "trtllm_mla")
@@ -269,13 +287,15 @@ class TestDraftFactoryStamping(CustomTestCase):
         # the name is a concrete kernel.
         from types import SimpleNamespace
 
+        from sglang.srt.layers.attention.base_attn_backend import SpecMode
+
         self._publish(attention_backend="hybrid_linear_attn")
-        concrete = SimpleNamespace(attn_backends=[SimpleNamespace()])
+        concrete = SimpleNamespace(attn_backends=[self._backend()])
         product = self._factory()._create_backend(
             "decode_attention_backend",
             {"hybrid_linear_attn": lambda: ("triton", concrete)},
             "unsupported {backend_type}",
-            stamps_children=True,
+            mode=SpecMode.DRAFT_DECODE,
         )
         self.assertEqual(product.prefill_attention_backend_str, "triton")
         self.assertEqual(

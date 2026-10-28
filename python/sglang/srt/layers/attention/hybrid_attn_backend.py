@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
+    SpecMode,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -56,10 +57,23 @@ class HybridAttnBackend(AttentionBackend):
     @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
-        backend = (
-            self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
-        )
-        return backend.supports_ragged_verify_graph
+        return self.target_verify_backend().supports_ragged_verify_graph
+
+    def target_verify_backend(self) -> AttentionBackend:
+        """The backend that runs target verify: the decode backend when
+        speculative_attention_mode is "decode", else the prefill backend."""
+        return self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
+
+    def require_spec_mode(self, model_runner: ModelRunner, mode: SpecMode) -> None:
+        # The child that runs ``mode`` answers for it, as `_select_backend`
+        # routes it.
+        if mode is SpecMode.TARGET_VERIFY:
+            backend = self.target_verify_backend()
+        elif mode is SpecMode.DRAFT_DECODE:
+            backend = self.decode_backend
+        else:
+            backend = self.prefill_backend
+        backend.require_spec_mode(model_runner, mode)
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -79,11 +93,7 @@ class HybridAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
         elif forward_mode.is_target_verify():
-            return (
-                self.decode_backend
-                if self.spec_attn_is_decode
-                else self.prefill_backend
-            )
+            return self.target_verify_backend()
         else:
             return self.prefill_backend
 

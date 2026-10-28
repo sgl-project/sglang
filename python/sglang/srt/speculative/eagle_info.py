@@ -4,8 +4,9 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -417,10 +418,12 @@ class EagleDraftExtendInput(SpecInput):
         paged_kernel_lens_sum: Optional[int],
         translator: KVIndexTranslator,
         plan: KVLocPlan,
+        kv_start_idx: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
         """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
-        draft-extend window."""
+        draft-extend window; ``kv_start_idx`` is each row's first column read
+        (a sliding window's start), None for column 0."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -451,6 +454,7 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
+            kv_start_idx=kv_start_idx,
             kind=kind,
             num_token_blocks=None,
             kv_lens_sum=host_kv_lens_sum,

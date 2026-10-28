@@ -179,15 +179,13 @@ class ForwardBatchDeepSeekMHAMixin:
         dense_metadata: bool = False,
     ):
 
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MLATokenToKVPool,
-        )
+        from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 
-        token_to_kv_pool = get_token_to_kv_pool()
-        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
-            isinstance(token_to_kv_pool, HybridLinearKVPool)
-            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+        # The prefix chunks gather one KV sub-pool's ids, which must be MLA.
+        router = get_token_to_kv_pool().layer_router
+        sub_pools = router.sub_pools()
+        assert len(sub_pools) == 1 and isinstance(
+            router.view(sub_pools[0].name), MLAKVView
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):

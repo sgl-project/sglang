@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.rust_tree_core.adapter import (
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     ComponentAction,
@@ -2370,20 +2371,18 @@ def _swa_transfer_core(
     has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-        UnifiedSWAAllocatorBase,
-    )
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
     from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
-    allocator = Mock(
-        spec=UnifiedSWAAllocatorBase if unified else SWATokenToKVPoolAllocator
-    )
+    allocator = Mock(spec=ChainAllocator if unified else SWATokenToKVPoolAllocator)
     allocator.device = torch.device("cpu")
     allocator.swa_req_ring = False
+    allocator.hands_out_virtual_ids = unified
+    allocator.has_window_pool = True
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,
@@ -2875,7 +2874,7 @@ def _swa_mamba_cache(
 
     _, allocator = _swa_cache(window=window, backend=backend)
     request_pool = Mock(spec=HybridReqToTokenPool)
-    request_pool.mamba_allocator = Mock()
+    allocator.state = Mock()
     with (
         get_context().override_server_args(
             _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -3824,7 +3823,7 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
     else:
         allocator = TokenToKVPoolAllocator(64, torch.bfloat16, "cpu", None, False)
         request_pool = Mock(spec=HybridReqToTokenPool)
-        request_pool.mamba_allocator = Mock()
+        allocator.state = Mock()
         with (
             get_context().override_server_args(
                 _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -4859,9 +4858,9 @@ def test_write_through_threshold_assignment_reaches_the_core():
 
 @pytest.mark.parametrize("backup_nodes", ["leaf", "parent_and_leaf", "parent"])
 def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
-    from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+    from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -5592,7 +5591,9 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
     )
     req.output_ids = array("q", [4, 5])
     req.finished_reason = "finished"
-    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    (req.kv.req_pool_idx,) = acquire_rows(
+        req_to_token_pool, req_to_token_pool.state, [req]
+    )
     req.lock = cache.lock(cache.root_node_handle())
     indices = allocator.alloc(5)
     assert indices is not None
