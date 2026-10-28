@@ -2613,6 +2613,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     tbo_split_seq_index: Optional[int] = None
+    # Every DP rank's first-micro-batch rows when this step runs TBO.
+    tbo_global_split_num_tokens: Optional[List[int]] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None

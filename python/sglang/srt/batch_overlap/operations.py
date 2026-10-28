@@ -135,7 +135,7 @@ class _StageExecutor:
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
             is_micro_batch=micro_batch,
             dp_global_num_tokens_bound=(
-                forward_batch.tbo_parent_global_num_tokens_cpu if micro_batch else None
+                forward_batch.tbo_dp_global_num_tokens_bound if micro_batch else None
             ),
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len

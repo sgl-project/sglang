@@ -136,6 +136,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     tp0_info_cpu=torch.tensor([[32, 32, 1, 0], [7, 7, 1, 0]]),
                     is_extend_in_batch=False,
                     tbo_split_seq_index=None,
+                    global_tbo_split_num_tokens=None,
                     global_forward_mode=ForwardMode.DECODE,
                     can_run_decode_cuda_graph=True,
                     can_run_draft_cuda_graph=True,
