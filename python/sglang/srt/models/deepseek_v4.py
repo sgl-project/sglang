@@ -1620,13 +1620,18 @@ class MQALayer(MqaAttentionBase):
         if not self.mega_wq_b_permuted:
             # The packed layout puts real heads where q_pad_buffer pads, so mega
             # keeps its own zeroed buffer; pack_query writes only the real heads.
-            out = self._zero_padded_q(
-                q,
-                kernel_num_heads,
-                attn_backend,
-                buffer_attr="q_mega_pad_buffer",
-                captured_attr="q_mega_pad_captured",
-            )
+            # A decoder tail graph keeps the metadata it captures with: the tail
+            # of an eager forward, which holds that forward's buffer. The tail
+            # graphs pack into fresh zeros of their own instead.
+            out = None
+            if not in_replay_tail_graph():
+                out = self._zero_padded_q(
+                    q,
+                    kernel_num_heads,
+                    attn_backend,
+                    buffer_attr="q_mega_pad_buffer",
+                    captured_attr="q_mega_pad_captured",
+                )
             q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             rows = q.shape[0]

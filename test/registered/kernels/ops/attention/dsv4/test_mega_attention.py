@@ -1,6 +1,7 @@
 import copy
 import itertools
 import unittest
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,7 +22,9 @@ from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     quantize_wo_a,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner import row_bucket_graph_runner
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.models import deepseek_v4_replay_tail
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4Model,
     MqaAttentionBase,
@@ -396,6 +399,116 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
                 self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
         self.assertEqual(meta.q_mega_pad_buffer.data_ptr(), warm_ptr)
         self.assertIs(tail.q_mega_pad_buffer, meta.q_mega_pad_buffer)
+
+    @contextmanager
+    def _row_bucket_runtime(self, backend):
+        # RowBucketGraphRunner on one GPU without the distributed runtime: a graph
+        # pool, a capture stream, a no-op TP barrier, and the backend whose
+        # metadata a recorded graph keeps.
+        pool, stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+
+        @contextmanager
+        def graph_capture(stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                yield SimpleNamespace(stream=stream)
+
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(barrier=lambda: None), tp_rank=0
+        )
+        runtime = {
+            "get_or_create_global_graph_memory_pool": lambda device_module: pool,
+            "get_or_create_global_graph_capture_stream": lambda: stream,
+            "set_graph_pool_id": lambda pool_id: None,
+            "graph_capture": graph_capture,
+            "get_parallel": lambda: parallel,
+            "get_attn_backend": lambda: backend,
+            "graph_pool_capture_scope": nullcontext,
+            "graph_pool_replay_scope": nullcontext,
+        }
+        with ExitStack() as stack:
+            for name, value in runtime.items():
+                stack.enter_context(patch.object(row_bucket_graph_runner, name, value))
+            yield
+
+    def test_tail_graph_leaves_the_forward_buffer_to_the_forward(self):
+        # A decoder tail graph (deepseek_v4_replay_tail) captures on first use,
+        # inside an eager prefill's late-layer tail, and keeps the metadata it
+        # captured with: that forward's tail metadata, which holds the forward's
+        # buffer. The buffer must still be freed when the forward ends, and the
+        # graph must keep packing exactly once that memory is reused.
+        torch.manual_seed(6)
+        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
+        forward_batch = prefill_forward_batch()
+        forward_batch.attn_tp_sequence_sharded = False
+        tokens, tail_rows = 1024, 100
+        queries = [
+            torch.randn(tokens, 16, 512, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        tail_queries = [
+            torch.randn(tail_rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        backend.forward_metadata = new_metadata()
+        backend.tail_forward_metadata = new_tail_metadata()
+        # 64-row buckets up to 256: the 100 tail rows replay the 128-row graph,
+        # captured after the 256- and 192-row ones (largest first).
+        runner = row_bucket_graph_runner.RowBucketGraphRunner(
+            row_step=64, max_rows=256, label="test"
+        )
+
+        def body(inputs, batch):
+            for q in inputs:
+                layer._forward_mega(q, 64, None, batch, backend)
+            return []
+
+        def run_tail():
+            runner.run(
+                key=(),
+                live=tail_queries,
+                forward_batch=forward_batch,
+                body=body,
+                context=lambda batch: deepseek_v4_replay_tail._replay_tail_scope(),
+            )
+
+        buffer_bytes, allocated_at_end = [], []
+
+        def run_layers():
+            for q in queries:
+                self._forward(layer, backend, q, 64, ForwardMode.EXTEND)
+            saved = backend.enter_late_layer_tail(forward_batch)
+            run_tail()
+            backend.exit_late_layer_tail(saved, forward_batch)
+            buffer_bytes.append(backend.forward_metadata.q_mega_pad_buffer.nbytes)
+            torch.cuda.synchronize()
+            allocated_at_end.append(torch.cuda.memory_allocated())
+
+        with self._row_bucket_runtime(backend):
+            self._model_forward(backend, forward_batch, run_layers)
+            torch.cuda.synchronize()
+            freed = allocated_at_end[0] - torch.cuda.memory_allocated()
+            # The eager layers' packs, then three captures (two warmups each) of
+            # the tail's two layers; the 128-row graph's capture comes last.
+            self.assertEqual(len(layer.packed), 2 + 3 * 3 * 2)
+            for q, p in zip(queries, layer.packed[:2], strict=True):
+                self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
+            graph_packed = layer.packed[-2:]
+            self.assertEqual(buffer_bytes, [tokens * 64 * 512 * 2])
+            self.assertEqual(freed, buffer_bytes[0])
+            # The freed buffer's memory goes back to this stream and this tensor.
+            _poison = torch.full(
+                (tokens, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
+            )
+            for _ in range(2):
+                for q in tail_queries:
+                    q.copy_(torch.randn_like(q))
+                run_tail()
+                torch.cuda.synchronize()
+                for q, p in zip(tail_queries, graph_packed, strict=True):
+                    self.assertTrue(
+                        torch.equal(p[:tail_rows], pack_query_reference(q, 64))
+                    )
 
 
 @unittest.skipUnless(
