@@ -580,6 +580,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     dp_spec_prefill_coordination_applied: bool = False
     can_run_decode_cuda_graph: bool = False
+    can_reuse_lora_routing: bool = False
     # Draft-only companion to the generic DP decode graph vote.
     can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
@@ -1081,6 +1082,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
+            can_reuse_lora_routing=(
+                batch.can_reuse_lora_routing and not model_runner.is_draft_worker
+            ),
             can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,

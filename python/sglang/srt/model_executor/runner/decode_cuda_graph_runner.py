@@ -239,6 +239,7 @@ def build_replay_fb_view(
             else forward_batch.lora_ids + [None] * (bs - len(forward_batch.lora_ids))
         ),
         can_run_decode_cuda_graph=forward_batch.can_run_decode_cuda_graph,
+        can_reuse_lora_routing=forward_batch.can_reuse_lora_routing,
         global_num_tokens_cpu=global_num_tokens_cpu,
         dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
     )

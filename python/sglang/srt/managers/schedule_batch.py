@@ -2607,6 +2607,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
+    can_reuse_lora_routing: bool = False
     # Rank-consistent EAGLE draft replay gate. Keep it separate so missing
     # draft-only state does not disable target verification or draft extend.
     can_run_dp_draft_cuda_graph: bool = False
@@ -4025,6 +4026,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_reuse_lora_routing=self.can_reuse_lora_routing,
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,

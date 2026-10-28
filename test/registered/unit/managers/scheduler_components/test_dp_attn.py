@@ -67,6 +67,9 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
+                    lora_manager=SimpleNamespace(
+                        can_reuse_dp_lora_routing=lambda batch: True
+                    ),
                 ),
                 get_idle_batch=Mock(
                     side_effect=AssertionError("DP1 must not emit idle batch")
@@ -79,6 +82,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
 
         all_gather.assert_not_called()
         self.assertEqual(result.global_num_tokens, [4])
+        self.assertFalse(result.can_reuse_lora_routing)
         self.assertEqual(result.tbo_split_seq_index, 2)
         self.assertEqual(result.global_forward_mode, ForwardMode.DECODE)
         self.assertEqual(result.recv_skipper_forward_mode, ForwardMode.DECODE)
@@ -86,6 +90,71 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             tbo_preparer.compute_output.call_args.args[0].tolist(),
             [[1, ForwardMode.DECODE.value]],
         )
+
+    def test_lora_reuse_requires_every_rank_and_graph_eligible_batch(self):
+        # DP2 x TP2 x CP2: a veto from a non-TP0/CP0 rank must survive
+        # even though ordinary scheduler metadata only reads replica rank 0.
+        world = 8
+        for veto_rank, inactive_rank in ((None, None), (7, None), (None, 7)):
+            with self.subTest(veto_rank=veto_rank, inactive_rank=inactive_rank):
+                infos = [
+                    dp_attn.MLPSyncBatchInfo(
+                        num_dp_ranks=2,
+                        tp_size=2,
+                        cp_size=2,
+                        num_tokens=4,
+                        num_tokens_for_logprob=4,
+                        can_run_decode_cuda_graph=True,
+                        can_run_draft_cuda_graph=True,
+                        can_run_prefill_cuda_graph=False,
+                        is_extend_in_batch=False,
+                        local_can_run_tbo=False,
+                        local_forward_mode=ForwardMode.DECODE.value,
+                        can_reuse_lora_routing=rank != veto_rank,
+                    )
+                    for rank in range(world)
+                ]
+                rows = torch.cat([i._get_local_tensor("cpu") for i in infos])
+                active = torch.ones(world, dtype=torch.int64)
+                if inactive_rank is not None:
+                    active[inactive_rank] = 0
+                parallel = SimpleNamespace(
+                    tp_group=SimpleNamespace(active_ranks_cpu=active)
+                )
+                with (
+                    patch.object(dp_attn, "get_parallel", return_value=parallel),
+                    patch.object(
+                        dp_attn,
+                        "exchange_sync_rows",
+                        side_effect=lambda output, *a, **kw: output.copy_(rows),
+                    ),
+                    envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(False),
+                ):
+                    for info in infos:
+                        info.all_gather(device="cpu", group=None)
+                        for skip_metadata, graph, extend in (
+                            (False, True, False),
+                            (True, True, False),
+                            (False, False, False),
+                            (False, True, True),
+                        ):
+                            info.can_run_decode_cuda_graph = graph
+                            info.is_extend_in_batch = extend
+                            batch = SimpleNamespace(can_reuse_lora_routing=True)
+                            dp_attn._update_gather_batch(
+                                batch,
+                                info,
+                                require_mlp_tp_gather=True,
+                                skip_global_metadata=skip_metadata,
+                            )
+                            self.assertEqual(
+                                batch.can_reuse_lora_routing,
+                                veto_rank is None
+                                and inactive_rank is None
+                                and not skip_metadata
+                                and graph
+                                and not extend,
+                            )
 
 
 class TestDPBalanceStats(CustomTestCase):
@@ -171,6 +240,7 @@ class TestDPBalanceStats(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
+                    lora_manager=None,
                 ),
                 get_idle_batch=get_idle_batch
                 or Mock(side_effect=AssertionError("local batch must not be replaced")),
@@ -618,6 +688,7 @@ def _exchange_worker(rank, world, port, out_q):
                     local_can_run_tbo=False,
                     local_forward_mode=ForwardMode.DECODE.value,
                     attention_pairs=1000 * (rank + 1) + round_idx,
+                    can_reuse_lora_routing=(round_idx == 0 or rank != sub - 1),
                 )
                 local = info._get_local_tensor(device="cpu")
                 reference = torch.zeros(sub * local.numel(), dtype=torch.int64)
@@ -646,6 +717,7 @@ def _exchange_worker(rank, world, port, out_q):
                         info.global_num_tokens,
                         info.global_attention_pairs,
                         info.can_run_decode_cuda_graph,
+                        info.can_reuse_lora_routing,
                     )
                 )
     finally:
@@ -677,10 +749,10 @@ class TestSyncRowExchangeGloo(CustomTestCase):
             for proc in procs:
                 proc.start()
             for _ in range(sum(_EXCHANGE_WORLDS) * _EXCHANGE_ROUNDS):
-                sub, round_idx, rank, same, tokens, pairs, graph = out_q.get(
+                sub, round_idx, rank, same, tokens, pairs, graph, reuse = out_q.get(
                     timeout=240
                 )
-                results[(sub, round_idx, rank)] = (same, tokens, pairs, graph)
+                results[(sub, round_idx, rank)] = (same, tokens, pairs, graph, reuse)
             for proc in procs:
                 proc.join(timeout=60)
                 self.assertEqual(proc.exitcode, 0)
@@ -693,7 +765,7 @@ class TestSyncRowExchangeGloo(CustomTestCase):
         for sub in _EXCHANGE_WORLDS:
             for round_idx in range(_EXCHANGE_ROUNDS):
                 for rank in range(sub):
-                    same, tokens, pairs, graph = results[(sub, round_idx, rank)]
+                    same, tokens, pairs, graph, reuse = results[(sub, round_idx, rank)]
                     self.assertTrue(
                         same, f"world {sub} round {round_idx} rank {rank} differs"
                     )
@@ -705,6 +777,8 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     )
                     # One rank votes eager each round; the min reaches every rank.
                     self.assertFalse(graph)
+                    # One routing change forces every participant to rebuild.
+                    self.assertEqual(reuse, round_idx == 0)
 
 
 if __name__ == "__main__":

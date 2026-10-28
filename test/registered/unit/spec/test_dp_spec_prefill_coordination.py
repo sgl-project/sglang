@@ -138,6 +138,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     tbo_split_seq_index=None,
                     global_forward_mode=ForwardMode.DECODE,
                     can_run_decode_cuda_graph=True,
+                    can_reuse_lora_routing=False,
                     can_run_draft_cuda_graph=True,
                     can_run_prefill_cuda_graph=False,
                     prefill_cuda_graph_max_prefix_len=0,

@@ -46,6 +46,7 @@ from sglang.srt.lora.utils import (
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -493,6 +494,15 @@ class LoRAManager:
 
     def reset_routing_cache(self) -> None:
         self.lora_backend.reset_routing_cache()
+
+    def can_reuse_dp_lora_routing(self, batch: Optional[ScheduleBatch]) -> bool:
+        """Vote that local cached routing inputs are unchanged for this step.
+
+        Managers that cache distributed routing may override this hook. A
+        unanimous vote is carried to prepare_lora_batch, where the manager must
+        still validate the globally selected batch shape before reusing routing.
+        """
+        return False
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Some internal-only backends (currently UNO) use explicit token-row
