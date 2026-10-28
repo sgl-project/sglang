@@ -47,13 +47,14 @@ enum BreakerOutcome {
     /// since a 2xx head can still be followed
     /// by a body that never completes.
     Success,
-    /// A real fault (5xx other than backpressure) → `record_failure`: count
+    /// A real fault (5xx other than 500 / 503) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure or a router-side stream expiry or abort →
-    /// `record_backpressure`: never opens the breaker and, while Closed, leaves
-    /// an in-progress failure streak intact — but still resolves a half-open
-    /// probe so a recovered-but-busy worker isn't wedged shut.
+    /// The worker answered but declined this request — backpressure (503 / 429)
+    /// or a per-request engine exception (500) — or a router-side stream expiry
+    /// or abort → `record_backpressure`: never opens the breaker and, while
+    /// Closed, leaves an in-progress failure streak intact — but still resolves
+    /// a half-open probe so a recovered worker isn't wedged shut.
     Neutral,
 }
 
@@ -76,21 +77,31 @@ impl BreakerOutcome {
 /// worker the router then sheds *every* request for the whole cool-down —
 /// including after the engine has drained and gone idle. So backpressure is
 /// [`Neutral`](BreakerOutcome::Neutral) (see [`CircuitBreaker::record_backpressure`]
-/// for its exact effect per breaker state). Genuine 5xx faults (500 / 502 /
-/// 504 / …) still count as failures, and transport errors / timeouts /
-/// mid-body drops are recorded as failures at the call sites — as are a
-/// malformed discovery URL (`parse_worker_url`) and a stream whose body dies
-/// after a 2xx head.
+/// for its exact effect per breaker state). Other 5xx faults (502 / 504 / …)
+/// still count as failures, and transport errors / timeouts / mid-body drops
+/// are recorded as failures at the call sites — as are a malformed discovery
+/// URL (`parse_worker_url`) and a stream whose body dies after a 2xx head.
 ///
-/// Tradeoff: because 503 never opens the breaker, a worker stuck returning 503
-/// indefinitely (a wedged engine, not transient load) is NOT detected here —
-/// HTTP status alone can't distinguish "busy" from "broken-and-saying-503", and
-/// counting it caused the worse fleet-wide false-shed above. Detecting a
-/// chronically-backpressuring worker is left to higher-level signals.
+/// `500 Internal Server Error` is Neutral too: the engine answered, so it is
+/// responsive. SGLang returns 500 for an exception raised while handling ONE
+/// request (a multimodal processor bug, a template error) and keeps serving
+/// everything else. Counting it let three replays of one bad request eject a
+/// healthy worker for the whole cool-down (MiniMax-M3.1: a video processor bug
+/// turned two healthy workers into `no_healthy_workers` for all traffic). A
+/// dead engine still trips the breaker through transport errors / timeouts.
+///
+/// Tradeoff: because 503 / 500 never open the breaker, a worker stuck returning
+/// them indefinitely (a wedged engine, not transient load or one bad request)
+/// is NOT detected here — HTTP status alone can't distinguish "busy" or "this
+/// request failed" from "broken-and-saying-so", and counting them caused the
+/// worse fleet-wide false-shed above. Detecting a chronically-failing worker is
+/// left to higher-level signals (health checks, readiness probes).
 fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
     use reqwest::StatusCode;
     match status {
-        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => BreakerOutcome::Neutral,
+        StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::INTERNAL_SERVER_ERROR => BreakerOutcome::Neutral,
         s if s.is_server_error() => BreakerOutcome::Failure,
         _ => BreakerOutcome::Success,
     }
@@ -604,12 +615,13 @@ mod tests {
             breaker_outcome(StatusCode::TOO_MANY_REQUESTS),
             BreakerOutcome::Neutral,
         );
+        // A per-request engine exception: responsive, not a worker fault.
+        assert_eq!(
+            breaker_outcome(StatusCode::INTERNAL_SERVER_ERROR),
+            BreakerOutcome::Neutral,
+        );
         // Genuine faults: still failures.
-        for s in [
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::GATEWAY_TIMEOUT,
-        ] {
+        for s in [StatusCode::BAD_GATEWAY, StatusCode::GATEWAY_TIMEOUT] {
             assert_eq!(breaker_outcome(s), BreakerOutcome::Failure, "{s}");
         }
         // Non-5xx (incl. 4xx client errors): treated as success.
@@ -823,13 +835,45 @@ mod tests {
         );
     }
 
-    /// Contrast guard, so the backpressure carve-out cannot disable fault
-    /// detection: a genuine 5xx fault (500) MUST still open the breaker. Loops
+    /// An engine answering 500 for a request it can't process (a per-request
+    /// processor exception) is still healthy: replaying that request past the
+    /// threshold must leave the breaker Closed, and the client still sees 500.
+    #[tokio::test]
+    async fn engine_500_does_not_trip_breaker() {
+        let (url, _shutdown) = spawn_status_worker(500).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = CircuitBreaker::new();
+        let headers = HeaderMap::new();
+
+        for i in 0..6 {
+            let resp = proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                    None,
+                )
+                .await
+                .expect("dispatch must reach the worker (breaker stays closed)");
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "iter {i}");
+        }
+        assert_eq!(
+            breaker.snapshot().state_code,
+            0,
+            "per-request 500s must leave the breaker Closed",
+        );
+    }
+
+    /// Contrast guard, so the 503 / 500 carve-outs cannot disable fault
+    /// detection: a genuine 5xx fault (502) MUST still open the breaker. Loops
     /// on `would_allow()` rather than a fixed count so the test stays correct if
     /// the default `CircuitBreakerConfig` threshold changes.
     #[tokio::test]
-    async fn engine_500_still_trips_breaker() {
-        let (url, _shutdown) = spawn_status_worker(500).await;
+    async fn engine_502_still_trips_breaker() {
+        let (url, _shutdown) = spawn_status_worker(502).await;
         let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
         let breaker = CircuitBreaker::new();
         let headers = HeaderMap::new();
@@ -853,7 +897,7 @@ mod tests {
         assert_eq!(
             breaker.snapshot().state_code,
             1,
-            "a run of 500s must open the breaker (fault detection still works)",
+            "a run of 502s must open the breaker (fault detection still works)",
         );
     }
 

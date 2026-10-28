@@ -173,6 +173,16 @@ impl CircuitBreaker {
         g.state = State::Closed;
     }
 
+    /// Force the breaker Closed with a clean failure streak, whatever its state.
+    /// Used by [`crate::workers::registry::WorkerRegistry::healthy_workers_for`]
+    /// to fail open when every worker's breaker is shut. A probe still in
+    /// flight resolves normally against the Closed breaker.
+    pub fn reset(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.consecutive_failures = 0;
+        g.state = State::Closed;
+    }
+
     pub fn record_failure(&self) {
         if !self.enabled {
             return;

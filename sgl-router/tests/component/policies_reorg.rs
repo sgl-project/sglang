@@ -146,6 +146,13 @@ async fn groups_isolate_model_health_stage_and_membership() {
         "b"
     );
     workers.remove(&WorkerId("b".into()));
+    // Only the breaker-open worker is left: the registry fails open to it
+    // rather than answering no candidates (`WorkerRegistry::healthy_workers_for`).
+    assert_eq!(
+        group.pick(&workers, &request).await.unwrap().engine.id.0,
+        "unhealthy"
+    );
+    workers.remove(&WorkerId("unhealthy".into()));
     assert!(matches!(
         group.pick(&workers, &request).await,
         Err(PickError::NoCandidates)

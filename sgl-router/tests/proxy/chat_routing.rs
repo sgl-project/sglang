@@ -1316,7 +1316,8 @@ async fn forward_json_to_records_failure_on_5xx() {
     use std::time::Duration;
 
     let worker = crate::common::mock_worker::MockWorker::start_returning_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
+        // 502, a genuine fault; a 500 is a per-request engine error and stays neutral.
+        StatusCode::BAD_GATEWAY,
         serde_json::json!({"error": {"type": "x"}}),
     )
     .await;
