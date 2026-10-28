@@ -171,7 +171,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             intake.add_request_to_queue(req)
 
         intake.mode_owners.disagg_decode.prealloc_queue.add.assert_not_called()
-        intake.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        intake.request_retirer.output_streamer.send_abort_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
     def test_priority_rejection_releases_early_prefetch(self):
@@ -254,15 +254,15 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 ):
                     intake.add_request_to_queue(preempted, admitted={admitted})
 
-                send_output = intake.ipc_channels.send_to_tokenizer.send_output
+                send_abort = intake.request_retirer.output_streamer.send_abort_output
                 if expected_abort is None:
-                    send_output.assert_not_called()
+                    send_abort.assert_not_called()
                     self.assertEqual(
                         intake.lists.waiting_queue, [admitted, queued, preempted]
                     )
                 else:
-                    send_output.assert_called_once()
-                    self.assertIs(send_output.call_args.args[1], queued)
+                    send_abort.assert_called_once()
+                    self.assertIs(send_abort.call_args.args[1], queued)
                     self.assertEqual(intake.lists.waiting_queue, [admitted, preempted])
 
 
