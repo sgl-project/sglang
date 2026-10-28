@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.utils import (
     get_hash_str,
     get_storage_hash_str,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -319,6 +320,31 @@ class TestKVCRStorage(CustomTestCase):
         )
         self.stub.start()
         self.addCleanup(self.stub.stop)
+
+    def test_replica_dp_storage_config_disambiguates_hint_sources(self):
+        """Independent DP replicas must not advertise the same source address."""
+        controller = object.__new__(HiCacheController)
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = self.pool
+        controller.storage_host_pool = self.pool
+        controller.mem_pool_host.storage_format_tag = None
+        controller.attn_cp_group = None
+        controller.enable_storage_metrics = False
+        sources = []
+        with get_context().override_server_args(tp_size=2, dp_size=2):
+            for rank in (0, 1):
+                with get_parallel().override(tp_rank=0, pp_rank=0, dp_rank=rank):
+                    config = controller._generate_storage_config(
+                        "glm-test", {"control_advertise_host": "source.example"}
+                    )
+                    backend = KVCRStore(config, self.pool)
+                    self.addCleanup(backend.close)
+                    sources.append(backend.get_kv_hint_source())
+        self.assertEqual([source["dp_rank"] for source in sources], [0, 1])
+        self.assertEqual(
+            [source["source_control_endpoint"] for source in sources],
+            ["tcp://source.example:32100", "tcp://source.example:32102"],
+        )
 
     def test_hint_source_uses_backend_resolved_address_without_starting_io(self):
         config = copy.copy(self.config)

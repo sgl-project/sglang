@@ -747,7 +747,7 @@ class HiCacheController:
         else:
             tp_rank = parallel.tp_rank
             tp_size = parallel.tp_size
-            dp_rank = 0
+            dp_rank = parallel.dp_rank if parallel.dp_rank is not None else 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
