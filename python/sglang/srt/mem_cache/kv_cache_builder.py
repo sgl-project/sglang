@@ -125,6 +125,20 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
+    if draft_plan.mode == HiCacheDraftMode.FUSED:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            validate_fused_hicache_draft,
+        )
+
+        validate_fused_hicache_draft(
+            draft_device_pools=draft_plan.device_pools, tree_cache=tree_cache
+        )
+        logger.info(
+            "HiCache fused draft KV uses the target FULL page envelopes "
+            "(%d draft layers); no draft host sidecar is allocated.",
+            draft_plan.device_pools[0].layer_num,
+        )
+        return
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
@@ -409,6 +423,12 @@ def build_kv_cache(
         draft_swa_window=draft_swa_window,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
+        sidecar_draft_device_pools=(
+            hicache_draft_plan.device_pools
+            if hicache_draft_plan is not None
+            and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
+            else ()
+        ),
     )
     if params.swa_retain_window != sliding_window_size:
         logger.info(

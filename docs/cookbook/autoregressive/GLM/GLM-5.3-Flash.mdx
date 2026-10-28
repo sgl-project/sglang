@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
 tag: NEW
 ---
 
@@ -29,6 +29,57 @@ cp python/pyproject_tpu.toml python/pyproject.toml
 pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
 pip install --no-deps -e .
 ```
+
+</Accordion>
+
+<Accordion title="Install and prepare Ascend NPUs">
+
+Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environment. Follow the
+[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[GLM-5.3-Flash deployment tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash#installation) to start a container with the NPU devices, driver mounts, and checkpoint directory. Run the setup and the generated **Python** command inside that container.
+
+<Tabs>
+<Tab title="A3">
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash
+```
+
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+```
+
+</Tab>
+<Tab title="950PR/DT series">
+
+Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify a 950PR/DT series image tag.
+
+```bash Command
+NPU_IMAGE="<your-compatible-950pr-dt-series-image>"
+docker pull "$NPU_IMAGE"
+```
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/memfabric_hybrid/set_env.sh
+```
+
+</Tab>
+</Tabs>
+
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
+
+Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for 950PR/DT series.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
 
 </Accordion>
 
