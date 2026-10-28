@@ -632,8 +632,10 @@ def _use_fused_index_topk(
         and block_size_q == 1
     ):
         return False
-    from .index_topk_gfx950 import can_fuse_index_topk
-
+    try:
+        from .index_topk_gfx950 import can_fuse_index_topk
+    except ImportError:  # Gluon without the CDNA4 MFMA op
+        return False
     return can_fuse_index_topk(q, k_cache, topk, local_blocks, page_size, block_size_k)
 
 
