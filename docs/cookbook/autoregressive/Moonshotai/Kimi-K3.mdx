@@ -170,13 +170,40 @@ not been re-measured on any cell — re-measure before you rely on one.
 
 Capacity levers, all in the Playground. Each trades precision or cache behavior for capacity — re-verify accuracy on your workload:
 
-| Lever | Effect |
-|---|---|
-| `--mamba-radix-cache-strategy extra_buffer_lazy` | 4 state slots per request instead of 5 |
-| `--mamba-ssm-dtype bfloat16` | ~halves state bytes; with spec on, KDA verification falls back from the fused kernel to Triton |
-| `--kv-cache-dtype fp8_e4m3` | halves KV bytes per token; under PD both roles must match at connect |
-| `--mem-fraction-static` 0.90–0.92 | cheapest first win when the boot log shows a large idle `avail mem` |
-| `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` | frees one more slot per request (experimental, under validation) |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.8%"}} />
+    <col style={{width: "66.2%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Lever</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--mamba-radix-cache-strategy extra_buffer_lazy</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 state slots per request instead of 5</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--mamba-ssm-dtype bfloat16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>~halves state bytes; with spec on, KDA verification falls back from the fused kernel to Triton</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--kv-cache-dtype fp8_e4m3</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>halves KV bytes per token; under PD both roles must match at connect</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--mem-fraction-static</code> 0.90–0.92</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>cheapest first win when the boot log shows a large idle <code>avail mem</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>frees one more slot per request (experimental, under validation)</td>
+    </tr>
+  </tbody>
+</table>
 
 Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request — the calculator folds this in — and an unset `--max-running-requests` resets to 48 under spec (the command panel reminds you; set it explicitly to raise).
 
@@ -190,17 +217,67 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 
 **Per-platform notes:**
 
-| Platform | Topology | Notes |
-|---|---|---|
-| B300 1×8 | TP8 (+DCP8) | accuracy-first defaults on Low-Latency and Balanced |
-| GB300 2×4 | TP8/DCP8 | MNNVL transport and cuMem auto-detected |
-| B200 2×8 | PP2 × TP8 on Low-Latency, PP2 × DCPEP8 on Balanced and High-Throughput. DSPARK re-lays the same 16 GPUs as TP16 / TP16+DCP16+EP16. PD prefill is TP1 × PP16 | Unified serves all three operating points; `Long-Context` is a `Prefill`-only strategy |
-| GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
-| H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
-| H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8/DCP8 ROCm/AITER (Unified Balanced) | AITER A8W4 FlyDSL MoE, AITER prefill/decode attention with sharded target MLA KV, graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
-| Ascend A3 Series 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | `Unified` plus an asymmetric 2P4D PD split — 2-node prefill (TP16/PP2/DP2, NOSPEC, no CUDA graph) + 4-node decode (TP64/DP4, DSPARK); pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
-| Ascend 950PR/DT Series 4×8 | TP32/dp1 + DeepEP | `Unified` only; DSPARK baked in; shared experts / dense MLP shard over attention-TP (`--shared-experts-tp-size 4`); radix cache off; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "14.6%"}} />
+    <col style={{width: "42.7%"}} />
+    <col style={{width: "42.7%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Platform</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Topology</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300 1×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP8 (+DCP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>accuracy-first defaults on Low-Latency and Balanced</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB300 2×4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP8/DCP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MNNVL transport and cuMem auto-detected</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200 2×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PP2 × TP8 on Low-Latency, PP2 × DCPEP8 on Balanced and High-Throughput. DSPARK re-lays the same 16 GPUs as TP16 / TP16+DCP16+EP16. PD prefill is TP1 × PP16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unified serves all three operating points; <code>Long-Context</code> is a <code>Prefill</code>-only strategy</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB200 4×4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP16/DCP16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MNNVL auto-detected</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200 2×8 (4×8 on Unified High-Throughput)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with <code>extra_buffer_lazy</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>same block on every node; export the cross-node NIC (<code>GLOO_SOCKET_IFNAME</code> / <code>NCCL_SOCKET_IFNAME</code>, <code>SGLANG_HOST_IP</code>); keep <code>NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100 4×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP32/EP32, Marlin + FlashMLA</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI350X/MI355X 1×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP8/DCP8 ROCm/AITER (Unified Balanced)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AITER A8W4 FlyDSL MoE, AITER prefill/decode attention with sharded target MLA KV, graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: <a href="#amd-env">AMD ROCm/AITER environment</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Ascend A3 Series 4×8 (32 cards / 64 dies)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP64/DP4 + DeepEP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>Unified</code> plus an asymmetric 2P4D PD split — 2-node prefill (TP16/PP2/DP2, NOSPEC, no CUDA graph) + 4-node decode (TP64/DP4, DSPARK); pin <code>GLOO</code>/<code>HCCL_SOCKET_IFNAME</code> on every node</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Ascend 950PR/DT Series 4×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TP32/dp1 + DeepEP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>Unified</code> only; DSPARK baked in; shared experts / dense MLP shard over attention-TP (<code>--shared-experts-tp-size 4</code>); radix cache off; pin <code>GLOO</code>/<code>HCCL_SOCKET_IFNAME</code> on every node</td>
+    </tr>
+  </tbody>
+</table>
 
 **Blackwell DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 
@@ -216,12 +293,42 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 
 **AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
 
-| Env var | Default | Effect |
-|---|---|---|
-| `AITER_SITUV2_A8W4=1` | unset | SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships. |
-| `AITER_SITUV2_A4W4=1` | unset | A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting **both** gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout. |
-| `SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
-| `SGLANG_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "23.8%"}} />
+    <col style={{width: "4.8%"}} />
+    <col style={{width: "71.4%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Env var</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>AITER_SITUV2_A8W4=1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>AITER_SITUV2_A4W4=1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting <strong>both</strong> gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Which FlyDSL implementation backs the fused decode: <code>auto</code> prefers SGLang's vendored kernels and falls back to the AITER module, <code>sglang</code> / <code>aiter</code> pin one. Leave it alone unless you are bisecting the two.</td>
+    </tr>
+  </tbody>
+</table>
 
 The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
 
@@ -323,11 +430,32 @@ PD splits prefill and decode into separate server groups; because K3 is hybrid, 
 
 The A3 Series disaggregates over the **Ascend memory fabric** (`--disaggregation-transfer-backend ascend`) in an asymmetric **2P4D** pool layout:
 
-| Pool layout | A3 Series (2P4D) |
-|---|---|
-| Prefill pool | 2 nodes, TP16 × PP2 × DP2, NOSPEC, no CUDA graph |
-| Decode pool | 4 nodes, TP64 × DP4, DSPARK, decode graph at bs 16 |
-| Total | 6 nodes |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "19.4%"}} />
+    <col style={{width: "80.6%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Pool layout</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>A3 Series (2P4D)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Prefill pool</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2 nodes, TP16 × PP2 × DP2, NOSPEC, no CUDA graph</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Decode pool</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 nodes, TP64 × DP4, DSPARK, decode graph at bs 16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Total</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>6 nodes</td>
+    </tr>
+  </tbody>
+</table>
 
 - Every rank of **both** pools registers its transfer buffers against a store served from the **prefill head node** (`ASCEND_MF_STORE_URL`) — set the prefill head's IP on the decode nodes too, not just the prefill pool.
 - The A3 prefill role is **pipelined** (PP2) and runs NOSPEC — the Spec Decode overlay ships DSPARK on the flat recipes here; newer releases admit it behind a PD prefill ([sgl-project/sglang#40045](https://github.com/sgl-project/sglang/pull/40045)), but no measured A3 command uses it yet.
@@ -369,12 +497,36 @@ processor rejects video and audio input.
 Use **VLM Transport** in the command picker. `Auto` is a topology-aware starting
 point, not a claim that one configuration is fastest for every workload.
 
-| Picker selection | Processor-to-scheduler feature path |
-|---|---|
-| Auto · single-node Unified CUDA | CUDA IPC |
-| Auto · Unified GB200/GB300 | CUDA VMM when IMEX is available; CPU otherwise |
-| Auto · PD or other topologies | CPU |
-| CPU | CPU, with no GPU feature pool |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "40.3%"}} />
+    <col style={{width: "59.7%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Picker selection</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Processor-to-scheduler feature path</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Auto · single-node Unified CUDA</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA IPC</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Auto · Unified GB200/GB300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA VMM when IMEX is available; CPU otherwise</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Auto · PD or other topologies</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CPU</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CPU, with no GPU feature pool</td>
+    </tr>
+  </tbody>
+</table>
 
 CUDA IPC and CUDA VMM reserve up to `SGLANG_MM_FEATURE_CACHE_MB` (1 GiB by
 default) on the base GPU and fall back to CPU per tensor when full. This setting
@@ -383,13 +535,40 @@ does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults t
 
 #### VLM compatibility
 
-| Feature | K3 behavior |
-|---|---|
-| PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
-| EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
-| MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
-| MM feature transport | Processor-to-scheduler features only. EPD encoder output and PD KV/KDA transfer use their own backends. |
-| ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "14.3%"}} />
+    <col style={{width: "85.7%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Feature</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>K3 behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PD</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in <a href="#pd-disaggregation">PD disaggregation</a>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>EPD</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Supported on the public <code>kimi-k3</code> branch. Use an <code>--encoder-only</code> vision role and a <code>--language-only</code> prefill role; add the normal decode role for full EPD. See the <a href="../../../docs/advanced_features/epd_disaggregation">EPD guide</a>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MM encoder DP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Built in. K3 shards complete images across TP ranks, so leave <code>--mm-enable-dp-encoder</code> unset in unified, PD-prefill, and encoder-only roles.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MM feature transport</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Processor-to-scheduler features only. EPD encoder output and PD KV/KDA transfer use their own backends.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ViT BCG</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below.</td>
+    </tr>
+  </tbody>
+</table>
 
 #### Should ViT BCG be enabled?
 
@@ -430,10 +609,32 @@ sglang serve \
 
 Two presets come out of this, at `N = 8k` GPUs:
 
-| Preset | What it trades | Pick it for |
-|---|---|---|
-| **Peak Throughput** — `dp = k`, attention-TP 8 | State shards 8-way. The per-step KDA all-reduce stays within one 8-GPU B200/B300 node, or spans two 4-GPU GB200/GB300 nodes over MNNVL. `--kv-cache-dtype fp8_e4m3` is load-bearing — bf16 KV does not fit 128 requests per replica. | Maximum sustained TPS — the default large-scale shape. |
-| **Peak Capacity (+DCP8)** — `dp = k` + `--dcp-size 8` | Deduplicates the attention-TP group's MLA KV: concurrency ceiling +72% at the same engine throughput, ~1.8× ITL. | Context ≥ ~16K, or per-replica concurrency past 128. |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "23.3%"}} />
+    <col style={{width: "52.9%"}} />
+    <col style={{width: "23.8%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Preset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>What it trades</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Pick it for</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Peak Throughput</strong> — <code>dp = k</code>, attention-TP 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>State shards 8-way. The per-step KDA all-reduce stays within one 8-GPU B200/B300 node, or spans two 4-GPU GB200/GB300 nodes over MNNVL. <code>--kv-cache-dtype fp8_e4m3</code> is load-bearing — bf16 KV does not fit 128 requests per replica.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum sustained TPS — the default large-scale shape.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Peak Capacity (+DCP8)</strong> — <code>dp = k</code> + <code>--dcp-size 8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deduplicates the attention-TP group's MLA KV: concurrency ceiling +72% at the same engine throughput, ~1.8× ITL.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context ≥ ~16K, or per-replica concurrency past 128.</td>
+    </tr>
+  </tbody>
+</table>
 
 - **Radix cache** is independent of the preset: for prefix-free traffic (offline batch, evals) switch it off (Playground's **Prefix Cache** card) — one state slot per request instead of 4–5.
 - The fully data-parallel extreme (`--attn-dp-size` = GPU count, attention-TP 1) — the shape behind the 64-GPU sweep's ~3K tok/s per GPU — is not a preset: 288 GB GPUs only, radix forced off, no head-to-head against the preset shape.
@@ -459,11 +660,47 @@ sglang serve \
 
 Scale by holding the per-replica shape fixed and moving only the replica count; pool sizing rides the calculator-driven `--mamba-full-memory-ratio`, which folds in DP, DCP, precision, and speculation:
 
-| GPUs | B200/B300 nodes | GB200/GB300 nodes | `--tp-size` / `--ep-size` | `--attn-dp-size` |
-|---|---|---|---|---|
-| 16 | 2×8 | 4×4 | 16 | 2 |
-| 32 | 4×8 | 8×4 | 32 | 4 |
-| 64 | 8×8 | 16×4 | 64 | 8 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "9.9%"}} />
+    <col style={{width: "18.5%"}} />
+    <col style={{width: "21.0%"}} />
+    <col style={{width: "30.9%"}} />
+    <col style={{width: "19.8%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>B200/B300 nodes</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GB200/GB300 nodes</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}><code>--tp-size</code> / <code>--ep-size</code></th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--attn-dp-size</code></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4×4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8×4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8×8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16×4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>64</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+    </tr>
+  </tbody>
+</table>
 
 For Peak Capacity, add `--dcp-size 8` and re-derive the pool split with the [Mamba ratio calculator](#mamba-ratio-calculator).
 
