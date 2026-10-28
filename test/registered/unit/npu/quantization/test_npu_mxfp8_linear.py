@@ -65,11 +65,25 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         )
         self.assertTrue(layer.weight_scale_inv.format_ue8m0)
 
-    def test_rejects_non_ue8m0_scale_format(self):
-        with self.assertRaisesRegex(ValueError, "scale_fmt='ue8m0'"):
+    def test_non_ue8m0_scale_format_uses_e4m3_requant_path(self):
+        # Only ue8m0 checkpoints get the layout-only conversion; plain block-FP8
+        # checkpoints carry arbitrary fp32 scales, so they must be requantized
+        # through the e4m3 path instead of being rejected.
+        layer = SimpleNamespace()
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8._layout_npu_arch35_e4m3_weights"
+            ) as e4m3_layout,
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8._layout_npu_arch35_ue8m0_weights"
+            ) as ue8m0_layout,
+        ):
             process_npu_arch35_mxfp8_linear_weights(
-                SimpleNamespace(), [128, 128], scale_fmt="float32"
+                layer, [128, 128], scale_fmt="float32"
             )
+
+        e4m3_layout.assert_called_once_with(layer, [128, 128])
+        ue8m0_layout.assert_not_called()
 
     def test_rejects_non_fp8_weight(self):
         with self.assertRaisesRegex(ValueError, "expects float8_e4m3fn weights"):
