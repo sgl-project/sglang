@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
 from sglang.utils import wait_for_server
 
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
 
 
 # Keep the first 6 layers of the BF16 checkpoint. The first 6 V4-Flash
@@ -61,6 +60,9 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
         ]
         env = os.environ.copy()
         env.update(DEEPSEEK_V4_BF16_ENVS)
+        env["PYTORCH_NPU_ALLOC_CONF"] = (
+            "expandable_segments:True,pin_memory_expandable_segments:True"
+        )
         _, host, port = DEFAULT_URL_FOR_TEST.split(":")
         server_command = [
             "python3",

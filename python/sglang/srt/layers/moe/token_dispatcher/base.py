@@ -21,8 +21,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -131,10 +131,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_ascend_tp()
+    ) -> TypeGuard[AscendOpsDispatchOutput]:
+        return dispatch_output.format.is_ascend_ops()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -173,13 +173,13 @@ class DispatchOutputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-    def is_ascend_tp(self) -> bool:
-        return self == DispatchOutputFormat.ASCEND_TP
+    def is_ascend_ops(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_OPS
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -231,10 +231,10 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         combine_input: CombineInput,
-    ) -> TypeGuard[AscendTPCombineInput]:
-        return combine_input.format == CombineInputFormat.ASCEND_TP
+    ) -> TypeGuard[AscendOpsCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_OPS
 
     @staticmethod
     def format_is_deepep_normal(
@@ -276,7 +276,7 @@ class CombineInputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
 
 class RoutewiseLayout(Enum):
@@ -329,6 +329,7 @@ class BaseDispatcher(ABC):
 
     def __init__(self):
         self.quant_config: dict = {}
+        self.runner_backend = None
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

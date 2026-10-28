@@ -6,7 +6,6 @@ from typing import Optional, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
@@ -20,7 +19,7 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -63,7 +62,7 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
     # The iteration's plan of `verify_cache_loc`: the draft block, the verify
     # and the target-hidden KV writes all take their ids from it.
-    kv_loc_plan: KVLocPlan
+    iteration_ids: IterationIds
 
 
 class DSparkVerifyPlanner:
@@ -172,7 +171,6 @@ class DSparkVerifyPlanner:
                 and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
-                and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
@@ -790,33 +788,36 @@ def alloc_verify_window(
     block_pos_offsets: torch.Tensor,
     model_runner,
     seq_lens_cpu: Optional[torch.Tensor],
+    bonus: Optional[torch.Tensor] = None,
+    anchor_ids: Optional[torch.Tensor] = None,
 ) -> VerifyWindow:
     """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
-    plan's read table."""
+    plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
+    by the same launch (SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE)."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = assign_extend_cache_locs_func(
+    positions_2d = None
+    if anchor_ids is not None:
+        positions_2d = torch.empty(
+            (bs, verify_w), dtype=torch.int64, device=prefix_lens.device
+        )
+    plan = model_runner.runner_ids.plan_uniform_extend(
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
-        batch_size=bs,
-        draft_token_num=verify_w,
-        device=device,
+        seq_lens=prefix_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        width=verify_w,
+        positions_out=positions_2d,
+        anchor_src=bonus,
+        anchor_out=anchor_ids,
     )
-    verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
+    if positions_2d is None:
+        positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+    verify_cache_loc = plan.write_virtual
     return VerifyWindow(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
-        verify_cache_loc_2d=verify_cache_loc_2d,
-        kv_loc_plan=model_runner.kv_index_translator.plan(
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=prefix_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            write_virtual=verify_cache_loc,
-            read_extent=verify_w,
-        ),
+        verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
+        iteration_ids=plan,
     )
 
 

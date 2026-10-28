@@ -206,6 +206,10 @@ class IPCManager(tvm_ffi.Object):
         self.__ffi_init__()
 
 
+# The dtypes the kernels reduce: those `FloatTrait` covers in distributed/communicator.cuh.
+SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 @cache_once
 def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
@@ -228,6 +232,10 @@ def custom_all_reduce(
 ) -> torch.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
     result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    # Already a torch.Tensor once tvm-ffi loads torch's DLPack exchange API;
+    # re-wrapping it is a pure round trip (~15 us per call on GB300).
+    if isinstance(result, torch.Tensor):
+        return result
     return torch.from_dlpack(result)
 
 
