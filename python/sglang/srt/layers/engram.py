@@ -26,6 +26,7 @@ from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
     engram_gather_peer,
+    engram_rows_to_token_major,
 )
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
@@ -1246,11 +1247,8 @@ class EngramEmbedding(nn.Module):
             group=group.device_group,
         )
         # [source rank, token, its columns] -> [token, columns in rank order]
-        return (
-            recv.view(self.tp_size, n, k, self.dim)
-            .transpose(0, 1)
-            .reshape(*indices.shape, self.dim)
-        )
+        out = engram_rows_to_token_major(recv, self.tp_size)
+        return out.view(*indices.shape, self.dim)
 
     def _dp_exchange(self, sizes: Optional[list[int]]) -> Optional[str]:
         """The exchange for an eager lookup, or None for the global-buffer path."""
@@ -1258,7 +1256,7 @@ class EngramEmbedding(nn.Module):
             return None
         if self.lookup == EngramLookup.REDUCE_SCATTER:
             return EngramLookup.REDUCE_SCATTER
-        # Measured fastest at DP 2-8 on GB300, B300 and H200, except GB300 at DP 2.
+        # Measured fastest at DP 2-8 on GB300, B300 and H200 from 8K tokens per rank up.
         return EngramLookup.ALL_TO_ALL if self._cols_per_rank is not None else None
 
     def _eager_dp_sizes(
