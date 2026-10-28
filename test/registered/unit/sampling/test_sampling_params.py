@@ -406,25 +406,59 @@ class TestSamplingParamsNormalize(CustomTestCase):
             f"at most {MAX_STOP_COUNT} stop strings are allowed, got {MAX_STOP_COUNT + 1}",
         )
 
-    def test_stop_str_max_len_uses_encoded_length(self):
-        """Test that max_len is based on encoded token count, not character count."""
-        # "ab" encodes to 1 token, "cdef" encodes to 2 tokens
+    def test_stop_str_max_len_uses_conservative_lookback(self):
+        """Lookback is max(canonical token count, UTF-8 bytes) across stops."""
+        # "ab": 1 token / 2 bytes; "cdef": 2 tokens / 4 bytes
         tokenizer = self._mock_tokenizer(encode_map={"ab": [1], "cdef": [2, 3]})
         sp = SamplingParams(stop=["ab", "cdef"])
         sp.normalize(tokenizer=tokenizer)
-        self.assertEqual(sp.stop_str_max_len, 2)  # max token count
+        self.assertEqual(sp.stop_str_max_len, 4)
 
     def test_stop_str_max_len_with_tokenizer(self):
-        """Test that with a tokenizer, max_len counts encoded token IDs."""
+        """UTF-8 bytes enlarge a shorter canonical encoding."""
         tokenizer = MagicMock()
-        # "hello" encodes to 2 tokens, "world!!" to 3 tokens
+        # "hello": 2 tokens / 5 bytes; "world!!": 3 tokens / 7 bytes
         tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
             "hello": [101, 102],
             "world!!": [201, 202, 203],
         }[s]
         sp = SamplingParams(stop=["hello", "world!!"])
         sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(sp.stop_str_max_len, 7)
+
+    def test_stop_str_max_len_enlarges_when_utf8_exceeds_canonical_count(self):
+        """Canonical encode("AAA") is one token; lookback still covers 3 bytes."""
+        tokenizer = self._mock_tokenizer(encode_map={"AAA": [50107]})
+        sp = SamplingParams(stop=["AAA"])
+        sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_str_max_len, 3)
+
+    def test_stop_str_max_len_keeps_canonical_count_when_larger_than_bytes(self):
+        """A larger canonical window must not shrink to the UTF-8 byte count."""
+        tokenizer = self._mock_tokenizer(encode_map={"ab": [1, 2, 3, 4, 5]})
+        sp = SamplingParams(stop=["ab"])
+        sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(len("ab".encode("utf-8")), 2)
+        self.assertEqual(sp.stop_str_max_len, 5)
+
+    def test_unicode_stop_without_tokenizer_raises(self):
+        """String stops require a tokenizer; tokenizer=None is not a valid path."""
+        with self.assertRaisesRegex(ValueError, "requires tokenizer"):
+            SamplingParams(stop="€").normalize(tokenizer=None)
+
+    def test_empty_stop_string_lookback_is_zero(self):
+        tokenizer = self._mock_tokenizer(encode_map={"": []})
+        sp = SamplingParams(stop=[""])
+        sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(sp.stop_strs, [""])
+        self.assertEqual(sp.stop_str_max_len, 0)
+
+    def test_string_stop_lookback_does_not_change_regex_window(self):
+        tokenizer = self._mock_tokenizer(encode_map={"AAA": [50107]})
+        sp = SamplingParams(stop=["AAA"], stop_regex=r"[a-z]{3}")
+        sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(sp.stop_str_max_len, 3)
+        self.assertEqual(sp.stop_regex_max_len, 3)
 
     def test_none_stop_regex_becomes_empty_list(self):
         """Test that normalize() converts None stop_regex to empty list with max_len=0."""
@@ -560,7 +594,7 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertIsInstance(rebuilt, SamplingParams)
         self.assertTrue(rebuilt.is_normalized)
         self.assertEqual(rebuilt.stop_strs, ["hello", "world"])
-        self.assertEqual(rebuilt.stop_str_max_len, 2)
+        self.assertEqual(rebuilt.stop_str_max_len, 5)
         self.assertEqual(rebuilt.stop_regex_strs, [r"[a-z]{3}"])
         self.assertEqual(rebuilt.stop_regex_max_len, 3)
         self.assertEqual(rebuilt.stop_token_ids, {1, 2})

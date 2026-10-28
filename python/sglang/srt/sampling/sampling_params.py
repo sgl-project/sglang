@@ -183,7 +183,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
     stop_regex_strs: Optional[Union[str, List[str]]] = None  # from stop_regex
-    stop_str_max_len: int = 0  # set by normalize()
+    stop_str_max_len: int = 0  # normalized lookback, not exact encoded length
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
     ebnf_full_assistant: bool = False
@@ -342,13 +342,19 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"got {len(self.stop_strs)}"
                 )
 
+            # Lookback is max(canonical token count, UTF-8 bytes): a short
+            # encoding of "AAA" can still be generated as three tokens, and a
+            # larger canonical count is kept. Not a universal bound.
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
+                utf8_len = len(stop_str.encode("utf-8"))
                 if tokenizer is not None:
                     stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                    stop_str_max_len = max(
+                        stop_str_max_len, len(stop_str_ids), utf8_len
+                    )
                 else:
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
+                    stop_str_max_len = max(stop_str_max_len, utf8_len)
             self.stop_str_max_len = stop_str_max_len
 
         # Process stop regex strings

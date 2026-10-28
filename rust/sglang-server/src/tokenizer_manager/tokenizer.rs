@@ -96,19 +96,16 @@ impl Runnable for TokenizerWorker {
             // goes back as `Failed`, so intake rejects it and releases its
             // tracking entry instead of leaving the client hung.
             let event = if let RequestKind::Generate(g) = &mut req.kind {
-                // Size the scheduler's stop-match window in TOKENS, as Python's
-                // `normalize(tokenizer)` does.
+                // Lookback is max(canonical token count, UTF-8 bytes);
+                // String::len is bytes. Not a universal bound.
                 let stop_tokens = g
                     .sampling_params
                     .stop_strs
                     .iter()
-                    // A stop that won't encode falls back to its byte length rather
-                    // than failing the request: still an over-estimate, never an
-                    // under-estimate, so the scheduler cannot miss that stop.
                     .map(|s| {
                         self.tokenizer
                             .encode(s, false)
-                            .map_or(s.len(), |ids| ids.len())
+                            .map_or(s.len(), |ids| s.len().max(ids.len()))
                     })
                     .max();
                 if let Some(n) = stop_tokens {
@@ -163,24 +160,21 @@ mod tests {
         }
     }
 
-    /// The scheduler's stop-match window must reach the wire as a TOKEN count, as
-    /// Python's `normalize(tokenizer)` produces.
-    ///
-    /// `Normalizing` leaves a UTF-8 BYTE count there — a safe over-estimate, but it
-    /// makes the scheduler decode a longer tail on EVERY decode step of EVERY
-    /// request (14 tokens vs 6 for a typical stop set). This stage owns the
-    /// tokenizer, so it is where the exact count is resolved.
-    #[test]
-    fn tokenizing_replaces_the_byte_window_with_a_token_count() {
+    /// More tokens than UTF-8 bytes: keep the larger canonical window.
+    struct OverlongTokenizer;
+    impl TextTokenizer for OverlongTokenizer {
+        fn encode(&self, text: &str, _: bool) -> Result<Vec<i32>, ProcessorError> {
+            Ok(vec![1; text.len() + 3])
+        }
+    }
+
+    fn tokenize_generate_stop_window(
+        tokenizer: Arc<dyn TextTokenizer>,
+        stop_strs: Vec<String>,
+        stop_str_max_len: usize,
+    ) -> usize {
         let (req_tx, req_rx) = flume::unbounded::<Request>();
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
-
-        // 8 bytes vs 3 "tokens" under WordTokenizer — units are distinguishable.
-        let sp = SamplingParams {
-            stop_strs: vec!["a bb ccc".to_string(), "dd".to_string()],
-            stop_str_max_len: 8, // what `normalize_stops` left: max BYTE length
-            ..Default::default()
-        };
         let (sink_tx, _sink_rx) = mpsc::channel(4);
         req_tx
             .send(Request {
@@ -192,24 +186,47 @@ mod tests {
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
                     text: Some("hello world".into()),
-                    sampling_params: sp,
+                    sampling_params: SamplingParams {
+                        stop_strs,
+                        stop_str_max_len,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })),
             })
             .expect("send");
-        drop(req_tx); // closes the loop after one request
-
-        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
-
+        drop(req_tx);
+        TokenizerWorker::new(req_rx, tm_tx, tokenizer).run();
         let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
             panic!("expected Tokenized");
         };
         let RequestKind::Generate(g) = &req.kind else {
             panic!("expected generate");
         };
+        g.sampling_params.stop_str_max_len
+    }
+
+    #[test]
+    fn tokenizing_keeps_max_of_bytes_and_canonical_count() {
         assert_eq!(
-            g.sampling_params.stop_str_max_len, 3,
-            "must be the max TOKEN count (3), not the byte count (8)"
+            tokenize_generate_stop_window(
+                Arc::new(WordTokenizer),
+                // 8 bytes vs 3 tokens under WordTokenizer
+                vec!["a bb ccc".to_string(), "dd".to_string()],
+                8,
+            ),
+            8,
+            "must keep the UTF-8 byte window (8), not shrink to the token count (3)"
+        );
+        assert_eq!(
+            tokenize_generate_stop_window(
+                Arc::new(OverlongTokenizer),
+                // "hi" is 2 UTF-8 bytes; OverlongTokenizer emits 5 ids
+                vec!["hi".to_string()],
+                2,
+            ),
+            5,
+            "must keep the larger canonical count (5), not the byte count (2)"
         );
     }
 
