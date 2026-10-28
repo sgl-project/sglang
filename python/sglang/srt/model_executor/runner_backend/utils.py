@@ -35,7 +35,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_context, get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -98,10 +98,13 @@ def resolve_decode_backend(
     if full_backend_cls is None:
         full_backend_cls = FullCudaGraphBackend
 
-    # The speculative step CUDA graph splices these graphs into its own.
+    # The speculative step CUDA graph splices these graphs into its own (no
+    # spec config is published in tools and unit tests).
     kwargs = {}
-    if get_spec().enable_speculative_step_cuda_graph and issubclass(
-        full_backend_cls, FullCudaGraphBackend
+    if (
+        get_context().is_config_namespace_published("spec")
+        and get_spec().enable_speculative_step_cuda_graph
+        and issubclass(full_backend_cls, FullCudaGraphBackend)
     ):
         kwargs["keep_raw_graph"] = True
     return full_backend_cls(

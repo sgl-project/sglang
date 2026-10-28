@@ -108,6 +108,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     capture as a child-graph node instead of being launched.
     """
 
+    # Class defaults, since backends built without __init__ set neither.
+    _keep_raw_graph = False
+    graph_epoch = 0
+
     def __init__(
         self,
         cuda_graph_runner: BaseCudaGraphRunner,
