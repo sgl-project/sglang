@@ -8,7 +8,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sglang_api_types::api::v1 as api;
 use tokio::sync::{mpsc, oneshot};
@@ -18,7 +18,7 @@ use crate::message::ids::Rid;
 use crate::message::io_struct::{
     CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
 };
-use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::request::{GenerateRequest, RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
@@ -28,6 +28,7 @@ use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
+use super::metrics::{FrontendMetrics, RequestMetrics};
 use super::{CoreError, CoreEvent, HealthStatus, prefetch};
 use crate::message::info::{InternalState, ModelInfo, ServerInfo};
 
@@ -42,6 +43,8 @@ pub(crate) struct CoreConfig {
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: Vec<(String, usize)>,
     pub(crate) metadata: CoreMetadata,
+    /// Request metrics, when `--enable-metrics` is on.
+    pub(crate) metrics: Option<Arc<FrontendMetrics>>,
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -53,7 +56,7 @@ pub(crate) struct CoreMetadata {
     served_model_name: String,
     tokenizer_path: String,
     preferred_sampling_params: Option<crate::message::config::PreferredSamplingParams>,
-    weight_version: Option<String>,
+    weight_version: Option<Arc<str>>,
     load_format: Option<String>,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
@@ -73,9 +76,9 @@ impl From<&ServerArgs> for CoreMetadata {
         Self {
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
-            tokenizer_path: args.tokenizer_path.clone(),
+            tokenizer_path: args.public_tokenizer_path.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
-            weight_version: args.weight_version.clone(),
+            weight_version: args.weight_version.as_deref().map(Arc::from),
             load_format: args.load_format.clone(),
             reasoning_parser: args.reasoning_parser.clone(),
             tool_call_parser: args.tool_call_parser.clone(),
@@ -114,6 +117,7 @@ struct CoreInner {
     mm_processor: OnceLock<Arc<dyn MmProcessor>>,
     metadata: CoreMetadata,
     generations: Generations,
+    metrics: Option<Arc<FrontendMetrics>>,
 }
 
 impl CoreHandle {
@@ -134,6 +138,7 @@ impl CoreHandle {
                 mm_processor: OnceLock::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
+                metrics: config.metrics,
             }),
         }
     }
@@ -158,10 +163,16 @@ impl CoreHandle {
         self.inner.response_activity.load(Ordering::Relaxed)
     }
 
+    /// The request metrics, when enabled.
+    pub(crate) fn metrics(&self) -> Option<&Arc<FrontendMetrics>> {
+        self.inner.metrics.as_ref()
+    }
+
     pub(crate) async fn generate(
         &self,
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
+        let created_at = Instant::now();
         let mut generation = self
             .inner
             .generations
@@ -171,19 +182,30 @@ impl CoreHandle {
             _ = generation.cancelled() => return Err(CoreError::Cancelled("request aborted".into())),
             result = self.prepare_generations(std::slice::from_mut(&mut request)) => result?,
         }
+        let metrics = self.request_metrics(&request, created_at);
         self.submit_generation(request, generation)
             .await
-            .map(CoreCall::new)
+            .map(|runtime| self.generation_call(runtime, metrics))
     }
 
     /// Submit core-owned work without exposing it through the public Abort
     /// registry. Drop still owns cancellation through `RuntimeCall`.
-    async fn generate_internal(&self, mut request: GenerateRequest) -> Result<CoreCall, CoreError> {
+    /// `log_metrics` is Python's flag of the same name: the health probe's
+    /// request is not counted.
+    async fn generate_internal(
+        &self,
+        mut request: GenerateRequest,
+        log_metrics: bool,
+    ) -> Result<CoreCall, CoreError> {
+        let created_at = Instant::now();
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
+        let metrics = log_metrics
+            .then(|| self.request_metrics(&request, created_at))
+            .flatten();
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(CoreCall::new)
+            .map(|runtime| self.generation_call(runtime, metrics))
     }
 
     /// Prepare the group before submitting any surviving request. Explicit
@@ -194,6 +216,7 @@ impl CoreHandle {
         &self,
         mut requests: Vec<GenerateRequest>,
     ) -> Result<Vec<CoreCall>, CoreError> {
+        let created_at = Instant::now();
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -222,8 +245,9 @@ impl CoreHandle {
         let mut calls = Vec::with_capacity(requests.len());
         for (request, generation) in requests.into_iter().zip(generations) {
             let rid = request.rid.clone();
+            let metrics = self.request_metrics(&request, created_at);
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => CoreCall::new(call),
+                Ok(call) => self.generation_call(call, metrics),
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -252,6 +276,19 @@ impl CoreHandle {
             .await
     }
 
+    fn generation_call(&self, runtime: RuntimeCall, metrics: Option<RequestMetrics>) -> CoreCall {
+        CoreCall::new(runtime, self.inner.metadata.weight_version.clone(), metrics)
+    }
+
+    fn request_metrics(
+        &self,
+        request: &GenerateRequest,
+        created_at: Instant,
+    ) -> Option<RequestMetrics> {
+        let metrics = self.inner.metrics.as_ref()?;
+        Some(metrics.start_request(request, created_at))
+    }
+
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
         prefetch::prefetch_all(
             requests,
@@ -274,7 +311,7 @@ impl CoreHandle {
             tokenizer_path: metadata.tokenizer_path.clone(),
             is_generation: true,
             preferred_sampling_params: metadata.preferred_sampling_params.clone(),
-            weight_version: metadata.weight_version.clone(),
+            weight_version: metadata.weight_version.as_deref().map(str::to_owned),
             load_format: metadata.load_format.clone(),
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
@@ -421,12 +458,21 @@ impl CoreHandle {
         text: String,
         add_special_tokens: bool,
     ) -> Result<TokenIds, CoreError> {
-        let mut call = self
-            .submit(RequestKind::Tokenize {
-                text,
-                add_special_tokens,
-            })
-            .await?;
+        self.tokenize_input(TokenizeInput::Text {
+            text,
+            add_special_tokens,
+        })
+        .await
+    }
+
+    /// Encode a rendered chat prompt on the tokenizer pool.
+    pub(crate) async fn tokenize_chat(&self, chat: RenderedChat) -> Result<TokenIds, CoreError> {
+        self.tokenize_input(TokenizeInput::Chat(Box::new(chat)))
+            .await
+    }
+
+    async fn tokenize_input(&self, input: TokenizeInput) -> Result<TokenIds, CoreError> {
+        let mut call = self.submit(RequestKind::Tokenize(input)).await?;
         match call.recv().await {
             Some(ResponseItem::TokenIds(ids)) => Ok(ids),
             Some(ResponseItem::Error(Error::Validation(message))) => {
@@ -468,7 +514,7 @@ impl CoreHandle {
         // The probe is intentionally not drained. Its call stays alive while
         // the heartbeat is observed, then aborts on drop to clean up a probe
         // that a busy scheduler skipped without producing a terminal frame.
-        let _probe = self.generate_internal(probe).await?;
+        let _probe = self.generate_internal(probe, false).await?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -491,23 +537,26 @@ impl CoreHandle {
             (Some("The capital city of France is".to_string()), None)
         };
         let mut call = self
-            .generate_internal(GenerateRequest {
-                rid: Rid::new(),
-                text,
-                input_ids,
-                sampling_params: SamplingParams {
-                    max_new_tokens: Some(8),
-                    temperature: 0.0,
+            .generate_internal(
+                GenerateRequest {
+                    rid: Rid::new(),
+                    text,
+                    input_ids,
+                    sampling_params: SamplingParams {
+                        max_new_tokens: Some(8),
+                        temperature: 0.0,
+                        ..Default::default()
+                    },
+                    stream: false,
+                    bootstrap_host: self
+                        .inner
+                        .is_disaggregation
+                        .then(|| FAKE_BOOTSTRAP_HOST.into()),
+                    bootstrap_room: self.inner.is_disaggregation.then_some(0),
                     ..Default::default()
                 },
-                stream: false,
-                bootstrap_host: self
-                    .inner
-                    .is_disaggregation
-                    .then(|| FAKE_BOOTSTRAP_HOST.into()),
-                bootstrap_room: self.inner.is_disaggregation.then_some(0),
-                ..Default::default()
-            })
+                true,
+            )
             .await?;
         loop {
             match call.recv().await {
@@ -600,13 +649,30 @@ fn translate_runtime_error(error: Error) -> CoreError {
 pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
+    /// The launch weight version, stamped on every output (see
+    /// [`CoreOutput::weight_version`](super::CoreOutput)).
+    weight_version: Option<Arc<str>>,
+    /// Observes every runtime item as the call receives it.
+    metrics: Option<RequestMetrics>,
 }
 
 impl CoreCall {
-    fn new(runtime: RuntimeCall) -> Self {
+    fn new(
+        runtime: RuntimeCall,
+        weight_version: Option<Arc<str>>,
+        metrics: Option<RequestMetrics>,
+    ) -> Self {
         Self {
             runtime,
             events_finished: false,
+            weight_version,
+            metrics,
+        }
+    }
+
+    fn observe(&mut self, item: Option<&ResponseItem>) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.observe(item);
         }
     }
 
@@ -616,15 +682,19 @@ impl CoreCall {
         response_tx
             .try_send(ResponseItem::Error(Error::Disconnected))
             .expect("new response channel has room for its terminal error");
-        Self::new(RuntimeCall {
-            rid,
-            response_rx,
-            abort_tx,
-            admission: RequestAdmission::pending(),
-            expected_response: ExpectedResponse::Generate,
-            in_flight: false,
-            generation: None,
-        })
+        Self::new(
+            RuntimeCall {
+                rid,
+                response_rx,
+                abort_tx,
+                admission: RequestAdmission::pending(),
+                expected_response: ExpectedResponse::Generate,
+                in_flight: false,
+                generation: None,
+            },
+            None,
+            None,
+        )
     }
 
     /// ID that adapters should return to their client.
@@ -640,8 +710,10 @@ impl CoreCall {
             return None;
         }
 
-        let event = match self.runtime.recv().await {
-            Some(item) => generation_event(item),
+        let item = self.runtime.recv().await;
+        self.observe(item.as_ref());
+        let event = match item {
+            Some(item) => self.generation_event(item),
             None => CoreEvent::Failed(CoreError::Internal(
                 "response truncated before completion".into(),
             )),
@@ -655,7 +727,10 @@ impl CoreCall {
     pub(crate) fn drain_ready(&mut self, events: &mut Vec<CoreEvent>) {
         while !self.events_finished {
             let event = match self.runtime.try_recv() {
-                Ok(item) => generation_event(item),
+                Ok(item) => {
+                    self.observe(Some(&item));
+                    self.generation_event(item)
+                }
                 // Preserve every queued event before reporting a premature
                 // close. The next awaited `recv` translates that close into
                 // one terminal failure, maintaining stream order while still
@@ -677,15 +752,35 @@ impl CoreCall {
     ) -> Self {
         let admission = RequestAdmission::pending();
         assert!(admission.try_accept(), "test calls start already admitted");
-        Self::new(RuntimeCall {
-            rid,
-            response_rx,
-            abort_tx,
-            admission,
-            expected_response: ExpectedResponse::Generate,
-            in_flight: true,
-            generation: None,
-        })
+        Self::new(
+            RuntimeCall {
+                rid,
+                response_rx,
+                abort_tx,
+                admission,
+                expected_response: ExpectedResponse::Generate,
+                in_flight: true,
+                generation: None,
+            },
+            None,
+            None,
+        )
+    }
+
+    fn generation_event(&self, item: ResponseItem) -> CoreEvent {
+        let mut event = generation_event(item);
+        if let CoreEvent::Delta(output) | CoreEvent::Finished(output) = &mut event {
+            output.weight_version = self.weight_version.clone();
+        }
+        event
+    }
+}
+
+impl Drop for CoreCall {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.call_dropped();
+        }
     }
 }
 
@@ -718,6 +813,7 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
                 CoreEvent::Failed(CoreError::from_runtime_rejection(
                     message.to_owned(),
                     legacy_http_status,
+                    output.into(),
                 ))
             } else {
                 CoreEvent::Finished(output.into())
@@ -893,7 +989,7 @@ struct RuntimeCall {
 
 impl RuntimeCall {
     async fn recv(&mut self) -> Option<ResponseItem> {
-        let item = tokio::select! {
+        let mut item = tokio::select! {
             biased;
             _ = async {
                 match self.generation.as_mut() {
@@ -904,11 +1000,14 @@ impl RuntimeCall {
             item = self.response_rx.recv() => item,
         };
         self.observe(item.as_ref());
+        if let Some(item) = &mut item {
+            self.name_client_rid(item);
+        }
         item
     }
 
     fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
-        let item = if self
+        let mut item = if self
             .generation
             .as_ref()
             .is_some_and(Generation::is_cancelled)
@@ -918,7 +1017,27 @@ impl RuntimeCall {
             self.response_rx.try_recv()?
         };
         self.observe(Some(&item));
+        self.name_client_rid(&mut item);
         Ok(item)
+    }
+
+    /// The scheduler knows a request by the rid this server sent it, which
+    /// carries [`Rid::from_client`]'s suffix. An abort message it writes
+    /// reaches the client, so name the request there by the client's rid.
+    ///
+    /// The message may hold the rid raw (`{rid}`) or as Python's `repr`
+    /// (`{rid=}`, `{rid!r}`), which escapes the client's part and quotes the
+    /// whole. The suffix is ASCII hex after `#`, so neither form changes it
+    /// or the quote `repr` picks: dropping the suffix leaves the client's rid
+    /// in the form the scheduler wrote, as Python's frontend shows it.
+    fn name_client_rid(&self, item: &mut ResponseItem) {
+        let client_rid = self.rid.client_facing();
+        if let ResponseItem::Done(output) = item
+            && client_rid.len() != self.rid.len()
+            && let Some(reason) = &mut output.finish_reason
+        {
+            reason.replace_in_abort_message(&self.rid.as_str()[client_rid.len()..], "");
+        }
     }
 
     fn observe(&mut self, item: Option<&ResponseItem>) {
@@ -1062,6 +1181,7 @@ mod tests {
                 is_disaggregation,
                 mm_limits,
                 metadata: CoreMetadata::default(),
+                metrics: None,
             },
         )
     }
@@ -1094,6 +1214,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                metrics: None,
                 metadata: CoreMetadata {
                     served_model_name: "served-model".into(),
                     max_context_length: 1_u64 << 32,
@@ -1202,7 +1323,8 @@ mod tests {
             (503, CoreErrorKind::Unavailable),
             (504, CoreErrorKind::DeadlineExceeded),
         ] {
-            let error = CoreError::from_runtime_rejection("rejected".into(), status);
+            let error =
+                CoreError::from_runtime_rejection("rejected".into(), status, Default::default());
             assert_eq!(error.kind(), expected, "legacy status {status}");
             assert!(matches!(
                 error,
@@ -1293,6 +1415,69 @@ mod tests {
         assert!(call.recv().await.is_none());
         drop(call);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// A scheduler abort that carried a status fails the call with that
+    /// status and keeps the terminal output, and the scheduler's message
+    /// names the request by the client's rid, not the suffixed one this
+    /// server sent the scheduler — raw, or as Python's `repr` (`{rid=}`)
+    /// with the client's escaping and quoting kept, as Python shows it.
+    #[tokio::test]
+    async fn status_abort_names_the_client_rid() {
+        // (client rid, Python's `repr` of it)
+        for (client_rid, client_repr) in [
+            ("client-rid", "'client-rid'"),
+            (r"back\slash", r"'back\\slash'"),
+            ("new\nline", r"'new\nline'"),
+            ("it's", r#""it's""#),
+        ] {
+            let harness = Harness::unbounded(8);
+            let mut call = harness
+                .handle
+                .generate(GenerateRequest {
+                    rid: Rid::from_client(client_rid),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let internal = call.runtime.rid.as_str().to_owned();
+            let suffix = &internal[client_rid.len()..];
+            // `repr` of the suffixed rid: the suffix lands inside the quotes.
+            let (body, quote) = client_repr.split_at(client_repr.len() - 1);
+            let internal_repr = format!("{body}{suffix}{quote}");
+            let request = accept_intake(harness.intake_rx.recv().unwrap());
+            request
+                .sink
+                .try_send(ResponseItem::Done(ChunkEvent {
+                    prompt_tokens: 3,
+                    finish_reason: serde_json::from_value(serde_json::json!({
+                        "type": "abort",
+                        "message": format!(
+                            "Request {internal} failed: req.rid={internal_repr}"
+                        ),
+                        "status_code": 500,
+                        "err_type": null
+                    }))
+                    .unwrap(),
+                    ..Default::default()
+                }))
+                .unwrap();
+
+            let Some(CoreEvent::Failed(error)) = call.recv().await else {
+                panic!("a status abort fails the call");
+            };
+            let expected = format!("Request {client_rid} failed: req.rid={client_repr}");
+            assert_eq!(error.http_status().as_u16(), 500);
+            assert_eq!(error.to_string(), expected, "client rid {client_rid:?}");
+            let output = error
+                .into_rejected_output()
+                .expect("a status abort keeps its output");
+            assert_eq!(output.prompt_tokens, 3);
+            assert_eq!(
+                output.finish_reason.unwrap().abort_status(),
+                Some((500, expected.as_str()))
+            );
+        }
     }
 
     #[tokio::test]
@@ -1616,10 +1801,10 @@ mod tests {
         assert!(!request.rid.as_str().is_empty());
         assert!(matches!(
             &request.kind,
-            RequestKind::Tokenize {
+            RequestKind::Tokenize(TokenizeInput::Text {
                 text,
                 add_special_tokens: true,
-            } if text == "hi"
+            }) if text == "hi"
         ));
         request
             .sink
