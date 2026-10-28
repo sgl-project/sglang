@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
@@ -26,7 +27,7 @@ from sglang.srt.parser.template_detection import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
@@ -988,6 +989,67 @@ class TestAnthropicServing(unittest.TestCase):
                 chat_request = serving._convert_to_chat_completion_request(request)
                 self.assertEqual(chat_request.reasoning_effort, openai_effort)
 
+    def test_json_output_reaches_sampling_constraints(self):
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "integer", "enum": [42]}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        request = self._anthropic_request(
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            json.loads(converted.to_sampling_params([], {})["json_schema"]), schema
+        )
+
+    def test_invalid_json_output_format_is_rejected(self):
+        for output_format in ({"type": "text", "schema": {}}, {"type": "json_schema"}):
+            with (
+                self.subTest(output_format=output_format),
+                self.assertRaises(ValueError),
+            ):
+                self._anthropic_request(output_config={"format": output_format})
+
+    def test_count_tokens_renders_output_config_like_messages(self):
+        rendered = []
+
+        class _CountingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self):
+                super().__init__()
+                self.tokenizer_manager.model_config = SimpleNamespace(
+                    is_multimodal=False
+                )
+
+            def _process_messages(self, chat_request, is_multimodal):
+                rendered.append(chat_request)
+                return SimpleNamespace(prompt_ids=[1])
+
+        output_config = {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": {"type": "object"}},
+        }
+        serving = AnthropicServing(_CountingOpenAI())
+        asyncio.run(
+            serving.handle_count_tokens(
+                AnthropicCountTokensRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    output_config=output_config,
+                ),
+                object(),
+            )
+        )
+        messages = serving._convert_to_chat_completion_request(
+            self._anthropic_request(output_config=output_config)
+        )
+        self.assertIsNotNone(messages.response_format)
+        self.assertEqual(
+            (rendered[0].response_format, rendered[0].reasoning_effort),
+            (messages.response_format, messages.reasoning_effort),
+        )
+
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
         import logging
@@ -1409,6 +1471,86 @@ class TestAnthropicServing(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             serving._convert_to_chat_completion_request(request)
         self.assertIn("nonexistent", str(ctx.exception))
+
+    def test_custom_tool_constraints_are_forwarded(self):
+        for tool_fields, tool_choice, expected in (
+            ({}, {"type": "auto"}, (False, True)),
+            (
+                {"strict": True},
+                {"type": "auto", "disable_parallel_tool_use": False},
+                (True, True),
+            ),
+            (
+                {"strict": False},
+                {"type": "auto", "disable_parallel_tool_use": True},
+                (False, False),
+            ),
+        ):
+            with self.subTest(tool_fields=tool_fields, tool_choice=tool_choice):
+                request = self._anthropic_request(
+                    tools=[
+                        {
+                            "name": "lookup",
+                            "input_schema": {"type": "object"},
+                            **tool_fields,
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                )
+                converted = self._serving()._convert_to_chat_completion_request(request)
+                self.assertEqual(
+                    (converted.tools[0].function.strict, converted.parallel_tool_calls),
+                    expected,
+                )
+
+    def test_rejected_requests_are_client_errors(self):
+        class _RejectingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self, error):
+                super().__init__()
+                self.tokenizer_manager.model_config = SimpleNamespace(
+                    is_multimodal=False
+                )
+                self.error = error
+
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
+                raise self.error
+
+            def _process_messages(self, chat_request, is_multimodal):
+                raise self.error
+
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        count_request = AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hello"}]
+        )
+        for error, status, error_type in (
+            (ValueError("unsupported tool control"), 400, "invalid_request_error"),
+            (RuntimeError("internal failure"), 500, "api_error"),
+        ):
+            serving = AnthropicServing(_RejectingOpenAI(error))
+            routes = {
+                "messages": serving._handle_non_streaming(
+                    chat_request, self._anthropic_request(stream=False), object()
+                ),
+                "stream": serving._handle_streaming(
+                    chat_request, self._anthropic_request(), object()
+                ),
+                "count_tokens": serving.handle_count_tokens(count_request, object()),
+            }
+            for route, handled in routes.items():
+                with self.subTest(error=type(error).__name__, route=route):
+                    response = asyncio.run(handled)
+                    payload = json.loads(response.body)
+                    self.assertEqual(
+                        (response.status_code, payload["error"]["type"]),
+                        (status, error_type),
+                    )
 
     def test_convert_response_non_streaming_empty_content_keeps_block(self):
         """Empty-string completion must still produce a content list of len 1."""

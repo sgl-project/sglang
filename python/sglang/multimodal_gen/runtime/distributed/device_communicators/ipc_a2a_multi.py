@@ -526,9 +526,10 @@ class IpcA2AMultiState:
         go straight into its own receive slot, and v always moves straight
         from ``v``. It is only called once the call is known to pipeline.
 
-        ``fill_all(blocks)`` is ``fill`` given every block at once, as a list of
+        ``fill_all(blocks, part)`` is ``fill`` given every block at once, as a list of
         ``(head_start, head_count, q_dst, k_dst)`` (for a norm over all heads of a row,
-        which one pass over q and k then writes everywhere).
+        which one pass then writes everywhere), for q (``part`` 0) and then k (1), so q
+        is on its way while k is filled.
 
         ``attend_into(q, k, v, out)``, when given, writes what ``attend``
         returns into ``out`` (any token stride); with ``out=None`` it only says
@@ -695,8 +696,9 @@ class IpcA2AMultiState:
         # my own rows of every group, here and in one pass per part: a same-device
         # copy runs on the SMs, so on the copy stream it would wait out the
         # previous group's attention and hold up the peer sends queued behind it
-        for part in (2,) if filled else range(3):
-            copy_head_groups(*own_rows_views(part))
+        if fill_all is None:
+            for part in (2,) if filled else range(3):
+                copy_head_groups(*own_rows_views(part))
         for g in range(groups):
             for part in range(3):
                 place_replicated(main, part, g)
@@ -713,8 +715,12 @@ class IpcA2AMultiState:
                     qk = slots.send_block(pool, p, g)
                     blocks.append((start(p, g, 0), hg, qk[0], qk[1]))
                 blocks.append((start(r, g, 0), hg, own_rows(0, g), own_rows(1, g)))
-            fill_all(blocks)
-            sent = own = [main.record_event()] * groups
+            for part in range(2):
+                fill_all(blocks, part)
+                sent.append(main.record_event())
+            # v's own rows after the fill, on the SMs while the copy engine sends it
+            copy_head_groups(*own_rows_views(2))
+            own = [main.record_event()] * groups
         elif fill is not None:
             # group by group: the peers' blocks first, so their copies start
             # while this rank fills its own block straight into its slot
@@ -737,9 +743,23 @@ class IpcA2AMultiState:
                     if not filled:
                         send_rows(cin, 0, p, g)
                         send_rows(cin, 1, p, g)
-                if filled:
+                chunk = s_local * row_bytes[0]
+                if fill_all is not None:
+                    # q, then k as soon as its pass is done
+                    for part in range(2):
+                        cin.wait_event(sent[part])
+                        for p in peers:
+                            mem.copy2d(
+                                cin,
+                                slots.slot_ptr(pool, p, g, part, 0, my_shard_row[part]),
+                                chunk,
+                                slots.send_block(pool, p, g).data_ptr() + part * chunk,
+                                chunk,
+                                chunk,
+                                1,
+                            )
+                elif filled:
                     cin.wait_event(sent[g])
-                    chunk = s_local * row_bytes[0]
                     for p in peers:
                         q_slot = slots.slot_ptr(pool, p, g, 0, 0, my_shard_row[0])
                         k_slot = slots.slot_ptr(pool, p, g, 1, 0, my_shard_row[1])
@@ -802,6 +822,7 @@ class IpcA2AMultiState:
                 if into:
                     out = full[:, :, start(r, g, 0) : start(r, g, 0) + hq]
                     attend_into(*views, out)
+                    attended = stream.record_event()
                     for p in peers:
                         # the peer's rows of this group, out of the token-major buffer
                         src_rows = out[:, plan.shard_row(0, p) :]
@@ -873,25 +894,36 @@ class IpcA2AMultiState:
                         batch * plan.out_rows,
                     )
                 done.append(stream.record_event())
-        for event in done:
-            main.wait_event(event)
-        if into:
-            # the peers' blocks of this rank's rows, every group in one pass each
-            for g in range(groups):
+
+        def gather(first: int, stop: int) -> None:
+            # the peers' blocks of this rank's rows for groups [first, stop), one pass each
+            for g in range(first, stop):
                 for p in peers:
                     mem.wait(main, pool.fout_ptr[r] + 4 * (g * world + p), call)
             outb = pool.outb[r]
             for p in peers:
                 blocks = outb.as_strided(
-                    (groups, batch, s_local, out_row // esz),
+                    (stop - first, batch, s_local, out_row // esz),
                     (slots.out_numel, s_local * out_row // esz, out_row // esz, 1),
-                    outb.storage_offset() + p * groups * slots.out_numel,
+                    outb.storage_offset() + (p * groups + first) * slots.out_numel,
                 )
-                heads = merged[:, :, start(p, 0, 0) : start(p, groups, 0)]
+                heads = merged[:, :, start(p, first, 0) : start(p, stop, 0)]
                 copy_head_groups(
                     blocks,
-                    heads.unflatten(2, (groups, hq)).flatten(3).permute(2, 0, 1, 3),
+                    heads.unflatten(2, (stop - first, hq))
+                    .flatten(3)
+                    .permute(2, 0, 1, 3),
                 )
+
+        if into and groups > 1:
+            # once the last group has attended, the SMs gather the earlier groups
+            # while the last group's blocks are still on the copy engines
+            main.wait_event(attended)
+            gather(0, groups - 1)
+        for event in done:
+            main.wait_event(event)
+        if into:
+            gather(groups - 1 if groups > 1 else 0, groups)
         # the next call's fill rewrites `send` and the caller may free `v`, both
         # read by the copy stream
         main.wait_stream(cin)

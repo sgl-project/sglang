@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -108,6 +109,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -1002,6 +1004,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     ),
                     key=lambda source: source["dp_rank"],
                 )
+            # Each PP stage reports only its own L3 pools; give every info the merged layout.
+            merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
@@ -1279,7 +1283,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         get_serving().port,
                         get_observability().enable_metrics,
                     )
-                scheduler_init_result.block_until_scheduler_exits()
+                with rust_server_sidecar(rust_server_owns_base_port):
+                    scheduler_init_result.block_until_scheduler_exits()
             finally:
                 scheduler_init_result.stop_grpc_server()
             return (
