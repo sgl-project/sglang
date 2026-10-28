@@ -9,7 +9,7 @@ use super::legacy::{
     LegacyFormatter, builtin_template, infer_legacy_template_from_model_path, parse_legacy_template,
 };
 use super::thinking::ThinkingTemplates;
-use super::{ChatFormatter, TemplateError, is_glm53};
+use super::{ChatFormatter, TemplateError, is_glm53, is_qwen38, takes_content_parts};
 
 pub fn load_chat_formatter(
     config_file: Option<&str>,
@@ -116,10 +116,11 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
 
 impl ChatFormatter {
     /// Build the HuggingFace formatter from parsed `tokenizer_config.json`
-    /// contents, which must carry a `chat_template`; GLM-5.3's template builds
-    /// [`ChatFormatter::Glm53`].
+    /// contents, which must carry a `chat_template`; GLM-5.3's and Qwen3.8's
+    /// templates build [`ChatFormatter::Glm53`] and [`ChatFormatter::Qwen38`].
     pub fn from_tokenizer_config(config: &Value) -> Result<Self, TemplateError> {
         let glm53 = config["chat_template"].as_str().is_some_and(is_glm53);
+        let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
         let thinking = ThinkingTemplates::from_config(config);
         let template: ChatTemplate = serde_json::from_value(config.clone())
             .map_err(|source| TemplateError::Config { source })?;
@@ -136,6 +137,12 @@ impl ChatFormatter {
         })?;
         Ok(if glm53 {
             Self::Glm53(formatter)
+        } else if let Some(template) = qwen38 {
+            Self::Qwen38 {
+                formatter,
+                thinking,
+                content_parts: takes_content_parts(template),
+            }
         } else {
             Self::HuggingFace {
                 formatter,
@@ -161,6 +168,27 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    /// A DeepSeek-V3.2 checkpoint's own template wins over the native encoder, as in Python.
+    #[test]
+    fn deepseek_v32_template_precedes_native_encoder() {
+        let dir = std::env::temp_dir().join(format!("sglang-dsv32-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"deepseek_v32"}"#).unwrap();
+        let render = |config: &str| {
+            std::fs::write(dir.join("tokenizer_config.json"), config).unwrap();
+            let options = ChatFormatterOptions {
+                tokenizer_path: dir.to_str().unwrap().into(),
+                ..Default::default()
+            };
+            let formatter = select_chat_formatter(&options).0.unwrap();
+            formatter.render(&request()).unwrap()
+        };
+        assert!(render("{}").contains("<｜User｜>Hello"));
+        let custom = r#"{"chat_template": "CUSTOM {{ messages[1].content }}"}"#;
+        assert_eq!(render(custom), "CUSTOM Hello");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -264,6 +292,8 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
+        // Python guesses the legacy template before reading the checkpoint's.
+        std::fs::write(model_dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
         let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
             tokenizer_path: model_dir.to_str().unwrap().into(),
             model_path: model_dir.to_str().unwrap().into(),

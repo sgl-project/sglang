@@ -40,17 +40,12 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791783771,
+          "created": 1791964699,
           "model": "zai-org/GLM-5.3",
           "choices": [
             {
               "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello!",
-                "reasoning_content": "Greet back.",
-                "tool_calls": null
-              },
+              "message": {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet back."},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 154827
@@ -61,7 +56,72 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
+          },
+          "metadata": {"weight_version": "default"}
+        }
+      }
+    },
+    {
+      "name": "watermark",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "watermark": {"key": "00ff", "context_window": 4}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Greet back.</think>Hello!",
+          "output_ids": [38, 3744, 1182, 13, 154842, 9703, 0],
+          "meta_info": {
+            "id": "r",
+            "finish_reason": {"type": "stop", "matched": 154827},
+            "prompt_tokens": 12,
+            "weight_version": "default",
+            "reasoning_tokens": 2,
+            "completion_tokens": 7,
+            "cached_tokens": 0
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {"watermark": {"key": "00ff", "context_window": 4}},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "r",
+          "object": "chat.completion",
+          "created": 1791964699,
+          "model": "zai-org/GLM-5.3",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet back."},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 154827
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 19,
+            "completion_tokens": 7,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -95,12 +155,12 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hel"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "lo!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hel"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "lo!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
           "[DONE]"
         ]
       }
@@ -157,10 +217,10 @@
       },
       "openai": {
         "events": [
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
           "[DONE]"
         ]
       }
@@ -209,12 +269,12 @@
         "body": {
           "id": "r",
           "object": "chat.completion",
-          "created": 1791783772,
+          "created": 1791964700,
           "model": "zai-org/GLM-5.3",
           "choices": [
             {
               "index": 0,
-              "message": {"role": "assistant", "content": "", "reasoning_content": "!", "tool_calls": null},
+              "message": {"role": "assistant", "content": "", "reasoning_content": "!"},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 154827
@@ -225,7 +285,8 @@
             "total_tokens": 13,
             "completion_tokens": 1,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -356,6 +417,7 @@
     "use_audio_in_video": false,
     "video_config": null,
     "sampling_params": null,
+    "watermark": null,
     "return_logprob": null,
     "logprob_start_len": null,
     "top_logprobs_num": null,
@@ -364,6 +426,7 @@
     "sampling_logprobs_mode": null,
     "return_text_in_logprobs": false,
     "return_flat_raw_top_logprobs": false,
+    "return_flat_raw_output_top_logprobs": false,
     "return_flat_raw_top_logprobs_b64": false,
     "stream": false,
     "log_metrics": true,
@@ -407,6 +470,7 @@
     "image_max_dynamic_patch": null,
     "video_max_dynamic_patch": null,
     "images_config": null,
+    "mm_processor_kwargs": null,
     "multi_item_delimiter_indices": null,
     "token_indices_to_pool": null,
     "cache_salt": null,
@@ -435,7 +499,8 @@
       "skip_special_tokens": true,
       "logit_bias": null,
       "custom_params": null,
-      "sampling_seed": null
+      "sampling_seed": null,
+      "watermark": null
     },
     "chat": {
       "temperature": 1.0,
@@ -459,7 +524,8 @@
       "logit_bias": null,
       "custom_params": null,
       "sampling_seed": null,
-      "spaces_between_special_tokens": true
+      "spaces_between_special_tokens": true,
+      "watermark": null
     }
   }
 }

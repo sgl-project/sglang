@@ -32,7 +32,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 TOKENS = 3
 HIDDEN = 8
@@ -420,6 +420,8 @@ class TestAttnBankSpMoeStages(CustomTestCase):
         residual = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(9))
 
         class Update:
+            bind = None
+            replay_update = None
             is_plain_add = True
 
             def slice_residual_attn_tp(self, residual):
