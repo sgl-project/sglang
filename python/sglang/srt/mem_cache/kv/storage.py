@@ -9,7 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -19,6 +19,10 @@ from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.host import page_envelope_pair
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan, SubPoolExternal, WireEntry
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -91,9 +95,107 @@ class KVStorage:
 
     @property
     def allocator(self):
-        """The chain allocator the scheduler drives directly until it takes the
-        request lifecycle through this storage."""
+        """The chain allocator, for what does not go through this storage yet:
+        admission and eviction (capacity), the tree's frees."""
         return self._allocator
+
+    # -- the request lifecycle --
+    #
+    # A take that may need room first calls ``make_room(num_tokens)``: the
+    # caller evicts from its prefix tree there, before any id is taken.
+
+    def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
+        """Bind the requests' rows and, with a state sub-pool, their state and
+        tracking slots; None when the table has too few free rows. A request
+        already holding a row (a later chunk) keeps it, and one already holding
+        a state slot (a radix hit) keeps that. If the slots run out after the
+        rows were bound, the rows and slots this call took go back before
+        `StateSlotsExhausted` surfaces."""
+        table = self.requests
+        state = self._allocator.state
+        fresh_rows = [req.kv.req_pool_idx is None for req in reqs]
+        rows = table.alloc(reqs)
+        if rows is None or state is None:
+            return rows
+        try:
+            state.acquire(table, reqs, rows, fresh_rows)
+        except StateSlotsExhausted:
+            for req, fresh in zip(reqs, fresh_rows):
+                if fresh:
+                    table.free(req)
+            raise
+        return rows
+
+    def take_tokens(
+        self, num_tokens: int, *, make_room: Callable[[int], Any]
+    ) -> Optional[torch.Tensor]:
+        """Owner token ids, one per token (page size 1); None when they do not
+        fit."""
+        make_room(num_tokens)
+        return self._allocator.alloc(num_tokens)
+
+    def take_extend(
+        self,
+        *,
+        rows: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        num_tokens: int,
+        make_room: Callable[[int], Any],
+        window_tail: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Owner token ids for ``[prefix_len, seq_len)`` of each request's
+        ``rows`` entry, by page, continuing each request's last page from
+        ``last_loc``; None when they do not fit. With ``window_tail`` (one
+        request whose KV a peer sends), a window binds pages for its last
+        ``window_tail`` tokens only."""
+        demand = self._allocator.get_extend_allocation_demand(
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            conservative_num_tokens=num_tokens
+            + len(seq_lens_cpu) * self._allocator.page_size,
+            shard_size=1,
+        )
+        make_room(demand)
+        if window_tail is not None:
+            return self._allocator.alloc_extend_swa_tail(
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                last_loc=last_loc,
+                extend_num_tokens=num_tokens,
+                swa_tail_len=window_tail,
+            )
+        return self._allocator.alloc_extend(
+            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, num_tokens
+        )
+
+    def take_decode(
+        self,
+        *,
+        rows: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        make_room: Callable[[int], Any],
+    ) -> Optional[torch.Tensor]:
+        """One owner token id per ``rows`` entry, at ``seq_len - 1``, taking a
+        page only when that request's last page is full; None when they do not
+        fit."""
+        make_room(len(seq_lens) * self._allocator.page_size)
+        return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    def free_tokens(self, ids: torch.Tensor) -> None:
+        """Give back owner token ids no request holds any more."""
+        self._allocator.free(ids)
+
+    def release_row(self, req: Req) -> None:
+        """Give back the request's row; its ids went back before."""
+        self.requests.free(req)
 
     @property
     def plan(self) -> KVStoragePlan:

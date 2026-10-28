@@ -393,6 +393,8 @@ class ReqToTokenPool:
     mamba_allocator = None
     mamba_ckpt_pool = None
     state: Optional[StateStorage] = None
+    # Whether a row names its request's state slot (the hybrid tables).
+    holds_state_slots: bool = False
 
     def __init__(
         self,
@@ -1365,6 +1367,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    holds_state_slots = True
     # The state sub-pool the slot ids in `req_index_to_mamba_index_mapping`
     # name; the allocator's id space for it says how the pool indexes them.
     state_sub_pool: str = "mamba"

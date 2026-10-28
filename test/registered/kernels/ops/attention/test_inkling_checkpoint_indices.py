@@ -15,12 +15,10 @@ from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedHybridReqToTokenPool,
-    UnifiedMambaPool,
-)
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -82,7 +80,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         )
         slots = allocator.alloc(slot_count)
         self.assertIsNotNone(slots)
-        req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
+        req_type = HybridReqToTokenPool if static else RequestTable
         req_pool = req_type.__new__(req_type)
         req_pool.size = 4
         req_pool.req_index_to_mamba_index_mapping = slots[1:2].to(torch.int32).repeat(4)

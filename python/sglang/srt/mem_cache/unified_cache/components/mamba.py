@@ -67,10 +67,10 @@ class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
-        assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
-            f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
+        assert params.req_to_token_pool.holds_state_slots, (
+            "MambaComponent requires a request table with state slots, got "
+            f"{type(params.req_to_token_pool)}"
         )
         # Without the extra buffer only the sequence-end state exists, so a cached
         # state needs page 1; a disabled tree caches none.

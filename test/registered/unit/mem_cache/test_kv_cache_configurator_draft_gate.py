@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -257,7 +258,15 @@ class TestDraftBindingDispatch(CustomTestCase):
     ):
         if req_to_token_pool == "shared":
             # The target's table: slot ids only, no recurrent state.
-            req_to_token_pool = SimpleNamespace(state=None)
+            req_to_token_pool = RequestTable(
+                size=8,
+                pre_alloc_size=0,
+                max_context_len=64,
+                state_sub_pool=None,
+                tracking=None,
+                device="cpu",
+                enable_memory_saver=False,
+            )
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -335,6 +344,22 @@ class TestDraftBindingDispatch(CustomTestCase):
             )
         sized = caught.exception.sizes.max_total_num_tokens
         self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
+
+    def test_a_declined_fusion_takes_the_private_arm_over_a_stateless_table(self):
+        """A target without recurrent state shares its stateless request table
+        with a draft whose fusion was declined (DFLASH without a draft window
+        under file-backed HiCache, which keeps drafts unfused; DSPARK under
+        HiCache): the draft binds no state and builds its private pool."""
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            with self.subTest(algorithm=algorithm.name):
+                alloc = self._swa_allocator(with_draft_region=False)
+                self.assertIsNone(alloc.state)
+                with self.assertRaises(_CapturedSizes):
+                    self._run(
+                        algorithm=algorithm,
+                        alloc=alloc,
+                        max_total_num_tokens=alloc.size_full,
+                    )
 
     def test_a_draft_with_a_region_binds_the_fused_pool(self):
         """An EAGLE or DSPARK draft binds the fused pool over the target's

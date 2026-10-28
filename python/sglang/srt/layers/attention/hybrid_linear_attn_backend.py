@@ -106,9 +106,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self._state_ids = model_runner.kv_index_translator.state_ids(
             pool.state_sub_pool
         )
-        self._fused_state_indices_ok = torch.device(
-            self.device
-        ).type == "cuda" and isinstance(pool, HybridReqToTokenPool)
+        self._fused_state_indices_ok = (
+            torch.device(self.device).type == "cuda" and pool.holds_state_slots
+        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place

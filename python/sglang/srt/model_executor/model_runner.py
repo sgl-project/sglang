@@ -104,7 +104,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1951,7 +1951,7 @@ class ModelRunner:
         """
         pool = self.req_to_token_pool
         if (
-            not isinstance(pool, HybridReqToTokenPool)
+            not pool.holds_state_slots
             or self.is_draft_worker
             or not forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()

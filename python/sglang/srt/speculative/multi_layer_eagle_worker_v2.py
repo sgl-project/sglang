@@ -36,7 +36,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -256,7 +255,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             and self.speculative_num_steps > 1
             # The fix stashes the mamba/sconv boundary state, so it only applies
             # to hybrid models; non-hybrid MTP drafts (e.g. MiMoV2) must skip it.
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and self.req_to_token_pool.holds_state_slots
         ):
             return
         draft_model_runner = self.draft_runner_list[0]
@@ -270,7 +269,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 target_hidden_size,
             )
             return
-        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+        if self.req_to_token_pool.holds_state_slots:
             target_pool = self.target_worker.model_runner.token_to_kv_pool
             conv_state = target_pool.layer_router.part_view(STATE_PART).mamba_cache.conv
             self.draft_extend_num_warmup_tokens = min(conv_state[0].shape[2:])

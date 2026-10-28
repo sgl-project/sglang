@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -344,7 +345,11 @@ class DecodeKVCacheOffloadManager:
         )
         self.tree_cache.unlock(req.lock)
         req.lock = None
-        self.req_to_token_pool.free(req)
+        kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+        ).release_row(req)
         req.kv.mark_kv_released()
         self.offloaded_state.pop(req, None)
 
