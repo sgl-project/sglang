@@ -121,8 +121,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         if isinstance(self._decode_runner, DecodeCudaGraphRunner):
             return self._decode_update_attr_name()
         raise TypeError(
-            "Unsupported NPU graph update runner: "
-            f"{type(self._decode_runner).__name__}"
+            f"Unsupported NPU graph update runner: {type(self._decode_runner).__name__}"
         )
 
     def _decode_update_attr_name(self):
@@ -443,8 +442,29 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> Any:
         runner = self._decode_runner
         if runner is not None:
+            from sglang.srt.speculative import (
+                multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
+            )
+
+            is_multi_layer_draft_extend = isinstance(
+                runner, multi_layer.MultiLayerEagleDraftExtendCudaGraphRunner
+            )
+            if (
+                is_multi_layer_draft_extend
+                and static_forward_batch.seq_lens_cpu is None
+            ):
+                # The shared runner propagates a missing live mirror as None.
+                # Its device buffer may include stale rows beyond this bucket.
+                raise ValueError(
+                    "Multi-layer draft-extend NPU graph replay requires current "
+                    "CPU sequence lengths."
+                )
             hf_config = runner.model_runner.model_config.hf_config
-            if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+            # The old multi-layer runner always updated Host lengths. Preserve
+            # that contract independently of the generic DSA/V4 opt-out.
+            if is_multi_layer_draft_extend or not (
+                is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+            ):
                 return self.replay_with_input_update(
                     shape_key,
                     seq_lens=self._decode_update_lengths(static_forward_batch),
