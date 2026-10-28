@@ -17,6 +17,7 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.allocator import batch_scan_width
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -43,7 +44,7 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
+from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import expect, resolve_level
 
 logger = logging.getLogger(__name__)
@@ -695,7 +696,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    next_power_of_2(bs),
+                    batch_scan_width(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
@@ -841,7 +842,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        next_power_of_2(bs),
+                        batch_scan_width(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices

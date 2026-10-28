@@ -1363,6 +1363,17 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        # A DFlash verify step commits up to a whole draft block for every running
+        # request, so back-to-back prefill batches stall far more output than in
+        # plain decode. With no interval configured, one verify step runs between
+        # consecutive prefill batches. DP attention is excluded: its ranks hold
+        # different running batches and must keep one prefill/decode cadence.
+        self.spec_verify_between_prefills = (
+            envs.SGLANG_MUSE_B200_OPTIMIZATIONS.get()
+            and self.spec_algorithm.is_dflash()
+            and not self.require_mlp_sync
+        )
+        self._spec_verify_owed = False
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1406,6 +1417,11 @@ class Scheduler(
             self.dynamic_chunk_sizer = sizer
 
     def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
+        if self._spec_verify_owed:
+            # One-shot: a round without a runnable decode batch admits prefill next.
+            self._spec_verify_owed = False
+            return not running_batch.is_empty() and not running_batch.is_prefill_only
+
         if self._prefill_decode_interval_remaining == 0:
             return False
 
@@ -1419,7 +1435,11 @@ class Scheduler(
         return True
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
-        if self.prefill_decode_interval == 0 or batch is None:
+        if batch is None:
+            return
+        if self.prefill_decode_interval == 0:
+            if self.spec_verify_between_prefills and batch.forward_mode.is_extend():
+                self._spec_verify_owed = True
             return
 
         # DP attention synchronizes this flag across ranks. This keeps every

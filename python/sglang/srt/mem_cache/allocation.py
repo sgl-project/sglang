@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.allocator import batch_scan_width
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
@@ -31,7 +32,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    next_power_of_2,
     support_triton,
 )
 from sglang.srt.utils.common import is_pin_memory_available
@@ -697,7 +697,7 @@ def assign_req_to_token_pool_func(
         end_offset,
         out_cache_loc,
         req_to_token.shape[1],
-        next_power_of_2(batch_size),
+        batch_scan_width(batch_size),
     )
 
 
