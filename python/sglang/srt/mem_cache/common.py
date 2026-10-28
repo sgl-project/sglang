@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
+    EvictResult,
     MatchPrefixParams,
     MatchResult,
     zero_match_result,
@@ -290,8 +291,8 @@ def evict_from_tree_cache(
 
 def _evict_until_allocatable(
     tree_cache: BasePrefixCache, allocator, num_tokens: int
-) -> None:
-    """Keep evicting the shortfall until `num_tokens` are allocatable.
+) -> EvictResult:
+    """Keep evicting until `num_tokens` are allocatable; return all evicted counts.
 
     Under classed page sharding available_size() reports the MIN-CLASS
     capacity floor, so a single evict() sized in tokens can raise that floor by
@@ -299,18 +300,22 @@ def _evict_until_allocatable(
     all owner classes. Looping is deterministic, so it stays mirrored across
     the ranks of a shard group. Stock allocators need no extra pass.
     """
+    total = EvictResult()
     if page_interleave_shard_size(allocator) <= 1:
-        return
+        return total
     while True:
         available_size = allocator.available_size()
         if available_size >= num_tokens:
-            return
+            return total
         shortfall = num_tokens - available_size
         result = tree_cache.evict(
             EvictParams(num_tokens=max(shortfall, allocator.page_size))
         )
+        total.num_tokens_evicted += result.num_tokens_evicted
+        total.swa_num_tokens_evicted += result.swa_num_tokens_evicted
+        total.mamba_num_evicted += result.mamba_num_evicted
         if result.num_tokens_evicted == 0:
-            return
+            return total
 
 
 def dsv4_needs_rebootstrap(
@@ -374,6 +379,24 @@ def restore_kv_cache(
     assert req.kv.retraction_backup is not None
     unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
+
+
+def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """``restore_kv_cache`` from the host pool without ordering later work after
+    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed."""
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.kv.retraction_backup is not None
+    unified_cache.start_restore_kv_cache(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
+
+
+def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Return the host slots of ``req``'s restore once its copy has finished."""
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.finish_restore_kv_cache(req)
 
 
 def discard_kv_cache_backup(
