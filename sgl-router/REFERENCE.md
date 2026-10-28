@@ -11,7 +11,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [OpenAI over /generate](#openai-over-generate)
 - [Embeddings](#embeddings), [Classify](#classify), [Completions](#completions), [Rerank](#rerank)
 - [Anthropic Messages](#anthropic-messages)
-- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3)
+- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3), [MiniMax-M3](#minimax-m3)
 - [HTTP/2](#http2)
 - [Native gRPC](#native-grpc)
 - [Upgrading from `cache_aware_zmq`](#upgrading-from-cache_aware_zmq)
@@ -395,7 +395,7 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's and Qwen3.8's templates are
+and Kimi-K3's native encoders and GLM-5.3's, MiniMax-M3's and Qwen3.8's templates are
 fixture-verified against SGLang's request normalization, so they forward every
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
@@ -493,7 +493,7 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -602,6 +602,18 @@ tiktoken encoding; shapes the formatter renders differently go to the worker.
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
 With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`.
+
+## MiniMax-M3
+
+MiniMax-M3 and M3.1 render with the checkpoint's `chat_template.jinja` through
+`rust/sglang-processor`, which picks them by their template and applies SGLang's M3
+request rules: the `thinking` type and the `root` message are validated, every tool
+call must be answered, `thinking` and effort aliases map onto `thinking_mode` and
+`reasoning_effort`, and tool results render in tool-call order. Every text chat
+forwards `input_ids`. Media, `tool_reference` content in tool results, floats in tool
+schemas, `-0` in tool arguments, and a `chat_template` key in `chat_template_kwargs`
+render on the worker. The processor does not reproduce the `minimax-m3` reasoning and
+tool parsers yet, so chats keep the engine's route.
 
 ## HTTP/2
 

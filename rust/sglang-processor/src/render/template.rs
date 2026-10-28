@@ -74,6 +74,7 @@ impl ChatFormatter {
             self,
             ChatFormatter::HuggingFace { .. }
                 | ChatFormatter::Glm53(_)
+                | ChatFormatter::MiniMaxM3(_)
                 | ChatFormatter::Qwen38 { .. }
         );
         let request = TemplateArgsRequest {

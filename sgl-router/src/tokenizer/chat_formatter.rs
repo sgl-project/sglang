@@ -4,7 +4,7 @@
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
 //! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4,
-//! V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 render through `sglang_processor`.
+//! V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`.
 //! Forwarding remains guarded until parity has been verified for each request
 //! shape.
 
@@ -42,7 +42,8 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 render through `sglang_processor`.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through
+    /// `sglang_processor`.
     processor: Option<ProcessorFormatter>,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
@@ -162,14 +163,16 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // GLM-5.3 and Qwen3.8 render through `sglang_processor`, which knows them by
-        // their template.
+        // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`, which knows
+        // them by their template.
         let processor = ProcessorFormatter::from_tokenizer_config(&cfg)
             .ok()
             .filter(|formatter| {
                 matches!(
                     formatter,
-                    ProcessorFormatter::Glm53(_) | ProcessorFormatter::Qwen38 { .. }
+                    ProcessorFormatter::Glm53(_)
+                        | ProcessorFormatter::MiniMaxM3(_)
+                        | ProcessorFormatter::Qwen38 { .. }
                 )
             });
         let template: ChatTemplate =
@@ -264,8 +267,8 @@ impl ChatFormatter {
             .and_then(ProcessorFormatter::reasoning_toggle)
     }
 
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 are fixture-verified against SGLang
-    /// for every text chat.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 are fixture-verified
+    /// against SGLang for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.processor {
             Some(_) => super::ForwardingScope::AllText,
@@ -770,6 +773,32 @@ mod tests {
             json!([{"role": "user", "content": "A"}, {"role": "system", "content": "B"}]);
         assert!(enc.render(&request(mid_system)).is_err());
         let other = jinja(json!({ "chat_template": template.replace("preserve_thinking", "") }));
+        assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
+    }
+
+    /// MiniMax-M3, known by its template, renders every text chat through `sglang_processor`:
+    /// SGLang's M3 request rules apply, and tool results render in tool-call order.
+    #[test]
+    fn minimax_m3_renders_through_the_processor() {
+        use crate::tokenizer::ForwardingScope;
+        let template =
+            "{# <mm:think> #}{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}";
+        let enc = jinja(json!({ "chat_template": template }));
+        assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let req = request(json!([
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": null, "tool_calls": [call("a"), call("b")]},
+            {"role": "tool", "tool_call_id": "b", "content": "B"},
+            {"role": "tool", "tool_call_id": "a", "content": "A"},
+        ]));
+        assert_eq!(
+            enc.render(&req).unwrap(),
+            "<user>Q<assistant><tool>A<tool>B"
+        );
+        let late_root = json!([{"role": "user", "content": "Q"}, {"role": "root", "content": "R"}]);
+        assert!(enc.render(&request(late_root)).is_err());
+        let other = jinja(json!({ "chat_template": template.replace("<mm:think>", "") }));
         assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
     }
 

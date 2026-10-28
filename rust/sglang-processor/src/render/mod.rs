@@ -22,8 +22,9 @@ use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
-    render_deepseek_v4, render_glm53, render_kimi_k3, render_qwen38, takes_content_parts,
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_minimax_m3,
+    is_qwen38, render_deepseek_v4, render_glm53, render_kimi_k3, render_minimax_m3, render_qwen38,
+    takes_content_parts,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -59,6 +60,8 @@ pub enum ChatFormatter {
     /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
     /// semantics, while [`Self::render_request`] follows SGLang's.
     KimiK3,
+    /// MiniMax-M3's and M3.1's Jinja template, which `render_request` renders as SGLang does.
+    MiniMaxM3(PromptFormatter),
     /// Qwen3.8's Jinja template, which `render_request` renders as SGLang does.
     Qwen38 {
         formatter: PromptFormatter,
@@ -85,6 +88,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { formatter, .. }
             | ChatFormatter::Glm53(formatter)
+            | ChatFormatter::MiniMaxM3(formatter)
             | ChatFormatter::Qwen38 { formatter, .. } => render_oai(formatter, request),
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
@@ -145,8 +149,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
-    /// this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, MiniMax-M3 and Qwen3.8
+    /// render this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -165,6 +169,9 @@ impl ChatFormatter {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
             ChatFormatter::KimiK3 => render_kimi_k3(request, default_kwargs),
+            ChatFormatter::MiniMaxM3(formatter) => {
+                render_minimax_m3(formatter, request, default_kwargs).map(text)
+            }
             ChatFormatter::Qwen38 {
                 formatter,
                 content_parts,
@@ -228,6 +235,7 @@ impl ChatFormatter {
             | ChatFormatter::DeepSeekV41(_)
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
+            | ChatFormatter::MiniMaxM3(_)
             | ChatFormatter::Qwen38 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
@@ -292,7 +300,8 @@ impl ChatFormatter {
             }
             // `template_detection`'s `glm53_always_think`.
             ChatFormatter::Glm53(_) => Some(true),
-            ChatFormatter::Legacy(_) => None,
+            // M3 reads `thinking_mode`, which its reasoning parser resolves.
+            ChatFormatter::MiniMaxM3(_) | ChatFormatter::Legacy(_) => None,
         }
     }
 }

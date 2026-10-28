@@ -275,7 +275,8 @@ tools) go to the engine's own route unchanged. See
 conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
 per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
-[Kimi-K3](REFERENCE.md#kimi-k3)) for which chats forward `input_ids`.
+[Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3)) for which
+chats forward `input_ids`.
 
 ### Anthropic Messages
 
