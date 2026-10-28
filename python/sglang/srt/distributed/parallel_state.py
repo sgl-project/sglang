@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_gfx95_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_shm_available,
@@ -84,7 +85,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
-
+_is_mlu = is_mlu()
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
@@ -2135,6 +2136,8 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
         return torch.device(f"xpu:{local_rank}")
     if _is_musa:
         return torch.device(f"musa:{local_rank}")
+    if _is_mlu:
+        return torch.device(f"mlu:{local_rank}")
     platform = platforms.current_platform
     if platform.is_out_of_tree():
         return platform.get_group_coordinator_device(local_rank)
@@ -2196,7 +2199,7 @@ def init_model_parallel_group(
         if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
             use_pynccl = False
         else:
-            use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")
+            use_pynccl = not (_is_npu or _is_xpu or _is_mlu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,

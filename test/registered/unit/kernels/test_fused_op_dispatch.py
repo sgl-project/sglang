@@ -75,6 +75,9 @@ class _AllPlatformsOp(BaseFusedOp):
     def forward_musa(self, x):
         return "musa"
 
+    def forward_mlu(self, x):
+        return "mlu"
+
     def forward_cpu(self, x):
         return "cpu"
 
@@ -154,6 +157,7 @@ def test_is_standard_nn_module(monkeypatch):
         ("npu", "npu"),
         ("xpu", "xpu"),
         ("musa", "musa"),
+        ("mlu", "mlu"),
         ("cpu", "cpu"),
         ("", "native"),
     ],
@@ -172,6 +176,7 @@ def test_platform_forward_dispatch(monkeypatch, key, expect):
         # NameError; ops opt in with an explicit forward_musa instead.
         ("musa", "native"),
         ("npu", "native"),  # no NPU path -> native
+        ("mlu", "native"),  # no MLU path -> native
         ("cpu", "native"),
         ("cuda", "cuda"),
     ],
