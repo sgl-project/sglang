@@ -422,6 +422,7 @@ class TargetVerifyExecutor:
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
+            iteration_ids=verify_window.iteration_ids,
         )
 
     def _run_ragged(

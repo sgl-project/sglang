@@ -12,7 +12,8 @@ slot, and a host page move carries the draft bytes with it.
 """
 
 import unittest
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.unified_draft_pool import (
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     plan_stand_in,
@@ -562,7 +564,7 @@ class TestFusedMLAHost(unittest.TestCase):
         )
 
 
-class TestRoutedDraftPool(unittest.TestCase):
+class TestRoutedDraftPool(CustomTestCase):
     """A draft with window layers binds one dense view per host sub-pool and
     routes per layer like the target's pool: a window layer's write needs the
     swa loc and lands in the swa entry's draft part, never in the full entry."""
@@ -570,8 +572,12 @@ class TestRoutedDraftPool(unittest.TestCase):
     PS = 2
     PAGES = 8
 
-    def _pool(self):
-        full_region = _draft_region()
+    def _pool(self, *, symmetric=False):
+        full_region = (
+            DenseDraftRegion(lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE)
+            if symmetric
+            else _draft_region()
+        )
         swa_region = DenseDraftRegion(
             lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE
         )
@@ -655,6 +661,252 @@ class TestRoutedDraftPool(unittest.TestCase):
         nz = raw.nonzero()
         self.assertGreater(nz.numel(), 0)
         self.assertTrue(bool((nz >= lo).all() and (nz < 7 * swa_entry).all()))
+
+    def _write_fixture(self, *, symmetric=False):
+        arena = self._pool(symmetric=symmetric)
+        pool = self._draft_pool(arena)
+        full = torch.tensor([[14, 15, 16], [17, 18, 19]], dtype=torch.int64)
+        swa = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.int64)
+        values = []
+        for layer_id, name in enumerate(("full", "swa")):
+            region = arena.spec(name).draft_region
+            k = (
+                torch.arange(6 * region.head_dim, dtype=_DTYPE).view(
+                    6, 1, region.head_dim
+                )
+                + 1
+                + layer_id * 64
+            )
+            v = (
+                -torch.arange(6 * region.resolved_v_head_dim(), dtype=_DTYPE).view(
+                    6, 1, region.resolved_v_head_dim()
+                )
+                - 1
+                - layer_id * 64
+            )
+            values.append((k, v))
+        return arena, pool, full, swa, values
+
+    def _expected_writes(self, arena, full, swa, values, commit_lens):
+        arena.raw.fill_(0x5A)
+        expected = arena.raw.clone()
+        rows = (
+            range(6)
+            if commit_lens is None
+            else (
+                row * 3 + col
+                for row, length in enumerate(commit_lens.tolist())
+                for col in range(length)
+            )
+        )
+        rows = tuple(rows)
+        for name, loc, (k, v) in zip(("full", "swa"), (full, swa), values):
+            key_views, value_views = arena.spec(name).draft_views(arena)
+            for source, buffer in ((k, key_views[0]), (v, value_views[0])):
+                base = buffer.data_ptr() - arena.raw.data_ptr()
+                stride = buffer.stride(0) * buffer.element_size()
+                for row in rows:
+                    value = source[row].contiguous().view(torch.uint8).flatten()
+                    offset = base + int(loc.flatten()[row]) * stride
+                    expected[offset : offset + value.numel()] = value
+        return expected
+
+    def test_layer_stores_keep_the_full_and_window_id_spaces(self):
+        """Routed draft writes must use each host's physical IDs and leave rejected rows intact."""
+        arena, pool, full, swa, values = self._write_fixture()
+        for lengths in (None, (2, 0), (0, 0)):
+            with self.subTest(commit_lens=lengths):
+                commit_lens = (
+                    torch.tensor(lengths, dtype=torch.int32)
+                    if lengths is not None
+                    else None
+                )
+                expected = self._expected_writes(arena, full, swa, values, commit_lens)
+                loc = KVWriteLoc(
+                    full if commit_lens is not None else full.flatten(),
+                    swa_loc=swa if commit_lens is not None else swa.flatten(),
+                    physical=True,
+                )
+                with patch.multiple(
+                    mem_pool, _is_cuda=False, _is_hip=False, _cpu_has_amx_support=False
+                ):
+                    for layer_id, (k, v) in enumerate(values):
+                        layer = SimpleNamespace(layer_id=layer_id)
+                        access = pool.layer_router.layer(layer_id)
+                        if commit_lens is None:
+                            access.store(layer, loc, k, v)
+                        else:
+                            access.store_prefix(layer, loc, commit_lens, k, v)
+                self.assertTrue(torch.equal(arena.raw, expected))
+
+    def _draft_layers(self, values):
+        return [
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    attn=SimpleNamespace(layer_id=i, k_scale=None, v_scale=None),
+                    num_kv_heads=1,
+                    head_dim=8,
+                    kv_proj_only=lambda hidden, k=k, v=v: (k, v),
+                    apply_k_norm=lambda k: k,
+                    apply_k_rope=lambda positions, k: k,
+                )
+            )
+            for i, (k, v) in enumerate(values)
+        ]
+
+    def test_dflash_context_append_routes_normal_and_prefix_writes(self):
+        """Both DFLASH materializers must retain SWA IDs through accepted-prefix commits."""
+        from sglang.srt.speculative import dflash_worker_v2
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
+        worker = object.__new__(DFlashWorkerV2)
+        worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
+        worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
+        worker.draft_parallel_layout = None
+        worker.lilicorr = None
+        worker.draft_model = SimpleNamespace(
+            layers=self._draft_layers(values),
+            project_target_hidden=lambda hidden: hidden,
+            prepare_context_hidden_for_kv=lambda layer, hidden: hidden,
+        )
+
+        class Materializer:
+            def materialize(self, *, write_layer_kv, **kwargs):
+                for layer_id, (k, v) in enumerate(values):
+                    write_layer_kv(layer_id, k, v)
+
+        for fused in (False, True):
+            for lengths in (None, (2, 0), (0, 0)):
+                with self.subTest(fused=fused, commit_lens=lengths):
+                    worker._use_fused_kv_materialize = fused
+                    worker._fused_kv_helper = Materializer() if fused else None
+                    commit_lens = (
+                        torch.tensor(lengths, dtype=torch.int32)
+                        if lengths is not None
+                        else None
+                    )
+                    expected = self._expected_writes(
+                        arena, full, swa, values, commit_lens
+                    )
+                    with (
+                        patch.multiple(
+                            mem_pool,
+                            _is_cuda=False,
+                            _is_hip=False,
+                            _cpu_has_amx_support=False,
+                        ),
+                        patch.object(dflash_worker_v2, "_is_npu", False),
+                        patch.object(
+                            dflash_worker_v2,
+                            "draft_tp_context",
+                            return_value=nullcontext(),
+                        ),
+                    ):
+                        worker._append_target_hidden_to_draft_kv_by_loc(
+                            target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                            cache_loc=full.flatten(),
+                            swa_cache_loc=swa.flatten(),
+                            positions=torch.arange(6),
+                            cache_loc_2d=full if commit_lens is not None else None,
+                            commit_lens=commit_lens,
+                        )
+                    self.assertTrue(torch.equal(arena.raw, expected))
+                    self.assertEqual(worker._use_fused_kv_materialize, fused)
+
+    def test_dspark_context_injector_uses_both_plan_id_spaces(self):
+        """DSpark's projected context must commit into both routed hosts without touching rejected rows."""
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+        from sglang.srt.models.dspark import DSparkDraftMixin
+        from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+            TargetHiddenKvInjector,
+        )
+
+        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
+        spaces = {
+            kind: IdSpace(key=kind, write=lambda ids, loc=loc: loc.flatten()[ids])
+            for kind, loc in (
+                (IdSpaceKind.FULL, full),
+                (IdSpaceKind.SLIDING_WINDOW, swa),
+            )
+        }
+        runner_ids = SimpleNamespace(space=spaces.get)
+        plan = IterationIds(
+            source=runner_ids,
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([3, 3]),
+            seq_lens_cpu=torch.tensor([3, 3]),
+            write_virtual=torch.arange(6),
+        )
+        model = SimpleNamespace(
+            layers=self._draft_layers(values),
+            project_target_hidden=lambda hidden: hidden,
+            _fused_kv_write_bundle=lambda pool: None,
+            _stacked_ctx_kv_params=lambda: None,
+        )
+        model.write_target_hidden_kv = MethodType(
+            DSparkDraftMixin.write_target_hidden_kv, model
+        )
+        injector = TargetHiddenKvInjector(
+            draft_model=model,
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=pool, runner_ids=runner_ids
+            ),
+            model_runner=SimpleNamespace(device=torch.device("cpu")),
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=3,
+            block_pos_offsets=torch.arange(3),
+        )
+        for lengths in (None, (2, 0), (0, 0)):
+            with self.subTest(commit_lens=lengths):
+                commit_lens = (
+                    torch.tensor(lengths, dtype=torch.int32)
+                    if lengths is not None
+                    else None
+                )
+                expected = self._expected_writes(arena, full, swa, values, commit_lens)
+                with patch.multiple(
+                    mem_pool, _is_cuda=False, _is_hip=False, _cpu_has_amx_support=False
+                ):
+                    injector.inject_target_hidden(
+                        target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                        cache_loc=plan.write_ids(runner_ids),
+                        positions=torch.arange(6),
+                        cache_loc_2d=full if commit_lens is not None else None,
+                        commit_lens=commit_lens,
+                        iteration_ids=plan,
+                    )
+                self.assertTrue(torch.equal(arena.raw, expected))
+
+    def test_dspark_single_location_fusion_declines_window_layers(self):
+        """A shared-location kernel cannot address full and SWA hosts with different IDs."""
+        from sglang.srt.models.dspark import DSparkDraftMixin
+
+        arena, pool, _, _, values = self._write_fixture(symmetric=True)
+        layers = self._draft_layers(values)
+        rotary = type("RotaryEmbedding", (), {})()
+        rotary.position_start = 0
+        rotary.rotary_dim = 8
+        rotary.is_neox_style = True
+        rotary.cos_sin_cache = torch.ones((16, 8), dtype=_DTYPE)
+        for layer in layers:
+            layer.self_attn.kv_size = 8
+            layer.self_attn.rotary_emb = rotary
+            layer.self_attn.k_norm = SimpleNamespace(
+                weight=torch.ones(8, dtype=_DTYPE), variance_epsilon=1e-6
+            )
+        model = SimpleNamespace(layers=layers)
+        model._fused_k_norm_weights = MethodType(
+            DSparkDraftMixin._fused_k_norm_weights, model
+        )
+        self.assertIsNone(
+            DSparkDraftMixin._fused_kv_write_layout(model, pool, project=lambda x: x)
+        )
+        model.layers = layers[:1]
+        self.assertIsNotNone(
+            DSparkDraftMixin._fused_kv_write_layout(model, pool, project=lambda x: x)
+        )
 
 
 if __name__ == "__main__":
