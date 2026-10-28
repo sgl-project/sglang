@@ -6,8 +6,8 @@ which scrambles top-k expert routing (noaux_tc picks experts by sigmoid-score +
 bias, and the ~34 bias dominates the [0, 1] sigmoid term). The fix keeps the bias
 in fp32 for GlmMoeDsa at both the parameter-construction site (MoEGate) and the
 aiter routing boundary (layers/moe/topk.py). GLM-5.3-Flash (glm5_next_text) keeps
-it fp32 as well, and also through select_experts, which otherwise casts the bias to
-the bf16 gating dtype before aiter. These tests are pure dtype / CPU logic -- no
+it fp32 as well, and select_experts hands an fp32 bias to aiter unchanged. These
+tests are pure dtype / CPU logic -- no
 server, no weight loading, no GPU required.
 """
 
@@ -131,8 +131,10 @@ class TestAiterRoutingBiasDtype(CustomTestCase):
     """The bias dtype select_experts hands the aiter grouped router, with bf16 logits as
     the HIP gate emits them."""
 
-    def _bias_dtype_at_router(self, fp32_correction_bias: bool) -> torch.dtype:
-        bias = BIAS_BASE + torch.linspace(0, 0.5, NUM_EXPERTS)
+    def _bias_dtype_at_router(
+        self, fp32_correction_bias: bool, bias_dtype: torch.dtype = torch.float32
+    ) -> torch.dtype:
+        bias = (BIAS_BASE + torch.linspace(0, 0.5, NUM_EXPERTS)).to(bias_dtype)
         config = TopKConfig(
             top_k=8,
             use_grouped_topk=True,
@@ -158,8 +160,13 @@ class TestAiterRoutingBiasDtype(CustomTestCase):
     def test_fp32_correction_bias_reaches_the_router_fp32(self):
         self.assertEqual(self._bias_dtype_at_router(True), torch.float32)
 
-    def test_default_still_casts_to_the_gating_dtype(self):
-        self.assertEqual(self._bias_dtype_at_router(False), torch.bfloat16)
+    def test_fp32_bias_reaches_the_router_fp32_without_the_flag(self):
+        self.assertEqual(self._bias_dtype_at_router(False), torch.float32)
+
+    def test_bf16_bias_reaches_the_router_bf16(self):
+        self.assertEqual(
+            self._bias_dtype_at_router(False, torch.bfloat16), torch.bfloat16
+        )
 
 
 class TestIsGlmMoeDsaHelper(CustomTestCase):

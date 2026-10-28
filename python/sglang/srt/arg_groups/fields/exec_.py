@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import (
+    Any,
+    Dict,
     List,
     Literal,
     Optional,
@@ -1114,6 +1117,16 @@ class ExecOffload(msgspec.Struct):
             "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
             "The file is sparse and reused across restarts; put it on fast "
             "local storage (NVMe).",
+        ),
+    ] = None
+    engram_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
+            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "collective|peer_read; an omitted key takes the first value. "
+            "See docs/advanced_features/engram.",
+            type_parser=json.loads,
         ),
     ] = None
 
