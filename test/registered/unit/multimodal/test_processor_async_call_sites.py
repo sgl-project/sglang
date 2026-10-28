@@ -139,6 +139,8 @@ _NO_WORKER_POOL_ROUTE = {
     "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
+    # Expands audio placeholders and extracts per-clip features in io_executor.
+    "lfm3_audio.py",
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",
