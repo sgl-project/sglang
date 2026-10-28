@@ -43,9 +43,8 @@ def uses_aiter_tuned_lm_head(layer: torch.nn.Module) -> bool:
 
     if not isinstance(layer, ParallelLMHead):
         return False
-    # the bf16 lm_head rows ship in the gfx950 aiter table registered by the M3 model
-    # override; an fp32 lm_head and the deterministic / on-policy modes keep
-    # LogitsProcessor's own GEMM
+    # the bf16 lm_head rows ship in the M3.1 in-tree aiter table the model installs; an
+    # fp32 lm_head and the deterministic / on-policy modes keep LogitsProcessor's GEMM
     platform = get_platform()
     if not (platform.is_hip and platform.is_gfx95 and envs.SGLANG_USE_AITER.get()):
         return False
