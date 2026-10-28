@@ -121,7 +121,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -332,7 +331,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -1079,8 +1077,8 @@ class WaitingMMRequestBase(ABC):
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         attach_mm_routing_labels(
-            getattr(mm_inputs, "mm_items", None),
-            getattr(self.recv_req, "mm_routing_labels", None),
+            mm_inputs.mm_items,
+            self.recv_req.mm_routing_labels,
         )
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
@@ -1860,9 +1858,9 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
         if info is None:
             mod_info[mod] = [start, end, shape[0], shape[1]]
         else:
-            assert info[3] == shape[1], (
-                f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
-            )
+            assert (
+                info[3] == shape[1]
+            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
             assert info[1] == start, f"non-contiguous parts in modality {mod}"
             info[1] = end
             info[2] += shape[0]

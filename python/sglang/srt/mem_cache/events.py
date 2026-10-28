@@ -133,10 +133,23 @@ class MmRoutingLabels:
     Entries can expire while blocks stay cached; their later events then carry
     no span and the router treats those tokens as unmapped (fail closed).
 
+    Known limitation: once an entry is evicted, a later request can register
+    the same pad value under a different label. Dynamo's id map already keeps
+    the first label for any block it has indexed, so a relabeled re-store is
+    counted as a conflict and dropped; the original routing continues to work.
+    The only gap is an *unindexed* block that is re-stored after eviction:
+    it is indexed under the new label. Both labels identify the same image, so
+    routing to either worker yields a cache hit.
+
     Only the "dynamo" KV event format reports labels, so registration is a
     no-op until an enabled recorder using that format turns it on.
     Tensor-parallel ranks that do not publish events, and the default format,
     never fill it.
+
+    Memory: the default capacity of 2**20 entries uses roughly 100–150 MiB RSS
+    in CPython (key int objects + OrderedDict overhead + label strings).  With
+    Dynamo's 16-character hex labels the measured cost is ~104 MiB; with the
+    128-byte maximum it is ~180 MiB.
     """
 
     def __init__(self, capacity: int = 1 << 20):
@@ -205,7 +218,7 @@ def register_mm_routing_labels(mm_items) -> None:
     if not MM_ROUTING_LABELS.enabled:
         return
     for item in mm_items or ():
-        label = getattr(item, "routing_label", None)
+        label = item.routing_label
         if label:
             MM_ROUTING_LABELS.register(item.padding_values(), label)
 

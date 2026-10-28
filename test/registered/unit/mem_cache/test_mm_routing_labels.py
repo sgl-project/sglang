@@ -111,6 +111,23 @@ class TestMmRoutingLabels(CustomTestCase):
         self.registry.register((31_000_000_001,), "ffff000000000001")
         self.assertIsNone(self.registry.get(X[0]))  # least recently used
 
+    def test_eviction_then_reregister_accepts_new_label(self):
+        # Known limitation: once evicted, a pad value can be registered again
+        # under a new label.  Dynamo's id map already keeps the first label for
+        # any block it has indexed, so a re-stored block is counted as a
+        # conflict and dropped.  The only gap is an *unindexed* block re-stored
+        # after eviction; both labels name the same image, so routing to either
+        # worker still yields a cache hit.
+        self.registry.register(X, LABEL_U)  # 4 entries
+        self.registry.register(Y, LABEL_V)  # 8 entries: at capacity
+        # Push X out (LRU) by adding a third item.
+        Z = (31_000_000_001, 32_000_000_002, 33_000_000_003, 34_000_000_004)
+        self.registry.register(Z, "aaaa000000000001")  # evicts X
+        self.assertIsNone(self.registry.get(X[0]))
+        # Re-register X under a different label: accepted because the entry is gone.
+        self.registry.register(X, LABEL_V)
+        self.assertEqual(self.registry.get(X[0]), LABEL_V)
+
     def test_register_maps_each_labeled_item_pad_value(self):
         labeled = MultimodalDataItem(
             modality=Modality.IMAGE, hash=0xDEADBEEF, routing_label=LABEL_U
