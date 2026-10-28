@@ -82,7 +82,7 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server.tool_call_parser = tool_call_parser
     server.reasoning_parser = None
     server._reasoning_detector = None
-    server.is_gpt_oss = server.is_gemma4 = False
+    server.is_gpt_oss = server.is_gemma4 = server.is_minimax_m3 = False
     server.chat_encoding_spec = chat_encoding.resolve_chat_encoding_spec(
         hf_config=hf_config,
         tokenizer=tokenizer,

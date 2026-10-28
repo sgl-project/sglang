@@ -474,7 +474,9 @@ class TestMonokernelFramework(CustomTestCase):
                 publish(ServerArgs(model_path="dummy", **{field: True}), role="test")
                 self.assertEqual(binding._backend(), backend)
                 reset_context()
-        with patch.dict(registry._REGISTRY, {binding.MSA_BACKEND: {ARCH: "x:y"}}):
+        with patch.dict(
+            registry._REGISTRY, {binding.MSA_BACKEND: {(ARCH, None): "x:y"}}
+        ):
             self.assertTrue(binding.msa_serves([ARCH]))
             self.assertFalse(binding.msa_serves(["OtherForCausalLM"]))
 

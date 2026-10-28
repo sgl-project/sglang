@@ -581,6 +581,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         when sharding is off (and on the root, which starts no chain)."""
         return self.node_by_id(node_id).rotation_base
 
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: rotation_base plus the node's first
+        position-page (host backups draw slots of the same owners)."""
+        node = self.node_by_id(node_id)
+        if node.rotation_base is None:
+            return None
+        prefix_len = 0
+        parent = node.parent
+        while parent is not None:
+            prefix_len += len(parent.key)
+            parent = parent.parent
+        return node.rotation_base + prefix_len // self.page_size
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()

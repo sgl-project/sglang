@@ -116,6 +116,7 @@ def _build_server_args(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -131,6 +132,9 @@ def _build_server_args(
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
