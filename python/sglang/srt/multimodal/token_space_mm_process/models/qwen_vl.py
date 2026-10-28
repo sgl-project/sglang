@@ -406,17 +406,17 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         return mm_token_expansion_spec
 
     # Adapted from the M-RoPE block of sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor._process_mm_data_uncached;
-    # reads the merged media fields instead of precomputed M-RoPE or mm_items.
-    def compute_mrope_positions(self, input_ids, media_features):
-        input_ids = torch.as_tensor(input_ids, dtype=torch.long).flatten()
-        image_grid_thw = media_features.get("image_grid_thw")
-        video_grid_thw = media_features.get("video_grid_thw")
-        second_per_grid_ts = media_features.get("second_per_grid_ts")
+    # reads the processor output instead of precomputed M-RoPE or mm_items.
+    def compute_mrope_positions(self, output):
+        input_ids = torch.as_tensor(output["input_ids"], dtype=torch.long).flatten()
+        image_grid_thw = output.get("image_grid_thw")
+        video_grid_thw = output.get("video_grid_thw")
+        second_per_grid_ts = output.get("second_per_grid_ts")
         if second_per_grid_ts is None:
-            second_per_grid_ts = media_features.get("video_second_per_grid")
+            second_per_grid_ts = output.get("video_second_per_grid")
         audio_feature_lengths = None
-        if media_features.get("feature_attention_mask") is not None:
-            audio_feature_lengths = media_features["feature_attention_mask"].sum(-1)
+        if output.get("feature_attention_mask") is not None:
+            audio_feature_lengths = output["feature_attention_mask"].sum(-1)
 
         mrope_result = None
         if (
