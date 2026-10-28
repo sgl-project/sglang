@@ -42,6 +42,7 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
         ),
     )
     owner.transfer_queue = SimpleNamespace(queue=[])
+    owner.attn_tp_cpu_group = None
     owner.ready = []
     owner.releasing = []
     owner.decode_offload_manager = None
