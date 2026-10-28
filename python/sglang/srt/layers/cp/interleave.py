@@ -83,6 +83,10 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     # Only sequence-dependent graph segments use this capacity. Eager cache
     # operations and gathers must continue using total_seq_lens (live tokens).
     graph_num_tokens: Optional[int] = None
+    # Set only by the breakable-graph adapter: the CP-local, physically padded
+    # position rows the captured body ran with (same row geometry as the local
+    # K shard). Eager CP leaves this None and shards forward_batch.positions.
+    presharded_positions: Optional[torch.Tensor] = None
 
 
 def is_interleave_extend(forward_batch):
