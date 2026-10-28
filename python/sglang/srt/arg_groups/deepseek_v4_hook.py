@@ -95,7 +95,9 @@ def _engram_config_from_env(cfg) -> EngramConfig:
 
 
 def _resolve_engram_config(server_args: ServerArgs) -> None:
-    """The only producer of the engram_config the Engram layers read."""
+    """Validate --engram-config and declare it. A `lookup` of `auto` stays as is:
+    the layers resolve it at model construction (`resolve_engram_config`), once the
+    parallel layout and the GPUs are known."""
     cfg = resolving_view(server_args)
     raw = cfg.engram_config
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
