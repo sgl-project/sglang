@@ -391,9 +391,23 @@ def run_bench_serving(
     gsp_num_groups=None,
     gsp_prompts_per_group=None,
     cache_report=False,
-    min_host_hit_rate_pct=None,
+    min_host_hit_rate=None,
     env=None,
 ):
+    """Run sglang.bench_serving against a live server and parse its metrics.
+
+    cache_report=True collects the server's --enable-cache-report hit rates
+    without asserting anything. The parsed metrics dict then carries
+    cache_hit_rate_pct (overall), device_hit_rate_pct (L1) and
+    host_hit_rate_pct (L2/HiCache), so L1 can be checked by reading the
+    returned dict. min_host_hit_rate is a fraction (0.1 = 10%): setting it
+    implicitly turns on cache_report and asserts L2 > threshold; leaving it
+    None keeps the run assertion-free.
+    """
+    # The assertion needs the report to exist; enable it implicitly so
+    # callers only set one knob for a checked L2 run.
+    if min_host_hit_rate is not None:
+        cache_report = True
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
         "./bench_log.txt"
@@ -600,19 +614,19 @@ def run_bench_serving(
                     if len(parts) >= 3:
                         metrics["accept_length"] = parts[2]
                 elif stripped_line.startswith("Cache hit rate:"):
-                    # Format: "Cache hit rate:    82.2%" (from --cache-report)
+                    # Overall KV hit rate, e.g. "Cache hit rate: 82.2%"
                     parts = stripped_line.split()
                     if len(parts) >= 4:
                         metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
                 elif stripped_line.startswith("Device:") and stripped_line.endswith(
                     "%"
                 ):
-                    # Format: "Device:    19.7%"
+                    # L1 (device KV cache) hit rate, e.g. "Device: 19.7%"
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
                 elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
-                    # Format: "Host:    19.7%"
+                    # L2 (host HiCache) hit rate, e.g. "Host: 19.7%"
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
@@ -629,24 +643,27 @@ def run_bench_serving(
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
-    if min_host_hit_rate_pct is not None:
+    if min_host_hit_rate is not None:
         host_hit = metrics.get("host_hit_rate_pct")
         if host_hit is None:
             raise Exception(
                 "No host hit rate found in bench_serving output while "
-                "min_host_hit_rate_pct is set (did the server run with "
+                "min_host_hit_rate is set (did the server run with "
                 "--enable-cache-report and the bench with --cache-report?)"
             )
-        dump_metric("host_hit_rate", float(host_hit), labels={"type": "perf"})
+        # Parsed values are percentages ("18.2"); thresholds are fractions.
+        host_hit_rate = float(host_hit) / 100
+        dump_metric("host_hit_rate", host_hit_rate, labels={"type": "perf"})
         dump_metric(
             "host_hit_rate_baseline",
-            float(min_host_hit_rate_pct),
+            float(min_host_hit_rate),
             labels={"type": "perf"},
         )
         # Strictly greater: a zero threshold stays meaningful (any actual
         # hit must be > 0), instead of trivially passing on ">=".
-        assert float(host_hit) > float(min_host_hit_rate_pct), (
-            f"L2 host hit rate {host_hit}% is not above {min_host_hit_rate_pct}%"
+        assert host_hit_rate > float(min_host_hit_rate), (
+            f"L2 host hit rate {host_hit}% is not above "
+            f"{float(min_host_hit_rate) * 100}%"
         )
 
     return metrics

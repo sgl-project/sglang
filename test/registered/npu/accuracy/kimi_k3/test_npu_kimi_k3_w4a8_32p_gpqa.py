@@ -134,7 +134,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     }
     timeout = 10000
     seed = 42
-    host_hit_rate = 10
+    host_hit_rate = 0.1  # fraction: 0.1 = 10% L2 host hit rate
 
     def test_npu_kimi_k3_w4a8_32p_gpqa(self):
         """Run NPU accuracy test for Kimi-K3-w4a8 32p four nodes on gpqa_diamond"""
@@ -157,8 +157,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
             gsp_prompts_per_group=32,
             seed=42,
             warmup_requests=16,
-            cache_report=True,
-            min_host_hit_rate_pct=self.host_hit_rate,
+            min_host_hit_rate=self.host_hit_rate,
         )
 
 
