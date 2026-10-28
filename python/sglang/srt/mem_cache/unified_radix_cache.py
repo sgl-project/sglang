@@ -3441,13 +3441,14 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = finish_count_tensor.item()
 
         # Process completed acks
-        while finish_count > 0:
-            ack = cc.ack_write_queue.pop(0)
+        completed_acks = cc.ack_write_queue[:finish_count] if finish_count > 0 else ()
+        if completed_acks:
+            del cc.ack_write_queue[:finish_count]
+        for ack in completed_acks:
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
-            finish_count -= 1
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
@@ -3487,8 +3488,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
-        while finish_count > 0:
-            ack = cc.ack_load_queue.pop(0)
+        completed_acks = cc.ack_load_queue[:finish_count] if finish_count > 0 else ()
+        if completed_acks:
+            del cc.ack_load_queue[:finish_count]
+        for ack in completed_acks:
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 if (
@@ -3515,7 +3518,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
                     )
-            finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
 

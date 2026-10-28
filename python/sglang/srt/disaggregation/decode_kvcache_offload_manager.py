@@ -301,8 +301,11 @@ class DecodeKVCacheOffloadManager:
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
-        while finish_count > 0:
-            ack = self.cache_controller.ack_write_queue.pop(0)
+        if finish_count <= 0:
+            return
+        completed_acks = self.cache_controller.ack_write_queue[:finish_count]
+        del self.cache_controller.ack_write_queue[:finish_count]
+        for ack in completed_acks:
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 (
@@ -332,7 +335,6 @@ class DecodeKVCacheOffloadManager:
 
                 if req.finished() and not self._has_inflight_offload(req):
                     self._release_finished_req(req)
-            finish_count -= 1
 
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
