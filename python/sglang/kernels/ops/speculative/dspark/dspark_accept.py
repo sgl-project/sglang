@@ -8,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -21,12 +24,8 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.sample import (
         chain_speculative_sampling_triton,
-        compute_dflash_correct_drafts_and_bonus,
     )
 else:
-    from sglang.kernels.ops.speculative.dflash import (
-        compute_dflash_correct_drafts_and_bonus,
-    )
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
     )
@@ -309,14 +308,6 @@ class SoftmaxTemp:
         temperatures: torch.Tensor,
         rows_per_request: int,
     ) -> torch.Tensor:
-        if _is_npu:
-            from sgl_kernel_npu.sample import softmax_temp_triton
-
-            return softmax_temp_triton(
-                logits=logits,
-                temperatures=temperatures,
-                rows_per_request=rows_per_request,
-            )
         return softmax_temp_triton(
             logits=logits,
             temperatures=temperatures,

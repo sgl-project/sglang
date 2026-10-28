@@ -14,11 +14,14 @@ from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     SoftmaxTemp,
+    _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
-from sglang.kernels.ops.speculative.dspark.dspark_verify_window import BuildOutTokens
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildOutTokens,
+    build_out_tokens_triton,
+)
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
-from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,7 +33,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         torch.manual_seed(42)
 
     def test_build_out_tokens_matches_full_torch_buffer(self):
-        from sgl_kernel_npu import sample
+        from sgl_kernel_npu.operators import sample
 
         for bs, gamma in ((0, 7), (1, 0), (33, 7)):
             for len_dtype in (torch.int32, torch.int64):
@@ -62,14 +65,17 @@ class TestDSparkNpuDispatch(CustomTestCase):
                         expected = BuildOutTokens.torch(**reference)
                         with mock.patch.object(
                             sample,
-                            "build_out_tokens_triton",
-                            wraps=sample.build_out_tokens_triton,
+                            "build_out_tokens",
+                            wraps=sample.build_out_tokens,
                         ) as kernel:
                             actual = BuildOutTokens.execute(**inputs)
                         kernel.assert_called_once_with(**inputs)
                         self.assertEqual(actual.dtype, torch.int64)
                         self.assertEqual(actual.device, draft.device)
                         self.assertTrue(torch.equal(actual.cpu(), expected))
+                        if bs:
+                            generic = build_out_tokens_triton(**inputs)
+                            self.assertTrue(torch.equal(generic.cpu(), expected))
 
     def test_placement_uses_first_tensor(self):
         cpu = torch.zeros(1)
@@ -95,7 +101,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         logits = torch.randn(rows * block, vocab, device="npu")
         logits[0, 5] = float("nan")
         expected_top1 = logits.cpu().argmax(-1)
-        self.assertTrue(torch.equal(row_argmax(logits).cpu(), expected_top1))
+        self.assertTrue(torch.equal(_row_argmax(logits).cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
         candidates = predict.clone()
         candidates[:, 1:] = predict[:, :-1]
@@ -123,9 +129,11 @@ class TestDSparkNpuDispatch(CustomTestCase):
     def test_softmax_temperature_mapping(self):
         logits = torch.randn(9, 4097, device="npu")
         temperatures = torch.tensor([0.3, 0.7, 1.2], device="npu")
-        actual = SoftmaxTemp.execute(
-            logits=logits, temperatures=temperatures, rows_per_request=3
-        )
+        with mock.patch.object(SoftmaxTemp, "torch", wraps=SoftmaxTemp.torch) as native:
+            actual = SoftmaxTemp.execute(
+                logits=logits, temperatures=temperatures, rows_per_request=3
+            )
+        native.assert_called_once()
         expected = torch.softmax(
             logits.cpu() / temperatures.cpu().repeat_interleave(3)[:, None], -1
         )
@@ -160,17 +168,21 @@ class TestDSparkNpuDispatch(CustomTestCase):
                     logits_out=torch.empty_like(kept, device="cpu"),
                 )
             )
-            from sgl_kernel_npu import sample
+            from sgl_kernel_npu.operators import sample
 
             with mock.patch.object(
                 sample,
-                "markov_sample_step_triton",
-                wraps=sample.markov_sample_step_triton,
+                "markov_sample",
+                wraps=sample.markov_sample,
             ) as kernel:
                 actual = MarkovSampleStep.execute(**kwargs)
             kernel.assert_called_once_with(**kwargs)
             self.assertTrue(torch.equal(actual.cpu(), expected))
             self.assertTrue(torch.equal(kept.cpu(), value.to(dtype)))
+            generic_kept = torch.empty_like(kept)
+            generic = MarkovSampleStep.triton(**dict(kwargs, logits_out=generic_kept))
+            self.assertTrue(torch.equal(generic.cpu(), expected))
+            self.assertTrue(torch.equal(generic_kept.cpu(), value.to(dtype)))
 
     def test_cpu_reference_stays_available(self):
         logits = torch.randn(6, 257)
