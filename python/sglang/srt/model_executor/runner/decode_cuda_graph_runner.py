@@ -1994,13 +1994,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _resolve_skips_prefilled_inputs(self) -> bool:
-        """The DSpark target verify runner, whose verify batches are pre-planned by
-        prepare_for_verify and then replayed from the same tensors."""
-        return (
+        """A target verify runner whose verify batches are pre-planned and then
+        replayed from the same tensors: DSpark's, and EAGLE's, whose plan-time load
+        runs after the draft has written the verify tokens and positions."""
+        if (
+            self.model_runner.is_draft_worker
+            or self.capture_forward_mode != ForwardMode.TARGET_VERIFY
+        ):
+            return False
+        algorithm = self.model_runner.spec_algorithm
+        return algorithm.is_eagle() or (
             envs.SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS.get()
-            and not self.model_runner.is_draft_worker
-            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
-            and self.model_runner.spec_algorithm.is_dspark()
+            and algorithm.is_dspark()
         )
 
     def _glues_target_verify_metadata(self) -> bool:
