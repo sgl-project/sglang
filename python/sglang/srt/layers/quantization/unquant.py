@@ -615,9 +615,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 layer.weight.dtype,
             )
         ):
-            return _rdna_splitk_gemv(
-                x.view(-1, x.shape[-1]), layer.weight
-            ).view(*x.shape[:-1], layer.weight.shape[0])
+            return _rdna_splitk_gemv(x.view(-1, x.shape[-1]), layer.weight).view(
+                *x.shape[:-1], layer.weight.shape[0]
+            )
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
