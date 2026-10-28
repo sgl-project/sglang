@@ -215,7 +215,9 @@ def intree_out_dir() -> str:
 class IntreeTable(msgspec.Struct, frozen=True):
     """An aiter tuned-config table that in-tree rows patch: aiter's variable for it, the
     ``AITER_CONFIGS`` attribute that resolves it, the in-tree CSV, the merged file's name
-    stem, and the table's key and kernel columns."""
+    stem, and the table's key and kernel columns. ``hipblaslt_rocm`` is the ROCm (major,
+    minor) whose hipBLASLt numbered the rows' ``solidx``, for a table that has
+    ``libtype == "hipblaslt"`` rows."""
 
     env: str
     attr: str
@@ -223,6 +225,32 @@ class IntreeTable(msgspec.Struct, frozen=True):
     stem: str
     key_cols: tuple
     kernel_cols: tuple
+    hipblaslt_rocm: Optional[tuple] = None
+
+
+def read_intree_rows(spec: IntreeTable):
+    """``spec``'s in-tree rows this runtime can use: hipBLASLt solution indices belong to
+    one hipBLASLt build, and another build rejects them, so a ROCm other than
+    ``spec.hipblaslt_rocm`` drops the hipBLASLt rows."""
+    import pandas as pd
+
+    from sglang.srt.utils.common import get_hip_version
+
+    rows = pd.read_csv(spec.csv)
+    rocm = get_hip_version()[:2]
+    if spec.hipblaslt_rocm is None or rocm == tuple(spec.hipblaslt_rocm):
+        return rows
+    hipblaslt = rows["libtype"] == "hipblaslt"
+    if hipblaslt.any():
+        logger.info(
+            "%s: %d hipBLASLt rows skipped; their solution indices are ROCm %s's, "
+            "this runtime is ROCm %s",
+            spec.stem,
+            int(hipblaslt.sum()),
+            ".".join(map(str, spec.hipblaslt_rocm)),
+            ".".join(map(str, rocm)),
+        )
+    return rows[~hipblaslt]
 
 
 def install_intree_table(spec: IntreeTable, out_dir: Optional[str] = None):
@@ -236,7 +264,7 @@ def install_intree_table(spec: IntreeTable, out_dir: Optional[str] = None):
     base = getattr(AITER_CONFIGS, spec.attr)
     table, stats = apply_intree_rows(
         pd.read_csv(base),
-        pd.read_csv(spec.csv),
+        read_intree_rows(spec),
         list(spec.key_cols),
         list(spec.kernel_cols),
     )
