@@ -126,7 +126,11 @@ def alloc_target_memory_pool(*, tp_worker, draft_worker) -> None:
     if draft_worker is not None:
         preloaded_weights_bytes += draft_worker.preloaded_weights_bytes
     tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
-    tp_worker.alloc_memory_pool()
+    tp_worker.alloc_memory_pool(
+        draft_parallel_layout=(
+            draft_worker.draft_parallel_layout if draft_worker is not None else None
+        )
+    )
 
 
 def alloc_draft_memory_pool(*, tp_worker, draft_worker) -> None:
