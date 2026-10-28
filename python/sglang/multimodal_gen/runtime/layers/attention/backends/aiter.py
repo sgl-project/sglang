@@ -378,6 +378,7 @@ class AITerImpl(AttentionImpl):
             key,
             value,
             dropout_p=self.dropout_p,
+            softmax_scale=self.softmax_scale,
             causal=self.causal,
             return_attn_probs=False,
             return_lse=False,
