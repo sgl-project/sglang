@@ -655,7 +655,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):
-        # Convert the raw-token skip boundary to page-aligned radix-key units.
+        # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
+        # Convert the request's raw-token skip boundary to page-aligned radix-key units.
         if self.linker is None:
             return nullcontext()
         skip_key = RadixKey(
