@@ -105,7 +105,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -1751,6 +1754,8 @@ class DenoisingStage(PipelineStage):
         *args,
         **kwargs,
     ):
+        # what the models kept for this loop is freed before decode
+        batch.extra.pop(DENOISING_LOOP_STATE, None)
         # Gather results if using sequence parallelism
         if trajectory_latents:
             trajectory_tensor = torch.stack(trajectory_latents, dim=1)
@@ -2563,6 +2568,19 @@ class DenoisingStage(PipelineStage):
         if padder is not None:
             return padder(call_kwargs, current_model, buckets)
         return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable graphs whose weights changed after capture; serving never re-captures."""
+        dropped = sum(len(runner.entries) for runner in self._bcg_runners.values())
+        for runner in self._bcg_runners.values():
+            runner.reset(disabled_reason=reason)
+        if dropped:
+            logger.warning(
+                "[Diffusion BCG] %s after capture: dropped %d graph(s); "
+                "requests run eager until restart.",
+                reason,
+                dropped,
+            )
 
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for

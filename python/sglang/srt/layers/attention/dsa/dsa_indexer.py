@@ -202,13 +202,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     # PyNCCL is the faster path under capture, but it is not a precondition:
     # a split attn-TP group is built without one (parallel_state.py), and the
     # process-group broadcast captures and replays correctly.
+    pynccl_comm = group.get_available_pynccl_comm()
     if (
         topk_indices.device.type == "cuda"
         and torch.cuda.is_current_stream_capturing()
-        and group.pynccl_comm is not None
+        and pynccl_comm is not None
     ):
-        with group.pynccl_comm.change_state(enable=True):
-            group.pynccl_comm.broadcast(topk_indices, src=0)
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.broadcast(topk_indices, src=0)
     else:
         group.broadcast(topk_indices, src=0)
 
@@ -1903,6 +1904,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    @property
+    def topk_output_width(self):
+        return self.index_topk
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1911,6 +1916,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1936,7 +1942,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside

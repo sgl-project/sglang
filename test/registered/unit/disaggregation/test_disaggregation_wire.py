@@ -68,7 +68,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -358,6 +358,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_data_ptrs=[[0x1000]],
             state_item_lens=[[32]],
             state_layer_ids=[[]],
+            aux_data_ptrs=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -380,6 +381,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
                 return info, manager._publish_peer_registration("decode", info)
@@ -597,6 +599,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        sender.conclude_state = None
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
@@ -1137,7 +1140,7 @@ class _MemcpyNixlAgent:
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
-    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
+    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif=b""):
         return src_descs, dst_descs
 
     def transfer(self, handle):
@@ -1217,7 +1220,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                 [dst_ptrs],
                 [self.DST_PAGES],
                 0,
-                "7_state_0",
                 decode_tp,
                 decode_tp_rank=dst_rank,
                 dst_state_item_lens=[[item_len] * len(dst_ptrs)],
@@ -1451,6 +1453,71 @@ class TestStagingWatermark(unittest.TestCase):
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
         )
+
+
+class TestStagingScatterLifecycle(CustomTestCase):
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_unregister_waits_for_submit_to_publish_its_event(self, make_event):
+        """Room teardown must not release a slot before its scatter is enqueued."""
+        room = 7
+        alloc_id = 5
+        receiver = SimpleNamespace(chunk_staging_infos=[(alloc_id, 4096, 0, 8192, 3)])
+        decode_req = SimpleNamespace(_chunk_events=[])
+        context = SimpleNamespace(
+            room_receivers={room: receiver}, room_bootstrap={room: object()}
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.kv_manager = SimpleNamespace(_staging_ctx=context)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._room_to_decode_req = {room: decode_req}
+        handler._room_to_receiver = {room: receiver}
+        handler._writer_counts = {room: {}}
+        handler._staging_lifecycle = threading.Condition()
+        token = object()
+        handler._room_tokens = {room: token}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._free_and_send_watermark = Mock()
+
+        scatter_started = threading.Event()
+        finish_scatter = threading.Event()
+        unregister_waiting = threading.Event()
+        original_wait = handler._staging_lifecycle.wait
+
+        def observed_wait():
+            unregister_waiting.set()
+            return original_wait()
+
+        def scatter_region(*_args):
+            scatter_started.set()
+            finish_scatter.wait()
+            return True
+
+        handler._staging_lifecycle.wait = observed_wait
+        handler._scatter_region = scatter_region
+        event = make_event.return_value
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            submit = pool.submit(handler.submit_chunk_scatter, room, 0, 11, 3)
+            try:
+                self.assertTrue(scatter_started.wait(timeout=1))
+                unregister = pool.submit(handler.unregister_decode_req, room)
+                self.assertTrue(unregister_waiting.wait(timeout=1))
+                self.assertFalse(unregister.done())
+                handler._free_and_send_watermark.assert_not_called()
+            finally:
+                finish_scatter.set()
+
+            self.assertTrue(submit.result(timeout=1))
+            unregister.result(timeout=1)
+
+        event.record.assert_called_once_with(handler.staging_allocator._scatter_stream)
+        handler._free_and_send_watermark.assert_called_once_with(alloc_id, decode_req)
+        self.assertNotIn(room, context.room_receivers)
+        self.assertNotIn(room, context.room_bootstrap)
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):

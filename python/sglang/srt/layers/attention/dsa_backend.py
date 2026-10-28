@@ -644,6 +644,9 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_metadata_kv_dtype = None
             self.aiter_dsa_kv_last_page_lens = None
             self.aiter_dsa_work_metadata = None
+            self.aiter_dsa_identity_scale = torch.ones(
+                (), dtype=torch.float32, device=self.device
+            )
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
@@ -802,9 +805,8 @@ class DeepseekSparseAttnBackend(
             q_dtype,
             kv_dtype,
             is_sparse=True,
-            fast_mode=False,
-            num_kv_splits=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            fast_mode=True,
+            intra_batch_mode=False,
         )
 
         return (
@@ -874,6 +876,7 @@ class DeepseekSparseAttnBackend(
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
     ) -> dict:
+        kv_indptr = kv_indptr[: bs + 1]
         self._ensure_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
             batch_size=bs,
@@ -900,10 +903,10 @@ class DeepseekSparseAttnBackend(
             kv_granularity=16,
             max_seqlen_qo=max_seqlen_q,
             uni_seqlen_qo=max_seqlen_q,
-            fast_mode=False,
-            topk=self.dsa_index_topk,
+            fast_mode=True,
+            topk=-1,
             max_split_per_batch=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            intra_batch_mode=False,
             dtype_q=q_dtype,
             dtype_kv=kv_dtype,
         )
@@ -916,8 +919,6 @@ class DeepseekSparseAttnBackend(
             "reduce_indptr": self.aiter_dsa_reduce_indptr,
             "reduce_final_map": self.aiter_dsa_reduce_final_map,
             "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
-            "intra_batch_mode": True,
-            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
         }
 
     def _pad_trtllm_sparse_page_table(
@@ -2376,7 +2377,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
-            )
+            ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
             "flashmla_sparse_q8",
@@ -3460,13 +3461,15 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
+        # The kernel adds a singleton batch axis; attention padding expects
+        # the token axis first, as in q_all.
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
-        )
+        ).squeeze(0)
 
     def _forward_triton_decode(
         self,
@@ -3491,7 +3494,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
-        )
+        ).squeeze(0)
 
     def _forward_intel_xpu_sparse_decode(
         self,
@@ -3620,11 +3623,14 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        o_dtype = torch.bfloat16 if q.dtype == fp8_dtype else q.dtype
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=o_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=o_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -3635,7 +3641,8 @@ class DeepseekSparseAttnBackend(
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3645,7 +3652,12 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = self.aiter_dsa_identity_scale
+            kv_scale = (
+                layer.k_scale.reshape(())
+                if isinstance(layer.k_scale, torch.Tensor)
+                else self.aiter_dsa_identity_scale
+            )
 
         kv_indptr = self.kv_indptr
 
@@ -3698,11 +3710,14 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        o_dtype = torch.bfloat16 if q.dtype == fp8_dtype else q.dtype
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim), dtype=o_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=o_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -3713,7 +3728,8 @@ class DeepseekSparseAttnBackend(
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3723,7 +3739,12 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = self.aiter_dsa_identity_scale
+            kv_scale = (
+                layer.k_scale.reshape(())
+                if isinstance(layer.k_scale, torch.Tensor)
+                else self.aiter_dsa_identity_scale
+            )
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -3806,9 +3827,14 @@ class DeepseekSparseAttnBackend(
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            if cos_sin_cache is None:
+            if q_rope is None:
+                # CP overlap prepares fused RoPE/FP8 Q/K before the indexer.
+                # Q is already merged and KV already replicated.
+                assert cos_sin_cache is None
+                assert q.dtype == k.dtype == k_rope.dtype == torch.float8_e4m3fn
+                assert q.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            elif cos_sin_cache is None:
                 q, k, k_rope = mla_quantize_for_fp8_no_rope(
                     q,
                     q_rope,
@@ -3940,6 +3966,10 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        if is_prefill:
+            # CP graph metadata includes the physical shard's padding; its
+            # eager attention bridge can narrow Q to the live local rows.
+            seq_lens = seq_lens[:batch_size]
 
         attention_kwargs = dict(
             kv_cache=kv,
