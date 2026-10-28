@@ -214,6 +214,8 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # Expert loaders may copy in parallel; restore before any thread writes.
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
@@ -298,15 +300,7 @@ class WeightUpdater:
     def _receive_bucketed_weights_from_distributed(
         self: WeightUpdater, *, names, dtypes, shapes, group_name
     ):
-        named_tensors = []
-        for name, dtype, shape in zip(names, dtypes, shapes):
-            target_dtype = (
-                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            )
-            named_tensors.append(
-                (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-            )
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.empty(names, dtypes, shapes, self.device)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(
             flattened_tensor,

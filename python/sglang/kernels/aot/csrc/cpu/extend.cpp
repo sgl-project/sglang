@@ -115,8 +115,8 @@ void extend_attention_kernel_impl(
       int seq_len_prefix = seq_len - seq_len_extend;
       int seq_extend_start_loc = extend_start_loc[bs];
 
-      int64_t req_pool_id = static_cast<int64_t>(req_pool_indices[bs]);
-      const int64_t row_base = req_pool_id * static_cast<int64_t>(max_context_len);
+      int req_pool_id = req_pool_indices[bs];
+      const int64_t req_to_token_row_offset = static_cast<int64_t>(req_pool_id) * max_context_len;
       int kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
       TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
@@ -167,7 +167,7 @@ void extend_attention_kernel_impl(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
             /* src_scale*/ k_buf_scale,
-            /*    ind */ req_to_token + row_base + n + kv_offset,
+            /*    ind */ req_to_token + req_to_token_row_offset + n + kv_offset,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ k_strideN,
@@ -222,7 +222,7 @@ void extend_attention_kernel_impl(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
             /* src_scale*/ v_buf_scale,
-            /*    ind */ req_to_token + row_base + n + kv_offset,
+            /*    ind */ req_to_token + req_to_token_row_offset + n + kv_offset,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ v_strideN,

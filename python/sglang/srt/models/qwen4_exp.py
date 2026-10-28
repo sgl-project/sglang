@@ -3,6 +3,7 @@
 import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
@@ -26,6 +27,12 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
@@ -40,6 +47,7 @@ from sglang.srt.layers.hyperconnection import (
 )
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -71,6 +79,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
@@ -89,7 +100,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -118,25 +129,24 @@ def _ple_table_is_fp8(
 
 
 @eager_on_graph(True)
-def _breakable_qsa_indexer(layer, hidden_states, positions):
+def _breakable_qsa_indexer(layer, hidden_states, positions, output):
+    """Writes the top-k into ``output``, the caller's rows of the layer's bridge;
+    allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     topk = layer._compute_qsa_topk_indices_eager(
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
-        use_host_prefill_lengths=True,
     )
-    # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
-    # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
-    bridge = layer._qsa_prefill_topk_bridge
-    if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
-        bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
-        layer._qsa_prefill_topk_bridge = bridge
-    output = bridge[: hidden_states.shape[0]]
+    if output is None:
+        # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA
+        # layers. For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB
+        # shared. Graphs captured on a smaller bridge keep writing and reading it.
+        output = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
+        layer._qsa_prefill_topk_bridges.insert(0, output)
     output.fill_(0)
     output[: topk.shape[0]].copy_(topk)
-    return output
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -177,20 +187,23 @@ class _PLEBatch(msgspec.Struct, frozen=True):
 
 
 class _BreakablePLEBatch:
-    # _copy_output needs __dict__ to replace batch on replay; Struct uses slots.
-    def __init__(self, batch: Optional[_PLEBatch]):
-        self.batch = batch
+    """The live batch's PLE layout for the PLE breaks of one forward. A capture
+    records this holder, and ``_breakable_prepare_ple_batch`` refills it at every
+    replay."""
+
+    def __init__(self):
+        self.batch: Optional[_PLEBatch] = None
 
 
 @eager_on_graph(True)
-def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
-    return _BreakablePLEBatch(
-        batch=_prepare_ple_batch(
-            input_ids=input_ids,
-            forward_batch=get_tc_piecewise_forward_context().forward_batch,
-            ngram_size=ngram_size,
-            ngram_eos_token_id=ngram_eos_token_id,
-        )
+def _breakable_prepare_ple_batch(
+    input_ids, *, ngram_size, ngram_eos_token_id, holder: _BreakablePLEBatch
+):
+    holder.batch = _prepare_ple_batch(
+        input_ids=input_ids,
+        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        ngram_size=ngram_size,
+        ngram_eos_token_id=ngram_eos_token_id,
     )
 
 
@@ -203,17 +216,22 @@ def _breakable_ple_prefetch(ple, batch):
 
 
 @eager_on_graph(True)
-def _breakable_ple_forward(ple, hidden_states, batch):
+def _breakable_ple_forward(ple, hidden_states, batch, output):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     if batch.batch is None:
         # Idle batch replayed as a dummy extend: join the collective, add nothing.
         ple.forward_idle(forward_batch)
-        return torch.zeros_like(hidden_states)
+        output.copy_(hidden_states)
+        return
     # PLE pads its output to the token bucket after applying the live layout.
-    return ple(
-        hidden_states=hidden_states,
-        forward_batch=forward_batch,
-        batch=batch.batch,
+    torch.add(
+        hidden_states,
+        ple(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            batch=batch.batch,
+        ),
+        out=output,
     )
 
 
@@ -1444,20 +1462,47 @@ def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
-def _qwen4_exp_stage_facts(config, layer_id, *, residual=None):
+def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
+    """A CP extend under CP-TP group sharing: every layer runs on this rank's
+    zigzag token rows, and the GDN and the PLE gather the sequence in global
+    token order where they need it. The batch metadata stays global."""
+    return (
+        get_parallel().enable_cp_tp_group_sharing
+        and forward_batch.attn_cp_metadata is not None
+        and is_cp_active(forward_batch)
+    )
+
+
+def _linear_attn_options():
+    """Linear attention scans the sequence in token order, and its output owes
+    the sum over the group its heads are partitioned over."""
+    return dict(
+        tp_group=(
+            SumGroup.TP if linear_attn_parallel_group() == "tp" else SumGroup.ATTN_TP
+        ),
+        in_token_order=True,
+    )
+
+
+def _qwen4_exp_stage_facts(config, layer_id, *, residual=None, linear_attention=False):
     """The attention and FFN stages a gated hyper-connection layer of either
     kind declares: the model's shared declaration function (see make_layers),
     which the layer declares itself with. ``residual`` is the layer's own
     reads and updates of the streams; without it, the stages declare what
     those do. A PLE layer's attention read needs every row, for the PLE
-    embedding is computed for all of them."""
+    embedding is computed for all of them. ``linear_attention`` for a GDN
+    layer."""
     if residual is None:
         residual = GatedResidualState.facts(
             attn_reads_every_row=_has_ple(layer_id, config)
         )
     sparse = _qwen3_5_is_moe(config)
     return (
-        declare_attn(read=residual.attn_readout, update=residual.attn_update),
+        declare_attn(
+            read=residual.attn_readout,
+            update=residual.attn_update,
+            **(_linear_attn_options() if linear_attention else {}),
+        ),
         declare_ffn(
             sparse=sparse,
             next_layer_sparse=sparse,
@@ -1467,7 +1512,7 @@ def _qwen4_exp_stage_facts(config, layer_id, *, residual=None):
     )
 
 
-def _build_qwen4_exp_stages(config, layer_id, residual):
+def _build_qwen4_exp_stages(config, layer_id, residual, *, linear_attention=False):
     """The attention and FFN stage boundaries of one gated hyper-connection
     layer, declared by _qwen4_exp_stage_facts with the layer's own reads and
     updates (``residual``).
@@ -1476,7 +1521,9 @@ def _build_qwen4_exp_stages(config, layer_id, residual):
     the writes are gated injections, so neither stage offers a fused
     add-and-norm candidate.
     """
-    attn, ffn = _qwen4_exp_stage_facts(config, layer_id, residual=residual)
+    attn, ffn = _qwen4_exp_stage_facts(
+        config, layer_id, residual=residual, linear_attention=linear_attention
+    )
     return append_stages((attn, None), (ffn, None))
 
 
@@ -1489,6 +1536,7 @@ class Qwen4ExpLayerExtensionMixin:
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        linear_attention: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1549,6 +1597,7 @@ class Qwen4ExpLayerExtensionMixin:
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
+            linear_attention=linear_attention,
         )
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
@@ -1631,14 +1680,22 @@ class Qwen4ExpLayerExtensionMixin:
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return residual + _breakable_ple_forward(
-                ple=self.ple, hidden_states=residual, batch=ple_batch
+            output = torch.empty_like(residual)
+            _breakable_ple_forward(
+                ple=self.ple, hidden_states=residual, batch=ple_batch, output=output
             )
+            return output
         if ple_batch is None:
             if not _get_ple_forward_mode(forward_batch).is_idle():
                 raise RuntimeError("non-idle Qwen4 PLE forward is missing its batch")
             self.ple.forward_idle(forward_batch)
             return residual
+        if _shards_rows_over_cp(forward_batch):
+            # The n-gram window and the short conv read the sequence in global
+            # token order: run on the gathered rows, keep this rank's rows.
+            full_rows = cp_gather_after_forward(residual, forward_batch)
+            embedding = self.ple(full_rows, forward_batch, ple_batch)
+            return residual + cp_shard_hidden_states(embedding, forward_batch)
         return residual + self.ple(residual, forward_batch, ple_batch)
 
     def _prepare_attn_stage(
@@ -1691,6 +1748,8 @@ class Qwen4ExpLayerExtensionMixin:
 class Qwen4ExpLinearDecoderLayer(
     Qwen4ExpLayerExtensionMixin, Qwen3_5LinearDecoderLayer
 ):
+    stage_facts = staticmethod(partial(_qwen4_exp_stage_facts, linear_attention=True))
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -1709,7 +1768,9 @@ class Qwen4ExpLinearDecoderLayer(
             is_nextn,
             build_stages=False,
         )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, linear_attention=True
+        )
 
     def forward(
         self,
@@ -1755,7 +1816,8 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
-        self._qsa_prefill_topk_bridge = None
+        # The prefill graphs' top-k bridges, newest first. Buckets share the newest.
+        self._qsa_prefill_topk_bridges: list = []
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -1773,9 +1835,25 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return _breakable_qsa_indexer(
-                layer=self, hidden_states=hidden_states, positions=positions
+            rows = hidden_states.shape[0]
+            bridges = self._qsa_prefill_topk_bridges
+            output = (
+                bridges[0][:rows] if bridges and bridges[0].shape[0] >= rows else None
             )
+            # A capture records the bridge it is given; the warmup before it
+            # allocates one.
+            assert output is not None or _current_capture_var.get() is None, (
+                "qsa top-k bridge not allocated before capture"
+            )
+            _breakable_qsa_indexer(
+                layer=self,
+                hidden_states=hidden_states,
+                positions=positions,
+                output=output,
+            )
+            if output is None:  # first run: the break allocated the bridge
+                output = bridges[0][:rows]
+            return output
         return self._compute_qsa_topk_indices_eager(
             hidden_states=hidden_states,
             positions=positions,
@@ -1787,8 +1865,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
-        use_host_prefill_lengths: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1807,18 +1883,22 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        if use_host_prefill_lengths:
-            indexer_metadata = msgspec.structs.replace(
-                indexer_metadata,
-                prefill_sequence_lengths_cpu=tuple(
-                    forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
-                ),
+        indexer_kwargs = {}
+        if _shards_rows_over_cp(forward_batch):
+            # Prefill CP: this rank's rows select against the index keys of the
+            # whole sequence, gathered in token order with the RoPE positions
+            # the model split (the batch keeps them whole).
+            indexer_kwargs["cp_global_rope_positions"] = (
+                forward_batch.mrope_positions
+                if positions.ndim == 2
+                else forward_batch.positions
             )
         topk_indices = self.indexer(
             hidden_states,
             positions,
             forward_batch,
             indexer_metadata,
+            **indexer_kwargs,
         )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
@@ -1867,6 +1947,16 @@ class Qwen4ExpAttentionDecoderLayer(
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
+            if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+                from sglang.srt.layers.attention.qsa.glue import (
+                    resolve_qsa_sparse_backend,
+                )
+
+                # Every CP rank issues the K/V gather before the index-key
+                # gather, overlapping it with the indexer's local computation.
+                resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
+                    self.attn, k, v, forward_batch
+                )
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
                 hidden_states, positions, forward_batch
             )
@@ -1984,6 +2074,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 pp_proxy_tensors, forward_batch
             )
 
+        shards_rows = _shards_rows_over_cp(forward_batch)
+        if shards_rows:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
+
         breakable_ple = (
             self.has_ple
             and is_in_breakable_cuda_graph()
@@ -1991,10 +2087,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         ple_batch = None
         if breakable_ple:
-            ple_batch = _breakable_prepare_ple_batch(
+            ple_batch = _BreakablePLEBatch()
+            _breakable_prepare_ple_batch(
                 input_ids=input_ids,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                holder=ple_batch,
             )
         elif self.has_ple:
             ple_batch = _prepare_ple_batch(
@@ -2060,6 +2158,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             forward_batch,
             _MixStreams(self.hyper_connection_mixer, normalized_input),
         )
+        if shards_rows:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            # Only hidden-state capture reads the streams; gather them for it.
+            capture = forward_batch.capture_hidden_mode
+            hc_hidden_states = (
+                cp_gather_after_forward(hc_hidden_states, forward_batch)
+                if capture is not None and capture.need_capture()
+                else None
+            )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 

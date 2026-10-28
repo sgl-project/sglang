@@ -7,28 +7,40 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def late_layer_dp_counts(
-    forward_batch: ForwardBatch, local_late_rows: int
+    forward_batch: ForwardBatch, local_late_rows: int, *, in_graph: bool
 ) -> Optional[List[int]]:
-    # Bounded replay shrinks an extending rank's late layers to its tail, but the
-    # TP-MoE gather / combine there spans every DP rank, so each rank needs all
-    # ranks' late-layer row counts. Eager forwards only: every rank takes this
-    # branch together, and graph replays never reach the late-layer switch.
+    # The TP-MoE gather / combine in the late layers spans every DP rank, so each
+    # rank needs all ranks' tail row counts.
     early = forward_batch.global_num_tokens_padded_cpu
     if early is None:
         early = forward_batch.global_num_tokens_cpu
-    if early is None or torch.cuda.is_current_stream_capturing():
+    if early is None:
         return None
     if len(early) == 1:
         # Local-only counts (MegaMoE with a DP LM head): no peer geometry to share.
         counts = [local_late_rows]
+    elif in_graph:
+        # The capture bakes the tail block and replays never run this code. Every
+        # rank shares one bucket whenever the graph holds a DP gather.
+        counts = [local_late_rows] * len(early)
+    elif forward_batch.global_late_layer_num_tokens_cpu is not None:
+        # Exchanged in ForwardBatch.prepare_mlp_sync_batch, which a peer replaying
+        # the prefill graph reaches too; a gather here would wait for it forever.
+        counts = forward_batch.global_late_layer_num_tokens_cpu
+        assert counts[get_parallel().attn_dp_rank] == local_late_rows, (
+            counts,
+            local_late_rows,
+        )
     else:
-        # Tail row counts are host-known; the CPU group avoids a device sync.
+        # Without the exchange (no extend in the batch) every rank takes this
+        # path; the CPU group avoids a device sync.
         counts = torch.empty(len(early), dtype=torch.int64)
         all_gather_single(
             counts,
@@ -56,9 +68,13 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
         fb.num_token_non_padded,
     )
     fb.global_num_tokens_cpu = counts
-    fb.global_num_tokens_gpu = torch.tensor(
-        counts, dtype=torch.int64, device=fb.global_num_tokens_gpu.device
-    )
+    # Device ops only: this runs inside prefill graph capture, where a host copy
+    # would be recorded against pageable memory.
+    gpu = fb.global_num_tokens_gpu
+    if len(set(counts)) == 1:
+        fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
+    else:
+        fb.global_num_tokens_gpu = async_h2d(counts, dtype=gpu.dtype, device=gpu.device)
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
     fb.global_num_tokens_for_logprob_cpu = counts
@@ -70,11 +86,13 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
     # With attention TP=1 the invariant scalar also describes local MoE rows.
     # Preserve an idle peer's zero bound even when it carries fabricated rows.
     local_rows = counts[get_parallel().attn_dp_rank if len(counts) > 1 else 0]
-    real_rows = min(local_rows, fb.global_num_token_non_padded_cpu)
-    fb.global_num_token_non_padded_cpu = real_rows
+    fb.global_num_token_non_padded_cpu = min(
+        local_rows, fb.global_num_token_non_padded_cpu
+    )
     if fb.global_num_token_non_padded is not None:
-        fb.global_num_token_non_padded = fb.global_num_token_non_padded.new_tensor(
-            real_rows
+        # Clamp the runner's static scalar so a graph replay rebounds it per batch.
+        fb.global_num_token_non_padded = torch.clamp(
+            fb.global_num_token_non_padded, max=local_rows
         )
         fb.num_token_non_padded = fb.global_num_token_non_padded
     set_dp_buffer_len_from_batch(fb)

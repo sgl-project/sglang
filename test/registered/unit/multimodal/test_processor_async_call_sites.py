@@ -18,7 +18,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _MULTIMODAL_ROOT = (
     pathlib.Path(__file__).resolve().parents[4]
@@ -145,6 +145,9 @@ _NO_WORKER_POOL_ROUTE = {
     "mimo_v2_asr.py",
     "minicpmv4_6.py",
     "moss_vl.py",
+    # Muse's custom media/artifact pipeline offloads preprocessing to io_executor
+    # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
+    "muse_spark_omni.py",
     "nano_nemotron_vl.py",
     "voxtral.py",
     "whisper.py",
