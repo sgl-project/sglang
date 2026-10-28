@@ -1295,6 +1295,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # True once this worker has taken dumper.step() over from the model runners.
+    _dumper_step_owner: bool = False
+
     @property
     def draft_parallel_layout(self):
         return (
@@ -1361,6 +1364,42 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+        self._take_over_dumper_step()
+
+    def _take_over_dumper_step(self) -> None:
+        """Stop the model runners from advancing dumper.step() per forward.
+
+        One speculation round drives the target runner once and the draft
+        runner(s) once per draft step plus once for draft-extend. Stepping per
+        forward means the round's target and draft tensors never share a step
+        number, so they cannot be diffed against each other. ``_dumper_step``
+        advances the counter once per round instead.
+
+        A subclass that skips this __init__ keeps the per-forward behaviour, and
+        ``_dumper_step`` stays a no-op for it so the two cannot both count.
+        """
+        from sglang.srt.debug_utils.dumper import dumper
+
+        # Leave non-dumping runs untouched.
+        if not dumper.may_enable:
+            return
+
+        runners = [self.target_worker.model_runner]
+        if self._draft_worker is not None:
+            runners.extend(self._draft_worker.draft_runners)
+        for runner in runners:
+            runner.dumper_step_driven_externally = True
+        self._dumper_step_owner = True
+
+    def _dumper_step(self) -> None:
+        """Advance one dump step; call only at a speculation-round boundary."""
+        if not self._dumper_step_owner:
+            return
+
+        from sglang.srt.debug_utils.dumper import dumper
+
+        dumper.step()
 
     @property
     def last_shared_read_runner(self):
@@ -1543,6 +1582,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_parent_list = parent_list.clone()
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
+            # Round boundary: target verify and draft extend are both done.
+            self._dumper_step()
             return batch_output
 
     def _forward_prefill_batch(
@@ -1572,6 +1613,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # A rank that does not host the draft (prefill-side PP builds it only on
         # the last stage) forwards the target's proxy tensors and stops here.
         if self._draft_worker is None:
+            self._dumper_step()
             return batch_output
 
         if coordination_plan is not None:
@@ -1599,6 +1641,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.mm_input_embeds,
                 kv_loc_plan=kv_loc_plan,
             )
+            # Round boundary: target prefill and draft prefill are both done.
+            self._dumper_step()
             return batch_output
 
     def _forward_dp_spec_prefill_coordination(
@@ -1673,6 +1717,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
+        self._dumper_step()
         return result
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:

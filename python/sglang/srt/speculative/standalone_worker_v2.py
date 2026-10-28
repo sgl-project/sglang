@@ -182,6 +182,10 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         # TODO: Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
 
+        # This __init__ replaces EAGLEWorkerV2's, but forward_batch_generation is
+        # inherited, so the per-round dumper stepping has to be armed here too.
+        self._take_over_dumper_step()
+
     def _validate_vocab_compatibility(
         self,
         target_vocab_size: int,

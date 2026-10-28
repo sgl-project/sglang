@@ -325,6 +325,10 @@ class ModelRunner:
 
     watermark_state: Optional[WatermarkState] = None
 
+    # Set to True by a speculative worker that advances dumper.step() itself at
+    # the speculation-round boundary, so the per-forward step() below is skipped.
+    dumper_step_driven_externally: bool = False
+
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
         return self._sampling_observer
@@ -1897,7 +1901,11 @@ class ModelRunner:
         if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
 
-        if dumper.may_enable:
+        # A speculation round runs several forwards (draft chain, target verify,
+        # draft extend) through this method; stepping per forward would spread
+        # one round over several steps and misalign target against draft. Such
+        # workers set dumper_step_driven_externally and step at the round edge.
+        if dumper.may_enable and not self.dumper_step_driven_externally:
             dumper.step()
 
         if self.msprobe_debugger is not None:
