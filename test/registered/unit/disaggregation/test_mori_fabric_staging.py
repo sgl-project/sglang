@@ -31,11 +31,10 @@ from sglang.srt.disaggregation.mori.fabric_staging import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 PACK = "sglang.srt.disaggregation.mori.conn.pack_row_segments"
 UNPACK = "sglang.srt.disaggregation.mori.conn.unpack_row_segments"
