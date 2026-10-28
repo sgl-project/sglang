@@ -491,13 +491,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     else None
                 ),
                 mamba_host_only_checkpoint=(
-                    bool(
-                        getattr(
-                            get_exec().mamba,
-                            "enable_mamba_host_only_checkpoint",
-                            False,
-                        )
-                    )
+                    get_exec().mamba.enable_mamba_host_only_checkpoint
                     if has_mamba
                     else False
                 ),

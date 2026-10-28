@@ -5318,7 +5318,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     ));
                 }
                 // Auxiliary host data may outlive Full host data under write-back.
-                if node.has_host_value(ct) && !full_hst && !(self.is_write_back && full_dev) {
+                // Host-only mamba keeps Full on device and the checkpoint on host.
+                let host_only_ok = full_dev
+                    && self.components[i].host_only_checkpoint_counts_as_device();
+                if node.has_host_value(ct)
+                    && !full_hst
+                    && !(self.is_write_back && full_dev)
+                    && !host_only_ok
+                {
                     errors.push(format!(
                         "node {node_id} {ct:?} host present but Full.host_value=None"
                     ));

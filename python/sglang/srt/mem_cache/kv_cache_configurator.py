@@ -2891,11 +2891,9 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
-        # Host-only checkpoints do not retain a GPU donate slot or a locked
-        # prefix slot. The GPU pool is the live slot plus ping-pong slots the
-        # extra-buffer kernel still writes into. Default off: the branch below
-        # is the previous ratio.
-        if getattr(get_exec().mamba, "enable_mamba_host_only_checkpoint", False):
+        # Host-only checkpoints keep the live slot plus the ping-pong slots
+        # the extra-buffer kernel writes. They do not keep a donate slot.
+        if get_exec().mamba.enable_mamba_host_only_checkpoint:
             if not get_exec().mamba.enable_mamba_extra_buffer:
                 return 1
             return 1 + get_mamba_tracking_slots(

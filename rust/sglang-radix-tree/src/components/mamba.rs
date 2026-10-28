@@ -201,6 +201,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
+        assert!(
+            params.mamba_value.is_none() || params.mamba_host_value.is_none(),
+            "mamba insert sets both a device slot and a host checkpoint"
+        );
         if params.mamba_value.is_none() && params.mamba_host_value.is_none() {
             if tree_core.allow_missing_mamba_insert {
                 result.mamba_exist = true;
@@ -269,7 +273,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if node.is_root() {
                 break;
             }
-            if node.has_device_value(MAMBA) {
+            let host_only_holder = self.mamba_host_only_checkpoint
+                && !node.has_device_value(MAMBA)
+                && node.has_host_value(MAMBA);
+            if node.has_device_value(MAMBA) || host_only_holder {
                 holders.push(node_id);
             }
             cursor = node.parent;
@@ -285,19 +292,29 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 break;
             }
             let node = tree_core.arena.node(node_id);
+            let host_only_holder =
+                !node.has_device_value(MAMBA) && node.has_host_value(MAMBA);
             if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
+                continue;
+            }
+            if host_only_holder && node.host_lock_ref(MAMBA) > 0 {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(node_id) {
                 continue;
             }
+            let layer = if host_only_holder {
+                EvictLayer::Host
+            } else {
+                EvictLayer::Device
+            };
             tree_core.evict_component_and_detach_lru_(
                 node_id,
                 MAMBA,
                 device_frees,
                 host_frees,
                 cache_actions,
-                EvictLayer::Device,
+                layer,
                 Some(&mut tracker),
             );
             tree_core.cascade_evict_(
@@ -307,7 +324,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 device_frees,
                 host_frees,
                 cache_actions,
-                EvictLayer::Device,
+                layer,
             );
             excess -= 1;
         }

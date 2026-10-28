@@ -727,6 +727,7 @@ fn host_only_checkpoint_keeps_the_device_kv_prefix() {
     assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
     assert!(tc.arena.node(leaf).has_host_value(MAMBA));
     assert!(matched.mamba_host_hit_length >= 1);
+    tc.sanity_check(&[], &[]);
 }
 
 #[test]
@@ -2405,6 +2406,37 @@ fn new_combines_the_chunk_and_tree_page_grids() {
 #[should_panic(expected = "requires mamba_cache_chunk_size")]
 fn new_panics_without_a_chunk_size() {
     MambaComponent::new(&CacheInitParams::default());
+}
+
+#[test]
+fn evict_excess_path_states_counts_host_only_checkpoints() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(256),
+            mamba_max_states_per_path: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let [a, b] = chain::<2>(&mut tc);
+    set_mamba_host(&mut tc, a, 7);
+    set_mamba_host(&mut tc, b, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(b).id)
+        .expect("live test node");
+    let freed = result
+        .host_frees
+        .remove(&MAMBA)
+        .expect("the excess host checkpoint frees its slot");
+    assert_eq!(freed.len(), 1);
+    assert!(freed[0].equal(&Tensor::from_slice(&[7i64])));
+    assert!(tc.arena.node(a).try_host_value(MAMBA).is_none());
+    assert!(tc.arena.node(b).try_host_value(MAMBA).is_some());
 }
 
 #[test]

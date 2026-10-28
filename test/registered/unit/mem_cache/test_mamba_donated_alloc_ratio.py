@@ -216,6 +216,67 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         self.assertEqual(r(extra_buffer=True, lazy=True, disable_overlap=False), 2)
         self.assertEqual(r(extra_buffer=True, lazy=False, disable_overlap=False), 3)
 
+    def _cleanup(self, *, host_only: bool, mamba_exist: bool):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+
+        freed = []
+        pool = SimpleNamespace(
+            free_mamba_cache=lambda req: freed.append(req),
+            mamba_ckpt_pool=None,
+        )
+        component = object.__new__(MambaComponent)
+        component.cache = SimpleNamespace(
+            req_to_token_pool=pool,
+            enable_mamba_extra_buffer=False,
+        )
+        req = SimpleNamespace()
+        with rc.get_context().override_server_args(
+            disable_radix_cache=False,
+            enable_mamba_host_only_checkpoint=host_only,
+        ):
+            component.cleanup_after_caching_req(
+                req,
+                is_finished=True,
+                insert_result=InsertResult(prefix_len=0, mamba_exist=mamba_exist),
+                insert_params=InsertParams(),
+            )
+        return freed, req
+
+    def test_flag_off_keeps_a_donated_gpu_slot(self):
+        freed, _req = self._cleanup(host_only=False, mamba_exist=False)
+        self.assertEqual(freed, [])
+
+    def test_host_only_no_buffer_frees_the_request_slot(self):
+        freed, req = self._cleanup(host_only=True, mamba_exist=False)
+        self.assertEqual(freed, [req])
+
+    def test_flag_off_inflight_anchor_still_loads(self):
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = SimpleNamespace(
+            buffer_pipeline=None,
+            linker=None,
+            ongoing_load_back={7: object()},
+            tree_core=SimpleNamespace(
+                is_full_device_evicted=lambda _node_id: True,
+                collect_full_device_indices=lambda *_a, **_k: torch.tensor([1, 2]),
+            ),
+        )
+        cache.load_back = lambda *_a, **_k: True
+        req = SimpleNamespace(
+            last_node=3,
+            rid="r",
+            swa_host_hit_length=0,
+            mamba_host_hit_length=0,
+        )
+        loaded = UnifiedRadixCache.init_load_back(
+            cache,
+            InitLoadBackParams(best_match_node=7, host_hit_length=1, req=req),
+        )
+        self.assertEqual(loaded, (2, 7))
+
 
 class _RecordingComp:
     """Fake tree component: records the dec params it is asked to release with."""
