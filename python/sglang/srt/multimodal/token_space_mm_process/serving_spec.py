@@ -1,4 +1,7 @@
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 
 class TokenSpaceServingSpec:
@@ -26,3 +29,15 @@ class TokenSpaceServingSpec:
         `/v1/decisions` rejects image requests when the processor exposes none.
         """
         return None
+
+    def split_mm_items(
+        self, mm_items: list["MultimodalDataItem"]
+    ) -> list["MultimodalDataItem"]:
+        """Split each modality's item into one item per media, for per-media cache keys.
+
+        Runs on processor worker threads, so it must not mutate the spec. The default
+        is the legacy processor's split, which finds media boundaries by field name.
+        """
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        return get_new_expanded_mm_items(mm_items)

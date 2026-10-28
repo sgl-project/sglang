@@ -23,7 +23,7 @@ TokenSpaceProcessor.process(media, IDs)
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy keeps its legacy processor's loader and worker defaults
-  registered serving spec -> mm_tokens and IO threads; none -> the defaults
+  registered serving spec -> mm_tokens, IO threads, item split; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   adjacent images -> two offsets from mm_spans, not one scanned run
@@ -439,6 +439,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_serving_spec_is_selected_apart_from_the_strategy(self):
         """The wrapper reads the spec registered for the architecture, else the defaults."""
         mm_tokens = object()
+        split_calls = []
 
         class _MarkerSpec(TokenSpaceServingSpec):
             models = _ImageWidthStrategy.models
@@ -446,6 +447,10 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
 
             def build_mm_tokens(self, processor):
                 return mm_tokens
+
+            def split_mm_items(self, mm_items):
+                split_calls.append(len(mm_items))
+                return super().split_mm_items(mm_items)
 
         reset_context()
         self.addCleanup(reset_context)
@@ -478,6 +483,13 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 self.addCleanup(processor.shutdown)
                 self.assertIs(processor.mm_tokens, expected_tokens)
                 self.assertEqual(processor._core.mm_io_worker_num, expected_io)
+                split_calls.clear()
+                asyncio.run(
+                    processor.process_mm_data_async(
+                        image_data=[Image.new("RGB", (2, 1))], input_ids=[1, IMAGE, 2]
+                    )
+                )
+                self.assertEqual(split_calls, [1] if specs else [])
 
     def test_served_core_applies_the_server_media_url_policy(self):
         """Building a core resets the process-wide URL policy to its config's.

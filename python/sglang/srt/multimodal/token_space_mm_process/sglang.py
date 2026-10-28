@@ -85,11 +85,11 @@ class TokenSpaceSGLangProcessor:
 
     def __init__(self, hf_config, server_args, _processor, transport_mode, **kwargs):
         strategy_class = self._strategy_class
-        serving_spec = self._serving_spec_class(hf_config)
+        self._serving_spec = self._serving_spec_class(hf_config)
         self._server_args = server_args
         mm = get_mm()
         self._video_preprocessing_device = (mm.mm_process_config or {}).get(
-            "video_preprocessing_device", serving_spec.video_preprocessing_device
+            "video_preprocessing_device", self._serving_spec.video_preprocessing_device
         )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
         self._feature_transport = MultimodalFeatureTransport(
@@ -121,7 +121,7 @@ class TokenSpaceSGLangProcessor:
             ),
             mm_io_worker_num=mm.mm_io_worker_num
             or int(os.environ.get("SGLANG_IO_WORKERS", 0))
-            or serving_spec.auto_mm_io_worker_num,
+            or self._serving_spec.auto_mm_io_worker_num,
             allowed_media_domains=mm.allowed_media_domains,
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
@@ -134,7 +134,7 @@ class TokenSpaceSGLangProcessor:
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
         # Request validation reads the prompt's media markers through it.
-        self.mm_tokens = serving_spec.build_mm_tokens(_processor)
+        self.mm_tokens = self._serving_spec.build_mm_tokens(_processor)
         self._image_device = self._serving_image_processor_device()
 
     @property
@@ -196,7 +196,7 @@ class TokenSpaceSGLangProcessor:
         )
 
     def _package_output(self, output: BatchFeature) -> MultimodalProcessorOutput:
-        """Package the token-space output for the scheduler; the same for every model.
+        """Package the token-space output for the scheduler.
 
         Runs on a processor worker thread, concurrently with other requests. Read
         only state fixed at construction, never `self._core._processor`: that is the
@@ -213,10 +213,7 @@ class TokenSpaceSGLangProcessor:
         mm_items = self._collect_mm_items(output)
         for item in mm_items:
             item.offsets = offsets[item.modality]
-        # Split bundled items into per-image/video items for better cache granularity.
-        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-
-        mm_items = get_new_expanded_mm_items(mm_items)
+        mm_items = self._serving_spec.split_mm_items(mm_items)
         # Hash the feature tensors themselves: transport may swap them for CUDA IPC handles.
         self._set_item_hashes(mm_items)
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
