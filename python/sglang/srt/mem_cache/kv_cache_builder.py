@@ -85,7 +85,12 @@ def prepare_hicache_staging(
     def prepare(pool, packed_drafts=(), *, sidecar=False):
         if isinstance(pool, SWAKVPool):
             prepare(pool.full_kv_pool)
-            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
+            if not (
+                get_disagg().disaggregation_mode == "decode"
+                and get_disagg().disaggregation_decode_enable_radix_cache
+                and not uses_ssm_state(tp_worker.model_runner.model_config)
+            ):
+                prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
         elif isinstance(pool, HybridLinearKVPool):
             prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
         elif isinstance(pool, MHATokenToKVPool):
@@ -270,6 +275,7 @@ def validate_decode_radix_cache(
     token_to_kv_pool: object,
     is_hybrid_swa: bool,
     enable_hierarchical_cache: bool,
+    pd_decode_aux_from_prefill: bool = False,
 ) -> None:
     """Reject decode-side radix cache on KV layouts its prefix reuse cannot serve.
 
@@ -280,12 +286,11 @@ def validate_decode_radix_cache(
     """
     if not is_hybrid_swa:
         return
-    if enable_hierarchical_cache:
+    if enable_hierarchical_cache and not pd_decode_aux_from_prefill:
         raise ValueError(
-            "--disaggregation-decode-enable-radix-cache with sliding "
-            "window attention (SWA) models currently supports only "
-            "device-resident cache and is incompatible with "
-            "--enable-hierarchical-cache."
+            "--disaggregation-decode-enable-radix-cache with "
+            "--enable-hierarchical-cache requires hybrid SWA/full "
+            "attention without SSM layers."
         )
     # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
     # SWA ring and c128 state are request-scoped and always transferred whole, so
@@ -298,7 +303,10 @@ def validate_decode_radix_cache(
             "requires the unified KV layout "
             "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
         )
-    if getattr(model_config, "is_hybrid_swa_compress", False):
+    if getattr(model_config, "is_hybrid_swa_compress", False) and (
+        model_config.hf_config.architectures[0]
+        not in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+    ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache does not support "
             "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
@@ -336,6 +344,14 @@ def build_kv_cache(
     )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
+
+    pd_decode_aux_from_prefill = (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+        and isinstance(token_to_kv_pool, SWAKVPool)
+        and token_to_kv_pool.full_kv_pool.layer_num > 0
+        and not is_hybrid_ssm
+    )
 
     sliding_window_size = None
     if is_hybrid_swa:
@@ -380,6 +396,7 @@ def build_kv_cache(
             token_to_kv_pool=token_to_kv_pool,
             is_hybrid_swa=is_hybrid_swa,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            pd_decode_aux_from_prefill=pd_decode_aux_from_prefill,
         )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -421,6 +438,7 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
         swa_gates_prefix_match=swa_gates_prefix_match,
         draft_swa_window=draft_swa_window,
+        pd_decode_aux_from_prefill=pd_decode_aux_from_prefill,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
         sidecar_draft_device_pools=(

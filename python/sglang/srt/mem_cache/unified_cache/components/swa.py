@@ -357,6 +357,8 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if self.cache.pd_decode_aux_from_prefill:
+            return lambda node: True
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -383,6 +385,8 @@ class SWAComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        if self.cache.pd_decode_aux_from_prefill:
+            return result._replace(swa_host_hit_length=0, swa_branching_seqlen=None)
         ct = self.component_type
         swa_boundary_len = result.device_prefix_len + result.host_hit_length
 
@@ -1006,6 +1010,28 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if self.cache.pd_decode_aux_from_prefill:
+            # Publish only Full rows whose request-owned SWA has been freed.
+            # The live window stays on the request until its final checkpoint.
+            if is_finished:
+                start = req.kv.get_evicted_seqlen(self.component_type)
+                indices = self.cache.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, start:token_ids_len
+                ]
+                self.cache.token_to_kv_pool_allocator.free_swa_segment(
+                    indices, start_pos=start
+                )
+                page_size = self.cache.page_size
+                req.kv.set_evicted_seqlen(
+                    self.component_type,
+                    (token_ids_len + page_size - 1) // page_size * page_size,
+                )
+            else:
+                self._free_out_of_window_slots(req, token_ids_len)
+            boundary = req.kv.get_evicted_seqlen(self.component_type)
+            insert_params.set_evicted_seqlen(self.component_type, boundary)
+            return None if is_finished else min(token_ids_len, boundary)
+
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.set_evicted_seqlen(
@@ -1040,6 +1066,7 @@ class SWAComponent(TreeComponent):
             page_size=self.cache.page_size,
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            supports_prefix_sharing=not self.cache.pd_decode_aux_from_prefill,
             retain_floor=self.cache.swa_retain_floor(req),
         )
 
