@@ -57,6 +57,13 @@ class NativeHipMapping:
 
 
 class TestMooncakeMemoryRegistration(unittest.TestCase):
+    def setUp(self):
+        allocator = patch.object(
+            torch.cuda.memory, "get_allocator_backend", return_value="native"
+        )
+        allocator.start()
+        self.addCleanup(allocator.stop)
+
     def test_fused_kv_transfer_does_not_overwrite_keys_with_values(self):
         manager, storage, snapshot = make_manager()
         manager.engine = NativeHipMapping(128)
@@ -97,6 +104,24 @@ class TestMooncakeMemoryRegistration(unittest.TestCase):
         ):
             regions = manager._registerable_regions()
         self.assertEqual(regions, [(base, 64), (base + 64, 64)])
+
+    def test_non_native_hip_allocator_does_not_read_native_snapshot(self):
+        manager, storage, _ = make_manager()
+        base = storage.data_ptr()
+        with (
+            patch.object(torch.version, "hip", "7.2.0"),
+            patch.object(
+                torch.cuda.memory,
+                "get_allocator_backend",
+                return_value="cudaMallocAsync",
+            ),
+            patch.object(
+                torch.cuda.memory, "memory_snapshot", return_value=[]
+            ) as snapshot,
+        ):
+            regions = manager._registerable_regions()
+        self.assertEqual(regions, [(base, 64), (base + 64, 64)])
+        snapshot.assert_not_called()
 
     def test_host_aux_and_untracked_state_regions_remain_registered(self):
         manager, storage, snapshot = make_manager()

@@ -397,7 +397,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions: List[Tuple[int, int]] = []
         seen: Set[Tuple[int, int]] = set()
         native_hip_allocations = []
-        if torch.version.hip:
+        if torch.version.hip and torch.cuda.memory.get_allocator_backend() == "native":
             native_hip_allocations = [
                 (segment["address"], segment["total_size"])
                 for segment in torch.cuda.memory.memory_snapshot()
