@@ -249,6 +249,7 @@ def fast_prefill_plan(
     self._qo_indptr_last = total_num_rows
     self._max_q_len = max_q_len
     self._max_kv_len = max_kv_len
+    self._window_left = window_left
 
     if self._max_total_num_rows is None:
         self._max_total_num_rows = total_num_rows
@@ -1373,6 +1374,17 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        # Window-read planning may put the window in a custom mask. Other
+        # wrappers leave per-layer windows to forward, even when planned with -1.
+        paged_window_left = layer.sliding_window_size
+        if (
+            self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            and prefill_wrapper_paged._window_left < 0
+        ) or (
+            self.forward_metadata.multi_item_params
+            and self.forward_metadata.multi_item_params.is_enabled()
+        ):
+            paged_window_left = -1
 
         logits_soft_cap = layer.logit_cap
 
@@ -1425,20 +1437,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
+                window_left=paged_window_left,
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -1500,7 +1499,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=paged_window_left,
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                     k_scale=layer.k_scale_float,
@@ -2316,7 +2315,10 @@ class FlashInferIndicesUpdaterPrefill:
 
         # cached part
         # Conditionally set multi-item parameters
-        if multi_item_params is not None and multi_item_params.is_enabled():
+        multi_item_enabled = (
+            multi_item_params is not None and multi_item_params.is_enabled()
+        )
+        if multi_item_enabled:
             # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
             use_custom_mask = None
             prefix_len_ptr = multi_item_params.prefix_len_ptr
@@ -2393,7 +2395,12 @@ class FlashInferIndicesUpdaterPrefill:
         # The kernel masks the window itself unless a mask carries it: the
         # window selects the module with the per-element window mask compiled
         # in.
-        if window is not None and use_custom_mask is None and window.window_left >= 0:
+        if (
+            window is not None
+            and use_custom_mask is None
+            and not multi_item_enabled
+            and window.window_left >= 0
+        ):
             paged_plan_kwargs["window_left"] = window.window_left
 
         wrapper_paged.begin_forward(
