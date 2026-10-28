@@ -110,6 +110,12 @@ def qr_all_reduce(
     if fa in _SGL_KERNEL_HANDLES:
         sgl_kernel_qr.qr_all_reduce(fa, inp, out, quant_level, cast_bf2half)
         return
+    # init cannot see the dtype; a float16 model reaches here only by the JIT flag
+    if inp.dtype != torch.bfloat16:
+        raise ValueError(
+            f"the JIT quick all-reduce reduces bf16 only, got {inp.dtype}; "
+            "unset SGLANG_ROCM_QUICK_ALL_REDUCE_JIT"
+        )
     if quant_level == _INT4 and inp.numel() * inp.element_size() < _INT8_BELOW_BYTES:
         quant_level = _INT8
     _module().all_reduce(fa, _flat(inp), _flat(out), quant_level, cast_bf2half)
