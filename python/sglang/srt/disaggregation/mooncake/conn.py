@@ -396,6 +396,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         regions: List[Tuple[int, int]] = []
         seen: Set[Tuple[int, int]] = set()
+        native_hip_allocations = []
+        if torch.version.hip:
+            native_hip_allocations = [
+                (segment["address"], segment["total_size"])
+                for segment in torch.cuda.memory.memory_snapshot()
+                if not segment.get("is_expandable", False)
+            ]
 
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
@@ -407,6 +414,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     #   support zero length memory region
                     # kv_args keeps the entry, so peers still pair positionally.
                     continue
+                # HIP IPC opens the allocation base. An interior V view of a
+                # fused K/V buffer must retain its offset in Mooncake's address
+                # relocation; register the whole native allocation once.
+                # Host/external buffers and expandable VMM regions stay intact.
+                for base, size in native_hip_allocations:
+                    if base <= ptr and ptr + length <= base + size:
+                        ptr, length = base, size
+                        break
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
