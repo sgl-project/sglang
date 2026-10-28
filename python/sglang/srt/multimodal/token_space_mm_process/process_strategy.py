@@ -201,9 +201,10 @@ class TokenSpaceProcessStrategy:
                 spans[index] = _to_contiguous_spans(media_positions)
         return spans
 
-    def compute_mrope_positions(self, input_ids: list[int], media_features: Mapping):
+    def compute_mrope_positions(self, output: Mapping):
         """Return (mrope_positions, mrope_position_delta), or (None, None) without M-RoPE.
 
-        `media_features` holds the merged media fields, e.g. grids.
+        `output` is the processor output: input_ids, the media fields, mm_modalities
+        and mm_spans.
         """
         return None, None
