@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -60,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
+    kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -287,6 +289,7 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.kv_checksum_computer = KvChecksumComputer(
@@ -1315,7 +1318,7 @@ class DisaggPrefill:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
-                value = 0
+                digest = signature = 0
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
@@ -1417,6 +1420,13 @@ class DisaggPrefill:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _minimax_payload():
+                return minimax_index_transfer_pages(
+                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
+                    page_size=page_size,
+                    prefix_len=req.disagg_decode_prefix_len,
+                )
+
             def _dsa_pages_payload():
                 # Decode already holds the indexer rows of the prefix it cached
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
@@ -1472,7 +1482,7 @@ class DisaggPrefill:
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
@@ -1538,7 +1548,7 @@ class DisaggPrefill:
                 sender.kv_mgr.enable_all_cp_ranks_for_transfer
                 and not get_parallel().enable_dsa_cache_layer_split
             ):
-                # The schedule stream waits on the in-flight forward; move the
+                # The schedule stream may wait on the in-flight forward; move the
                 # D2H wait to the transfer worker so scheduling can continue.
                 page_indices_dev = kv_indices[::page_size] // page_size
                 page_indices = torch.empty(

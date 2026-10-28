@@ -21,8 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 @cache_once
-def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
-    args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype)
+def _jit_qknorm_module(
+    head_dim: int, dtype: torch.dtype, half_warp: bool = True
+) -> Module:
+    """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
+    variant would apply; tests use it as the bit-exactness oracle."""
+    args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype, half_warp)
     return load_jit(
         "qknorm",
         *args,

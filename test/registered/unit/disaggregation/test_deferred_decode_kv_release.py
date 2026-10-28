@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=37, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
@@ -370,6 +370,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -387,6 +388,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -497,6 +499,9 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.tree_cache = object()
     q.request_retirer = SimpleNamespace(retire_finished=tree_release(q))
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
+    q.metadata_buffers.clear_slot = lambda idx: (
+        q.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+    )
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.metrics_sink = SimpleNamespace(enable_metrics=enable_metrics)
     q.metrics_collector = SimpleNamespace(

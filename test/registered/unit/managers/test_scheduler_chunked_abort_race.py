@@ -26,7 +26,7 @@ from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
 from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import request_registry_of  # noqa: E402
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:

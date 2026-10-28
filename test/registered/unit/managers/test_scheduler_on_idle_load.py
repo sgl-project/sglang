@@ -23,7 +23,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestOnIdleStallPublish(CustomTestCase):

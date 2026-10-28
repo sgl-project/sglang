@@ -35,7 +35,7 @@ from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAllocationConfiguration(CustomTestCase):

@@ -1,5 +1,6 @@
 """Tests for KV checksum integration in PD disaggregation."""
 
+import random
 import unittest
 import zlib
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
@@ -211,7 +213,8 @@ class _FakeOwner(DisaggDecode):
         self.prealloc_queue = SimpleNamespace(
             kv_manager=SimpleNamespace(
                 should_verify_kv_checksum=lambda bootstrap_addr: True
-            )
+            ),
+            kv_checksum_mismatch_injector=random.Random(0),
         )
         self.tree_cache = None
         self.request_retirer = SimpleNamespace(retire_finished=tree_release(self))
@@ -238,7 +241,27 @@ def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0
     )
 
 
-class TestPrefillHealthCheckChecksum(unittest.TestCase):
+class TestPrefillChecksum(unittest.TestCase):
+    def _send_last_chunk(self, sched, req):
+        page_indices = Mock(return_value=None)
+        with (
+            patch.object(
+                SchedulerDisaggregationPrefillMixin,
+                "_send_kv_chunk",
+                lambda *args, **kwargs: None,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.page_indices_for_request",
+                page_indices,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.state_indices_for_request",
+                lambda *args, **kwargs: None,
+            ),
+        ):
+            sched.send_kv_chunk(req, last_chunk=True)
+        return page_indices
+
     def test_health_check_clears_metadata_checksum(self):
         owner = prefill_owner_shell(
             kv_checksum_computer=object(),
@@ -376,7 +399,40 @@ class TestAdmissionChecksum(unittest.TestCase):
         mock_abort.assert_not_called()
         mock_release.assert_not_called()
 
-    def test_retract_re_verifies(self):
+    def test_injected_mismatch_aborts_without_raising_in_ci(self):
+        """The injector must not trip the in-CI raise it exists to exercise."""
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(self.true_chksum, self.num_pages)
+        sched.waiting_queue = [req]
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            self.assertIsNone(self._run_once(sched))
+        self.assertEqual(sched.streamed_aborts, [req])
+        mock_abort.assert_called_once()
+
+    def test_mismatch_decision_is_all_reduced(self):
+        """Every rank drops the same requests, even if only a peer saw the fault."""
+        sched = self._make_sched(_SENTINEL)
+        clean = _make_req(self.true_chksum, self.num_pages, rid="clean")
+        sched.waiting_queue = [clean]
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            batch = self._run_once(
+                sched, reduce=lambda flags, group, op: [1] * len(flags)
+            )
+        self.assertIsNone(batch)
+        self.assertEqual(sched.streamed_aborts, [clean])
+
+    def test_verified_once(self):
+        """A request is digested when it first enters a batch, not again after
+        a retraction, by which time decode has written into its last page."""
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
         # A retracted request is verified again when it is admitted again.

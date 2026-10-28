@@ -26,7 +26,7 @@ from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import make_request_registry
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class RecordingAllocator(BaseTokenToKVPoolAllocator):

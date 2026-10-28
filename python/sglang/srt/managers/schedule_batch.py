@@ -58,9 +58,9 @@ import hashlib
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
-from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from typing import (
@@ -110,6 +110,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -140,6 +141,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.req_state import DisaggReqState
     from sglang.srt.dllm.req_state import DllmReqState
+    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_retirer import (
@@ -333,31 +335,6 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
-
-
-class Modality(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    AUDIO = auto()
-
-    @staticmethod
-    def from_str(modality_str: str):
-        try:
-            return Modality[modality_str.upper()]
-        except KeyError:
-            raise ValueError(
-                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
-            )
-
-    @staticmethod
-    def all():
-        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
-
-
-class MultimodalInputFormat(Enum):
-    NORMAL = auto()
-    PROCESSOR_OUTPUT = auto()
-    PRECOMPUTED_EMBEDDING = auto()
 
 
 # Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
@@ -986,6 +963,11 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
 
     # Penalty history row, from PenaltyStore.alloc until the slot is freed
     # (free_req_slot).
@@ -1247,14 +1229,16 @@ class Req:
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
+        self._think_start_match_len = 0
 
-        # Only custom logit processors need the "__req__" reference cycle.
+        # Only custom logit processors read "__req__", and the reference is weak
+        # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
-                "__req__": self
+                "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
@@ -1281,6 +1265,8 @@ class Req:
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Owned by Scheduler.defer_response until its completion is retired.
+        self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
@@ -2318,6 +2304,30 @@ class Req:
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
 
+    def update_self_opened_reasoning_tokens(
+        self, token_id, think_start_ids, think_end_ids
+    ):
+        """Count reasoning the model opens itself; an output not opening with the start tag has none."""
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        consumed = 0
+        while self._think_start_match_len < len(think_start_ids):
+            if consumed == len(token_id):
+                return
+            if token_id[consumed] != think_start_ids[self._think_start_match_len]:
+                self._is_reasoning_over = True
+                return
+            self._think_start_match_len += 1
+            consumed += 1
+            if self._think_start_match_len == len(think_start_ids):
+                self.reasoning_tokens += len(think_start_ids)
+
+        self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -2747,6 +2757,8 @@ class ScheduleBatch:
     # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
+    # Per engram layer, the rows the scheduler staged (EngramRowStager).
+    engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64

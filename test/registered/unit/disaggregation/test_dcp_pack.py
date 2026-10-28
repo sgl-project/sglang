@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -103,7 +103,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 )
                 owner._send_kv_chunk(req, last_chunk=True)
                 calls = mgr.add_transfer_request.call_args_list
-                token_counts = [c.args[7] for c in calls]
+                token_counts = [c.kwargs["num_kv_tokens"] for c in calls]
                 if peer == "dcp":
                     self.assertLessEqual(max(token_counts), limit)
                 else:
@@ -123,8 +123,10 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.assertEqual(
                     [c.args[3] for c in calls], [False] * (len(calls) - 1) + [True]
                 )
-                self.assertTrue(all(c.args[6] is None for c in calls[:-1]))
-                self.assertEqual(int(calls[-1].args[6][0][0]), 17)
+                self.assertTrue(
+                    all(c.kwargs["state_indices"] is None for c in calls[:-1])
+                )
+                self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

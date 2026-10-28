@@ -16,6 +16,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.forward_pass_metrics import (
     ScheduledRequestMetrics,
     WelfordAccumulator,
@@ -78,6 +80,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE,
     SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
@@ -1432,6 +1435,22 @@ class SchedulerMetricsReporter:
             host_total - host_pool.available_size()
         )
         self.metrics_sink.stats.hicache_host_total_tokens = host_total
+
+        mamba_host_pool = None
+        if (
+            isinstance(self.scheduler.tree_cache, UnifiedRadixCache)
+            and self.scheduler.tree_cache.host_pool_group is not None
+        ):
+            entry = self.scheduler.tree_cache.host_pool_group.entry_map.get(
+                PoolName.MAMBA
+            )
+            mamba_host_pool = None if entry is None else entry.host_pool
+        if mamba_host_pool is not None:
+            mamba_total = mamba_host_pool.logical_size
+            self.stats.hicache_host_mamba_used_states = (
+                mamba_total - mamba_host_pool.available_size()
+            )
+            self.stats.hicache_host_mamba_total_states = mamba_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

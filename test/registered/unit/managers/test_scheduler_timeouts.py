@@ -33,7 +33,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.scheduler_request_intake import make_request_intake
 from sglang.test.scheduler_request_lists import make_request_registry
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:

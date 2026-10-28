@@ -125,6 +125,20 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
+    if draft_plan.mode == HiCacheDraftMode.FUSED:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            validate_fused_hicache_draft,
+        )
+
+        validate_fused_hicache_draft(
+            draft_device_pools=draft_plan.device_pools, tree_cache=tree_cache
+        )
+        logger.info(
+            "HiCache fused draft KV uses the target FULL page envelopes "
+            "(%d draft layers); no draft host sidecar is allocated.",
+            draft_plan.device_pools[0].layer_num,
+        )
+        return
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 

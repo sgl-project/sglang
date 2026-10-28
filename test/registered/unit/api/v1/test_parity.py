@@ -37,7 +37,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.json"
@@ -51,14 +51,11 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
         "conversation_id",
-        "custom_labels",
-        "custom_logit_processor",
         "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
         "http_worker_ipc",
         "image_max_dynamic_patch",
-        "images_config",
         "input_embeds",
         "log_metrics",
         "lora_id",
@@ -66,7 +63,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
-        "modalities",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
@@ -79,12 +75,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
         "return_indexer_topk",
-        "return_prompt_token_ids",
         "return_routed_experts",
-        "return_sampling_mask",
-        "routed_experts_start_len",
         "sampling_logprobs_mode",
-        "session_id",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
@@ -231,7 +223,7 @@ class TestRequestFieldParity(CustomTestCase):
 class TestResponseParity(CustomTestCase):
     def test_python_server_meta_info_decodes_to_the_schema_subset(self):
         """The Python server's `meta_info` carries keys the schema does not
-        model (weight_version, num_retractions, spec stats, ...). The
+        model (num_retractions, spec stats, ...). The
         generated types ignore them and re-emit the schema subset, so a
         Rust-server client and a Python-server client see one shape."""
         python_frame = {
@@ -260,6 +252,7 @@ class TestResponseParity(CustomTestCase):
                 "e2e_latency",
                 "cached_tokens",
                 "reasoning_tokens",
+                "weight_version",
             ],
         )
         self.assertEqual(
@@ -273,15 +266,32 @@ class TestResponseParity(CustomTestCase):
         serializers must keep matching it."""
         self.assertEqual(
             list(GenerateResponse.__struct_fields__),
-            ["text", "meta_info", "output_ids", "index"],
+            ["text", "meta_info", "output_ids", "index", "prompt_token_ids"],
         )
         self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[:4],
-            ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
-        )
-        self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[-3:],
-            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+            list(GenerateMetaInfo.__struct_fields__),
+            [
+                "id",
+                "prompt_tokens",
+                "completion_tokens",
+                "finish_reason",
+                "output_token_logprobs",
+                "input_token_logprobs",
+                "output_top_logprobs",
+                "input_top_logprobs",
+                "output_token_ids_logprobs",
+                "input_token_ids_logprobs",
+                "hidden_states",
+                "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
+                "output_token_logprobs_length",
+                "weight_version",
+                "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
+            ],
         )
 
 

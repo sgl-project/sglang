@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_lists import make_request_registry
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import math
 import queue
@@ -177,6 +177,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
         for algorithm in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
         ):
             with self.subTest(algorithm=algorithm):
@@ -339,6 +340,8 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         )
     if not hasattr(scheduler, "draft_worker"):
         scheduler.draft_worker = None
+    if not hasattr(scheduler, "enable_hierarchical_cache"):
+        scheduler.enable_hierarchical_cache = False
     context = types.SimpleNamespace(
         enable_metrics=False,
         is_stats_logging_rank=True,
@@ -851,7 +854,9 @@ class TestIdleMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
                 get_pool_stats=lambda: types.SimpleNamespace(
-                    update_scheduler_stats=lambda _: None
+                    update_scheduler_stats=lambda _: None,
+                    full_capacity=1,
+                    is_hybrid_swa=False,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,

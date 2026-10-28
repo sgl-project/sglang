@@ -192,6 +192,8 @@ class TestLocalKvEventSources(CustomTestCase):
 
         controller = DataParallelController.__new__(DataParallelController)
         controller.env_lock = threading.Lock()
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()

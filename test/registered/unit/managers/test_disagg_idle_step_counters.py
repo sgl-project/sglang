@@ -40,7 +40,7 @@ from sglang.test.test_utils import (
     published_topology,
 )
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.
@@ -467,6 +467,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         # Intake ends the test; extra admission attempts simply find no work.
         scheduler.schedule = lambda: next(scheduled_batches, None)
         scheduler.is_disable_overlap_for_batch = Mock(return_value=False)
+        scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
         scheduler.on_idle = Mock()
         return scheduler

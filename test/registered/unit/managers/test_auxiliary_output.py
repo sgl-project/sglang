@@ -34,7 +34,7 @@ from sglang.test.disagg_owner_shells import (
 )
 from sglang.test.test_utils import published_topology
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @dataclass

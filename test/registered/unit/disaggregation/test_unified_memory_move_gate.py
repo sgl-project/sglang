@@ -43,7 +43,7 @@ from sglang.test.test_utils import (  # noqa: E402
     published_topology,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeTransferQueue:

@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
