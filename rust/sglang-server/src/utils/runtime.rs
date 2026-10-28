@@ -326,6 +326,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            multimodal: cfg.server_args.model_is_multimodal(),
             peer_endpoints: crate::api_server::core::peer_endpoints(
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
@@ -541,6 +542,115 @@ mod tests {
         // Joins the api thread; the listener is closed by the time it returns.
         rt.request_shutdown();
 
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "port still accepting connections after shutdown",
+        );
+    }
+
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed, because admission runs the processor's media hooks; a
+    /// request sent earlier waits and is admitted once the pool starts. The
+    /// control routes serve from the start: `/health` answers 503, and the PD
+    /// bootstrap registry accepts a rank's registration, so other ranks can
+    /// register while the processor is still being built. A text model admits
+    /// at once, and a runtime shut down with a request still waiting exits.
+    #[test]
+    fn multimodal_admission_waits_for_the_mm_pool() {
+        use crate::message::config::DisaggregationMode;
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        struct NoMedia;
+        impl crate::multi_modality::worker::MmProcessor for NoMedia {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<
+                crate::multi_modality::worker::MmProcessOutput,
+                crate::multi_modality::worker::MediaError,
+            > {
+                unreachable!("no request carries media")
+            }
+        }
+        let start_prefill = |is_multimodal: bool| {
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            cfg.server_args = Arc::new(ServerArgs {
+                disaggregation_mode: DisaggregationMode::Prefill,
+                model_config: crate::message::config::ModelConfig {
+                    is_multimodal,
+                    ..Default::default()
+                },
+                ..test_server_args()
+            });
+            (start(cfg, None).expect("start runtime"), addr)
+        };
+        let send = |addr, method: &str, path: &str, body: &str| {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                conn,
+                "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            conn
+        };
+        let response = |mut conn: std::net::TcpStream| {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        };
+        let generate = r#"{"input_ids":[1,2,3],"sampling_params":{"max_new_tokens":8}}"#;
+        let registration = serde_json::json!({
+            "attn_tp_size": 2, "attn_tp_rank": 1,
+            "attn_cp_size": 1, "attn_cp_rank": 0,
+            "attn_dp_size": 1, "attn_dp_rank": 0,
+            "pp_size": 1, "pp_rank": 0,
+            "system_dp_size": 1, "system_dp_rank": 0,
+            "rank_ip": "10.0.0.1", "rank_port": 17000, "page_size": 64,
+        })
+        .to_string();
+
+        let (rt, addr) = start_prefill(false);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "a text model did not admit the request",
+        );
+        rt.request_shutdown();
+
+        let (rt, addr) = start_prefill(true);
+        let waiting = send(addr, "POST", "/generate", generate);
+        let registered = response(send(addr, "PUT", "/route", &registration));
+        assert!(registered.starts_with("HTTP/1.1 200"), "{registered}");
+        let health = response(send(addr, "GET", "/health", ""));
+        assert!(health.starts_with("HTTP/1.1 503"), "{health}");
+        assert!(
+            !rt.to_scheduler_rx.wait(Duration::from_millis(300)),
+            "admitted before the MM pool ran",
+        );
+        rt.start_mm_workers_with_processor(Arc::new(NoMedia), 1, false);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "not admitted once the MM pool ran",
+        );
+        rt.request_shutdown();
+        drop(waiting);
+
+        let (rt, addr) = start_prefill(true);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        rt.request_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?} with a request waiting for the MM pool",
+            started.elapsed(),
+        );
         assert!(
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",

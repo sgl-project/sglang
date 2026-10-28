@@ -2,11 +2,11 @@
 //! cancellation ownership, and the runtime-call guard behind every operation.
 
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{SetOnce, mpsc};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
@@ -28,6 +28,9 @@ pub(crate) struct CoreConfig {
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: Vec<(String, usize)>,
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed ([`CoreHandle::set_mm_processor`]).
+    pub(crate) multimodal: bool,
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
@@ -103,9 +106,11 @@ pub(super) struct CoreInner {
     pub(super) startup_ready: AtomicBool,
     pub(super) is_disaggregation: bool,
     pub(super) mm_limits: Vec<(String, usize)>,
+    pub(super) multimodal: bool,
     /// The MM pool's processor, whose media hooks admission runs; set once
-    /// when the pool starts (after the listeners are up).
-    pub(super) mm_processor: OnceLock<Arc<dyn MmProcessor>>,
+    /// when the pool starts (after the listeners are up), and awaited by a
+    /// multimodal model's admission.
+    pub(super) mm_processor: SetOnce<Arc<dyn MmProcessor>>,
     pub(super) metadata: CoreMetadata,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
@@ -130,7 +135,8 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
-                mm_processor: OnceLock::new(),
+                multimodal: config.multimodal,
+                mm_processor: SetOnce::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
@@ -148,6 +154,13 @@ impl CoreHandle {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.inner.startup_ready.load(Ordering::Acquire)
+    }
+
+    /// Whether health may answer 200: startup warmup finished (or was
+    /// skipped) and, for a multimodal model, the MM pool's processor is
+    /// installed, so a generation would be admitted rather than wait.
+    pub(crate) fn is_serving(&self) -> bool {
+        self.is_ready() && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
     }
 
     /// The request metrics, when enabled.

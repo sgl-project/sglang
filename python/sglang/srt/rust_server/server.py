@@ -133,7 +133,8 @@ class RustServer:
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
         model package whose ``_start_multimodal`` starts its own pipeline
-        overrides this to return ``None``."""
+        overrides this to return ``None``; its server admits no generation
+        request until that pipeline starts."""
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
@@ -251,8 +252,9 @@ class RustServer:
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback. The listener answers as soon as the server is constructed,
-        # so refuse a model without one first.
+        # fallback. The listener answers as soon as the server is constructed
+        # (a multimodal one admits generation requests once `_start_multimodal`
+        # starts its pool), so refuse a model without one first.
         mm_spec = (
             cls._resolve_multimodal(scheduler)
             if scheduler.model_config.is_multimodal

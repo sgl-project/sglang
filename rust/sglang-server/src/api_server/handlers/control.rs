@@ -147,6 +147,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata::default(),
                 peer_endpoints: vec![DummyTarget::replying(&[1, 2], |rank| {

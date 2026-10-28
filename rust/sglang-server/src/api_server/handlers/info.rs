@@ -115,6 +115,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata {
@@ -162,6 +163,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata {
                     deployment_info: crate::message::config::DeploymentInfo {
