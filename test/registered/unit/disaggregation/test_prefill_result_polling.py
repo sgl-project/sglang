@@ -33,6 +33,9 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_assembly import init_mode_stages
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
@@ -223,6 +226,7 @@ class _Scheduler:
     is_disable_overlap_for_batch = Scheduler.is_disable_overlap_for_batch
     may_disable_overlap = Scheduler.may_disable_overlap
     launch_step = Scheduler.launch_step
+    _apply_pending_war_barrier = Scheduler._apply_pending_war_barrier
     join_launched_step = Scheduler.join_launched_step
     commit_step = Scheduler.commit_step
     commit_pending_steps = Scheduler.commit_pending_steps
@@ -326,6 +330,11 @@ class _Scheduler:
         )
         self.request_retirer.clear_finished_media = Mock()
         self.output_streamer = Mock(spec=["maybe_reply_health_check"])
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=self.disaggregation_mode,
+            output_streamer=self.output_streamer,
+            request_retirer=self.request_retirer,
+        )
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
