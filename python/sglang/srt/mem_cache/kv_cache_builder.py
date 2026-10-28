@@ -42,8 +42,9 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     prepare_page_unified_write_back_staging,
@@ -95,8 +96,8 @@ def prepare_hicache_staging(
             )
         elif router.wrapped_view() is not None:
             prepare(router.wrapped_view(), packed_drafts, sidecar=sidecar)
-        elif isinstance(pool, (MHATokenToKVPool, MLATokenToKVPool)):
-            is_mla = isinstance(pool, MLATokenToKVPool)
+        elif isinstance(pool, (MHAKVView, MLAKVView)):
+            is_mla = isinstance(pool, MLAKVView)
             if pool.layer_num == 0 or (
                 is_mla and memory.hicache_mem_layout != "page_unified"
             ):

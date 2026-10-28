@@ -1,10 +1,5 @@
-"""The unified pool's transfer surface: external names, PD wire entries, regions,
-and the HiCache host stack built from the plan.
-
-The PD registration and the host stack are compared with what the pool
-classes chose (the per-class PD branches and HiCache strategies), which PD
-peers already running and every L3 key written so far follow.
-"""
+"""Pool names, PD wire entries and host-stack routing must agree with the
+byte layouts and storage keys used by PD peers and HiCache."""
 
 import unittest
 from types import SimpleNamespace
@@ -91,6 +86,49 @@ class TestPlanNames(CustomTestCase):
                     wires[name],
                 )
                 self.assertEqual(storage.page_envelope_pair(), envelopes[name])
+
+    def test_tree_slots_in_drive_order(self):
+        # What the prefix tree builds for a unified plan: today's component ids,
+        # each with its sub-pool's family, in the order it drives their eviction
+        # (owner, window, state).
+        expected = {
+            "swa": (("FULL", "token"), ("SWA", "window")),
+            "mamba": (("FULL", "token"), ("MAMBA", "state")),
+            "tri": (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
+        }
+        for name, slots in expected.items():
+            with self.subTest(chain=name):
+                storage = _bundle(name).token_to_kv_pool_allocator.storage
+                self.assertEqual(
+                    tuple((s.component, s.family) for s in storage.tree_slots()),
+                    slots,
+                )
+
+    def test_static_tree_slots_follow_the_pool_shape(self):
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        cases = {
+            (False, False): (("FULL", "token"),),
+            (True, False): (("FULL", "token"), ("SWA", "window")),
+            (False, True): (("FULL", "token"), ("MAMBA", "state")),
+            (True, True): (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
+        }
+        for (has_window, has_state), slots in cases.items():
+            with self.subTest(has_window=has_window, has_state=has_state):
+                storage = StaticKVStorage(
+                    None,
+                    None,
+                    shape=StaticPoolShape(
+                        has_window=has_window, has_state=has_state, token_capacity=1
+                    ),
+                )
+                self.assertEqual(
+                    tuple((s.component, s.family) for s in storage.tree_slots()),
+                    slots,
+                )
 
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:
@@ -277,7 +315,7 @@ class TestHostStack(CustomTestCase):
                 allocator = cache.token_to_kv_pool_allocator
                 storage = allocator.storage
                 expected = {
-                    storage.owner: allocator.full_attn_allocator.translate_kv_loc,
+                    storage.owner: allocator.full_attn_allocator.ids.translate,
                     "swa": None,
                     "mamba": None
                     if allocator.state is None
@@ -293,10 +331,6 @@ class TestHostStack(CustomTestCase):
                     self.assertEqual(entry.device_translate, expected[sub_pool])
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))
-                for sub_pool in storage.sub_pool_names():
-                    self.assertNotIn(
-                        "host_transfer_translate", vars(storage.view(sub_pool))
-                    )
 
     def test_owner_host_pool_is_named_by_its_sub_pool(self):
         result, _, _ = self._build("swa", backend="file")

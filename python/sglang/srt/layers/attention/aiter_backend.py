@@ -44,7 +44,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -95,7 +95,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.utils import get_bool_env_var
 
@@ -179,6 +179,36 @@ class MlaPrefillPsMetadata:
     is_causal: bool
     need_lse: bool
     num_partial_tiles: int
+
+
+def _kv_cache_is_vectorized_5d(pool) -> bool:
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
+    window sub-pool answers with its full view's layout, or its window view's
+    when it routes no full layers (a draft fused into the window sub-pool)."""
+    router = pool.layer_router
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+        pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
+    return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+
+
+def _require_untranslated_storage(*pools) -> None:
+    """This backend reads a pool's K/V as dense ``(pages, page_size, H, D)``
+    caches, gathers their indices straight from the request table, and maps
+    window layers through a static full -> window slot table. A pool whose
+    views take physical write ids (the unified pool, or a draft fused into it)
+    needs translated indices and strided entry views, for full and window
+    layers alike, so the backend cannot read it."""
+    for pool in pools:
+        if pool is not None and pool.requires_physical_write_loc:
+            raise ValueError(
+                "The aiter attention backend reads KV caches as dense pages "
+                "indexed by the request table's ids, which a pool taking "
+                "physical write ids (--enable-unified-memory, or a draft fused "
+                "into its pool) does not provide. Choose another attention "
+                "backend for this runner (--attention-backend, or "
+                "--speculative-draft-attention-backend for a draft)."
+            )
 
 
 @dataclass
@@ -386,7 +416,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -505,7 +535,7 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
@@ -525,14 +555,10 @@ class AiterAttnBackend(AttentionBackend):
         # and (b) route the decode attention through pa_decode_gluon (see the
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
-        def _pool_is_vec5d(pool):
-            # A pool with a window sub-pool reports its owner view's layout.
-            router = pool.layer_router
-            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-                pool = router.view(IdSpaceKind.FULL)
-            return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
-
-        self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
+        self.kv_cache_is_vectorized_5d = _kv_cache_is_vectorized_5d(
+            model_runner.token_to_kv_pool
+        )
+        _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
@@ -1239,7 +1265,7 @@ class AiterAttnBackend(AttentionBackend):
             if swa_page_table is not None:
                 pt = swa_page_table
 
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o = q_u.new_empty(
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
@@ -1573,7 +1599,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         k_descale,
     ):
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_buffer = self.kv_layers.read(layer.layer_id).key()
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
@@ -1747,9 +1773,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         _, lse = mla_decode_fwd(
             q_in,
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, 1, 1, layer.qk_head_dim
-            ),
+            self.kv_layers.read(layer.layer_id).key().view(-1, 1, 1, layer.qk_head_dim),
             out,
             fm.qo_indptr,
             kv_indptr,
@@ -1846,7 +1870,7 @@ class AiterAttnBackend(AttentionBackend):
 
         out_a, lse_a = mla_gluon_decode(
             q=q.view(n_rows, num_heads, layer.qk_head_dim),
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            k_buffer=self.kv_layers.read(layer.layer_id).key(),
             layer=layer,
             kv_indices=fm.verify_token_table,
             kv_indptr=seqused_k,
@@ -2283,8 +2307,8 @@ class AiterAttnBackend(AttentionBackend):
                         req_pool_indices=forward_batch.req_pool_indices,
                         paged_kernel_lens=forward_batch.seq_lens,
                         paged_kernel_lens_sum=forward_batch.seq_lens_sum,
-                        translator=self.kv_index_translator,
-                        plan=forward_batch.kv_loc_plan,
+                        runner_ids=self.runner_ids,
+                        plan=forward_batch.iteration_ids,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -2531,7 +2555,7 @@ class AiterAttnBackend(AttentionBackend):
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
-                    plan=forward_batch.kv_loc_plan,
+                    plan=forward_batch.iteration_ids,
                 )
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -2572,7 +2596,7 @@ class AiterAttnBackend(AttentionBackend):
                     prefix_lens,
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
-                    plan=forward_batch.kv_loc_plan,
+                    plan=forward_batch.iteration_ids,
                 )
 
                 if self.use_sliding_window_kv_pool:
@@ -2660,10 +2684,10 @@ class AiterAttnBackend(AttentionBackend):
         # The planner leaves the compacted ids WIDENED (see its docstring), and
         # mla_gluon indexes the pool directly, so collapse them once per forward
         # -- the same contract flashinfer_mla_backend.py follows.
-        translator = self.kv_index_translator
-        if total_local_len > 0 and translator.needs_read_translate:
+        runner_ids = self.runner_ids
+        if total_local_len > 0 and runner_ids.needs_read_translate:
             valid = kv_indices[:total_local_len]
-            valid.copy_(translator.translate_dcp_read_ids(valid))
+            valid.copy_(runner_ids.translate_dcp_read_ids(valid))
 
     def _build_dcp_local_kv_lens(
         self,
@@ -2711,8 +2735,8 @@ class AiterAttnBackend(AttentionBackend):
 
         # Write each request's row 0 in place: the row stride handed to the
         # kernel spans that request's whole block of q_len rows.
-        translator = self.kv_index_translator
-        v2p = translator.full_v2p_table
+        runner_ids = self.runner_ids
+        v2p = runner_ids.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (bs, triton.cdiv(num_cols, _DCP_VERIFY_TABLE_COLS_PER_BLOCK))
         ](
@@ -3702,7 +3726,7 @@ class AiterAttnBackend(AttentionBackend):
                 # launch_reshape_and_cache_flash; always route through
                 # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
                 if self.kv_cache_is_vectorized_5d:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -3724,9 +3748,7 @@ class AiterAttnBackend(AttentionBackend):
                     and self.use_sliding_window_kv_pool
                 ):
                     token_to_kv_pool = self.token_to_kv_pool
-                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
-                    )
+                    k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                     slot_mapping_swa = self.swa_kv_pool.full_to_swa_index_mapping
 
                     launch_reshape_and_cache_flash(
@@ -3750,14 +3772,14 @@ class AiterAttnBackend(AttentionBackend):
                 elif self.use_mla:
                     if self.dcp_world_size > 1:
                         kv_lora_rank = v.shape[-1]
-                        self.token_to_kv_pool.set_mla_kv_buffer(
+                        self.kv_layers.layer(layer.layer_id).store_mla(
                             layer,
                             KVWriteLoc.for_layer(forward_batch, layer),
                             k[..., :kv_lora_rank],
                             k[..., kv_lora_rank:],
                         )
                     else:
-                        self.token_to_kv_pool.set_kv_buffer(
+                        self.kv_layers.layer(layer.layer_id).store(
                             layer,
                             KVWriteLoc.for_layer(forward_batch, layer),
                             k,
@@ -3765,9 +3787,7 @@ class AiterAttnBackend(AttentionBackend):
                         )
                 elif self._use_fused_fp8_kv_write(layer):
                     # FP8: fuse bf16->fp8 cast + paged write in one kernel.
-                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
-                    )
+                    k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                     launch_reshape_and_cache_flash(
                         k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -3782,7 +3802,7 @@ class AiterAttnBackend(AttentionBackend):
                         v_scale=v_descale,
                     )
                 else:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -3801,8 +3821,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             qo_indptr = self.forward_metadata.qo_indptr
-            K_Buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            V_Buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            K_Buffer = self.kv_layers.read(layer.layer_id).key()
+            V_Buffer = self.kv_layers.read(layer.layer_id).value()
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
 
@@ -4113,9 +4133,7 @@ class AiterAttnBackend(AttentionBackend):
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
                 ):
-                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
-                    )
+                    k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                     page_table = self.forward_metadata.kv_indices
                     max_kv_len = page_table.shape[1] * self.page_size
 
@@ -4240,8 +4258,8 @@ class AiterAttnBackend(AttentionBackend):
                     k.contiguous(),
                     v.contiguous(),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    self.kv_layers.read(layer.layer_id).key(),
+                    self.kv_layers.read(layer.layer_id).value(),
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
@@ -4274,7 +4292,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     o = torch.empty_like(q)
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                 page_table, swa_page_table = self._build_unified_page_table_from_spec(
                     self.forward_metadata, bs
                 )
@@ -4390,7 +4408,7 @@ class AiterAttnBackend(AttentionBackend):
                 and not self.kv_cache_is_vectorized_5d
                 and self.forward_metadata.max_kv_len is not None
             ):
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                 tok_idx, cu_k = self._asm_context_prefill_indices(
                     forward_batch, forward_batch.batch_size, k_cache.shape[0]
                 )
@@ -4457,7 +4475,7 @@ class AiterAttnBackend(AttentionBackend):
                 and not paged_asm_available
             ):
                 bs = forward_batch.batch_size
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                 tok_idx, cu_k = self._asm_context_prefill_indices(
                     forward_batch, bs, k_cache.shape[0]
                 )
@@ -4574,7 +4592,7 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_dtype == fp8_dtype:
                 q, q_descale = self._quantize_q_fp8(q)
 
-            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
 
             page_table = self.forward_metadata.kv_indices
             if (
@@ -4666,7 +4684,7 @@ class AiterAttnBackend(AttentionBackend):
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
@@ -4684,7 +4702,7 @@ class AiterAttnBackend(AttentionBackend):
             # like full_to_swa_index_mapping.
             elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = self.token_to_kv_pool
-                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
                 launch_reshape_and_cache_flash(
@@ -4703,7 +4721,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             elif self.use_mla:
                 # MLA pool has its own set_kv_buffer (no scale args).
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(forward_batch),
                     k,
@@ -4712,7 +4730,9 @@ class AiterAttnBackend(AttentionBackend):
             elif self._use_fused_fp8_kv_write(layer):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                 token_to_kv_pool = self.token_to_kv_pool
-                k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = token_to_kv_pool.layer_router.read(
+                    layer.layer_id
+                ).kv()
                 launch_reshape_and_cache_flash(
                     k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -4727,7 +4747,7 @@ class AiterAttnBackend(AttentionBackend):
                     v_scale=v_descale,
                 )
             else:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
@@ -4741,7 +4761,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_mla:
             if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
-                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                k_buffer = self.kv_layers.read(layer.layer_id).key()
                 return self._forward_decode_dcp(q, k_buffer, layer, k_descale)
 
             o = self._forward_mla_decode(q, layer, forward_batch, k_descale)
@@ -4749,7 +4769,7 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.logits_soft_cap = layer.logit_cap
 
-            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
 
             if layer.qk_head_dim != layer.v_head_dim:
                 o = q.new_empty(
@@ -4890,7 +4910,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -4906,7 +4926,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -4920,7 +4940,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         kv_start_idx = None
         kv_indptr = self.kv_indptr
@@ -4969,7 +4989,7 @@ class AiterIndicesUpdaterPrefill:
                     req_pool_indices=req_pool_indices,
                     paged_kernel_lens=paged_kernel_lens,
                     paged_kernel_lens_sum=paged_kernel_lens_sum,
-                    translator=self.kv_index_translator,
+                    runner_ids=self.runner_ids,
                     plan=plan,
                 )
             )
@@ -4984,7 +5004,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -5004,7 +5024,7 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -5019,7 +5039,7 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInput],
         *,
-        plan: KVLocPlan,
+        plan: IterationIds,
     ):
         bs = len(req_pool_indices)
 
@@ -5053,7 +5073,7 @@ class AiterMlaIndicesUpdaterPrefill:
                     req_pool_indices=req_pool_indices,
                     paged_kernel_lens=kv_lens,
                     paged_kernel_lens_sum=kv_lens_sum,
-                    translator=self.kv_index_translator,
+                    runner_ids=self.runner_ids,
                     plan=plan,
                 )
             )
@@ -5108,7 +5128,7 @@ class AiterMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
@@ -5124,8 +5144,8 @@ class AiterMultiStepDraftBackend:
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
             context_len=self.max_context_len,
         )
-        src = self.kv_index_translator.read_source(
-            forward_batch.kv_loc_plan,
+        src = self.runner_ids.read_source(
+            forward_batch.iteration_ids,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
         )

@@ -30,64 +30,28 @@ a prefix `match_prefix` cannot honor and trips
 import unittest
 
 import torch
-from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.storage import _page_pairs
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _SWA = ComponentType.SWA
-
-
-def _build_swa_composite(n_full=64, n_swa=64):
-    full_spec = MHASubPoolSpec(
-        name="full",
-        layer_num=4,
-        head_num=2,
-        head_dim=4,
-        store_dtype=torch.float16,
-        grow_direction="up",
-    )
-    swa_spec = MHASubPoolSpec(
-        name="swa",
-        layer_num=2,
-        head_num=2,
-        head_dim=4,
-        store_dtype=torch.float16,
-        grow_direction="down",
-    )
-    total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-    pool = UnifiedKVPool(
-        total_bytes=total,
-        sub_pool_specs=[full_spec, swa_spec],
-        device=_DEV,
-        enable_memory_saver=False,
-    )
-    kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = ChainAllocator(
-        roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
-        kvcache=kvcache,
-        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
-        device=_DEV,
-        full_max_total_num_tokens=n_full,
-        swa_max_total_num_tokens=n_swa,
-        need_sort=False,
-        forward_stream=None,
-    )
-    return allocator
 
 
 class _StubTreeCore:
@@ -102,15 +66,22 @@ class _StubTreeCore:
 
 
 class _Cache:
-    def __init__(self, allocator):
+    def __init__(self, allocator, storage=None):
         self.token_to_kv_pool_allocator = allocator
+        self.req_to_token_pool = None
+        self._storage = storage
+
+    def kv_storage(self):
+        if self._storage is not None:
+            return self._storage
+        return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
 
 class _Probe(SWAComponent):
-    """SWAComponent wired to the real allocator and stub tree core."""
+    """SWAComponent wired to the real allocator, its storage and a stub tree core."""
 
     def __init__(self, allocator):
-        self.cache = _Cache(allocator)
+        self.cache = _Cache(allocator, allocator.storage)
         self.tree_core = _StubTreeCore()
 
 
@@ -120,6 +91,7 @@ class _StaticAllocRecorder:
     routing static pools through the original recipe."""
 
     hands_out_virtual_ids = False
+    storage = None
 
     def __init__(self, n=16):
         self.full_to_swa_index_mapping = torch.arange(n, dtype=torch.int64)
@@ -156,7 +128,18 @@ class _StaticAllocRecorder:
 
 class _RecoverTestBase(unittest.TestCase):
     def _probe(self):
-        allocator = _build_swa_composite()
+        # The full + window chain as the builder makes it, with its storage.
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                chain="swa",
+                full_layer_ids=(0, 1),
+                swa_layer_ids=(2, 3),
+                page_size=1,
+                full_tokens=64,
+                swa_tokens=64,
+            )
+        ).token_to_kv_pool_allocator
         self.assertIsInstance(allocator, ChainAllocator)
         return _Probe(allocator), allocator
 
@@ -176,16 +159,17 @@ class TestPagePairing(_RecoverTestBase):
         probe, _ = self._probe()
         kept = torch.tensor([9, 7, 5], dtype=torch.int64)  # descending
         incoming = torch.tensor([2, 4, 6], dtype=torch.int64)  # ascending
-        kept_pages, incoming_pages = probe._page_pairs(kept, incoming)
+        kept_pages, incoming_pages = _page_pairs(kept, incoming, 1)
         self.assertEqual(kept_pages.tolist(), [9, 7, 5])
         self.assertEqual(incoming_pages.tolist(), [2, 4, 6])
 
     def test_length_mismatch_is_rejected(self):
         probe, _ = self._probe()
         with self.assertRaises(AssertionError):
-            probe._page_pairs(
+            _page_pairs(
                 torch.tensor([1, 2, 3], dtype=torch.int64),
                 torch.tensor([4, 5], dtype=torch.int64),
+                1,
             )
 
 
@@ -194,21 +178,21 @@ class TestOwnershipTransfer(_RecoverTestBase):
         probe, allocator = self._probe()
         swa = allocator.swa_attn_allocator
         kept, incoming = self._two_ranges(allocator)
-        donated = swa.virtual_to_physical[incoming.to(torch.int64)].clone()
+        donated = swa.ids.virtual_to_physical[incoming.to(torch.int64)].clone()
 
-        probe._transfer_swa_pages(allocator, kept, incoming)
+        allocator.storage.rehome_window("swa", kept, incoming)
 
         self.assertEqual(
-            swa.virtual_to_physical[kept.to(torch.int64)].tolist(),
+            swa.ids.virtual_to_physical[kept.to(torch.int64)].tolist(),
             donated.tolist(),
             "the node's ids must now resolve to the donated physical pages",
         )
         self.assertTrue(
-            bool((swa.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
+            bool((swa.ids.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
             "the incoming ids' swa side must be tombstoned",
         )
         self.assertEqual(
-            swa.physical_to_virtual[donated].tolist(),
+            swa.ids.physical_to_virtual[donated].tolist(),
             kept.to(torch.int64).tolist(),
             "the inverse map must follow, or a later free credits the wrong id",
         )
@@ -219,7 +203,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
-            probe._transfer_swa_pages(allocator, kept, incoming)
+            allocator.storage.rehome_window("swa", kept, incoming)
 
 
 class TestRecoverActionHandler(_RecoverTestBase):
@@ -331,7 +315,7 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(
-            bool((swa.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
+            bool((swa.ids.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
             "the incoming ids' swa side must be tombstoned",
         )
         self.assertEqual(swa.allocated_count(), swa_live, "ownership only moved")

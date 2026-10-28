@@ -113,14 +113,14 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.kv.lifecycle import acquire
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -150,6 +150,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.kv.storage import KVStorage
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
@@ -187,6 +188,7 @@ class DecodeReqToTokenPool:
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
     # No recurrent state (`ReqToTokenPool.mamba_pool`, `ReqToTokenPool.state`).
+    holds_state_slots = False
     state = None
     mamba_pool = None
     mamba_allocator = None
@@ -635,14 +637,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        # HiSparse registers its host pool instead; unified memory refuses it.
-        storage = (
-            None
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool_allocator.storage
+        storage = kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool, storage
+        # HiSparse registers its host pool instead; unified memory refuses it.
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+            if self.scheduler.enable_hisparse
+            else get_kv_transfer_buf_infos(storage)
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -692,14 +697,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
-        state = self.token_to_kv_pool_allocator.state
         setup_state_kv_args(
             kv_args,
-            self.token_to_kv_pool,
+            storage,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-            state_pool=None if state is None else state.pool,
-            storage=storage,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -752,11 +754,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_retraction_max_tokens(
                         self.req_to_token_pool,
                         # The one state entry here is the window's.
-                        (
-                            pool.swa_kv_pool
-                            if storage is None
-                            else storage.view(storage.wire_entries()[0].sub_pool)
-                        ),
+                        storage.view(storage.wire_entries()[0].sub_pool),
                     ),
                     ceil_align(
                         self.scheduler.sliding_window_size + pool.page_size - 1,
@@ -2262,7 +2260,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _alloc_for_decode_prealloc(
         self, allocator: BaseTokenToKVPoolAllocator, **kwargs
     ) -> torch.Tensor:
-        return alloc_for_decode_prealloc(allocator, **kwargs)
+        storage = kv_storage_of(
+            self.req_to_token_pool, allocator, tree_cache=self.tree_cache
+        )
+        return alloc_for_decode_prealloc(storage, allocator, **kwargs)
 
     def _transfer_page_indices(
         self, decode_req: DecodeRequest, kv_indices: torch.Tensor, page_size: int
@@ -2290,9 +2291,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = acquire(
-            self.req_to_token_pool, self.token_to_kv_pool_allocator.state, [req]
-        )
+        req_pool_indices = kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+        ).acquire([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
@@ -2470,7 +2473,13 @@ def alloc_for_decode_prealloc_hisparse(
     return kv_loc
 
 
+def _evicted_by_caller(num_tokens: int) -> None:
+    """A pre-allocation's room was made before it: by the radix eviction in
+    `_pre_alloc`, or by admission."""
+
+
 def alloc_for_decode_prealloc(
+    storage: KVStorage | StaticKVStorage,
     allocator: BaseTokenToKVPoolAllocator,
     *,
     req: Req,
@@ -2485,68 +2494,99 @@ def alloc_for_decode_prealloc(
 ) -> torch.Tensor:
     req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
-        kv_loc = allocator.alloc(delta_len)
-    else:
-        device = allocator.device
-        last_loc = (
-            prefix_indices[-1:].to(dtype=torch.int64, device=device)
-            if prefix_len > 0
-            else async_h2d([-1], dtype=torch.int64, device=device)
+        return storage.take_tokens(delta_len, make_room=_evicted_by_caller)
+    device = allocator.device
+    last_loc = (
+        prefix_indices[-1:].to(dtype=torch.int64, device=device)
+        if prefix_len > 0
+        else async_h2d([-1], dtype=torch.int64, device=device)
+    )
+    if hasattr(allocator, "c128_attn_allocator"):
+        # NPU DeepSeek-V4 pre-allocates its c4/c128 pages with the tokens.
+        return _alloc_for_decode_prealloc_dsv4(
+            allocator,
+            req=req,
+            fill_len=fill_len,
+            delta_len=delta_len,
+            total_prefix_len=total_prefix_len,
+            last_loc=last_loc,
+            uses_swa_tail=uses_swa_tail,
+            swa_tail_len=swa_tail_len,
+            req_to_token_pool=req_to_token_pool,
         )
-        extra_kwargs = {}
-        dsv4_unwrap_prealloc = None
-        if hasattr(allocator, "c128_attn_allocator"):
-            assert req_to_token_pool is not None
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                dsv4_prealloc_kwargs,
-                dsv4_unwrap_prealloc,
-            )
-
-            extra_kwargs = dsv4_prealloc_kwargs(
-                allocator,
-                req,
-                fill_len,
-                req_to_token_pool,
-                device=device,
-            )
-        if uses_swa_tail:
-            # Full-attention layers reuse prefix KV; SWA layers allocate only
-            # the live window tail.
-            kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=async_h2d(
-                    [total_prefix_len], dtype=torch.int64, device=device
-                ),
-                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=last_loc,
-                extend_num_tokens=delta_len,
-                swa_tail_len=swa_tail_len,
-                **extra_kwargs,
-            )
-            swa_evicted_seqlen = fill_len - swa_tail_len
-            assert (
-                swa_evicted_seqlen >= 0
-                and swa_evicted_seqlen % allocator.page_size == 0
-            )
-            req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
-        else:
-            kv_loc = allocator.alloc_extend(
-                prefix_lens=async_h2d(
-                    [total_prefix_len], dtype=torch.int64, device=device
-                ),
-                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=last_loc,
-                extend_num_tokens=delta_len,
-                **extra_kwargs,
-            )
-        if dsv4_unwrap_prealloc is not None:
-            kv_loc = dsv4_unwrap_prealloc(
-                kv_loc, req_to_token_pool, req, total_prefix_len, fill_len
-            )
+    kv_loc = storage.take_extend(
+        rows=None,
+        prefix_lens=async_h2d([total_prefix_len], dtype=torch.int64, device=device),
+        prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+        seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
+        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+        last_loc=last_loc,
+        num_tokens=delta_len,
+        make_room=_evicted_by_caller,
+        # Full-attention layers reuse prefix KV; SWA layers allocate only the
+        # live window tail.
+        window_tail=swa_tail_len if uses_swa_tail else None,
+    )
+    if uses_swa_tail:
+        swa_evicted_seqlen = fill_len - swa_tail_len
+        assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
     return kv_loc
+
+
+def _alloc_for_decode_prealloc_dsv4(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    delta_len: int,
+    total_prefix_len: int,
+    last_loc: torch.Tensor,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+    req_to_token_pool: Optional[ReqToTokenPool],
+) -> torch.Tensor:
+    assert req_to_token_pool is not None
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+        dsv4_prealloc_kwargs,
+        dsv4_unwrap_prealloc,
+    )
+
+    device = allocator.device
+    extra_kwargs = dsv4_prealloc_kwargs(
+        allocator,
+        req,
+        fill_len,
+        req_to_token_pool,
+        device=device,
+    )
+    if uses_swa_tail:
+        kv_loc = allocator.alloc_extend_swa_tail(
+            prefix_lens=async_h2d([total_prefix_len], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+            seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=last_loc,
+            extend_num_tokens=delta_len,
+            swa_tail_len=swa_tail_len,
+            **extra_kwargs,
+        )
+        swa_evicted_seqlen = fill_len - swa_tail_len
+        assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+    else:
+        kv_loc = allocator.alloc_extend(
+            prefix_lens=async_h2d([total_prefix_len], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+            seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=last_loc,
+            extend_num_tokens=delta_len,
+            **extra_kwargs,
+        )
+    return dsv4_unwrap_prealloc(
+        kv_loc, req_to_token_pool, req, total_prefix_len, fill_len
+    )
 
 
 def _generate_fake_prefill_handoff_output_id(req: Req) -> int:

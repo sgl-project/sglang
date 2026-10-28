@@ -11,22 +11,18 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvAttnBackend,
     InklingShortConvHybridAttnBackend,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
+from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
+from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedHybridReqToTokenPool,
-    UnifiedKVPool,
-    UnifiedMambaPool,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -61,22 +57,21 @@ class TestInklingCheckpointIndices(CustomTestCase):
             store_dtype=torch.bfloat16,
             grow_direction="down",
         )
-        shared = UnifiedKVPool(
+        shared = arena_of(
             total_bytes=64 * mamba.entry_bytes(),
             sub_pool_specs=[mamba, full],
             device="cuda",
             enable_memory_saver=False,
         )
-        shared._raw.zero_()
-        pool = UnifiedMambaPool(
-            unified_buffer=shared,
-            sub_pool_name="mamba",
+        shared.raw.zero_()
+        pool = StateView(
+            arena=shared,
+            spec=shared.spec("mamba"),
             spec_state_size=0,
             mamba_layer_ids=[0, 1],
         )
-        allocator = MultiEndedAllocator(
-            kvcache=pool,
-            unified_buffer=shared,
+        allocator = Band(
+            arena=shared,
             sub_pool_name="mamba",
             device="cuda",
             is_id_owner=True,
@@ -84,7 +79,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         )
         slots = allocator.alloc(slot_count)
         self.assertIsNotNone(slots)
-        req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
+        req_type = HybridReqToTokenPool if static else RequestTable
         req_pool = req_type.__new__(req_type)
         req_pool.size = 4
         req_pool.req_index_to_mamba_index_mapping = slots[1:2].to(torch.int32).repeat(4)
@@ -97,7 +92,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         backend._state_ids = (
             IdSpace(key=("mamba", None))
             if static
-            else slot_id_space(allocator, owner=None)
+            else allocator.ids.slot_space((allocator.sub_pool_name, None))
         )
         backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(
@@ -472,8 +467,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
         composite.captured_req_width = 4
         composite.draft_extend_attn_backend_list = [wrapper]
         composite._out_cache_loc_virtual = None
-        composite._kv_loc_plan = None
-        composite._kv_loc_cols = None
+        composite._iteration_ids = None
+        composite._iteration_cols = None
         for step, tracking in enumerate((True, False, True)):
             with self.subTest(tracking=tracking, step=step):
                 ids = slots[-4:].roll(step).clone()
@@ -831,9 +826,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
-            # The KV side is not under test: a static pool's translator binds
+            # The KV side is not under test: a static pool's runner_ids binds
             # the captured batch to its own write ids.
-            kv_index_translator=KVIndexTranslator(
+            runner_ids=RunnerIds(
                 req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
                 token_to_kv_pool_allocator=None,
                 token_to_kv_pool=SimpleNamespace(
@@ -1036,8 +1031,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     positions=buffers.positions[: live * 4],
                     out_cache_loc=buffers.out_cache_loc[: live * 4],
                     out_cache_loc_virtual=None,
-                    kv_loc_plan=None,
-                    kv_loc_cols=None,
+                    iteration_ids=None,
+                    iteration_cols=None,
                     req_pool_indices=torch.arange(1, live + 1, device="cuda"),
                     seq_lens=torch.full((live,), 6, dtype=torch.int64, device="cuda"),
                     seq_lens_sum=6 * live,
@@ -1090,8 +1085,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         composite._replay_spec_info,
                         None,
                         out_cache_loc_virtual=composite._out_cache_loc_virtual,
-                        kv_loc_plan=composite._kv_loc_plan,
-                        kv_loc_cols=composite._kv_loc_cols,
+                        iteration_ids=composite._iteration_ids,
+                        iteration_cols=composite._iteration_cols,
                     )
                 else:
                     runner.execute(fresh, torch.arange(live, device="cuda") * 4 + 1)

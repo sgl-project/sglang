@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -7,8 +8,8 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -74,7 +75,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=target), storage=None
             ),
@@ -130,7 +131,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=target), storage=None
             ),
@@ -153,7 +154,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=pool), storage=None
             ),

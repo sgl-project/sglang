@@ -15,6 +15,10 @@ Every pool chain is built from the unified pool fixtures on the CPU; HiCache
 host pools register host memory with CUDA, so a CUDA device must be visible.
 Pointers are recorded relative to the unified buffer, eviction callbacks by
 what they ask of a recording cache, allocation callbacks by their names.
+
+Pools built without unified memory register with PD peers too (configurations
+named ``static_*``): they are built on the CUDA device, and their pointers are
+recorded relative to the lowest one they register.
 """
 
 import argparse
@@ -24,6 +28,7 @@ import json
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -72,6 +77,15 @@ _COMPONENTS = {
     "mamba": {ComponentType.FULL, ComponentType.MAMBA},
     "tri": {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA},
 }
+# Pools built without unified memory, registered with PD peers.
+STATIC_CONFIGS = (
+    "static_mha",
+    "static_mla",
+    "static_swa",
+    "static_hybrid",
+    "static_hybrid_mla",
+    "static_tri",
+)
 # (hicache_mem_layout, hicache_storage_backend): the page-envelope host needs
 # no backend or one that keeps envelopes; "file" does not.
 HICACHE_VARIANTS = (("page_first", None), ("page_first", "file"), ("layer_first", None))
@@ -87,44 +101,88 @@ def _state_pool(bundle):
     return getattr(table, "mamba_pool", None)
 
 
+def _buffer_base(bundle) -> int:
+    # The unified buffer moved from the pool bundle to the arena; a tool run on
+    # both sides of that move reads whichever this checkout has.
+    arena = getattr(bundle, "arena", None)
+    if arena is not None:
+        return arena.raw.data_ptr()
+    return bundle.unified_memory_pool._raw.data_ptr()
+
+
 def _rel(ptrs, base):
     return [p - base for p in ptrs]
 
 
 def pd_summary(bundle, total_layers: int) -> dict:
-    from sglang.srt.disaggregation import utils as pd
     from sglang.srt.disaggregation.base.conn import KVArgs
 
     pool = bundle.token_to_kv_pool
     allocator = bundle.token_to_kv_pool_allocator
-    base = bundle.unified_memory_pool._raw.data_ptr()
+    base = _buffer_base(bundle)
     storage = getattr(allocator, "storage", None)
     kv_args = KVArgs()
+    kv, layer_ids = _register(
+        kv_args,
+        pool,
+        storage,
+        total_layers,
+        state_pool=_state_pool(bundle),
+        req_to_token_pool=getattr(bundle, "req_to_token_pool", None),
+    )
+    return _pd_record(kv_args, kv, layer_ids, base)
+
+
+def _register(kv_args, pool, storage, total_layers, *, state_pool, req_to_token_pool):
+    """Register ``pool`` as this checkout's PD code does: through the storage
+    where registration takes one (``storage`` is None for a static pool), else
+    through the pool and its keywords. Returns the KV entries and layer ids."""
+    from sglang.srt.disaggregation import utils as pd
+
     setup = inspect.signature(pd.setup_state_kv_args).parameters
-    kwargs = {}
-    if "storage" in setup:
-        kwargs["storage"] = storage
-    if "state_pool" in setup:
-        kwargs["state_pool"] = _state_pool(bundle)
+    if list(setup)[1] == "storage":
+        if storage is None:
+            from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+
+            allocator = SimpleNamespace(
+                storage=None,
+                state=None if state_pool is None else SimpleNamespace(pool=state_pool),
+                get_kvcache=lambda: pool,
+            )
+            storage = StaticKVStorage(None, allocator, num_hidden_layers=total_layers)
+        kv = pd.get_kv_transfer_buf_infos(storage)
+        pd.setup_state_kv_args(kv_args, storage, None, total_layers)
+        layer_id_kwargs = {"storage": storage}
     else:
-        kwargs["req_to_token_pool"] = getattr(bundle, "req_to_token_pool", None)
-    if "storage" in inspect.signature(pd.get_kv_transfer_buf_infos).parameters:
-        kv = pd.get_kv_transfer_buf_infos(pool, storage)
-    else:
-        kv = pd.get_kv_transfer_buf_infos(pool)
-    pd.setup_state_kv_args(kv_args, pool, None, total_layers, **kwargs)
-    layer_id_kwargs = {}
-    if "storage" in inspect.signature(pd.build_kv_layer_ids).parameters:
-        layer_id_kwargs["storage"] = storage
+        kwargs = {}
+        if "storage" in setup:
+            kwargs["storage"] = storage
+        if "state_pool" in setup:
+            kwargs["state_pool"] = state_pool
+        else:
+            kwargs["req_to_token_pool"] = req_to_token_pool
+        if "storage" in inspect.signature(pd.get_kv_transfer_buf_infos).parameters:
+            kv = pd.get_kv_transfer_buf_infos(pool, storage)
+        else:
+            kv = pd.get_kv_transfer_buf_infos(pool)
+        pd.setup_state_kv_args(kv_args, pool, None, total_layers, **kwargs)
+        layer_id_kwargs = {}
+        if "storage" in inspect.signature(pd.build_kv_layer_ids).parameters:
+            layer_id_kwargs["storage"] = storage
+    layer_ids = pd.build_kv_layer_ids(
+        token_to_kv_pool=pool,
+        draft_token_to_kv_pool=None,
+        num_draft_entries=0,
+        num_hidden_layers=total_layers,
+        **layer_id_kwargs,
+    )
+    return kv, layer_ids
+
+
+def _pd_record(kv_args, kv, layer_ids, base) -> dict:
     return {
         "kv": {"ptrs": _rel(kv[0], base), "lens": kv[1], "item_lens": kv[2]},
-        "kv_layer_ids": pd.build_kv_layer_ids(
-            token_to_kv_pool=pool,
-            draft_token_to_kv_pool=None,
-            num_draft_entries=0,
-            num_hidden_layers=total_layers,
-            **layer_id_kwargs,
-        ),
+        "kv_layer_ids": layer_ids,
         "state_types": [t.value for t in kv_args.state_types],
         "state_ptrs": [_rel(p, base) for p in kv_args.state_data_ptrs],
         "state_lens": kv_args.state_data_lens,
@@ -137,6 +195,114 @@ def pd_summary(bundle, total_layers: int) -> dict:
         "swa_kv_cache_layout": kv_args.swa_kv_cache_layout,
         "mla_compression_ratios": kv_args.mla_compression_ratios,
     }
+
+
+def _static_mamba(layer_ids):
+    import torch
+
+    from sglang.srt.configs.inkling import (
+        InklingConvCacheParams,
+        InklingConvStateShape,
+        InklingStateDType,
+    )
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+
+    return MambaPool(
+        size=16,
+        spec_state_size=4,
+        cache_params=InklingConvCacheParams(
+            shape=InklingConvStateShape(
+                conv=[(3, 256), (3, 256), (3, 128), (3, 128), (3, 256), (3, 256)],
+                temporal=(2, 8, 16),
+            ),
+            layers=layer_ids,
+            dtype=InklingStateDType(conv=torch.bfloat16, temporal=torch.bfloat16),
+        ),
+        mamba_layer_ids=layer_ids,
+        device="cuda",
+    )
+
+
+def build_static(name: str):
+    """A static pool, and the recurrent state pool beside it when the KV pool
+    does not hold that state itself."""
+    import torch
+
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    common = dict(size=256, page_size=16, dtype=torch.bfloat16, device="cuda")
+    if name == "static_mha":
+        pool = MHATokenToKVPool(
+            head_num=2, head_dim=64, layer_num=4, enable_memory_saver=False, **common
+        )
+        return pool, None
+    if name == "static_mla":
+        pool = MLATokenToKVPool(
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            layer_num=4,
+            enable_memory_saver=False,
+            **common,
+        )
+        return pool, None
+    if name in ("static_swa", "static_tri"):
+        pool = SWAKVPool(
+            size_swa=128,
+            head_num=2,
+            head_dim=64,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            token_to_kv_pool_class=MHATokenToKVPool,
+            swa_kv_pool_kwargs={
+                "head_num": 1,
+                "head_dim": 64,
+                "page_size": 16,
+                "device": "cuda",
+                "enable_memory_saver": False,
+            },
+            **common,
+        )
+        return pool, _static_mamba([0, 2]) if name == "static_tri" else None
+    mla = name == "static_hybrid_mla"
+    pool = HybridLinearKVPool(
+        head_num=2,
+        head_dim=64,
+        full_attention_layer_ids=[0, 2],
+        mamba_pool=_static_mamba([1, 3]),
+        use_mla=mla,
+        kv_lora_rank=64 if mla else None,
+        qk_rope_head_dim=16 if mla else None,
+        **common,
+    )
+    return pool, None
+
+
+def static_pd_summary(name: str) -> dict:
+    from sglang.srt.disaggregation.base.conn import KVArgs
+
+    pool, state_pool = build_static(name)
+    # Before the state moved to the allocator, the request table described it.
+    table = (
+        None
+        if state_pool is None
+        else SimpleNamespace(
+            get_state_buf_infos=state_pool.get_contiguous_buf_infos,
+            get_state_dim_per_tensor=state_pool.get_state_dim_per_tensor,
+            get_state_conv_shard_groups=state_pool.get_state_conv_shard_groups,
+            get_state_slice_outer_counts=state_pool.get_state_slice_outer_counts,
+        )
+    )
+    kv_args = KVArgs()
+    kv, layer_ids = _register(
+        kv_args, pool, None, 4, state_pool=state_pool, req_to_token_pool=table
+    )
+    base = min(list(kv[0]) + [p for ptrs in kv_args.state_data_ptrs for p in ptrs])
+    return _pd_record(kv_args, kv, layer_ids, base)
 
 
 class _RecordingCache:
@@ -295,8 +461,13 @@ def hicache_summary(bundle, chain: str, page_size: int, layout, backend) -> dict
 
 
 def summarize_one(name: str, variant: int) -> dict:
-    geometry = GEOMETRIES[name]
     setup_allocator_context()
+    if name in STATIC_CONFIGS:
+        try:
+            return static_pd_summary(name)
+        except Exception as e:  # recorded: an error on both sides agrees
+            return {"error": f"{type(e).__name__}: {e}"}
+    geometry = GEOMETRIES[name]
     bundle = build_unified_bundle(geometry)
     if variant < 0:
         layers = (
@@ -330,9 +501,10 @@ def summarize() -> dict:
         for i, (layout, backend) in enumerate(HICACHE_VARIANTS)
     )
     jobs = [(name, variant) for name in GEOMETRIES for variant in keys]
+    jobs += [(name, -1) for name in STATIC_CONFIGS]
     with ThreadPoolExecutor(max_workers=8) as pool:
         records = list(pool.map(lambda job: run(*job), jobs))
-    out = {name: {} for name in GEOMETRIES}
+    out = {name: {} for name in (*GEOMETRIES, *STATIC_CONFIGS)}
     for (name, variant), record in zip(jobs, records):
         out[name][keys[variant]] = record
     return out
@@ -368,7 +540,7 @@ def main():
     compare.add_argument("--base", required=True)
     compare.add_argument("--out", default=None)
     one = sub.add_parser("one")
-    one.add_argument("name", choices=sorted(GEOMETRIES))
+    one.add_argument("name", choices=sorted((*GEOMETRIES, *STATIC_CONFIGS)))
     one.add_argument("variant", type=int, help="-1 for PD, else a HiCache variant")
     args = parser.parse_args()
     if args.cmd == "one":

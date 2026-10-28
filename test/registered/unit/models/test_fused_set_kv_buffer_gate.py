@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PublicSubPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.models import utils as model_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,11 +43,13 @@ def _static_window_pool():
     views = {
         IdSpaceKind.SLIDING_WINDOW: SimpleNamespace(requires_physical_write_loc=False)
     }
+    buffer = torch.zeros(_FULL_TO_SWA.numel(), _HEADS, _DIM)
+    layer_kv = SimpleNamespace(key=lambda: buffer, value=lambda: buffer)
     router = SimpleNamespace(
         sub_pool=lambda name: window if name == window.name else None,
         view=lambda name: views[name],
+        read=lambda layer_id: layer_kv,
     )
-    buffer = torch.zeros(_FULL_TO_SWA.numel(), _HEADS, _DIM)
     return SimpleNamespace(
         layer_router=router,
         page_size=_PAGE,
@@ -76,6 +78,7 @@ def _hip_write_slots(pool, layer, out_cache_loc):
     with (
         patch.object(model_utils, "_is_hip", True),
         patch.object(model_utils, "get_token_to_kv_pool", return_value=pool),
+        patch.object(model_utils, "get_kv_layers", return_value=pool.layer_router),
     ):
         arg = model_utils.create_fused_set_kv_buffer_arg(
             torch.zeros(out_cache_loc.numel(), _HEADS * _DIM),

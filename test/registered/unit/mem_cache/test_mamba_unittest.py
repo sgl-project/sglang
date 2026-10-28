@@ -10,12 +10,12 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MambaPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
@@ -143,7 +143,7 @@ class TestMamba(unittest.TestCase):
         )
 
         # alloc req
-        acquire(req_to_token_pool, req_to_token_pool.state, [req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
@@ -157,7 +157,7 @@ class TestMamba(unittest.TestCase):
 
         # alloc req without free mamba cache
         req.kv.mamba_pool_idx = None
-        acquire(req_to_token_pool, req_to_token_pool.state, [req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert (
@@ -165,7 +165,7 @@ class TestMamba(unittest.TestCase):
         )
 
         # alloc again
-        acquire(req_to_token_pool, req_to_token_pool.state, [req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
@@ -306,7 +306,7 @@ class TestMamba(unittest.TestCase):
                 origin_input_ids=array("q"),
                 sampling_params=sampling_params,
             )
-            acquire(req_to_token_pool, req_to_token_pool.state, [req])
+            acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
             return req
 
         return allocator, req_to_token_pool, make_dummy_req

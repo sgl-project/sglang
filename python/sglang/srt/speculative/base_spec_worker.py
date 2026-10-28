@@ -190,15 +190,13 @@ class BaseSpecWorker(ABC):
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
-        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
-
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return None
-        pool = draft_runners[0].token_to_kv_pool
-        if fused_draft_host_allocator(pool) is not None:
+        # A fused draft's KV lives in the target's pool: it has none of its own.
+        if draft_runners[0].runner_ids.is_fused_draft:
             return None
-        return pool
+        return draft_runners[0].token_to_kv_pool
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -283,11 +281,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        from sglang.srt.mem_cache.unified_draft_pool import (
-            fused_draft_host_allocator,
-        )
-
-        if any(fused_draft_host_allocator(pool) is not None for pool in draft_pools):
+        if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,
             )

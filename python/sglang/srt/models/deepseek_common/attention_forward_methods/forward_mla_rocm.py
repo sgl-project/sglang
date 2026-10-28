@@ -45,7 +45,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -410,7 +413,7 @@ def _fused_rope_cat_and_cache(
         q_pe,
         k_nope,
         k_pe,
-        kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
+        kv_pool.layer_router.read(attn.attn_mqa.layer_id).key(),
         out_cache_loc,
         positions,
         attn.rotary_emb.cos_cache,
@@ -477,7 +480,7 @@ def _fused_bmm_rope_cat_and_cache(
         q_pe,
         k_nope,
         k_pe,
-        get_token_to_kv_pool().get_key_buffer(attn.attn_mqa.layer_id),
+        get_kv_layers().read(attn.attn_mqa.layer_id).key(),
         out_cache_loc,
         positions,
         attn.rotary_emb.cos_cache,
@@ -952,7 +955,7 @@ class DeepseekMLARocmForwardMixin:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             if llama_4_scaling is not None:
                 q[..., : self.kv_lora_rank] *= llama_4_scaling
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 KVWriteLoc.for_batch(forward_batch),
                 k_nope,

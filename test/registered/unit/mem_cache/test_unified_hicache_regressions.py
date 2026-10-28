@@ -231,16 +231,16 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
 class TestTriPoolAssembly(CustomTestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-            MultiEndedAllocator,
-        )
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.kv.alloc.band import (
+            Band,
+        )
 
         for unified in (False, True):
             with self.subTest(unified=unified):
-                # Unified memory always builds a MultiEndedAllocator SWA end.
+                # Unified memory always builds a Band SWA end.
                 swa_allocator = (
-                    object.__new__(MultiEndedAllocator)
+                    object.__new__(Band)
                     if unified
                     else SimpleNamespace(alloc=Mock(), free=Mock())
                 )

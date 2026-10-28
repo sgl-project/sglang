@@ -1,26 +1,23 @@
-"""Today's capacity policy of each unified chain shape, kept as data.
+"""Capacity policies selected from unified chain geometry.
 
-`ChainAllocator` owns the bands and every lifecycle fan-out; what still
-differs between the chains it serves (joint pricing, admission hooks, reclaim
-and the per-side capacity views) lives here, one policy per chain shape, chosen
-from the band geometry alone. Each policy reproduces the decisions of the
-allocator that served that shape before, so a replaced chain keeps its
-admission, reclaim and compaction outcomes.
+`ChainAllocator` owns the bands and lifecycle operations. Each policy supplies
+joint pricing, admission hooks, reclaim and per-side capacity views for one
+chain shape.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
+from sglang.srt.mem_cache.kv.alloc.band import (
+    FloatBand,
     _float_open_short_side,
-    _flush_deferred_free_group,
-    _relieve_for_alloc,
+    flush_deferred_free_group,
+    relieve_for_alloc,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
@@ -71,9 +68,14 @@ def _virtual_tokens_to_physical(virtual_tokens: torch.Tensor, band) -> torch.Ten
     the band does not bind yields a negative id."""
     page_size = band.page_size
     if page_size == 1:
-        return band.virtual_to_physical[virtual_tokens]
-    physical_pages = band.virtual_to_physical[virtual_tokens // page_size]
+        return band.ids.virtual_to_physical[virtual_tokens]
+    physical_pages = band.ids.virtual_to_physical[virtual_tokens // page_size]
     return physical_pages * page_size + virtual_tokens % page_size
+
+
+def _state_usage(c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+    """The state sub-pool's (slots, free slots)."""
+    return {c.roles.state: (c.state.pool.size, c.state_slots.available_size())}
 
 
 class _InterimPolicy:
@@ -120,6 +122,11 @@ class _InterimPolicy:
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        """Each sub-pool's (capacity, available units) as observers report
+        them, by sub-pool name: tokens, or slots for a state sub-pool."""
+        raise NotImplementedError
 
     def resize(self, c: ChainAllocator, config) -> None:
         raise NotImplementedError(
@@ -179,13 +186,19 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return c
 
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        return {
+            c.roles.owner: (c.size, c.available_size()),
+            **_state_usage(c),
+        }
+
     def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
         """Make deferred Full reclaim visible to the Mamba capacity view."""
         c.flush_deferred_full_frees()
         if target_size > c.mamba_allocator.schedulable_available_size():
             return
         if target_size > c.mamba_allocator.available_size():
-            _relieve_for_alloc(c.mamba_allocator, target_size)
+            relieve_for_alloc(c.mamba_allocator, target_size)
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(
@@ -214,7 +227,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
     ):
         owner = c.views[c.roles.owner]
         kv_cpu = owner.get_cpu_copy(
-            c.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
             req_pool_index=req_pool_index,
         )
         state_cpu = None
@@ -230,7 +243,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         kv_cpu, state_cpu = cpu_copy
         c.views[c.roles.owner].load_cpu_copy(
             kv_cpu,
-            c.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
             req_pool_index=req_pool_index,
         )
         if state_cpu is not None and mamba_indices is not None:
@@ -268,7 +281,7 @@ class _WindowPolicy(_InterimPolicy):
         self._full_max_total_num_tokens = self._size_full
         self._swa_max_total_num_tokens = self._size_swa
         # Epoch-keyed memo for the joint capacity view (any chain member's
-        # mutation invalidates -- see `MultiEndedAllocator._chain_capacity_epoch`).
+        # mutation invalidates -- see `Band._chain_capacity_epoch`).
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
@@ -335,7 +348,7 @@ class _WindowPolicy(_InterimPolicy):
         )
 
     def memo_violations(self, c: ChainAllocator) -> List[str]:
-        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
+        """Idle-time twin of `Band._capacity_memo_violations`
         for the joint view. Empty == healthy."""
         if (
             self._joint_avail_memo_epoch
@@ -571,6 +584,12 @@ class _TokenEndsPolicy(_WindowPolicy):
             (c.current_swa_capacity, c.swa_available_size()),
         )
 
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        return {
+            c.roles.owner: (c.current_full_capacity, c.full_available_size()),
+            c.roles.window: (c.current_swa_capacity, c.swa_available_size()),
+        }
+
     def max_new_tokens_for_memory(
         self,
         c: ChainAllocator,
@@ -635,7 +654,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             and memory.hicache_storage_backend is not None
         ) or get_disagg().disaggregation_mode == "decode"
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        _flush_deferred_free_group(
+        flush_deferred_free_group(
             c,
             (
                 c.free_group,
@@ -666,18 +685,18 @@ class _TokenEndsPolicy(_WindowPolicy):
 
     def resize(self, c: ChainAllocator, config) -> None:
         """Synchronize allocator capacity after the shared pool is finalized."""
-        if not c.unified_buffer.post_capture_active:
+        if not c.arena.backed_after_capture:
             raise RuntimeError("ChainAllocator.resize requires post-capture backing")
         final_pool_bytes = config.unified_memory_pool_bytes
         if final_pool_bytes is None:
             raise ValueError(
                 "ChainAllocator.resize requires config.unified_memory_pool_bytes"
             )
-        if int(final_pool_bytes) != c.unified_buffer.total_bytes:
+        if int(final_pool_bytes) != c.arena.total_bytes:
             raise RuntimeError(
-                "UnifiedKVPool.finalize_backing must run before allocator.resize: "
+                "the arena must be backed before allocator.resize: "
                 f"config has {int(final_pool_bytes)} bytes but the pool exposes "
-                f"{c.unified_buffer.total_bytes} bytes"
+                f"{c.arena.total_bytes} bytes"
             )
         fa, sa = c.full_attn_allocator, c.swa_attn_allocator
         for allocator in (fa, sa):
@@ -686,10 +705,10 @@ class _TokenEndsPolicy(_WindowPolicy):
                     f"cannot resize non-empty unified allocator "
                     f"{allocator.sub_pool_name!r}"
                 )
-        fa._set_capacity(c.unified_buffer.max_slots(fa.sub_pool_name))
+        fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
         sa._set_capacity(
-            c.unified_buffer.max_slots(sa.sub_pool_name),
-            virtual_num_pages=fa.num_virtual_ids,
+            c.arena.num_entries(sa.sub_pool_name),
+            virtual_num_pages=fa.ids.num_virtual_ids,
         )
         self._empty_shared_gap_bytes = fa._current_gap_bytes()
         self._size_full = fa.available_size()
@@ -705,13 +724,10 @@ class _TokenEndsPolicy(_WindowPolicy):
             (sa, self._size_swa),
         ):
             pool = c.views[allocator.sub_pool_name]
-            pool._num_pages = allocator.num_pages
+            pool.num_pages = allocator.num_pages
             pool.size = allocator.num_pages * c.page_size - c.page_size
             pool.host_capacity_tokens = host_capacity
-            pool.host_capacity_bytes = (
-                host_capacity
-                * c.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
-            )
+            pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
 
 
 class _FloatChainPolicy(_WindowPolicy):
@@ -871,7 +887,7 @@ class _FloatChainPolicy(_WindowPolicy):
         if float_byte_shortfall(_snapshot(c), chain, need_tokens) > 0:
             return False
         # Today's last resort, imperative: where the float's holes sit decides it.
-        return _relieve_for_alloc(c, need_tokens)
+        return relieve_for_alloc(c, need_tokens)
 
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
@@ -903,7 +919,7 @@ class _FloatChainPolicy(_WindowPolicy):
         demand = self._alloc_demand(c, need_tokens)
         flt = None
         for b in demand:
-            if isinstance(b, FloatMultiEndedAllocator):
+            if isinstance(b, FloatBand):
                 flt = b
         _float_open_short_side(flt, demand)
 
@@ -916,7 +932,7 @@ class _FloatChainPolicy(_WindowPolicy):
         if target_size <= c.mamba_allocator.available_size():
             return
         c.full_attn_allocator.flush_for_allocation()
-        _relieve_for_alloc(c.mamba_allocator, target_size)
+        relieve_for_alloc(c.mamba_allocator, target_size)
 
     def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
@@ -938,6 +954,20 @@ class _FloatChainPolicy(_WindowPolicy):
             (full_capacity, c.conserve_full_available_size()),
             (swa_capacity, c.conserve_swa_available_size()),
         )
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        # The static caps the slot-conservation views count down from.
+        return {
+            c.roles.owner: (
+                self._full_max_total_num_tokens,
+                c.conserve_full_available_size(),
+            ),
+            c.roles.window: (
+                self._swa_max_total_num_tokens,
+                c.conserve_swa_available_size(),
+            ),
+            **_state_usage(c),
+        }
 
     @rank_consensus(same_params=["num_tokens"], same_results=True)
     def evict_to_free_tokens(

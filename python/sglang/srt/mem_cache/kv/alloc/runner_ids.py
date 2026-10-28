@@ -25,14 +25,14 @@ The two coincide on a plain pool, so nothing here does any work there.
 
 A pool can hold several sub-pools (full attention, sliding window), each with
 its own physical ids and named by an `IdSpace` (`space`). Writes are translated
-once per sub-pool, by the iteration's `KVLocPlan` or its fused producer.
+once per sub-pool, by the iteration's `IterationIds` or its fused producer.
 A read is translated exactly once, by the readers below or a captured gather
 using the `IdSpace`'s live mapping. The
 plan's read table exists only once a table reader asks for it (`read_table`,
 `copy_page_table`), built into that reader's own capture-stable table when it
 is the first; later readers take it, earlier ones translate in their own
 gather. The readers answer "what do I gather from, and which row is mine?"
-with a `KVIndexTable`:
+with a `ReadTable`:
 
     ids[row_ids[b], pos]
 
@@ -76,15 +76,12 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.kv_loc_plan import (
-    IdSpace,
-    IdSpaceKind,
-    KVLocPlan,
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind, state_id_space
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
+    IterationIds,
     pad_with_sink,
-    state_id_space,
     window_read_extent,
 )
-from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
@@ -99,11 +96,11 @@ def _localized(name: str, space: IdSpace, localize) -> IdSpace:
     return msgspec.structs.replace(space, write=lambda ids: to_space(localize(ids)))
 
 
-class KVIndexTable(msgspec.Struct, frozen=True):
+class ReadTable(msgspec.Struct, frozen=True):
     """What one batch gathers from, and how its entries become the ids a
     kernel reads: lane ``b``'s entry ``j`` is ``ids[row_ids[b] * row_stride +
     j // entry_page_size]``, expanded to tokens when an entry is a page, then
-    mapped through ``v2p`` (page-granular, at the translator's page size) when
+    mapped through ``v2p`` (page-granular, at the `RunnerIds`' page size) when
     one is given. A gather kernel executes exactly this; it never decides
     whether or how to translate."""
 
@@ -117,7 +114,7 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     v2p: Optional[torch.Tensor] = None
 
 
-class KVIndexTranslator:
+class RunnerIds:
     """Built once per ModelRunner."""
 
     def __init__(
@@ -139,11 +136,15 @@ class KVIndexTranslator:
             and token_to_kv_pool_allocator.hands_out_virtual_ids
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
-        host_allocator = fused_draft_host_allocator(token_to_kv_pool)
-        is_fused_draft = (
-            host_allocator is not None and host_allocator is token_to_kv_pool_allocator
+        # A fused draft's pool views the target's sub-pools: it shares the
+        # target's allocator, and its writes take that allocator's physical ids.
+        self.is_fused_draft = (
+            not is_unified_target
+            and token_to_kv_pool_allocator is not None
+            and token_to_kv_pool_allocator.hands_out_virtual_ids
+            and token_to_kv_pool.requires_physical_write_loc
         )
-        self.is_translating = is_unified_target or is_fused_draft
+        self.is_translating = is_unified_target or self.is_fused_draft
         # Keyed by sub-pool name; a runner reads the token sub-pools its pool
         # routes layers to. A consumer outside an iteration's plan maps ids as
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
@@ -161,7 +162,15 @@ class KVIndexTranslator:
             # runner shares the target's sub-pools, and so their keys. A fused
             # draft reads the ones its own pool routes layers to.
             alloc_spaces = alloc.id_spaces(defer_reads=self.defer_read_translate)
-            routed = alloc_spaces if is_unified_target else token_to_kv_pool.id_spaces()
+            # A fused draft's write ids are the owner's virtual ids, whichever
+            # sub-pools its layers read.
+            routed = (
+                alloc_spaces
+                if is_unified_target
+                else {IdSpaceKind.FULL}.union(
+                    sp.name for sp in token_to_kv_pool.layer_router.sub_pools()
+                )
+            )
             self._spaces = {
                 name: space for name, space in alloc_spaces.items() if name in routed
             }
@@ -244,12 +253,12 @@ class KVIndexTranslator:
         taken from its plan and padded with the sink to its `out_cache_loc`'s
         length (a padded batch, a captured graph's buffer). None when there is
         no write loc or no such sub-pool."""
-        plan = getattr(forward_batch, "kv_loc_plan", None)
+        plan = getattr(forward_batch, "iteration_ids", None)
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if plan is None or out_cache_loc is None:
             return None
         ids = plan.write_ids(
-            self, kind=kind, cols=getattr(forward_batch, "kv_loc_cols", None)
+            self, kind=kind, cols=getattr(forward_batch, "iteration_cols", None)
         )
         return pad_with_sink(ids, out_cache_loc.shape[0])
 
@@ -275,7 +284,7 @@ class KVIndexTranslator:
         read_extent: int = 0,
         write_slots: Optional[torch.Tensor] = None,
         translated_writes: Optional[Dict[IdSpaceKind, torch.Tensor]] = None,
-    ) -> KVLocPlan:
+    ) -> IterationIds:
         """This iteration's ids, translated once. ``write_virtual`` is the
         iteration's write window (``[batch, window]`` flattened when its
         forwards write columns of it); ``read_extent`` is how far past
@@ -283,7 +292,7 @@ class KVIndexTranslator:
         ``write_virtual`` for a runner's own buffer (`bind_runner_slots`).
         ``translated_writes`` supplies physical outputs already computed by
         the producer, keyed by this source's sub-pools."""
-        return KVLocPlan(
+        return IterationIds(
             source=self,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -304,7 +313,7 @@ class KVIndexTranslator:
         positions_out: Optional[torch.Tensor] = None,
         anchor_src: Optional[torch.Tensor] = None,
         anchor_out: Optional[torch.Tensor] = None,
-    ) -> KVLocPlan:
+    ) -> IterationIds:
         """Gather one fixed-width speculative window, translating at its producer.
 
         The virtual window stays available for accept/reclaim bookkeeping;
@@ -354,7 +363,7 @@ class KVIndexTranslator:
             translated_writes=translated,
         )
 
-    def own_plan(self, forward_batch, *, runner_slots: bool = False) -> KVLocPlan:
+    def own_plan(self, forward_batch, *, runner_slots: bool = False) -> IterationIds:
         """The plan of a forward that is its own iteration, from its own
         fields: its ``out_cache_loc`` is the write window (virtual, or with
         ``runner_slots`` a runner's own buffer), and its reads reach
@@ -399,14 +408,14 @@ class KVIndexTranslator:
 
     def build_iteration_table(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         space: IdSpace,
         *,
         rows: Optional[int],
-        previous: Optional[KVIndexTable],
+        previous: Optional[ReadTable],
         into: Optional[torch.Tensor] = None,
-    ) -> KVIndexTable:
-        """Build ``plan``'s page table in ``space`` for `KVLocPlan.read_table`:
+    ) -> ReadTable:
+        """Build ``plan``'s page table in ``space`` for `IterationIds.read_table`:
         the passthrough where reads stay virtual, else one build over ``[0,
         seq_lens + read_extent)``. Rows past the plan's batch read the sink; a
         request wider than ``previous`` copies its rows rather than translating
@@ -452,7 +461,7 @@ class KVIndexTranslator:
                 zero_tail=True,
                 seq_len_delta=plan.read_extent,
             )
-        return KVIndexTable(
+        return ReadTable(
             ids=out,
             row_ids=self._rows[:rows],
             row_stride=out.stride(0),
@@ -468,12 +477,12 @@ class KVIndexTranslator:
 
     def read_source(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         *,
         req_pool_indices: torch.Tensor,
         bs: int,
         kind: IdSpaceKind = IdSpaceKind.FULL,
-    ) -> KVIndexTable:
+    ) -> ReadTable:
         """The row source a gather kernel reads lane ``b``'s ``kind`` ids from:
         the plan's table once a table reader has had it built, else the virtual
         `req_to_token` rows with ``v2p`` for the kernel's gather to apply (no
@@ -483,7 +492,7 @@ class KVIndexTranslator:
             return self._passthrough_table(req_pool_indices)
         if plan.has_read_table(kind, reader=self):
             return self._plan_table(plan, kind=kind, rows=bs)
-        return KVIndexTable(
+        return ReadTable(
             ids=self.req_to_token,
             row_ids=req_pool_indices,
             row_stride=self.req_to_token.stride(0),
@@ -494,11 +503,11 @@ class KVIndexTranslator:
 
     def read_table(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         *,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
-    ) -> KVIndexTable:
+    ) -> ReadTable:
         """The plan's ``kind`` page table, exactly ``rows`` rows when given
         (lanes past the plan's batch read the sink); the ``req_to_token``
         passthrough where reads stay virtual (a static or private pool, or DCP,
@@ -509,7 +518,7 @@ class KVIndexTranslator:
 
     def _plan_table(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         *,
         kind: IdSpaceKind,
         rows: Optional[int] = None,
@@ -521,8 +530,8 @@ class KVIndexTranslator:
         )
         return plan.read_table(kind=kind, rows=rows, into=into, reader=self)
 
-    def _passthrough_table(self, req_pool_indices: torch.Tensor) -> KVIndexTable:
-        return KVIndexTable(
+    def _passthrough_table(self, req_pool_indices: torch.Tensor) -> ReadTable:
+        return ReadTable(
             ids=self.req_to_token,
             row_ids=req_pool_indices,
             row_stride=self.req_to_token.stride(0),
@@ -532,7 +541,7 @@ class KVIndexTranslator:
 
     def pack_read_stream(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         *,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -609,7 +618,7 @@ class KVIndexTranslator:
 
     def copy_page_table(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         *,
         out: torch.Tensor,
         kind: IdSpaceKind = IdSpaceKind.FULL,
@@ -637,7 +646,7 @@ class KVIndexTranslator:
 
     @property
     def reads_are_translated(self) -> bool:
-        """Whether a read this translator fills comes out physical. False
+        """Whether a read this runner_ids fills comes out physical. False
         on a non-unified pool, and under DCP, where the ids stay VIRTUAL for
         ``translate_dcp_read_ids`` to finish."""
         return self._reads_translated(IdSpaceKind.FULL)
@@ -654,7 +663,7 @@ class KVIndexTranslator:
         return self._full_v2p_table
 
     def bind_and_verify_backends(self, backends) -> None:
-        """Boot: make every reachable backend carry THIS translator.
+        """Boot: make every reachable backend carry THIS runner_ids.
 
         Model-layer producers read it off `get_attn_backend()`, so an unset
         attribute is an unreachable hook, not "no translation needed".
@@ -662,11 +671,11 @@ class KVIndexTranslator:
         for backend in backends:
             if backend is None:
                 continue
-            if backend.kv_index_translator is None:
-                backend.kv_index_translator = self
+            if backend.runner_ids is None:
+                backend.runner_ids = self
                 continue
-            assert backend.kv_index_translator is self, (
-                f"{type(backend).__name__} carries a KVIndexTranslator that is "
+            assert backend.runner_ids is self, (
+                f"{type(backend).__name__} carries a RunnerIds that is "
                 "not this runner's. A wrapper must forward the inner backend's "
                 "copy, not build its own."
             )

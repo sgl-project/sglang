@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -33,6 +34,11 @@ def make_pool(free, *, lazy=False, extra_buffer=True, track_buffer_size=2):
     pool.available_size = lambda: 1
     pool.alloc = MagicMock(return_value=[1])
     return pool, held
+
+
+def _storage(pool):
+    # The static table and the state it hands slots from.
+    return StaticKVStorage(pool, SimpleNamespace(state=pool.state, storage=None))
 
 
 def make_req(*, holds_mamba=False, has_buffer=False):
@@ -166,7 +172,7 @@ class TestMambaCapacity(unittest.TestCase):
         self.assertEqual(pool.mamba_allocator.available_size(), 2)
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(alloc_req_slots(pool, pool.state, [req], cache), [1])
+        self.assertEqual(alloc_req_slots(_storage(pool), pool.state, [req], cache), [1])
         pool.alloc.assert_called_once_with([req])
 
     def test_uses_only_missing_slots_for_each_request(self):

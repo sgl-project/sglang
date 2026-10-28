@@ -217,10 +217,13 @@ def _build_resolved_backend(
     init_new_workspace: bool,
 ) -> AttentionBackend:
     if resolved.is_draft_override:
-        attn_backend = _build_backend_from_str(
-            model_runner=model_runner,
-            backend_str=resolved.prefill,
-            init_new_workspace=init_new_workspace,
+        attn_backend = attn_backend_wrapper(
+            model_runner,
+            _build_full_attention_backend_from_str(
+                model_runner=model_runner,
+                backend_str=resolved.prefill,
+                init_new_workspace=init_new_workspace,
+            ),
         )
     elif resolved.decode != resolved.prefill:
         from sglang.srt.layers.attention.hybrid_attn_backend import (
@@ -290,19 +293,6 @@ def _require_dcp_target_verify(
             "implement target verify under decode context parallelism. Use a "
             "backend that does (cutedsl_mla) for the side that verifies."
         )
-
-
-def _build_backend_from_str(
-    *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
-) -> AttentionBackend:
-    return attn_backend_wrapper(
-        model_runner,
-        _build_full_attention_backend_from_str(
-            model_runner=model_runner,
-            backend_str=backend_str,
-            init_new_workspace=init_new_workspace,
-        ),
-    )
 
 
 def _build_full_attention_backend_from_str(

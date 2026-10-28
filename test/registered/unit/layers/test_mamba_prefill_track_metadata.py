@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -269,7 +269,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
             # A pass-through runner: its plan hands the batch its ids untouched.
-            kv_index_translator=SimpleNamespace(
+            runner_ids=SimpleNamespace(
                 own_plan=lambda batch: SimpleNamespace(
                     bind=lambda batch, reader, cols=None: None
                 )

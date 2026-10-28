@@ -88,8 +88,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # The state sub-pool's storage and each state layer's index in it, as
-        # the KV pool's router binds them.
+        # State views and local layer indices come from the same router binding.
         router = self.token_to_kv_pool.layer_router
         self.state_pool = router.part_view(STATE_PART)
         self.state_layer_indices = router.part_indices(STATE_PART)
@@ -103,12 +102,10 @@ class MambaAttnBackendBase(AttentionBackend):
         # The request table's slot ids as the state pool indexes them: the
         # identity or one gather through the id space's table, both of which
         # `fused_replay_state_indices` reproduces in its own launch.
-        self._state_ids = model_runner.kv_index_translator.state_ids(
-            pool.state_sub_pool
+        self._state_ids = model_runner.runner_ids.state_ids(pool.state_sub_pool)
+        self._fused_state_indices_ok = (
+            torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
-        self._fused_state_indices_ok = torch.device(
-            self.device
-        ).type == "cuda" and isinstance(pool, HybridReqToTokenPool)
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
@@ -1216,7 +1213,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
-        self.kv_index_translator = full_attn_backend.kv_index_translator
+        self.runner_ids = full_attn_backend.runner_ids
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens

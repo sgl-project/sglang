@@ -28,13 +28,13 @@ end of the table: an unchecked write, not a raised index.
 import unittest
 
 import torch
-from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
+from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
+from test_swa_locked_full_recover_unified import _DEV
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -59,7 +59,7 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
         store_dtype=torch.float16,
         grow_direction="down",
     )
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes(),
         sub_pool_specs=[full_spec, swa_spec],
         device=_DEV,
@@ -67,7 +67,7 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
     )
     return ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=_FakeUnifiedSWAKVPool(pool),
         views=stand_in_views(
             ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
@@ -89,13 +89,13 @@ class TestSharedVirtualIdSpace(unittest.TestCase):
                 owner = alloc.full_attn_allocator
                 swa = alloc.swa_attn_allocator
                 self.assertGreaterEqual(
-                    int(swa.virtual_to_physical.shape[0]),
-                    owner.num_virtual_ids + 1,
+                    int(swa.ids.virtual_to_physical.shape[0]),
+                    owner.ids.num_virtual_ids + 1,
                     "swa v2p cannot address every id the owner can mint",
                 )
                 # p2v stays this pool's own business: it is indexed by physical id.
                 self.assertEqual(
-                    int(swa.physical_to_virtual.shape[0]), swa.num_pages + 1
+                    int(swa.ids.physical_to_virtual.shape[0]), swa.num_pages + 1
                 )
 
     def test_churn_past_the_swa_page_count_binds_cleanly(self):

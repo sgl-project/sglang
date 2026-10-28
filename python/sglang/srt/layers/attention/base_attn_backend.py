@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -50,13 +51,14 @@ def resolve_window_id_space(
     model_runner: ModelRunner, window_pool: Optional[KVCache]
 ) -> Optional[IdSpace]:
     """How ``window_pool``'s window sub-pool names the iteration's slots: by
-    its allocator's tables when the allocator hands out virtual ids for that
-    pool (the unified pool's tables are its allocator's), else as the pool
+    its allocator's tables when the allocator hands out virtual ids and the
+    pool's writes take physical ones (the unified pool, and a draft fused into
+    it, view the sub-pools whose tables are the allocator's), else as the pool
     maps them itself."""
     if window_pool is None:
         return None
     allocator = model_runner.token_to_kv_pool_allocator
-    if allocator.hands_out_virtual_ids and allocator.get_kvcache() is window_pool:
+    if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
         return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
     return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
@@ -128,11 +130,18 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
-    # The runner's KVIndexTranslator; backends that read through it set the
+    # The runner's RunnerIds; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
-    kv_index_translator = None
+    runner_ids = None
+
+    @property
+    def kv_layers(self) -> KVLayerRouter:
+        """Per-layer KV of ``token_to_kv_pool``, derived on every access: a
+        frozen-KV MTP draft swaps its backend's pool for the target's, and its
+        reads and writes must follow the swap."""
+        return self.token_to_kv_pool.layer_router
 
     def get_fused_kv_write_buffers(
         self, layer: RadixAttention, forward_batch: ForwardBatch

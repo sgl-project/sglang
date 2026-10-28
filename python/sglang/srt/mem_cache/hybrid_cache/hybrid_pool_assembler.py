@@ -342,9 +342,9 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+    from sglang.srt.mem_cache.kv.alloc.band import Band
 
-    if isinstance(allocator, MultiEndedAllocator):
+    if isinstance(allocator, Band):
         # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,
@@ -1828,12 +1828,12 @@ def _build_mha_mla_host_pool(
     pool_label: str,
     host_token_capacity: int | None = None,
 ):
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if isinstance(pool, MHATokenToKVPool) and layout == "page_first_kv_split":
+    if isinstance(pool, MHAKVView) and layout == "page_first_kv_split":
         layout = "page_first_direct"
 
     kwargs = dict(
@@ -1845,7 +1845,7 @@ def _build_mha_mla_host_pool(
         pool_label=pool_label,
         host_token_capacity=host_token_capacity,
     )
-    if isinstance(pool, MHATokenToKVPool):
+    if isinstance(pool, MHAKVView):
         host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
         return host_cls(host_input, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
@@ -2039,12 +2039,12 @@ def validate_fused_hicache_draft(
         )
 
     if draft_device_pools is not None:
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 
         if not (
             len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], UnifiedDraftKVPool)
-            and draft_device_pools[0]._host_sub_pool_name == "full"
+            and isinstance(draft_device_pools[0], DraftMHAView)
+            and draft_device_pools[0]._sub_pool_name == "full"
         ):
             raise NotImplementedError(
                 "HiCache fused draft KV requires a full-attention DFLASH draft."
@@ -2066,7 +2066,7 @@ def validate_fused_hicache_draft(
             "the fused draft bytes."
         )
     target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._unified_buffer is not target._unified_buffer:
+    if draft_device_pools[0]._arena is not target._arena:
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 
@@ -2077,7 +2077,7 @@ def build_hicache_draft_sidecars(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
@@ -2360,7 +2360,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW
@@ -2411,7 +2411,7 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW

@@ -327,7 +327,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
 class MlxAuxiliaryStateComponent(MambaComponent):
     """Unified radix component for MLX native auxiliary-state snapshots."""
 
-    def __init__(self, cache, params):
+    def __init__(self, cache, params, slot):
         if params.enable_mamba_extra_buffer:
             raise NotImplementedError(
                 "MLX auxiliary-state radix cache does not support "
@@ -339,7 +339,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 "MlxAuxiliaryStateComponent requires MlxAuxiliaryStatePool, "
                 f"got {type(pool)}"
             )
-        TreeComponent.__init__(self, cache, params)
+        TreeComponent.__init__(self, cache, params, slot)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
