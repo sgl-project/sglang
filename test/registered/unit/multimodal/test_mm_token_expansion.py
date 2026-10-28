@@ -307,7 +307,12 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         with patch.object(processor, "_load_media_lists", load):
             asyncio.run(processor.process(["image"], input_ids=[1, IMAGE]))
         load.assert_awaited_once_with(
-            ["image"], None, None, audio_sample_rate=24000, discard_alpha_channel=False
+            ["image"],
+            None,
+            None,
+            audio_sample_rate=24000,
+            discard_alpha_channel=False,
+            video_decode_device=None,
         )
 
 
