@@ -68,6 +68,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -78,6 +79,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
@@ -249,6 +251,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
     ):
+        if envs.SGLANG_HICACHE_PAGEABLE.get() and layout != "page_first_direct":
+            raise ValueError("Pageable DSV4 HiCache requires page_first_direct layout.")
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
@@ -273,7 +277,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
@@ -365,8 +369,35 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
         self._init_write_back_staging_buffers()
         self.clear()
+
+    def destroy(self):
+        if getattr(self, "_destroyed", False):
+            return
+        super().destroy()
+        self._staged_direct_backup = self._staged_direct_load = None
+        self.data_refs = []
+        self.data_ptrs = None
+        self.staging_buffer = None
+
+    def _transfer_pageable_tokens(self, host_indices, device_indices, layer=None):
+        # Match transfer_cache_dsv4_mla's V4 row: 64 values of 576 bytes,
+        # followed by 64 scales of 8 bytes, padded to a 576-byte boundary.
+        # Partial writes must preserve neighboring slots and page padding.
+        from sglang.srt.mem_cache.pool_host.staged_direct import (
+            transfer_pageable_dsv4_tokens,
+        )
+
+        transfer_pageable_dsv4_tokens(
+            self.kv_buffer,
+            self.device_buffers,
+            host_indices,
+            device_indices,
+            layer=layer,
+        )
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
@@ -507,6 +538,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # [value0..value63][scale0..scale63].
         if self.page_aligned_only:
             raise self._unaligned_transfer_error(host_indices, device_indices)
+        if envs.SGLANG_HICACHE_PAGEABLE.get():
+            self._transfer_pageable_tokens(host_indices, device_indices)
+            return
         transfer_cache_dsv4_mla(
             src_ptrs=self.device_ptrs,
             dst_ptrs=self.data_ptrs,
@@ -528,6 +562,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # Whole C4 pages can use the normal HiCache page-row copy below.
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+        if envs.SGLANG_HICACHE_PAGEABLE.get():
+            from sglang.srt.mem_cache.pool_host.staged_direct import StagedDirectBackup
+
+            if self._staged_direct_backup is None:
+                self._staged_direct_backup = StagedDirectBackup(
+                    self.kv_buffer, 1, self.gpu_device
+                )
+            self._staged_direct_backup.backup(self.device_ptrs, host_rows, device_rows)
+            return
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
@@ -626,6 +669,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             # preload, so it cannot use the normal HiCache page-row copy.
             if self.page_aligned_only:
                 raise self._unaligned_transfer_error(host_indices, device_indices)
+            if envs.SGLANG_HICACHE_PAGEABLE.get():
+                self._transfer_pageable_tokens(host_indices, device_indices, layer_id)
+                return
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
@@ -635,6 +681,18 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+
+        if envs.SGLANG_HICACHE_PAGEABLE.get():
+            from sglang.srt.mem_cache.pool_host.staged_direct import StagedDirectLoad
+
+            if self._staged_direct_load is None:
+                self._staged_direct_load = StagedDirectLoad(
+                    self.kv_buffer, 1, self.gpu_device
+                )
+            self._staged_direct_load.load(
+                self.device_buffers[layer_id], host_rows, device_rows, layer_id
+            )
+            return
 
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
@@ -795,7 +853,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.swa_page_size = swa_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size

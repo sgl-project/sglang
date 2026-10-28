@@ -15,6 +15,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
@@ -170,7 +172,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = anchor_host.layout
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.dtype = device_pool.store_dtype
@@ -246,6 +248,8 @@ class DSAIndexerPoolHost(HostKVCache):
             )
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
         self.lock = threading.RLock()
         self.clear()
 
@@ -257,6 +261,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.index_k_with_scale_buffer = None
         self.index_k_data_refs = []
         super().destroy()
+        # Transfers have drained before teardown; drop staging-owned host views
+        # and device buffers while the pool object may still be referenced.
+        self._staged_direct_backup = None
+        self._staged_direct_load = None
 
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
@@ -431,6 +439,22 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
+                if envs.SGLANG_HICACHE_PAGEABLE.get() and self.can_use_staged_direct:
+                    from sglang.srt.mem_cache.pool_host.staged_direct import (
+                        StagedDirectLoad,
+                    )
+
+                    if self._staged_direct_load is None:
+                        self._staged_direct_load = StagedDirectLoad(
+                            self.index_k_with_scale_buffer, 1, device_pool.device
+                        )
+                    self._staged_direct_load.load(
+                        device_pool.index_k_with_scale_buffer[device_layer_id],
+                        host_page_indices,
+                        device_page_indices,
+                        host_layer_id,
+                    )
+                    return
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.index_k_with_scale_buffer],
                     dst_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
@@ -501,6 +525,24 @@ class DSAIndexerPoolHost(HostKVCache):
                 )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    @property
+    def can_use_staged_direct(self) -> bool:
+        if (
+            not _is_cuda
+            or self.layout != "page_first_direct"
+            or not envs.SGLANG_HICACHE_PAGEABLE.get()
+            or self.pin_memory
+            or getattr(self, "_is_dummy", False)
+            or self._is_device_layer_sharded(self.device_pool)
+        ):
+            return False
+        return len(self.packed_device_index_buffers) == self.layer_num and all(
+            b.is_contiguous()
+            and b[0].numel() * b.element_size()
+            == self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            for b in self.packed_device_index_buffers
+        )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -573,6 +615,27 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
+                if self.can_use_staged_direct:
+                    from sglang.srt.mem_cache.pool_host.staged_direct import (
+                        StagedDirectBackup,
+                    )
+
+                    if self._staged_direct_backup is None:
+                        # One packed indexer row represents a complete KV page,
+                        # including its scales; copy the row as opaque bytes.
+                        self._staged_direct_backup = StagedDirectBackup(
+                            self.index_k_with_scale_buffer, 1, device_pool.device
+                        )
+                        logger.info(
+                            "HiCache staged direct DSA backup enabled: "
+                            "layers=%d, staging_bytes=%d",
+                            self.layer_num,
+                            self._staged_direct_backup.packed.numel(),
+                        )
+                    self._staged_direct_backup.backup(
+                        self.index_k_device_ptrs, host_page_indices, device_page_indices
+                    )
+                    return
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=self.packed_device_index_buffers,
                     dst_ptrs=[self.index_k_with_scale_buffer],

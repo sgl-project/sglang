@@ -327,6 +327,11 @@ def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     return buffer
 
 
+def resolve_host_pin_memory(pin_memory: bool) -> bool:
+    """Keep pool metadata consistent with the selected allocation mode."""
+    return pin_memory and not envs.SGLANG_HICACHE_PAGEABLE.get()
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -340,6 +345,7 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True. On ROCm with
     HSA_USERPTR_FOR_PAGED_MEM=0, default-allocator pools come from hipHostMalloc.
     """
+    pin_memory = resolve_host_pin_memory(pin_memory)
     if _uses_hip_owned_host_memory(pin_memory=pin_memory, allocator=allocator):
         assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
         _log_hip_owned_host_pool()
@@ -361,6 +367,7 @@ def alloc_with_pin_memory(
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
+    pin_memory = resolve_host_pin_memory(pin_memory)
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 

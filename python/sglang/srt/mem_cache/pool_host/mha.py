@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
@@ -923,7 +924,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
