@@ -123,7 +123,12 @@ _LOOP_SCHEDULING = {
     ("managers/scheduler.py", "Scheduler._admit_dllm_step"),
     ("managers/scheduler.py", "Scheduler.process_prefill_transfer_queue"),
     ("managers/scheduler.py", "Scheduler.process_batch_result"),
-    # Prefill admission, decode selection and retraction.
+    # Prefill admission (and the interval that defers it), decode selection
+    # and retraction.
+    (
+        "managers/scheduler_components/step_planner.py",
+        "StepPlanner.should_defer_prefill",
+    ),
     (
         "managers/scheduler_components/step_planner.py",
         "StepPlanner.admission_skip_reason",
