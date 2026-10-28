@@ -109,9 +109,6 @@ class TokenSpaceSGLangProcessor:
             hf_config,
             _processor,
             processor_config=processor_config,
-            compute_mrope_positions=True,
-            # Decode where the legacy processors do.
-            pin_io_threads_to_current_device=False,
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
@@ -158,14 +155,14 @@ class TokenSpaceSGLangProcessor:
             video_data = request_obj.video_data
         if audio_data is None and request_obj is not None:
             audio_data = request_obj.audio_data
-        kwargs.setdefault("image_device", self._serving_image_processor_device())
         return await self._core.process(
             image_data,
             video_data,
             audio_data,
             input_ids=input_ids,
+            image_device=self._serving_image_processor_device(),
+            compute_mrope_positions=True,
             package_output=self._package_output,
-            **kwargs,
         )
 
     def _package_output(self, output: BatchFeature) -> MultimodalProcessorOutput:
@@ -221,8 +218,11 @@ class TokenSpaceSGLangProcessor:
         return list(items.values())
 
     def compute_mrope_positions(self, input_ids, mm_items):
-        """M-RoPE from bound items, for requests that arrive already processed."""
-        media_features = {}
+        """M-RoPE from bound items, for requests that arrive already processed.
+
+        Bound items keep only the grids, so the strategy gets input_ids and grids.
+        """
+        output = {"input_ids": input_ids}
         for key, modality in (
             ("image_grid_thw", Modality.IMAGE),
             ("video_grid_thw", Modality.VIDEO),
@@ -233,8 +233,8 @@ class TokenSpaceSGLangProcessor:
                 if item.is_modality(modality) and key in item.model_specific_data
             ]
             if grids:
-                media_features[key] = torch.cat(grids)
-        return self._core.strategy.compute_mrope_positions(input_ids, media_features)
+                output[key] = torch.cat(grids)
+        return self._core.strategy.compute_mrope_positions(output)
 
     def resolve_image_token_counts(self, images: list) -> list[int]:
         """Per-image expanded token counts, from the HF processor's own helper."""

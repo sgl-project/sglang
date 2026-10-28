@@ -273,31 +273,23 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                     )
                 )
 
-    def test_trainer_io_threads_decode_on_the_rank_device(self):
-        """A new thread starts on cuda:0, not on the device its rank selected."""
+    def test_worker_threads_start_on_the_device_the_caller_passes(self):
+        """A new thread starts on cuda:0, not on the device the caller's rank selected."""
         self.assertIsNone(self._processor().io_executor._initializer)
-        with (
-            patch("torch.cuda.is_initialized", return_value=True),
-            patch("torch.cuda.current_device", return_value=3),
+        processor = TokenSpaceProcessor.for_strategy(_ImageWidthStrategy)(
+            None,
+            _bare_tokenizer(),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=2),
+            worker_thread_device=3,
+        )
+        self.addCleanup(processor.shutdown)
+        for executor in (
+            processor.io_executor,
+            processor.mm_processor_executor._executor,
         ):
-            initializer = self._processor().io_executor._initializer
-            reset_context()
-            self.addCleanup(reset_context)
-            server_args = ServerArgs(
-                model_path="dummy",
-                model_impl="sglang",
-                mm_process_config={},
-                enable_token_space_processor=True,
-                mm_processor_worker_num=1,
-            )
-            publish(server_args, role="test")
-            serving = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
-                None, server_args, _bare_tokenizer(), None
-            )
-            self.addCleanup(serving.shutdown)
-        self.assertIs(initializer.func, torch.cuda.set_device)
-        self.assertEqual(initializer.args, (3,))
-        self.assertIsNone(serving._core.io_executor._initializer)
+            self.assertIs(executor._initializer.func, torch.cuda.set_device)
+            self.assertEqual(executor._initializer.args, (3,))
+
     def test_inline_processing_runs_on_the_device_the_caller_passes(self):
         """With one processor worker there is no pool, so the caller's thread decodes on cuda:0."""
         with (
@@ -366,7 +358,7 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         for name in (
             "not_an_attribute",
             "process",
-            "_io_thread_initializer",
+            "_worker_thread_initializer",
             "keep_mm_features_on_device",
         ):
             with (
