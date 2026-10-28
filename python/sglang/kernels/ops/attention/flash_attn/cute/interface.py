@@ -726,9 +726,26 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
-        assert (
-            arch // 10 == 10
-        ), "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        if arch // 10 == 12:
+            assert (
+                q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+            ), "SM120 FA4 FP8 requires E4M3 Q, K and V"
+            if any(t is not None for t in (q_descale, k_descale, v_descale)):
+                # DescaleTensors rebuilds its fields positionally from non-None
+                # values, so fill missing slots with unit scales. The kernel
+                # also expects a unit inner stride, so materialize expand() views.
+                q_descale, k_descale, v_descale = (
+                    torch.ones(
+                        (batch_size, num_head_kv), dtype=torch.float32, device=device
+                    )
+                    if t is None
+                    else t.contiguous()
+                    for t in (q_descale, k_descale, v_descale)
+                )
+        else:
+            assert (
+                arch // 10 == 10
+            ), "FP8 is only supported on SM100 and SM120 for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -765,6 +782,7 @@ def _flash_attn_fwd(
             window_size_right=window_size_right,
             pack_gqa=pack_gqa,
             paged_kv=page_table is not None,
+            dtype=dtype,
         )
         fwd_cfg = FwdConfig(
             arch_forward_config.tile_m,
@@ -1672,6 +1690,7 @@ def _flash_attn_fwd(
                 compile_args.extend(
                     arch_forward_host.compile_arguments(arch_forward_plan)
                 )
+                compile_args.append(descale_tensors_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1779,6 +1798,7 @@ def _flash_attn_fwd(
             if arch_forward_host is not None:
                 assert arch_forward_plan is not None
                 call_args.extend(arch_forward_host.runtime_arguments(arch_forward_plan))
+                call_args.append(descale_tensors)
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
                 arch_forward_host is not None
@@ -1799,6 +1819,7 @@ def _flash_attn_fwd(
                 and q_descale is None
                 and k_descale is None
                 and v_descale is None
+                and not is_fp8
                 and rel_bias is None
                 and sfq is None
                 and sfk is None
@@ -1855,6 +1876,7 @@ def _flash_attn_fwd(
         and q_descale is None
         and k_descale is None
         and v_descale is None
+        and not is_fp8
         and rel_bias is None
         and sfq is None
         and sfk is None
@@ -1900,10 +1922,19 @@ def _flash_attn_fwd(
     return out, lse
 
 
+_CUTE_SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Architecture-owned forward hosts (fa4_sm120) compile into these caches too,
+# so their sources must invalidate the persistent fingerprint as well.
+_JIT_SOURCE_PATHS = (
+    _CUTE_SOURCE_DIR,
+    os.path.join(os.path.dirname(os.path.dirname(_CUTE_SOURCE_DIR)), "fa4_sm120"),
+)
+
+
 def _get_jit_cache(name: str):
     return get_jit_cache(
         name,
-        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
+        source_paths=_JIT_SOURCE_PATHS,
         enable_tvm_ffi=True,
     )
 

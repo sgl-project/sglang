@@ -274,6 +274,8 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
+        # SM120 FA4 runs FP8 KV natively for prefill and head dims above 256.
+        self.fa4_sm120 = self.fa_impl_ver == 4 and device_capability[0] == 12
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import get_scheduler_metadata
 
@@ -1416,10 +1418,14 @@ class FlashAttentionBackend(AttentionBackend):
     ]:
         k_descale = v_descale = None
         if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
+            self.kv_cache_dtype != torch.bfloat16
+            and self.kv_cache_dtype != torch.float16
+            and self.kv_cache_dtype_str != "auto"
             and not self.kv_cache_is_mxfp8
-            and (not is_prefill or self.fa_impl_ver != 4)
+            and (
+                self.fa4_sm120
+                or (layer.head_dim <= 256 and (not is_prefill or self.fa_impl_ver != 4))
+            )
         ):
             if layer.k_scale is not None:
                 descale_shape = (logical_batch_size, kv_head_num)
