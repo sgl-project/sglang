@@ -260,6 +260,24 @@ def test_fused_rmsnorm_accepts_an_eligible_payload():
     _release(quick_reduce)
 
 
+def test_fused_rmsnorm_limit_follows_the_quickreduce_workspace():
+    quick_reduce = _make()
+    quick_reduce.world_size = 2
+    quick_reduce.use_fp16_kernels = 0
+    quick_reduce.disabled = False
+    quick_reduce.qr_max_size = 512 * MB
+    fake = _FakeFlyDSLInt4()
+    _FakeFlyDSLInt4.supports = True
+    quick_reduce._flydsl_int4 = fake
+    payload, _, _ = _eligible_operands()
+
+    assert quick_reduce.fused_rmsnorm_limit_bytes(payload) == 512 * MB
+    _FakeFlyDSLInt4.supports = False
+    assert quick_reduce.fused_rmsnorm_limit_bytes(payload) is None
+    _FakeFlyDSLInt4.supports = True
+    _release(quick_reduce)
+
+
 def test_fused_rmsnorm_declines_outside_the_kernel(monkeypatch):
     quick_reduce = _make()
     quick_reduce.world_size = 2

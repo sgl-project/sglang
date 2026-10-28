@@ -327,6 +327,23 @@ class QuickAllReduce:
         """Whether ``quick_all_reduce`` runs ``inp`` through FlyDSL."""
         return self.should_quick_allreduce(inp) and self._use_flydsl_int4(inp)
 
+    def fused_rmsnorm_limit_bytes(self, inp: torch.Tensor) -> Optional[int]:
+        """Largest all-reduce that FlyDSL can fuse with add-RMSNorm, or None.
+
+        The custom-all-reduce fused kernel stops at its 64 MB pool. FlyDSL
+        stages this fusion through the QuickReduce workspace instead, so a
+        prefill chunk above that pool can still fuse when this returns a size.
+        """
+        if not self.uses_flydsl_int4(inp):
+            return None
+        supports = getattr(self._flydsl_int4, "supports_rmsnorm", None)
+        if supports is None:
+            return None
+        nbytes = inp.numel() * inp.element_size()
+        if not supports(inp.shape[-1], nbytes):
+            return None
+        return int(self.qr_max_size)
+
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
     ) -> bool:
@@ -418,6 +435,13 @@ class _QuickAllReduceAdapter:
         if uses is None:
             return False
         return bool(uses(inp))
+
+    def fused_rmsnorm_limit_bytes(self, inp: torch.Tensor) -> Optional[int]:
+        limit = getattr(self._communicator, "fused_rmsnorm_limit_bytes", None)
+        if limit is None:
+            return None
+        value = limit(inp)
+        return None if value is None else int(value)
 
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
