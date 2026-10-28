@@ -16,6 +16,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.managers.overlap_utils_hip import DeferredSeqLensPull
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -284,6 +285,7 @@ class FutureMap:
     """
 
     _relay = None
+    seq_lens_pull = None
 
     def __init__(
         self,
@@ -348,6 +350,8 @@ class FutureMap:
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
+        # gfx950 DSpark decode's deferred host seq-lens pull; set by the scheduler.
+        self.seq_lens_pull: Optional[DeferredSeqLensPull] = None
 
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
@@ -659,9 +663,13 @@ class FutureMap:
         if relay is not None and new_seq_lens is relay.published_seq_lens:
             relay.published_seq_lens = None
         else:
+            if self.seq_lens_pull is not None:
+                self.seq_lens_pull.before_publish()
             self.new_seq_lens_buf[indices] = new_seq_lens.to(
                 self.new_seq_lens_buf.dtype
             )
+            if self.seq_lens_pull is not None:
+                self.seq_lens_pull.on_publish(self.new_seq_lens_buf)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)

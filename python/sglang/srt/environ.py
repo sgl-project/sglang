@@ -973,6 +973,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # gfx950 quick all-reduce at TP4 on the JIT build (quick_all_reduce_hip) instead of
+    # sgl-kernel's; INT4 runs INT8 below 64 MiB, and groups it does not serve, or other
+    # GPUs, keep sgl-kernel's
+    SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
@@ -2114,6 +2118,12 @@ class Envs:
     # Run the sparse prefill main attention through AITER's Gluon paged attention
     # instead of the Triton kernel. Unsupported cases fall back to Triton.
     SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
+    # gfx950 M3.1 main K/V and index-K cache layout: auto (the packed NVFP4 MSA-v1 pool
+    # under DSPARK, fp8 otherwise) or fp8 (e4m3) everywhere
+    SGLANG_MINIMAX_M3_AMD_KV_FORMAT = EnvStr("auto")
+    # gfx950 M3.1 raises ROCM_QUICK_REDUCE_QUANTIZATION from INT8, the ROCm images' default for
+    # every model, to INT4 (half the long-prefill all-reduce at TP4); 0 keeps a chosen INT8
+    SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4 = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
@@ -2126,9 +2136,11 @@ class Envs:
     # cached block_table override.
     SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
-    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
-    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
-    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    # when aiter all-reduce fusion is off, except for the checkpoints measured
+    # faster with it on gfx950 (quark_mxfp4, the M3.1 NVFP4 and Quark exports; see
+    # model_overrides/minimax_m3_hip.py). Set this to opt back in and keep
+    # custom/quick all-reduce enabled -- e.g. to run the INT4 quick-reduce path
+    # via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================

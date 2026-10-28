@@ -123,6 +123,7 @@ class _Inner(AttentionBackend):
         self.req_to_token_pool = None
         self.needs_cpu_seq_lens = False
         self.max_context_len = 8
+        self.dense_layer_ids = []
 
 
 class _InnerModelConfig:

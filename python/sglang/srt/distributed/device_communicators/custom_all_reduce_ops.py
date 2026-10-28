@@ -6,7 +6,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +131,31 @@ elif _is_hip:
 
 # region IS_QUICK_AR_AVAILABLE
 
+
+def _uses_jit_quick_all_reduce() -> bool:
+    if not (_is_hip and envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get()):
+        return False
+    if not is_gfx95_supported():
+        logger.warning(
+            "SGLANG_ROCM_QUICK_ALL_REDUCE_JIT is validated on gfx950 only; "
+            "using sgl-kernel's quick all-reduce"
+        )
+        return False
+    return True
+
+
 if not IS_QUICK_AR_AVAILABLE:
     pass
+
+elif _uses_jit_quick_all_reduce():
+    from sglang.kernels.ops.communication.quick_all_reduce_hip import (  # noqa: F401
+        init_custom_qr,
+        qr_all_reduce,
+        qr_destroy,
+        qr_get_handle,
+        qr_max_size,
+        qr_open_handles,
+    )
 
 elif _is_hip:
     # ROCM custom quick allreduce

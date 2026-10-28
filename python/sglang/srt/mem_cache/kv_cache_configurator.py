@@ -2551,7 +2551,7 @@ class KVCacheConfigurator:
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.configs.model_config import (
-            uses_minimax_m3_nvfp4_native_stack,
+            uses_minimax_m3_packed_nvfp4_kv,
         )
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -2570,7 +2570,10 @@ class KVCacheConfigurator:
                 parse_hisparse_config().host_to_device_ratio
             )
         pool_cls = MiniMaxSparseKVPool
-        if uses_minimax_m3_nvfp4_native_stack(self.model_config.quantization):
+        if uses_minimax_m3_packed_nvfp4_kv(
+            self.model_config.quantization,
+            speculative_algorithm=get_spec().speculative_algorithm,
+        ):
             from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
             pool_cls = MiniMaxM3Nvfp4KVPool

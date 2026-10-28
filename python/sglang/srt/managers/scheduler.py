@@ -444,6 +444,9 @@ def _accumulate_decode_moment(
 _is_npu = is_npu()
 _is_hip = is_hip()
 
+if _is_hip:
+    from sglang.srt.managers import overlap_utils_hip as _hip
+
 
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
@@ -1696,6 +1699,12 @@ class Scheduler(
         ):
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
+            )
+        if _is_hip:
+            self.future_map.seq_lens_pull = _hip.make_decode_seq_lens_pull(
+                model_worker=self.model_worker,
+                future_map=self.future_map,
+                confidence_budget_prepare=self._confidence_budget_prepare,
             )
 
         # If enable async D2H copy when overlap is enabled
@@ -4721,6 +4730,9 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                seq_lens_pull = self.future_map.seq_lens_pull
+                if seq_lens_pull is not None and not seq_lens_pull.begin_step(batch):
+                    seq_lens_pull = None
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 gpu_only_lens = (
@@ -4728,7 +4740,7 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
-                if not gpu_only_lens:
+                if not gpu_only_lens and seq_lens_pull is None:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
@@ -4739,6 +4751,8 @@ class Scheduler(
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
                         self.future_map.resolve_seq_lens_cpu(batch, stream_ordered=True)
+                    elif seq_lens_pull is not None:
+                        seq_lens_pull.resolve(batch)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -4763,6 +4777,10 @@ class Scheduler(
                             if batch.spec_algorithm.supports_grammar_overlap():
                                 fwd_kwargs["grammar_barrier"] = (
                                     self._advance_pending_grammar
+                                )
+                            if seq_lens_pull is not None:
+                                fwd_kwargs["pull_seq_lens_cpu"] = partial(
+                                    seq_lens_pull.apply, batch
                                 )
 
                         # FIXME: pp is not compatible with overlap
@@ -4809,6 +4827,10 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+
+                if seq_lens_pull is not None:
+                    # the isolation restore reverted what the worker pulled
+                    seq_lens_pull.apply(batch, rebuild_seq_lens=True)
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
