@@ -1219,38 +1219,61 @@ class EngramEmbedding(nn.Module):
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
         sizes = self._dp_sizes(indices, forward_batch)
-        exchange = self._dp_exchange(sizes)
-        if exchange is None:
+        lookup = self._dp_lookup(sizes)
+        if lookup == EngramLookup.ALL_REDUCE:
             return self._dp_global_buffer_lookup(indices, forward_batch)
         if sum(sizes) == 0:
             return self.new_rows(indices)
-        group = get_parallel().tp_group
-        # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collectives.
-        equal = len(set(sizes)) == 1
         ids = indices.new_empty((sum(sizes), *indices.shape[1:]))
-        if equal:
-            group.all_gather_into_tensor(ids, indices.contiguous())
+        get_parallel().tp_group.all_gatherv(
+            indices.contiguous(), sizes=sizes, output=ids
+        )
+        if lookup == EngramLookup.REDUCE_SCATTER:
+            out = self._dp_reduce_scatter_lookup(ids, sizes)
         else:
-            group.all_gatherv(indices.contiguous(), sizes=sizes, output=ids)
-        if exchange == EngramLookup.REDUCE_SCATTER:
-            values = self._owned_rows(ids).view(ids.shape[0], -1)
-            if equal:
-                local = values.new_empty((indices.shape[0], values.shape[1]))
-                group.reduce_scatter_tensor(local, values)
-            else:
-                local = group.reduce_scatterv(values, sizes=sizes)
-            return local.view(*indices.shape, self.dim)
-        # all_to_all: look up this rank's own hash columns for every token, then send
-        # each rank its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are
-        # [token, n-gram size, head], so the columns are in that order.
-        k, n = self._cols_per_rank, indices.shape[0]
-        start = get_parallel().tp_rank * k
+            out = self._dp_all_to_all_lookup(ids, sizes)
+        return out.view(*indices.shape, self.dim)
+
+    def _dp_lookup(self, sizes: Optional[list[int]]) -> str:
+        """The lookup for per-rank `sizes`; `all_reduce` is the global-buffer path."""
+        if sizes is None or self.lookup == EngramLookup.ALL_REDUCE:
+            return EngramLookup.ALL_REDUCE
+        if self.lookup == EngramLookup.REDUCE_SCATTER:
+            return EngramLookup.REDUCE_SCATTER
+        # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
+        # per rank and for decode from DP 4; elsewhere within tens of microseconds.
+        if self._cols_per_rank is None:
+            return EngramLookup.ALL_REDUCE
+        return EngramLookup.ALL_TO_ALL
+
+    def _dp_reduce_scatter_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up the owned rows of every rank's `ids`; a reduce-scatter hands each
+        rank its own tokens' rows."""
+        group = get_parallel().tp_group
+        values = self._owned_rows(ids).view(ids.shape[0], -1)
+        if len(set(sizes)) > 1:
+            return group.reduce_scatterv(values, sizes=sizes)
+        # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+        local = values.new_empty((sizes[0], values.shape[1]))
+        group.reduce_scatter_tensor(local, values)
+        return local
+
+    def _dp_all_to_all_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up this rank's own hash columns for every token, then send each rank
+        its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are [token,
+        n-gram size, head], so the columns are in that order."""
+        parallel = get_parallel()
+        group = parallel.tp_group
+        k, n = self._cols_per_rank, sizes[parallel.attn_dp_rank]
+        start = parallel.tp_rank * k
         own = ids.flatten(1)[:, start : start + k].contiguous()
         values = self._owned_rows(own).view(own.shape[0], -1)
         recv = values.new_empty((self.tp_size * n, values.shape[1]))
-        if equal:
-            group.all_to_all_single(recv.view(-1), values.view(-1))
-        else:
+        if len(set(sizes)) > 1:
             torch.distributed.all_to_all_single(
                 recv,
                 values,
@@ -1258,20 +1281,11 @@ class EngramEmbedding(nn.Module):
                 input_split_sizes=sizes,
                 group=group.device_group,
             )
+        else:
+            # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+            group.all_to_all_single(recv.view(-1), values.view(-1))
         # [source rank, token, its columns] -> [token, columns in rank order]
-        out = engram_rows_to_token_major(recv, self.tp_size)
-        return out.view(*indices.shape, self.dim)
-
-    def _dp_exchange(self, sizes: Optional[list[int]]) -> Optional[str]:
-        """The exchange for a lookup with per-rank `sizes`, or None for the
-        global-buffer path."""
-        if sizes is None or self.lookup == EngramLookup.ALL_REDUCE:
-            return None
-        if self.lookup == EngramLookup.REDUCE_SCATTER:
-            return EngramLookup.REDUCE_SCATTER
-        # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
-        # per rank and for decode from DP 4; elsewhere within tens of microseconds.
-        return EngramLookup.ALL_TO_ALL if self._cols_per_rank is not None else None
+        return engram_rows_to_token_major(recv, self.tp_size)
 
     def _dp_sizes(
         self, indices: torch.Tensor, forward_batch: ForwardBatch
