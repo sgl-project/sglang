@@ -4,10 +4,10 @@ on:
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
-   branches:
-     - main
-     - 'npu/**'
-     - 'npu-*'
+    branches:
+      - main
+      - 'npu/**'
+      - 'npu-*'
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -360,18 +360,8 @@ jobs:
 
       - name: Install dependencies
         env:
-          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
-          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
         run: |
-          # speed up by using infra cache services
-          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
-          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -510,18 +500,8 @@ jobs:
 
       - name: Install dependencies
         env:
-          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
-          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
         run: |
-          # speed up by using infra cache services
-          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
-          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -944,8 +924,7 @@ jobs:
 
           if ! python3 -c "import regex" 2>/dev/null; then
             python3 -m pip install regex \
-              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
-              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              -i https://repo.huaweicloud.com/repository/pypi/simple \
               --retries 3 --timeout 60 \
               || python3 -m pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
@@ -995,8 +974,7 @@ jobs:
           # their SQLite data.
           if ! python3 -c "import coverage" 2>/dev/null; then
             python3 -m pip install coverage==7.8.* \
-              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
-              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              -i https://repo.huaweicloud.com/repository/pypi/simple \
               --retries 3 --timeout 60 \
               || python3 -m pip install coverage==7.8.* -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
           fi
@@ -1054,8 +1032,18 @@ jobs:
             --include='*/sglang/srt/hardware_backend/npu/*' \
             --directory="${REPORT_DIR}-npu"
 
+          # Compute the NPU-only TOTAL once: it feeds both the run-page summary
+          # and the OBS coverage gate (${RUN_DIR}/npu_coverage.txt), so the
+          # gated number and the displayed number cannot diverge. Written
+          # unconditionally because GITHUB_STEP_SUMMARY may be unset on the
+          # k8s runner pool while the gate still needs the value.
+          NPU_TOTAL_LINE="$(COVERAGE_FILE=/tmp/.coverage-npu \
+            python3 -m coverage report --rcfile=/tmp/report-rc \
+            --include='*/sglang/srt/hardware_backend/npu/*' | tail -n 1)"
+          printf '%s\n' "${NPU_TOTAL_LINE}" | awk '{print $NF}' | tr -d '%' \
+            > "${RUN_DIR}/npu_coverage.txt"
+
           # Surface the totals directly on the run page.
-          # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
               echo "### Coverage"
@@ -1064,9 +1052,7 @@ jobs:
               COVERAGE_FILE=/tmp/.coverage-all \
                 python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
               echo "python/sglang/srt/hardware_backend/npu (full-tree denominator):"
-              COVERAGE_FILE=/tmp/.coverage-npu \
-                python3 -m coverage report --rcfile=/tmp/report-rc \
-                --include='*/sglang/srt/hardware_backend/npu/*' | tail -n 1
+              echo "${NPU_TOTAL_LINE}"
               echo '```'
               echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`htmlcov/index.html\` (NPU-only view: \`htmlcov-npu/index.html\`)."
             } >> "${GITHUB_STEP_SUMMARY}"
@@ -1135,16 +1121,107 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Upload baseline to OBS
+        shell: bash
+        env:
+          # Ascend repo's OBS writer credentials (precision baseline bucket).
+          OBS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
+          OBS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          OBS_ENDPOINT="${OBS_ENDPOINT:-obs.cn-southwest-2.myhuaweicloud.com}"
+          OBS_BUCKET="${OBS_BUCKET:-sglang-npu}"
+          # TEMP: debug prefix, revert to "coverage" once verified.
+          OBS_PREFIX="${OBS_PREFIX:-coverage/pr}"
+
+          # Same skip rule as publish: no map -> incomplete baseline, never
+          # overwrite the good one in OBS.
+          if [ ! -s "${RUN_DIR}/test_case_map.json" ] || [ ! -s "${RUN_DIR}/outputs.tar.gz" ]; then
+            echo "::warning::test_case_map.json or outputs.tar.gz missing (no coverage data this run), skip OBS upload"
+            exit 0
+          fi
+
+          # NPU-only coverage gate: only the threshold comparison lives here.
+          # The percentage is computed once by the "Generate HTML coverage
+          # report" step above (same container). Fail closed when the value is
+          # missing, e.g. that step died before writing it.
+          MIN_NPU_COVERAGE=40
+          NPU_PCT_FILE="${RUN_DIR}/npu_coverage.txt"
+          if [ ! -s "${NPU_PCT_FILE}" ]; then
+            echo "::error::NPU-only coverage value missing (${NPU_PCT_FILE}); refusing to upload the baseline to OBS"
+            exit 1
+          fi
+          NPU_PCT="$(<"${NPU_PCT_FILE}")"
+          echo "NPU-only coverage: ${NPU_PCT}% (threshold: ${MIN_NPU_COVERAGE}%)"
+          if ! awk "BEGIN {exit !(${NPU_PCT} >= ${MIN_NPU_COVERAGE})}"; then
+            echo "::error::NPU-only coverage ${NPU_PCT}% is below ${MIN_NPU_COVERAGE}%, skip OBS upload"
+            exit 1
+          fi
+
+          if [ -z "${OBS_ACCESS_KEY_ID:-}" ] || [ -z "${OBS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::warning::OBS_ACCESS_KEY_PRECISION/OBS_SECRET_ACCESS_KEY_PRECISION secrets not set, skip OBS upload"
+            exit 0
+          fi
+
+          if ! command -v obsutil >/dev/null 2>&1; then
+            curl -fsSL \
+              --retry 3 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "https://obs-community.obs.cn-north-1.myhuaweicloud.com/obsutil/current/obsutil_linux_amd64.tar.gz" \
+              -o /tmp/obsutil.tar.gz
+            tar xzf /tmp/obsutil.tar.gz -C /tmp
+            OBSUTIL="$(find /tmp -maxdepth 2 -path '/tmp/obsutil_linux_amd64_*/obsutil' -type f -print -quit)"
+            chmod +x "${OBSUTIL}"
+            install -m 0755 "${OBSUTIL}" /usr/local/bin/obsutil 2>/dev/null \
+              || { mkdir -p /tmp/bin && cp "${OBSUTIL}" /tmp/bin/obsutil && export PATH="/tmp/bin:${PATH}"; }
+          fi
+
+          obsutil config \
+            -i="${OBS_ACCESS_KEY_ID}" \
+            -k="${OBS_SECRET_ACCESS_KEY}" \
+            -e="${OBS_ENDPOINT}"
+
+          # ACL lives on the object, not on the key: overwriting uploads a new
+          # object that inherits the bucket default (private), while the
+          # recommend job fetches these over anonymous HTTPS. Pass ACL in the
+          # upload request itself so an interruption cannot leave behind an
+          # object that exists but is private.
+          for f in outputs.tar.gz test_case_map.json; do
+            obj="obs://${OBS_BUCKET}/${OBS_PREFIX}/${f}"
+            obsutil cp "${RUN_DIR}/${f}" "${obj}" -f -acl=public-read
+          done
+
+          # Anonymous-read check: a stale private ACL here would only surface
+          # as a confusing failure in the next run's download steps.
+          for f in outputs.tar.gz test_case_map.json; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -I -L \
+              "https://${OBS_BUCKET}.${OBS_ENDPOINT}/${OBS_PREFIX}/${f}")"
+            echo "${f}: anonymous HEAD -> HTTP ${code}"
+            if [ "${code}" != "200" ]; then
+              echo "::error::${f} not publicly readable (HTTP ${code}); check its ACL"
+              exit 1
+            fi
+          done
+
+          echo "Uploaded baseline to obs://${OBS_BUCKET}/${OBS_PREFIX}/"
+          ls -lh "${RUN_DIR}/outputs.tar.gz" "${RUN_DIR}/test_case_map.json"
+
       - name: Publish outputs and map to shared disk
+        # Runs even if the OBS upload above failed: the shared-disk baseline is
+        # the primary product, the OBS copy is only for the recommend job.
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           # Fixed-name copy for manual use; the recommend job's baseline lives
-          # in OBS (upload outputs.tar.gz + test_case_map.json manually after
-          # each run). coverage-data.tar.gz has no automatic consumer — no OBS
-          # copy, only this dir and the precise-test-coverage-data artifact.
+          # in OBS, refreshed by the "Upload baseline to OBS" step above.
+          # coverage-data.tar.gz has no automatic consumer — no OBS copy, only
+          # this dir and the precise-test-coverage-data artifact.
           PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
 
           # Skip publish when no coverage data this run — never overwrite
@@ -1181,13 +1258,26 @@ jobs:
           ls -lh "${PUBLISH_DIR}" | tail -n +2
 
       - name: Clean up per-run directory
-        # Skipped on publish failure, keeping RUN_DIR for manual recovery.
+        # Default success() on purpose: any earlier failure (incl. the OBS
+        # upload) keeps RUN_DIR for manual recovery.
+        # A successful run also sweeps leftovers from earlier failed runs, so
+        # residue does not pile up. Only dirs older than STALE_MINUTES: RUN_DIR
+        # is per-run for a reason, and a bare glob would delete the directory
+        # of a concurrently running job mid-flight.
         shell: bash
         run: |
           set -euo pipefail
-          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          CACHE_ROOT="/root/.cache/tests/precise-test"
+          RUN_DIR="${CACHE_ROOT}/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # 8h > the 6h per-job execution limit, so a live run can never match.
+          STALE_MINUTES=480
           rm -rf "${RUN_DIR}"
           echo "Removed ${RUN_DIR}"
+          # -maxdepth 1 keeps the shared coverage/ dir out of reach.
+          find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
+            -name '*-attempt-*' -mmin +"${STALE_MINUTES}" \
+            -print -exec rm -rf {} +
+          echo "Swept stale run dirs older than ${STALE_MINUTES}min"
 
   pr-test-npu-finish:
     needs:

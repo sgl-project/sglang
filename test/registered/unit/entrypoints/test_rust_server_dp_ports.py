@@ -18,7 +18,7 @@ from sglang.srt.rust_server import server as rust_server
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _scheduler_for_typed_config():
@@ -44,6 +44,7 @@ def _scheduler_for_typed_config():
         tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
+        rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )
 
 
@@ -77,6 +78,10 @@ def _scheduler_for_typed_config():
             "limit_mm_data_per_request",
             [("video", 1), ("image", 2)],
         ),
+        # The server loads the scheduler's tokenizer copy and reports the
+        # launched path.
+        ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
+        ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
     ],
     ids=[
         "native-grpc",
@@ -90,6 +95,8 @@ def _scheduler_for_typed_config():
         "priority-on",
         "mm-limits-unset",
         "mm-limits-keep-order",
+        "loaded-tokenizer",
+        "public-tokenizer",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -122,6 +129,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    assert deployment_info["rust_server_endpoints"] == [
+        {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
+    ]
 
 
 @pytest.mark.parametrize(

@@ -34,8 +34,9 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import index_slots
 
-register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="base-a-test-cpu")
 
 _REQ = CacheRequestHandle("r", 0)
 
@@ -70,6 +71,7 @@ def _staged_fixture(full_match=2):
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
     cache.components = {}
+    index_slots(cache, cache.components)
     cache.prefetch_threshold = 2
     cache._build_sidecar_transfers = Mock(return_value=[])
     cache.supports_swa = lambda: True

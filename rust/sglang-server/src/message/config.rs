@@ -18,7 +18,7 @@
 //! Python-facing code in this file;
 //! the rest is pure Rust.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -94,9 +94,15 @@ pub struct ServerArgs {
     pub model_path: String,
     /// Model name reported by `/v1/models` and `/server_info`.
     pub served_model_name: String,
-    /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
-    /// in standalone (test) configs — then boot requires `skip_tokenizer_init`.
+    /// Tokenizer source this server loads (model dir / `tokenizer.json` / HF
+    /// repo id). A model package may point it at a process-local copy of
+    /// `--tokenizer-path`, which is why the info endpoints report
+    /// [`Self::public_tokenizer_path`] instead. Empty only in standalone (test)
+    /// configs — then boot requires `skip_tokenizer_init`.
     pub tokenizer_path: String,
+    /// `--tokenizer-path` as launched, reported by `/get_model_info` and
+    /// `/server_info`.
+    pub public_tokenizer_path: String,
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
     /// Weight format selected by `--load-format`, reported by `/get_model_info`.
@@ -130,6 +136,8 @@ pub struct ServerArgs {
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     pub chat_template: Option<String>,
+    /// `--default-chat-template-kwargs`, under each request's own.
+    pub default_chat_template_kwargs: HashMap<String, serde_json::Value>,
     /// Parser selected by `--tool-call-parser`.
     pub tool_call_parser: Option<String>,
     /// Reasoning splitter selected by `--reasoning-parser` (e.g. deepseek-r1).
@@ -224,6 +232,7 @@ impl ServerArgs {
         model_path,
         served_model_name,
         tokenizer_path,
+        public_tokenizer_path,
         revision,
         load_format,
         weight_version,
@@ -237,6 +246,7 @@ impl ServerArgs {
         log_level,
         log_level_http,
         chat_template,
+        default_chat_template_kwargs,
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
@@ -276,6 +286,7 @@ impl ServerArgs {
         model_path: String,
         served_model_name: String,
         tokenizer_path: String,
+        public_tokenizer_path: String,
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
@@ -289,6 +300,7 @@ impl ServerArgs {
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
+        default_chat_template_kwargs: String,
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
@@ -326,6 +338,7 @@ impl ServerArgs {
             model_path,
             served_model_name,
             tokenizer_path,
+            public_tokenizer_path,
             revision,
             load_format,
             weight_version,
@@ -339,6 +352,8 @@ impl ServerArgs {
             log_level,
             log_level_http,
             chat_template,
+            default_chat_template_kwargs: serde_json::from_str(&default_chat_template_kwargs)
+                .expect("default_chat_template_kwargs is a JSON object"),
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
@@ -384,6 +399,7 @@ impl Default for ServerArgs {
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),
+            public_tokenizer_path: String::new(),
             revision: None,
             load_format: None,
             weight_version: None,
@@ -397,6 +413,7 @@ impl Default for ServerArgs {
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
+            default_chat_template_kwargs: HashMap::new(),
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
@@ -455,6 +472,14 @@ pub struct DeploymentInfo {
     pub hicache_write_policy: Option<String>,
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
+    pub rust_server_endpoints: Vec<RustServerEndpoint>,
+}
+
+/// One DP rank's listener, as a base URL (`http://host:port`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RustServerEndpoint {
+    pub dp_rank: u32,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

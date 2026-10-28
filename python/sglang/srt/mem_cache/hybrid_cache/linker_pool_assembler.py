@@ -485,9 +485,7 @@ def _mha_device_pool_entry(
     )
 
 
-def _mamba_device_pool_entry(
-    req_to_token_pool: Any, start_layer: int
-) -> DevicePoolEntry:
+def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
     )
@@ -500,16 +498,16 @@ def _mamba_device_pool_entry(
         )
     # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
     if (
-        req_to_token_pool.mamba_ckpt_pool is not None
-        or req_to_token_pool.short_conv_pool.enabled
-        or req_to_token_pool.ngram_pool.enabled
+        state.ckpt_pool is not None
+        or state.short_conv_pool.enabled
+        or state.ngram_pool.enabled
     ):
         raise ValueError(
             "The direct external linker does not support int8 Mamba checkpoints "
             "or Mamba side states yet."
         )
 
-    mamba_pool = req_to_token_pool.mamba_pool
+    mamba_pool = state.pool
     mamba_cache = mamba_pool.mamba_cache
     layers = range(mamba_pool.num_mamba_layers)
     # One row per state slot; conv-only models carry an empty temporal state.
@@ -523,9 +521,7 @@ def _mamba_device_pool_entry(
         indices_from_pool=PoolName.MAMBA,
         device_pool=mamba_pool,
         components=components,
-        layer_mapping=_stage_local_layer_mapping(
-            req_to_token_pool.mamba_map, start_layer
-        ),
+        layer_mapping=_stage_local_layer_mapping(state.layer_map, start_layer),
         page_size=1,
         rows_are_pages=True,
     )
@@ -546,7 +542,9 @@ def _build_mamba_swa_device_pool_group(
         _mha_device_pool_entry(
             PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
         ),
-        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+        _mamba_device_pool_entry(
+            params.token_to_kv_pool_allocator.state, kvcache.start_layer
+        ),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     return DevicePoolGroup(entries, num_layers + 1, page_size)
@@ -588,7 +586,9 @@ def _build_mamba_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
         ),
-        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+        _mamba_device_pool_entry(
+            params.token_to_kv_pool_allocator.state, kvcache.start_layer
+        ),
     ]
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:

@@ -11,6 +11,7 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
 )
@@ -135,18 +136,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
-        if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, list[object], str | None] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -372,7 +369,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: str | None = None
+    ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -383,7 +382,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready_events = self.record_offload_ready()
-        self.offload_queue.put((expanded, tokens, ready_events))
+        self.offload_queue.put((expanded, tokens, ready_events, session_id))
         return True
 
     def offload_thread_func(self) -> None:
@@ -392,10 +391,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_events = task
+                expanded, tokens, ready_events, session_id = task
                 for event in ready_events:
                     event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
+                extra_info = (
+                    HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
+                    if session_id
+                    else None
+                )
+                results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
