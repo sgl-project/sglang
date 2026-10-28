@@ -53,6 +53,54 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.tp_worker = MagicMock()
         return s
 
+    def test_peer_notification_failure_preserves_old_role(self):
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        manager = SimpleNamespace(
+            supports_role_switch=True,
+            enable_staging=False,
+            notify_role_switch_peers=MagicMock(side_effect=TimeoutError("missing ACK")),
+        )
+        with patch.object(role_switch, "_current_kv_manager", return_value=manager):
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role="decode")
+            )
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
+        self.assertIn("role unchanged", out.message)
+        manager.notify_role_switch_peers.assert_called_once()
+        s.teardown_disaggregation.assert_not_called()
+        s.init_disaggregation.assert_not_called()
+        self.assertFalse(s._pd_role_switch_unhealthy)
+        self.assertFalse(s._pd_role_switch_in_progress)
+        self.assertEqual(rc.get_disagg().disaggregation_mode, "prefill")
+
+    def test_peer_notification_only_for_mooncake_and_mori(self):
+        for backend in ("mooncake", "mori", "nixl"):
+            with self.subTest(backend=backend):
+                s = self._scheduler(DisaggregationMode.PREFILL)
+                rc.get_context().override(
+                    "test.backend", disaggregation_transfer_backend=backend
+                )
+                # Isolate notification dispatch from backend lifecycle support.
+                manager = SimpleNamespace(
+                    supports_role_switch=True,
+                    enable_staging=False,
+                    notify_role_switch_peers=MagicMock(),
+                )
+                with patch.object(
+                    role_switch, "_current_kv_manager", return_value=manager
+                ):
+                    out = Scheduler.handle_pd_role_switch(
+                        s, PdRoleSwitchReqInput(new_role="decode")
+                    )
+                self.assertTrue(out.success)
+                if backend in ("mooncake", "mori"):
+                    manager.notify_role_switch_peers.assert_called_once()
+                else:
+                    manager.notify_role_switch_peers.assert_not_called()
+                s.teardown_disaggregation.assert_called_once()
+                s.init_disaggregation.assert_called_once()
+
     def test_preflight_checks_graph_headroom_without_releasing_resources(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"

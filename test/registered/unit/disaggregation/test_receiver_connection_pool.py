@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -88,6 +89,169 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
+    def _transport_manager(self):
+        manager = _manager()
+        manager._zmq_ctx = zmq.Context()
+        self.addCleanup(manager._zmq_ctx.destroy, linger=0)
+        manager.local_ip = "127.0.0.1"
+        manager.server_socket = manager._zmq_ctx.socket(zmq.PULL)
+        manager.rank_port = manager.server_socket.bind_to_random_port("tcp://127.0.0.1")
+        manager.connection_pool = {}
+        manager.connection_lock = threading.Lock()
+        manager._socket_cache = {}
+        manager._monitor_cache = {}
+        manager._socket_send_locks = {}
+        manager._socket_lock = threading.Lock()
+        manager._peer_cache_condition = threading.Condition()
+        manager._peer_cache_request_id = None
+        manager._peer_cache_pending = set()
+        manager._retired_decode_peers = set()
+        manager.disaggregation_mode = DisaggregationMode.DECODE
+        manager.defer_decode_allocation = False
+        return manager
+
+    def _listen(self, manager, *, duplicate=False, stale_ack=False):
+        stop = threading.Event()
+
+        def receive():
+            while not stop.is_set():
+                if not manager.server_socket.poll(20):
+                    continue
+                msg = manager.server_socket.recv_multipart()
+                invalidation = msg[0] == b"PEER_CACHE_INVALIDATE"
+                if stale_ack and invalidation:
+                    msg[1] = b"previous-switch"
+                manager.handle_peer_cache_invalidation(msg)
+                if duplicate and invalidation:
+                    manager.handle_peer_cache_invalidation(msg)
+
+        worker = threading.Thread(target=receive)
+        worker.start()
+
+        def cleanup():
+            stop.set()
+            worker.join(2)
+
+        self.addCleanup(cleanup)
+
+    def test_worker_notification_invalidates_peer_and_reregisters_once(self):
+        prefill, decode, empty_decode = [self._transport_manager() for _ in range(3)]
+        prefill.disaggregation_mode = DisaggregationMode.PREFILL
+        self._listen(prefill)
+        endpoint = f"tcp://127.0.0.1:{prefill.rank_port}"
+        CommonKVReceiver._connect(endpoint)
+        self.addCleanup(CommonKVReceiver.close_all_sockets)
+        old = [{"rank_ip": "127.0.0.1", "rank_port": prefill.rank_port}]
+        other = [{"rank_ip": "127.0.0.1", "rank_port": prefill.rank_port + 1}]
+        decode.connection_pool = {
+            "prefill:8998_0_0_0": old,
+            "alias:8998_0_0_0": old,
+            "other": other,
+        }
+        decode.request_status = {1: KVPoll.Success, 2: KVPoll.WaitingForInput}
+        prefill.decode_kv_args_table = {
+            name: SimpleNamespace(endpoint="127.0.0.1", dst_port=peer.rank_port)
+            for name, peer in (
+                ("one", decode),
+                ("duplicate", decode),
+                ("two", empty_decode),
+            )
+        }
+        self._listen(decode)
+        self._listen(empty_decode)
+        prefill.notify_role_switch_peers(timeout=1)
+        self.assertNotIn(endpoint, CommonKVReceiver._socket_cache)
+        self.assertEqual(decode.connection_pool, {"other": other})
+        self.assertEqual(
+            decode.request_status, {1: KVPoll.Success, 2: KVPoll.WaitingForInput}
+        )
+
+        # Re-register even if the rebuilt P reuses its old port. Later requests
+        # keep the cache fast path: no HTTP lookup or registration per request.
+        receiver = _fetching_receiver(decode.connection_pool)
+        receiver._get_bootstrap_info_from_server = Mock(return_value=dict(old[0]))
+        receiver._register_kv_args = Mock(return_value=True)
+        receiver._setup_bootstrap_infos()
+        receiver._register_kv_args.assert_called_once()
+        receiver = _fetching_receiver(decode.connection_pool)
+        receiver._setup_bootstrap_infos()
+        self.assertEqual(receiver.fetch_count, 0)
+
+    def test_ack_is_sent_only_after_socket_cache_removal(self):
+        endpoint = "tcp://127.0.0.1:12345"
+        socket = Mock()
+        CommonKVReceiver._socket_cache[endpoint] = socket
+        CommonKVReceiver._socket_locks[endpoint] = threading.Lock()
+        self.addCleanup(CommonKVReceiver.close_all_sockets)
+        socket.send_multipart.side_effect = lambda *args, **kwargs: self.assertNotIn(
+            endpoint, CommonKVReceiver._socket_cache
+        )
+        CommonKVReceiver.disconnect_endpoint(endpoint, final_message=[b"ACK"])
+        socket.send_multipart.assert_called_once_with([b"ACK"], flags=zmq.NOBLOCK)
+        socket.close.assert_called_once_with(linger=1000)
+
+    def test_departing_decode_is_not_awaited_until_it_serves_again(self):
+        prefill, decode = self._transport_manager(), self._transport_manager()
+        prefill.disaggregation_mode = DisaggregationMode.PREFILL
+        prefill.decode_kv_args_table = {
+            "decode": SimpleNamespace(endpoint="127.0.0.1", dst_port=decode.rank_port)
+        }
+        decode.connection_pool = {
+            "prefill": [{"rank_ip": "127.0.0.1", "rank_port": prefill.rank_port}]
+        }
+        self._listen(prefill)
+        self._listen(decode)
+        decode.notify_role_switch_peers(timeout=1)
+        endpoint = f"tcp://127.0.0.1:{decode.rank_port}"
+        self.assertIn(endpoint, prefill._retired_decode_peers)
+        with patch.object(prefill, "_connect") as connect:
+            prefill.notify_role_switch_peers(timeout=1)
+            connect.assert_not_called()
+        prefill._send_multipart_locked(endpoint, [b"status"])
+        self.assertNotIn(endpoint, prefill._retired_decode_peers)
+        prefill.notify_role_switch_peers(timeout=1)
+        self.assertEqual(decode.connection_pool, {})
+
+    def test_failed_decode_departure_cannot_leave_a_retired_cached_peer(self):
+        prefill, silent, decode = [self._transport_manager() for _ in range(3)]
+        prefill.disaggregation_mode = DisaggregationMode.PREFILL
+        decode.connection_pool = {
+            str(peer.rank_port): [{"rank_ip": "127.0.0.1", "rank_port": peer.rank_port}]
+            for peer in (prefill, silent)
+        }
+        self._listen(prefill)
+        self._listen(decode)
+        self.addCleanup(CommonKVReceiver.close_all_sockets)
+        with self.assertRaises(TimeoutError):
+            decode.notify_role_switch_peers(timeout=0.15)
+        self.assertIn(
+            f"tcp://127.0.0.1:{decode.rank_port}", prefill._retired_decode_peers
+        )
+        # The conversion may be cancelled after only some peers retired D.
+        # Its next request must refetch/re-register rather than reuse a cache.
+        self.assertEqual(decode.connection_pool, {})
+        receiver = _fetching_receiver(decode.connection_pool)
+        receiver._register_kv_args = Mock(return_value=True)
+        receiver._setup_bootstrap_infos()
+        receiver._register_kv_args.assert_called_once()
+
+    def test_notification_requires_all_peers_and_matching_ack(self):
+        for stale_ack in (False, True):
+            with self.subTest(stale_ack=stale_ack):
+                prefill, decode, silent = [self._transport_manager() for _ in range(3)]
+                prefill.disaggregation_mode = DisaggregationMode.PREFILL
+                self._listen(prefill)
+                peers = [decode] if stale_ack else [decode, silent]
+                prefill.decode_kv_args_table = {
+                    str(peer.rank_port): SimpleNamespace(
+                        endpoint="127.0.0.1", dst_port=peer.rank_port
+                    )
+                    for peer in peers
+                }
+                self._listen(decode, duplicate=not stale_ack, stale_ack=stale_ack)
+                with self.assertRaisesRegex(TimeoutError, "did not acknowledge"):
+                    prefill.notify_role_switch_peers(timeout=0.15)
+
     def test_next_receiver_refetches_after_invalidation(self):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         connection_pool = {"prefill:8998_0_0_0": stale}
@@ -205,6 +369,36 @@ class TestReceiverControlMessages(CustomTestCase):
 
         receiver._connect_to_bootstrap_server = connect
         return receiver, sent
+
+    def test_mori_peer_notification_bypasses_legacy_parsers(self):
+        for start, role in (
+            ("_start_bootstrap_thread", b"decode"),
+            ("_start_decode_thread", b"prefill"),
+        ):
+            with self.subTest(worker=start):
+                manager = self.backends["mori"].__new__(self.backends["mori"])
+                manager._stopped = False
+                manager._worker_threads = []
+                manager.server_socket = object()
+                message = [b"PEER_CACHE_INVALIDATE", b"id", role, b"127.0.0.1", b"6000"]
+                pending = [message]
+
+                def recv():
+                    if pending:
+                        return pending.pop()
+                    manager._stopped = True
+                    return None
+
+                manager._make_worker_recv = Mock(return_value=recv)
+                manager.handle_peer_cache_invalidation = Mock(return_value=True)
+                manager._validate_message = Mock(return_value=None)
+                manager.parse_kv_status_message = Mock(return_value=None)
+                getattr(manager, start)()
+                manager._worker_threads[0].join(1)
+                self.assertFalse(manager._worker_threads[0].is_alive())
+                manager.handle_peer_cache_invalidation.assert_called_once_with(message)
+                manager._validate_message.assert_not_called()
+                manager.parse_kv_status_message.assert_not_called()
 
     def test_registration_wire_is_preserved_for_all_peers(self):
         """Registration refactors must preserve each backend's legacy frame layout."""

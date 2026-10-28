@@ -981,6 +981,8 @@ class MoriKVManager(CommonKVManager):
                     if msg is None:
                         continue
 
+                    if self.handle_peer_cache_invalidation(msg):
+                        continue
                     tag = msg[0]
                     if tag == ABORT_TAG:
                         self._handle_abort_message(msg)
@@ -1012,6 +1014,8 @@ class MoriKVManager(CommonKVManager):
                 try:
                     msg = recv()
                     if msg is None:
+                        continue
+                    if self.handle_peer_cache_invalidation(msg):
                         continue
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)

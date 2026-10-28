@@ -122,6 +122,19 @@ def handle_pd_role_switch(
 
     scheduler._pd_role_switch_in_progress = True
     try:
+        km = _current_kv_manager(scheduler)
+        # Peer invalidation is wired up for Mooncake and Mori.
+        if km is not None and get_disagg().disaggregation_transfer_backend in (
+            "mooncake",
+            "mori",
+        ):
+            try:
+                km.notify_role_switch_peers()
+            except Exception as e:
+                return _fail(
+                    f"peer cache invalidation failed; role unchanged: {e}",
+                    safe_to_restore=True,
+                )
         # Teardown + role flip + rebuild are one logical atomic step. If any of
         # them raises, the instance is left half-torn-down (old role released,
         # new role not up) and isn't safe to serve, so mark it unhealthy. There

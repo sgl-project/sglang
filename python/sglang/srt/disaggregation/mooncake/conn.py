@@ -2941,6 +2941,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                if self.handle_peer_cache_invalidation(waiting_req_bytes):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -3021,6 +3023,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             while not self._stopped:
                 msg = recv()
                 if msg is None:
+                    continue
+                if self.handle_peer_cache_invalidation(msg):
                     continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)

@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import (
@@ -74,6 +75,8 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+PEER_CACHE_INVALIDATE = b"PEER_CACHE_INVALIDATE"
+PEER_CACHE_ACK = b"PEER_CACHE_ACK"
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -407,6 +410,10 @@ class CommonKVManager(BaseKVManager):
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
+        self._peer_cache_condition = threading.Condition()
+        self._peer_cache_request_id = None
+        self._peer_cache_pending = set()
+        self._retired_decode_peers = set()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
@@ -750,6 +757,125 @@ class CommonKVManager(BaseKVManager):
         if self.kv_status_msg_tag is not None:
             parts.insert(0, self.kv_status_msg_tag)
         return parts
+
+    def notify_role_switch_peers(self, timeout: float = 5.0) -> None:
+        """Wait for known peers to forget this idle manager before teardown."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            with self._socket_lock:
+                retired = self._retired_decode_peers.copy()
+            peers = {
+                (peer.endpoint, peer.dst_port)
+                for peer in list(self.decode_kv_args_table.values())
+                if NetworkAddress(peer.endpoint, peer.dst_port).to_tcp() not in retired
+            }
+        else:
+            with self.connection_lock:
+                peers = {
+                    (info["rank_ip"], info["rank_port"])
+                    for infos in self.connection_pool.values()
+                    for info in infos
+                }
+                # If only some P peers retire us before notification fails,
+                # staying in D must still force registration on the next use.
+                self.connection_pool.clear()
+        if not peers:
+            return
+        started = time.monotonic()
+        request_id = uuid.uuid4().bytes
+        with self._peer_cache_condition:
+            self._peer_cache_request_id = request_id
+            self._peer_cache_pending = peers.copy()
+        try:
+            message = [
+                PEER_CACHE_INVALIDATE,
+                request_id,
+                self.disaggregation_mode.value.encode("ascii"),
+                self.local_ip.encode("ascii"),
+                str(self.rank_port).encode("ascii"),
+            ]
+            # Fan out without waiting between peers or blocking on a full queue.
+            for ip, port in peers:
+                endpoint = NetworkAddress(ip, port)
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    sock, lock = CommonKVReceiver._connect(
+                        endpoint.to_tcp(), endpoint.is_ipv6
+                    )
+                else:
+                    sock = self._connect(endpoint.to_tcp(), is_ipv6=endpoint.is_ipv6)
+                    lock = self._socket_send_locks[endpoint.to_tcp()]
+                with lock:
+                    sock.send_multipart(message, flags=zmq.NOBLOCK)
+            with self._peer_cache_condition:
+                if not self._peer_cache_condition.wait_for(
+                    lambda: not self._peer_cache_pending,
+                    timeout=max(0, timeout - (time.monotonic() - started)),
+                ):
+                    raise TimeoutError(
+                        f"Peers did not acknowledge cache invalidation: {sorted(self._peer_cache_pending)}"
+                    )
+        finally:
+            with self._peer_cache_condition:
+                self._peer_cache_request_id = None
+                self._peer_cache_pending.clear()
+
+    def handle_peer_cache_invalidation(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] not in (PEER_CACHE_INVALIDATE, PEER_CACHE_ACK):
+            return False
+        try:
+            if msg[0] == PEER_CACHE_ACK:
+                _, request_id, ip, port = msg
+                with self._peer_cache_condition:
+                    if request_id == self._peer_cache_request_id:
+                        self._peer_cache_pending.discard(
+                            (ip.decode("ascii"), int(port))
+                        )
+                        self._peer_cache_condition.notify_all()
+                return True
+            _, request_id, role, ip, port = msg
+            ip, port = ip.decode("ascii"), int(port)
+            endpoint = NetworkAddress(ip, port)
+            ack = [
+                PEER_CACHE_ACK,
+                request_id,
+                self.local_ip.encode("ascii"),
+                str(self.rank_port).encode("ascii"),
+            ]
+            if (
+                role == b"prefill"
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+            ):
+                with self.connection_lock:
+                    stale_keys = [
+                        key
+                        for key, infos in self.connection_pool.items()
+                        if any(
+                            (info["rank_ip"], info["rank_port"]) == (ip, port)
+                            for info in infos
+                        )
+                    ]
+                    for key in stale_keys:
+                        del self.connection_pool[key]
+                # Remove the socket from the cache before ACK can release P.
+                # Its final frame still uses the already-established connection.
+                CommonKVReceiver.disconnect_endpoint(
+                    endpoint.to_tcp(), final_message=ack, is_ipv6=endpoint.is_ipv6
+                )
+            elif (
+                role == b"decode"
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
+                # Keep backend registrations for normal teardown, but do not
+                # await departed D workers during a later P role switch.
+                with self._socket_lock:
+                    self._retired_decode_peers.add(endpoint.to_tcp())
+                sock = self._connect(endpoint.to_tcp(), is_ipv6=endpoint.is_ipv6)
+                with self._socket_send_locks[endpoint.to_tcp()]:
+                    sock.send_multipart(ack, flags=zmq.NOBLOCK)
+            else:
+                raise ValueError("Peer invalidation role does not match receiver")
+        except (ValueError, UnicodeDecodeError, zmq.ZMQError):
+            logger.exception("Failed to handle peer cache invalidation")
+        return True
 
     def parse_kv_status_message(
         self, msg: List[bytes]
@@ -1711,6 +1837,9 @@ class CommonKVManager(BaseKVManager):
         sock = self._connect(endpoint, is_ipv6=is_ipv6)
         with self._socket_send_locks[endpoint]:
             sock.send_multipart(parts)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            with self._socket_lock:
+                self._retired_decode_peers.discard(endpoint)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -2474,7 +2603,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
-    _global_lock = threading.Lock()
+    _global_lock = threading.RLock()
 
     def __init__(
         self,
@@ -2751,16 +2880,26 @@ class CommonKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     @classmethod
-    def disconnect_endpoint(cls, endpoint: str):
+    def disconnect_endpoint(
+        cls,
+        endpoint: str,
+        *,
+        final_message: Optional[List[bytes]] = None,
+        is_ipv6: bool = False,
+    ):
         with cls._global_lock:
+            if final_message is not None and endpoint not in cls._socket_cache:
+                cls._connect(endpoint, is_ipv6)
             sock = cls._socket_cache.pop(endpoint, None)
             lock = cls._socket_locks.pop(endpoint, None)
         if sock:
-            if lock:
-                with lock:
-                    sock.close()
-            else:
-                sock.close()
+            with lock if lock is not None else nullcontext():
+                try:
+                    if final_message is not None:
+                        sock.send_multipart(final_message, flags=zmq.NOBLOCK)
+                finally:
+                    # Let a queued ACK leave; ordinary invalidation closes immediately.
+                    sock.close(linger=1000 if final_message is not None else 0)
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
