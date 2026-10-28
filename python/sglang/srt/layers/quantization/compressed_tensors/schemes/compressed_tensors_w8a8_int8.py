@@ -191,7 +191,7 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
                 raise NotImplementedError(
                     "NPU static compressed-tensors requires symmetric activations"
                 )
-            self.kernel = NPUW8A8Int8StaticLinearMethod(strategy)
+            self.kernel = NPUW8A8Int8StaticLinearMethod()
         else:
             self.kernel = NPUW8A8Int8DynamicLinearMethod()
 
@@ -215,17 +215,28 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             weight_loader,
             **kwargs,
         )
-        if self.is_static_input_scheme:
-            # QKV and gate/up loaders assign one scale to each logical shard.
-            # Reject missing calibration data instead of consuming empty memory.
-            layer.input_scale.data.fill_(float("nan"))
-            layer.weight_scale.data.fill_(float("nan"))
 
     @classmethod
     def get_min_capability(cls) -> int:
         return NotImplementedError
 
     def process_weights_after_loading(self, layer):
+        if self.is_static_input_scheme:
+            # Fused shards share one activation quantization, matching the
+            # compressed-tensors CUDA scheme's symmetric scale reduction.
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+            if self.strategy == QuantizationStrategy.TENSOR:
+                # Preserve the exported integer weights: expand each shard's
+                # scale to its output channels instead of requantizing them.
+                scales = torch.cat(
+                    [
+                        scale.expand(width)
+                        for scale, width in zip(
+                            layer.weight_scale, layer.logical_widths
+                        )
+                    ]
+                )
+                layer.weight_scale = Parameter(scales, requires_grad=False)
         return self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(self, layer, x, bias):

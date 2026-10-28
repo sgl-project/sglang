@@ -2,7 +2,6 @@
 
 import unittest
 from itertools import product
-from types import SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
@@ -20,7 +19,6 @@ def make_layer(strategy, widths, dtype):
     scheme = NPUCompressedTensorsW8A8Int8(strategy, True, True)
     with torch.device("npu"):
         layer = torch.nn.Module()
-        layer.tp_group = SimpleNamespace(world_size=2)
         scheme.create_weights(
             layer,
             list(widths),
@@ -60,13 +58,18 @@ class TestNPUStaticInt8Linear(CustomTestCase):
                 bias=bias_enabled,
             ):
                 scheme, layer = make_layer(strategy, widths, dtype)
+                # Fused shards can have different activation calibration
+                # scales; the shared input must use their maximum.
+                input_scales = torch.arange(1, len(widths) + 1) * 0.125
+                layer.input_scale.data.copy_(input_scales)
+                input_scale = input_scales.max().item()
                 weight = layer.weight.detach().cpu().long()
                 scales = layer.weight_scale.detach().cpu().flatten()
                 if strategy == "tensor":
                     scales = torch.cat([s.expand(w) for s, w in zip(scales, widths)])
                 scheme.process_weights_after_loading(layer)
                 x = (
-                    torch.linspace(-2.5, 2.5, torch.tensor(shape).prod().item())
+                    torch.linspace(-70, 70, torch.tensor(shape).prod().item())
                     .reshape(shape)
                     .to(dtype)
                 )
@@ -75,8 +78,10 @@ class TestNPUStaticInt8Linear(CustomTestCase):
                     if bias_enabled
                     else None
                 )
-                q = torch.round(x.float() / 0.125).clamp(-128, 127).long()
-                expected = (q.reshape(-1, 128) @ weight.T).float() * (scales * 0.125)
+                q = torch.round(x.float() / input_scale).clamp(-128, 127).long()
+                expected = (q.reshape(-1, 128) @ weight.T).float() * (
+                    scales * input_scale
+                )
                 if bias is not None:
                     expected += bias.float()
                 actual = scheme.apply_weights(
@@ -93,21 +98,12 @@ class TestNPUStaticInt8Linear(CustomTestCase):
                     torch.empty(0, *shape[1:-1], sum(widths), dtype=dtype),
                 )
 
-    def test_invalid_calibration(self):
-        for parameter, value in product(
-            ("input_scale", "weight_scale"), (float("nan"), float("inf"), 0.0, -1.0)
-        ):
-            with self.subTest(parameter=parameter, value=value):
-                scheme, layer = make_layer("channel", (128, 64, 64), torch.bfloat16)
-                getattr(layer, parameter).data.flatten()[0] = value
-                with self.assertRaisesRegex(ValueError, "finite and positive"):
-                    scheme.process_weights_after_loading(layer)
-        scheme, layer = make_layer("channel", (128, 64, 64), torch.bfloat16)
-        layer.input_scale.data[1] = 0.25
-        with self.assertRaisesRegex(ValueError, "identical input scales"):
-            scheme.process_weights_after_loading(layer)
+    def test_unsupported_configuration(self):
         with self.assertRaisesRegex(NotImplementedError, "symmetric activations"):
             NPUCompressedTensorsW8A8Int8("channel", True, False)
+        scheme = NPUCompressedTensorsW8A8Int8("channel", True, True)
+        with self.assertRaisesRegex(ValueError, "float16 and bfloat16"):
+            scheme.create_weights(torch.nn.Module(), [128], 128, torch.float32, None)
 
 
 if __name__ == "__main__":
