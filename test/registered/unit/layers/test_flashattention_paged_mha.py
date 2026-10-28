@@ -18,6 +18,7 @@ with patch.dict(
         )
     },
 ):
+    from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.layers.attention import flashattention_backend
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
@@ -27,6 +28,7 @@ with patch.dict(
         UnquantizedKVCacheMethod,
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -257,19 +259,80 @@ class TestFlashAttentionFa3UpgradesToFa4(unittest.TestCase):
                     )
                 )
             )
-            kernel = Mock(return_value=torch.zeros(1, 4, head_dim))
-            with patch.object(
-                flashattention_backend, "flash_attn_with_kvcache", kernel
-            ):
-                backend.forward_decode(
-                    torch.zeros(1, 4 * head_dim, dtype=torch.bfloat16),
-                    None,
-                    None,
-                    layer,
-                    forward_batch,
-                    save_kv_cache=False,
-                )
-            self.assertEqual(kernel.call_args.kwargs["ver"], expected_ver, head_dim)
+            kernels = {
+                ver: Mock(return_value=torch.zeros(1, 4, head_dim)) for ver in (3, 4)
+            }
+            backend._fa_kernels = {ver: (Mock(), k) for ver, k in kernels.items()}
+            backend.forward_decode(
+                torch.zeros(1, 4 * head_dim, dtype=torch.bfloat16),
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+            )
+            self.assertTrue(kernels[expected_ver].called, head_dim)
+            self.assertFalse(kernels[4 if expected_ver == 3 else 3].called, head_dim)
+
+
+def _gemma4_runner():
+    # Enough of a ModelRunner for FlashAttentionBackend.__init__ on CPU, with
+    # Gemma-4's head_dim 512 full-attention layers.
+    req_to_token = torch.zeros(9, 64, dtype=torch.int32)
+    return SimpleNamespace(
+        sliding_window_size=None,
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False,
+            context_len=64,
+            attention_arch=AttentionArch.MHA,
+            is_local_attention_model=False,
+            head_dim=512,
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=2, attn_logit_softcapping=None
+            ),
+            get_num_kv_heads=lambda tp_size: 2,
+        ),
+        device="cpu",
+        req_to_token_pool=SimpleNamespace(size=8, req_to_token=req_to_token),
+        token_to_kv_pool=object(),
+        token_to_kv_pool_allocator=object(),
+        kv_index_translator=SimpleNamespace(),
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="auto",
+        page_size=1,
+        is_draft_worker=False,
+        attention_chunk_size=None,
+        prefill_aware_swa=False,
+    )
+
+
+class TestFa3UpgradesToFa4Init(unittest.TestCase):
+    def test_fa4_layers_enable_batch_invariance(self):
+        # fa3 with head_dim 512 layers runs them on FA4, so deterministic
+        # inference must switch FA4 to batch-invariant mode at init, before
+        # its first compile, as the fa4 backend does.
+        fa4, batch_invariance = MagicMock(), MagicMock()
+        modules = {
+            "sgl_kernel.flash_attn": MagicMock(),
+            "sglang.kernels.ops.attention.flash_attention_v3": MagicMock(),
+            "sglang.kernels.ops.attention.flash_attention_v4": fa4,
+            "sglang.kernels.ops.attention.flash_attn": MagicMock(),
+            "sglang.kernels.ops.attention.flash_attn.cute": MagicMock(),
+            "sglang.kernels.ops.attention.flash_attn.cute.batch_invariance": (
+                batch_invariance
+            ),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(
+                flashattention_backend, "get_device_capability", return_value=(9, 0)
+            ),
+            get_context().override_server_args(enable_deterministic_inference=True),
+        ):
+            backend = FlashAttentionBackend(_gemma4_runner(), fa_impl_ver=3)
+
+        batch_invariance.set_batch_invariant.assert_called_once_with(True)
+        self.assertIs(backend._fa_kernels[4][1], fa4.flash_attn_with_kvcache)
 
 
 if __name__ == "__main__":
