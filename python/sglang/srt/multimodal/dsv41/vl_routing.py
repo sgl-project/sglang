@@ -26,6 +26,24 @@ def vision_topk(
     num_token_non_padded=None,
     expert_location_dispatch_info=None,
 ):
+    topk_output = _select_vision_experts(
+        moe,
+        logits,
+        input_ids,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+    # Waterfill appends the shared expert here, as it does after TopK.forward.
+    return moe.topk._apply_waterfill(topk_output, logits.shape[0])
+
+
+def _select_vision_experts(
+    moe,
+    logits,
+    input_ids,
+    num_token_non_padded=None,
+    expert_location_dispatch_info=None,
+):
     bound, dispatch_info = moe.topk.routing_inputs()
     if num_token_non_padded is None:
         num_token_non_padded = bound

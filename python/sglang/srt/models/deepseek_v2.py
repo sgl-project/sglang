@@ -1126,7 +1126,10 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(
-                hidden_states, forward_batch, input_ids_global=input_ids_global
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+                use_vision_topk=use_vision_topk,
             )
 
     def forward_normal_dual_stream(
@@ -1530,6 +1533,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
+        use_vision_topk: bool = False,
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -1564,11 +1568,18 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                **topk_kwargs,
-            )
+            if use_vision_topk:
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                )
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device,

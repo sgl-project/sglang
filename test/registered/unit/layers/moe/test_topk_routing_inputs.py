@@ -5,7 +5,7 @@ import sys
 import unittest
 from enum import IntEnum
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -315,6 +315,77 @@ class TestTopKRoutingInputs(CustomTestCase):
             logical = logits.topk(2, dim=-1).indices
             expected = self.metadata.logical_to_all_physical_map[0, logical, 0]
             self.assertTrue(torch.equal(output.topk_ids.long(), expected))
+
+    def test_a2a_vision_router_selects_image_rows_with_vl_bias(self):
+        """All-to-all MoE (DeepEP etc.) must route image tokens with the VL bias,
+        then let Waterfill append the shared expert as on the text path."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+        class OneRankWaterfill:
+            def expand_topk(self, topk_output, num_tokens):
+                shared = torch.full((num_tokens, 1), 4, dtype=torch.int32)
+                return topk_output._replace(
+                    topk_ids=torch.cat([topk_output.topk_ids, shared], dim=-1),
+                    topk_weights=torch.nn.functional.pad(
+                        topk_output.topk_weights, (0, 1), value=1.0
+                    ),
+                )
+
+        with get_model().override(
+            shared_experts=SharedExpertsConfig(
+                num_fused_shared_experts=1, use_waterfill=True
+            )
+        ):
+            router = TopK(
+                top_k=2,
+                layer_id=0,
+                custom_routing_function=fused_topk_torch_native,
+                output_format=TopKOutputFormat.STANDARD,
+            )
+        router.waterfill_balancer = OneRankWaterfill()
+        routed = []
+
+        def experts(hidden_states, topk_output):
+            routed.append(topk_output)
+            return torch.zeros_like(hidden_states)
+
+        moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        vars(moe).update(
+            topk=router,
+            layer_id=0,
+            config=SimpleNamespace(image_token_id=99),
+            gate=MagicMock(
+                return_value=self.logits,
+                e_score_correction_bias=torch.zeros(4),
+                e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 3.0]),
+            ),
+            experts=experts,
+            is_hash=False,
+            is_nextn=False,
+            _enable_a2a_moe=True,
+            _fuse_shared_experts_inside_sbo=False,
+            num_fused_shared_experts=0,
+            alt_stream=None,
+            _forward_shared_experts=lambda hidden_states: None,
+            routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
+        )
+        batch = _batch(4)
+        with (
+            patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False),
+            get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+            forward_context(ForwardContext(attn_backend=object()), forward_batch=batch),
+        ):
+            moe.forward(
+                self.hidden, batch, input_ids_global=torch.tensor([1, 99, 1, 99])
+            )
+        # Text rows pick logical [0, 1]; image rows pick [2, 3] on the VL bias.
+        # Placement maps them to physical [2, 0] and [3, 1]; Waterfill adds 4.
+        self.assertEqual(
+            routed[0].topk_ids.tolist(),
+            [[2, 0, 4], [3, 1, 4], [2, 0, 4], [3, 1, 4]],
+        )
 
     def test_draft_without_input_ids_retains_prepared_live_width(self):
         """Deferred draft IDs must not turn a live draft's padding bound into zero."""
