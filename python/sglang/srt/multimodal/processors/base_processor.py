@@ -510,6 +510,7 @@ class BaseMultimodalProcessor(ABC):
             ),
             "gpu_image_decode": self.gpu_image_decode,
             "image_processor_backend": self.image_processor_backend,
+            "mm_preprocessing_device": get_mm().mm_preprocessing_device,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
             "video_config": self.video_config,

@@ -183,6 +183,28 @@ class TestResolveMmPreprocessingDevice(CustomTestCase):
             self.assertFalse(processor._resolve_gpu_image_decode())
         self.assertEqual(self._device(processor), "cuda:3")
 
+    def test_device_choice_changes_the_artifact_fingerprint(self):
+        from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
+
+        fingerprints = []
+        for setting in ("auto", "cpu", "auto"):
+            processor = _make(mm_preprocessing_device=setting)
+            processor._processor = _Processor()
+            # Even a model without GPU decode can preprocess on CPU or GPU.
+            processor.gpu_image_decode = False
+            processor.image_processor_backend = "torchvision"
+            processor.mm_feature_transport = "cpu"
+            processor.image_config = {}
+            processor.video_config = {}
+            processor.audio_config = {}
+            fingerprints.append(
+                build_processor_fingerprint(
+                    processor, SimpleNamespace(to_dict=lambda: {"model_type": "vlm"})
+                )
+            )
+        self.assertNotEqual(fingerprints[0], fingerprints[1])
+        self.assertEqual(fingerprints[0], fingerprints[2])
+
 
 class _FastImageProcessor:
     pass
@@ -637,6 +659,7 @@ class TestModelProcessorsUseTheResolver(CustomTestCase):
                 processor.disable_fast_image_processor = False
                 processor.image_config = {}
                 processor.use_cuda_ipc = False
+                processor.FEATURE_NAMES = ["pixel_values", "pixel_values_videos"]
                 processor.image_processor = SimpleNamespace(
                     image_mean=[0.5] * 3,
                     image_std=[0.25] * 3,
