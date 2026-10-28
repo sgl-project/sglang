@@ -11,22 +11,21 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvAttnBackend,
     InklingShortConvHybridAttnBackend,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
+from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedHybridReqToTokenPool,
-    UnifiedKVPool,
     UnifiedMambaPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -61,22 +60,21 @@ class TestInklingCheckpointIndices(CustomTestCase):
             store_dtype=torch.bfloat16,
             grow_direction="down",
         )
-        shared = UnifiedKVPool(
+        shared = arena_of(
             total_bytes=64 * mamba.entry_bytes(),
             sub_pool_specs=[mamba, full],
             device="cuda",
             enable_memory_saver=False,
         )
-        shared._raw.zero_()
+        shared.raw.zero_()
         pool = UnifiedMambaPool(
-            unified_buffer=shared,
-            sub_pool_name="mamba",
+            arena=shared,
+            spec=shared.spec("mamba"),
             spec_state_size=0,
             mamba_layer_ids=[0, 1],
         )
-        allocator = MultiEndedAllocator(
-            kvcache=pool,
-            unified_buffer=shared,
+        allocator = Band(
+            arena=shared,
             sub_pool_name="mamba",
             device="cuda",
             is_id_owner=True,
@@ -97,7 +95,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         backend._state_ids = (
             IdSpace(key=("mamba", None))
             if static
-            else slot_id_space(allocator, owner=None)
+            else allocator.ids.slot_space((allocator.sub_pool_name, None))
         )
         backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(

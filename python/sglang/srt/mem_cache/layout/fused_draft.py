@@ -374,8 +374,8 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     """Where every draft runner's layers live inside the host sub-pools.
 
     One region per host sub-pool that carries draft lanes plus each runner's
-    lane range into it. Built once on the target, stored on the
-    `UnifiedKVPool`, and read back by each draft runner, so the two sides
+    lane range into it. Built once on the target, stored on its KV storage
+    plan, and read back by each draft runner, so the two sides
     cannot disagree on a lane.
     """
 

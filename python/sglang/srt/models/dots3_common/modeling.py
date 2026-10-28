@@ -102,7 +102,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (

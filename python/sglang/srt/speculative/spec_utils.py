@@ -41,8 +41,8 @@ from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

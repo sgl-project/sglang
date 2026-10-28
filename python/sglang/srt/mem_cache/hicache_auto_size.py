@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,

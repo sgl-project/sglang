@@ -14,8 +14,8 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs

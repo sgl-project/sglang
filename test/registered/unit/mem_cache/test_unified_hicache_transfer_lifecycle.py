@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _swa_allocation_callbacks,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -124,7 +124,7 @@ class _Rows:
         self.swa = bundle.token_to_kv_pool.layer_router.view("swa").get_key_buffer(0)
 
     def full_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.full_attn_allocator.translate_kv_loc(ids.to(torch.int64))
+        return self.allocator.full_attn_allocator.ids.translate(ids.to(torch.int64))
 
     def swa_rows(self, ids: torch.Tensor) -> torch.Tensor:
         return self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(ids)
@@ -170,15 +170,17 @@ def _recorded_stream():
 
 def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
-    for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-        kvcache = side._kvcache
-        move = kvcache.move_physical_pages
+    arena = allocator.arena
+    move = arena.move_units
+    sides = {allocator.full_attn_allocator.sub_pool_name}
+    sides.add(allocator.swa_attn_allocator.sub_pool_name)
 
-        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
+    def recorded(name, dst, src):
+        if name in sides:
             log.append(("move", name))
-            return move(dst, src, page_size)
+        return move(name, dst, src)
 
-        kvcache.move_physical_pages = recorded
+    arena.move_units = recorded
 
 
 class _ConfigCase(unittest.TestCase):

@@ -10,8 +10,8 @@ draft pool exists.
 import unittest
 
 from sglang.srt.disaggregation.utils import build_staging_slot_metadata
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

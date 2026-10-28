@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,

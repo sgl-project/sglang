@@ -1,19 +1,37 @@
 """The unified buffer's byte budget and its bs=1 floor, from a plan."""
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import FullLifetime, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
-from sglang.srt.mem_cache.unified_memory_pool import (
-    _check_bs1_feasibility_floor,
-    _reserved_floor_bytes,
-)
 
 # One running request holds 1 active state slot plus 2 radix checkpoints; a
 # floor, not headroom.
 _BS1_STATE_SLOTS = 3
+
+
+def check_bs1_floor(
+    *, total_bytes: int, floor_terms: Sequence[Tuple[str, int]], where: str
+) -> None:
+    """bs=1 feasibility FLOOR -- the retract loop's terminal guarantee.
+
+    The scheduler retracts requests until the LAST one fits; if one worst-case
+    request running ALONE does not fit in the buffer, under-sizing is a retract
+    LIVELOCK at runtime, not a perf bug. Fail loud at boot, before any pool
+    construction, with the itemized requirement.
+    """
+    floor = sum(b for _, b in floor_terms)
+    if total_bytes >= floor:
+        return
+    detail = " + ".join(f"{name}={b}" for name, b in floor_terms)
+    raise RuntimeError(
+        f"[unified-memory-pool] {where}: byte budget {total_bytes} cannot fit "
+        f"ONE worst-case request (bs=1 floor {floor} = {detail}). A pool this "
+        f"size retract-livelocks at runtime. Raise --mem-fraction-static, lower "
+        f"the model context length, or reduce reserved memory."
+    )
 
 
 class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -68,7 +86,7 @@ def _bs1_floor_terms(
     state = plan.of_lifetime(StateLifetime)
     if state is not None:
         terms.append(("bs1_state_slots", _BS1_STATE_SLOTS * state.spec.entry_bytes()))
-    terms.append(("sink", _reserved_floor_bytes(plan.specs(), plan.page_size)))
+    terms.append(("sink", plan.sink_bytes()))
     return tuple(terms)
 
 
@@ -81,10 +99,8 @@ def size_kv_storage(plan: KVStoragePlan, inputs: KVSizingInputs) -> SizedKVStora
     terms: Tuple[Tuple[str, int], ...] = ()
     if inputs.context_len is not None:
         terms = _bs1_floor_terms(plan, inputs.context_len)
-        _check_bs1_feasibility_floor(
-            total_bytes=total_bytes,
-            floor_terms=list(terms),
-            factory="build_unified_pools",
+        check_bs1_floor(
+            total_bytes=total_bytes, floor_terms=terms, where="build_unified_pools"
         )
     if total_bytes <= 0:
         raise ValueError(f"total_bytes must be positive, got {total_bytes}")

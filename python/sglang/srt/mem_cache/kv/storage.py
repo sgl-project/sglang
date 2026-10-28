@@ -58,10 +58,13 @@ class KVStorage:
         router: KVLayerRouter,
         allocator,
         start_layer: int,
+        requests=None,
     ):
         self._plan = plan
         self._allocator = allocator
         self.start_layer = start_layer
+        # The request table: rows and the ids they hold.
+        self.requests = requests
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -85,6 +88,17 @@ class KVStorage:
                 )
             )
         self._sub_pools = tuple(sub_pools)
+
+    @property
+    def allocator(self):
+        """The chain allocator the scheduler drives directly until it takes the
+        request lifecycle through this storage."""
+        return self._allocator
+
+    @property
+    def plan(self) -> KVStoragePlan:
+        """The plan this storage was built from (read-only)."""
+        return self._plan
 
     @property
     def owner(self) -> str:
@@ -151,7 +165,7 @@ class KVStorage:
         stream; pins keep the rows in place until the copy is acknowledged."""
         roles = self._allocator.roles
         if sub_pool == roles.owner:
-            return self._allocator.full_attn_allocator.translate_kv_loc
+            return self._allocator.full_attn_allocator.ids.translate
         if sub_pool == roles.state:
             return self._allocator.state.slots.translate
         return None

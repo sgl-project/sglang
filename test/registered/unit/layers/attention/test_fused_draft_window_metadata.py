@@ -17,10 +17,10 @@ from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.attention import trtllm_mha_backend as tm
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_FULL,
     LAYER_WINDOW,
@@ -33,7 +33,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedKVPool,
     UnifiedMHATokenToKVPool,
 )
 from sglang.srt.runtime_context import publish, reset_context
@@ -41,6 +40,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import arena_of, plan_stand_in
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
@@ -88,7 +88,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             )
             for name, direction in (("full", "up"), ("swa", "down"))
         ]
-        buffer = UnifiedKVPool(
+        buffer = arena_of(
             total_bytes=1024 * sum(spec.entry_bytes() for spec in specs),
             sub_pool_specs=specs,
             device="cuda",
@@ -97,23 +97,23 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(unified_buffer=buffer, sub_pool_name=name)
+            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
             for name in ("full", "swa")
         }
         target_pool = RoutedKVCache(
-            unified_buffer=buffer,
+            arena=buffer,
             owner="full",
             layer_maps=[("full", views["full"], {0: 0}), ("swa", views["swa"], {1: 0})],
             page_size=1,
             start_layer=0,
             end_layer=None,
-            size=buffer.max_slots("full") - 1,
+            size=buffer.num_entries("full") - 1,
             head_num=views["full"].head_num,
             head_dim=views["full"].head_dim,
         )
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=buffer,
+            arena=buffer,
             kvcache=target_pool,
             views=views,
             device="cuda",
@@ -136,7 +136,8 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         bound = bind_fused_draft(
             placement=placement,
             runner=0,
-            unified_buffer=buffer,
+            arena=buffer,
+            plan=plan_stand_in(buffer, placement),
             owner="full",
             target_state=None,
             model=SimpleNamespace(modules=lambda: [layer]),
@@ -522,7 +523,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             )
             for name, direction in (("full", "up"), ("swa", "down"))
         ]
-        buffer = UnifiedKVPool(
+        buffer = arena_of(
             total_bytes=1024 * sum(spec.entry_bytes() for spec in specs),
             sub_pool_specs=specs,
             device="cuda",
@@ -531,23 +532,23 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(unified_buffer=buffer, sub_pool_name=name)
+            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
             for name in ("full", "swa")
         }
         target_pool = RoutedKVCache(
-            unified_buffer=buffer,
+            arena=buffer,
             owner="full",
             layer_maps=[("full", views["full"], {0: 0}), ("swa", views["swa"], {1: 0})],
             page_size=1,
             start_layer=0,
             end_layer=None,
-            size=buffer.max_slots("full") - 1,
+            size=buffer.num_entries("full") - 1,
             head_num=views["full"].head_num,
             head_dim=views["full"].head_dim,
         )
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
-            unified_buffer=buffer,
+            arena=buffer,
             kvcache=target_pool,
             views=views,
             device="cuda",
@@ -562,7 +563,8 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         bound = bind_fused_draft(
             placement=placement,
             runner=0,
-            unified_buffer=buffer,
+            arena=buffer,
+            plan=plan_stand_in(buffer, placement),
             owner="full",
             target_state=None,
             model=SimpleNamespace(modules=lambda: [layer]),
@@ -572,10 +574,10 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         )
         # Move the cached prefix: rebind its virtual ids to other physical
         # units, as compaction does.
-        band = allocator.full_attn_allocator
-        physical = band.translate_kv_loc(prefix)
-        band.bind(prefix, physical.flip(0))
-        moved = band.translate_kv_loc(prefix)
+        ids = allocator.full_attn_allocator.ids
+        physical = ids.translate(prefix)
+        ids.bind(prefix, physical.flip(0))
+        moved = ids.translate(prefix)
         self.assertFalse(torch.equal(moved, req.req_to_token[0]))
 
         draft_pool = bound.token_to_kv_pool

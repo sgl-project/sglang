@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

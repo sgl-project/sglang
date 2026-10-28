@@ -1,16 +1,23 @@
 """The MLA sub-pool layout: one latent row per layer in a token-major entry."""
 
 from dataclasses import dataclass
+from typing import ClassVar, List, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _check_row_alignment
+from sglang.srt.mem_cache.kv.layout.base import (
+    SubPoolSpec,
+    _check_row_alignment,
+    check_physical_id_bound,
+    dense_rows,
+)
 from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
 from sglang.srt.mem_cache.layout.token_major import (
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
     align_part_offset,
+    build_dense_views,
 )
 
 
@@ -24,6 +31,8 @@ class MLASubPoolSpec(SubPoolSpec):
     invariant there do not apply. With `draft_region` set, the draft's K and V
     parts follow the latent rows inside every slot's entry, as on an MHA host.
     """
+
+    zero_units_on_handout: ClassVar[bool] = True
 
     kv_lora_rank: int
     qk_rope_head_dim: int
@@ -81,6 +90,29 @@ class MLASubPoolSpec(SubPoolSpec):
         if self.draft_region is not None:
             parts += self.draft_region.parts(self.draft_offset_in_entry())
         return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
+
+    def views(self, arena) -> List[torch.Tensor]:
+        """Per-layer latent views over this sub-pool's band of ``arena``,
+        indexed by the physical token id."""
+        rows = dense_rows(arena, self.name)
+        check_physical_id_bound(sub_pool=self.name, n_rows=rows)
+        return build_dense_views(
+            arena.raw, layout=self.layout(), part_name="kv", num_slots=rows
+        )
+
+    def draft_views(self, arena) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Per-layer K and V views of the draft parts fused into this
+        sub-pool's entries: the same rows, the same ids."""
+        assert self.draft_region is not None, (
+            f"sub-pool {self.name!r} carries no fused draft region"
+        )
+        rows = dense_rows(arena, self.name)
+        return tuple(
+            build_dense_views(
+                arena.raw, layout=self.layout(), part_name=part, num_slots=rows
+            )
+            for part in ("draft_k", "draft_v")
+        )
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype

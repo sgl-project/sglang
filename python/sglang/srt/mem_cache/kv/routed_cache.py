@@ -14,8 +14,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     KVWriteLoc,
@@ -42,7 +44,7 @@ class RoutedKVCache(KVCache):
     def __init__(
         self,
         *,
-        unified_buffer,
+        arena: KVArena,
         owner: str,
         layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]],
         page_size: int,
@@ -51,10 +53,14 @@ class RoutedKVCache(KVCache):
         size: int,
         head_num: int,
         head_dim: int,
+        bs1_floor_terms: Sequence[Tuple[str, int]] = (),
     ):
-        # KVCache.__init__ allocates buffers; these views alias the unified
-        # buffer, which owns the memory.
-        self._unified_buffer = unified_buffer
+        # KVCache.__init__ allocates buffers; these views alias the arena,
+        # which owns the memory.
+        self._arena = arena
+        # Checked again on the final budget when the arena is backed after
+        # capture; a draft over the target's arena leaves it to the target.
+        self._bs1_floor_terms = tuple(bs1_floor_terms)
         self._owner = owner
         self._layer_maps = tuple(layer_maps)
         views = {name: view for name, view, _ in self._layer_maps}
@@ -66,7 +72,7 @@ class RoutedKVCache(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = sum(len(indices) for _, _, indices in self._layer_maps)
-        self.device = unified_buffer.device
+        self.device = arena.device
         self.dtype = self._owner_view.dtype
         self.store_dtype = self._owner_view.store_dtype
         for name, view in views.items():
@@ -77,7 +83,7 @@ class RoutedKVCache(KVCache):
         self.layer_transfer_counter = None
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
-        self.mem_usage = 0.0  # the unified buffer logs the real size
+        self.mem_usage = 0.0  # the arena logs the real size
 
     def _build_layer_router(self) -> KVLayerRouter:
         return KVLayerRouter.from_layer_maps(self, self._layer_maps)
@@ -88,18 +94,30 @@ class RoutedKVCache(KVCache):
             "tables: read them from the allocator or the runner's translator"
         )
 
-    # -- the unified buffer --
+    # -- the arena --
 
     @property
     def post_capture_active(self) -> bool:
-        return self._unified_buffer.post_capture_active
+        return self._arena.backed_after_capture
 
     @property
     def post_capture_backed_bytes(self) -> int:
-        return self._unified_buffer.post_capture_backed_bytes
+        return self._arena.backed_bytes
 
     def finalize_backing(self, config) -> None:
-        self._unified_buffer.finalize_backing(config)
+        """Back the final byte budget the configurator chose after capture."""
+        total_bytes = config.unified_memory_pool_bytes
+        if total_bytes is None:
+            raise ValueError(
+                "backing the KV arena after capture requires "
+                "config.unified_memory_pool_bytes"
+            )
+        check_bs1_floor(
+            total_bytes=int(total_bytes),
+            floor_terms=self._bs1_floor_terms,
+            where="RoutedKVCache.finalize_backing",
+        )
+        self._arena.finalize_backing(int(total_bytes))
 
     # -- answers of the owner's view --
 
@@ -222,8 +240,8 @@ class RoutedKVCache(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError(
-            "a unified pool compacts per sub-pool, through each view's "
-            "move_physical_pages"
+            "a unified pool compacts per sub-pool: its allocator moves units "
+            "in the arena"
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):

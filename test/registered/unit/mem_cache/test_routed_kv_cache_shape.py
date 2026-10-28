@@ -31,7 +31,7 @@ class TestRoutedKVCacheShape(CustomTestCase):
         )
         # Layers 0-2 of the stage are recurrent; full attention is layer 3.
         cache = RoutedKVCache(
-            unified_buffer=types.SimpleNamespace(device="cpu"),
+            arena=types.SimpleNamespace(device="cpu"),
             owner="full",
             layer_maps=[("full", mla, {3: 0})],
             page_size=1,

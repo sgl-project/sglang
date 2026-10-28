@@ -24,8 +24,8 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -628,8 +628,8 @@ def _translate_through_a_moving_page_map(backend):
     """Give the backend a translating pool whose virtual->physical page map the
     test rewrites before every replay, so a page-table column the refill missed
     still holds an earlier replay's page."""
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 
     rows, width = backend.req_to_token.shape
     # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.

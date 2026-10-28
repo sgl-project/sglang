@@ -81,6 +81,9 @@ class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
 class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     lifetime: KVLifetime
+    # Entries per allocation unit: the page for token sub-pools, one entry (a
+    # request's slot) for state.
+    unit: int
     layer_ids: Tuple[int, ...]
     geometry: PartGeometry
     spec: SubPoolSpec
@@ -102,6 +105,11 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     def specs(self) -> List[SubPoolSpec]:
         """Specs in the order the unified buffer takes them: the owner first."""
         return [s.spec for s in reversed(self.sub_pools)]
+
+    def sink_bytes(self) -> int:
+        """The padding sink at the low end of the buffer: every sub-pool's
+        dummy writes (entry 0) land in it, so it spans the largest unit."""
+        return max(s.unit * s.spec.entry_bytes() for s in self.sub_pools)
 
     def lifetime_types(self) -> frozenset:
         return frozenset(type(s.lifetime) for s in self.sub_pools)
@@ -241,7 +249,7 @@ def plan_kv_storage(
     chain = sorted(groups, key=_chain_key)
     sub_pools = []
     for i, key in enumerate(chain):
-        lifetime, _ = key
+        lifetime, unit = key
         layer_ids, geometry = groups[key]
         name = _SUB_POOL_NAMES[type(lifetime)]
         grow_direction = "up" if i == 0 else "down" if i == len(chain) - 1 else "float"
@@ -249,6 +257,7 @@ def plan_kv_storage(
             PlannedSubPool(
                 name=name,
                 lifetime=lifetime,
+                unit=unit,
                 layer_ids=tuple(layer_ids),
                 geometry=geometry,
                 spec=_spec_for(

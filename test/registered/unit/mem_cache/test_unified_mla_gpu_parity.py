@@ -29,6 +29,7 @@ import torch
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
@@ -58,7 +59,6 @@ def _make_pools(ps: int, n_tokens: int = 4096):
     from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.unified_memory_pool import (
-        UnifiedKVPool,
         UnifiedMLATokenToKVPool,
     )
 
@@ -80,7 +80,7 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         grow_direction="up",
     )
     total = full.entry_bytes() * n_tokens + mamba.entry_bytes() * 16
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full, mamba],
         device=_DEV,
@@ -88,12 +88,12 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         page_size=ps,
     )
     unified = UnifiedMLATokenToKVPool(
-        unified_buffer=pool,
-        sub_pool_name="full",
+        arena=pool,
+        spec=pool.spec("full"),
         kv_cache_dtype=_DTYPE,
         page_size=ps,
     )
-    max_tokens = pool.max_slots("full")
+    max_tokens = pool.num_entries("full")
     ref = MLATokenToKVPool(
         size=max_tokens - ps,
         page_size=ps,

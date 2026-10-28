@@ -67,10 +67,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,

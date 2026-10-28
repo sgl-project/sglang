@@ -70,7 +70,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         full, swa = _RecordingPool(), _RecordingPool()
         # layer 0 -> full attention; layer 1 -> SWA, each index 0 in its view.
         pool = RoutedKVCache(
-            unified_buffer=types.SimpleNamespace(device="cpu"),
+            arena=types.SimpleNamespace(device="cpu"),
             owner="full",
             layer_maps=[("full", full, {0: 0}), ("swa", swa, {1: 0})],
             page_size=1,
@@ -164,7 +164,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
 
 
 class TestUnifiedSWATombstoneClamp(unittest.TestCase):
-    """A window band's `translate_kv_loc` (its id space's write) must clamp
+    """A window band's translation (its id space's write) must clamp
     tombstoned ids to the reserved padding sink (0).
 
     A token whose swa page was freed carries -1 in `virtual_to_physical`, and a
@@ -173,17 +173,20 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     """
 
     def _make_bare_band(self, page_size, v2p):
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+        from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 
-        # A real sub-allocator (not a stand-in): the translation reads its v2p
-        # table.
-        swa_allocator = object.__new__(MultiEndedAllocator)
-        # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
-        # rows per page; equal at dcp_size == 1, which is what this fixture is.
-        swa_allocator.page_size = page_size
-        swa_allocator.pool_page_size = page_size
-        swa_allocator.virtual_to_physical = v2p
-        return swa_allocator
+        # A real unit record (not a stand-in): the translation reads its v2p
+        # table. `unit_tokens` is the physical rows per page, the widened page
+        # at dcp_size == 1, which is what this fixture is.
+        ids = UnitIds(
+            num_virtual_ids=int(v2p.numel()) - 1,
+            num_physical_units=int(v2p.numel()) - 1,
+            unit_tokens=page_size,
+            shards_under_dcp=False,
+            device="cpu",
+        )
+        ids.virtual_to_physical = v2p
+        return types.SimpleNamespace(ids=ids)
 
     def test_tombstoned_id_lands_on_sink(self):
         for ps in (1, 4):
@@ -191,7 +194,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
             band = self._make_bare_band(ps, v2p)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
             kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
-            out = band.translate_kv_loc(kv_indices)
+            out = band.ids.translate(kv_indices)
             self.assertEqual(out.dtype, torch.int64)
             self.assertTrue(
                 bool((out >= 0).all().item()),

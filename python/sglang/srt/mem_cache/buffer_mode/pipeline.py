@@ -292,7 +292,7 @@ class BufferModePipeline:
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
         router = kvcache.layer_router

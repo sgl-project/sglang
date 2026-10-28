@@ -275,8 +275,8 @@ class BuilderAdapter:
         out: Dict[str, object] = {}
         for m in self.members():
             p = m.sub_pool_name
-            out[f"{p}.v2p"] = m.virtual_to_physical.tolist()
-            out[f"{p}.p2v"] = m.physical_to_virtual.tolist()
+            out[f"{p}.v2p"] = m.ids.virtual_to_physical.tolist()
+            out[f"{p}.p2v"] = m.ids.physical_to_virtual.tolist()
             if m.grow_direction == "float":
                 out[f"{p}.edges"] = [m.low_wm_page, m.high_wm_page]
             else:

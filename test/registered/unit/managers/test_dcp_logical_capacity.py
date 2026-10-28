@@ -13,11 +13,10 @@ from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -51,7 +50,7 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
         temporal_dtype=torch.float32,
         grow_direction="up",
     )
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=full.entry_bytes() * n_full_tokens
         + mamba.entry_bytes() * n_mamba_slots,
         sub_pool_specs=[full, mamba],
@@ -60,12 +59,12 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
         page_size=1,
     )
     kvcache = NS(
-        full_kv_pool=NS(buf=torch.empty(pool.max_slots("full"))),
-        mamba_pool=NS(buf=torch.empty(pool.max_slots("mamba"))),
+        full_kv_pool=NS(buf=torch.empty(pool.num_entries("full"))),
+        mamba_pool=NS(buf=torch.empty(pool.num_entries("mamba"))),
     )
     return ChainAllocator(
         roles=ChainRoles(owner="full", state="mamba"),
-        unified_buffer=pool,
+        arena=pool,
         kvcache=kvcache,
         views=stand_in_views(
             ChainRoles(owner="full", state="mamba"), kvcache, kvcache.mamba_pool

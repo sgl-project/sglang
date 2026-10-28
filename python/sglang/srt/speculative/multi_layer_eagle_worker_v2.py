@@ -34,8 +34,8 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,

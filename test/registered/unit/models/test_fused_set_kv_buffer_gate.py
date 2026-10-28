@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PublicSubPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.models import utils as model_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

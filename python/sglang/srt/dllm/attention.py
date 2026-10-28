@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     update_sliding_window_buffer,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,

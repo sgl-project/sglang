@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,

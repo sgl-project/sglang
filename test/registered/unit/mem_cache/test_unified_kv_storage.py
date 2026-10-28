@@ -277,7 +277,7 @@ class TestHostStack(CustomTestCase):
                 allocator = cache.token_to_kv_pool_allocator
                 storage = allocator.storage
                 expected = {
-                    storage.owner: allocator.full_attn_allocator.translate_kv_loc,
+                    storage.owner: allocator.full_attn_allocator.ids.translate,
                     "swa": None,
                     "mamba": None
                     if allocator.state is None

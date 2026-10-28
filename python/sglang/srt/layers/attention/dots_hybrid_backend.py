@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

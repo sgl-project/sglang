@@ -342,9 +342,9 @@ def build_kv_only_group(
 
 def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+    from sglang.srt.mem_cache.kv.alloc.band import Band
 
-    if isinstance(allocator, MultiEndedAllocator):
+    if isinstance(allocator, Band):
         # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,
@@ -2066,7 +2066,7 @@ def validate_fused_hicache_draft(
             "the fused draft bytes."
         )
     target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._unified_buffer is not target._unified_buffer:
+    if draft_device_pools[0]._arena is not target._arena:
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 
@@ -2077,7 +2077,7 @@ def build_hicache_draft_sidecars(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
@@ -2360,7 +2360,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW
@@ -2411,7 +2411,7 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW

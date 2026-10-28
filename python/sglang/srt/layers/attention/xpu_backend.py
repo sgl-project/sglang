@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.local_attention import (
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (

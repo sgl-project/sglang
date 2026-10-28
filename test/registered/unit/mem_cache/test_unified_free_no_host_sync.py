@@ -32,18 +32,18 @@ import unittest
 from unittest import mock
 
 import torch
-from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
+from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.mem_cache.kv.alloc import chain
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import stand_in_views
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -51,7 +51,7 @@ PAGE_SIZE = _PagedFixture.PAGE_SIZE
 
 
 def _paged_allocator(lazy: bool):
-    """A real paged `MultiEndedAllocator` from the sibling fixture."""
+    """A real paged `Band` from the sibling fixture."""
     inst = _PagedFixture([m for m in dir(_PagedFixture) if m.startswith("test_")][0])
     _pool, full, _swa, _fkv, _skv = inst._build()
     full.lazy_compaction = lazy
@@ -100,14 +100,14 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
 # a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
-    (mea.MultiEndedAllocator, "_free_lazy"),
-    (mea.MultiEndedAllocator, "free"),
-    (mea.MultiEndedAllocator, "free_physical"),
-    (mea.MultiEndedAllocator, "_commit_move_batch"),
-    (mea.FloatMultiEndedAllocator, "free"),
-    (mea.FloatMultiEndedAllocator, "free_physical"),
-    (mea.FloatMultiEndedAllocator, "make_room"),
-    (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
+    (mea.Band, "_free_lazy"),
+    (mea.Band, "free"),
+    (mea.Band, "free_physical"),
+    (mea.Band, "_commit_move_batch"),
+    (mea.FloatBand, "free"),
+    (mea.FloatBand, "free_physical"),
+    (mea.FloatBand, "make_room"),
+    (mea.FloatBand, "_relocate_to_positions"),
 ]
 
 
@@ -120,7 +120,8 @@ _UNIFIED_MODULES = (mea, chain)
 
 
 def _allocators_in_module():
-    """Every allocator class DEFINED in the unified allocator modules (not imported)."""
+    """Every allocator and band class DEFINED in the unified allocator modules
+    (not imported)."""
     return sorted(
         (
             c
@@ -128,7 +129,7 @@ def _allocators_in_module():
             for c in vars(mod).values()
             if isinstance(c, type)
             and c.__module__ == mod.__name__
-            and "Allocator" in c.__name__
+            and ("Allocator" in c.__name__ or issubclass(c, mea.Band))
         ),
         key=lambda c: c.__name__,
     )
@@ -194,7 +195,7 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
         # Self-check first: a scan whose AST matching has drifted reports
         # clean on every method below.
         def _offender(self):
-            self.virtual_to_physical[free_v_pages] = -1  # noqa: F821
+            self.ids.virtual_to_physical[free_v_pages] = -1  # noqa: F821
 
         self.assertEqual(len(_scalar_index_assignments(_offender)), 1)
 
@@ -335,7 +336,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
 
     def test_all_overridden(self):
         for cls in (
-            mea.MultiEndedAllocator,
+            mea.Band,
             chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):
@@ -353,7 +354,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         """Every allocator that can receive a segment free needs the group
         buffer, or `free_segment` raises inside a group."""
         for cls in (
-            mea.MultiEndedAllocator,
+            mea.Band,
             chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):
@@ -422,12 +423,10 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     def _swa_composite(self, lazy=True, ps=None):
         from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-
         full = _make_mha_spec("full", "up", layer_num=4)
         swa = _make_mha_spec("swa", "down", layer_num=2)
         total = 64 * full.entry_bytes() + 64 * swa.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device="cpu",
@@ -437,15 +436,15 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
 
         class _KV:
             def __init__(self, p):
-                self.full_kv_pool = _FakeKVCache(p.max_slots("full"))
-                self.swa_kv_pool = _FakeKVCache(p.max_slots("swa"))
+                self.full_kv_pool = _FakeKVCache(p, "full")
+                self.swa_kv_pool = _FakeKVCache(p, "swa")
 
             def attach_allocators(self, **kwargs):
                 pass
 
         return chain.ChainAllocator(
             roles=chain.ChainRoles(owner="full", window="swa"),
-            unified_buffer=pool,
+            arena=pool,
             kvcache=_KV(pool),
             views=stand_in_views(
                 chain.ChainRoles(owner="full", window="swa"), _KV(pool)
@@ -515,8 +514,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                 a2.free_swa(v2[: 4 * self.PS])  # fallback (radix shape)
                 self.assertTrue(
                     torch.equal(
-                        a1.swa_attn_allocator.virtual_to_physical,
-                        a2.swa_attn_allocator.virtual_to_physical,
+                        a1.swa_attn_allocator.ids.virtual_to_physical,
+                        a2.swa_attn_allocator.ids.virtual_to_physical,
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
