@@ -1433,7 +1433,7 @@ class DisaggPrefill:
                 return minimax_index_transfer_pages(
                     self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
                     page_size=page_size,
-                    prefix_len=req.disagg_decode_prefix_len,
+                    prefix_len=req.disagg.decode_prefix_len,
                 )
 
             def _dsa_pages_payload():
