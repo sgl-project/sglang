@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensors_blake3
+from sglang.kernels.selector import get_kernel
 
 _DOMAIN = b"sglang-mm-structured-identity-v1"
 
@@ -145,7 +145,8 @@ def structured_digest(value) -> bytes:
     _gpu_leaves(value, batches)
     gpu_digests = {}
     for tensors in batches.values():
-        gpu_digests.update(zip(tensors, gpu_tensors_blake3(list(tensors.values()))))
+        digests = get_kernel("memory.gpu_tensors_blake3")(list(tensors.values()))
+        gpu_digests.update(zip(tensors, digests))
     return blake3.blake3(_DOMAIN + _encode(value, gpu_digests)).digest()
 
 

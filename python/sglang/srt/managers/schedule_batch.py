@@ -1217,6 +1217,7 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
+        self._user_cache_salt = self.cache_salt
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -1643,6 +1644,24 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+        self.bind_multimodal_cache_namespace()
+
+    def bind_multimodal_cache_namespace(self) -> None:
+        """Protect KV lookup with full identities, not partial pad-token matches.
+
+        A media span can contain only one token, so even wide pad sentinels
+        cannot carry its entire digest. Scope both the radix tree and storage
+        to the ordered media identities. This deliberately gives up text-prefix
+        sharing across different media while preserving same-media reuse.
+        """
+        if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
+            identities = tuple(
+                item.cache_key for item in self.multimodal_inputs.mm_items
+            )
+            self.cache_salt = (
+                "sglang-mm-v1:"
+                + structured_digest((self._user_cache_salt, identities)).hex()
+            )
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""

@@ -3,9 +3,11 @@
 import itertools
 import pickle
 import unittest
+from array import array
 from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
     _insert,
     _key,
+    _pump_insert,
     _tree_core,
 )
 from unittest.mock import patch
@@ -20,11 +22,16 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+    MultimodalInputs,
+    Req,
 )
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +45,58 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_request_namespace_prevents_partial_media_prefix_reuse(self):
+        for backend, page_size, text_len, media_len in itertools.product(
+            ("python", "rust"), (1, 16), (15, 16), (1, 32)
+        ):
+            with self.subTest(
+                backend=backend, page=page_size, text=text_len, media=media_len
+            ):
+                a, b = _item(torch.zeros(8)), _item(torch.ones(8))
+                a.set_pad_value()
+                b.set_pad_value()
+                # Simulate a short sentinel collision; full identities differ.
+                b.pad_values = (a.pad_values[0], *b.pad_values[1:])
+                b.pad_value = b.pad_values[0]
+                keys = []
+                for index, item in enumerate((a, b, a)):
+                    req = Req(
+                        rid=str(index),
+                        origin_input_text=None,
+                        origin_input_ids=[1] * text_len
+                        + item.padding_sequence(media_len)
+                        + [2] * 32,
+                        sampling_params=SamplingParams(),
+                        cache_salt="tenant",
+                    )
+                    req.extend_image_inputs(MultimodalInputs(mm_items=[item]))
+                    keys.append(
+                        RadixKey(
+                            array("q", req.origin_input_ids), cache_salt=req.cache_salt
+                        )
+                    )
+                    salt = req.cache_salt
+                    req.bind_multimodal_cache_namespace()
+                    self.assertEqual(req.cache_salt, salt)
+                self.assertNotEqual(keys[0].cache_salt, keys[1].cache_salt)
+                self.assertEqual(keys[0].cache_salt, keys[2].cache_salt)
+                self.assertNotEqual(
+                    get_storage_hash_str(keys[0]), get_storage_hash_str(keys[1])
+                )
+                core = _tree_core(backend, page_size=page_size)
+                cached_len = len(keys[0]) // page_size * page_size
+                _pump_insert(
+                    core, InsertParams(key=keys[0], value=torch.arange(cached_len))
+                )
+                self.assertEqual(
+                    core.match_prefix(MatchPrefixParams(key=keys[1])).device_prefix_len,
+                    0,
+                )
+                self.assertEqual(
+                    core.match_prefix(MatchPrefixParams(key=keys[2])).device_prefix_len,
+                    cached_len,
+                )
+
     def test_empty_numpy_retains_shape_and_dtype(self):
         keys = [
             structured_digest(np.empty(shape, dtype=dtype))
