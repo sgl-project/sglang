@@ -1900,6 +1900,8 @@ class ModelRunner:
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        if isinstance(output.logits_output, LogitsProcessorOutput):
+            output.logits_output.own_customized_info()
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (

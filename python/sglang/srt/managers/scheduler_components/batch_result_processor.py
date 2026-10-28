@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -19,7 +20,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
+    RequestCustomizedInfo,
     SamplingMaskStatus,
+    TokenCustomizedInfo,
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.schedule_batch import (
@@ -92,6 +95,38 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     if stride is None or stride < 1:
         raise RuntimeError("speculative result is missing a positive output row stride")
     return stride
+
+
+def materialize_typed_customized_info(
+    logits_output: Optional[LogitsProcessorOutput],
+) -> None:
+    """Convert the step's typed customized_info rows to host lists, once for
+    the batch. A new dict: a graph replay's capture-time dict stays as is."""
+    if logits_output is None or not logits_output.customized_info:
+        return
+    materialized = dict(logits_output.customized_info)
+    for key, value in materialized.items():
+        if isinstance(value, (TokenCustomizedInfo, RequestCustomizedInfo)):
+            if value.ready is not None:
+                value.ready.synchronize()
+            materialized[key] = type(value)(value.rows.tolist())
+    logits_output.customized_info = materialized
+
+
+def _record_token_values(
+    req: Req, key: str, row: List[Any], output_start: int, num_visible: int
+) -> None:
+    """Store a token row's visible values at their output positions."""
+    if num_visible > len(row):
+        raise RuntimeError(
+            f"{key!r} has {len(row)} values for {num_visible} committed tokens"
+        )
+    values = req.customized_info.setdefault(key, [])
+    if len(values) > output_start:
+        raise RuntimeError(f"{key!r} has values past output position {output_start}")
+    if len(values) < output_start:
+        values.extend([None] * (output_start - len(values)))
+    values.extend(row if num_visible == len(row) else row[:num_visible])
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -195,11 +230,25 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         logits_output: LogitsProcessorOutput,
+        num_new_tokens: int = 1,
     ):
+        """``req`` has just committed ``num_new_tokens`` tokens."""
         if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
                 req.customized_info = {}
+            output_start = len(req.output_ids) - num_new_tokens
             for k, v in logits_output.customized_info.items():
+                if isinstance(v, TokenCustomizedInfo):
+                    num_visible = self._visible_output_len(req) - output_start
+                    if num_visible > 0:
+                        _record_token_values(req, k, v.rows[i], output_start, num_visible)
+                    continue
+                if isinstance(v, RequestCustomizedInfo):
+                    # A re-prefill after retraction, or a running request in a
+                    # mixed batch, starts past its first output and keeps its value.
+                    if output_start == 0:
+                        req.customized_info.setdefault(k, [v.rows[i]])
+                    continue
                 if k not in req.customized_info:
                     req.customized_info[k] = []
                 # Copy the element so it doesn't retain the entire batch
@@ -294,6 +343,7 @@ class SchedulerBatchResultProcessor:
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
+            materialize_typed_customized_info(logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -972,6 +1022,7 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
         self.materialize_sampling_mask_output(batch.reqs, logits_output)
+        materialize_typed_customized_info(logits_output)
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
@@ -1053,7 +1104,9 @@ class SchedulerBatchResultProcessor:
                 self._handle_sampling_mask_abort(req)
                 continue
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req, batch, result, i, logits_output, new_accept_len
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1382,6 +1435,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        num_new_tokens: int = 1,
     ):
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
@@ -1468,7 +1522,7 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_completion_time()
 
-        self._maybe_collect_customized_info(i, req, logits_output)
+        self._maybe_collect_customized_info(i, req, logits_output, num_new_tokens)
 
     def _mamba_can_cache_finished_req(
         self, req: Req, result: GenerationBatchResult, i: int

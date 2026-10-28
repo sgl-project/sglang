@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils.common import (
+    async_d2h,
     is_cpu,
     is_npu,
     is_pin_memory_available,
@@ -216,6 +217,25 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
 
 
 @dataclasses.dataclass
+class _TypedCustomizedInfo:
+    """A ``customized_info`` value with one row per request of the batch."""
+
+    # Host lists once the scheduler materializes the batch's rows.
+    rows: Union[torch.Tensor, List[Any]]
+    # Recorded after the rows' copy to the host; reading the rows waits on it.
+    ready: Optional[torch.Event] = None
+
+
+class TokenCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size, width]``: one value per emitted token, stored at that
+    token's output position. A speculative step stores its accepted tokens'."""
+
+
+class RequestCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size]``: one value per request, stored once at its first output."""
+
+
+@dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
@@ -291,6 +311,26 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def own_customized_info(self) -> None:
+        """Copy this forward's typed customized_info rows to the host.
+
+        Producers may publish views of CUDA-graph or persistent buffers, and a
+        graph replay hands back its capture-time dict, so the next forward
+        rewrites them before the scheduler reads the result.
+        """
+        if not self.customized_info:
+            return
+        owned = dict(self.customized_info)
+        ready = None
+        for key, value in owned.items():
+            if isinstance(value, _TypedCustomizedInfo):
+                if ready is None and value.rows.device.type != "cpu":
+                    ready = torch.get_device_module(value.rows.device).Event()
+                owned[key] = type(value)(async_d2h(value.rows), ready)
+        if ready is not None:
+            ready.record()
+        self.customized_info = owned
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
