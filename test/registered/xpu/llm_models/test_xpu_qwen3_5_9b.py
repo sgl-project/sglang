@@ -24,6 +24,7 @@ class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 1
     accuracy = 0.90
+    use_sgl_eval = False
     # max_tokens=8192 lets the GSM8K CoT complete under num_threads=4.
     num_examples = 50
     num_threads = 4

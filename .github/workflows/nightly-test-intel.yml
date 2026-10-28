@@ -65,9 +65,10 @@ jobs:
           # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
-          docker exec ci_sglang_xpu cp \
-            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
-            "$dest/test/ci/ci_utils.py"
+          for f in ci/ci_utils.py xpu/simple_eval_gsm8k_xpu_mixin.py; do
+            docker exec ci_sglang_xpu cp \
+              "/sglang-checkout/python/sglang/test/$f" "$dest/test/$f"
+          done
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -173,9 +174,10 @@ jobs:
           # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
-          docker exec ci_sglang_xpu cp \
-            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
-            "$dest/test/ci/ci_utils.py"
+          for f in ci/ci_utils.py xpu/simple_eval_gsm8k_xpu_mixin.py; do
+            docker exec ci_sglang_xpu cp \
+              "/sglang-checkout/python/sglang/test/$f" "$dest/test/$f"
+          done
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -270,9 +272,10 @@ jobs:
           # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
-          docker exec ci_sglang_xpu cp \
-            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
-            "$dest/test/ci/ci_utils.py"
+          for f in ci/ci_utils.py xpu/simple_eval_gsm8k_xpu_mixin.py; do
+            docker exec ci_sglang_xpu cp \
+              "/sglang-checkout/python/sglang/test/$f" "$dest/test/$f"
+          done
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 
@@ -367,9 +370,10 @@ jobs:
           # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
-          docker exec ci_sglang_xpu cp \
-            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
-            "$dest/test/ci/ci_utils.py"
+          for f in ci/ci_utils.py xpu/simple_eval_gsm8k_xpu_mixin.py; do
+            docker exec ci_sglang_xpu cp \
+              "/sglang-checkout/python/sglang/test/$f" "$dest/test/$f"
+          done
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
             "import sglang.test.ci.ci_utils; print('overlay ok')"
 

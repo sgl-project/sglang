@@ -22,6 +22,7 @@ class TestQwen3_5_35BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-35B-A3B"
     tp_size = 4
     accuracy = 0.90
+    use_sgl_eval = False
     timeout_for_server_launch = 3600
     num_examples = 50
     num_threads = 4
