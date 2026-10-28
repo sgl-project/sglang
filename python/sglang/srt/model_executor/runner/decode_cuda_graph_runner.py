@@ -218,8 +218,8 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-        kv_loc_plan=forward_batch.kv_loc_plan,
-        kv_loc_cols=forward_batch.kv_loc_cols,
+        iteration_ids=forward_batch.iteration_ids,
+        iteration_cols=forward_batch.iteration_cols,
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,
@@ -595,7 +595,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._draft_glue_logged = 0
         self._skips_prefilled_inputs = self._resolve_skips_prefilled_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
-            self._metadata_glue = MetadataGlueGraph(self.device)
+            # The backend declared its prep capturable: in CI a failed capture fails.
+            self._metadata_glue = MetadataGlueGraph(
+                self.device, strict=envs.SGLANG_IS_IN_CI.get()
+            )
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
@@ -1262,7 +1265,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
