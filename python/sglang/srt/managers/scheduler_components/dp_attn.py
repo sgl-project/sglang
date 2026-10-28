@@ -66,7 +66,9 @@ def exchange_sync_rows(
     serial hops; gather + broadcast is one hop plus a log-depth tree. At two
     ranks the ring is the single hop, so it stays."""
     world_size = torch.distributed.get_world_size(group)
-    if local_row.device.type != "cpu" or world_size <= 2:
+    # An elastic group can count fewer ranks than the buffer has slots after a fault.
+    narrowed = global_flat.numel() != world_size * local_row.numel()
+    if local_row.device.type != "cpu" or world_size <= 2 or narrowed:
         all_gather_single(global_flat, local_row, group=group)
         return
     root = torch.distributed.get_global_rank(group, 0)
@@ -260,7 +262,6 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-            # No retry here: one rank retrying deadlocks against peers that completed.
             torch.distributed.all_reduce(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
@@ -271,19 +272,10 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            # Retried: Mooncake refuses this mid rank-fault. Retry is safe only for one
-            # collective, so Mooncake skips exchange_sync_rows (gather then broadcast).
-            from sglang.srt.elastic_ep.elastic_ep import (
-                is_mooncake_pg,
-                mooncake_all_gather_settling,
-            )
-
-            gather = all_gather_single if is_mooncake_pg(group) else exchange_sync_rows
-            mooncake_all_gather_settling(
+            exchange_sync_rows(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
-                gather=gather,
             )
 
         tp_info = global_info_tensor.view(
