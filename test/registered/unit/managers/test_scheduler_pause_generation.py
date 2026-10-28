@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch

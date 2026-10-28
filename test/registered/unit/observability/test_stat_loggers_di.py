@@ -32,6 +32,8 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
