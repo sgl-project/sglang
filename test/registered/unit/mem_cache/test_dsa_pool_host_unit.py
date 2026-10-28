@@ -3,6 +3,8 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
@@ -11,9 +13,39 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=19, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _build_mla_host(device_pool, page_size: int, pin_memory: bool):
+    """Mirror the production MLATokenToKVPoolHost construction for a DSA pool."""
+    return MLATokenToKVPoolHost(
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        host_to_device_ratio=2.0,
+        host_size=0,
+        page_size=page_size,
+        layout="layer_first",
+        pin_memory=pin_memory,
+        device="cpu",
+        allocator_type="default",
+        override_kv_cache_dim=device_pool.kv_cache_dim,
+        device_capacity_tokens=(
+            device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens
+        ),
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        target_layer_num=(
+            (device_pool.layer_num + device_pool.layer_shard_size - 1)
+            // device_pool.layer_shard_size
+            if device_pool.layer_shard_enabled
+            else device_pool.layer_num
+        ),
+        layer_shard_enabled=device_pool.layer_shard_enabled,
+    )
 
 
 def _make_indexer_host(pool, anchor, *, packed_draft_device_pools=(), **kwargs):
@@ -96,31 +128,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             use_fp4_indexer=use_fp4_indexer,
         )
         pin_memory = io_backend == "kernel"
-        mla_host = MLATokenToKVPoolHost(
-            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=page_size,
-            layout="layer_first",
-            pin_memory=pin_memory,
-            device="cpu",
-            allocator_type="default",
-            override_kv_cache_dim=device_pool.kv_cache_dim,
-            device_capacity_tokens=(
-                device_pool.size
-                if device_pool.host_capacity_tokens is None
-                else device_pool.host_capacity_tokens
-            ),
-            start_layer=device_pool.start_layer,
-            end_layer=device_pool.end_layer,
-            target_layer_num=(
-                (device_pool.layer_num + device_pool.layer_shard_size - 1)
-                // device_pool.layer_shard_size
-                if device_pool.layer_shard_enabled
-                else device_pool.layer_num
-            ),
-            layer_shard_enabled=device_pool.layer_shard_enabled,
-        )
+        mla_host = _build_mla_host(device_pool, page_size, pin_memory)
         indexer_host = _make_indexer_host(
             device_pool,
             mla_host,
@@ -222,6 +230,143 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         for fp4 in (False, True):
             with self.subTest(fp4=fp4):
                 self._run_device_to_host_indexer_copy("direct", fp4)
+
+
+class TestDSAIndexKElision(CustomTestCase):
+    """Skip-topk layers get a 0-row index-K buffer, and the host (L2) indexer
+    pool packs only the layers that actually own index keys."""
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for DSA pool allocation tests.")
+        if is_npu() or is_xpu() or not (is_cuda() or is_hip()):
+            self.skipTest("DSA pool allocation tests only support CUDA/ROCm.")
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
+    @staticmethod
+    def _build_pool(page_size: int, skip_topk_layers):
+        return DSATokenToKVPool(
+            size=page_size * 4,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=len(skip_topk_layers),
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+            skip_topk_layers=skip_topk_layers,
+        )
+
+    def test_skip_topk_layers_get_zero_row_buffers(self):
+        page_size = 1 if is_hip() else 64
+        # Layer 1 reuses layer 0's top-k, so it never writes index-K.
+        pool = self._build_pool(page_size, [False, True, False])
+
+        buffers = pool.index_k_with_scale_buffer
+        self.assertEqual(buffers[1].shape[0], 0)
+        self.assertGreater(buffers[0].shape[0], 0)
+        self.assertGreater(buffers[2].shape[0], 0)
+
+        # The PD wire layer trims on these: a 0-byte region is never registered
+        # (Mooncake rejects it) and `is_elided_entry` drops the transfer pair.
+        _, data_lens, item_lens = pool.get_state_buf_infos()
+        self.assertEqual(data_lens[1], 0)
+        self.assertEqual(item_lens[1], 0)
+        self.assertGreater(item_lens[0], 0)
+        self.assertGreater(item_lens[2], 0)
+
+    def test_all_layers_owned_when_nothing_is_skipped(self):
+        page_size = 1 if is_hip() else 64
+        pool = self._build_pool(page_size, [False, False])
+
+        self.assertTrue(all(buf.shape[0] > 0 for buf in pool.index_k_with_scale_buffer))
+        _, data_lens, item_lens = pool.get_state_buf_infos()
+        self.assertTrue(all(length > 0 for length in data_lens))
+        self.assertTrue(all(length > 0 for length in item_lens))
+
+    def test_host_indexer_pool_packs_only_owning_layers(self):
+        page_size = 1 if is_hip() else 64
+        skip_topk_layers = [False, True, False, True]
+        pool = self._build_pool(page_size, skip_topk_layers)
+
+        (index_info,) = [
+            info
+            for info in pool.get_device_pool_infos()
+            if info.pool_name == PoolName.INDEXER
+        ]
+        self.assertEqual(
+            index_info.layer_ids, tuple(pool.model_layer_ids[i] for i in (0, 2))
+        )
+
+        mla_host = _build_mla_host(pool, page_size, pin_memory=True)
+        indexer_host = _make_indexer_host(
+            pool, mla_host, pin_memory=True, device="cpu", allocator_type="default"
+        )
+        self.addCleanup(mla_host.destroy)
+        self.addCleanup(indexer_host.destroy)
+
+        # Host storage is compacted: 2 owning layers out of 4 device layers,
+        # addressed by compact slot rather than by device layer id.
+        self.assertEqual(indexer_host.target_layer_num, 2)
+        self.assertEqual(indexer_host._host_layer_index(0), 0)
+        self.assertEqual(indexer_host._host_layer_index(2), 1)
+        self.assertEqual(indexer_host._owned_device_layer_ids(pool), [0, 2])
+        self.assertFalse(indexer_host._is_device_layer_owned(pool, 1))
+
+    def test_pool_exposes_no_indexer_info_when_every_layer_skips(self):
+        page_size = 1 if is_hip() else 64
+        pool = self._build_pool(page_size, [True, True])
+
+        # No layer owns index keys, so there is nothing to mirror to the host.
+        names = [info.pool_name for info in pool.get_device_pool_infos()]
+        self.assertNotIn(PoolName.INDEXER, names)
+
+    def test_hisparse_pool_elides_and_scales_the_saving_by_the_ratio(self):
+        # HiSparse sizes index-K at logical (host) capacity on the device via
+        # `index_buf_size = size * host_to_device_ratio`, so eliding a skip layer
+        # saves ratio times as much as on a plain DSA pool. The elide decision
+        # still arrives as the same `skip_topk_layers` kwarg.
+        page_size = 1 if is_hip() else 64
+        ratio = 2
+
+        def build(skip_topk_layers):
+            return HiSparseDSATokenToKVPool(
+                size=page_size * 4,
+                page_size=page_size,
+                kv_lora_rank=128,
+                dtype=torch.bfloat16,
+                qk_rope_head_dim=32,
+                layer_num=len(skip_topk_layers),
+                device="cuda",
+                index_head_dim=128,
+                enable_memory_saver=False,
+                kv_cache_dim=576,
+                skip_topk_layers=skip_topk_layers,
+                host_to_device_ratio=ratio,
+            )
+
+        elided = build([False, True, False, True])
+        self.assertEqual(elided.index_k_with_scale_buffer[1].shape[0], 0)
+        self.assertEqual(elided.index_k_with_scale_buffer[3].shape[0], 0)
+        _, data_lens, item_lens = elided.get_state_buf_infos()
+        self.assertEqual([data_lens[1], data_lens[3]], [0, 0])
+        self.assertEqual([item_lens[1], item_lens[3]], [0, 0])
+
+        full = build([False, False, False, False])
+        elided_bytes = sum(b.nbytes for b in elided.index_k_with_scale_buffer)
+        full_bytes = sum(b.nbytes for b in full.index_k_with_scale_buffer)
+        # 2 of 4 layers own index-K.
+        self.assertEqual(elided_bytes * 2, full_bytes)
+        # Each owning layer still covers the full logical host capacity.
+        rows_per_owning_layer = elided.index_k_with_scale_buffer[0].shape[0]
+        self.assertEqual(
+            rows_per_owning_layer, full.index_k_with_scale_buffer[0].shape[0]
+        )
+        self.assertGreater(rows_per_owning_layer, 0)
 
 
 if __name__ == "__main__":
