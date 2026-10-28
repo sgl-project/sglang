@@ -437,17 +437,7 @@ def _bf16_gemm_dispatch_impl(
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
-    if (
-        _use_rdna_splitk_gemv is not None
-        and bias is None
-        and x.is_contiguous()
-        and weight.is_contiguous()
-        and _use_rdna_splitk_gemv(m, weight.shape[0], weight.shape[1], weight.dtype)
-    ):
-        output = _rdna_splitk_gemv(x.view(-1, x.shape[-1]), weight).view(
-            *x.shape[:-1], weight.shape[0]
-        )
-    elif _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
@@ -610,6 +600,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif (
+            _use_rdna_splitk_gemv is not None
+            and bias is None
+            and x.is_contiguous()
+            and layer.weight.is_contiguous()
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and _use_rdna_splitk_gemv(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+                layer.weight.dtype,
+            )
+        ):
+            return _rdna_splitk_gemv(
+                x.view(-1, x.shape[-1]), layer.weight
+            ).view(*x.shape[:-1], layer.weight.shape[0])
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
