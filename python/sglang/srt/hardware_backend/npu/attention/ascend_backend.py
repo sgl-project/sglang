@@ -543,16 +543,6 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-            if (
-                self.dense_mla_dcp_target
-                and forward_batch.forward_mode.is_target_verify()
-                and _is_dflash_verify(forward_batch.spec_info)
-            ):
-                # DFlash/DSPARK replay Host lengths include the verify block.
-                # Adapt capture prefixes to the same convention for _apply.
-                host_seq_lens_cpu = (
-                    host_seq_lens_cpu + self.speculative_num_draft_tokens
-                )
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
