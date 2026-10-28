@@ -43,10 +43,6 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.disaggregation.custom_mem_pool import (
-    maybe_init_custom_mem_pool as maybe_init_custom_mem_pool,
-)
-from sglang.srt.environ import envs as envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
