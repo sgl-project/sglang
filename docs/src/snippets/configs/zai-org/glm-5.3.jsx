@@ -236,13 +236,23 @@ sgl-eval run aime25 \\
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "Not validated on AMD ROCm (MI300X/MI325X/MI355X): --speculative-num-steps > 3 hits a separate build issue on gfx950. MI355X runs EAGLE 3-1-4 in the agentic recipe of section 3.6." },
+          disable: [
+            { when: { hw: ["mi325x", "mi300x"] },
+              reason: "Not validated on MI300X/MI325X." },
+            { when: { hw: ["mi355x"], quant: ["bf16"] },
+              reason: "Not validated with the BF16 checkpoint on MI355X." },
+            { when: { hw: ["mi355x"], strategy: ["high-throughput"] },
+              reason: "On MI355X, the high-throughput cell runs out of memory at startup with 5 draft steps (CUDA graphs up to 256 requests at --mem-fraction-static 0.85). Use 1-1-2 there." },
+          ] },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "Not validated on AMD ROCm (MI300X/MI325X/MI355X). MI355X runs EAGLE 3-1-4 in the agentic recipe of section 3.6." },
+          disable: [
+            { when: { hw: ["mi325x", "mi300x"] },
+              reason: "Not validated on MI300X/MI325X." },
+            { when: { hw: ["mi355x"], quant: ["bf16"] },
+              reason: "Not validated with the BF16 checkpoint on MI355X." },
+          ] },
         { id: "dflash", label: "DFlash2 (block diffusion)",
           // Block-wise draft from a separate checkpoint, not the in-checkpoint
           // MTP layer. The block size (8) comes from the draft's own
@@ -1089,9 +1099,10 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
-    // No MTP: the Speculative card keeps its presets off on AMD (num-steps>3
-    // hits a separate build issue on gfx950); MI355X runs EAGLE 3-1-4 in the
-    // MDX agentic recipe (section 3.6).
+    // MTP: the MI355X FP8 low-latency cell serves EAGLE 3-1-4, as the MDX
+    // agentic recipe (section 3.6) does; the other AMD cells serve without MTP.
+    // The Speculative card offers its presets on the MI355X FP8 cells only, and
+    // not 5-1-6 at high throughput (startup OOM).
     // Strategies differ only by batch-shaping levers
     // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
     //   low-latency      — large chunked-prefill, default bs.
@@ -1109,6 +1120,10 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 131072",
         "--mem-fraction-static 0.80",
         "--watchdog-timeout 1200",
