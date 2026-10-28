@@ -120,6 +120,7 @@ class PrefillBudget:
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         """Return admission feasibility and a memory bound on the requested chunk."""
         return (
@@ -235,6 +236,7 @@ class SWAPrefillBudget(PrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         if total_tokens >= self.remaining_total:
             return False, None
@@ -398,6 +400,7 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         needed = self.swa_tokens(
             extend_input_len,

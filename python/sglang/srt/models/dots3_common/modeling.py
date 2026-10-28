@@ -48,9 +48,9 @@ from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
@@ -78,8 +78,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -94,8 +94,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -126,7 +126,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     ceil_align,
     ceil_div,
-    get_bool_env_var,
     is_cuda,
     log_info_on_rank0,
     make_pp_layers,
@@ -278,9 +277,7 @@ class Dots3MoE(nn.Module):
         super().__init__()
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -314,17 +311,17 @@ class Dots3MoE(nn.Module):
         )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=config.num_experts_per_tok,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -469,14 +466,10 @@ class Dots3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
         final_hidden_states = self.experts(
@@ -484,14 +477,15 @@ class Dots3MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if fused_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif not self.experts.should_fuse_routed_scaling_factor_in_topk:
+        elif not fused_in_topk:
             final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -1604,7 +1598,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.model = Dots3Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1648,10 +1643,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             )
         return None
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1667,9 +1662,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
         if mm_inputs.audio_start_id is not None and mm_inputs.audio_end_id is not None:
             token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
-        return MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=token_pairs or None
-        ).pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=token_pairs or None
+        )
 
     def _get_precomputed_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         embed_param = next(self.model.embed_tokens.parameters())
@@ -1791,7 +1786,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
-                    and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                    and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
                     # The issue is that when multiplying w_kc the reduction dim can not be divided
@@ -2476,6 +2471,10 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         return Dots3LanguageModelForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        return Dots3LanguageModelForCausalLM.num_fusable_shared_experts(hf_config)
 
     def __init__(
         self,

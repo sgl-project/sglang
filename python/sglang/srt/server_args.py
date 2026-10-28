@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
@@ -300,8 +301,17 @@ class ServerArgs:
 
     @property
     def launch_command(self) -> str | None:
-        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
+        """Original CLI arguments or Engine call, with secrets redacted."""
         return getattr(self, "_launch_command", None)
+
+    def __repr__(self) -> str:
+        hidden = {"watermark_key", "watermark_key_b", "watermark_config"}
+        values = ", ".join(
+            f"{field.name}={getattr(self, field.name)!r}"
+            for field in record_fields(type(self))
+            if field.name not in hidden
+        )
+        return f"ServerArgs({values})"
 
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
@@ -361,7 +371,7 @@ class ServerArgs:
             choices=["auto"] + reasoning_parser_choices,
             default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
-            f"Use 'auto' to detect from chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {reasoning_parser_choices}.",
         )
         tool_call_parser_choices = _tool_call_parser_choices()
@@ -371,7 +381,7 @@ class ServerArgs:
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
-            f"Use 'auto' to detect from chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
@@ -411,6 +421,19 @@ class ServerArgs:
             new_flag="--attn-dp-size <dp-size>",
             help="Deprecated. Use --attn-dp-size <dp-size> instead of "
             "--dp-size <dp-size> --enable-dp-attention.",
+        )
+        # amd was the only monokernel backend the flag could name.
+        parser.add_argument(
+            "--monokernel-backend",
+            action=DeprecatedStoreConstAction,
+            dest="enable_amd_monokernel",
+            nargs=None,
+            choices=["amd"],
+            const_value=True,
+            default=False,
+            new_flag="--enable-amd-monokernel",
+            help="Deprecated. Use --enable-amd-monokernel instead of "
+            "--monokernel-backend amd.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -574,8 +597,8 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
     GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
     sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
-    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
-    bf16 q) without having to move off trtllm_mha.
+    it forces bf16 q with the widening sparse/indexer path without having to
+    move off trtllm_mha.
     """
     from sglang.srt.environ import envs
 
@@ -688,7 +711,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
+
+    server_args._launch_command = redact_watermark_command_line(
+        argv, raw_args.watermark_config
+    )
     return server_args
 
 

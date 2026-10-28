@@ -98,15 +98,20 @@ The configuration file is read at server startup. Its supported fields are:
 | `timeout` | HTTP operation timeout in seconds; defaults to `60` |
 | `api_key_env` | Name of an environment variable on the diffusion server containing the SRT API key |
 | `generation_kwargs` | SRT chat-completion options, such as `max_tokens`, `temperature`, `chat_template_kwargs`, or `response_format` |
+| `tasks` | Per-task settings for `image`, `image_edit`, or `video`; see below |
+| `protocol` | Optional built-in enhancer protocol; currently `flux3-klein-pup` |
+| `protocol_source` | Local directory or Hugging Face repo containing the protocol's files; omit to use the protocol's default repository |
 
-Default generation options are `max_tokens=512` and `temperature=0`.
+Without a built-in protocol, default generation options are `max_tokens=512`
+and `temperature=0`.
 `generation_kwargs` cannot replace the model, messages, single-output or
 non-streaming settings, or enable tools. Choose a non-thinking model or configure
 its supported chat template to suppress reasoning; only message `content` is
 used as the diffusion prompt.
 
-The enhancer receives a JSON text message containing `task` (`image`,
-`image_edit`, or `video`) and `prompt`. It returns the replacement prompt as
+Unless a task sets `user_template`, the enhancer receives a JSON text message
+containing `task` (`image`, `image_edit`, or `video`) and `prompt`.
+It returns the replacement prompt as
 text. Seed, negative prompt, references and diffusion sampling options are not
 rewritten. The diffusion frontend reuses HTTP connections and makes no enhancer
 calls during synthetic warmup.
@@ -115,6 +120,43 @@ Timeouts return HTTP 504. Upstream failures, empty responses and truncated
 completions return HTTP 502 before diffusion is queued. There is no automatic
 retry or fallback to the original prompt. An unconfigured server rejects
 `enhance_prompt=true` with HTTP 400.
+
+### Task-specific templates and sampling
+
+Each entry in `tasks` accepts:
+
+| Field | Meaning |
+| --- | --- |
+| `system_prompt` | Override the top-level system instruction for this task |
+| `user_template` | User message text containing `{prompt}`, which is replaced by the request prompt |
+| `images_first` | Put image content before text; defaults to `false` and requires top-level `include_images=true` to forward images |
+| `generation_kwargs` | Override individual top-level chat-completion options for this task |
+
+For example, keep image rewriting on the default JSON protocol while giving
+video rewriting its own instruction and token limit:
+
+```json
+{
+  "base_url": "http://127.0.0.1:31000/v1",
+  "model": "Qwen/Qwen3-4B-Instruct-2507",
+  "tasks": {
+    "video": {
+      "system_prompt": "Expand the video prompt while preserving its subjects, motion and timing. Return only the rewritten prompt.",
+      "user_template": "Video prompt: {prompt}",
+      "generation_kwargs": {"max_tokens": 256}
+    }
+  }
+}
+```
+
+Use `protocol="flux3-klein-pup"` for the checkpoint-specific
+[FLUX.3 prompt upsampler](/cookbook/diffusion/FLUX/FLUX.3#7-prompt-upsampler).
+It loads `system_prompts.json` and supplies image/edit templates, sampling
+defaults and image forwarding. Top-level `generation_kwargs` override protocol
+sampling defaults; task-level options take precedence over both. An explicit
+`tasks` entry replaces that protocol task's entire configuration, not just its
+specified fields. Include the required template and system instruction when
+overriding a protocol task.
 
 ## Choose a model combination
 

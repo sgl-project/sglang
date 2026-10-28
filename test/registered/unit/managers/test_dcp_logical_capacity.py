@@ -22,7 +22,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 PHYSICAL = 690240
 CONTEXT = 1048576
@@ -32,6 +32,7 @@ def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    configurator.model_config = NS(hf_config=NS(architectures=["LlamaForCausalLM"]))
     return configurator
 
 
@@ -149,6 +150,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.swa_max_total_num_tokens = 16
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
+
+    def test_short_pool_warning_uses_served_capacity(self):
+        # dcp1 serves 690K < 1M and warns; dcp2 widens the same rows to 1.38M.
+        with self.assertLogs("sglang.srt.managers.tp_worker", "WARNING") as cm:
+            TpModelWorker.get_worker_info(self.make_worker(1))
+        self.assertIn(f"{PHYSICAL} tokens", cm.output[0])
+        with self.assertNoLogs("sglang.srt.managers.tp_worker", "WARNING"):
+            TpModelWorker.get_worker_info(self.make_worker(2))
 
 
 if __name__ == "__main__":

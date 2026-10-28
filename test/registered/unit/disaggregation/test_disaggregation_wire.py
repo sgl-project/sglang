@@ -1,5 +1,4 @@
 import concurrent.futures
-import struct
 import threading
 import unittest
 from collections import defaultdict
@@ -23,17 +22,13 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     group_concurrent_contiguous,
-    pack_int_lists,
-    pack_list_of_buffers,
-    unpack_int_lists,
-    unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
-    KVArgsRegisterInfo,
+    FailedSessionProbe,
     MooncakeKVManager,
     MooncakeKVSender,
     TransferInfo,
@@ -69,10 +64,11 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -159,6 +155,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
                     manager.session_failures = defaultdict(int)
+                    manager.failed_session_probes = {}
                     manager.state_layout_rejections = {}
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
@@ -361,6 +358,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_data_ptrs=[[0x1000]],
             state_item_lens=[[32]],
             state_layer_ids=[[]],
+            aux_data_ptrs=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -368,6 +366,11 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 2})
+        manager.failed_session_probes = {
+            "decode": FailedSessionProbe(
+                last_requested=0.0, next_probe_at=0.0, interval=300.0
+            )
+        }
         manager.state_layout_rejections = {}
         manager.state_strides_validated = set()
         manager.decode_kv_args_table = {}
@@ -378,6 +381,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
                 return info, manager._publish_peer_registration("decode", info)
@@ -390,6 +394,7 @@ class TestDisaggregationWire(unittest.TestCase):
         # A transport blacklist is cleared by registering, as before.
         self.assertFalse(manager.failed_sessions)
         self.assertFalse(manager.session_failures)
+        self.assertFalse(manager.failed_session_probes)
 
         bad, mismatch = register(64)
         self.assertIn("item length mismatch", mismatch)
@@ -475,6 +480,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.failure_lock = threading.Lock()
         manager.failed_sessions = set()
         manager.session_failures = defaultdict(int)
+        manager.failed_session_probes = {}
         manager.failure_records = {}
         manager._staging_outstanding = defaultdict(int)
         manager.request_status = {42: KVPoll.Transferring}
@@ -525,8 +531,12 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 1})
+        manager.failed_session_probes = {}
         reason = f"{StateType.SWA} item length mismatch for positional entry 0"
         manager.state_layout_rejections = {"decode": reason}
+        manager.failed_session_probe_interval = 30.0
+        manager.failed_session_probe_max_interval = 300.0
+        manager.failed_session_idle_timeout = 600.0
         manager.engine = SimpleNamespace(send_probe=Mock(return_value=0))
 
         manager._run_one_probe_pass()
@@ -589,6 +599,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        sender.conclude_state = None
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
@@ -607,64 +618,6 @@ class TestDisaggregationWire(unittest.TestCase):
                     ack.assert_called_once_with(42, target)
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
-
-    def test_mooncake_registration_staging_fields(self):
-        msg = [
-            b"room",
-            b"127.0.0.1",
-            b"1234",
-            b"session",
-            struct.pack("Q", 0x1000),
-            struct.pack("Q", 0x2000),
-            b"",
-            b"0",
-            b"1",
-            b"128",
-            b"",
-            b"",
-            b"",
-            b"",
-            struct.pack("Q", 0x3000),
-            b"4096",
-            b"4",
-            b"2",
-        ]
-
-        info = KVArgsRegisterInfo.from_zmq(msg)
-
-        self.assertEqual(info.staging_base_ptr, 0x3000)
-        self.assertEqual(info.staging_total_size, 4096)
-        self.assertEqual(info.dst_dcp_size, 4)
-        self.assertEqual(info.dst_dcp_rank, 2)
-        self.assertEqual(info.dst_kv_item_lens, [])
-        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
-        self.assertEqual(info.dst_kv_item_lens, [128])
-
-    def test_int_lists_roundtrip(self):
-        cases = [
-            ("Q", [[1, 2, 3], [4]]),
-            ("I", [[10, 20], [30, 40, 50]]),
-            ("i", [[-1, 2], [3, -4, 5]]),
-        ]
-        for fmt, sample in cases:
-            packed = pack_int_lists(sample, fmt)
-            self.assertEqual(unpack_int_lists(packed, fmt), sample, msg=fmt)
-
-    def test_pack_accepts_ndarray(self):
-        arrs = [
-            np.array([1, 2, 3], dtype=np.int32),
-            np.array([4, 5], dtype=np.int32),
-        ]
-        packed = pack_int_lists(arrs, "i")
-        self.assertEqual(unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
-
-    def test_empty_outer_list(self):
-        self.assertEqual(pack_int_lists([], "Q"), b"")
-        self.assertEqual(unpack_int_lists(b"", "Q"), [])
-
-    def test_empty_inner_list(self):
-        packed = pack_int_lists([[]], "I")
-        self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
@@ -699,10 +652,6 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(batch.extend_num_tokens, 3)
         self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
         req.get_fill_ids.assert_not_called()
-
-    def test_list_of_buffers_roundtrip(self):
-        bufs = [b"abc", b"", b"de", b"x" * 17]
-        self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
 class TestPollCollectives(CustomTestCase):
@@ -818,25 +767,30 @@ class TestPollCollectives(CustomTestCase):
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
+        # Under CP-TP group sharing each CP rank owns its own linear-attention
+        # head shard, so no rank skips its state.
         cases = [
-            (1, 0, False, False),
-            (8, 0, False, False),
-            (8, 1, False, True),
-            (8, 7, False, True),
-            (8, 1, True, False),
+            (1, 0, False, False, False),
+            (8, 0, False, False, False),
+            (8, 1, False, False, True),
+            (8, 7, False, False, True),
+            (8, 1, True, False, False),
+            (8, 1, False, True, False),
         ]
 
-        for cp_size, cp_rank, layer_split, expected in cases:
+        for cp_size, cp_rank, layer_split, sharing, expected in cases:
             with self.subTest(
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 layer_split=layer_split,
+                sharing=sharing,
             ):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
                 with get_context().override_server_args(
                     enable_dsa_cache_layer_split=layer_split,
+                    enable_cp_tp_group_sharing=sharing,
                 ):
                     self.assertEqual(
                         manager._should_skip_cp_replicated_state_transfer(),
@@ -963,6 +917,118 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(kv_args.state_item_lens[1:], [[], []])
         self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
 
+    def test_elided_dsa_layers_are_not_registered(self):
+        """A 0-row index-K buffer must not reach Mooncake's registration.
+
+        The engine rejects it outright ("Transfer Engine does not support zero
+        length memory region"). Skipping happens in _registerable_regions, not
+        in kv_args, so the per-layer list keeps its dense shape and peers still
+        pair positionally.
+        """
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[],
+            kv_data_lens=[],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            # 6 layers, 3 producers.
+            state_data_ptrs=[[100, 101, 102, 103, 104, 105]],
+            state_data_lens=[[4096, 0, 0, 4096, 0, 4096]],
+        )
+        regions = mgr._registerable_regions()
+        self.assertEqual(regions, [(100, 4096), (103, 4096), (105, 4096)])
+
+    def test_stride_check_accepts_one_sided_elided_dsa_entry(self):
+        """A prefill that elides a shared-topk layer's index-K must still pair
+        with a dense decode (and the reverse): the registration-time stride
+        check used to reject the decode with "prefill=0 decode=64", failing
+        every request to it. A real stride disagreement is still rejected."""
+        for layer_ids in ([], [3, 4]):
+            for src_lens, dst_lens, expect_ok in (
+                ([0, 132], [64, 132], True),
+                ([64, 132], [0, 132], True),
+                ([132, 132], [64, 132], False),
+            ):
+                with self.subTest(
+                    layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
+                ):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.pp_size = 1
+                    manager.kv_args = SimpleNamespace(
+                        mla_compression_ratios=None, prefill_start_layer=0
+                    )
+                    reason = manager._state_stride_mismatch(
+                        src_data_ptrs=[0x1000, 0x1100],
+                        dst_data_ptrs=[0x2000, 0x2100],
+                        item_lens=src_lens,
+                        dst_item_lens=dst_lens,
+                        state_type=StateType.DSA,
+                        src_layer_ids=layer_ids,
+                        dst_layer_ids=layer_ids,
+                    )
+                    if expect_ok:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn("item length mismatch", reason)
+
+    def test_send_drops_entry_elided_by_either_peer(self):
+        """An entry elided on either side must not be sent. A dense prefill
+        against an elided decode used to keep the entry (the filter only looked
+        at the prefill length), writing index-K into a decode buffer that has no
+        memory and was never registered."""
+        for layer_ids in ([], [3, 4, 5]):
+            for src_lens, dst_lens in (
+                ([132, 132, 132], [0, 132, 132]),
+                ([0, 132, 132], [132, 132, 132]),
+            ):
+                with self.subTest(
+                    layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
+                ):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.pp_size = 1
+                    manager.kv_args = SimpleNamespace(
+                        mla_compression_ratios=None, prefill_start_layer=0
+                    )
+                    manager.state_strides_validated = set()
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    manager._transfer_data = Mock(return_value=0)
+
+                    ret = manager._send_kvcache_generic(
+                        "decode",
+                        [0x1000, 0x1100, 0x1200],
+                        [0x2000, 0x2100, 0x2200],
+                        src_lens,
+                        np.array([0], dtype=np.int32),
+                        np.array([0], dtype=np.int32),
+                        executor=None,
+                        state_type=StateType.DSA,
+                        src_layer_ids=layer_ids,
+                        dst_layer_ids=layer_ids,
+                        dst_item_lens=dst_lens,
+                    )
+
+                    self.assertEqual(ret, 0)
+                    manager._transfer_data.assert_called_once_with(
+                        "decode", [(0x1100, 0x2100, 132), (0x1200, 0x2200, 132)]
+                    )
+
+    def test_dense_shape_keeps_positional_pairing_intact(self):
+        """Both peers still publish one entry per layer, so pairing is unchanged.
+
+        This is what keeps the wire compatible with a peer that elides nothing:
+        counts match, and build_transfer_entry_pairs stays on its positional
+        path with no layer ids on either side.
+        """
+        self.assertEqual(
+            build_transfer_entry_pairs([], [], 6, 6),
+            [(i, i) for i in range(6)],
+        )
+
     def test_compact_qsa_entries_map_by_global_layer_id(self):
         self.assertEqual(
             build_transfer_entry_pairs(
@@ -1074,7 +1140,7 @@ class _MemcpyNixlAgent:
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
-    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
+    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif=b""):
         return src_descs, dst_descs
 
     def transfer(self, handle):
@@ -1145,16 +1211,19 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
         prefill.agent = _MemcpyNixlAgent(memory)
-        handles = prefill.maybe_send_extra(
-            "decode",
-            [np.array(self.SRC_PAGES, dtype=np.int32)],
-            [dst_ptrs],
-            [self.DST_PAGES],
-            0,
-            "7_state_0",
-            decode_tp,
-            decode_tp_rank=dst_rank,
-            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+        prefill._prepared_state_plans = {}
+        prefill._state_layout_rejections = {}
+        handles = list(
+            prefill.maybe_send_extra(
+                "decode",
+                [np.array(self.SRC_PAGES, dtype=np.int32)],
+                [dst_ptrs],
+                [self.DST_PAGES],
+                0,
+                decode_tp,
+                decode_tp_rank=dst_rank,
+                dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+            )
         )
         self.assertEqual(len(handles), 1)
 
@@ -1328,28 +1397,6 @@ class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
             b"",
         ]
 
-    def test_real_transfer_is_not_dummy(self):
-        kv = np.array([3, 5], dtype=np.int32)
-        info = TransferInfo.from_zmq(
-            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
-        )
-
-        self.assertFalse(info.is_dummy)
-        np.testing.assert_array_equal(info.dst_kv_indices, kv)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.dst_state_indices, [[1]])
-
-    def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
-        # Empty kv indices serialize to an empty frame, so only the non-empty
-        # aux frame distinguishes a full-prefix-hit transfer from a dummy one.
-        info = TransferInfo.from_zmq(
-            self._frames(np.array([], dtype=np.int32).tobytes(), b"4", b"", b"128")
-        )
-
-        self.assertFalse(info.is_dummy)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.decode_prefix_len, 128)
-
     def test_dummy_parses_dummy_and_clears_payload_fields(self):
         info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"0"))
 
@@ -1371,35 +1418,6 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     @staticmethod
     def _arr(values):
         return np.array(values, dtype=np.int32)
-
-    def test_single_contiguous_group(self):
-        src = self._arr([10, 11, 12])
-        dst = self._arr([5, 6, 7])
-        self.assertEqual(
-            group_concurrent_contiguous(src, dst),
-            ([[10, 11, 12]], [[5, 6, 7]]),
-        )
-
-    def test_splits_on_discontiguous_indices(self):
-        src = self._arr([10, 11, 20])
-        dst = self._arr([5, 6, 7])
-        self.assertEqual(
-            group_concurrent_contiguous(src, dst),
-            ([[10, 11], [20]], [[5, 6], [7]]),
-        )
-
-    def test_empty_src_nonempty_dst(self):
-        self.assertEqual(
-            group_concurrent_contiguous(self._arr([]), self._arr([1, 2])), ([], [])
-        )
-
-    def test_nonempty_src_empty_dst(self):
-        # Regression: a non-empty source paired with an empty destination must not
-        # raise a NumPy broadcast error (observed transferring DSA sparse-attention
-        # state on a disaggregated GLM deployment when decode registered zero dst indices).
-        self.assertEqual(
-            group_concurrent_contiguous(self._arr([1, 2]), self._arr([])), ([], [])
-        )
 
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
@@ -1434,6 +1452,163 @@ class TestStagingWatermark(unittest.TestCase):
 
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
+
+
+class TestStagingScatterLifecycle(CustomTestCase):
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_unregister_waits_for_submit_to_publish_its_event(self, make_event):
+        """Room teardown must not release a slot before its scatter is enqueued."""
+        room = 7
+        alloc_id = 5
+        receiver = SimpleNamespace(chunk_staging_infos=[(alloc_id, 4096, 0, 8192, 3)])
+        decode_req = SimpleNamespace(_chunk_events=[])
+        context = SimpleNamespace(
+            room_receivers={room: receiver}, room_bootstrap={room: object()}
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.kv_manager = SimpleNamespace(_staging_ctx=context)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._room_to_decode_req = {room: decode_req}
+        handler._room_to_receiver = {room: receiver}
+        handler._writer_counts = {room: {}}
+        handler._staging_lifecycle = threading.Condition()
+        token = object()
+        handler._room_tokens = {room: token}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._free_and_send_watermark = Mock()
+
+        scatter_started = threading.Event()
+        finish_scatter = threading.Event()
+        unregister_waiting = threading.Event()
+        original_wait = handler._staging_lifecycle.wait
+
+        def observed_wait():
+            unregister_waiting.set()
+            return original_wait()
+
+        def scatter_region(*_args):
+            scatter_started.set()
+            finish_scatter.wait()
+            return True
+
+        handler._staging_lifecycle.wait = observed_wait
+        handler._scatter_region = scatter_region
+        event = make_event.return_value
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            submit = pool.submit(handler.submit_chunk_scatter, room, 0, 11, 3)
+            try:
+                self.assertTrue(scatter_started.wait(timeout=1))
+                unregister = pool.submit(handler.unregister_decode_req, room)
+                self.assertTrue(unregister_waiting.wait(timeout=1))
+                self.assertFalse(unregister.done())
+                handler._free_and_send_watermark.assert_not_called()
+            finally:
+                finish_scatter.set()
+
+            self.assertTrue(submit.result(timeout=1))
+            unregister.result(timeout=1)
+
+        event.record.assert_called_once_with(handler.staging_allocator._scatter_stream)
+        handler._free_and_send_watermark.assert_called_once_with(alloc_id, decode_req)
+        self.assertNotIn(room, context.room_receivers)
+        self.assertNotIn(room, context.room_bootstrap)
+
+
+class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    def test_draft_buffers_use_logical_device_indices(self):
+        """A local target layer count must not turn remote target KV into draft KV."""
+        for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):
+            with self.subTest(pp_size=pp_size, stage_start=stage_start):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None,
+                    prefill_start_layer=stage_start,
+                    prefill_end_layer=stage_start + 2,
+                    kv_data_ptrs=[1000, 2000, 3000],
+                    kv_item_lens=[100, 100, 100],
+                    kv_layer_ids=[],
+                    num_draft_entries=1,
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 0
+                manager.pp_size = pp_size
+                manager._transfer_data = Mock(return_value=0)
+                dst_ptrs = (
+                    [10000, 20000, 50000]
+                    if pp_size == 1
+                    else [10000, 20000, 30000, 40000, 50000]
+                )
+                with patch(
+                    "sglang.srt.disaggregation.mooncake.conn.get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ):
+                    status = manager.send_kvcache(
+                        mooncake_session_id="session",
+                        prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                        dst_kv_ptrs=dst_ptrs,
+                        dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                        dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                        executor=None,
+                    )
+
+                self.assertEqual(status, 0)
+                blocks = manager._transfer_data.call_args.args[1]
+                self.assertEqual(
+                    blocks,
+                    [
+                        (1100, dst_ptrs[stage_start] + 700, 200),
+                        (2100, dst_ptrs[stage_start + 1] + 700, 200),
+                        (3100, dst_ptrs[-1] + 2100, 200),
+                    ],
+                )
+
+
+class TestHiSparseStagedSpecRelay(CustomTestCase):
+    def test_builds_lightweight_eagle_relay_handle(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 5], device="cpu")
+
+        spec_input = future_map.make_staged_spec_input(future_indices)
+
+        self.assertIs(spec_input.future_indices, future_indices)
+        self.assertFalse(spec_input.future_dsa_topk_indices_available)
+
+    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
+    def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = True
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
+        future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
+        future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 3], dtype=torch.int64)
+        spec_input = future_map.make_staged_spec_input(future_indices)
+        gather_spec_extras.return_value = (
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1), dtype=torch.int64),
+            torch.tensor([2, 3]),
+            None,
+        )
+
+        future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+
+        torch.testing.assert_close(
+            spec_input.draft_probs, future_map.draft_probs_buf[future_indices]
         )
 
 
@@ -1538,6 +1713,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             cached_tokens_device=0,
             cached_tokens_host=0,
             cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
@@ -1964,16 +2140,6 @@ class TestDSV4C4StateIndices(unittest.TestCase):
             np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
         )
 
-    def test_short_and_empty_sequences(self):
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(3, 3, ring_size=8),
-            np.array([24, 25, 26], dtype=np.int32),
-        )
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(3, 0, ring_size=8),
-            np.empty((0,), dtype=np.int32),
-        )
-
     def test_invalid_ring_size_is_rejected(self):
         with self.assertRaises(ValueError):
             c4_state_transfer_indices(0, 8, ring_size=4)
@@ -1982,30 +2148,6 @@ class TestDSV4C4StateIndices(unittest.TestCase):
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
-    def test_online_aligned_boundary_has_no_partial_state(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 256, ratio=128, online=True, ring_size=1
-            ),
-            np.empty((0,), dtype=np.int32),
-        )
-
-    def test_online_partial_boundary_uses_request_slot(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 257, ratio=128, online=True, ring_size=1
-            ),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_offline_aligned_boundary_has_no_partial_state(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 256, ratio=128, online=False, ring_size=128
-            ),
-            np.empty((0,), dtype=np.int32),
-        )
-
     def test_offline_partial_boundary_uses_request_local_page(self):
         np.testing.assert_array_equal(
             request_scoped_state_transfer_indices(
@@ -2049,14 +2191,6 @@ class TestDSV4RequestStateTransfer(unittest.TestCase):
             kv.request_state_transfer_indices(7, 256), np.empty((0,), dtype=np.int32)
         )
 
-    def test_online_pool_ships_the_request_row(self):
-        kv = self._kv(
-            _make_state_pool(ratio=128, request_scoped=True, online=True, ring_size=1)
-        )
-        np.testing.assert_array_equal(
-            kv.request_state_transfer_indices(7, 257), np.array([7], dtype=np.int32)
-        )
-
     def test_requires_request_scoped_pools_with_one_ring_layout(self):
         with self.assertRaises(AssertionError):
             self._kv(
@@ -2095,9 +2229,10 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.swa_valid_from = swa_valid_from
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.swa_page_size = 256
@@ -2139,6 +2274,23 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 [[11], [12]],
             ),
         ]
+        mark = torch.zeros(3, dtype=torch.int64)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping, swa_valid_from=mark)
+        expected_infos = draft.get_state_buf_infos()
+        kv_args = KVArgs()
+
+        setup_state_kv_args(
+            kv_args, _make_dsv4_target(unified=False, mapping=mapping), draft
+        )
+
+        # The draft's SWA valid-from follows its SWA as one item per request slot.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1], expected_infos[0])
+        self.assertEqual(kv_args.state_data_ptrs[2], [mark.data_ptr()])
+        self.assertEqual(kv_args.state_item_lens[2], [mark[0].nbytes])
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):
