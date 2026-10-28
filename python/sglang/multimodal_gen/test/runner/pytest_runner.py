@@ -100,6 +100,7 @@ def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
 
 
 def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
+    sys.stdout.flush()
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -267,6 +268,7 @@ def run_pytest(
     filter_expr: str | None = None,
     junit_xml_path: str | None = None,
     exitfirst: bool = False,
+    failure_summary: list[str] | None = None,
 ) -> tuple[int, list[str], dict[str, str]]:
     if not files:
         print("No files to run.")
@@ -336,24 +338,20 @@ def run_pytest(
         if returncode == 0:
             if is_retry:
                 print(f"Recovered retryable failures on attempt {i + 1}.")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
+            break
         if returncode == 5:
             print(
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a partition. Treating as success."
             )
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
+            break
 
         if not retryable:
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
+            break
 
         if i == max_retries:
             print(f"Max retry exceeded ({max_retries})")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
+            break
 
         if retry_deadline is not None:
             remaining = retry_deadline - time.time()
@@ -367,8 +365,7 @@ def run_pytest(
                     "Preserving the failing result instead of starting another attempt.",
                     flush=True,
                 )
-                _print_attempt_tail_summary(attempt_reports, len(files))
-                return (returncode, list(all_executed_cases), all_case_results)
+                break
 
         print(
             f"Retryable failure detected on attempt {i + 1}. "
@@ -376,8 +373,10 @@ def run_pytest(
         )
 
     _print_attempt_tail_summary(attempt_reports, len(files))
+    if failure_summary is not None and returncode not in (0, 5):
+        failure_summary.extend(attempt_reports[-1]["failure_tail"])
     return (
-        attempt_reports[-1]["returncode"],
+        0 if returncode == 5 else returncode,
         list(all_executed_cases),
         all_case_results,
     )
