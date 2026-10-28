@@ -2044,7 +2044,7 @@ def validate_fused_hicache_draft(
         if not (
             len(draft_device_pools) == 1
             and isinstance(draft_device_pools[0], DraftMHAView)
-            and draft_device_pools[0]._host_sub_pool_name == "full"
+            and draft_device_pools[0]._sub_pool_name == "full"
         ):
             raise NotImplementedError(
                 "HiCache fused draft KV requires a full-attention DFLASH draft."
