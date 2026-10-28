@@ -18,9 +18,11 @@ Data copies go through a fake kvcache and the view math is pure torch, so the
 suite runs on CPU apart from the cases that skip themselves without CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 import contextlib
 import random
@@ -94,7 +96,12 @@ class _FakeKVCache:
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
 
-    def move_kv_cache(self, dst_loc: torch.Tensor, src_loc: torch.Tensor):
+    def move_physical_pages(
+        self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
@@ -1843,7 +1850,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
         mamba_kv.attach_allocator = lambda allocator: None
         # The physical-move contract for the mamba sub-pool (un-translated);
-        # _FakeKVCache already provides move_kv_cache, so nothing extra.
+        # _FakeKVCache already provides move_physical_pages, so nothing extra.
 
         class _FakeHybridLinearKVPool:
             full_kv_pool = full_kv
@@ -2719,7 +2726,7 @@ class TestChainFrontierWalk(unittest.TestCase):
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
 
 
-class TestFloatMultiEndedAllocator(unittest.TestCase):
+class TestFloatMultiEndedAllocator(CustomTestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
     and the on-demand movers `make_room` and `compact_holes`."""
@@ -2730,7 +2737,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _build_tri(self, n_state=8, n_float=32, n_full=32):
+    def _build_tri(self, n_state=8, n_float=32, n_full=32, device=_DEV):
         state = _make_mamba_spec("state", "up", layer_num=2)
         fl = _make_mha_spec("swa", "float", layer_num=2)
         full = _make_mha_spec("full", "down", layer_num=2)
@@ -2742,14 +2749,14 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         pool = UnifiedKVPool(
             total_bytes=total,
             sub_pool_specs=[full, fl, state],
-            device=_DEV,
+            device=device,
             enable_memory_saver=False,
         )
         sa = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("state")),
             unified_buffer=pool,
             sub_pool_name="state",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
         fkv = _FakeKVCache(pool.max_slots("swa"))
@@ -2757,7 +2764,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             kvcache=fkv,
             unified_buffer=pool,
             sub_pool_name="swa",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
         dkv = _FakeKVCache(pool.max_slots("full"))
@@ -2765,7 +2772,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             kvcache=dkv,
             unified_buffer=pool,
             sub_pool_name="full",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
         # Chain wiring state <-> float <-> full.
@@ -2799,6 +2806,30 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             self.assertNotEqual(v, -1, f"live page {p} unbound")
             self.assertEqual(int(fla.virtual_to_physical[v].item()), p)
             self.assertEqual(int(kv.buf[p].item()), v, f"data lost at {p}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA tombstone kernel")
+    def test_free_strided_page_ids_preserves_live_bindings(self):
+        """Retiring alternate pages must not accidentally retire their neighbours."""
+        _, _, allocator, _, _ = self._build_tri(device="cuda")
+        pages = allocator.alloc(8)
+        self.assertIsNotNone(pages)
+        freed = pages[::2]
+        self.assertFalse(freed.is_contiguous())
+        physical = allocator.virtual_to_physical[freed].clone()
+        expected_v2p = allocator.virtual_to_physical.clone()
+        expected_p2v = allocator.physical_to_virtual.clone()
+        expected_v2p[freed] = -1
+        expected_p2v[physical] = -1
+
+        allocator.free(freed)
+        torch.testing.assert_close(allocator.virtual_to_physical, expected_v2p)
+        torch.testing.assert_close(allocator.physical_to_virtual, expected_p2v)
+        torch.testing.assert_close(
+            allocator._free_phys_pages.sort().values, physical.sort().values
+        )
+        self.assertEqual(allocator._live_pages(), 4)
+        allocator.free(pages[1::2])
+        self.assertTrue(allocator._is_frontier_transparent())
 
     def test_midpoint_initial_placement(self):
         _, _, fla, _, _ = self._build_tri()
