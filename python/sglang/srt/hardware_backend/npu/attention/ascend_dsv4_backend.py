@@ -1529,26 +1529,39 @@ class LowRatioCompressAscendBackendMixin:
             return_value=False,
         )
         scored = indices.view(t, topk).to(torch.int32)
-        if (
-            os.environ.get("SGLANG_DSV41_DEBUG_QSLI")
-            and layer.layer_id not in self._dsv41_debugged
-        ):
-            self._dsv41_debugged.add(layer.layer_id)
-            visible = forward_batch.seq_lens // ratio
-            print(
-                f"[dsv41] qsli layer={layer.layer_id} ratio={ratio} rows={t}\n"
-                f"[dsv41]   k shape={tuple(qsli_k.shape)} "
-                f"stride0/544={qsli_k.stride(0) // 544}\n"
-                f"[dsv41]   page_table={tuple(page_table.shape)} "
-                f"max={int(page_table.max())}\n"
-                f"[dsv41]   visible_max={int(visible.max())} "
-                f"scored_min={int(scored.min())} scored_max={int(scored.max())} "
-                f"neg={int((scored < 0).sum())}\n"
-                f"[dsv41]   candidates={tuple(candidate_indices.shape)} "
-                f"block_len min/max="
-                f"{int(candidate_lengths.min())}/{int(candidate_lengths.max())}",
-                flush=True,
+        if os.environ.get("SGLANG_DSV41_DEBUG_QSLI"):
+            # What MQSMLA will be told: cmp_topk_length = min(visible, index_topk)
+            # (the position-derived upper bound).  Any -1 of `scored` inside that
+            # prefix is the exact wild-address violation -- the CPU golden raises
+            # on it (mqsmla_golden.py L215) and the kernel does not skip it --
+            # so print every occurrence, not just the first call per layer.
+            lens = (forward_batch.seq_lens // ratio).clamp_max(int(topk)).to(
+                torch.long
             )
+            in_prefix = torch.arange(topk, device=scored.device) < lens.unsqueeze(1)
+            neg_in = int(((scored < 0) & in_prefix).sum())
+            cov = (
+                candidate_lengths.reshape(-1).to(torch.long)[:t]
+                * int(indexer.candidate_block_size)
+            ).clamp_max(int(topk))
+            short = bool((cov < lens).any())
+            key = (layer.layer_id, "qsli")
+            if neg_in or short or key not in self._dsv41_debugged:
+                self._dsv41_debugged.add(key)
+                print(
+                    f"[dsv41] qsli layer={layer.layer_id} ratio={ratio} rows={t} "
+                    f"neg_in_prefix={neg_in} len_max={int(lens.max())} "
+                    f"vis_max={int((forward_batch.seq_lens // ratio).max())} "
+                    f"cov_max={int(cov.max())} "
+                    f"cand={tuple(candidate_indices.shape)} "
+                    f"block_len={int(candidate_lengths.min())}/"
+                    f"{int(candidate_lengths.max())} "
+                    f"scored_min={int(scored.min())} "
+                    f"scored_max={int(scored.max())} "
+                    f"k={tuple(qsli_k.shape)} "
+                    f"pt={tuple(page_table.shape)}/{int(page_table.max())}",
+                    flush=True,
+                )
         return scored
 
     def _dsv41_index_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
@@ -1791,76 +1804,171 @@ class LowRatioCompressAscendBackendMixin:
         return attn_sink.reshape(-1).to(torch.float32)
 
     def _dsv41_audit_smla(self, layer, q, forward_batch, kw, ratio: int) -> None:
-        """Report every SMLA argument range a healthy step keeps legal.
+        """Row-accurate MQSMLA contract audit.
 
-        The aicore fault is asynchronous, so the Python stack names whoever synced
-        next; these checks name the buffer that actually broke.  Snapshot lines
-        print once per (layer, phase); violations print on every step they occur.
+        The device contract (mixed_quant_sparse_flash_mla_dsl/README.md L209-L214,
+        enforced by the CPU golden mqsmla_golden.py L211-L216) is: for every query
+        row, every sparse index inside the ``topk_length`` prefix must be a valid
+        logical token index of that row's batch, and must map through
+        ``block_table[b, idx // block_size]`` to a column inside the table and a
+        page inside the pool.  The kernel does no bounds checking, so any
+        violation is exactly the wild GM address of the aicore fault.  Every
+        check is per-row and names the offending rows, so the last VIOLATION
+        line before the async fault pinpoints the layer / side / row that fed
+        the bad address.  A run that crashes with no VIOLATION line (but with
+        the cfg/snapshot lines present) moves the suspicion off the values and
+        onto the operator/dispatch internals.
         """
         phase = "decode" if forward_batch.forward_mode.is_decode() else "extend"
-        problems = []
-        rows = int(q.shape[0])
-        tokens = int(forward_batch.input_ids.numel())
-        if rows != tokens:
-            problems.append(f"q rows {rows} != tokens {tokens}")
-        cu = kw.get("cu_seqlens_q")
-        if cu is not None and int(cu[-1]) - int(cu[0]) != rows:
-            problems.append(
-                f"cu_seqlens_q span {int(cu[-1]) - int(cu[0])} != q rows {rows}"
+        step = getattr(self, "_dsv41_audit_step", 0) + 1
+        self._dsv41_audit_step = step
+        if ("cfg",) not in self._dsv41_debugged:
+            self._dsv41_debugged.add(("cfg",))
+            print(
+                f"[dsv41] cfg index_topk={self._dsv4_index_topk} "
+                f"sliding_window={self._dsv4_sliding_window_size} "
+                f"candidate_topk_blocks={self._dsv41_candidate_topk_blocks} "
+                f"candidate_block_size={self._dsv41_candidate_block_size} "
+                f"low_ratios={self._dsv41_low_ratios()}",
+                flush=True,
             )
+        rows = int(q.shape[0])
+        positions = forward_batch.positions.reshape(-1).to(torch.long)
+        seq_lens = forward_batch.seq_lens.reshape(-1).to(torch.long)
+        device = positions.device
+        cu = kw.get("cu_seqlens_q")
+        problems = []
+        if rows != int(positions.numel()):
+            problems.append(f"q rows {rows} != positions {int(positions.numel())}")
+        if cu is not None and int(cu[-1]) != rows:
+            problems.append(f"cu span {int(cu[-1])} != q rows {rows}")
+        # row -> batch map (decode: one token per request; extend: cu bucketing)
+        if cu is not None and rows == int(cu[-1]) and rows != cu.numel() - 1:
+            row_b = torch.repeat_interleave(
+                torch.arange(cu.numel() - 1, device=device),
+                (cu[1:] - cu[:-1]).to(torch.long),
+            )
+        else:
+            row_b = torch.arange(rows, device=device)
+        # The dispatch table must tile [0, rows) exactly (README L214); a stale
+        # or mismatched metadata shows up here as a row-count disagreement.
+        md = kw.get("metadata")
+        if md is not None and md.numel() % 2 == 0:
+            counts = md[md.shape[0] // 2 :]
+            total = int(counts.sum())
+            if total != rows:
+                problems.append(
+                    f"metadata tiles {total} rows != q rows {rows} "
+                    f"(stale dispatch table?)"
+                )
         for prefix in ("ori", "cmp"):
             kv = kw.get(f"{prefix}_kv")
             bt = kw.get(f"{prefix}_block_table")
-            idx = kw.get(f"{prefix}_sparse_indices")
-            lens = kw.get(f"{prefix}_topk_length")
-            if kv is None or bt is None or idx is None or lens is None:
+            idx_t = kw.get(f"{prefix}_sparse_indices")
+            lens_t = kw.get(f"{prefix}_topk_length")
+            if kv is None or bt is None or idx_t is None or lens_t is None:
                 continue
-            if int(bt.max()) >= kv.shape[0]:
-                problems.append(
-                    f"{prefix}: page {int(bt.max())} >= kv pages {kv.shape[0]}"
-                )
-            if int(idx.max()) >= int(lens.max()):
-                problems.append(
-                    f"{prefix}: index {int(idx.max())} >= len {int(lens.max())} "
-                    f"(bt={tuple(bt.shape)} pages={kv.shape[0]} "
-                    f"page_of_index={int(idx.max()) // max(1, int(kv.shape[1]))})"
-                )
-            if int(lens.max()) > idx.shape[-1]:
-                problems.append(
-                    f"{prefix}: len {int(lens.max())} > topk {idx.shape[-1]}"
-                )
-            if int(idx.min()) < -1:
-                problems.append(f"{prefix}: index min {int(idx.min())} < -1")
-        key = (layer.layer_id, phase)
-        sample = ("sample", layer.layer_id, phase)
-        if problems and sample not in self._dsv41_debugged:
-            # Are the window indices absolute positions or window slots? That
-            # decides whether the block table needs absolute width. Row 0 only.
-            self._dsv41_debugged.add(sample)
-            idx = kw["ori_sparse_indices"]
-            print(
-                f"[dsv41] SAMPLE layer={layer.layer_id} pos0={int(forward_batch.positions[0])} "
-                f"len0={int(kw['ori_topk_length'][0])} "
-                f"head={idx[0, :8].tolist()} tail={idx[0, -8:].tolist()}",
-                flush=True,
+            vis = seq_lens if prefix == "ori" else seq_lens // max(1, ratio)
+            idx = idx_t.reshape(rows, -1).to(torch.long)
+            lens = lens_t.reshape(-1).to(torch.long)
+            k = idx.shape[-1]
+            block = max(1, int(kv.shape[1]))
+            width = int(bt.shape[1])
+            pages = int(kv.shape[0])
+            in_prefix = torch.arange(k, device=device) < lens.unsqueeze(1)
+            col = torch.div(idx, block, rounding_mode="floor")
+            page = bt.to(torch.long)[row_b.unsqueeze(1), col.clamp(0, width - 1)]
+            checks = (
+                # golden rule: the prefix must be exact -- a -1 inside it is
+                # consumed as a logical token index and becomes a wild address
+                ("neg_in_prefix", (idx < 0) & in_prefix),
+                # in-prefix index at/after the row's visible logical length
+                ("idx_ge_visible", (idx >= vis.clamp_min(1).unsqueeze(1)) & in_prefix),
+                # in-prefix index maps to a column outside the block table
+                ("bt_col_oob", (col >= width) & in_prefix),
+                # the page at that column is outside the pool (or negative)
+                ("page_oob", ((page < 0) | (page >= pages)) & in_prefix),
+                # outside the prefix only the -1 filler is allowed
+                ("garbage_tail", idx < -1),
             )
+            side_bad = False
+            for name, mask in checks:
+                n = int(mask.sum())
+                if not n:
+                    continue
+                side_bad = True
+                r0 = int(mask.any(dim=1).nonzero()[0, 0])
+                j = mask[r0].nonzero()[:4, 0].tolist()
+                problems.append(
+                    f"{prefix}.{name} n={n} first_row={r0} "
+                    f"(b={int(row_b[r0])} pos={int(positions[r0])} "
+                    f"seq={int(seq_lens[r0])} len={int(lens[r0])} "
+                    f"bt={width}x pages={pages} block={block}) "
+                    + " ".join(
+                        f"[j={a} idx={int(idx[r0, a])} col={int(idx[r0, a]) // block} "
+                        f"page={int(page[r0, a])}]"
+                        for a in j
+                    )
+                )
+            # window-side staleness: the prefix must end at the row position
+            if prefix == "ori" and rows == int(positions.numel()):
+                last = idx.gather(1, (lens - 1).clamp_min(0).unsqueeze(1)).squeeze(1)
+                if not bool((last == positions).all()):
+                    bad = (last != positions).nonzero()[:8, 0].tolist()
+                    problems.append(
+                        f"ori.window_stale rows={bad} last={last[bad].tolist()} "
+                        f"pos={positions[bad].tolist()}"
+                    )
+            # direct test of the QSLI prefix hypothesis: the length passed to
+            # MQSMLA must not exceed the candidate tokens QSLI could fill
+            if prefix == "cmp":
+                cand = getattr(self.forward_metadata, "dsv41_candidate_blocks", None)
+                if cand is not None and self._dsv41_candidate_block_size > 0:
+                    cov = (
+                        cand[1].reshape(-1).to(torch.long)[:rows]
+                        * self._dsv41_candidate_block_size
+                    ).clamp_max(self._dsv4_index_topk)
+                    over = lens > cov
+                    if bool(over.any()):
+                        r = over.nonzero()[:8, 0].tolist()
+                        problems.append(
+                            f"cmp.len_gt_candidate rows={r} "
+                            f"len={lens[r].tolist()} cov={cov[r].tolist()} "
+                            f"(QSLI pads -1 inside this prefix)"
+                        )
         if problems:
             print(
-                f"[dsv41] AUDIT FAIL layer={layer.layer_id} ratio={ratio} "
-                f"phase={phase} bs={forward_batch.batch_size}: " + "; ".join(problems),
+                f"[dsv41] VIOLATION step={step} layer={layer.layer_id} ratio={ratio} "
+                f"phase={phase} bs={forward_batch.batch_size} rows={rows}: "
+                + " | ".join(problems),
                 flush=True,
             )
-        elif key not in self._dsv41_debugged:
+        key = (layer.layer_id, ratio, phase)
+        if key not in self._dsv41_debugged:
             self._dsv41_debugged.add(key)
             shapes = {n: tuple(v.shape) for n, v in kw.items() if torch.is_tensor(v)}
             print(
-                f"[dsv41] AUDIT ok layer={layer.layer_id} ratio={ratio} "
-                f"phase={phase} bs={forward_batch.batch_size} q={tuple(q.shape)}\n"
+                f"[dsv41] AUDIT snapshot step={step} layer={layer.layer_id} "
+                f"ratio={ratio} phase={phase} bs={forward_batch.batch_size} "
+                f"q={tuple(q.shape)}\n"
                 f"[dsv41]   {shapes}\n"
-                f"[dsv41]   ori_len={int(kw['ori_topk_length'].max())} "
+                f"[dsv41]   pos=[{int(positions.min())},{int(positions.max())}] "
+                f"seq=[{int(seq_lens.min())},{int(seq_lens.max())}]\n"
+                f"[dsv41]   ori_len_max={int(kw['ori_topk_length'].max())} "
                 f"ori_idx_max={int(kw['ori_sparse_indices'].max())} "
+                f"ori_bt={tuple(kw['ori_block_table'].shape)} "
                 f"ori_bt_max={int(kw['ori_block_table'].max())} "
-                f"ori_pages={kw['ori_kv'].shape[0]}",
+                f"ori_pages={kw['ori_kv'].shape[0]}"
+                + (
+                    f"\n[dsv41]   cmp_len_max={int(kw['cmp_topk_length'].max())} "
+                    f"cmp_idx_max={int(kw['cmp_sparse_indices'].max())} "
+                    f"cmp_bt={tuple(kw['cmp_block_table'].shape)} "
+                    f"cmp_bt_max={int(kw['cmp_block_table'].max())} "
+                    f"cmp_pages={kw['cmp_kv'].shape[0]} "
+                    f"md_head={md[:4].tolist() if md is not None else None}"
+                    if "cmp_kv" in kw
+                    else ""
+                ),
                 flush=True,
             )
 
@@ -1967,10 +2075,13 @@ class LowRatioCompressAscendBackendMixin:
                     forward_batch, compress_ratio
                 ),
             )
-            if os.environ.get("SGLANG_DSV41_DEBUG_SMLA"):
-                self._dsv41_audit_smla(
-                    layer, q, forward_batch, attn_kwargs, compress_ratio
-                )
+        # Audit every ratio (0 included): a win-only layer can fault through the
+        # ori side too, and the audit must name the last call before the async
+        # aicore fault.
+        if os.environ.get("SGLANG_DSV41_DEBUG_SMLA"):
+            self._dsv41_audit_smla(
+                layer, q, forward_batch, attn_kwargs, compress_ratio
+            )
         attn_out, _lse = _ds41_ops().mixed_quant_sparse_flash_mla(q, **attn_kwargs)
         return attn_out
 
