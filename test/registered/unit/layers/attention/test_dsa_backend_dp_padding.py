@@ -117,16 +117,19 @@ class TestDSABackendDPPadding(CustomTestCase):
             else "triton_sparse_mla_fwd",
             fake_sparse_fwd,
         )
-        backend = SimpleNamespace(
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.__dict__.update(
             dsa_prefill_impl=implementation,
             use_mha=False,
             use_fused_topk=True,
             hisparse_coordinator=None,
             dsa_index_kpool=1,
             forward_metadata=SimpleNamespace(max_seq_len_k=64),
-            token_to_kv_pool=SimpleNamespace(
-                get_key_buffer=lambda _: torch.zeros(64, 1, 3),
-                set_mla_kv_buffer=lambda *args: None,
+            token_to_kv_pool=_routed(
+                SimpleNamespace(
+                    get_key_buffer=lambda _: torch.zeros(64, 1, 3),
+                    set_mla_kv_buffer=lambda *args: None,
+                )
             ),
             _resolve_kpool_tail_backend=lambda indices, impl: impl,
             _check_kpool_tail_backend=lambda *args: None,
