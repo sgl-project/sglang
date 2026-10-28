@@ -1550,6 +1550,9 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+UE8M0_INDEX_K_LAYOUT = "index_k:ue8m0"
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one.
     The index-K scales are FP32 or packed UE8M0 in the same bytes, so they are part of it."""
@@ -1559,7 +1562,7 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     ue8m0 = index_k_cache_is_ue8m0(token_to_kv_pool)
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         layout = token_to_kv_pool.pd_kv_layout()
-        return f"{layout},index_k:ue8m0" if ue8m0 else layout
+        return f"{layout},{UE8M0_INDEX_K_LAYOUT}" if ue8m0 else layout
     if ue8m0 is None:
         return None
     return f"index_k:{'ue8m0' if ue8m0 else 'fp32'}"
@@ -1569,7 +1572,7 @@ def pd_kv_layouts_match(prefill: Optional[str], decode: Optional[str]) -> bool:
     """A peer that reports no layout predates the UE8M0 index-K cache, so it only
     matches a peer whose index-K scales are FP32."""
     if prefill is None or decode is None:
-        return "index_k:ue8m0" not in (prefill or decode or "")
+        return UE8M0_INDEX_K_LAYOUT not in (prefill or decode or "")
     return prefill == decode
 
 

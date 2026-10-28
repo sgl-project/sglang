@@ -392,6 +392,14 @@ def index_k_cache_is_ue8m0(kv_pool) -> Optional[bool]:
     return None
 
 
+def with_index_k_storage_tag(model_name: Optional[str], kv_pool) -> Optional[str]:
+    """``model_name`` as storage keys use it: tagged for a UE8M0 index-K cache,
+    whose scales share their bytes with the FP32 format."""
+    if not index_k_cache_is_ue8m0(kv_pool):
+        return model_name
+    return f"{model_name}-index_k-ue8m0" if model_name else "index_k-ue8m0"
+
+
 @lru_cache(maxsize=1)
 def resolve_num_sms() -> int:
     """SM count used to size the paged-MQA-logits schedule.

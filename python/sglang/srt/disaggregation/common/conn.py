@@ -1304,7 +1304,9 @@ class CommonKVManager(BaseKVManager):
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
-            response = requests.get(url, timeout=5)
+            response = requests.get(
+                url, params={"decode_kv_layout": self.kv_layout or ""}, timeout=5
+            )
             if response.status_code == 200:
                 data = response.json()
                 info = PrefillServerInfo(**data)
@@ -3209,6 +3211,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     text=f"Prefill server not fully registered yet"
                     f" ({self._registered_count} workers registered).",
                     status=503,
+                )
+            # A decoder that does not report its layout predates the UE8M0 index-K
+            # cache and would accept these pages without checking
+            if "decode_kv_layout" not in request.query and not pd_kv_layouts_match(
+                self.kv_layout, None
+            ):
+                return web.Response(
+                    text=f"Prefill server has kv_layout={self.kv_layout}, which a "
+                    "decode server from before the UE8M0 index-K cache cannot read. "
+                    "Upgrade the decode server.",
+                    status=400,
                 )
             info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,

@@ -63,14 +63,14 @@ def storage_model_name(
     device_pool: Any = None,
 ) -> Optional[str]:
     """The model name storage backends key pages on, tagged with the host
-    pool's page format when it has one of its own, and with a UE8M0 index-K
-    cache, whose scales share their bytes with the FP32 format."""
-    from sglang.srt.layers.attention.dsa.utils import index_k_cache_is_ue8m0
+    pool's page format when it has one of its own, and with the device pool's
+    index-K scale format."""
+    from sglang.srt.layers.attention.dsa.utils import with_index_k_storage_tag
 
-    tags = [host_pool.storage_format_tag]
-    if index_k_cache_is_ue8m0(device_pool):
-        tags.append("index_k-ue8m0")
-    return "-".join(part for part in (model_name, *tags) if part) or None
+    tag = host_pool.storage_format_tag
+    if tag is not None:
+        model_name = f"{model_name}-{tag}" if model_name else tag
+    return with_index_k_storage_tag(model_name, device_pool)
 
 
 class LayerLoadingEvent:

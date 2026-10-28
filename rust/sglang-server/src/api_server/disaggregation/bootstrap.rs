@@ -281,7 +281,22 @@ async fn route_get(
     }
 
     if (dp, cp, tp, pp) == (-1, -1, -1, -1) {
-        // Aggregate-topology sentinel.
+        // Aggregate-topology sentinel. A decoder that does not report its layout
+        // predates the UE8M0 index-K cache and would accept these pages unchecked.
+        let ue8m0 = topo
+            .kv_layout
+            .as_deref()
+            .is_some_and(|layout| layout.contains("index_k:ue8m0"));
+        if ue8m0 && !query.contains_key("decode_kv_layout") {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Prefill server has kv_layout={}, which a decode server from \
+                     before the UE8M0 index-K cache cannot read. Upgrade the decode server.",
+                    topo.kv_layout.as_deref().unwrap_or_default()
+                ),
+            );
+        }
         return Json(PrefillServerInfo {
             attn_tp_size: topo.attn_tp_size.unwrap(),
             attn_cp_size: topo.attn_cp_size.unwrap(),
@@ -575,6 +590,29 @@ mod tests {
         let (_, body) = request(addr, "GET", SENTINEL, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    #[test]
+    fn ue8m0_index_k_prefill_rejects_decoders_without_a_layout() {
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({"kv_layout": "index_k:ue8m0"}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 400, "{body}");
+        let with_layout = format!("{SENTINEL}&decode_kv_layout=index_k%3Aue8m0");
+        let (status, body) = request(addr, "GET", &with_layout, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["kv_layout"], "index_k:ue8m0");
+    }
+
+    #[test]
+    fn fp32_index_k_prefill_serves_decoders_without_a_layout() {
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({"kv_layout": "index_k:fp32"}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 200);
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis

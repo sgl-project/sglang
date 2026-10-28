@@ -1,17 +1,36 @@
 """PD peers and HiCache storage must agree on the index-K scale bytes: FP32 or
 DeepGEMM's packed UE8M0."""
 
+import asyncio
+import importlib
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+)
 from sglang.srt.disaggregation.utils import get_pd_kv_layout, pd_kv_layouts_match
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_index_k_cache_is_ue8m0
 from sglang.srt.managers.cache_controller import storage_model_name
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.unified_cache.linker_factory import (
+    create_unified_cache_linker,
+    get_startup_linker_config,
+)
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -129,6 +148,130 @@ class TestPdIndexKScaleLayout(CustomTestCase):
                     )
                 )
                 self.assertEqual(get_pd_kv_layout(pool), want)
+
+
+class TestDirectLinkerStorageKeys(CustomTestCase):
+    def test_direct_linkers_name_a_ue8m0_index_cache(self):
+        group = DevicePoolGroup(
+            [
+                DevicePoolEntry(
+                    name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[[torch.zeros((2, 8), dtype=torch.uint8)]],
+                    layer_mapping={0: 0},
+                    page_size=1,
+                    rows_are_pages=False,
+                )
+            ],
+            num_layers=1,
+            page_size=1,
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(),
+            page_size=1,
+        )
+        for backend, module_path in (
+            ("mooncake", "mooncake_store.mooncake_direct_linker"),
+            ("mori", "umbp.umbp_direct_linker"),
+        ):
+            module = importlib.import_module(
+                f"sglang.srt.mem_cache.storage.{module_path}"
+            )
+            for ue8m0 in (False, True):
+                with (
+                    self.subTest(backend=backend, ue8m0=ue8m0),
+                    get_context().override_server_args(
+                        unified_cache_external_linker_backend=backend,
+                        unified_cache_external_linker_config={},
+                    ),
+                    patch(f"{_UTILS}.index_k_cache_is_ue8m0", return_value=ue8m0),
+                    patch.object(
+                        module, "resolve_hybrid_device_pool_group", return_value=group
+                    ),
+                    patch.object(
+                        module.torch.distributed, "is_initialized", return_value=False
+                    ),
+                    patch.object(
+                        module,
+                        "HiCacheStorageConfig",
+                        side_effect=RuntimeError("storage boundary"),
+                    ) as storage_config,
+                    self.assertRaisesRegex(RuntimeError, "storage boundary"),
+                ):
+                    create_unified_cache_linker(
+                        "args",
+                        params,
+                        backend=get_memory().unified_cache_external_linker_backend,
+                        config=get_startup_linker_config(),
+                        components={"full"},
+                    )
+                model_name = storage_config.call_args.kwargs["model_name"]
+                self.assertEqual(model_name.endswith("-index_k-ue8m0"), ue8m0)
+
+
+def _bootstrap_server(kv_layout):
+    server = CommonKVBootstrapServer.__new__(CommonKVBootstrapServer)
+    server.__dict__.update(
+        attn_tp_size=1,
+        attn_cp_size=1,
+        dp_size=1,
+        pp_size=1,
+        page_size=64,
+        kv_cache_dtype="auto",
+        kv_layout=kv_layout,
+        dsv41_spec_layout=None,
+        follow_bootstrap_room=True,
+        enable_dsa_cache_layer_split=False,
+        enable_kv_cache_sharding=False,
+        prefill_http_port=30000,
+        decode_allocation_policy="early",
+        _registered_count=1,
+    )
+    return server
+
+
+def _route_status(server, **query):
+    query = dict(
+        prefill_dp_rank="-1",
+        prefill_cp_rank="-1",
+        target_tp_rank="-1",
+        target_pp_rank="-1",
+        **query,
+    )
+    with patch.object(CommonKVBootstrapServer, "_is_ready", return_value=True):
+        response = asyncio.run(server._handle_route_get(SimpleNamespace(query=query)))
+    return response.status
+
+
+class TestMixedVersionPd(CustomTestCase):
+    def test_ue8m0_prefill_refuses_a_decoder_that_reports_no_layout(self):
+        server = _bootstrap_server("index_k:ue8m0")
+        self.assertEqual(_route_status(server), 400)
+        self.assertEqual(_route_status(server, decode_kv_layout="index_k:ue8m0"), 200)
+
+    def test_fp32_prefill_serves_a_decoder_that_reports_no_layout(self):
+        for kv_layout in ("index_k:fp32", None):
+            with self.subTest(kv_layout=kv_layout):
+                self.assertEqual(_route_status(_bootstrap_server(kv_layout)), 200)
+
+    def test_decoder_reports_its_layout_to_prefill(self):
+        for kv_layout, sent in (("index_k:ue8m0", "index_k:ue8m0"), (None, "")):
+            with self.subTest(kv_layout=kv_layout):
+                manager = CommonKVManager.__new__(CommonKVManager)
+                manager.prefill_info_table = {}
+                manager.kv_layout = kv_layout
+                failed = SimpleNamespace(status_code=500, text="stop")
+                with patch(
+                    "sglang.srt.disaggregation.common.conn.requests.get",
+                    return_value=failed,
+                ) as get:
+                    self.assertFalse(manager.try_ensure_parallel_info("host:8998"))
+                self.assertEqual(
+                    get.call_args.kwargs["params"], {"decode_kv_layout": sent}
+                )
 
 
 if __name__ == "__main__":
