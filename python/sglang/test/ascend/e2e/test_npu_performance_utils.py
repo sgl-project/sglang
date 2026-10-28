@@ -214,7 +214,14 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
-BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+# Idle timeout: no output for this long means the benchmark is stuck, then
+# force-kill. Long silent phases are normal here: the server may still be
+# loading weights or capturing DSPARK graphs while the bench process waits,
+# and triton JIT compilation is quiet for minutes (run 40705231433 lost
+# both attempts to the old 300s default). Override via env if needed.
+BENCHMARK_STDOUT_IDLE_TIMEOUT = int(
+    os.environ.get("SGLANG_BENCH_STDOUT_IDLE_TIMEOUT", "1800")
+)
 BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
@@ -1321,7 +1328,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        wait_server_ready(
+            f"{cls.base_url}/health", deep_url=f"{cls.base_url}/model_info"
+        )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
