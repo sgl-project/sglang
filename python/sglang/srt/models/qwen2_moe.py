@@ -207,6 +207,10 @@ class Qwen2MoeMLP(nn.Module):
         # fused path replaces act_fn + the down_proj input quantization with a
         # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
         self._enable_silu_fp4_quant_fusion = False
+        # Set externally (see qwen3_5.py) on ROCm when both projections are
+        # Quark MXFP4: aiter's fused SiLU+mul+MXFP4 quant (pre-shuffled scales)
+        # feeds down_proj's ASM A4W4 GEMM a prequantized (fp4, scale) tuple.
+        self._enable_silu_mxfp4_quant_fusion = False
         self._masked_m_cache: dict = {}
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
@@ -238,11 +242,43 @@ class Qwen2MoeMLP(nn.Module):
         y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
         return y_fp4, y_sf
 
+    def _silu_mxfp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
+        from aiter.ops.triton.fusions.activation import act_mul_and_mxfp4_quant
+
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            _AsmShuffledMxfp4Input,
+        )
+
+        # "roundup" is per_1x32_f4_quant's E8M0 scale, and round_to_input_dtype
+        # quantizes bf16(bf16(silu(gate)) * up), what the unfused SiluAndMul
+        # writes: the result equals SiluAndMul + per_1x32_f4_quant bit for bit.
+        # Same dtypes and padded/shuffled scale layout as
+        # per_1x32_f4_quant(shuffle=True), which the ASM GEMM reads.
+        y_fp4, y_scale = act_mul_and_mxfp4_quant(
+            gate_up,
+            "silu",
+            scaling_mode="roundup",
+            shuffle=True,
+            round_to_input_dtype=True,
+        )
+        return _AsmShuffledMxfp4Input(
+            (y_fp4.view(self._mxfp4_x_dtype), y_scale.view(self._mxfp4_scale_dtype))
+        )
+
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if (
+            self._enable_silu_mxfp4_quant_fusion
+            and not isinstance(gate_up, tuple)
+            and gate_up.dim() == 2
+            and gate_up.shape[0] > 0
+            and getattr(self.down_proj, "use_aiter_asm_fp4_gemm", False)
+        ):
+            x, _ = self.down_proj(self._silu_mxfp4_quant_fused(gate_up))
+            return x
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
