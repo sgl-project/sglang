@@ -118,7 +118,8 @@ TOKEN_TEXT = {
     END: "<|vision_end|>",
     EOS: "<|im_end|>",
 }
-# Set only when a processor computes a cache key; the two routes may differ.
+# Cache identity: legacy keys it by artifact or by feature bytes, token space by
+# feature bytes scoped by the item's grids, so the routes never compare it.
 _CACHE_IDENTITY_ITEM_FIELDS = ("hash", "pad_value", "pad_values", "identity")
 
 
@@ -537,7 +538,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
     def test_serving_output_matches_legacy_processor(self):
         """A model moved to token space must hand the scheduler the legacy output.
 
-        Every field is compared exactly: final and padded IDs, special token IDs,
+        Every field but the cache identity is compared exactly: final IDs, special token IDs,
         M-RoPE, and each item's modality, offsets, feature and model-specific data.
         """
         hf_processor = _make_hf_processor(Qwen3VLProcessor, 16)._processor
@@ -587,17 +588,15 @@ class TestQwenTokenizedMedia(CustomTestCase):
     def assert_same_output(self, actual, expected):
         actual, expected = (msgspec.structs.asdict(o) for o in (actual, expected))
         actual_items, expected_items = actual.pop("mm_items"), expected.pop("mm_items")
-        # Padded IDs carry the cache identity too, so they follow the same rule.
-        if actual["padded_input_ids"] is None or expected["padded_input_ids"] is None:
-            actual.pop("padded_input_ids"), expected.pop("padded_input_ids")
+        # Padded IDs are the final IDs with the cache identity's pad values.
+        actual.pop("padded_input_ids"), expected.pop("padded_input_ids")
         self.assert_same_fields(actual, expected, "output")
         self.assertEqual(len(actual_items), len(expected_items))
         for index, (item, reference) in enumerate(zip(actual_items, expected_items)):
             item, reference = (msgspec.structs.asdict(i) for i in (item, reference))
             for name in _CACHE_IDENTITY_ITEM_FIELDS:
                 # sglang-miles' MultimodalDataItem predates pad_values and identity.
-                if item.get(name) is None or reference.get(name) is None:
-                    item.pop(name, None), reference.pop(name, None)
+                item.pop(name, None), reference.pop(name, None)
             self.assert_same_fields(item, reference, f"mm_items[{index}]")
 
     def assert_same_fields(self, actual, expected, where):
