@@ -1,13 +1,21 @@
-"""CPU-only routing tests for the Qwen3.5 GDN MXFP4 handoff."""
+"""CPU-only routing tests for the Qwen3.5 GDN MXFP4 handoff and prefill views."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    QWEN38_GDN_HEAD_DIM,
+    QWEN38_GDN_NUM_QK_HEADS,
+    QWEN38_GDN_NUM_V_HEADS,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -153,6 +161,85 @@ class TestQwen35GDNMXFP4Routing(unittest.TestCase):
 
         prepare_input.assert_not_called()
         norm.assert_called_once_with(x, z)
+
+
+class TestQwen38PrefillProjectionViews(CustomTestCase):
+    """ROCm prefill reads the in_proj outputs as strided views only where the
+    fused Qwen3.8 GDN prefill prologue consumes them; every other case keeps
+    the contiguous unpack."""
+
+    NUM_ROWS = 8
+
+    def _decide(
+        self,
+        *,
+        prologue: bool = True,
+        deterministic: bool = False,
+        page_major: bool = False,
+        layer: dict | None = None,
+        batch: dict | None = None,
+    ) -> bool:
+        layer_fields = dict(
+            attn_tp_size=1,
+            num_k_heads=QWEN38_GDN_NUM_QK_HEADS,
+            num_v_heads=QWEN38_GDN_NUM_V_HEADS,
+            head_k_dim=QWEN38_GDN_HEAD_DIM,
+            head_v_dim=QWEN38_GDN_HEAD_DIM,
+        )
+        layer_fields.update(layer or {})
+        batch_fields = dict(
+            forward_mode=ForwardMode.EXTEND,
+            multi_item_delimiter_indices=None,
+            mamba_track_mask=None,
+            global_num_token_non_padded_cpu=self.NUM_ROWS,
+        )
+        batch_fields.update(batch or {})
+        exec_config = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
+        )
+        memory_config = SimpleNamespace(enable_page_major_kv_layout=page_major)
+        with (
+            patch.object(qwen3_5, "_enable_qwen38_gdn_prefill_prologue", prologue),
+            patch.object(qwen3_5, "get_exec", return_value=exec_config),
+            patch.object(qwen3_5, "get_memory", return_value=memory_config),
+        ):
+            return Qwen3_5GatedDeltaNet._uses_qwen38_prefill_views(
+                SimpleNamespace(**layer_fields),
+                SimpleNamespace(**batch_fields),
+                self.NUM_ROWS,
+            )
+
+    def test_tp1_extend_with_prologue_reads_views(self):
+        self.assertTrue(self._decide())
+        # No DP metadata (None) is not DP padding.
+        self.assertTrue(self._decide(batch=dict(global_num_token_non_padded_cpu=None)))
+
+    def test_cases_outside_the_prologue_keep_the_contiguous_unpack(self):
+        half_dim = QWEN38_GDN_HEAD_DIM // 2
+        cases = {
+            "prologue off": dict(prologue=False),
+            "deterministic inference": dict(deterministic=True),
+            "page-major KV layout": dict(page_major=True),
+            "TP2 head shard": dict(layer=dict(attn_tp_size=2)),
+            "other k-head count": dict(layer=dict(num_k_heads=8)),
+            "other v-head count": dict(layer=dict(num_v_heads=32)),
+            "other k-head dim": dict(layer=dict(head_k_dim=half_dim)),
+            "other v-head dim": dict(layer=dict(head_v_dim=half_dim)),
+            "decode": dict(batch=dict(forward_mode=ForwardMode.DECODE)),
+            "target verify": dict(batch=dict(forward_mode=ForwardMode.TARGET_VERIFY)),
+            "multi-item scoring": dict(
+                batch=dict(multi_item_delimiter_indices=[torch.zeros(1)])
+            ),
+            "mamba state tracking": dict(
+                batch=dict(mamba_track_mask=torch.ones(1, dtype=torch.bool))
+            ),
+            "DP padding": dict(
+                batch=dict(global_num_token_non_padded_cpu=self.NUM_ROWS - 1)
+            ),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._decide(**kwargs))
 
 
 if __name__ == "__main__":

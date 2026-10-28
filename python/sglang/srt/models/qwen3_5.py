@@ -32,6 +32,11 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    QWEN38_GDN_HEAD_DIM,
+    QWEN38_GDN_NUM_QK_HEADS,
+    QWEN38_GDN_NUM_V_HEADS,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -132,6 +137,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_lora,
+    get_memory,
     get_model,
     get_parallel,
     get_stream,
@@ -186,6 +192,11 @@ _gdn_decode_fused_proj_conv = (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+# With the fused Qwen3.8 GDN prefill prologue on (ROCm gfx95), prefill reads the
+# in_proj outputs as strided views: the prologue and the gated norm read them in place.
+_enable_qwen38_gdn_prefill_prologue = (
+    _use_aiter and _is_gfx95 and envs.SGLANG_QWEN38_GDN_PREFILL_PROLOGUE_FUSION.get()
+)
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -976,6 +987,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _uses_qwen38_prefill_views(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> bool:
+        """Whether this extend reads the in_proj outputs as strided views on
+        ROCm: Qwen3.8 at TP1 with the fused GDN prefill prologue on."""
+        if not _enable_qwen38_gdn_prefill_prologue:
+            return False
+        real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+        has_dp_padding = real_num_tokens is not None and real_num_tokens < num_rows
+        return (
+            self.attn_tp_size == 1
+            and self.num_k_heads == QWEN38_GDN_NUM_QK_HEADS
+            and self.num_v_heads == QWEN38_GDN_NUM_V_HEADS
+            and self.head_k_dim == QWEN38_GDN_HEAD_DIM
+            and self.head_v_dim == QWEN38_GDN_HEAD_DIM
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.multi_item_delimiter_indices is None
+            and forward_batch.mamba_track_mask is None
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not get_memory().enable_page_major_kv_layout
+            and not has_dp_padding
+        )
+
     def _norm_and_out_proj(
         self,
         core_attn_out: torch.Tensor,
@@ -1068,10 +1102,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
+            # On ROCm only the Qwen3.8 prefill prologue path reads them.
             use_strided_prefill_z = (
                 _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
-            )
+                or self._uses_qwen38_prefill_views(
+                    forward_batch, projected_states_qkvz.shape[0]
+                )
+            ) and forward_batch.logical_forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
                 if use_strided_prefill_z
