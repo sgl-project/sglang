@@ -542,16 +542,14 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
-                prefix_lens_cpu=host_seq_lens_cpu,
-                spec_info=forward_batch.spec_info,
             )
             if (
                 self.dense_mla_dcp_target
                 and forward_batch.forward_mode.is_target_verify()
                 and _is_dflash_verify(forward_batch.spec_info)
             ):
-                # _init consumed prefix lengths. _apply expects the worker's
-                # DFlash/DSPARK Host convention, including the verify block.
+                # DFlash/DSPARK replay Host lengths include the verify block.
+                # Adapt capture prefixes to the same convention for _apply.
                 host_seq_lens_cpu = (
                     host_seq_lens_cpu + self.speculative_num_draft_tokens
                 )
@@ -931,9 +929,6 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
-        *,
-        prefix_lens_cpu: torch.Tensor,
-        spec_info: Optional[SpecInput],
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
@@ -972,28 +967,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        if self.dense_mla_dcp_target:
-            # Capture-only Host seed. The caller already copied device prefixes
-            # to CPU; these additions do not advance the request's actual length.
-            global_host_kv_lens_cpu = prefix_lens_cpu
-            if forward_mode.is_target_verify():
-                global_host_kv_lens_cpu = (
-                    global_host_kv_lens_cpu + self.speculative_num_draft_tokens
-                )
-            elif forward_mode.is_decode_or_idle() and spec_info is not None:
-                global_host_kv_lens_cpu = (
-                    global_host_kv_lens_cpu + self.speculative_step_id + 1
-                )
-            local_host_kv_lens_cpu = get_dcp_lens(
-                global_host_kv_lens_cpu,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            )
-            metadata.seq_lens_cpu_list = local_host_kv_lens_cpu.tolist() + [0] * (
-                bs - local_host_kv_lens_cpu.numel()
-            )
-        else:
+        if not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if self.dense_mla_dcp_target and forward_mode.is_target_verify():
