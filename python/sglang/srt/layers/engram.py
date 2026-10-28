@@ -957,6 +957,38 @@ class _PeerShards:
         return out.view(*indices.shape, self.dim)
 
 
+def _reads_peer_shards(config: EngramConfig) -> bool:
+    """peer_read, chosen or picked by `auto` for device tables. Measured on GB300,
+    B300 and H200 at TP 2-8 and DP 8-32, it was faster than every collective, for
+    prefill and decode."""
+    if config.lookup == EngramLookup.PEER_READ:
+        return True
+    return (
+        config.lookup == EngramLookup.AUTO
+        and config.placement == EngramPlacement.GPU
+        and is_cuda()
+        and _tp_in_one_nvlink_domain()
+    )
+
+
+@functools.cache
+def _tp_in_one_nvlink_domain() -> bool:
+    """Collective over the TP group, once per process."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+
+    found = in_one_nvlink_domain(
+        get_parallel().tp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+    logger.info(
+        "Engram lookup auto: %s",
+        "peer_read" if found else "collectives, the TP group is not one NVLink domain",
+    )
+    return found
+
+
 def shard_range(
     num_embeddings: int,
     column_bounds: tuple[int, ...],
@@ -1012,7 +1044,7 @@ class EngramEmbedding(nn.Module):
         config = get_exec().offload.engram_config or EngramConfig()
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
-        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
+        if self.tp_size > 1 and _reads_peer_shards(config):
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
