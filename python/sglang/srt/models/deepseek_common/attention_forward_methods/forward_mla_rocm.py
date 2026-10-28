@@ -343,23 +343,20 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            if not (
-                _use_gfx1250_absorb_bmm
-                and _gfx1250_absorb_bmm_ok(
-                    x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
-                )
+            if _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+                x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
             ):
-                torch.bmm(
-                    attn_output.to(torch.bfloat16).transpose(0, 1),
-                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                    out=_bmm_buf.transpose(0, 1),
-                )
-            else:
                 batched_gemm_bf16(
                     XQ=attn_output.transpose(0, 1),
                     WQ=attn.w_vc.transpose(1, 2),
                     YQ=_bmm_buf.transpose(0, 1),
                     backend="gluon",
+                )
+            else:
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                    out=_bmm_buf.transpose(0, 1),
                 )
         else:
             attn_bmm_output = torch.bmm(
