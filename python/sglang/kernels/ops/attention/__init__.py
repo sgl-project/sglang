@@ -590,7 +590,7 @@ register_kernel(
     KernelSpec(
         op="attention.build_pooled_page_table",
         backend=KernelBackend.TORCH,
-        target="sgl_kernel_npu.operators.mem_cache:build_pooled_page_table_64",
+        target="sgl_kernel_npu.operators.attention:build_pooled_page_table_64",
         capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )
