@@ -1572,6 +1572,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.TORCH_SDPA,
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
+        AttentionBackendEnum.AITER_SAGE,
         AttentionBackendEnum.AITER_QUANT,
     }
 
