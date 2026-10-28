@@ -156,8 +156,6 @@ def test_trainer_uses_shared_pools_without_inference_imports():
             processor_config=MultimodalProcessorConfig(
                 mm_io_worker_num=2, mm_processor_worker_num=2,
             ),
-            # M-RoPE must also stay clear of the forbidden inference modules.
-            compute_mrope_positions=True,
         )
 
         strategy = processor.strategy
@@ -171,9 +169,11 @@ def test_trainer_uses_shared_pools_without_inference_imports():
                     strategy, "process_image",
                     wraps=strategy.process_image,
                 ) as wrapped_process_image:
+                    # M-RoPE must also stay clear of the forbidden inference modules.
                     batch = asyncio.run(processor.process(
                         [ImageData(str(image_path), preprocess_kwargs={"do_rescale": False})],
                         input_ids=[4, 2, 5], image_device="cpu",
+                        compute_mrope_positions=True,
                     ))
                 assert wrapped_process_image.call_args.args[1] is not hf_processor
                 expected = hf_processor.image_processor(image, do_rescale=False, return_tensors="pt")
@@ -194,10 +194,6 @@ def test_trainer_uses_shared_pools_without_inference_imports():
                 patch.object(
                     processor, "_load_media_lists",
                     AsyncMock(return_value=([image], ["video"], [])),
-                ),
-                patch.object(
-                    strategy, "compute_mrope_positions",
-                    return_value=(None, None),
                 ),
                 patch.object(
                     strategy, "process_image",
