@@ -283,7 +283,15 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.metrics_sink.enable_fpm = False
         reporter.mode_owners = ModeOwners(
-            disagg_decode=decode_owner_shell(transfer_queue=queue)
+            disagg_decode=decode_owner_shell(
+                transfer_queue=queue,
+                prealloc_queue=SimpleNamespace(
+                    queue=[],
+                    retracted_queue=[],
+                    held_rebootstrap_reqs=[],
+                    pre_allocated_token_counts=lambda: (0, 0),
+                ),
+            )
         )
         reporter.request_registry = make_request_registry(
             mode_owners=reporter.mode_owners
@@ -292,6 +300,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.pool_stats_observer = SimpleNamespace(
             get_pool_stats=lambda: SimpleNamespace(
                 update_scheduler_stats=lambda stats: None,
+                full_capacity=1,
+                is_hybrid_swa=False,
             ),
             streaming_session_count=lambda: 0,
             session_held_tokens=lambda: 0,
@@ -368,6 +378,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     retracted_queue=[],
                     held_rebootstrap_reqs=[],
                     num_tokens_pre_allocated=0,
+                    pre_allocated_token_counts=lambda: (0, 0),
                 ),
             )
         )
@@ -381,6 +392,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             get_pool_stats=lambda: SimpleNamespace(
                 get_decode_usage_msg_parts=lambda: [],
                 update_scheduler_stats=lambda stats: None,
+                full_capacity=1,
+                is_hybrid_swa=False,
             ),
             streaming_session_count=lambda: 0,
             session_held_tokens=lambda: 0,
