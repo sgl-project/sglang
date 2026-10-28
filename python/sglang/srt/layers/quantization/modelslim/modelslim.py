@@ -223,9 +223,7 @@ class ModelSlimConfig(QuantizationConfig):
             if isinstance(
                 getattr(module, "quant_method", None), ModelSlimKVCacheMethod
             ):
-                return module.scheme.get_cache_layout(
-                    use_mla_backend=use_mla_backend
-                )
+                return module.scheme.get_cache_layout(use_mla_backend=use_mla_backend)
         return None
 
     @staticmethod

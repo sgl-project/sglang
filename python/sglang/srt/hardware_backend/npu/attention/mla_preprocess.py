@@ -695,14 +695,20 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.weight_quant_mode == 2
             and get_token_to_kv_pool().index_head_dim is not None
         )
-        return self.is_npu_arch35 or _is_dsa_mlaprolog or (
-            hasattr(self.quant_config, "ignore")
-            and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
-            # Other ModelSlim projections retain the legacy MLAPO path.
-            and not (
-                hasattr(self.qkv_a_proj.quant_method, "quantization_config")
-                and self.qkv_a_proj.quant_method.quantization_config.get_name()
-                == "modelslim"
+        return (
+            self.is_npu_arch35
+            or _is_dsa_mlaprolog
+            or (
+                hasattr(self.quant_config, "ignore")
+                and any(
+                    re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
+                )
+                # Other ModelSlim projections retain the legacy MLAPO path.
+                and not (
+                    hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+                    and self.qkv_a_proj.quant_method.quantization_config.get_name()
+                    == "modelslim"
+                )
             )
         )
 
