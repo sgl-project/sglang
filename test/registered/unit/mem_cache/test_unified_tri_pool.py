@@ -1103,6 +1103,7 @@ class TestTriFactorySizing(unittest.TestCase):
                             use_mla_backend=False,
                             is_hybrid_swa=tri_pool,
                             is_hybrid_swa_compress=False,
+                            sliding_window_size=model.sliding_window_size,
                             forward_stream=None,
                             # Spec off: no draft region to fuse.
                             _fused_draft_for_mamba_factory=lambda: None,
@@ -1162,6 +1163,9 @@ class TestTriFactorySizing(unittest.TestCase):
                             ),
                             patch.object(
                                 cfg, "_should_enable_lazy_compaction", return_value=True
+                            ),
+                            patch.object(
+                                cfg, "mamba_cache_chunk_size", return_value=64
                             ),
                         ):
                             storage = cfg.KVCacheConfigurator._init_unified_pools(
