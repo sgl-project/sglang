@@ -21,7 +21,7 @@ TokenSpaceProcessor.process(media, IDs)
   worker_thread_device d -> IO and processor threads start on device d
 
 get_mm_processor -> TokenSpaceSGLangProcessor
-  each strategy keeps its legacy processor's loader and worker defaults
+  each strategy and serving spec keep the legacy processor's loader and worker defaults
   registered serving spec -> mm_tokens and IO threads; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
@@ -59,6 +59,7 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
+    serving_spec_for,
 )
 from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
     TokenSpaceServingSpec,
@@ -346,17 +347,29 @@ def _legacy_defaults(processor_cls, hf_config):
     return defaults
 
 
-def _token_space_defaults(strategy_class):
+def _token_space_defaults(strategy_class, hf_config):
     core_cls = TokenSpaceProcessor.for_strategy(strategy_class)
     defaults = {name: getattr(core_cls, name) for name in _LOADER_ATTRIBUTES}
     # The wrapper's auto count when preprocessing does not compete with the scheduler.
     defaults["auto_mm_processor_worker_num"] = 2
-    defaults["auto_mm_io_worker_num"] = core_cls.auto_mm_io_worker_num
+    # Serving takes the IO thread default from the serving spec, not the core.
+    serving_spec = serving_spec_for(hf_config)(hf_config)
+    defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
     return defaults
 
 
 # The model types each registered architecture is served with.
-_MODEL_TYPES_BY_ARCH = {}
+_MODEL_TYPES_BY_ARCH = {
+    "Qwen2VLForConditionalGeneration": ("qwen2_vl",),
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl",),
+    "Qwen3VLForConditionalGeneration": ("qwen3_vl",),
+    "Qwen3VLMoeForConditionalGeneration": ("qwen3_vl_moe",),
+    "Qwen3_5ForConditionalGeneration": ("qwen3_5",),
+    "Qwen3_5MoeForConditionalGeneration": ("qwen3_5_moe",),
+    "Qwen3_5ForCausalLMMTP": ("qwen3_5",),
+    "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
+    "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
+}
 
 
 class TestTokenSpaceSGLangProcessor(unittest.TestCase):
@@ -370,10 +383,13 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             if arch not in legacy:
                 continue
             for model_type in _MODEL_TYPES_BY_ARCH[arch]:
-                hf_config = SimpleNamespace(model_type=model_type)
+                hf_config = SimpleNamespace(model_type=model_type, architectures=[arch])
+                hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
                 with self.subTest(arch=arch, model_type=model_type):
-                    self.assertEqual(_token_space_defaults(strategy_class), expected)
+                    self.assertEqual(
+                        _token_space_defaults(strategy_class, hf_config), expected
+                    )
 
     def test_strategy_alone_serves_a_model_without_an_hf_processor(self):
         """A strategy plus a tokenizer is enough to register, build, and serve."""
