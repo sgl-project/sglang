@@ -131,10 +131,8 @@ class StateStorage:
                 req.kv.mamba_pool_idx = mid[0]
                 given_state.append(req)
                 req.kv.mamba_needs_clear = True
-                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
-                # ring. write_pos=0 means "ring empty", so the decode kernel
-                # ignores ring contents and reads only the checkpoint state
-                # (the post-prefill state that prefill wrote into this slot).
+                # A zero write_pos empties the ReplaySSM ring;
+                # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:
                     self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
             mamba_indices.append(req.kv.mamba_pool_idx)
@@ -168,11 +166,8 @@ class StateStorage:
             )
 
     def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
-        """Allocate the ping-pong track buffer for a new request; False when
-        too few slots are left.
-
-        Lazy mode allocates 1 slot with the second set to -1 (allocated
-        on demand at track boundaries). Normal mode allocates all slots upfront.
+        """Return False if slots are exhausted. Lazy mode starts with one slot
+        and a -1 sentinel for the second; normal mode allocates all slots.
         """
         n = table.mamba_initial_tracking_slots
         slots = self.slots.alloc(n)
@@ -244,10 +239,7 @@ class StateStorage:
             else:
                 for p in positions:
                     self.slots.free(row[p : p + 1])
-            # Match the req.kv.mamba_pool_idx=None clear above so the next
-            # acquire doesn't see a stale ping-pong reference on the req
-            # and skip allocation (which would silently reuse a freed
-            # tensor on the req side while the new pool slot leaks).
+            # Clear freed references so the next acquire allocates new slots.
             req.kv.mamba_ping_pong_track_buffer = None
             req.kv.mamba_ping_pong_empty = None
             req.kv.mamba_next_track_idx = None
@@ -261,10 +253,8 @@ class StateStorage:
         self.slots.clear()
         self.short_conv_pool.clear()
         self.ngram_pool.clear()
-        # The int8 checkpoint pool holds radix-cached states in its own slots; a
-        # flush/reset drops the radix tree, so its slots must be released too,
-        # otherwise the (now unreferenced) slots leak and break the int8-pool
-        # invariant (int8_available + radix_cached != int8_total).
+        # Reset must also release the int8 pool's radix-cached slots;
+        # dropping the tree alone leaves them allocated and unreachable.
         if self.ckpt_pool is not None:
             self.ckpt_pool.clear()
 

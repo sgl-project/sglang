@@ -28,8 +28,7 @@ class _RecordingCounter:
 
 
 class _Pool:
-    """A pipeline stage starting at layer 4: full layers 7 and 11, state
-    layers 4, 5, 6 and 8."""
+    """Pipeline stage 4 has full layers 7 and 11 and state layers 4, 5, 6 and 8."""
 
     def __init__(self):
         self.start_layer = _START_LAYER
@@ -55,9 +54,8 @@ class _Pool:
 
 
 class _StageWithoutStateLayers:
-    """The last stage of a pipeline whose split leaves it only full layer 47
-    (Qwen3.5 48 layers, full attention every fourth, layer split 47,1): the
-    model has recurrent state, this stage none of its layers."""
+    """The last pipeline stage holds only full-attention layer 47; the model
+    has recurrent layers, but none are assigned to this stage."""
 
     def __init__(self):
         self.start_layer = 47
@@ -67,9 +65,8 @@ class _StageWithoutStateLayers:
 
 class TestKVLayerRouterParts(CustomTestCase):
     def test_state_reads_wait_only_once_the_host_stack_loads_state(self):
-        """A counter registered for KV alone must not hold up state reads, and
-        one that also restores state must, at the same stage-local layer a KV
-        read of that layer would wait for."""
+        """State reads wait at their stage-local layer only when the host stack
+        restores state; KV-only restores must not block them."""
         pool = _Pool()
         counter = _RecordingCounter()
         pool.layer_transfer_counter = counter
@@ -86,10 +83,8 @@ class TestKVLayerRouterParts(CustomTestCase):
         self.assertEqual(counter.waits, [7 - _START_LAYER, 6 - _START_LAYER])
 
     def test_out_of_loop_readers_wait_for_their_own_layer(self):
-        """The N-gram context is read before the layer loop, so it waits for the
-        first state layer only; a whole-state copy reads every state layer, so
-        it waits for the last. Waiting for the last before the loop would
-        serialize the load-back with the forward."""
+        """N-gram reads wait for the first state layer, while whole-state copies
+        wait for the last; waiting for the last early would serialize load-back."""
         pool = _Pool()
         counter = _RecordingCounter()
         pool.layer_transfer_counter = counter
@@ -101,9 +96,8 @@ class TestKVLayerRouterParts(CustomTestCase):
         self.assertEqual(counter.waits, [4 - _START_LAYER, 8 - _START_LAYER])
 
     def test_a_part_with_no_layer_on_this_stage_waits_for_nothing(self):
-        """A prefix hit's deferred state copy waits for the state part before
-        copying; on a stage without state layers that is no wait, with or
-        without a host stack restoring state layer by layer."""
+        """A stage without state layers must not wait for a state or N-gram load,
+        even when the host stack restores state layer by layer."""
         stage = _StageWithoutStateLayers()
         state_view, ngram_view = object(), object()
         stage.router.bind_part(
@@ -124,10 +118,8 @@ class TestKVLayerRouterParts(CustomTestCase):
         self.assertIs(stage.router.part_view("ngram"), ngram_view)
 
     def test_a_stage_without_state_layers_binds_and_reuses_a_prefix(self):
-        """A real request table whose stage holds none of the model's state
-        layers, with the N-gram context on: binding its routes and a prefix
-        hit's deferred copy (wait for the state part, copy the slot) work and
-        copy nothing."""
+        """A real request table on a stage without state layers binds empty routes
+        and performs a prefix-hit state copy without waiting for nonexistent layers."""
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=64,

@@ -1,17 +1,11 @@
-"""A PD decode server builds its pools with the decode request table.
-
-``_build_req_to_token_pool`` picks ``DecodeReqToTokenPool`` for a decode server
-and for a prefill server that can switch to decode, also without unified
-memory. ``_init_pools`` then reads the table's recurrent state, so the decode
-table must answer it like the other request tables: no state.
-"""
+"""Decode and role-switching prefill servers initialize stateless request tables."""
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -32,7 +26,7 @@ def _reach_token_pool(self, *, req_to_token_pool, state, **kwargs):
     raise _ReachedTokenPool(req_to_token_pool, state)
 
 
-class TestDecodeTableInitPools(unittest.TestCase):
+class TestDecodeTableInitPools(CustomTestCase):
     def _init_pools(self, *, disagg):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.is_draft_worker = False
@@ -88,8 +82,8 @@ class TestDecodeTableInitPools(unittest.TestCase):
         self.assertIsNone(reached.state)
 
     def test_a_decode_server_reaches_the_token_pool(self):
-        """BUG REGRESSION. ``_init_pools`` read ``req_to_token_pool.state`` and
-        the decode table had none: AttributeError before the token pool."""
+        """A decode table must expose its absent recurrent state so pool initialization
+        can continue to the token pool."""
         reached = self._init_pools(
             disagg=SimpleNamespace(
                 disaggregation_mode="decode",
