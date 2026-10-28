@@ -14,7 +14,7 @@ use crate::components::{
     self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
 };
 use crate::components::{
-    BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
+    BASE_COMPONENT_TYPE, ComponentType, FULL, Family, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
 use crate::node::Node;
 use crate::node::NodeArena;
@@ -608,6 +608,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     components: Vec<Arc<dyn TreeComponent<K> + Send + Sync>>,
     /// Prebuilt per-type driver lookup, indexed by `ComponentType::idx`.
     components_by_type: [Option<Arc<dyn TreeComponent<K> + Send + Sync>>; NUM_COMPONENT_TYPES],
+    /// Each family's slot, indexed by `Family::idx`: the core finds the window
+    /// or state slot by its family, never by its id.
+    slot_of_family: [Option<ComponentType>; Family::COUNT],
     /// Per-component bookkeeping, indexed by `ComponentType::idx`.
     pub(crate) component_states: [ComponentState; NUM_COMPONENT_TYPES],
     /// Nodes currently eligible for device eviction (D-leaves).
@@ -901,20 +904,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Validate the component configuration used by the public bindings.
     pub fn validate_init_params(
         params: &CacheInitParams,
-        component_types: &[ComponentType],
+        slots: &[(ComponentType, Family)],
     ) -> Result<(), String> {
-        if component_types != [FULL]
-            && component_types != [FULL, SWA]
-            && component_types != [FULL, MAMBA]
-            && component_types != [FULL, SWA, MAMBA]
+        let families: Vec<Family> = slots.iter().map(|&(_, family)| family).collect();
+        if families != [Family::Token]
+            && families != [Family::Token, Family::Window]
+            && families != [Family::Token, Family::State]
+            && families != [Family::Token, Family::Window, Family::State]
         {
-            return Err("only the [Full], [Full, Swa], [Full, Mamba], and [Full, Swa, Mamba] component sets are supported".to_owned());
+            return Err("only the [token], [token, window], [token, state], and [token, window, state] slot families are supported".to_owned());
         }
-        if component_types.contains(&SWA) && params.swa_sliding_window_size.is_none() {
-            return Err("the Swa component requires swa_sliding_window_size".to_owned());
+        if let Some(&(slot, family)) = slots
+            .iter()
+            .find(|&&(slot, family)| slot != components::native_slot(family))
+        {
+            return Err(format!(
+                "the native {family:?} driver serves slot {:?}, not {slot:?}",
+                components::native_slot(family)
+            ));
         }
-        if component_types.contains(&MAMBA) && params.mamba_cache_chunk_size.is_none() {
-            return Err("the Mamba component requires mamba_cache_chunk_size".to_owned());
+        if families.contains(&Family::Window) && params.swa_sliding_window_size.is_none() {
+            return Err("the window slot requires swa_sliding_window_size".to_owned());
+        }
+        if families.contains(&Family::State) && params.mamba_cache_chunk_size.is_none() {
+            return Err("the state slot requires mamba_cache_chunk_size".to_owned());
         }
         if params.page_size == 0 {
             return Err("page_size must be at least 1".to_owned());
@@ -932,18 +945,38 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
-        Self::validate_components_(&component_types, params.page_size);
-        let mut components = Vec::with_capacity(component_types.len());
-        for ct in &component_types {
-            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match ct {
-                ComponentType::Full => Arc::new(FullComponent),
-                ComponentType::Swa => Arc::new(SwaComponent::new(&params)),
-                ComponentType::Mamba => Arc::new(MambaComponent::new(&params)),
+    /// Build a core for `slots`, each slot's id and family as the plan gives
+    /// them: the family chooses the driver, the id names its slot.
+    pub fn new_with_slots(params: CacheInitParams, slots: Vec<(ComponentType, Family)>) -> Self {
+        let slot_ids: Vec<ComponentType> = slots.iter().map(|&(slot, _)| slot).collect();
+        Self::validate_components_(&slot_ids, params.page_size);
+        let mut components = Vec::with_capacity(slots.len());
+        for &(slot, family) in &slots {
+            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match family {
+                Family::Token => Arc::new(FullComponent),
+                Family::Window => Arc::new(SwaComponent::new(&params)),
+                Family::State => Arc::new(MambaComponent::new(&params)),
             };
+            assert_eq!(
+                component.component_type(),
+                slot,
+                "the native {family:?} driver serves slot {:?}",
+                component.component_type()
+            );
             components.push(component);
         }
         Self::new_with_components_(params, components)
+    }
+
+    /// A core for `component_types`, each named slot given the family its
+    /// native driver serves.
+    #[cfg(test)]
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        let slots = component_types
+            .into_iter()
+            .map(|slot| (slot, components::native_family(slot)))
+            .collect();
+        Self::new_with_slots(params, slots)
     }
 
     /// Construct a core from a fixed set of native component drivers.
@@ -958,6 +991,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             arena,
             components: Vec::new(),
             components_by_type: Default::default(),
+            slot_of_family: Default::default(),
             component_states: Default::default(),
             evictable_device_leaves: NodeSet::new(),
             evictable_host_leaves: NodeSet::new(),
@@ -1145,7 +1179,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         skip_swa_and_below: bool,
     ) {
         let swa_priority = if skip_swa_and_below {
-            self.try_component_by_type_(SWA)
+            self.slot_of_family(Family::Window)
+                .and_then(|window| self.try_component_by_type_(window))
                 .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
         } else {
             None
@@ -1157,7 +1192,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 continue;
             }
             if let Some(swa_priority) = swa_priority
-                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
+                && (Some(ct) == self.slot_of_family(Family::Window)
+                    || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
             {
                 continue;
             }
@@ -1223,7 +1259,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<(), NodeAccessError> {
         let node_idx = self.arena.resolve(node_id)?;
         self.assert_receipt_anchor_(node_idx, params);
-        let Some(swa) = self.try_component_by_type_(SWA) else {
+        let Some(swa) = self
+            .slot_of_family(Family::Window)
+            .and_then(|window| self.try_component_by_type_(window))
+        else {
             return Ok(());
         };
         swa.release_window_lock(
@@ -1262,7 +1301,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<EvictionStepResult, NodeAccessError> {
         let tail_node_id = self.arena.resolve(tail_node_id)?;
         let mut result = EvictionStepResult::default();
-        let component = self.component_by_type_(MAMBA);
+        let component = self.component_by_type_(self.family_slot_(Family::State));
         component.evict_excess_path_states(
             self,
             tail_node_id,
@@ -2582,7 +2621,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "duplicate component type {component_type:?}"
         );
         *slot = Some(Arc::clone(&component));
+        let family = component.family();
+        assert!(
+            self.slot_of_family[family.idx()].is_none(),
+            "a second {family:?} slot ({component_type:?}); the native core keeps one per family"
+        );
+        self.slot_of_family[family.idx()] = Some(component_type);
         self.components.push(component);
+    }
+
+    /// The tree's slot of `family`, if it has one.
+    pub(crate) fn slot_of_family(&self, family: Family) -> Option<ComponentType> {
+        self.slot_of_family[family.idx()]
+    }
+
+    /// The tree's slot of `family`; panics when it has none.
+    fn family_slot_(&self, family: Family) -> ComponentType {
+        self.slot_of_family(family)
+            .unwrap_or_else(|| panic!("the tree has no {family:?} slot"))
     }
 
     /// Panics if the component is not enabled, matching the python KeyError.
@@ -2655,9 +2711,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             );
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         let state = self.component_state(component_type);
-        if component_type == MAMBA {
+        if Some(component_type) == self.slot_of_family(Family::State) {
             result.mamba_backup_node_id = state.evict_device_pending_node;
-        } else if component_type == SWA {
+        } else if Some(component_type) == self.slot_of_family(Family::Window) {
             result.swa_backup_node_id = state.evict_device_pending_node;
             result.swa_backup_num_tokens = state.evict_device_pending_num_tokens;
         }
@@ -2674,12 +2730,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// and acknowledged its host backup. A failed backup still drops the
     /// state so an imminent device allocation can make progress.
     pub fn finish_mamba_state_eviction(&mut self, node_id: NodeId) -> EvictionStepResult {
-        self.finish_internal_component_eviction_(MAMBA, node_id)
+        self.finish_internal_component_eviction_(self.family_slot_(Family::State), node_id)
     }
 
     /// Finish an internal SWA eviction after its best-effort host backup.
     pub fn finish_swa_state_eviction(&mut self, node_id: NodeId) -> EvictionStepResult {
-        self.finish_internal_component_eviction_(SWA, node_id)
+        self.finish_internal_component_eviction_(self.family_slot_(Family::Window), node_id)
     }
 
     fn finish_internal_component_eviction_(
@@ -2705,6 +2761,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Ok(node_idx) = self.arena.resolve(node_id) else {
             return result;
         };
+        let is_state = Some(component_type) == self.slot_of_family(Family::State);
         let node = self.arena.node(node_idx);
         // Own-component locks protect DMA sources; another component's
         // transfer may mark this node without using its restored state.
@@ -2712,13 +2769,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // evicted outside a pending Full load-back's restored SWA window.
         if !node.has_device_value(component_type)
             || self.arena.device_lock_ref(node_idx, component_type) > 0
-            || (component_type == MAMBA && node.is_load_back_pending())
+            || (is_state && node.is_load_back_pending())
             || !self.device_lru_list(component_type).in_list(Some(node_idx))
         {
             return result;
         }
         if self.evictable_device_leaves.contains(node_idx)
-            || (component_type == MAMBA && !node.has_device_value(FULL))
+            || (is_state && !node.has_device_value(FULL))
         {
             // Re-select through the ordinary walk if the victim's shape has
             // changed; an internal-state finish must never demote Full KV.
@@ -4774,7 +4831,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     fn validate_swa_span_(&self, key: &K, start: usize, end: usize) -> Result<(), String> {
-        if self.components_by_type[SWA.idx()].is_none() {
+        if self.slot_of_family(Family::Window).is_none() {
             return Err("SWA component is not enabled".into());
         }
         if start > end || end > key.atom_len() {
@@ -4796,13 +4853,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         end: usize,
     ) -> Result<Vec<(usize, usize)>, String> {
         self.validate_swa_span_(key, start, end)?;
+        let window = self.family_slot_(Family::Window);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         if start == end {
             return Ok(ranges);
         }
         for (child_id, pos, prefix_len) in self.collect_matched_spans_(key, namespace, end) {
             let seg_end = pos + prefix_len;
-            if seg_end <= start || self.arena.has_device_value(child_id, SWA) {
+            if seg_end <= start || self.arena.has_device_value(child_id, window) {
                 continue;
             }
             let lo = start.max(pos);
@@ -4832,6 +4890,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         swa_values: &Tensor,
     ) -> Result<CacheActions, String> {
         self.validate_swa_span_(key, window_start, window_end)?;
+        let window = self.family_slot_(Family::Window);
         if swa_values.kind() != Kind::Int64 || swa_values.device() != self.device {
             return Err(format!(
                 "attach_swa_window requires int64 values on {:?}",
@@ -4861,7 +4920,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if pos + prefix_len <= window_start {
                 continue;
             }
-            if self.arena.has_device_value(child_id, SWA) {
+            if self.arena.has_device_value(child_id, window) {
                 return Err(format!(
                     "attach_swa_window over live SWA at [{}, {})",
                     window_start.max(pos),
@@ -4905,7 +4964,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     (seg_end - seg_start) as i64,
                 )
                 .copy();
-            self.set_component_device_value_(target, SWA, values);
+            self.set_component_device_value_(target, window, values);
         }
         Ok(actions)
     }
@@ -6002,24 +6061,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.protected_size()
     }
 
+    /// `size_of` the tree's slot of `family`; 0 when it has none.
+    fn family_size_(&self, family: Family, size_of: fn(&Self, ComponentType) -> usize) -> usize {
+        self.slot_of_family(family)
+            .map_or(0, |slot| size_of(self, slot))
+    }
+
     /// SWA component evictable token count.
     pub fn swa_evictable_size(&self) -> usize {
-        self.evictable_size_(SWA)
+        self.family_size_(Family::Window, Self::evictable_size_)
     }
 
     /// Mamba component evictable token count.
     pub fn mamba_evictable_size(&self) -> usize {
-        self.evictable_size_(MAMBA)
+        self.family_size_(Family::State, Self::evictable_size_)
     }
 
     /// SWA component protected token count.
     pub fn swa_protected_size(&self) -> usize {
-        self.protected_size_(SWA)
+        self.family_size_(Family::Window, Self::protected_size_)
     }
 
     /// Mamba component protected token count.
     pub fn mamba_protected_size(&self) -> usize {
-        self.protected_size_(MAMBA)
+        self.family_size_(Family::State, Self::protected_size_)
     }
 
     /// (full_tokens, aux_tokens) summed across the whole tree.
@@ -6055,7 +6120,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         unlocked_only: bool,
         swa_resident_only: bool,
     ) -> KvCanaryWalkResult {
-        let swa_filter = swa_resident_only && self.components_by_type[SWA.idx()].is_some();
+        let window_slot = self.slot_of_family(Family::Window);
+        let swa_filter = swa_resident_only && window_slot.is_some();
         let mut slot_indices: Vec<i64> = Vec::new();
         let mut positions: Vec<i64> = Vec::new();
         let mut prev_slot_indices: Vec<i64> = Vec::new();
@@ -6077,13 +6143,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // hold Full KV for a running request while its SWA slots are unused.
                 emit = emit
                     && if swa_filter {
-                        node.device_lock_ref(SWA) == 0
+                        window_slot.is_some_and(|window| node.device_lock_ref(window) == 0)
                     } else {
                         node.device_lock_ref(FULL) == 0
                     };
             }
             if swa_filter {
-                emit = emit && node.has_device_value(SWA);
+                emit = emit && window_slot.is_some_and(|window| node.has_device_value(window));
             }
 
             // Skipped nodes still advance the chain/depth so descendants stay consistent.
@@ -6116,7 +6182,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Every Mamba device value in the tree, concatenated.
     pub fn all_mamba_values_flatten(&self) -> Tensor {
-        components::all_values_flatten(self, MAMBA)
+        match self.slot_of_family(Family::State) {
+            Some(state) => components::all_values_flatten(self, state),
+            None => self.empty_device_indices.shallow_clone(),
+        }
     }
 }
 

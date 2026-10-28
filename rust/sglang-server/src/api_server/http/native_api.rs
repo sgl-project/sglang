@@ -4,7 +4,7 @@
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
 //! tuples, cumulative vs incremental streams) lives here; submission and
-//! request lifetime belong to the shared [`crate::api_server::core::CoreHandle`].
+//! request lifetime belong to the shared [`crate::api_server::handlers::CoreHandle`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use super::app::AppState;
 use super::generate_hook::{GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys};
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{
-    CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
-};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
+use crate::api_server::handlers::{CoreCall, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]
@@ -586,7 +585,7 @@ pub(super) fn generation_event_stream_with(
             let mut terminal = None;   // (finish_reason) of a `Done` in this batch
             let mut failed = None;     // an `Error` in this batch
 
-            for item in items {
+            for item in items.into_iter().map(stream_event) {
                 match item {
                     CoreEvent::Delta(out) => {
                         requests[i].timing.observe_first_output();
@@ -635,6 +634,20 @@ pub(super) fn generation_event_stream_with(
             }
         }
         yield "[DONE]".to_string();
+    }
+}
+
+/// A stream's view of `event`: a scheduler abort that carried an error status
+/// ends a native stream as Python's server ends it, on a normal terminal frame
+/// whose `meta_info.finish_reason` is the abort, status code and message
+/// included. A unary response reports the abort's status instead.
+fn stream_event(event: CoreEvent) -> CoreEvent {
+    match event {
+        CoreEvent::Failed(error) => match error.into_rejected_output() {
+            Ok(output) => CoreEvent::Finished(output),
+            Err(error) => CoreEvent::Failed(error),
+        },
+        event => event,
     }
 }
 
@@ -736,16 +749,17 @@ mod tests {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -779,16 +793,17 @@ mod tests {
             ..Default::default()
         };
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: activity.clone(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -819,16 +834,17 @@ mod tests {
     async fn unary_http_generate_round_trips_through_frontend_handle() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             abort_tx,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -900,16 +916,17 @@ mod tests {
         items: usize,
     ) -> Vec<(Option<i64>, bool)> {
         let (intake_tx, intake_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             flume::unbounded().0,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -1125,16 +1142,17 @@ mod tests {
             (true, true, false),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
-            let core = crate::api_server::core::CoreHandle::new(
+            let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 flume::unbounded().0,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             );
@@ -1521,30 +1539,50 @@ mod tests {
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
 
+    /// A scheduler abort that carried an error status ends a stream on a
+    /// normal frame, as Python's server ends it: the output so far, the
+    /// request's counts, and the abort as the finish reason, then `[DONE]`.
+    /// A unary response answers with the abort's status and message instead.
     #[tokio::test]
-    async fn scheduler_rejection_preserves_legacy_http_status() {
+    async fn scheduler_abort_ends_a_stream_on_a_frame_and_fails_unary() {
+        let finish_reason = serde_json::json!({
+            "type": "abort",
+            "message": "media decode failed",
+            "status_code": 432,
+            "err_type": "BadRequestError"
+        });
+        let abort = |rid: u64| {
+            ResponseItem::Done(ChunkEvent {
+                rid: Rid::from(rid.to_string()),
+                prompt_tokens: 5,
+                finish_reason: serde_json::from_value(finish_reason.clone()).unwrap(),
+                ..Default::default()
+            })
+        };
+
         let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, false, false);
+        let stream = generation_event_stream(vec![timed_call(10, rx)], false, false);
         futures::pin_mut!(stream);
-
-        tx.send(ResponseItem::Done(ChunkEvent {
-            finish_reason: serde_json::from_value(serde_json::json!({
-                "type": "abort",
-                "message": "media decode failed",
-                "status_code": 432,
-                "err_type": "BadRequestError"
-            }))
-            .unwrap(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-
-        let failure = parse(&stream.next().await.unwrap());
-        assert_eq!(failure["error"]["code"], 432);
-        assert_eq!(failure["error"]["message"], "media decode failed");
+        tx.send(frame(10, "partial")).await.unwrap();
+        assert_eq!(parse(&stream.next().await.unwrap())["text"], "partial");
+        tx.send(abort(10)).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert!(v.get("error").is_none(), "no error item: {v}");
+        assert_eq!(v["text"], "partial");
+        assert_eq!(v["meta_info"]["prompt_tokens"], 5);
+        assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert_eq!(v["meta_info"]["finish_reason"], finish_reason);
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(abort(11)).await.unwrap();
+        let (mut call, timing) = timed_call(11, rx);
+        let (status, item) = drain_unary(&mut call, "11", timing).await;
+        assert_eq!(status.as_u16(), 432);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["error"]["code"], 432);
+        assert_eq!(v["error"]["message"], "media decode failed");
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
