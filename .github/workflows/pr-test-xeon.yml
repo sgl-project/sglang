@@ -6,8 +6,17 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -20,7 +29,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xeon-${{ inputs.ref || github.ref }}
+  group: pr-test-xeon-${{ inputs.extra_only && 'extra' || 'base' }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -68,6 +77,7 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
+              - ".github/workflows/pr-test-extra.yml"
               - "docker/xeon.Dockerfile"
 
   # ==================== PR Gate ==================== #
@@ -75,6 +85,8 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci-extra: ${{ inputs.extra_only == true }}
     secrets: inherit
 
   build-test:
@@ -85,35 +97,14 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          # GNR runs only the TP suite (needs >=6 NUMA nodes for --tp 6),
-          # full machine, no partitioning. 4 files: 3 TP + autoround.
-          - runner: xeon-gnr
-            role: gnr
-            suite: "stage-a-tp-test-cpu-intel"
-            name: gnr
-
-          # Each SPR box (2 sockets / 2 NUMA, 32 physical cores each) runs TWO
-          # socket-pinned containers in parallel, each taking one partition of a
-          # 4-way split over the merged non-TP pool. Each container is capped
-          # with --memory so sglang (which reads cgroup memory.max, PR #38260 +
-          # the empty-NUMA-node fix) sizes its KV pool against one socket's
-          # budget, not the whole host -- so two parallel servers no longer
-          # exhaust host RAM. 2 boxes x 2 sockets = 4 partitions.
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr1
-            part_lo: 0
-            part_hi: 1
-            part_size: 4
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr2
-            part_lo: 2
-            part_hi: 3
-            part_size: 4
+        # Extra runs only on SPR; GNR remains dedicated to the base TP suite.
+        # Base uses two SPR jobs (four partitions); extra uses one (two partitions).
+        include: >-
+          ${{ fromJSON(inputs.extra_only &&
+          '[{"runner":"xeon-spr","role":"spr","suite":"extra-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":2}]' ||
+          '[{"runner":"xeon-gnr","role":"gnr","suite":"stage-a-tp-test-cpu-intel","name":"gnr"},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":4},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr2","part_lo":2,"part_hi":3,"part_size":4}]') }}
     steps:
       - name: Cleanup workspace
         run: |
