@@ -243,8 +243,8 @@ class _Fp8KvRowReader:
         self._arange: Optional[torch.Tensor] = None
 
     def use_compact(self, num_kv_ids: int) -> bool:
-        """Repeated physical rows must not make the compact copy larger than the pool."""
-        return num_kv_ids <= self.pool_rows
+        """Bound the byte gather plus converted output by a full-pool cast."""
+        return 3 * num_kv_ids <= 2 * self.pool_rows
 
     @staticmethod
     def enabled(token_to_kv_pool, q_dtype: torch.dtype) -> bool:
