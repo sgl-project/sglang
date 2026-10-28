@@ -178,8 +178,7 @@ impl ChatFormatter {
         // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`. M3 is
         // keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`), the
         // others on their template.
-        let processor =
-            ProcessorFormatter::from_tokenizer_config_with_type(&cfg, model_type)
+        let processor = ProcessorFormatter::from_tokenizer_config_with_type(&cfg, model_type)
             .ok()
             .filter(|formatter| {
                 matches!(

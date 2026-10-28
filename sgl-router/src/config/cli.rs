@@ -67,6 +67,11 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_id: String,
 
+    /// Extra `model` value served as --model-id (repeatable); the body is forwarded unchanged
+    /// and /v1/models lists only --model-id. E.g. a gateway sending the engine's --model-path.
+    #[arg(long = "model-alias", value_name = "MODEL")]
+    pub model_alias: Vec<String>,
+
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
@@ -658,6 +663,7 @@ impl Cli {
                         .unwrap_or_else(|| self.model.model_id.clone())
                 }),
                 id: self.model.model_id,
+                aliases: self.model.model_alias,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
@@ -1546,6 +1552,23 @@ mod tests {
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
         assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
+        assert!(c.model.aliases.is_empty());
+    }
+
+    #[test]
+    fn model_alias_is_repeatable() {
+        let c = into_config(&[
+            "--model-id",
+            "org/repo",
+            "--model-alias",
+            "/weights-repo/snapshots/abc",
+            "--model-alias",
+            "repo",
+            "--worker-urls",
+            "http://x:30000",
+        ])
+        .unwrap();
+        assert_eq!(c.model.aliases, ["/weights-repo/snapshots/abc", "repo"]);
     }
 
     #[test]

@@ -213,6 +213,7 @@ impl AppContext {
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
+                    aliases: Vec::new(),
                     id: "stub-model".into(),
                     tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,

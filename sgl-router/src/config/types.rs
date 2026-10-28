@@ -381,6 +381,8 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
+    /// Extra `model` values served as `id` (`--model-alias`); only `id` is advertised.
+    pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
     pub tokenizer_path: Option<String>,
