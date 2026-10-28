@@ -32,8 +32,8 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     _make_score_mod,
     _pad_reference_video_kv,
     _quantize_fp8_per_token_head,
-    _split_attention_is_exact,
     _sp_scatter_out,
+    _split_attention_is_exact,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
     WanAnimate2ClipConditioning,
@@ -372,7 +372,12 @@ def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
     reference[0, 1] = torch.linspace(0.5, 2.0, 16).view(2, 8)
     padded = _pad_reference_video_kv(reference, layout)
     q8, scale = _quantize_fp8_per_token_head(padded)
-    assert q8.dtype == torch.float8_e4m3fn and tuple(scale.shape) == (1, layout.padded_reference_video_len, 2, 1)
+    assert q8.dtype == torch.float8_e4m3fn and tuple(scale.shape) == (
+        1,
+        layout.padded_reference_video_len,
+        2,
+        1,
+    )
     dequant = q8.float() * scale
     assert torch.isfinite(dequant).all()
     assert dequant[:, 2:].abs().sum() == 0
@@ -409,7 +414,11 @@ def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
         (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 1, True),  # full clip
         (_InContextLayout((2, 1, 2), (1, 1, 2), (4, 1, 2)), 1, True),  # short last clip
         (_SHORT_CLIP_LAYOUT, 1, False),  # zero slots inside each frame
-        (_InContextLayout((2, 2, 2), (1, 1, 5), (2, 2, 2)), 1, False),  # wider reference frame
+        (
+            _InContextLayout((2, 2, 2), (1, 1, 5), (2, 2, 2)),
+            1,
+            False,
+        ),  # wider reference frame
         (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 2, False),
     ],
 )
@@ -445,7 +454,9 @@ def test_split_attention_matches_flex(log_scale, fp8, full_clip_f):
     )
     ref_k, ref_v = (
         _pad_reference_video_kv(
-            torch.randn(1, 256, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g),
+            torch.randn(
+                1, 256, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g
+            ),
             layout,
         )
         for _ in range(2)

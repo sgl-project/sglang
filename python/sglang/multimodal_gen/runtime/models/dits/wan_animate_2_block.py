@@ -97,7 +97,9 @@ def _pad_reference_video_kv(x: torch.Tensor, layout: _InContextLayout) -> torch.
     f = layout.reference_video_f
     tokens_per_frame = layout.reference_video_tokens_per_frame
     slot = layout.max_tokens_per_frame
-    out = x.new_zeros(batch_size, layout.padded_reference_video_len, num_heads, head_dim)
+    out = x.new_zeros(
+        batch_size, layout.padded_reference_video_len, num_heads, head_dim
+    )
     out[:, : f * slot].view(batch_size, f, slot, num_heads, head_dim)[
         :, :, :tokens_per_frame
     ] = x[:, : f * tokens_per_frame].view(
@@ -369,7 +371,8 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         reference_video_v: torch.Tensor,
         block_mask: BlockMask,
         layout: _InContextLayout,
-        reference_video_k_scale: torch.Tensor | None = None,  # [B, padded_reference_video_len, H, 1] fp32
+        # [B, padded_reference_video_len, H, 1] fp32 when the reference K/V are FP8.
+        reference_video_k_scale: torch.Tensor | None = None,
         reference_video_v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build the padded [gen | reference-video] layout and run compiled flex_attention.
@@ -536,10 +539,22 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             other_k = torch.cat([k[: frame_1.start], k[frame_1.stop :]])
             other_v = torch.cat([v[: frame_1.start], v[frame_1.stop :]])
             out, lse = attend(
-                q, other_k, other_v, whole(n), whole(n - tokens_per_frame), n, n - tokens_per_frame
+                q,
+                other_k,
+                other_v,
+                whole(n),
+                whole(n - tokens_per_frame),
+                n,
+                n - tokens_per_frame,
             )
             out_1, lse_1 = attend(
-                q, k[frame_1], v[frame_1], whole(n), whole(tokens_per_frame), n, tokens_per_frame
+                q,
+                k[frame_1],
+                v[frame_1],
+                whole(n),
+                whole(tokens_per_frame),
+                n,
+                tokens_per_frame,
             )
             out, lse = merge_state(out, lse, out_1, lse_1 + log_scale)
 
@@ -566,7 +581,9 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         # and value 0, so they only add num_zero_keys to the softmax denominator.
         num_zero_keys = layout.max_generation_video_num_tokens - n
         if num_zero_keys:
-            out = (out * torch.sigmoid(lse - math.log(num_zero_keys)).unsqueeze(-1)).to(q.dtype)
+            out = (out * torch.sigmoid(lse - math.log(num_zero_keys)).unsqueeze(-1)).to(
+                q.dtype
+            )
         return out.unsqueeze(0)
 
 
