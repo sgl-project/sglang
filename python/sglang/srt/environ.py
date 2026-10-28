@@ -2088,7 +2088,7 @@ class Envs:
     SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # when aiter all-reduce fusion is off, except for the checkpoints measured
-    # faster with it (quark_mxfp4, the M3.1 NVFP4 and Quark exports; see
+    # faster with it on gfx950 (quark_mxfp4, the M3.1 NVFP4 and Quark exports; see
     # model_overrides/minimax_m3_hip.py). Set this to opt back in and keep
     # custom/quick all-reduce enabled -- e.g. to run the INT4 quick-reduce path
     # via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.

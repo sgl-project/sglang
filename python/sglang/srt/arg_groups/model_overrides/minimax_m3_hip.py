@@ -71,16 +71,13 @@ def rocm_overrides(
     cfg: Any, hf_config: Any, quantization: Optional[str], overrides: dict
 ) -> bool:
     """The other MiniMax-M3 checkpoints on ROCm: the M3.1 Quark export's gfx950 defaults.
-    Returns whether custom all-reduce stays on: quark_mxfp4 and the M3.1 Quark export are
-    measured faster with it at equal accuracy; MXFP8 is not."""
-    m31_quark = (
-        get_platform().is_gfx95
-        and quantization == "quark"
-        and is_m31_quark_export(hf_config)
-    )
+    Returns whether custom all-reduce stays on: on gfx950, quark_mxfp4 and the M3.1 Quark
+    export are measured faster with it at equal accuracy; MXFP8 is not."""
+    gfx950 = get_platform().is_gfx95
+    m31_quark = gfx950 and quantization == "quark" and is_m31_quark_export(hf_config)
     if m31_quark:
         _m31_quark_gfx950_overrides(cfg, overrides)
-    keeps_custom_all_reduce = quantization == "quark_mxfp4" or m31_quark
+    keeps_custom_all_reduce = m31_quark or (gfx950 and quantization == "quark_mxfp4")
     if keeps_custom_all_reduce:
         _require_attention_tp_within_kv_heads(cfg, hf_config)
     return keeps_custom_all_reduce
