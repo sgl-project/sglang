@@ -202,10 +202,8 @@ class IndexerKPool(MultiPlatformOp):
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
         self.mx_mqa_logits = uses_mx_mqa_logits(get_device().device)
-        # Other paged backends read the FP32 scales, which the ragged path repacks
-        self.ue8m0_index_cache = (
-            self.mx_mqa_logits and self.paged_mqa_logits_backend.is_deepgemm()
-        )
+        # DeepGEMM is the only SM100 paged reader of the k-pool cache
+        self.ue8m0_index_cache = self.mx_mqa_logits
 
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)

@@ -172,6 +172,10 @@ def cutedsl_paged_mqa_logits(
     else:
         q_dsl = q_fp8[:q_offset].unsqueeze(1)
         block_tables_dsl = block_tables[:B]
+        if schedule_metadata is None:
+            schedule_metadata = get_paged_mqa_logits_metadata_fn(
+                ctx_lens_1d.unsqueeze(-1), blocksize, sm_count
+            )
 
     return CuteDSLPagedMQALogitsRunner.forward(
         q_dsl,

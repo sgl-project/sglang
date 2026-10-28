@@ -1298,10 +1298,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
-        use_cute_dsl = (
-            self.paged_mqa_logits_backend.is_cutedsl()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
-        )
+        use_cute_dsl = self.paged_mqa_logits_backend.is_cutedsl()
+        draft_extend = forward_batch.forward_mode.is_draft_extend_v2()
         dsl_expand_factor, dsl_atom = 1, 1
         if (
             use_cute_dsl
@@ -1318,7 +1316,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_heads=self.n_heads,
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
-        if self.mx_mqa_logits and not use_cute_dsl:
+        if self.mx_mqa_logits and not use_cute_dsl and not _use_torch_mqa_logits():
             assert self.ue8m0_index_cache, (
                 "SM100 DeepGEMM paged MQA logits need the UE8M0 index cache, which "
                 "only the deepgemm paged backend writes"
@@ -1432,23 +1430,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 clean_logits=False,
             )
         elif use_cute_dsl:
+            # Draft extend scores one row per query token, as the DeepGEMM split path does
             logits = cutedsl_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                metadata.get_seqlens_int32(),
+                (
+                    seqlens_32.reshape(-1)[:q_offset]
+                    if draft_extend
+                    else metadata.get_seqlens_int32()
+                ),
                 block_tables,
-                schedule_metadata,
+                None if draft_extend else schedule_metadata,
                 max_seq_len,
                 q_offset=q_offset,
-                B=B,
-                next_n=next_n,
+                B=q_offset if draft_extend else B,
+                next_n=1 if draft_extend else next_n,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 dsl_expand_factor=dsl_expand_factor,
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
+                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(
+                    cutedsl=True
+                ),
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(

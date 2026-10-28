@@ -373,9 +373,10 @@ def resolve_num_sms() -> int:
     ).multi_processor_count
 
 
-@lru_cache(maxsize=1)
-def resolve_paged_mqa_logits_metadata_fn():
-    if _use_torch_mqa_logits():
+@lru_cache(maxsize=None)
+def resolve_paged_mqa_logits_metadata_fn(cutedsl: bool = False):
+    # The CuTe DSL kernel walks 256-token KV splits; DeepGEMM's SM100 schedule uses 384
+    if cutedsl or _use_torch_mqa_logits():
         from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
 
         return get_paged_mqa_logits_metadata

@@ -77,6 +77,9 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
@@ -570,6 +573,11 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.paged_mqa_schedule_fn = resolve_paged_mqa_logits_metadata_fn(
+            cutedsl=DSAPagedMQALogitsBackend.resolve(
+                get_exec().kernel.dsa_paged_mqa_logits_backend
+            ).is_cutedsl()
+        )
         if (
             not _is_hip
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
@@ -964,9 +972,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = resolve_paged_mqa_logits_metadata_fn()(
-            seqlens_32_2d, 64, resolve_num_sms()
-        )
+        new_schedule = self.paged_mqa_schedule_fn(seqlens_32_2d, 64, resolve_num_sms())
         if metadata.paged_mqa_schedule_metadata is None:
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
@@ -1374,10 +1380,8 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded,
                 forward_batch.batch_size,
             )
-            # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
-            # block_kv * 4 and both DG's and the indexer's compute kernels
-            # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+            # NOTE: block_kv arg must be 64 here, independent of the cache page size.
+            paged_mqa_schedule_metadata = self.paged_mqa_schedule_fn(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
@@ -1767,7 +1771,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+            paged_mqa_schedule_metadata = self.paged_mqa_schedule_fn(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
