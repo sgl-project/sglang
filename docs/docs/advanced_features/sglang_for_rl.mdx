@@ -206,8 +206,8 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`selector`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which model runners to reload under speculative decoding. Use `"target"` to keep a separate draft model's weights.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"all"`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which model runners to reload under speculative decoding. By default the draft is reloaded only when it was loaded from the target's checkpoint (e.g. a bundled MTP layer), so a separate draft such as DFLASH keeps its weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`"target"`, `"draft"`, `"all"`</td>
     </tr>
   </tbody>
@@ -252,7 +252,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
   </tbody>
 </table>
 
-**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None, selector="all")`
+**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None, selector=None)`
 
 **Diffusion engine (SGLang-Diffusion):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
 

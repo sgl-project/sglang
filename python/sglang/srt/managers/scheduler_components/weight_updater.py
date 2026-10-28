@@ -44,7 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,8 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners(recv_req.selector):
+            selector = recv_req.selector or self._default_disk_update_selector()
+            for role, runner in self._select_runners(selector):
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -174,6 +175,13 @@ class SchedulerWeightUpdaterManager:
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
+
+    @staticmethod
+    def _default_disk_update_selector() -> str:
+        # A draft with its own checkpoint (e.g. DFLASH, EAGLE3) must not load the
+        # target's; a draft bundled in the target checkpoint is reloaded with it.
+        draft_path = get_spec().speculative_draft_model_path
+        return "all" if draft_path in (None, get_model().model_path) else "target"
 
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
         roles = _parse_runner_selector(selector)

@@ -1990,8 +1990,9 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
-    # which runners the op applies to
-    selector: Literal["target", "draft", "all"] = "all"
+    # which runners the op applies to; None reloads the draft only when it was
+    # loaded from the target's checkpoint (e.g. a bundled MTP layer)
+    selector: Optional[Literal["target", "draft", "all"]] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):

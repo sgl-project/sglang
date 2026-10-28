@@ -275,6 +275,34 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         target.weight_updater.update_weights_from_disk.assert_not_called()
         draft.weight_updater.update_weights_from_disk.assert_called_once()
 
+    def _default_disk_update(self, draft_path):
+        target, draft = _runner(), _runner()
+        module = "sglang.srt.managers.scheduler_components.weight_updater"
+        with (
+            patch(
+                f"{module}.get_spec",
+                return_value=SimpleNamespace(speculative_draft_model_path=draft_path),
+            ),
+            patch(
+                f"{module}.get_model", return_value=SimpleNamespace(model_path="target")
+            ),
+        ):
+            output = self._manager(target, draft).update_weights_from_disk(
+                _request(selector=None)
+            )
+        self.assertTrue(output.success)
+        target.weight_updater.update_weights_from_disk.assert_called_once()
+        return draft.weight_updater.update_weights_from_disk
+
+    def test_disk_update_default_skips_draft_with_its_own_checkpoint(self):
+        """A separate draft (e.g. DFLASH) must not load the target's checkpoint."""
+        self._default_disk_update("draft").assert_not_called()
+
+    def test_disk_update_default_reloads_draft_bundled_in_target(self):
+        """A draft loaded from the target's checkpoint (e.g. MTP) is reloaded with it."""
+        self._default_disk_update("target").assert_called_once()
+        self._default_disk_update(None).assert_called_once()
+
     def test_end_runs_post_load_on_both_when_load_was_bypassed(self):
         """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
         target, draft = _runner(), _runner()

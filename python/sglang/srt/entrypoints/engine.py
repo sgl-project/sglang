@@ -1701,14 +1701,15 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
-        selector: str = "all",
+        selector: Optional[str] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
         This method allows updating the model weights from disk without restarting
         the engine. It can be used to load a different model or update weights with
-        new training. Pass selector="target" to leave a separate draft model
-        (e.g. a DFLASH or EAGLE3 draft) untouched.
+        new training. By default a draft model is reloaded only when it was
+        loaded from the target's checkpoint; pass selector="target", "draft" or
+        "all" to choose explicitly.
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
