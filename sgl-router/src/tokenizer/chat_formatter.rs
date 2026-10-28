@@ -295,6 +295,12 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// MiniMax-M3 / M3.1 (`model_type == "minimax_m3_vl"`), whose thinking
+    /// contract the chat route enforces at ingress.
+    pub fn is_minimax_m3(&self) -> bool {
+        matches!(self.processor, Some(ProcessorFormatter::MiniMaxM3(_)))
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
@@ -798,6 +804,7 @@ mod tests {
             "{# <mm:think> #}{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}";
         let enc = jinja(json!({ "chat_template": template }));
         assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        assert!(enc.is_minimax_m3());
         let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
         let req = request(json!([
             {"role": "user", "content": "Q"},
@@ -813,6 +820,7 @@ mod tests {
         assert!(enc.render(&request(late_root)).is_err());
         let other = jinja(json!({ "chat_template": template.replace("<mm:think>", "") }));
         assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
+        assert!(!other.is_minimax_m3());
     }
 
     #[test]

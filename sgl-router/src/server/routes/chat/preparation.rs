@@ -167,10 +167,19 @@ impl PreparedRequest {
         model: ModelId,
         fields: RoutingFields,
         headers: &HeaderMap,
-        body: Bytes,
+        mut body: Bytes,
         policy_needs_request_tokens: bool,
         lower: bool,
     ) -> Result<Self, ApiError> {
+        // MiniMax-M3.1's thinking contract, before anything renders or forwards the
+        // body, so the engine and the router's render see the same request.
+        if path == CHAT_PATH && ctx.tokenizers.is_minimax_m3(&model.0) {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+                if enforce_minimax_m31_thinking(&mut value)? {
+                    body = Bytes::from(serde_json::to_vec(&value).map_err(|_| invalid_request())?);
+                }
+            }
+        }
         // The fleet's sampling contract applies to the client's body on both routes.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
@@ -1567,9 +1576,112 @@ fn invalid_request() -> ApiError {
     ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
 
+/// MiniMax-M3.1's thinking contract (its inspection manual and MiniMax's Provider
+/// Verifier, `m3_a_reasoning_effort`), which the engine does not enforce:
+///
+/// - thinking is always adaptive, so `thinking: {"type": "disabled"}` and
+///   `chat_template_kwargs.thinking_mode: "disabled"` are a 400;
+/// - `reasoning_effort: "none"` is not accepted — a 400;
+/// - `reasoning_effort: "minimal"` is accepted and mapped to `low`.
+///
+/// The effort is read wherever the engine reads it: `reasoning_effort`,
+/// `reasoning.effort` / `reasoning.reasoning_effort` and
+/// `chat_template_kwargs.reasoning_effort`. Returns whether the request was
+/// rewritten, so the caller re-serializes the forwarded body.
+fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, ApiError> {
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(false);
+    };
+    let is = |v: Option<&Value>, want: &str| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case(want))
+    };
+    if is(obj.get("thinking").and_then(|t| t.get("type")), "disabled")
+        || is(
+            obj.get("chat_template_kwargs")
+                .and_then(|c| c.get("thinking_mode")),
+            "disabled",
+        )
+    {
+        return Err(ApiError::BadRequest(
+            "thinking cannot be disabled for MiniMax-M3.1: thinking is always adaptive \
+             (set its depth with reasoning_effort: low, medium, high, xhigh or max)"
+                .into(),
+        ));
+    }
+    fn effort(slot: Option<&mut Value>) -> Result<bool, ApiError> {
+        let Some(effort) = slot else {
+            return Ok(false);
+        };
+        match effort.as_str() {
+            Some(s) if s.eq_ignore_ascii_case("none") => Err(ApiError::BadRequest(
+                "reasoning_effort \"none\" is not supported for MiniMax-M3.1: thinking is always \
+                 adaptive; use one of low, medium, high, xhigh, max"
+                    .into(),
+            )),
+            Some(s) if s.eq_ignore_ascii_case("minimal") => {
+                *effort = Value::from("low");
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+    let mut changed = effort(obj.get_mut("reasoning_effort"))?;
+    if let Some(reasoning) = obj.get_mut("reasoning").and_then(Value::as_object_mut) {
+        changed |= effort(reasoning.get_mut("effort"))?;
+        changed |= effort(reasoning.get_mut("reasoning_effort"))?;
+    }
+    if let Some(kwargs) = obj
+        .get_mut("chat_template_kwargs")
+        .and_then(Value::as_object_mut)
+    {
+        changed |= effort(kwargs.get_mut("reasoning_effort"))?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimax_m31_thinking_contract() {
+        let run = |mut v: Value| enforce_minimax_m31_thinking(&mut v).map(|changed| (changed, v));
+        for bad in [
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"thinking": {"type": "Disabled"}, "reasoning_effort": "high"}),
+            json!({"chat_template_kwargs": {"thinking_mode": "disabled"}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning": {"effort": "none"}}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "NONE"}}),
+        ] {
+            assert!(
+                matches!(run(bad.clone()), Err(ApiError::BadRequest(_))),
+                "{bad} must be a 400"
+            );
+        }
+        // minimal -> low, wherever the effort is given.
+        let (changed, v) = run(json!({"reasoning_effort": "minimal", "messages": []})).unwrap();
+        assert!(changed);
+        assert_eq!(v["reasoning_effort"], "low");
+        let (changed, v) = run(json!({
+            "reasoning": {"effort": "minimal"},
+            "chat_template_kwargs": {"reasoning_effort": "minimal"},
+        }))
+        .unwrap();
+        assert!(changed);
+        assert_eq!(v["reasoning"]["effort"], "low");
+        assert_eq!(v["chat_template_kwargs"]["reasoning_effort"], "low");
+        // Accepted as-is.
+        for ok in [
+            json!({}),
+            json!({"reasoning_effort": "high", "thinking": {"type": "adaptive"}}),
+            json!({"chat_template_kwargs": {"thinking_mode": "adaptive"}}),
+            json!({"reasoning_effort": "max"}),
+        ] {
+            assert_eq!(run(ok.clone()).unwrap(), (false, ok));
+        }
+    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
