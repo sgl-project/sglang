@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from functools import partial
@@ -79,6 +80,31 @@ def per_step_draft_out_cache_loc(
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
     )
+
+
+@contextlib.contextmanager
+def bind_draft_step_writes(forward_batch, *, step: int, topk: int, num_steps: int):
+    """Bind step ``step``'s write ids, as `EagleWorkerV2.draft_forward` slices
+    them, and its write-window columns while its backend derives its targets."""
+    loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
+    if loc is None:
+        yield
+        return
+    if cols is None:
+        # The draft's own window, each row laid out (topk, num_steps).
+        step_cols = slice(step, None, num_steps)
+    else:
+        # A chain draft writes the leading columns of the verify window.
+        assert topk == 1 and isinstance(cols, slice) and cols.step is None
+        step_cols = slice(cols.start + step, cols.start + step + 1)
+    forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
+        loc, forward_batch.batch_size, topk, num_steps
+    )[step]
+    forward_batch.kv_loc_cols = step_cols
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
 
 
 def _eagle_prefill_tail_tokens(

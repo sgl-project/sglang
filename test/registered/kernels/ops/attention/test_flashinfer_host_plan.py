@@ -37,6 +37,8 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         obj.speculative_num_steps = steps
         obj.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         obj.draft_window_size = obj.draft_sink_size = 0
+        obj.window_rail = False
+        obj.attn_backends = [SimpleNamespace(use_sliding_window_kv_pool=False)] * steps
         obj.kv_index_translator = SimpleNamespace(
             read_source=lambda plan, **kw: SimpleNamespace(
                 row_ids=kw["req_pool_indices"],
@@ -44,7 +46,9 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
                 row_stride=pool_len,
                 entry_page_size=1,
                 v2p=None,
-            )
+                is_translated=False,
+            ),
+            window_kv_kind=None,
         )
         obj.page_size = page_size
         obj.pool_len = pool_len
@@ -65,6 +69,8 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
             seq_lens_sum=sum(lengths),
             req_pool_indices=torch.arange(n, device="cuda", dtype=torch.int32),
             positions=seq.repeat_interleave(topk),
+            out_cache_loc=None,
+            kv_loc_cols=None,
             spec_info=SimpleNamespace(is_draft_input=lambda: True),
         )
         return obj, indices, fb
@@ -149,6 +155,62 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         torch.testing.assert_close(obj.kv_indptr, expected_indptr, rtol=0, atol=0)
         for i, host in enumerate(observed):
             torch.testing.assert_close(host, expected_indptr[i].cpu(), rtol=0, atol=0)
+
+    def test_a_static_window_rail_reads_each_steps_swa_slots(self):
+        """A static pool's window rail keeps each step's last `window` ids of
+        the prefix and the branch's chain, in swa slots, under either host
+        indptr mirror."""
+        topk, steps, window, lengths = 2, 3, 64, [300, 5, 0]
+        obj, indices, fb = self._build(topk, steps, 1, lengths)
+        pool = obj.req_to_token_pool.req_to_token
+        mapping = torch.randperm(pool.numel(), device="cuda")
+        swa_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda ids: mapping[ids]
+        )
+        obj.window_rail, obj.window_width = True, window
+        obj.window_kv_indptr = torch.zeros_like(obj.kv_indptr)
+        obj.attn_backends = [
+            SimpleNamespace(use_sliding_window_kv_pool=True, _swa_kv_pool=swa_pool)
+        ] * steps
+        window_ids = torch.zeros(
+            (steps, len(lengths) * topk * window), device="cuda", dtype=torch.int32
+        )
+        for host_indptr in (False, True):
+            observed = []
+
+            def plan(i, batch):
+                observed.append(
+                    (
+                        i,
+                        batch.spec_info.window_kv_indptr.cpu(),
+                        batch.spec_info.window_kv_indices.clone(),
+                        batch.spec_info.window_kv_indptr_cpu.clone(),
+                    )
+                )
+
+            with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(host_indptr):
+                obj.common_template(
+                    fb, indices, plan, window_kv_indices_buffer=window_ids
+                )
+            self.assertEqual([i for i, *_ in observed], list(range(steps - 1)))
+            for i, indptr, ids, indptr_cpu in observed:
+                expected, offsets = [], [0]
+                for b, n in enumerate(lengths):
+                    row = pool[int(fb.req_pool_indices[b])]
+                    for t in range(topk):
+                        chain = row[n + t * steps : n + t * steps + i + 1]
+                        keys = torch.cat((row[:n], chain))[-window:]
+                        expected.append(mapping[keys])
+                        offsets.append(offsets[-1] + keys.numel())
+                expected_indptr = torch.tensor(offsets, dtype=torch.int32)
+                torch.testing.assert_close(indptr, expected_indptr, rtol=0, atol=0)
+                torch.testing.assert_close(indptr_cpu, expected_indptr, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    ids[: offsets[-1]].to(mapping.dtype),
+                    torch.cat(expected),
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_missing_host_mirror_and_failed_plan_restore_override(self):
         obj, indices, fb = self._build(1, 3, 1, [8192])

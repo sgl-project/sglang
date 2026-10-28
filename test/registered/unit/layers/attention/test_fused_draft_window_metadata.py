@@ -2,7 +2,8 @@
 
 The old multi-step path only built window indices for SWA pools, so accepted
 FULL placements reached decode with no window metadata. Exercise placement,
-binding and the real index reader through eager and captured metadata gathers.
+binding and the real index reader through eager and captured metadata gathers,
+on the Triton and FlashInfer draft backends.
 """
 
 import unittest
@@ -11,6 +12,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention import flashinfer_backend as fb
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -46,7 +49,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.args = ServerArgs(model_path="dummy", page_size=1)
         publish(self.args, role="tokenizer")
 
-    def _fixture(self, window, target_window):
+    def _fixture(self, window, target_window, flashinfer=False):
         decision = place_fused_draft(
             profile=DraftKVProfile(
                 num_layers=1,
@@ -63,8 +66,6 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ctx=PlacementContext(
                 host_names=("full", "swa") if target_window else ("full", "mamba"),
                 target_window=target_window,
-                asymmetric_rows_ok=False,
-                draft_backends=("triton",),
             ),
             store_dtype=torch.bfloat16,
         )
@@ -138,6 +139,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         runner = SimpleNamespace(
             req_to_token_pool=req,
             device="cuda",
+            page_size=1,
             model_config=SimpleNamespace(get_max_num_attention_heads=lambda: 1),
             server_args=self.args,
             sliding_window_size=window,
@@ -147,8 +149,20 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         # The model's per-step attention is outside this metadata test. All
         # placement, allocation, translation and multi-step metadata are real.
         inner = SimpleNamespace(max_context_len=512)
-        with patch.object(tb, "TritonAttnBackend", return_value=inner):
-            backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
+        if flashinfer:
+            # A unified pool's reads come translated: the static pool's
+            # full->swa translate must not run on top of them.
+            inner._swa_kv_pool = (
+                SimpleNamespace(translate_loc_from_full_to_swa=None)
+                if host == "swa"
+                else None
+            )
+            inner.use_sliding_window_kv_pool = host == "swa"
+            with patch.object(fb, "FlashInferAttnBackend", return_value=inner):
+                backend = fb.FlashInferMultiStepDraftBackend(runner, 1, 3)
+        else:
+            with patch.object(tb, "TritonAttnBackend", return_value=inner):
+                backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([300], dtype=torch.int32, device="cuda")
         plan = reader.plan(
@@ -162,10 +176,17 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             batch_size=1,
             seq_lens_sum=None,
             seq_lens=seq_lens,
+            seq_lens_cpu=None,
             req_pool_indices=rows,
             positions=seq_lens.to(torch.int64),
+            out_cache_loc=None,
+            kv_loc_cols=None,
             kv_loc_plan=plan,
-            spec_info=SimpleNamespace(window_kv_indices=None, window_kv_indptr=None),
+            spec_info=SimpleNamespace(
+                window_kv_indices=None,
+                window_kv_indptr=None,
+                is_draft_input=lambda: True,
+            ),
         )
         full = allocator.translate_kv_loc(virtual)
         swa = allocator.translate_loc_from_full_to_swa(virtual)
@@ -217,6 +238,60 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 batch.positions.fill_(301)
                 graph.replay()
                 check(301)
+
+    def test_flashinfer_window_reads_follow_placement(self):
+        """Each FlashInfer draft step plans its window layers over the last
+        `window` + 1 ids of the storage they live in, with the host indptr
+        mirror from either the device read or the resolved host lengths."""
+        for window, target_window in ((256, 128), (64, None), (64, 128)):
+            with self.subTest(window=window, target_window=target_window):
+                backend, batch, physical = self._fixture(
+                    window, target_window, flashinfer=True
+                )
+                width = window + 1
+                full_ids = torch.zeros((3, 512), dtype=torch.int32, device="cuda")
+                window_ids = torch.zeros((3, width), dtype=torch.int32, device="cuda")
+                # Out-of-graph replans at a later length reuse the buffers.
+                for length, host_indptr in ((300, False), (301, True)):
+                    batch.seq_lens.fill_(length)
+                    batch.positions.fill_(length)
+                    batch.seq_lens_sum = length
+                    batch.seq_lens_cpu = (
+                        torch.tensor([length], dtype=torch.int32)
+                        if host_indptr
+                        else None
+                    )
+                    observed = []
+
+                    def collect(step, forward_batch):
+                        spec_info = forward_batch.spec_info
+                        observed.append(
+                            (
+                                step,
+                                spec_info.window_kv_indptr.cpu(),
+                                spec_info.window_kv_indices.clone(),
+                                spec_info.window_kv_indptr_cpu.clone(),
+                            )
+                        )
+
+                    with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(
+                        host_indptr
+                    ):
+                        backend.common_template(
+                            batch,
+                            full_ids,
+                            collect,
+                            window_kv_indices_buffer=window_ids,
+                        )
+                    self.assertEqual([step for step, *_ in observed], [0, 1])
+                    expected_indptr = torch.tensor([0, width], dtype=torch.int32)
+                    for step, indptr, indices, indptr_cpu in observed:
+                        end = length + step + 1
+                        torch.testing.assert_close(indptr, expected_indptr)
+                        torch.testing.assert_close(indptr_cpu, expected_indptr)
+                        torch.testing.assert_close(
+                            indices.to(physical.dtype), physical[end - width : end]
+                        )
 
 
 if __name__ == "__main__":

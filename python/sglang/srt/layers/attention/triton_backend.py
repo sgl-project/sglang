@@ -42,7 +42,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.eagle_utils import bind_draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -2636,30 +2636,18 @@ class TritonMultiStepDraftBackend:
 
     @contextlib.contextmanager
     def _step_writes(self, forward_batch, step: int):
-        """Bind draft step ``step``'s slice of the batch's write ids, as
-        `EagleWorkerV2.draft_forward` slices them, and its columns of the
-        iteration's write window, while a per-step backend derives its write
-        targets (the swa ids included) from the batch."""
-        loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
-        if loc is None or not self.attn_backends[step].use_sliding_window_kv_pool:
+        """`bind_draft_step_writes` for a step whose backend writes a
+        sliding-window sub-pool."""
+        if not self.attn_backends[step].use_sliding_window_kv_pool:
             yield
             return
-        num_steps = self.speculative_num_steps
-        if cols is None:
-            # The draft's own window, each row laid out (topk, num_steps).
-            step_cols = slice(step, None, num_steps)
-        else:
-            # A chain draft writes the leading columns of the verify window.
-            assert self.topk == 1 and isinstance(cols, slice) and cols.step is None
-            step_cols = slice(cols.start + step, cols.start + step + 1)
-        forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
-            loc, forward_batch.batch_size, self.topk, num_steps
-        )[step]
-        forward_batch.kv_loc_cols = step_cols
-        try:
+        with bind_draft_step_writes(
+            forward_batch,
+            step=step,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+        ):
             yield
-        finally:
-            forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
 
     def _fill_window_rail(
         self,

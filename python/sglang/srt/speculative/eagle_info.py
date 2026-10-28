@@ -418,9 +418,10 @@ class EagleDraftExtendInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        kv_start_idx: Optional[torch.Tensor] = None,
     ):
-        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
-        draft-extend window."""
+        """Draft-extend CSR args; ``paged_kernel_lens`` includes the extend window
+        and ``kv_start_idx`` starts a window layer's reads at the tail it keeps."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -451,6 +452,7 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
+            kv_start_idx=kv_start_idx,
             kind=kind,
             num_token_blocks=None,
             kv_lens_sum=host_kv_lens_sum,

@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import TRANSLATED_MHA_RAILS
+from sglang.srt.arg_groups.kv_cache_hook import (
+    unified_memory_attention_backends,
+)
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
@@ -1086,9 +1088,7 @@ class KVCacheConfigurator:
         sub-pools. An empty decision means fusion does not apply (unified
         memory off, no hybrid host, or no EAGLE- or DFLASH-family draft config
         loaded at target boot); a declined one says why the draft cannot fuse.
-        The pool factories decide whether a decline refuses the boot.
-        Asymmetric K/V rows fuse only on backends that carry v_head_dim through
-        to the kernel."""
+        The pool factories decide whether a decline refuses the boot."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             LAYER_FULL,
             FusedDraftDecision,
@@ -1134,16 +1134,6 @@ class KVCacheConfigurator:
         draft_backends = (
             {draft_backend} if draft_backend else set(attention_backends()) - {None}
         )
-        # A fused draft reads its rows through the KV-index translator, which
-        # other backends miss on some draft path.
-        if not draft_backends <= TRANSLATED_MHA_RAILS:
-            return FusedDraftDecision(
-                declined=(
-                    f"the draft runs on {', '.join(sorted(draft_backends))}, "
-                    "off the translated MHA rails "
-                    f"({', '.join(sorted(TRANSLATED_MHA_RAILS))})"
-                )
-            )
         # Under DCP each rank's host rows hold only its share of the widened
         # id space, while the draft never joins the DCP group and needs every
         # token; its translator also leaves the read ids widened for a DCP
@@ -1187,6 +1177,21 @@ class KVCacheConfigurator:
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
         )
+        # A fused draft reads the unified pool on the backends that support its
+        # own attention and row geometry, as the target's backends must.
+        asymmetric_kv = profile.has_asymmetric_rows()
+        supported = unified_memory_attention_backends(
+            mla=False, asymmetric_kv=asymmetric_kv
+        )
+        if not draft_backends <= supported:
+            rows = " with asymmetric K/V rows" if asymmetric_kv else ""
+            return FusedDraftDecision(
+                declined=(
+                    f"the draft runs on {', '.join(sorted(draft_backends))}, which "
+                    f"the unified pool does not support for MHA attention{rows} "
+                    f"({', '.join(sorted(supported))})"
+                )
+            )
         if fused_hicache and set(profile.kinds) != {LAYER_FULL}:
             return FusedDraftDecision(
                 declined="HiCache fused DFLASH requires a full-attention-only draft"
@@ -1239,31 +1244,10 @@ class KVCacheConfigurator:
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
                 target_window=self.model_config.sliding_window_size,
-                asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
-                draft_backends=self._draft_attention_backends(),
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
             kv_dtype=region_kv_dtype,
         )
-
-    def _draft_attention_backends(self) -> tuple:
-        """The backends the draft worker may run on: its explicit one, else
-        the target's, which it inherits."""
-        explicit = get_spec().speculative_draft_attention_backend
-        if explicit is not None:
-            return (explicit,)
-        return tuple(sorted(b for b in attention_backends() if b is not None))
-
-    def _draft_backends_carry_v_head_dim(self) -> bool:
-        """Whether every resolved attention backend, the draft's included,
-        carries v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS). The
-        draft worker inherits the target's backend unless one is set."""
-        from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
-
-        backends = set(attention_backends())
-        backends.add(get_spec().speculative_draft_attention_backend)
-        backends.discard(None)
-        return backends <= ASYMMETRIC_KV_BACKENDS
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +
