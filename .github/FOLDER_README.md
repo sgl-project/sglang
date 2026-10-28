@@ -28,7 +28,8 @@ Legacy `/tag-and-rerun-ci <tier>` still retries broadly; its arguments add label
 `/run-extra-ci <hardware>` (also `/rerun-extra-ci <hardware>`) selects the
 `<hardware>-extra` tier only when it is registered. Otherwise, the existing
 ignored-suffix behavior is preserved. The registry contains `extra`, covering
-both NVIDIA and AMD extra workflows, and `nv`, selecting NVIDIA base/shared checks.
+both NVIDIA and AMD extra workflows, `nv`, selecting NVIDIA base/shared checks,
+and `mlu`, selecting `pr-test-mlu.yml` with `run-ci-mlu`.
 The shared `extra` tier keeps `run-ci-extra`; separate hardware extra tiers are
 left for a follow-up. Other hardware-specific selections are not yet registered.
 
