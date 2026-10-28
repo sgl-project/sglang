@@ -28,6 +28,7 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.cp.utils import is_cp_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -42,6 +43,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -55,7 +63,21 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+@eager_on_graph
+def _publish_index_topk_share_at_replay(topk_indices: Optional[torch.Tensor]) -> None:
+    # The seed buffer and its row select live on the serving batch's spec_info,
+    # which a captured body never sees; as a graph break this reads the live one.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    IndexTopKShareState(forward_batch, topk_indices).publish()
+
+
 class DeepseekModelNextN(nn.Module):
+    # forward embeds input_ids itself (the multimodal rows use mm_input_embeds),
+    # so a captured prefill graph holds the text-only embedding.
+    prefill_cuda_graph_text_only = True
+    # Set per instance in __init__; see the `layers` property.
+    exposes_decoder_as_layers = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -137,6 +159,24 @@ class DeepseekModelNextN(nn.Module):
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # DP attention and PP drafts are not validated with the draft prefill graph.
+        # Prefill CP: the captured body skips the index-share CP gather (no seed
+        # buffer at capture), so the replayed publish would read CP-local rows.
+        self.exposes_decoder_as_layers = (
+            envs.SGLANG_ENABLE_NEXTN_DRAFT_PREFILL_CUDA_GRAPH.get()
+            and not get_parallel().attn_dp_enabled
+            and get_parallel().pp_size == 1
+            and not is_cp_enabled()
+        )
+
+    @property
+    def layers(self) -> Tuple[nn.Module, ...]:
+        # Prefill CUDA graph setup finds the decoder stack through `layers`; a
+        # tuple keeps the decoder out of the module tree and the state dict.
+        if not self.exposes_decoder_as_layers:
+            raise AttributeError("layers")
+        return (self.decoder,)
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -238,11 +278,24 @@ class DeepseekModelNextN(nn.Module):
                 )
 
             index_topk_share.update(topk_indices)
-            index_topk_share.publish()
+            self._publish_index_topk_share(index_topk_share)
         finally:
             exit_stack.close()
 
         return hidden_states
+
+    def _publish_index_topk_share(self, index_topk_share: IndexTopKShareState) -> None:
+        # Only the prefill BCG runner installs the tc_piecewise context; the decode
+        # breakable backend captures publish() against its own static buffers.
+        if (
+            self.exposes_decoder_as_layers
+            and index_topk_share.topk_indices is not None
+            and is_in_breakable_cuda_graph()
+            and get_tc_piecewise_forward_context() is not None
+        ):
+            _publish_index_topk_share_at_replay(index_topk_share.topk_indices)
+        else:
+            index_topk_share.publish()
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):

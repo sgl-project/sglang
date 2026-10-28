@@ -22,7 +22,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_platform,
     get_schedule,
@@ -101,8 +103,14 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -493,6 +501,56 @@ def _validate_flashmla_sparse_q8_backend(
         )
 
 
+def _layerwise_kv_load_configured() -> bool:
+    # Each of these registers a layer-transfer counter on the KV pool after graph
+    # capture; a layer's attention must then wait on its load event per replay.
+    # HiCache is not listed: start_loading() issues every layer's copy and records
+    # its event before the batch's forward, so _wait_for_layerwise_kv_load covers it.
+    memory = get_memory()
+    return bool(
+        memory.enable_flexkv
+        or memory.enable_unified_cache_external_linker
+        or memory.radix_cache_backend
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    )
+
+
+# Prefill graph buckets below this many rows keep the eager attention break of the
+# captured DSA prefill attention. -1: the smallest bucket whose real rows all exceed
+# SMs / 2 (96 on 152 SMs), below which the sparse MLA kernel may split the KV over
+# CTAs differently for the padded bucket than for the real rows (same math, other
+# FP8 rounding), so every batch stays bitwise equal to the eager break. 0: every bucket.
+_PREFILL_GRAPH_MIN_ROWS = -1
+
+
+def _aligned_prefill_graph_buckets() -> list[int]:
+    # Token-count buckets, aligned to TP shards as the prefill graph runner does.
+    return sorted(
+        {
+            get_cuda_graph_max_batch_size(n)
+            for n in get_exec().graph.cuda_graph_config.prefill.bs or ()
+        }
+    )
+
+
+def _min_bitwise_prefill_graph_bucket(*, buckets: list[int], num_sms: int) -> int:
+    """Smallest bucket whose every real row count exceeds ``num_sms / 2``.
+
+    The TRT-LLM sparse MLA kernel splits each row's KV over
+    ``min(window / 256, num_sms // (rows * ctas_per_row_q))`` CTAs (FlashInfer
+    ``computeCtaAndClusterConfig``). Above ``num_sms / 2`` rows that is one CTA
+    for the padded bucket and for the eager break's real rows alike, so the two
+    round identically; below it the split can differ between them.
+    """
+    half_sms = num_sms // 2
+    smaller_bucket = 0
+    for bucket in sorted(buckets):
+        if smaller_bucket >= half_sms:
+            return bucket
+        smaller_bucket = bucket
+    return smaller_bucket + 1
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -510,6 +568,9 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    # [rows] int32 sparse-MLA lengths of prefill attention captured in the
+    # breakable prefill graph; set in __init__ when that path applies.
+    _prefill_graph_seq_lens: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -613,12 +674,14 @@ class DeepseekSparseAttnBackend(
             is_in_breakable_cuda_graph,
         )
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            get_tc_piecewise_forward_context,
             is_in_tc_piecewise_cuda_graph,
         )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         self._is_in_breakable_cuda_graph = is_in_breakable_cuda_graph
         self._is_in_tc_piecewise_cuda_graph = is_in_tc_piecewise_cuda_graph
+        self._get_tc_piecewise_forward_context = get_tc_piecewise_forward_context
         self._get_device_sm = get_device_sm
         self._is_blackwell = is_blackwell
 
@@ -789,6 +852,65 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
+
+        self._prefill_graph_seq_lens = self._make_prefill_graph_seq_lens()
+        self._prefill_graph_min_rows = self._resolve_prefill_graph_min_rows()
+        if self._prefill_graph_seq_lens is not None:
+            logger.info(
+                "DSA prefill attention runs inside the breakable prefill CUDA graph "
+                "for buckets of >= %d rows.",
+                self._prefill_graph_min_rows,
+            )
+
+    def _make_prefill_graph_seq_lens(self) -> Optional[torch.Tensor]:
+        if not (
+            envs.SGLANG_ENABLE_DSA_PREFILL_ATTN_IN_CUDA_GRAPH.get()
+            and _is_cuda
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            and self.dsa_prefill_impl == "trtllm"
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and self.use_fused_topk
+            # The padded-row column-0 clamp assumes these put a valid slot first.
+            and (
+                self.dsa_topk_backend.is_sgl_kernel()
+                or self.dsa_topk_backend.is_flashinfer()
+            )
+            and self.workspace_buffer is not None
+            and self._multi_ctas_kv_counter_buffer is not None
+            and self.dcp_size == 1
+            and self.hisparse_coordinator is None
+            # Page-sharded caches gather prefix KV into a per-batch scratch.
+            and self._kv_shard_pool is None
+            and self.dsa_index_kpool <= 1
+            and self.qk_rope_head_dim > 0
+            and self.dsa_index_topk % 4 == 0
+            and not get_parallel().attn_dp_enabled
+            and not is_dsa_enable_prefill_cp()
+            and not get_exec().overlap.enable_two_batch_overlap
+        ):
+            return None
+        if _layerwise_kv_load_configured():
+            logger.info(
+                "DSA prefill attention stays an eager break of the prefill CUDA "
+                "graph: a cache tier loads prefix KV layer by layer."
+            )
+            return None
+        buckets = _aligned_prefill_graph_buckets()
+        if not buckets:
+            return None
+        capacity = max(buckets)
+        # Before any capture: growing the counter later frees what graphs replay.
+        self._ensure_multi_ctas_kv_counter_capacity(capacity)
+        return torch.ones(capacity, dtype=torch.int32, device=self.device)
+
+    def _resolve_prefill_graph_min_rows(self) -> int:
+        min_rows = _PREFILL_GRAPH_MIN_ROWS
+        if min_rows >= 0 or self._prefill_graph_seq_lens is None:
+            return min_rows
+        return _min_bitwise_prefill_graph_bucket(
+            buckets=_aligned_prefill_graph_buckets(),
+            num_sms=torch.cuda.get_device_properties(self.device).multi_processor_count,
+        )
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -1365,6 +1487,11 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        if (
+            self._prefill_graph_seq_lens is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self._refresh_prefill_graph_seq_lens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -4090,6 +4217,122 @@ class DeepseekSparseAttnBackend(
         )
 
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
+
+    def _refresh_prefill_graph_seq_lens(self, dsa_cache_seqlens: torch.Tensor) -> None:
+        buf = self._prefill_graph_seq_lens
+        num_rows = dsa_cache_seqlens.shape[0]
+        if num_rows > buf.shape[0]:
+            # Wider than every prefill graph bucket: this batch runs eagerly.
+            return
+        # Real rows are >= 1; attention-TP padding rows come as 0. Those and the
+        # bucket's padded rows attend to one dummy KV slot (forward_prefill_in_graph).
+        torch.clamp(dsa_cache_seqlens, min=1, out=buf[:num_rows])
+        buf[num_rows:].fill_(1)
+        self._wait_for_layerwise_kv_load()
+
+    def _wait_for_layerwise_kv_load(self) -> None:
+        # Captured attention cannot wait per layer in get_key_buffer, so a batch
+        # with a HiCache load-back in flight waits for every transfer layer's event
+        # before the forward: correct, without the per-layer load/compute overlap.
+        # Draft pools have no counter; their loads finish before the target's last
+        # event, and the draft forward is stream-ordered after the target's.
+        counter = self.token_to_kv_pool.layer_transfer_counter
+        if counter is None or counter.consumer_index < 0:
+            return
+        for transfer_layer_id in range(counter.num_layers):
+            counter.wait_until(transfer_layer_id)
+
+    def can_run_prefill_attention_in_graph(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> bool:
+        """Whether the DSA attention of this extend, ``num_rows`` rows (the
+        graph bucket), can be recorded inside the breakable prefill CUDA graph.
+        Static per process, forward mode and bucket, so capture and every
+        replay of a bucket agree."""
+        return (
+            self._prefill_graph_seq_lens is not None
+            and num_rows >= self._prefill_graph_min_rows
+            and not self.use_mha
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self._is_in_breakable_cuda_graph()
+            # Installed only by the prefill graph runner, not the decode BCG.
+            and self._get_tc_piecewise_forward_context() is not None
+        )
+
+    def forward_prefill_in_graph(
+        self,
+        *,
+        layer: RadixAttention,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        topk_indices: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        out: torch.Tensor,
+    ) -> None:
+        """TRT-LLM sparse MLA prefill over every row of a prefill graph bucket.
+
+        The FP8 + fused-top-k path of ``_forward_trtllm`` with nothing read
+        from the host: per-row lengths come from ``_prefill_graph_seq_lens``
+        (refreshed by ``init_forward_metadata``), and the context length only
+        through them and the top-k slots. Padded rows read positions 0, write
+        their KV to the dummy slot 0 (``out_cache_loc`` is zero-padded), and
+        attend to that slot alone; their outputs are never consumed. Real rows
+        run the same kernels on the same inputs as the eager split op; only
+        at <= SMs / 2 real rows may the kernel split the KV over CTAs
+        differently for the bucket than for the real rows, which the default
+        _PREFILL_GRAPH_MIN_ROWS excludes.
+        """
+        import flashinfer.decode
+
+        num_rows = q_nope.shape[0]
+        q, k, k_rope_fp8 = mla_quantize_and_rope_for_fp8(
+            q_nope,
+            q_rope,
+            k_nope.squeeze(1),
+            k_rope.squeeze(1),
+            positions,
+            cos_sin_cache,
+            is_neox,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+        )
+        self.token_to_kv_pool.set_mla_kv_buffer(layer, out_cache_loc, k, k_rope_fp8)
+
+        # The indexer fills padded top-k rows with -1; give them the dummy slot
+        # so their length-1 attention reads valid KV. The gated top-k backends
+        # put a valid slot first in every real row, so it is a no-op there.
+        topk_indices[:, 0].clamp_(min=0)
+        page_table, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
+            self._get_fused_topk_page_table(topk_indices)
+        )
+        kv = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, 1, self.physical_page_size, self.kv_cache_dim
+        )
+        k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q.view(num_rows, 1, layer.tp_q_head_num, layer.head_dim),
+            kv_cache=kv,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=page_table.unsqueeze(1),
+            seq_lens=self._prefill_graph_seq_lens[:num_rows],
+            # Any value >= the top-k gives the kernel the same window
+            # (min(max_seq_len, top-k)); decode graphs pass the table width too.
+            max_seq_len=self.req_to_token.shape[1],
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out.view(num_rows, 1, layer.tp_q_head_num, layer.v_head_dim),
+            bmm1_scale=k_scale * layer.scaling,
+            backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_for(num_rows),
+        )
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
