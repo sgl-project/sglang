@@ -24,6 +24,7 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
@@ -117,6 +118,15 @@ class SchedulerOutputStreamer:
                         http_worker_ipc=self.return_health_check_ipcs.popleft()
                     )
                 )
+
+    def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
+        """Report a request the scheduler ends outside the output stream
+        (aborted while queued, preempted, retracted or rejected)."""
+        if self.rust_server is not None:
+            # The zmq tokenizer socket is not consumed in Rust mode.
+            self.rust_server.push_abort(abort_req, req)
+        else:
+            self.send_to_tokenizer.send_output(abort_req, req)
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""

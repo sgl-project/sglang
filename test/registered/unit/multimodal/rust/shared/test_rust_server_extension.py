@@ -259,15 +259,17 @@ class TestRustServerExtension(CustomTestCase):
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
-        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.output_streamer import (
+            SchedulerOutputStreamer,
+        )
 
         req = SimpleNamespace(
             origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
-        Scheduler.send_abort_output(scheduler, abort, req)
+        streamer = SimpleNamespace(rust_server=server, send_to_tokenizer=Mock())
+        SchedulerOutputStreamer.send_abort_output(streamer, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
             msgspec.msgpack.decode(header),
@@ -276,13 +278,11 @@ class TestRustServerExtension(CustomTestCase):
             + [[True]],
         )
         self.assertEqual(cols, [b""])
-        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        streamer.send_to_tokenizer.send_output.assert_not_called()
 
-        scheduler.rust_server = None
-        Scheduler.send_abort_output(scheduler, abort, req)
-        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
-            abort, req
-        )
+        streamer.rust_server = None
+        SchedulerOutputStreamer.send_abort_output(streamer, abort, req)
+        streamer.send_to_tokenizer.send_output.assert_called_once_with(abort, req)
 
     def test_frame_metadata_fixture_matches_python(self):
         with open(RUST_FRAME_METADATA_FIXTURE) as f:

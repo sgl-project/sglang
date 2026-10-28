@@ -42,22 +42,25 @@ def _req(rid, return_logprob=False):
     return req
 
 
-def _deferred(disaggregation_mode=DisaggregationMode.NULL):
+def _deferred(disaggregation_mode=DisaggregationMode.NULL, rust_frontend=False):
     streamer = object.__new__(SchedulerOutputStreamer)
     streamer.is_generation = True
     streamer.defer_outputs = False
-    ipc_channels = Mock()
+    streamer.send_to_tokenizer = Mock()
+    streamer.rust_server = Mock() if rust_frontend else None
     return DeferredResponses(
         disaggregation_mode=disaggregation_mode,
         output_streamer=streamer,
-        request_retirer=make_request_retirer(
-            output_streamer=streamer, ipc_channels=ipc_channels
-        ),
+        request_retirer=make_request_retirer(output_streamer=streamer),
     )
 
 
 def _sent_aborts(deferred):
-    return deferred.request_retirer.ipc_channels.send_to_tokenizer.send_output
+    """The sender of the active frontend: the Rust egress or the tokenizer."""
+    streamer = deferred.output_streamer
+    if streamer.rust_server is not None:
+        return streamer.rust_server.push_abort
+    return streamer.send_to_tokenizer.send_output
 
 
 def _scheduler(deferred):
@@ -116,9 +119,15 @@ def test_defer_response_rejects_invalid_ownership(invalid):
     assert not req.defer_output
 
 
-@pytest.mark.parametrize("cancelled", [False, True], ids=["error", "cancelled"])
-def test_failed_completion_releases_an_error_response(cancelled):
-    deferred, req, completion = _deferred(), _req("failed"), Future()
+@pytest.mark.parametrize(
+    ("cancelled", "rust_frontend"),
+    [(False, False), (True, False), (False, True)],
+    ids=["error", "cancelled", "rust-error"],
+)
+def test_failed_completion_releases_an_error_response(cancelled, rust_frontend):
+    """Failed publication reaches the active frontend, including Rust egress."""
+    deferred = _deferred(rust_frontend=rust_frontend)
+    req, completion = _req("failed"), Future()
     deferred.defer(req, completion)
     if cancelled:
         completion.cancel()
@@ -140,9 +149,14 @@ def test_failed_completion_releases_an_error_response(cancelled):
     assert not req.defer_output and not deferred.has_pending()
 
 
-@pytest.mark.parametrize("abort_all", [False, True], ids=["matching", "all"])
-def test_abort_cancels_only_matching_held_responses(abort_all):
-    deferred = _deferred()
+@pytest.mark.parametrize(
+    ("abort_all", "rust_frontend"),
+    [(False, False), (True, False), (False, True)],
+    ids=["matching", "all", "rust-matching"],
+)
+def test_abort_cancels_only_matching_held_responses(abort_all, rust_frontend):
+    """Cancellation retires matching responses through the active frontend."""
+    deferred = _deferred(rust_frontend=rust_frontend)
     scheduler = _scheduler(deferred)
     reqs = [_req("group-0"), _req("other")]
     completions = [Future(), Future()]

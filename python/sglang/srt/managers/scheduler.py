@@ -162,9 +162,6 @@ from sglang.srt.managers.scheduler_components.mode_stages import (
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import (
-    make_abort_req,
-)
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -1010,8 +1007,8 @@ class Scheduler:
         self.parts.lists._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
-        self.parts.ipc_channels.send_to_tokenizer.send_output(
-            make_abort_req(req, finished_reason=finished_reason), req
+        self.parts.request_retirer.send_abort_output(
+            req, finished_reason=finished_reason
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 

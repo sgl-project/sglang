@@ -87,15 +87,13 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
         sched.parts.request_retirer = Mock()
         sched.parts.kv.tree_cache = None
-        sched.parts.ipc_channels = Mock()
 
         sched.process_pending_chunked_abort()
 
         self.assertEqual(req.finished_reason.status_code, 503)
-        (abort_req, _), _ = (
-            sched.parts.ipc_channels.send_to_tokenizer.send_output.call_args
+        sched.parts.request_retirer.send_abort_output.assert_called_once_with(
+            req, finished_reason=req.discard_output_reason.to_json()
         )
-        self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
 
     def test_pp_pd_prefill_slot_applies_the_abort(self):
         # A PP ring slot on a PD prefill node drops the aborted chunked request
