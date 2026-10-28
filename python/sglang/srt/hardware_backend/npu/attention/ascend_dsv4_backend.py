@@ -1535,8 +1535,17 @@ class LowRatioCompressAscendBackendMixin:
             # prefix is the exact wild-address violation -- the CPU golden raises
             # on it (mqsmla_golden.py L215) and the kernel does not skip it --
             # so print every occurrence, not just the first call per layer.
-            lens = (forward_batch.seq_lens // ratio).clamp_max(int(topk)).to(
-                torch.long
+            # Per-row lengths: extend rows outnumber batches (cu bucketing).
+            cu = fm.actual_seq_lengths_q_pa
+            if cu is not None and t == int(cu[-1]) and t != cu.numel() - 1:
+                row_b = torch.repeat_interleave(
+                    torch.arange(cu.numel() - 1, device=scored.device),
+                    (cu[1:] - cu[:-1]).to(torch.long),
+                )
+            else:
+                row_b = torch.arange(t, device=scored.device)
+            lens = (forward_batch.seq_lens.to(torch.long) // ratio)[row_b].clamp_max(
+                int(topk)
             )
             in_prefix = torch.arange(topk, device=scored.device) < lens.unsqueeze(1)
             neg_in = int(((scored < 0) & in_prefix).sum())
@@ -1803,6 +1812,35 @@ class LowRatioCompressAscendBackendMixin:
             return cached
         return attn_sink.reshape(-1).to(torch.float32)
 
+    def _dsv41_regenerate_smla_metadata(self, kw: dict):
+        """Re-run the metadata op on the exact tensors this SMLA call receives.
+
+        The two-stage contract says the dispatch table must be derived from this
+        step's lengths; a table that differs from a fresh regeneration is a
+        stale buffer on the sglang side, while an equal-but-broken table points
+        at the operator.  Debug tooling only: never mask the underlying fault.
+        """
+        try:
+            ori_len = kw["ori_topk_length"]
+            has_cmp = "cmp_topk_length" in kw
+            cmp_len = kw["cmp_topk_length"] if has_cmp else torch.zeros_like(ori_len)
+            return _ds41_ops().mixed_quant_sparse_flash_mla_metadata(
+                ori_len,
+                cmp_len,
+                cu_seqlens_q=kw.get("cu_seqlens_q"),
+                num_heads_q=int(self._dsv4_q_head_num),
+                num_heads_kv=1,
+                head_dim=int(self._dsv4_head_dim),
+                quant_mode=1,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_ori_kv=True,
+                has_cmp_kv=has_cmp,
+            )
+        except Exception as err:
+            print(f"[dsv41] metadata regeneration failed: {err}", flush=True)
+            return None
+
     def _dsv41_audit_smla(self, layer, q, forward_batch, kw, ratio: int) -> None:
         """Row-accurate MQSMLA contract audit.
 
@@ -1852,14 +1890,38 @@ class LowRatioCompressAscendBackendMixin:
             row_b = torch.arange(rows, device=device)
         # The dispatch table must tile [0, rows) exactly (README L214); a stale
         # or mismatched metadata shows up here as a row-count disagreement.
+        # Small-T1 runs passing this check pin the layout as [starts | counts]
+        # with per-core ROW counts, so a mismatch is a real broken table, not a
+        # reading error.  The regeneration cross-check separates "we passed a
+        # stale buffer" from "the operator produced this broken table".
         md = kw.get("metadata")
         if md is not None and md.numel() % 2 == 0:
-            counts = md[md.shape[0] // 2 :]
+            half = md.shape[0] // 2
+            counts = md[half:]
             total = int(counts.sum())
             if total != rows:
                 problems.append(
                     f"metadata tiles {total} rows != q rows {rows} "
-                    f"(stale dispatch table?)"
+                    f"blocks={half} "
+                    f"starts_head={md[:4].tolist()} "
+                    f"counts_head={counts[:4].tolist()} "
+                    f"counts_tail={counts[-4:].tolist()} "
+                    f"(broken dispatch table)"
+                )
+            if rows > half:
+                problems.append(
+                    f"rows {rows} > core blocks {half} "
+                    f"(multi-row-per-core dispatch path)"
+                )
+            fresh = self._dsv41_regenerate_smla_metadata(kw)
+            if (
+                fresh is not None
+                and fresh.shape == md.shape
+                and not bool(torch.equal(fresh, md))
+            ):
+                problems.append(
+                    "metadata differs from a fresh regeneration "
+                    "(stale buffer, sglang-side)"
                 )
         for prefix in ("ori", "cmp"):
             kv = kw.get(f"{prefix}_kv")
@@ -1868,7 +1930,10 @@ class LowRatioCompressAscendBackendMixin:
             lens_t = kw.get(f"{prefix}_topk_length")
             if kv is None or bt is None or idx_t is None or lens_t is None:
                 continue
-            vis = seq_lens if prefix == "ori" else seq_lens // max(1, ratio)
+            # Per-row visible length: extend rows outnumber batches, so the
+            # batch-level lengths must be gathered through the row->batch map.
+            vis_batch = seq_lens if prefix == "ori" else seq_lens // max(1, ratio)
+            vis = vis_batch[row_b]
             idx = idx_t.reshape(rows, -1).to(torch.long)
             lens = lens_t.reshape(-1).to(torch.long)
             k = idx.shape[-1]
@@ -1965,7 +2030,11 @@ class LowRatioCompressAscendBackendMixin:
                     f"cmp_bt={tuple(kw['cmp_block_table'].shape)} "
                     f"cmp_bt_max={int(kw['cmp_block_table'].max())} "
                     f"cmp_pages={kw['cmp_kv'].shape[0]} "
-                    f"md_head={md[:4].tolist() if md is not None else None}"
+                    f"md=(2x{md.shape[0] // 2},)"
+                    f"{' rows>blocks!' if rows > md.shape[0] // 2 else ''} "
+                    f"md_head={md[:4].tolist()} "
+                    f"md_counts_head={md[md.shape[0] // 2 :][:4].tolist()} "
+                    f"md_counts_sum={int(md[md.shape[0] // 2 :].sum())}"
                     if "cmp_kv" in kw
                     else ""
                 ),
