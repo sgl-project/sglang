@@ -284,7 +284,7 @@ class RequestRetirer:
     def send_abort_output(
         self, req: Req, finished_reason: Optional[FinishReasonDict] = None
     ) -> None:
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.output_streamer.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
 

@@ -81,7 +81,9 @@ def _make_processor(
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         kv=kv,
         services=SimpleNamespace(
             metrics_sink=SimpleNamespace(
@@ -264,7 +266,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
         processor.model_config.self_opened_think_start_ids = [5]
 
         for token in [5, 10, 10, 9, 11, 11]:
-            processor._maybe_update_reasoning_tokens(req, token)
+            maybe_update_reasoning_tokens(processor.model_config, req, token)
 
         self.assertEqual(req.reasoning_tokens, 4)
 
@@ -276,7 +278,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
         for output in ([11, 5, 10, 9], [9, 11, 11]):
             req = _make_req(terminate_after=99)
             for token in output:
-                processor._maybe_update_reasoning_tokens(req, token)
+                maybe_update_reasoning_tokens(processor.model_config, req, token)
             self.assertEqual(req.reasoning_tokens, 0)
 
     def test_unforced_reasoning_spans_multi_token_steps(self):
@@ -285,9 +287,9 @@ class TestReasoningTokenAccounting(CustomTestCase):
         processor.model_config.think_end_ids = [8, 9]
         processor.model_config.self_opened_think_start_ids = [4, 5]
 
-        processor._maybe_update_reasoning_tokens(req, [4])
-        processor._maybe_update_reasoning_tokens(req, [5, 10, 8])
-        processor._maybe_update_reasoning_tokens(req, [9, 11, 11])
+        maybe_update_reasoning_tokens(processor.model_config, req, [4])
+        maybe_update_reasoning_tokens(processor.model_config, req, [5, 10, 8])
+        maybe_update_reasoning_tokens(processor.model_config, req, [9, 11, 11])
 
         self.assertEqual(req.reasoning_tokens, 5)
         self.assertTrue(req._is_reasoning_over)

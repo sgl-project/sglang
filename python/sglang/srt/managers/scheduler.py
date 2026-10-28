@@ -68,6 +68,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.dllm.manager import DllmManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -160,9 +161,6 @@ from sglang.srt.managers.scheduler_components.mode_stages import (
 )
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
-)
-from sglang.srt.managers.scheduler_components.request_retirer import (
-    make_abort_req,
 )
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
@@ -480,6 +478,21 @@ class Scheduler:
                 self.parts.streams.forward_stream
             )
 
+    def _war_barrier_is_coarse(self) -> bool:
+        # Same condition as _apply_war_barrier's whole-forward fallback.
+        if not self._war_barrier_enabled:
+            return False
+        runner = self.parts.workers.model_worker.last_shared_read_runner
+        return (
+            runner.shared_read_done_event is None
+            or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+        )
+
+    def _apply_pending_war_barrier(self) -> None:
+        if self._war_barrier_pending:
+            self._war_barrier_pending = False
+            self._apply_war_barrier()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop: a step commits in the iteration launching it."""
@@ -559,6 +572,14 @@ class Scheduler:
         # Fixed for the loop, so read once: an env read costs more than the
         # check it gates.
         may_sync_overlap = overlap and self.may_disable_overlap()
+        # A PD prefill node defers a whole-forward WAR barrier past the
+        # previous result's commit and the KV transfer poll: they mutate no
+        # request of the launched forward (a continuing chunked one is only
+        # read).
+        defer_coarse_war_barrier = (
+            overlap and self.mode.disaggregation_mode == DisaggregationMode.PREFILL
+        )
+        self._war_barrier_pending = False
         busy_self_check = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
         # True while passes repeat intake for the oldest pending result.
         waiting_for_result = False
@@ -627,7 +648,12 @@ class Scheduler:
                         except Exception:
                             pass
                 if step:
-                    launched = record = self.launch_step(step, slot, overlap=overlap)
+                    launched = record = self.launch_step(
+                        step,
+                        slot,
+                        overlap=overlap,
+                        defer_coarse_war_barrier=defer_coarse_war_barrier,
+                    )
 
             # Commit: without overlap every pending step; with overlap the
             # oldest launched before this pass, once its result is ready.
@@ -640,6 +666,8 @@ class Scheduler:
                     and not is_result_ready(next(iter(self.parts.pending)).result)
                 ):
                     waiting_for_result = True
+                    if defer_coarse_war_barrier:
+                        self._apply_pending_war_barrier()
                     self._yield_gil_if_needed()
                     continue
                 self.commit_step(self.parts.pending.popleft())
@@ -654,6 +682,8 @@ class Scheduler:
                 self.parts.lists.waiting_queue = after_commit(
                     self.parts.lists.waiting_queue
                 )
+            if defer_coarse_war_barrier:
+                self._apply_pending_war_barrier()
 
             # Run sample of the launched step. It depends on the result of the
             # pending one (e.g., grammar), so it runs after that commit.
@@ -694,6 +724,7 @@ class Scheduler:
         slot: ScheduleSlot,
         overlap: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        defer_coarse_war_barrier: bool = False,
     ) -> PendingStep:
         """Run a step, move the requests it launches, and keep it pending. A
         ring slot's step runs behind the PP fences, until the ring brings its
@@ -706,8 +737,12 @@ class Scheduler:
         else:
             result = self.mode.step_launcher.run_batch(step)
             if overlap:
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
+                # Fence result processing behind this forward's shared reads;
+                # a deferred whole-forward fence waits for the driver.
+                if defer_coarse_war_barrier and self._war_barrier_is_coarse():
+                    self._war_barrier_pending = True
+                else:
+                    self._apply_war_barrier()
         self.join_launched_step(step, slot)
         record = PendingStep(
             step=step,
@@ -972,8 +1007,8 @@ class Scheduler:
         self.parts.lists._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
-        self.parts.ipc_channels.send_to_tokenizer.send_output(
-            make_abort_req(req, finished_reason=finished_reason), req
+        self.parts.request_retirer.send_abort_output(
+            req, finished_reason=finished_reason
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -1118,6 +1153,7 @@ class Scheduler:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.parts.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -1225,6 +1261,7 @@ class Scheduler:
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.parts.dp_attn_adapter.drop_sync_wait_carry()
+        self.parts.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
         self.parts.output_streamer.maybe_reply_health_check()
 
@@ -1249,6 +1286,7 @@ class Scheduler:
                 hicache_storage_enabled()
                 or self.mode.disaggregation_mode != DisaggregationMode.NULL
                 or get_memory().enable_lmcache
+                or self.parts.deferred_responses.has_pending()
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -1307,11 +1345,19 @@ class Scheduler:
             self.hub.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if self.parts.deferred_responses.has_pending():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the completion's worker.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.parts.metrics_sink.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.parts.deferred_responses.has_pending():
+            self.parts.deferred_responses.stream_released()
+            time.sleep(0)
         if self.hub.request_registry.is_fully_idle():
             self.parts.metrics_sink.record_scheduler_idle()
         else:
@@ -1513,7 +1559,18 @@ class Scheduler:
 
     # The abort RPC handler.
     def abort_request(self, recv_req: AbortReq):
+        self.parts.deferred_responses.abort(recv_req)
         self.hub.request_registry.abort_request(recv_req)
+
+    # The plugin API of deferred responses; see deferred_output.
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        self.parts.deferred_responses.defer(req, completion)
+
+    def stream_released_deferred_outputs(self) -> None:
+        self.parts.deferred_responses.stream_released()
+
+    def has_pending_deferred_outputs(self) -> bool:
+        return self.parts.deferred_responses.has_pending()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -1527,12 +1584,15 @@ class Scheduler:
             # The request lists, chunked_req and the pending steps are left
             # untouched. On resume, the event loop commits the pending steps
             # and schedules from the lists through the standard code paths.
+            self.parts.step_counters.begin_pause(time.monotonic())
             return
 
         # Under PP the ring commits its pending steps once their outputs come
         # back over the relay; there is nothing to commit here.
         if self.parts.pending and get_parallel().pp_size == 1:
             self.commit_pending_steps()
+        # A first retract starts the pause once the in-flight result has drained.
+        self.parts.step_counters.begin_pause(time.monotonic())
 
         self.hub.step_planner.retract_for_pause()
 
@@ -1567,6 +1627,7 @@ class Scheduler:
         if self.disagg_decode is not None:
             self.disagg_decode.prealloc_queue.enqueue_held_rebootstrap()
         self.parts.flags._engine_paused = False
+        self.parts.step_counters.end_pause(time.monotonic())
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput

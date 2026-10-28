@@ -283,7 +283,15 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.metrics_sink.enable_fpm = False
         reporter.mode_owners = ModeOwners(
-            disagg_decode=decode_owner_shell(transfer_queue=queue)
+            disagg_decode=decode_owner_shell(
+                transfer_queue=queue,
+                prealloc_queue=SimpleNamespace(
+                    queue=[],
+                    retracted_queue=[],
+                    held_rebootstrap_reqs=[],
+                    pre_allocated_token_counts=lambda: (0, 0),
+                ),
+            )
         )
         reporter.request_registry = make_request_registry(
             mode_owners=reporter.mode_owners
@@ -292,6 +300,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.pool_stats_observer = SimpleNamespace(
             get_pool_stats=lambda: SimpleNamespace(
                 update_scheduler_stats=lambda stats: None,
+                full_capacity=1,
+                is_hybrid_swa=False,
             ),
             streaming_session_count=lambda: 0,
             session_held_tokens=lambda: 0,
@@ -368,6 +378,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     retracted_queue=[],
                     held_rebootstrap_reqs=[],
                     num_tokens_pre_allocated=0,
+                    pre_allocated_token_counts=lambda: (0, 0),
                 ),
             )
         )
@@ -381,6 +392,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             get_pool_stats=lambda: SimpleNamespace(
                 get_decode_usage_msg_parts=lambda: [],
                 update_scheduler_stats=lambda stats: None,
+                full_capacity=1,
+                is_hybrid_swa=False,
             ),
             streaming_session_count=lambda: 0,
             session_held_tokens=lambda: 0,
@@ -530,6 +543,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
     unexported misses looked like a radix-tree bug."""
 
     def setUp(self):
+        enter_scope(self, published_topology())
         self.labels = {"model_name": "test"}
 
     def _reporter(self, entry_map):
@@ -539,10 +553,16 @@ class TestHiCacheHostMambaStats(CustomTestCase):
             logical_size=1000, available_size=lambda: 400
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
-        reporter.scheduler = SimpleNamespace(
-            enable_hierarchical_cache=True, tree_cache=tree_cache
+        reporter.kv = SimpleNamespace(tree_cache=tree_cache)
+        reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.metrics_sink.stats = SchedulerStats()
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.get_memory",
+                return_value=SimpleNamespace(enable_hierarchical_cache=True),
+            ),
         )
-        reporter.stats = SchedulerStats()
         return reporter
 
     def _collector(self):
@@ -570,13 +590,17 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
         reporter._log_hicache_stats()
 
-        self.assertEqual(reporter.stats.hicache_host_used_tokens, 600)
-        self.assertEqual(reporter.stats.hicache_host_total_tokens, 1000)
-        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 128)
-        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 138)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_used_tokens, 600)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_total_tokens, 1000)
+        self.assertEqual(
+            reporter.metrics_sink.stats.hicache_host_mamba_used_states, 128
+        )
+        self.assertEqual(
+            reporter.metrics_sink.stats.hicache_host_mamba_total_states, 138
+        )
 
         collector = self._collector()
-        SchedulerMetricsCollector.log_stats(collector, reporter.stats)
+        SchedulerMetricsCollector.log_stats(collector, reporter.metrics_sink.stats)
         self.assertEqual(
             collector.hicache_host_mamba_used_states.sets, [(self.labels, 128)]
         )
@@ -589,12 +613,12 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
         reporter._log_hicache_stats()
 
-        self.assertEqual(reporter.stats.hicache_host_used_tokens, 600)
-        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 0)
-        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 0)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_used_tokens, 600)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_mamba_used_states, 0)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_mamba_total_states, 0)
 
         collector = self._collector()
-        SchedulerMetricsCollector.log_stats(collector, reporter.stats)
+        SchedulerMetricsCollector.log_stats(collector, reporter.metrics_sink.stats)
         self.assertEqual(collector.hicache_host_mamba_used_states.sets, [])
         self.assertEqual(collector.hicache_host_mamba_total_states.sets, [])
 
@@ -605,28 +629,28 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         reporter = self._reporter(
             {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
         )
-        reporter.scheduler.tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        reporter.kv.tree_cache.token_to_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 1000
         )
-        reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL
-        reporter.scheduler.running_batch = SimpleNamespace(reqs=[])
-        reporter.scheduler.waiting_queue = []
-        reporter.scheduler.grammar_manager = []
-        reporter.scheduler.enable_fpm = False
-        reporter.scheduler.enable_priority_scheduling = False
-        reporter.scheduler.pool_stats_observer = SimpleNamespace(
+        reporter.mode_owners = ModeOwners()
+        reporter.request_registry = make_request_registry()
+        reporter.grammar_manager = []
+        reporter.metrics_sink.enable_fpm = False
+        reporter.pool_stats_observer = SimpleNamespace(
             get_pool_stats=lambda: SimpleNamespace(
                 update_scheduler_stats=lambda stats: None
             ),
             streaming_session_count=lambda: 0,
             session_held_tokens=lambda: 0,
         )
-        reporter.current_scheduler_metrics_enabled = True
-        reporter.stats.hicache_host_used_tokens = 600  # the last batch's report
-        reporter.stats.hicache_host_mamba_used_states = 128
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
+        reporter.metrics_sink.stats.hicache_host_used_tokens = (
+            600  # the last batch's report
+        )
+        reporter.metrics_sink.stats.hicache_host_mamba_used_states = 128
         collector = MagicMock()
         collector.last_log_time = -1e9  # past the 30 s window
-        reporter.metrics_collector = collector
+        reporter.metrics_sink.metrics_collector = collector
 
         with patch(
             "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
@@ -634,10 +658,12 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         ):
             reporter._maybe_log_idle_metrics()
 
-        self.assertEqual(reporter.stats.hicache_host_used_tokens, 0)
-        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 0)
-        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 138)
-        collector.log_stats.assert_called_once_with(reporter.stats)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_used_tokens, 0)
+        self.assertEqual(reporter.metrics_sink.stats.hicache_host_mamba_used_states, 0)
+        self.assertEqual(
+            reporter.metrics_sink.stats.hicache_host_mamba_total_states, 138
+        )
+        collector.log_stats.assert_called_once_with(reporter.metrics_sink.stats)
 
 
 if __name__ == "__main__":

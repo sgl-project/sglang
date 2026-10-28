@@ -11,7 +11,6 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
@@ -178,8 +177,8 @@ class RequestRegistry:
                 self.request_retirer.retire_aborted_waiting(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            self.request_retirer.send_abort_output(
+                req, finished_reason=recv_req.finished_reason
             )
             logger.debug(f"Abort queued request. {req.rid=}")
 

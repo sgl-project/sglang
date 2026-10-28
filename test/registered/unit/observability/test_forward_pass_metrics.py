@@ -895,7 +895,13 @@ class TestIdleMetrics(CustomTestCase):
             num_pending_deferred_releases=lambda: 0,
         )
         self.reporter.mode_owners.disagg_decode = decode_owner_shell(
-            transfer_queue=transfer_queue
+            transfer_queue=transfer_queue,
+            prealloc_queue=types.SimpleNamespace(
+                queue=[],
+                retracted_queue=[],
+                held_rebootstrap_reqs=[],
+                pre_allocated_token_counts=lambda: (0, 0),
+            ),
         )
         for _ in host_reqs:
             collector.increment_decode_host_receive_reqs()

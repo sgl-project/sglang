@@ -219,7 +219,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 has_grammar=False,
             )
             target_worker = SimpleNamespace(
-                forward_batch_generation=lambda **_: SimpleNamespace(
+                forward_model=lambda **_: SimpleNamespace(
                     logits_output=SimpleNamespace(next_token_logits=torch.zeros(7, 8))
                 ),
                 model_runner=SimpleNamespace(

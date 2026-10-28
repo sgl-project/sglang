@@ -166,7 +166,15 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
 def test_typed_config_carries_tokenizer_metrics(enable_metrics):
     extension = MagicMock()
     with (
-        get_context().override_server_args(enable_metrics=enable_metrics, page_size=16),
+        get_context().override_server_args(
+            enable_metrics=enable_metrics,
+            page_size=16,
+            served_model_name="m",
+            enable_priority_scheduling=True,
+            extra_metric_labels={"cluster": "c"},
+            bucket_inter_token_latency=[0.001, 0.01],
+            generation_tokens_buckets=["custom", "10", "1"],
+        ),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),

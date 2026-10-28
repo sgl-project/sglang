@@ -119,7 +119,11 @@ def _accept_grammar_tokens(req: Req, tokens: Union[int, List[int]]) -> List[int]
         logger.error(
             f"Grammar accept_token failed for req {req.rid} with token {tokens}: {e}"
         )
-        req.to_finish = FINISH_ABORT()
+        req.to_finish = FINISH_ABORT(
+            f"Grammar accept_token failed: {e}",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+        )
     return retained
 
 
@@ -194,6 +198,11 @@ def maybe_update_reasoning_tokens(
     next_token_id: Union[int, List[int]],
 ):
     if not req.require_reasoning:
+        think_start_ids = model_config.self_opened_think_start_ids
+        if think_start_ids:
+            req.update_self_opened_reasoning_tokens(
+                next_token_id, think_start_ids, model_config.think_end_ids
+            )
         return
     think_end_ids = model_config.think_end_ids
     if req._think_end_matcher is None:
@@ -1467,7 +1476,9 @@ class SchedulerBatchResultProcessor:
 def _abort_at_next_commit(req: Req, error: str) -> None:
     """Abort a running request: it finishes at its next commit, as a client
     abort does, since the next step may already run it."""
-    req.to_finish = FINISH_ABORT(error, HTTPStatus.INTERNAL_SERVER_ERROR)
+    req.to_finish = FINISH_ABORT(
+        error, HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError"
+    )
 
 
 class _PrefillOutcome:

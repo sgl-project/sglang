@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.auxiliary_output import CompositeHostAuxiliaryOutput
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -101,7 +101,7 @@ def test_tp_worker_attaches_observer_output_to_the_result(has_observer, can_run_
         patch.object(ForwardBatch, "init_new", return_value=forward_batch),
         patch("sglang.srt.managers.tp_worker.capture_pre_sample_logits"),
     ):
-        result = _tp_worker(runner).forward_batch_generation(batch)
+        result = _tp_worker(runner).forward_model(batch)
 
     if has_observer:
         observer.after_forward.assert_called_once_with(
@@ -143,10 +143,10 @@ def test_forward_outputs_are_copied_to_the_host(has_sampling_output):
 
 
 @pytest.mark.parametrize("has_forward_output", [False, True])
-def test_scheduler_copies_forward_output_for_non_overlap_results(has_forward_output):
+def test_launcher_copies_forward_output_for_non_overlap_results(has_forward_output):
     event = object()
-    scheduler = object.__new__(Scheduler)
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=event))
+    launcher = object.__new__(StepLauncher)
+    launcher.device_module = SimpleNamespace(Event=Mock(return_value=event))
     result = SimpleNamespace(
         logits_output=SimpleNamespace(auxiliary_device_output=None),
         forward_auxiliary_output=object() if has_forward_output else None,
@@ -157,7 +157,7 @@ def test_scheduler_copies_forward_output_for_non_overlap_results(has_forward_out
     batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
     with published_topology():
-        Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
+        launcher._copy_auxiliary_output_to_cpu(batch, result)
 
     if has_forward_output:
         assert result.copy_done is event

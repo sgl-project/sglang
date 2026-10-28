@@ -9,6 +9,10 @@ from parameterized import parameterized
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+)
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -24,7 +28,10 @@ from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
     PendingSteps,
 )
-from sglang.srt.managers.scheduler_components.step_counters import StepCounters
+from sglang.srt.managers.scheduler_components.step_counters import (
+    STEP_MAX_US,
+    StepCounters,
+)
 from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -264,6 +271,121 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         # The decode broke contiguity, so it contributes no timing sample.
         self.assertEqual(scheduler.parts.step_counters.decode_moment_totals[0], 0)
 
+    def test_long_prefill_step_is_charged_but_long_decode_cadence_is_not(self):
+        # A long-context chunk can outlast STEP_MAX_US and is still busy time.
+        long_step = STEP_MAX_US / 1e6 + 1.5
+        scheduler = self.make_scheduler([])
+        counters = scheduler.parts.step_counters
+        for i in range(2):
+            prefill = self.make_record(ForwardMode.EXTEND, i + 1, i * long_step)
+            self.record_result(scheduler, prefill, (i + 1) * long_step)
+
+        self.assertEqual(counters.total_prefill_busy_us, total_us([long_step] * 2))
+        self.assertEqual(counters.total_prefill_uncached_tokens, 2 * 1024)
+
+        # A decode or verify launch gap that long is a stall, not a cadence sample.
+        forward_iter = 3
+        for start, mode in ((10, ForwardMode.DECODE), (20, ForwardMode.TARGET_VERIFY)):
+            for i in range(2):
+                record = self.make_record(
+                    mode, forward_iter, start + i * long_step, extend_num_tokens=None
+                )
+                forward_iter += 1
+                self.record_result(scheduler, record, start + i * long_step + 0.1)
+        self.assertEqual(counters.decode_moment_totals[0], 0)
+
+    def test_pause_between_prefills_is_not_charged(self):
+        scheduler = self.make_scheduler([])
+        first = self.make_record(ForwardMode.EXTEND, 1, 0.0)
+        self.record_result(scheduler, first, 0.125)
+        self.pause_and_resume(scheduler, 0.125, 10.0)
+        second = self.make_record(ForwardMode.EXTEND, 2, 10.0)
+        self.record_result(scheduler, second, 10.125)
+
+        counters = scheduler.parts.step_counters
+        self.assertEqual(counters.total_prefill_busy_us, total_us([0.125, 0.125]))
+        self.assertEqual(counters.total_prefill_uncached_tokens, 2 * 1024)
+
+    def test_result_held_across_a_pause_excludes_the_pause(self):
+        # An overlapped prefill launched before the pause has its result processed after resume.
+        scheduler = self.make_scheduler([])
+        record = self.make_record(ForwardMode.EXTEND, 1, 0.0)
+        self.pause_and_resume(scheduler, 0.05, 10.0)
+        self.record_result(scheduler, record, 10.125)
+
+        self.assertEqual(
+            scheduler.parts.step_counters.total_prefill_busy_us,
+            int((10.125 - 9.95) * 1e6),
+        )
+
+    def test_result_processed_during_an_open_pause_excludes_it(self):
+        # A retract after an in-place pause processes the held result before resume.
+        scheduler = self.make_scheduler([])
+        counters = scheduler.parts.step_counters
+        first = self.make_record(ForwardMode.EXTEND, 1, 0.0)
+        self.pause(scheduler, 0.125)
+        self.record_result(scheduler, first, 10.125)
+        self.assertEqual(counters.total_prefill_busy_us, total_us([0.125]))
+
+        self.resume(scheduler, 11.0)
+        second = self.make_record(ForwardMode.EXTEND, 2, 11.0)
+        self.record_result(scheduler, second, 11.125)
+        self.assertEqual(counters.total_prefill_busy_us, total_us([0.125, 0.125]))
+
+    def test_many_pauses_inside_one_step_are_all_excluded(self):
+        scheduler = self.make_scheduler([])
+        counters = scheduler.parts.step_counters
+        record = self.make_record(ForwardMode.EXTEND, 1, 0.0)
+        for i in range(100):
+            self.pause_and_resume(scheduler, 1.0 + i * 0.125, 1.0625 + i * 0.125)
+        self.record_result(scheduler, record, 14.0)
+
+        self.assertEqual(counters.total_prefill_busy_us, total_us([14.0 - 6.25]))
+        # Every window ended before this step's end, so none is kept.
+        self.assertEqual(len(counters._pause_intervals), 0)
+
+    def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
+        scheduler = self.make_scheduler([])
+        first = self.make_record(ForwardMode.EXTEND, 1, 0.0)
+        self.record_result(scheduler, first, 0.125)
+        self.pause_and_resume(scheduler, 0.25, 0.5)
+        second = self.make_record(ForwardMode.EXTEND, 2, 1.0, after_idle_gap=True)
+        self.record_result(scheduler, second, 1.125)
+
+        self.assertEqual(
+            scheduler.parts.step_counters.total_prefill_busy_us,
+            total_us([0.125, 0.125]),
+        )
+
+    def test_repeated_pause_keeps_one_window_from_the_first_start(self):
+        scheduler = self.make_scheduler([])
+        self.pause(scheduler, 1.0)
+        self.pause(scheduler, 2.0)
+        self.resume(scheduler, 3.0)
+        self.assertEqual(
+            list(scheduler.parts.step_counters._pause_intervals), [(1.0, 3.0)]
+        )
+
+    def pause(self, scheduler, paused_at):
+        with patch(
+            "sglang.srt.managers.scheduler.time.monotonic", return_value=paused_at
+        ):
+            Scheduler.pause_generation(
+                scheduler, PauseGenerationReqInput(mode="in_place")
+            )
+
+    def resume(self, scheduler, resumed_at):
+        with patch(
+            "sglang.srt.managers.scheduler.time.monotonic", return_value=resumed_at
+        ):
+            Scheduler.continue_generation(
+                scheduler, ContinueGenerationReqInput(torch_empty_cache=False)
+            )
+
+    def pause_and_resume(self, scheduler, paused_at, resumed_at):
+        self.pause(scheduler, paused_at)
+        self.resume(scheduler, resumed_at)
+
     def make_batch(self, mode, forward_iter, *, extend_num_tokens=1024):
         return ScheduleBatch(
             reqs=[Mock(rid="request", finished=Mock(return_value=False))],
@@ -273,12 +395,14 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             extend_num_tokens=extend_num_tokens,
         )
 
-    def make_record(self, mode, forward_iter, launch_ts, **kwargs):
+    def make_record(
+        self, mode, forward_iter, launch_ts, *, after_idle_gap=False, **kwargs
+    ):
         return PendingStep(
             step=self.make_batch(mode, forward_iter, **kwargs),
             result=GenerationBatchResult(),
             launch_ts=launch_ts,
-            after_idle_gap=False,
+            after_idle_gap=after_idle_gap,
         )
 
     def make_batches(self, mode):

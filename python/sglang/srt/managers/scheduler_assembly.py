@@ -71,6 +71,9 @@ from sglang.srt.managers.scheduler_components.bundles import (
     Streams,
     Workers,
 )
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -274,6 +277,7 @@ class SchedulerParts:
     beam_coordinator: BeamCoordinator
     batch_result_processor: SchedulerBatchResultProcessor
     request_retirer: RequestRetirer
+    deferred_responses: DeferredResponses
     step_counters: StepCounters
 
 
@@ -792,6 +796,11 @@ def assemble_scheduler(
         output_streamer=output_streamer,
         ipc_channels=ipc_channels,
     )
+    deferred_responses = DeferredResponses(
+        disaggregation_mode=disaggregation_mode,
+        output_streamer=output_streamer,
+        request_retirer=request_retirer,
+    )
     batch_result_processor = SchedulerBatchResultProcessor(
         is_generation=is_generation,
         model_config=model_config,
@@ -896,6 +905,7 @@ def assemble_scheduler(
         beam_coordinator=beam_coordinator,
         batch_result_processor=batch_result_processor,
         request_retirer=request_retirer,
+        deferred_responses=deferred_responses,
         step_counters=step_counters,
     )
 
@@ -1214,12 +1224,15 @@ def init_disaggregation() -> DisaggregationMode:
     """The configured disaggregation mode."""
     disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
 
-    # In rust-server mode the KV bootstrap registry is already serving on
-    # the rust api listener (the rust server launches before this runs —
-    # the PrefillBootstrapQueue's KVManager below registers to it
-    # synchronously, and a failed registration only retries ~60s then logs,
-    # leaving every PD request unroutable). Only the ascend config store,
-    # which start_disagg_service would otherwise create, is left to do.
+    # In rust-server mode the KV bootstrap server is already up before the
+    # PrefillBootstrapQueue's KVManager registers to it (synchronously; a
+    # failed registration only retries ~60s then logs, leaving every PD
+    # request unroutable): either the rust api listener serves the HTTP
+    # registry (the rust server launches before this runs), or, for a
+    # transfer backend with its own bootstrap server, the main process has
+    # started that server (start_disagg_service_for_rust_server). Only the
+    # ascend config store, which start_disagg_service would otherwise
+    # create, is left to do here.
     if disaggregation_mode == DisaggregationMode.PREFILL and _hosts_rust_server():
         maybe_create_ascend_config_store(
             transfer_backend=TransferBackend(

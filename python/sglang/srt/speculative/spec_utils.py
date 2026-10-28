@@ -977,16 +977,24 @@ class VerifyTrackIndices:
         self._req_pool_indices = self._mapping = self._indices = None
         self._positions = self._versions = None
 
-    def set_from_reqs(self, batch: ScheduleBatch) -> None:
-        """set_mamba_track_indices_from_reqs, without its gathers and host-to-device
-        copy when the request slots and the ping-pong mapping are the same tensors at
-        the same versions, no track position moved and the last indices are unwritten.
+    def set_from_reqs(
+        self, batch: ScheduleBatch, track_positions: List[Optional[int]]
+    ) -> None:
+        """set_mamba_track_indices_from_reqs over the planned track positions,
+        without its gathers and host-to-device copy when the request slots and the
+        ping-pong mapping are the same tensors at the same versions, the plan and
+        the untracked requests are the same and the last indices are unwritten.
         """
         req_pool_indices = batch.req_pool_indices
         mapping = (
             batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
         )
-        positions = tuple(req.kv.mamba_next_track_idx for req in batch.reqs)
+        # What the build reads besides the tensors: the plan, and which
+        # requests track nowhere.
+        positions = (
+            tuple(track_positions),
+            tuple(req.kv.mamba_next_track_idx is None for req in batch.reqs),
+        )
         if (
             req_pool_indices is self._req_pool_indices
             and mapping is self._mapping
@@ -994,12 +1002,10 @@ class VerifyTrackIndices:
             and self._versions is not None
             and _versions(req_pool_indices, mapping, self._indices) == self._versions
         ):
-            batch.mamba_track_buffer_indices = [
-                0 if p is None else p for p in positions
-            ]
+            batch.mamba_track_buffer_indices = list(track_positions)
             batch.mamba_track_indices = self._indices
             return
-        set_mamba_track_indices_from_reqs(batch)
+        set_mamba_track_indices_from_reqs(batch, track_positions)
         self._req_pool_indices, self._mapping = req_pool_indices, mapping
         self._indices, self._positions = batch.mamba_track_indices, positions
         self._versions = _versions(req_pool_indices, mapping, self._indices)
@@ -1032,7 +1038,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+    if lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
     else:
         track_positions = batch.mamba_track_buffer_indices
@@ -1040,7 +1047,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
         "spec verify without a track plan: spec_prepare_for_decode must plan "
         "every spec decode step"
     )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+    if not lazy and _VERIFY_TRACK_INDICES is not None:
+        _VERIFY_TRACK_INDICES.set_from_reqs(batch, track_positions)
+    else:
+        set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None

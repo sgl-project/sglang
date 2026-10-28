@@ -95,6 +95,11 @@ def load_tokenizer(
         think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if think_end_ids:
             model_config.think_end_ids = think_end_ids
+            model_config.self_opened_think_start_ids = (
+                reasoning_parser.detector.get_self_opened_think_start_token_ids(
+                    tokenizer
+                )
+            )
         else:
             logger.warning(
                 "Reasoning parser think_end_token %r could not be encoded; "
