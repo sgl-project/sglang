@@ -1,19 +1,11 @@
-"""Under decode context parallelism a unified pool's target verify must run on
-a backend that implements DCP verify.
-
-DFLASH keeps speculative_attention_mode "prefill", so with trtllm_mla prefill
-and cutedsl_mla decode its verify runs on trtllm_mla, whose kernel refuses a
-DCP verify at the first call. The runner now refuses that pair when it builds
-its backends; Kimi-K3's DSPARK override moves verify to the decode backend,
-which implements it.
-"""
+"""Reject unsupported DCP target verify on the backend selected by speculative mode."""
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -97,11 +89,10 @@ def _kimi_k3_mode(algorithm: str) -> str:
     return overrides.get("speculative_attention_mode", "prefill")
 
 
-class TestDcpTargetVerifyBackend(unittest.TestCase):
+class TestDcpTargetVerifyBackend(CustomTestCase):
     def test_bf16_prefill_mode_verifies_on_trtllm_mla_and_is_refused(self):
-        """BUG REGRESSION. trtllm_mla prefill (BF16 KV) with cutedsl_mla decode
-        passed every gate, then DFLASH verify ran on trtllm_mla under DCP and
-        raised NotImplementedError at capture or the first verify."""
+        """DFLASH verify on the TRTLLM MLA prefill backend must fail at setup,
+        before its unsupported DCP kernel is captured or executed."""
         hybrid = _hybrid(TRTLLMMLABackend, CuteDslMLABackend, "prefill")
         with self.assertRaisesRegex(ValueError, "TRTLLMMLABackend"):
             _require(hybrid, mode="prefill")
