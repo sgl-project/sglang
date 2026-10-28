@@ -74,6 +74,17 @@ def compressed_tensors_version(torch_version: str) -> str:
         ) from exc
 
 
+def ci_install_extras(torch_version: str) -> str:
+    # The legacy runner supplies its own 2.9 vendor wheel bundle. dev_musa
+    # targets MUSA 5.2 / Torch 2.11, so its exact vendor pins cannot be resolved
+    # against that bundle. Install the shared runtime and test dependencies;
+    # build_constraints still pins every installed vendor distribution.
+    compressed_tensors_version(torch_version)
+    if torch_minor(torch_version) == (2, 9):
+        return "runtime_common,diffusion_musa,test"
+    return "dev_musa"
+
+
 def build_constraints() -> list[str]:
     versions = {name: distribution_version(name) for name in CORE_DISTRIBUTIONS}
     pins = [f"{name}=={version}" for name, version in versions.items()]
@@ -216,6 +227,8 @@ def parse_args() -> argparse.Namespace:
     constraints = subparsers.add_parser("constraints")
     constraints.add_argument("--output", type=Path, required=True)
 
+    subparsers.add_parser("install-extras")
+
     verify = subparsers.add_parser("verify")
     verify.add_argument("--expected-triton-version", required=True)
     verify.add_argument("--require-driver", action="store_true")
@@ -231,6 +244,8 @@ def main() -> None:
     try:
         if args.command == "constraints":
             write_constraints(args.output)
+        elif args.command == "install-extras":
+            print(ci_install_extras(distribution_version("torch")))
         else:
             verify_stack(
                 expected_triton_version=args.expected_triton_version,

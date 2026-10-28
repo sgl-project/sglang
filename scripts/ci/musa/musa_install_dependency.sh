@@ -258,10 +258,13 @@ else
     bash "${REPO_ROOT}/scripts/ci/utils/install_rustup.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
+    MUSA_SGLANG_EXTRAS="$(python3 "$STACK_HELPER" install-extras)"
+    echo "Installing checkout SGLang extras: ${MUSA_SGLANG_EXTRAS}"
     cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" \
         --constraint "$MUSA_CONSTRAINTS" \
         -v \
-        -e "python[dev_musa]" \
+        -e "python[${MUSA_SGLANG_EXTRAS}]" \
+        "numpy<2.0" "mthreads-ml-py" \
         --user
 
     cd "${REPO_ROOT}/python/sglang/kernels/aot"

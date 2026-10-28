@@ -13,6 +13,26 @@ SPEC.loader.exec_module(musa_python_stack)
 
 
 class MusaPythonStackTest(unittest.TestCase):
+    def test_legacy_runner_installs_runtime_and_tests_without_new_vendor_pins(
+        self,
+    ) -> None:
+        self.assertEqual(
+            musa_python_stack.ci_install_extras("2.9.0"),
+            "runtime_common,diffusion_musa,test",
+        )
+
+    def test_current_runner_uses_public_musa_dependency_set(self) -> None:
+        self.assertEqual(
+            musa_python_stack.ci_install_extras("2.11.0.post1+musa5.2.0"),
+            "dev_musa",
+        )
+
+    def test_install_extras_reject_unknown_torch_line(self) -> None:
+        with self.assertRaisesRegex(
+            musa_python_stack.StackError, "unsupported MUSA Torch line 2.10"
+        ):
+            musa_python_stack.ci_install_extras("2.10.0")
+
     def test_compressed_tensors_for_torch_29(self) -> None:
         self.assertEqual(
             musa_python_stack.compressed_tensors_version("2.9.0+musa"),
