@@ -465,6 +465,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             if is_multi_layer_draft_extend or not (
                 is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
             ):
+                # The EAGLE draft check must precede the decode fallback:
+                # EAGLEDraftCudaGraphRunner also subclasses
+                # DecodeCudaGraphRunner.
+                from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+                    EAGLEDraftCudaGraphRunner,
+                )
+                if isinstance(runner, EAGLEDraftCudaGraphRunner):
+                    cpu_update_input = self._build_eagle_draft_update_payload(
+                        static_forward_batch
+                    )
+                    return self.replay_with_input_update(
+                        shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    )
                 return self.replay_with_input_update(
                     shape_key,
                     seq_lens=self._decode_update_lengths(static_forward_batch),
@@ -473,6 +486,20 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
+
+    def _build_eagle_draft_update_payload(self, forward_batch):
+        runner = self._decode_runner
+        # One {attr_name: seq_lens} dict per speculative draft step: the
+        # kth draft forward reads KV lengths seq_len + 1 + k (one draft token
+        # is written to KV per step); padding rows carry 0 so attention
+        # skips them.
+        attr_name = self.get_update_attr_name()
+        cpu_update_input = []
+        for step in range(runner.speculative_num_steps - 1):
+            seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs] + step + 1
+            seq_lens = seq_lens_cpu.tolist() + [0] * (runner.bs - runner.raw_bs)
+            cpu_update_input.append({attr_name: seq_lens})
+        return cpu_update_input
 
     def replay_with_input_update(
         self,
