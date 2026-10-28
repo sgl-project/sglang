@@ -870,6 +870,65 @@ class TestCPUGraph(CustomTestCase):
         self.assertIs(selected[0][0], padded_graph)
         self.assertEqual(selected[0][1].input_ids.shape[0], 256)
 
+    def test_dynamic_prefill_graph_bs1_is_selected_for_uncaptured_tokens(self):
+        runner = _make_cpu_graph_runner()
+        runner.prefill_dynamic_graph_bs1 = object()
+        runner.enable_torch_compile = False
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=129, batch_size=1)
+        selected = []
+
+        def run_prefill_once(compiled_fn, batch):
+            selected.append((compiled_fn, batch))
+            return object()
+
+        with patch.object(runner, "_run_prefill_once", side_effect=run_prefill_once):
+            runner._execute_prefill_graph(forward_batch)
+
+        self.assertIs(selected[0][0], runner.prefill_dynamic_graph_bs1)
+        self.assertIs(selected[0][1], forward_batch)
+
+    def test_can_run_prefill_graph_bs1_with_dynamic_fallback(self):
+        runner = _make_cpu_graph_runner()
+        runner.prefill_dynamic_graph_bs1 = object()
+        runner.prefill_graphs_bs1 = {128: object()}
+        # 300 tokens cannot pad to 128/256/390 (diff 90 to 390 > 64 and 90/300=30% > 20%)
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=300, batch_size=1)
+        self.assertTrue(runner._can_run_prefill_graph(forward_batch))
+
+        # Without dynamic fallback graph, 300 tokens cannot run
+        runner.prefill_dynamic_graph_bs1 = None
+        self.assertFalse(runner._can_run_prefill_graph(forward_batch))
+
+    def test_capture_prefill_skips_multi_batch_graphs_for_single_token_or_max_bs_one(
+        self,
+    ):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.capture_num_tokens = [1, 128]
+        runner.prefill_max_bs = 1
+        runner.prefill_graphs = {}
+        runner.prefill_graphs_bs1 = {}
+        runner.enable_dynamic_graph = False
+        runner.is_encoder_decoder = False
+        runner.is_generation = True
+        runner._reset_mamba_cache_if_needed = lambda: None
+        runner._compile_decode_dynamic_graphs = lambda: None
+
+        with (
+            patch.object(
+                cpu_graph_runner_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+            patch.object(runner, "_compile_prefill_bucket") as mock_bucket,
+            patch.object(
+                runner, "_compile_prefill_bucket_bs1", return_value=object()
+            ) as mock_bs1,
+        ):
+            runner.capture_prefill()
+
+        mock_bucket.assert_not_called()
+        self.assertEqual(mock_bs1.call_count, 2)
+
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",
