@@ -21,6 +21,7 @@ class TestDFlashHeadWeights(CustomTestCase):
         model = DFlashDraftModel.__new__(DFlashDraftModel)
         nn.Module.__init__(model)
         model.projector_type = None
+        model.layers = nn.ModuleList()
         model.own_lm_head = nn.Linear(8, 16, bias=False)
         return model
 

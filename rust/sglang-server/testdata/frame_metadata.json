@@ -1,0 +1,72 @@
+{
+  "batch": {
+    "header": "dc001792a4646f6e65a772756e6e696e679282a474797065a66c656e677468a66c656e67746803c0920506920301920000920000909090909090909090909090929293a36f6c64000293a36e65770203c092080092000292000092cb3fd0000000000000c0",
+    "data": "0100000000000000020000000000000003000000000000000400000000000000",
+    "decode_latencies": {
+      "done": 0.25
+    },
+    "meta_info": {
+      "done": {
+        "weight_version": "new",
+        "weight_versions": [
+          {
+            "version": "old",
+            "start": 0,
+            "end": 2
+          },
+          {
+            "version": "new",
+            "start": 2,
+            "end": 3
+          }
+        ],
+        "image_tokens": 8
+      },
+      "running": {
+        "weight_version": "launch",
+        "audio_tokens": 2
+      }
+    }
+  },
+  "logprob_batch": {
+    "header": "dc001792a86c6f6770726f6273a5706c61696e9282a474797065a66c656e677468a66c656e67746802c09203049202019200009200009202009090909090909090909090929193a276310002c090909092cb3fe0000000000000c0",
+    "data": "070000000000000008000000000000000900000000000000000000bf000080be0700000008000000",
+    "decode_latencies": {
+      "logprobs": 0.5
+    },
+    "meta_info": {
+      "logprobs": {
+        "weight_version": "v1",
+        "weight_versions": [
+          {
+            "version": "v1",
+            "start": 0,
+            "end": 2
+          }
+        ]
+      },
+      "plain": {
+        "weight_version": "launch"
+      }
+    }
+  },
+  "abort": {
+    "header": "dc001891a761626f727465649182a474797065a561626f7274a76d657373616765b641626f727420696e2077616974696e672071756575659102910091009100909090909090909090909090919293a36f6c64000293a36e657702099090909091c3",
+    "completion_tokens": 3,
+    "meta_info": {
+      "weight_version": "new",
+      "weight_versions": [
+        {
+          "version": "old",
+          "start": 0,
+          "end": 2
+        },
+        {
+          "version": "new",
+          "start": 2,
+          "end": 3
+        }
+      ]
+    }
+  }
+}
