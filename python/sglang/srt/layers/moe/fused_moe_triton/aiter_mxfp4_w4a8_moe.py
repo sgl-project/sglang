@@ -409,6 +409,24 @@ def _pad_dim(t: torch.Tensor, dim: int, size: int, value) -> torch.Tensor:
     return torch.cat([t, t.new_full(pad_shape, value)], dim=dim)
 
 
+_weight_pool = None
+
+
+def _to_weight_pool(*tensors: torch.Tensor) -> list[torch.Tensor]:
+    """Copies of ``tensors`` in a memory pool that holds nothing but them."""
+    global _weight_pool
+    if _weight_pool is None:
+        _weight_pool = torch.cuda.MemPool()
+    copies = []
+    with torch.cuda.use_mem_pool(_weight_pool):
+        for t in tensors:
+            copy = t.clone()
+            if getattr(t, "is_shuffled", False):
+                copy.is_shuffled = True  # aiter.fused_moe reads it
+            copies.append(copy)
+    return copies
+
+
 def prepare_w4a8_gfx1250_flydsl_weights(
     w13_weight: torch.Tensor,
     w13_weight_scale: torch.Tensor,
@@ -468,6 +486,17 @@ def prepare_w4a8_gfx1250_flydsl_weights(
     )
     w2_scale = moe_shuffle_scale(w2_scale.contiguous(), num_experts).contiguous()
     w2_bias = _pad_dim(w2_weight_bias, 1, hidden_pad, 0).float().contiguous()
+
+    # The padded buffers are larger than the loaded ones, so the caching allocator
+    # cannot reuse the loaded buffers' blocks for them and carves them (and the
+    # small scales and biases) out of whatever the loaded buffers and the
+    # temporaries above leave free. Once those are freed, every segment that
+    # holds a piece of the result stays reserved: 13.6 GiB at TP1 over 36 layers,
+    # counted as weight memory and taken from the KV pool. Copied into a pool of
+    # their own, the results leave those segments wholly free for empty_cache.
+    w13, w13_scale, w13_bias, w2, w2_scale, w2_bias = _to_weight_pool(
+        w13, w13_scale, w13_bias, w2, w2_scale, w2_bias
+    )
 
     # Gluon views: (E, K_pad * 16, N // 16) weights, (E, K_scale_pad * 32, N // 32)
     # scales (moe_gemm_a8w4 transposes them back), cut to the first N rows: GEMM 1
