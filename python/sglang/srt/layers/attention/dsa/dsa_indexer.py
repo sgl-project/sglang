@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     _use_torch_mqa_logits,
     aiter_can_use_preshuffle_paged_mqa,
+    dsa_index_k_cache_is_ue8m0,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -436,11 +437,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # SM100 DeepGEMM reads MXFP8, so index-K scales are powers of two there and
         # are stored as packed UE8M0 when DeepGEMM reads the paged cache
         self.mx_mqa_logits = _is_cuda and uses_mx_mqa_logits(get_device().device)
-        self.ue8m0_index_cache = (
-            self.mx_mqa_logits
-            and self.paged_mqa_logits_backend.is_deepgemm()
-            and not _use_torch_mqa_logits()
-        )
+        self.ue8m0_index_cache = dsa_index_k_cache_is_ue8m0(kpool=False)
         self.index_k_scale_fmt = self.scale_fmt or (
             "ue8m0" if self.mx_mqa_logits else None
         )
@@ -1352,9 +1349,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
-                    seqlens_32_2d, blocksize, self.sm_count
-                )
+                schedule_metadata = resolve_paged_mqa_logits_metadata_fn(
+                    cutedsl=use_cute_dsl
+                )(seqlens_32_2d, blocksize, self.sm_count)
 
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size

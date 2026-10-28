@@ -12,6 +12,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     fp8_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
     mx_kv_scale,
     mx_q_and_weights,
     to_fp32_logits,
@@ -28,8 +29,8 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    dsa_index_k_cache_is_ue8m0,
     dsa_use_prefill_cp,
-    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -202,8 +203,7 @@ class IndexerKPool(MultiPlatformOp):
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
         self.mx_mqa_logits = uses_mx_mqa_logits(get_device().device)
-        # DeepGEMM is the only SM100 paged reader of the k-pool cache
-        self.ue8m0_index_cache = self.mx_mqa_logits
+        self.ue8m0_index_cache = dsa_index_k_cache_is_ue8m0(kpool=True)
 
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
@@ -858,7 +858,7 @@ class IndexerKPool(MultiPlatformOp):
                 ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
-                pool_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+                pool_schedule_metadata = get_paged_mqa_logits_metadata(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
                 )
             return (
@@ -898,7 +898,7 @@ class IndexerKPool(MultiPlatformOp):
 
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
-            pool_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+            pool_schedule_metadata = get_paged_mqa_logits_metadata(
                 pool_context_lens.clamp(min=1), blocksize, self.sm_count
             )
 

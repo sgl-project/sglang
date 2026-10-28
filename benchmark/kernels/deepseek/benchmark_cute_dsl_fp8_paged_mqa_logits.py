@@ -10,9 +10,15 @@ import torch
 
 import sglang.kernels.ops.attention.dsa.cutedsl_paged_mqa_logits  # noqa: F401
 from sglang.kernels.ops.attention.dsa import pick_dsl_expand
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    pack_ue8m0_x4,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
+    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.utils import is_sm100_supported
 
@@ -72,12 +78,17 @@ def _generate_bench_data(
     kv_fp8 = (kv_bf16 / kv_scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
     kv_fused = fp8_mqa_logits_make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim)
+    # SM100 DeepGEMM reads the scales as packed UE8M0
+    kv_fused_ue8m0 = kv_fused.clone()
+    scales = kv_fused_ue8m0.view(total_blocks, -1)[:, block_kv * head_dim :]
+    scales.copy_(pack_ue8m0_x4(kv_scales).view(torch.uint8).view_as(scales))
 
     return {
         "q_fp8": q_fp8,
         "kv_fp8": kv_fp8,
         "kv_scales": kv_scales,
         "kv_fused": kv_fused,
+        "kv_fused_ue8m0": kv_fused_ue8m0,
         "weights": weights,
         "context_lens": context_lens,
         "block_table": block_table,
@@ -108,7 +119,6 @@ def benchmark(
     native path is always visible even on shapes where the picker prefers a
     split. ``use_cuda_graph=True`` matches SGLang's runtime decode path.
     """
-    import deep_gemm
     from flashinfer.testing.utils import bench_gpu_time
 
     num_heads = 32
@@ -178,7 +188,7 @@ def benchmark(
                     }
 
                 def _meta(t):
-                    return deep_gemm.get_paged_mqa_logits_metadata(
+                    return resolve_paged_mqa_logits_metadata_fn(cutedsl=True)(
                         t["ctx_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
                     )
 
@@ -225,20 +235,20 @@ def benchmark(
                 dg_nat_ctx_2d = (
                     data["context_lens"].unsqueeze(-1).expand(-1, next_n).contiguous()
                 )
-                dg_nat_schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                dg_nat_schedule_meta = get_paged_mqa_logits_metadata(
                     dg_nat_ctx_2d, DG_METADATA_BLOCK_KV, num_sms
                 )
 
                 def _dg_native():
-                    deep_gemm.fp8_paged_mqa_logits(
+                    fp8_paged_mqa_logits(
                         data["q_fp8"],
-                        data["kv_fused"],
+                        data["kv_fused_ue8m0"],
                         data["weights"],
                         dg_nat_ctx_2d,
                         data["block_table"],
                         dg_nat_schedule_meta,
                         data["max_model_len"],
-                        clean_logits=False,
+                        logits_dtype=output_dtype,
                     )
 
                 bench_kwargs = dict(

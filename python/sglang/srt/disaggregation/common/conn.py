@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    pd_kv_layouts_match,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -1345,15 +1346,14 @@ class CommonKVManager(BaseKVManager):
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
-        if (
-            info.kv_layout is not None
-            and self.kv_layout is not None
-            and info.kv_layout != self.kv_layout
-        ):
+        if not pd_kv_layouts_match(info.kv_layout, self.kv_layout):
             raise RuntimeError(
                 f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
-                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT, "
+                f"and both or neither must keep the index-K cache in DeepGEMM's "
+                f"SM100 UE8M0 format (same GPU arch, --dsa-paged-mqa-logits-backend "
+                f"and indexer env overrides)."
             )
 
         local_layout = self.dsv41_spec_layout

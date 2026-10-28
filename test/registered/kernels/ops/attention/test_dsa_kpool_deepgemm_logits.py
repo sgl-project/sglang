@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
-from sglang.srt.layers.attention.deep_gemm_mqa_logits import pack_ue8m0_x4
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    get_paged_mqa_logits_metadata,
+    pack_ue8m0_x4,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     kpool_softmax_rotate_write_cache,
 )
+from sglang.srt.layers.attention.dsa.kpool_plan import _compute_pool_schedule_metadata
 from sglang.srt.layers.attention.dsa.utils import resolve_paged_mqa_logits_metadata_fn
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -147,6 +152,23 @@ class TestDsaKpoolDeepGemmLogits(CustomTestCase):
             want = torch.cat([ref[i, starts[i] : ends[i]] for i in range(num_rows)])
             self.assertLess(_calc_diff(got, want), 3e-5, f"{ue8m0_index_cache=}")
 
+    def test_pool_schedule_matches_deepgemm_under_torch_mqa_logits(self):
+        import deep_gemm
+
+        pool_lens = torch.full((3,), 2048, dtype=torch.int32, device="cuda")
+        want = get_paged_mqa_logits_metadata(
+            pool_lens.view(-1, 1), PAGE_SIZE, deep_gemm.get_num_sms()
+        )
+        resolve_paged_mqa_logits_metadata_fn.cache_clear()
+        try:
+            with envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True):
+                got = _compute_pool_schedule_metadata(
+                    pool_lens, index_page_size=PAGE_SIZE
+                )
+        finally:
+            resolve_paged_mqa_logits_metadata_fn.cache_clear()
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
     def test_paged_logits_read_the_ue8m0_cache(self):
         import deep_gemm
 
@@ -170,7 +192,7 @@ class TestDsaKpoolDeepGemmLogits(CustomTestCase):
         context_lens = torch.randint(
             1, max_seq_len + 1, (num_rows, 1), device="cuda"
         ).int()
-        schedule = resolve_paged_mqa_logits_metadata_fn()(
+        schedule = get_paged_mqa_logits_metadata(
             context_lens, PAGE_SIZE, deep_gemm.get_num_sms()
         )
         logits = _indexer(True)._deep_gemm_paged_mqa_logits(

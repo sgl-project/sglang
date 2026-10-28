@@ -1535,11 +1535,13 @@ class DeepseekV4AttnBackend(
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
-            # The SM120 FP4 kernel schedules split_kv=128, while the generic
-            # JIT metadata planner encodes split_kv=256.
+            # The SM120 FP4 kernel schedules split_kv=128 and the SM100 low-ratio
+            # FP4 indexer uses DeepGEMM's own SM100 format, while the generic JIT
+            # metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
                 self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
-            ),
+            )
+            or (compress_ratio in (1, 2) and get_platform().is_sm100),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,

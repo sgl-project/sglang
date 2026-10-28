@@ -10,6 +10,10 @@ from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
+    uses_mx_mqa_logits,
+)
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_needs_budget_check,
@@ -25,6 +29,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     process_model_config,
@@ -81,8 +86,6 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     Reached only on gfx950, since gfx950_fused_indexer.supported_hardware() is
     evaluated first. Every decline here is therefore a configuration or toolchain
     error; it is logged, as a warning when the path was asked for by name."""
-    from sglang.srt.runtime_context import get_exec
-
     requested = get_exec().kernel.enable_dsa_fused_indexer
     if requested is False:
         return False  # asked for the standard path; not worth a line per server
@@ -358,6 +361,17 @@ def fp8_mqa_logits_make_fused_kv(
 
 def _use_torch_mqa_logits() -> bool:
     return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+
+
+def dsa_index_k_cache_is_ue8m0(kpool: bool) -> bool:
+    """Whether the DSA index-K cache stores packed UE8M0 scales: on SM100 when
+    DeepGEMM reads the paged cache, which it always does for the k-pool layout."""
+    if not (is_cuda() and uses_mx_mqa_logits(torch.device("cuda"))):
+        return False
+    backend = DSAPagedMQALogitsBackend.resolve(
+        get_exec().kernel.dsa_paged_mqa_logits_backend
+    )
+    return kpool or (backend.is_deepgemm() and not _use_torch_mqa_logits())
 
 
 @lru_cache(maxsize=1)
