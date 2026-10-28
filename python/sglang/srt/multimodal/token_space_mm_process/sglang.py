@@ -112,6 +112,7 @@ class TokenSpaceSGLangProcessor:
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
+        self._image_device = self._serving_image_processor_device()
 
     @property
     def cudaipc_mmfeature_pool(self):
@@ -160,7 +161,7 @@ class TokenSpaceSGLangProcessor:
             video_data,
             audio_data,
             input_ids=input_ids,
-            image_device=self._serving_image_processor_device(),
+            image_device=self._image_device,
             compute_mrope_positions=True,
             package_output=self._package_output,
         )
