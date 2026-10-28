@@ -13,7 +13,7 @@ from sglang.test.kl_multiturn_utils import (
 )
 from sglang.test.server_fixtures.dsa_mtp_fixture import DsaMtpServerBase
 
-register_amd_ci(est_time=1800, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 GLM52_MODEL_PATH = os.environ.get("GLM52_MODEL_PATH", "amd/GLM-5.2-MXFP4")
 DCP_SIZE = 4
