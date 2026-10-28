@@ -885,18 +885,11 @@ class Scheduler:
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.parts.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.parts.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
+                if self.parts.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.parts.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.parts.ipc_channels.recv_from_rpc, output)
                 else:
-                    self.parts.ipc_channels.send_to_tokenizer.send_output(
-                        output, recv_req
-                    )
+                    self.parts.output_streamer.send_control_output(output, recv_req)
 
         self.hub.flush_wrapper.check_pending()
         if self.parts.external_corpus_manager is not None:

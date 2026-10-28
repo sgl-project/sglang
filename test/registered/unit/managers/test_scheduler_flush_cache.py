@@ -3,9 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
+)
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -130,10 +132,14 @@ class TestSchedulerFlushCache(unittest.TestCase):
         egress ring when the scheduler embeds one, else the tokenizer socket."""
         output = FlushCacheReqOutput(success=True)
         req = FlushCacheReqInput(rid="r", timeout_s=1.0)
-        rust = SimpleNamespace(rust_server=MagicMock(), ipc_channels=MagicMock())
-        Scheduler.send_control_output(rust, output, req)
+        rust = SimpleNamespace(rust_server=MagicMock(), send_to_tokenizer=MagicMock())
+        SchedulerOutputStreamer.send_control_output(rust, output, req)
         rust.rust_server.push_control_output.assert_called_once_with(req, output)
-        rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        rust.send_to_tokenizer.send_output.assert_not_called()
+
+        zmq = SimpleNamespace(rust_server=None, send_to_tokenizer=MagicMock())
+        SchedulerOutputStreamer.send_control_output(zmq, output, req)
+        zmq.send_to_tokenizer.send_output.assert_called_once_with(output, req)
 
 
 if __name__ == "__main__":

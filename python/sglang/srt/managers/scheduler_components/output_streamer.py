@@ -87,11 +87,28 @@ class SchedulerOutputStreamer:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+            if self.rust_server is not None:
+                # The zmq tokenizer socket is not consumed in Rust mode. Rust
+                # probes share one heartbeat, so one acknowledgement answers
+                # every probe skipped so far.
+                self.return_health_check_ipcs.clear()
+                self.rust_server.push_health_ack()
+            else:
+                self.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=self.return_health_check_ipcs.popleft()
+                    )
                 )
-            )
+
+    def send_control_output(self, output, recv_req) -> None:
+        """Answer a control request, at dispatch or later (a deferred flush)."""
+        if self.rust_server is not None:
+            # Embedded Rust server: every control-request response goes
+            # back through the egress ring (the zmq tokenizer socket is
+            # not consumed); the Rust api_server shapes it per-endpoint.
+            self.rust_server.push_control_output(recv_req, output)
+        else:
+            self.send_to_tokenizer.send_output(output, recv_req)
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:

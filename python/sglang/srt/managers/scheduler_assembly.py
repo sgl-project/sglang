@@ -967,7 +967,7 @@ def assemble_scheduler(
     flush_wrapper = SchedulerFlushWrapper(
         flush_cache=step_planner.flush_cache,
         request_registry=request_registry,
-        ipc_channels=ipc_channels,
+        send_output=output_streamer.send_control_output,
     )
     load_inquirer = SchedulerLoadInquirer(
         capacity=capacity,
