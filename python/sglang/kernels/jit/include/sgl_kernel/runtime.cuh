@@ -173,9 +173,7 @@ inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int
  *        cap that needs no opt-in.
  * \param use_cache False re-queries the driver instead of reading the memo.
  */
-inline auto get_max_smem_per_block(
-    int device_id, bool opt_in = true, bool use_cache = true
-) -> std::size_t {
+inline auto get_max_smem_per_block(int device_id, bool opt_in = true, bool use_cache = true) -> std::size_t {
   /// NOTE: we all know this is no larger than 1MB for all GPU, so use uint32_t
   static DeviceCacheMap<uint32_t, 0> smem_cache[2];
 #ifdef USE_ROCM
@@ -185,15 +183,13 @@ inline auto get_max_smem_per_block(
   (void)opt_in;
   constexpr auto attr = hipDeviceAttributeMaxSharedMemoryPerBlock;
 #else
-  const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin
-                           : cudaDevAttrMaxSharedMemoryPerBlock;
+  const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin : cudaDevAttrMaxSharedMemoryPerBlock;
 #endif
-  return smem_cache[opt_in].get_cached(
-      device_id, use_cache, [attr](int32_t device_id) {
-        int value = 0;
-        CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
-        return value;
-      });
+  return smem_cache[opt_in].get_cached(device_id, use_cache, [attr](int32_t device_id) {
+    int value = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
+    return value;
+  });
 }
 
 }  // namespace host::runtime
