@@ -149,6 +149,34 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
 
+    def test_draft_is_hybrid_swa_only_by_the_listed_rules(self):
+        """FROZEN_KV_MTP gives its draft a single-pool dummy config, so a draft
+        whose layer_types mix sliding and full layers keeps one KV pool."""
+        text_config = SimpleNamespace(
+            num_hidden_layers=4,
+            sliding_window=512,
+            layer_types=["sliding_attention"] * 3 + ["full_attention"],
+        )
+        cases = [
+            # (architecture, is_draft_model, is_hybrid_swa, is_layer_types_hybrid_swa)
+            ("Gemma4AssistantForCausalLM", False, True, True),
+            ("Gemma4AssistantForCausalLM", True, False, False),
+            ("Gemma4ForCausalLM", True, True, False),
+        ]
+        for architecture, is_draft_model, hybrid, layer_types_hybrid in cases:
+            with self.subTest(architecture=architecture, is_draft_model=is_draft_model):
+                config = object.__new__(ModelConfig)
+                config.is_draft_model = is_draft_model
+                config.disable_hybrid_swa_memory = False
+                config.hf_config = SimpleNamespace(architectures=[architecture])
+                config.hf_text_config = text_config
+                with mock.patch.object(
+                    ModelConfig, "_detect_attention_sinks", return_value=False
+                ):
+                    config._derive_hybrid_model()
+                self.assertEqual(config.is_hybrid_swa, hybrid)
+                self.assertEqual(config.is_layer_types_hybrid_swa, layer_types_hybrid)
+
     def test_nemotron_h_omni_mtp_uses_language_model_config(self):
         config = object.__new__(ModelConfig)
         config.is_draft_model = True

@@ -1212,16 +1212,17 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        layer_types_only = is_layer_types_hybrid_swa_model(
+            self.hf_config.architectures, self.hf_text_config
+        )
+        # Drafts keep the listed rules: speculative workers size draft KV pools
+        # themselves, e.g. FROZEN_KV_MTP passes a single-pool dummy config.
         self.is_hybrid_swa = (
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
+            and not (layer_types_only and self.is_draft_model)
             and not self.disable_hybrid_swa_memory
         )
-        self.is_layer_types_hybrid_swa = (
-            self.is_hybrid_swa
-            and is_layer_types_hybrid_swa_model(
-                self.hf_config.architectures, self.hf_text_config
-            )
-        )
+        self.is_layer_types_hybrid_swa = self.is_hybrid_swa and layer_types_only
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
         self.swa_attention_layer_ids: Optional[List[int]] = None
         self.full_attention_layer_ids: Optional[List[int]] = None
