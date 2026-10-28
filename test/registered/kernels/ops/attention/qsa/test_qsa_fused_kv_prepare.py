@@ -16,9 +16,17 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @pytest.mark.parametrize("requests", [1, 3, 8, 128])
 @pytest.mark.parametrize("width", [1, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# FP8 packed scratch is used only with an FP8 KV pool.
+@pytest.mark.parametrize(
+    "dtype,packed_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
 @pytest.mark.parametrize("padding", [False, True])
-def test_fused_kv_prepare(requests, width, dtype, padding):
+def test_fused_kv_prepare(requests, width, dtype, padding, packed_dtype):
     torch.manual_seed(23)
     rows, heads, dim, length, topk, stride = requests * width, 2, 256, 4096, 2051, 2112
     mapping = (torch.randperm(requests * length, device="cuda") + 1).view(
@@ -47,7 +55,7 @@ def test_fused_kv_prepare(requests, width, dtype, padding):
     kc = torch.randn(requests * length + 1, heads, dim, device="cuda").to(dtype)
     vc = torch.randn_like(kc.float()).to(dtype)
     counts = torch.empty(rows, device="cuda", dtype=torch.int32)
-    ok = torch.empty(rows * stride, heads, dim, device="cuda", dtype=torch.bfloat16)
+    ok = torch.empty(rows * stride, heads, dim, device="cuda", dtype=packed_dtype)
     ov = torch.empty_like(ok)
     cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32) * stride
     store_cache(
@@ -236,6 +244,77 @@ def test_fused_block_expansion(requests, width, dtype, padding, chain_positions)
         torch.testing.assert_close(actual.float(), ref.float(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("width", [1, 4])
+def test_fused_block_expansion_writes_only_visible_pages(width):
+    """With visible_page_size, a row's packed K/V matches the full write up to its
+    valid count rounded up to the page (counts at, below and past page edges),
+    and nothing after that page is written."""
+    torch.manual_seed(7)
+    page, stride = 64, 2112
+    bases = [1, 2, 3, 4, 5, 63, 64, 65, 127, 128, 129, 2047, 2048, 2049, 2052, 8192]
+    requests = len(bases)
+    rows, length = requests * width, 9216
+    mapping = (torch.randperm(requests * length, device="cuda") + 1).view(
+        requests, length
+    )
+    req = torch.arange(requests, device="cuda").repeat_interleave(width).int()
+    lens = torch.tensor(
+        [bases[r // width] + r % width for r in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = lens - 1
+    loc = mapping[req.long(), positions.long()].contiguous()
+    blocks = torch.full((rows, 512), -1, device="cuda", dtype=torch.int32)
+    for row in range(rows):
+        n = int(lens[row]) // 4
+        chosen = torch.randperm(n, device="cuda")[:512]
+        blocks[row, : chosen.numel()] = chosen.int()
+    k = torch.randn(requests * length + 1, 1, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    nk = torch.randn(rows, 1, 256, device="cuda", dtype=torch.bfloat16)
+    nv = torch.randn_like(nk)
+
+    def run(visible_page_size, fill):
+        kc, vc = k.clone(), v.clone()
+        counts = torch.empty(rows, device="cuda", dtype=torch.int32)
+        ok = torch.full(
+            (rows * stride, 1, 256), fill, device="cuda", dtype=torch.bfloat16
+        )
+        ov = torch.full_like(ok, fill)
+        fused_kv_prepare(
+            kc,
+            vc,
+            nk,
+            nv,
+            loc,
+            mapping,
+            req,
+            blocks,
+            lens,
+            counts,
+            ok,
+            ov,
+            width,
+            compress_ratio=4,
+            query_positions=positions,
+            chain_positions=True,
+            visible_page_size=visible_page_size,
+        )
+        return kc, vc, counts, ok.view(rows, stride, -1), ov.view(rows, stride, -1)
+
+    full = run(0, 0.0)
+    paged = run(page, float("nan"))
+    for actual, ref in zip(paged[:3], full[:3]):
+        assert torch.equal(actual, ref)
+    counts = full[2]
+    for row in range(rows):
+        visible = -(-int(counts[row]) // page) * page
+        for actual, ref in zip(paged[3:], full[3:]):
+            assert torch.equal(actual[row, :visible], ref[row, :visible])
+            assert torch.isnan(actual[row, visible:]).all()
+
+
 def test_block_indices_expand_on_attention_fallback(monkeypatch):
     from types import SimpleNamespace
 
@@ -358,7 +437,7 @@ def test_fused_pool_eligibility(dtype, quantized, wrapped):
     "mode_name", ["DECODE", "TARGET_VERIFY", "DRAFT_EXTEND_V2", "EXTEND"]
 )
 @pytest.mark.parametrize("ratio,budget", [(4, 2048), (2, 1024), (4, 8192)])
-def test_defer_expansion_metadata(mode_name, ratio, budget):
+def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     from types import SimpleNamespace
 
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
@@ -390,12 +469,17 @@ def test_defer_expansion_metadata(mode_name, ratio, budget):
     runner = SimpleNamespace(
         token_to_kv_pool=pool,
         device="cuda",
+        is_draft_worker=False,
         req_to_token_pool=SimpleNamespace(req_to_token=table),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
     mode = getattr(ForwardMode, mode_name)
     width = 1 if mode.is_decode() else 2
+    monkeypatch.setattr(
+        "sglang.srt.layers.attention.qwen_sparse_attn_backend.get_spec",
+        lambda: SimpleNamespace(speculative_num_draft_tokens=width),
+    )
     lengths = torch.tensor([8], device="cuda", dtype=torch.int32)
     batch = SimpleNamespace(
         forward_mode=mode,
@@ -421,6 +505,9 @@ def test_defer_expansion_metadata(mode_name, ratio, budget):
     assert metadata.indexer_metadata.defer_block_expansion == expected
     if not mode.is_extend_without_speculative():
         backend.init_cuda_graph_state(1, width)
+        assert backend.verify_mask is not None
+        assert not backend.verify_mask.is_read
+        assert backend.verify_mask.buffer.numel() == width * width
         backend.token_to_kv_pool = None
         backend._fused_kv_pool_eligible = False
         backend._capture_cuda_graph_metadata(

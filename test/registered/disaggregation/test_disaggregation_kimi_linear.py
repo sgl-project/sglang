@@ -8,7 +8,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
@@ -45,6 +45,11 @@ DCP_ARGS = DETERMINISTIC_ARGS + [
     "--chunked-prefill-size",
     str(CHUNKED_PREFILL_SIZE),
 ]
+DCP_ENV = {
+    **SERVER_ENV,
+    # Deterministic flashinfer aligns prefill chunks to this tile; keep it <= chunk.
+    "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE": str(CHUNKED_PREFILL_SIZE),
+}
 
 
 def _boundary_prompts(tokenizer):
@@ -96,6 +101,8 @@ class TestKimiLinearTPDisaggregation(PDLogprobParityMixin, PDDisaggregationServe
 
 
 class TestKimiLinearDCPDisaggregation(TestKimiLinearTPDisaggregation):
+    extra_prefill_env = DCP_ENV
+    extra_decode_env = DCP_ENV
     reference_parallel_args = ["--tp-size", "2", "--dcp-size", str(DCP_SIZE)]
     baseline_args = DCP_ARGS
     extra_prefill_args = DCP_ARGS

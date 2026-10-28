@@ -277,7 +277,8 @@ class MiniCPMLightningMixer(nn.Module):
         if self.use_output_norm:
             self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
             set_weight_attrs(
-                self.o_norm.weight, {"weight_loader": sharded_weight_loader(0)}
+                self.o_norm.weight,
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
 
         if self.use_output_gate:

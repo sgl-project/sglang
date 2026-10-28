@@ -16,7 +16,7 @@ from sglang.kernels.jit.benchmark.utils import (
     run_benchmark_no_cudagraph,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
-    _jit_online_c128_mtp_module,
+    online_c128_mtp_write_prefix_states,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -118,8 +118,8 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
     )
 
 
-def call_write_prefix(module, case: BenchmarkCase) -> None:
-    module.write_prefix_states(
+def call_write_prefix(case: BenchmarkCase) -> None:
+    online_c128_mtp_write_prefix_states(
         case.kv_score_input,
         case.seq_lens,
         case.req_pool_indices,
@@ -129,6 +129,7 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
         case.layer_bs,
         case.num_verify_tokens,
         case.state_slot_stride,
+        head_dim=HEAD_DIM,
     )
 
 
@@ -149,10 +150,7 @@ def benchmark(
     batch_size: int, num_verify_tokens: int, launch_mode: str
 ) -> tuple[float, float, float]:
     case = make_case(batch_size, num_verify_tokens)
-    module = _jit_online_c128_mtp_module(
-        HEAD_DIM, case.seq_lens.dtype, case.req_pool_indices.dtype, case.state.dtype
-    )
-    fn = lambda: call_write_prefix(module, case)
+    fn = lambda: call_write_prefix(case)
 
     if launch_mode == "cuda_graph":
         return run_benchmark(fn)

@@ -26,10 +26,10 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
-from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,11 +43,6 @@ STARTS = [0, 1, 2, 5, 7, 13, 31]
 def _owner_count(length: int, n: int, rank: int, start: int) -> int:
     """Ground truth: # of absolute positions p in [start, start+length) with p % n == rank."""
     return sum(1 for p in range(start, start + length) if p % n == rank)
-
-
-def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
-    """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
-    return (length - rank - 1) // n + 1
 
 
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
@@ -159,21 +154,6 @@ class TestGetDcpLens(CustomTestCase):
                     f"start=None mismatch at n={n}, rank={rank}: {got.tolist()} != {expected.tolist()}",
                 )
 
-    def test_start_none_matches_legacy_inplace_formula(self):
-        # The collapse claim: get_dcp_lens (start=None) == legacy floor((L-rank-1)/N)+1.
-        for n in DCP_SIZES:
-            for rank in range(n):
-                lens = torch.tensor(LENS, dtype=torch.int64)
-                got = get_dcp_lens(lens, n, rank)
-                legacy = torch.tensor(
-                    [_legacy_inplace_formula(L, n, rank) for L in LENS],
-                    dtype=torch.int64,
-                )
-                self.assertTrue(
-                    torch.equal(got.to(torch.int64), legacy),
-                    f"legacy-formula mismatch at n={n}, rank={rank}",
-                )
-
     def test_start_tensor_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):
@@ -266,6 +246,38 @@ class TestGetDcpLens(CustomTestCase):
         self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
         self.assertTrue(torch.equal(out, q))
 
+    def test_triton_dcp_write_marks_the_rank_local_loc(self):
+        """Each rank writes at `out_cache_loc // dcp_size` with the batch's
+        physical mark, masked by position to the tokens it owns."""
+        writes = []
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.dcp_size, backend.dcp_rank = 2, 1
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_kv_buffer=lambda *args, **kwargs: writes.append((args, kwargs))
+        )
+        out_cache_loc = torch.tensor([8, 9, 10, 11, 12])
+        forward_batch = SimpleNamespace(
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_is_physical=True,
+            positions=torch.arange(5),
+            dcp_kv_mask=None,
+        )
+        k = torch.zeros(5, 1, 2)
+
+        backend._set_kv_buffer(forward_batch, SimpleNamespace(), None, k, k.clone())
+
+        ((args, kwargs),) = writes
+        loc_info = args[1]
+        self.assertIsInstance(loc_info, KVWriteLoc)
+        self.assertTrue(loc_info.physical)
+        self.assertTrue(torch.equal(loc_info.loc, out_cache_loc // 2))
+        self.assertTrue(
+            torch.equal(
+                kwargs["dcp_kv_mask"],
+                torch.tensor([False, True, False, True, False]),
+            )
+        )
+
     def test_dense_q_indptr_matches_the_arange_it_replaces(self):
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
@@ -355,18 +367,39 @@ class TestGetDcpLens(CustomTestCase):
         v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
 
         for tp_rank in range(4):
-            layer = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=head_size,
-                total_num_heads=8,
-                total_num_kv_heads=2,
-                bias=False,
-                params_dtype=torch.float32,
-                tp_rank=tp_rank,
+            group = SimpleNamespace(rank_in_group=tp_rank, world_size=4)
+            with rc.get_parallel().override(
+                tp_group=group,
+                attn_tp_group=group,
                 tp_size=4,
-                kv_tp_rank=tp_rank // 2,
-                kv_tp_size=2,
-            )
+                tp_rank=tp_rank,
+                attn_tp_rank=tp_rank,
+                moe_tp_rank=tp_rank,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                moe_ep_rank=0,
+                dcp_rank=tp_rank % 2,
+                **rc.derive_parallel_widths(
+                    tp_size=4,
+                    attn_cp_size=1,
+                    attn_dp_size=1,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    dcp_size=2,
+                    dcp_enabled=True,
+                ),
+            ):
+                layer = QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=8,
+                    total_num_kv_heads=2,
+                    bias=False,
+                    params_dtype=torch.float32,
+                    parallel_group="attn_tp",
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                )
             layer.weight_loader(layer.weight, q_weight, "q")
             layer.weight_loader(layer.weight, k_weight, "k")
             layer.weight_loader(layer.weight, v_weight, "v")
@@ -410,6 +443,8 @@ class TestGetDcpLens(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
+                kv_shard_size=1,
+                kv_shard_spec=None,
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.
