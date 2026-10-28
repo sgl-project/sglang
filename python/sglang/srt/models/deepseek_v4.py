@@ -71,7 +71,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
     DeepseekV41Indexer,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.indexer import C4Indexer, C4IndexerBackendMixin
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
@@ -810,6 +810,9 @@ def deepseek_v4_attention_with_output(
 
     original_out_cache_loc = forward_batch.out_cache_loc
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    # The backend's verify-merged mixed split writes into this slice in place.
+    out_view = output[:real_num_tokens]
+    forward_batch.attn_output_buffer = out_view
 
     attn_backend = get_attn_backend()
     try:
@@ -825,6 +828,11 @@ def deepseek_v4_attention_with_output(
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.attn_output_buffer = None
+
+    if ret is out_view:
+        output[real_num_tokens:].zero_()
+        return
 
     assert output[:real_num_tokens].numel() == ret.numel(), (
         f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
@@ -948,6 +956,24 @@ bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
     deepseek_v4_write_tail_source_kv,
     on_capture=_write_tail_source_kv_on_capture,
 )
+
+
+def deepseek_v4_eager_c4_indexer(indexer, x, q_lora) -> None:
+    # SGLANG_OPT_DSV4_INDEXER_EAGER_RAGGED: C4 indexer logits + top-k on the real rows
+    # only; the indexer compressor stays in the captured segment.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        return
+    get_attn_backend().forward_c4_indexer_eager(
+        x=x[:real_num_tokens],
+        q_lora=q_lora[:real_num_tokens],
+        c4_indexer=indexer,
+        forward_batch=forward_batch,
+    )
+
+
+bcg_deepseek_v4_eager_c4_indexer = eager_on_graph(True)(deepseek_v4_eager_c4_indexer)
 
 
 def deepseek_v4_engram_hash_ids(
@@ -1879,6 +1905,15 @@ class MQALayer(MqaAttentionBase):
         )
         return kv
 
+    def _use_eager_c4_indexer(self, forward_batch: ForwardBatch, attn_backend) -> bool:
+        return (
+            envs.SGLANG_OPT_DSV4_INDEXER_EAGER_RAGGED.get()
+            and self.indexer is not None
+            and is_in_breakable_cuda_graph()
+            and isinstance(attn_backend, C4IndexerBackendMixin)
+            and attn_backend.eager_ragged_indexer_supported(self.indexer, forward_batch)
+        )
+
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
@@ -1910,16 +1945,25 @@ class MQALayer(MqaAttentionBase):
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
+        eager_indexer = self._use_eager_c4_indexer(forward_batch, attn_backend)
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                    enable_multi_stream=True,
-                    q_lora_ready=q_lora_ready,
-                )
+                if eager_indexer:
+                    attn_backend.forward_indexer_compressor(
+                        x=x,
+                        forward_batch=forward_batch,
+                        layer_id=self.indexer.layer_id,
+                        compressor=self.indexer.compressor,
+                    )
+                else:
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        enable_multi_stream=True,
+                        q_lora_ready=q_lora_ready,
+                    )
 
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
@@ -1941,6 +1985,8 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_indexer)
         del qkv_a
 
+        if eager_indexer:
+            bcg_deepseek_v4_eager_c4_indexer(self.indexer, x, q_lora)
         return q
 
     def _forward_prepare_low_ratio_multi_stream(
@@ -2568,6 +2614,14 @@ class MQALayer(MqaAttentionBase):
                         attn_backend=attn_backend,
                         skip_compressor=True,
                     )
+                elif self._use_eager_c4_indexer(forward_batch, attn_backend):
+                    attn_backend.forward_indexer_compressor(
+                        x=x,
+                        forward_batch=forward_batch,
+                        layer_id=self.indexer.layer_id,
+                        compressor=self.indexer.compressor,
+                    )
+                    bcg_deepseek_v4_eager_c4_indexer(self.indexer, x, q_lora)
                 else:
                     self.indexer(
                         x=x,
@@ -2892,6 +2946,8 @@ class MQALayer(MqaAttentionBase):
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
+            # Only heads [tp_slice] may be read: with
+            # SGLANG_OPT_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY the other heads of `o` are stale.
             o = o[:, tp_slice, :]
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)

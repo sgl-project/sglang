@@ -55,6 +55,7 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
+    VerifyPlacement,
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
@@ -389,6 +390,7 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
+        placement: Optional[VerifyPlacement] = None,
     ) -> None:
         if run_compact:
             self.kv_injector.inject_ragged(
@@ -414,7 +416,11 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        if placement is None:
+            placement = VerifyPlacement(
+                self.kv_injector.ids_for(verify_window.kv_loc_plan), None
+            )
+        cache_loc = placement.cache_loc
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -422,6 +428,7 @@ class TargetVerifyExecutor:
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
+            swa_loc=placement.swa_loc,
         )
 
     def _run_ragged(

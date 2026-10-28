@@ -1379,6 +1379,22 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        from sglang.srt.arg_groups.validation_hook import verify_merged_mixed_enabled
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        self.verify_merged_mixed = (
+            verify_merged_mixed_enabled(
+                self.server_args,
+                hybrid_linear_attn=mambaish_config(self.model_config) is not None,
+            )
+            and self.is_mixed_chunk
+        )
+        # Prefill-budget charge per running row of a mixed step.
+        self.mixed_tokens_per_running_row = (
+            int(get_spec().speculative_num_draft_tokens)
+            if self.verify_merged_mixed
+            else 1
+        )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -4227,7 +4243,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs * self.mixed_tokens_per_running_row
+                if self.is_mixed_chunk
+                else 0
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4446,6 +4466,17 @@ class Scheduler(
             and new_batch.input_embeds is None
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
+            # Grammar masks, custom logit processors and sampling-mask capture
+            # are not applied inside a verify-merged mixed step.
+            and not (
+                self.verify_merged_mixed
+                and any(
+                    b.has_grammar
+                    or b.sampling_info.has_custom_logit_processor
+                    or any(r.return_sampling_mask for r in b.reqs)
+                    for b in (new_batch, running_batch)
+                )
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             finishing_reqs = self._reqs_finishing_inflight(running_batch)
@@ -4457,9 +4488,15 @@ class Scheduler(
             # step, which fits them; a mixed step does not retract them.
             if not running_batch.is_empty() and running_batch.check_decode_mem():
                 running_batch.prepare_for_decode()
-                new_batch.mix_with_running(running_batch)
+                new_batch.mix_with_running(
+                    running_batch, verify_merged=self.verify_merged_mixed
+                )
                 new_batch.decoding_reqs = running_batch.reqs
-                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                if (
+                    not self.enable_overlap
+                    and not self.spec_algorithm.is_none()
+                    and not self.verify_merged_mixed
+                ):
                     # Non-overlap spec never writes the relay; stash the
                     # tails' pending tokens for the mixed input resolve.
                     last_tokens = torch.tensor(
@@ -5160,6 +5197,8 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+        elif batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
+            self.batch_result_processor.process_batch_result_mixed(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -5191,8 +5230,12 @@ class Scheduler(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
         mode = batch.forward_mode
-        is_prefill = mode.is_extend_without_speculative()
-        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+        # A verify-merged mixed step is timed as a decode step.
+        is_mixed_spec = batch.num_prefill_rows is not None and mode.is_mixed()
+        is_prefill = mode.is_extend_without_speculative() and not is_mixed_spec
+        if not (
+            is_prefill or is_mixed_spec or mode.is_decode() or mode.is_target_verify()
+        ):
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return

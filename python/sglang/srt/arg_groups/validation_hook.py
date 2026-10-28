@@ -20,12 +20,13 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import print_warning_once, torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,58 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "parallelism: allocatable slots per microbatch are bounded by "
         "pp-max-micro-batch-size, so the threshold may never be reached"
     )
+
+
+def verify_merged_mixed_enabled(
+    server_args: Any, *, hybrid_linear_attn: bool = False
+) -> bool:
+    """Whether mixed steps run DSPARK's verify-merged path.
+
+    Needs SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION, DSPARK and
+    --enable-mixed-chunk; unsupported setups warn and keep the default 1-token
+    decode of running rows.
+    """
+    if not envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.get():
+        return False
+    cfg = resolved_view(server_args)
+    unsupported = [
+        name
+        for name, bad in (
+            (
+                "a non-DSPARK speculative algorithm",
+                (cfg.speculative_algorithm or "").upper() != "DSPARK",
+            ),
+            ("mixed chunk disabled", not cfg.enable_mixed_chunk),
+            ("DP attention", attn_dp_enabled_of(cfg)),
+            ("pipeline parallelism", cfg.pp_size > 1),
+            # The mixed forward is a plain extend: it fills no per-draft
+            # linear-attention states for the verify commit to read.
+            ("a hybrid linear-attention target", hybrid_linear_attn),
+            ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
+            ("two-batch overlap", cfg.enable_two_batch_overlap),
+            # Chunked-prefix replay indexes by the tails' upper-bound prefix lengths.
+            (
+                "a prefill CUDA graph backend other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # Their attention dispatch does not split prefill and verify rows.
+            (
+                "--dsv4-attn-backend trtllm/flashmla_mega",
+                cfg.dsv4_attn_backend in ("trtllm", "flashmla_mega"),
+            ),
+        )
+        if bad
+    ]
+    if unsupported:
+        # Called by the scheduler and the attention backend: warn once.
+        print_warning_once(
+            "SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION ignored "
+            f"({', '.join(unsupported)}); "
+            "mixed steps keep the 1-token decode of running requests."
+        )
+        return False
+    return True
 
 
 def check_server_args(server_args: Any):
