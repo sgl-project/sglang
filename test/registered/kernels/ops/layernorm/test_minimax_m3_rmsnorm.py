@@ -246,6 +246,23 @@ def test_fp8_reads_of_a_gemma_norm_apply_one_plus_weight(quant_format, num_token
     assert torch.equal(_bits(ffn_input[2]), _bits(normed_ref))
 
 
+@_GFX95_ONLY
+@torch.inference_mode()
+def test_no_tokens_return_empty_outputs():
+    """An idle DP-attention rank runs its layers on zero tokens, with the GEMM output to
+    zero-fill as empty as its input."""
+    x, residual, weight = _decode_inputs(1)
+    x, residual = x[:0], residual[:0]
+    zeros = torch.empty((0, 100), device=DEVICE, dtype=torch.bfloat16)
+
+    (q, scale), residual_out = gemma_add_rmsnorm_fp8(
+        x, residual, weight, EPS, group_size=128, transpose_scale=True, zeros=zeros
+    )
+
+    assert q.shape == (0, x.shape[1]) and scale.numel() == 0
+    assert residual_out.shape == (0, x.shape[1])
+
+
 if __name__ == "__main__":
     import sys
 
