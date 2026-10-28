@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, patch
 
 from transformers import BaseImageProcessor, PreTrainedTokenizerFast
 
-from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
@@ -22,6 +21,9 @@ from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
 )
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
+)
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
 )
 from sglang.srt.multimodal.token_space_mm_process.sglang import (
     TokenSpaceSGLangProcessor,
@@ -140,10 +142,6 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 )
 
 
-class _PinnedVideoStrategy(TokenSpaceProcessStrategy):
-    processor_class_attributes = {"video_preprocessing_device": "cpu"}
-
-
 class TestTokenSpaceDevices(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -177,36 +175,83 @@ class TestTokenSpaceDevices(CustomTestCase):
             ):
                 self.assertEqual(wrapper._serving_image_processor_device(), expected)
 
-    def test_strategy_video_device_overrides_every_media_device(self):
+    def test_video_requests_use_the_configured_video_device(self):
         # As in process_mm_data: a video request runs all its media on that device.
-        processor = TokenSpaceProcessor.for_strategy(_PinnedVideoStrategy)(
+        for config_device, spec_device, expected in (
+            (None, None, None),
+            (None, "cpu", "cpu"),
+            ("cpu", None, "cpu"),
+            ("cuda:1", "cpu", "cuda:1"),
+        ):
+
+            class _Spec(TokenSpaceServingSpec):
+                video_preprocessing_device = spec_device
+
+            mm_process_config = (
+                {}
+                if config_device is None
+                else {"video_preprocessing_device": config_device}
+            )
+            server_args = ServerArgs(
+                model_path="dummy",
+                mm_process_config=mm_process_config,
+                enable_token_space_processor=True,
+                mm_processor_worker_num=1,
+            )
+            publish(server_args, role="test")
+            wrapper = TokenSpaceSGLangProcessor.for_strategy(
+                TokenSpaceProcessStrategy, _Spec
+            )(
+                None,
+                server_args,
+                PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+                None,
+            )
+            self.addCleanup(wrapper.shutdown)
+            wrapper._image_device = "cuda:5"
+            for video_data, image_device, video_device in (
+                (["video"], expected or "cuda:5", expected),
+                (None, "cuda:5", None),
+            ):
+                with (
+                    self.subTest(
+                        config_device=config_device,
+                        spec_device=spec_device,
+                        video=bool(video_data),
+                    ),
+                    patch.object(wrapper._core, "process", AsyncMock()) as process,
+                ):
+                    asyncio.run(
+                        wrapper.process_mm_data_async(
+                            image_data=["image"], video_data=video_data, input_ids=[1]
+                        )
+                    )
+                self.assertEqual(process.call_args.kwargs["image_device"], image_device)
+                self.assertEqual(process.call_args.kwargs["video_device"], video_device)
+
+    def test_videos_decode_on_cpu_only_when_their_device_is_cpu(self):
+        """The decode device can change pixels, so the trainer must decode as rollout did."""
+        processor = TokenSpaceProcessor.for_strategy(TokenSpaceProcessStrategy)(
             None,
             PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
             processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
         )
         self.addCleanup(processor.shutdown)
-        seen = {}
-
-        async def capture(function, **kwargs):
-            seen[kwargs["modality"]] = kwargs["request_options"]
-            raise _Stop
-
-        loaded = ([object()], [object()], [])
-        with (
-            patch.object(
-                processor, "_load_media_lists", AsyncMock(return_value=loaded)
-            ),
-            patch.object(processor, "_run_mm_processor", capture),
-            self.assertRaises(_Stop),
-        ):
-            asyncio.run(
-                processor.process(
-                    ["image"], ["video"], input_ids=[1], image_device="cuda:5"
+        for video_device, use_gpu in ((None, True), ("cuda:3", True), ("cpu", False)):
+            with (
+                self.subTest(video_device=video_device),
+                patch(
+                    "sglang.srt.multimodal.multimodal_processor_mixin.load_video"
+                ) as load_video,
+                self.assertRaises(_Stop),
+                patch.object(processor, "_list_media_items", side_effect=_Stop),
+            ):
+                asyncio.run(
+                    processor.process(
+                        None, ["clip.mp4"], input_ids=[1], video_device=video_device
+                    )
                 )
-            )
-        for modality in (Modality.IMAGE, Modality.VIDEO):
-            self.assertEqual(seen[modality]["image_device"], "cpu")
-            self.assertEqual(seen[modality]["video_device"], "cpu")
+            load_video.assert_called_once_with("clip.mp4", use_gpu=use_gpu)
 
 
 class _Stop(Exception):

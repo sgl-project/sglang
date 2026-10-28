@@ -109,6 +109,7 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
     wrapper = object.__new__(TokenSpaceSGLangProcessor)
     wrapper._core = SimpleNamespace(process=AsyncMock(return_value=object()))
     wrapper._image_device = "image device"
+    wrapper._video_preprocessing_device = None
     request_obj = SimpleNamespace(video_data=["request video"], audio_data=["audio"])
     media = (
         {"video_data": ["video"], "audio_data": ["audio"]}
@@ -133,6 +134,7 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
         input_ids=[1, 101, 2],
         package_output=wrapper._package_output,
         image_device="image device",
+        video_device=None,
         compute_mrope_positions=True,
     )
 
