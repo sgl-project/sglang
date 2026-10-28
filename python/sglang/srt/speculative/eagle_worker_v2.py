@@ -14,9 +14,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -498,7 +495,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2DraftCudaGraphRunner = {
             "xpu": EAGLEDraftCudaGraphRunner,
-            "npu": EAGLEDraftNpuGraphRunner,
+            "npu": EAGLEDraftCudaGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
