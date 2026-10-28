@@ -8,23 +8,16 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import torch
-
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
 )
 from sglang.srt.disaggregation.utils import get_pd_kv_layout, pd_kv_layouts_match
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import dsa_index_k_cache_is_ue8m0
 from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-    DevicePoolEntry,
-    DevicePoolGroup,
-)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.unified_cache.linker_factory import (
     create_unified_cache_linker,
@@ -39,17 +32,16 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _UTILS = "sglang.srt.layers.attention.dsa.utils"
 
 
-def _kernel_args(backend="auto", fp4_indexer=False):
-    return SimpleNamespace(
+def _device(
+    stack, *, sm100=True, backend="auto", fp4_indexer=False, torch_fallback=False
+):
+    exec_args = SimpleNamespace(
         kernel=SimpleNamespace(
             dsa_paged_mqa_logits_backend=backend,
             enable_deepseek_v4_fp4_indexer=fp4_indexer,
         )
     )
-
-
-def _device(stack, *, sm100=True, backend="auto", fp4_indexer=False):
-    exec_args = _kernel_args(backend, fp4_indexer)
+    stack.enter_context(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_fallback))
     stack.enter_context(patch(f"{_UTILS}.is_cuda", return_value=True))
     stack.enter_context(patch(f"{_UTILS}.uses_mx_mqa_logits", return_value=sm100))
     stack.enter_context(patch(f"{_UTILS}.get_exec", return_value=exec_args))
@@ -68,37 +60,26 @@ def _dsa_pool(index_kpool=1):
 
 
 class TestPdIndexKScaleLayout(CustomTestCase):
-    def _dsa_layout(self, pool=None, **device):
-        with ExitStack() as stack:
-            _device(stack, **device)
-            return get_pd_kv_layout(pool if pool is not None else _dsa_pool())
-
-    def test_dsa_cache_format_follows_its_sm100_reader(self):
+    def test_dsa_reader_format_reaches_pd_and_storage(self):
+        host_pool = SimpleNamespace(storage_format_tag=None)
         cases = [
-            (dict(backend="deepgemm"), 1, True),
-            (dict(backend="cutedsl"), 1, False),
-            (dict(backend="cutedsl"), 4, True),
-            (dict(sm100=False), 1, False),
+            (dict(backend="deepgemm"), 1, "ue8m0"),
+            (dict(backend="cutedsl"), 1, "fp32"),
+            (dict(backend="cutedsl"), 4, "ue8m0"),
+            (dict(sm100=False), 1, "fp32"),
+            (dict(torch_fallback=True), 1, "fp32"),
         ]
-        for device, index_kpool, ue8m0 in cases:
-            with self.subTest(device=device, index_kpool=index_kpool):
-                with ExitStack() as stack:
-                    _device(stack, **device)
+        for device, kpool, fmt in cases:
+            with self.subTest(device=device, kpool=kpool), ExitStack() as stack:
+                _device(stack, **device)
+                pool = _dsa_pool(kpool)
+                for wrapped in (pool, SimpleNamespace(full_kv_pool=pool)):
+                    self.assertEqual(get_pd_kv_layout(wrapped), f"index_k:{fmt}")
                     self.assertEqual(
-                        dsa_index_k_cache_is_ue8m0(kpool=index_kpool > 1), ue8m0
+                        storage_model_name("org/model", host_pool, wrapped),
+                        "org/model-index_k-ue8m0" if fmt == "ue8m0" else "org/model",
                     )
-        with ExitStack() as stack:
-            _device(stack)
-            stack.enter_context(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True))
-            self.assertFalse(dsa_index_k_cache_is_ue8m0(kpool=False))
-
-    def test_dsa_peers_with_different_readers_report_different_layouts(self):
-        deepgemm = self._dsa_layout(backend="deepgemm")
-        self.assertEqual(deepgemm, "index_k:ue8m0")
-        self.assertEqual(self._dsa_layout(backend="cutedsl"), "index_k:fp32")
-        self.assertEqual(self._dsa_layout(sm100=False), "index_k:fp32")
-        hybrid = SimpleNamespace(full_kv_pool=_dsa_pool())
-        self.assertEqual(self._dsa_layout(hybrid, backend="deepgemm"), deepgemm)
+        self.assertEqual(storage_model_name("org/model", host_pool), "org/model")
 
     def test_a_peer_without_a_layout_only_matches_fp32_index_scales(self):
         self.assertTrue(pd_kv_layouts_match(None, None))
@@ -108,20 +89,6 @@ class TestPdIndexKScaleLayout(CustomTestCase):
         self.assertFalse(pd_kv_layouts_match("v4,index_k:ue8m0", None))
         self.assertFalse(pd_kv_layouts_match("index_k:fp32", "index_k:ue8m0"))
         self.assertTrue(pd_kv_layouts_match("index_k:ue8m0", "index_k:ue8m0"))
-
-    def test_storage_keys_name_a_ue8m0_index_cache(self):
-        host_pool = SimpleNamespace(storage_format_tag=None)
-        for device, want in [
-            (dict(backend="deepgemm"), "org/model-index_k-ue8m0"),
-            (dict(backend="cutedsl"), "org/model"),
-            (dict(sm100=False), "org/model"),
-        ]:
-            with self.subTest(device=device), ExitStack() as stack:
-                _device(stack, **device)
-                self.assertEqual(
-                    storage_model_name("org/model", host_pool, _dsa_pool()), want
-                )
-        self.assertEqual(storage_model_name("org/model", host_pool), "org/model")
 
     def test_dsv4_layout_names_a_ue8m0_fp8_index_cache(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
@@ -152,20 +119,18 @@ class TestPdIndexKScaleLayout(CustomTestCase):
 
 class TestDirectLinkerStorageKeys(CustomTestCase):
     def test_direct_linkers_name_a_ue8m0_index_cache(self):
-        group = DevicePoolGroup(
-            [
-                DevicePoolEntry(
-                    name=PoolName.KV,
-                    indices_from_pool=PoolName.KV,
-                    device_pool=None,
-                    components=[[torch.zeros((2, 8), dtype=torch.uint8)]],
-                    layer_mapping={0: 0},
-                    page_size=1,
-                    rows_are_pages=False,
-                )
-            ],
-            num_layers=1,
+        # Pool resolution is the device boundary; no GPU buffers are needed to
+        # verify the namespace passed by each real linker to its storage backend.
+        entry = SimpleNamespace(
+            components=[[None]],
+            layer_mapping={0: 0},
             page_size=1,
+            get_page_buffer_meta=lambda indices: ([0], [8]),
+        )
+        group = SimpleNamespace(
+            entry_map={PoolName.KV: entry},
+            num_layers=1,
+            rank_replicated=True,
         )
         params = CacheInitParams(
             disable=False,

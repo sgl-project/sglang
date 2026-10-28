@@ -19,6 +19,11 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.kpool_plan import _compute_pool_schedule_metadata
 from sglang.srt.layers.attention.dsa.utils import resolve_paged_mqa_logits_metadata_fn
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.paged_mqa import (
+    assert_paged_mqa_matches_ref,
+    generate_paged_mqa_test_data,
+    ref_fp8_paged_mqa_logits,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -172,54 +177,45 @@ class TestDsaKpoolDeepGemmLogits(CustomTestCase):
     def test_paged_logits_read_the_ue8m0_cache(self):
         import deep_gemm
 
-        num_rows, num_pages = 16, 32
-        q_fp8, weights = self._q_and_weights(num_rows)
-        k_fp8, k_scale = _cast_to_fp8_pow2(
-            torch.randn(num_pages * PAGE_SIZE, INDEX_HEAD_DIM, device="cuda")
-        )
-        k_scale = k_scale.squeeze(-1)
-        cache = torch.empty(num_pages, PAGE_NBYTES, dtype=torch.uint8, device="cuda")
-        data_bytes = PAGE_SIZE * INDEX_HEAD_DIM
-        cache[:, :data_bytes] = k_fp8.view(torch.uint8).view(num_pages, data_bytes)
-        cache[:, data_bytes:] = (
-            pack_ue8m0_x4(k_scale).view(torch.uint8).view(num_pages, PAGE_SIZE * 4)
-        )
-
-        block_tables = torch.stack(
-            [torch.randperm(num_pages, device="cuda") for _ in range(num_rows)]
-        ).int()
-        max_seq_len = num_pages * PAGE_SIZE
-        context_lens = torch.randint(
-            1, max_seq_len + 1, (num_rows, 1), device="cuda"
-        ).int()
-        schedule = get_paged_mqa_logits_metadata(
-            context_lens, PAGE_SIZE, deep_gemm.get_num_sms()
-        )
+        num_rows, max_seq_len = 16, 2048
+        data = generate_paged_mqa_test_data(num_rows, 1, NUM_HEADS, 1024, max_seq_len)
+        cache = data["kv_fused"]
+        scales = cache.view(cache.shape[0], -1)[:, PAGE_SIZE * INDEX_HEAD_DIM :]
+        scales.copy_(pack_ue8m0_x4(data["kv_scales"]).view(torch.uint8).view_as(scales))
+        # Exercise non-contiguous physical pages, not just identity mapping.
+        data["block_table"] = torch.randperm(cache.shape[0], device="cuda")[
+            data["block_table"].long()
+        ].int()
+        lens = data["context_lens"].unsqueeze(-1)
         logits = _indexer(True)._deep_gemm_paged_mqa_logits(
-            q_fp8,
-            cache.view(num_pages, PAGE_SIZE, 1, INDEX_HEAD_DIM + 4),
-            weights,
-            context_lens,
-            block_tables,
-            schedule,
+            data["q_fp8"].squeeze(1),
+            cache,
+            data["weights"],
+            lens,
+            data["block_table"],
+            get_paged_mqa_logits_metadata(lens, PAGE_SIZE, deep_gemm.get_num_sms()),
             max_seq_len,
         )
         self.assertEqual(logits.dtype, torch.float32)
-
-        tokens = (
-            block_tables.long().unsqueeze(-1) * PAGE_SIZE
-            + torch.arange(PAGE_SIZE, device="cuda")
-        ).flatten(1)
-        got, want = [], []
-        for i in range(num_rows):
-            n = int(context_lens[i])
-            row_k = tokens[i, :n]
-            ref = _ref_logits(
-                q_fp8[i : i + 1], k_fp8[row_k], k_scale[row_k], weights[i : i + 1]
-            )
-            got.append(logits[i, :n])
-            want.append(ref[0])
-        self.assertLess(_calc_diff(torch.cat(got), torch.cat(want)), 3e-5)
+        ref = ref_fp8_paged_mqa_logits(
+            data["q_fp8"],
+            data["kv_fp8"],
+            data["kv_scales"],
+            data["weights"].bfloat16().float(),
+            data["context_lens"],
+            data["block_table"],
+            max_seq_len,
+            PAGE_SIZE,
+        )
+        assert_paged_mqa_matches_ref(
+            logits,
+            ref,
+            data["context_lens"],
+            num_rows,
+            1,
+            max_seq_len,
+            max_calc_diff=3e-5,
+        )
 
 
 if __name__ == "__main__":

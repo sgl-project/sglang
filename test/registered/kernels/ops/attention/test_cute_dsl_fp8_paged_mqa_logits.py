@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from itertools import product
 
 import pytest
 import torch
@@ -54,41 +55,25 @@ def _run_cutedsl_paged_mqa_logits(
     ).flatten()
     block_tables_expanded = data["block_table"].repeat_interleave(next_n, dim=0)
     q_rows = data["q_fp8"].view(batch_size * next_n, num_heads, HEAD_DIM)
-    if draft_extend:
-        return cutedsl_paged_mqa_logits(
-            q_rows,
-            data["kv_fused"],
-            data["weights"],
-            expanded_ctx,
-            block_tables_expanded,
-            None,
-            max_model_len,
-            q_offset=batch_size * next_n,
-            B=batch_size * next_n,
-            next_n=1,
-            is_target_verify=False,
-            dsl_expand_factor=1,
-            dsl_atom=1,
-            blocksize=BLOCK_KV,
-            sm_count=num_sms,
-            get_paged_mqa_logits_metadata_fn=get_metadata,
-        )
-    schedule_metadata = get_metadata(expanded_ctx.unsqueeze(-1), BLOCK_KV, num_sms)
-
+    schedule_metadata = (
+        None
+        if draft_extend
+        else get_metadata(expanded_ctx.unsqueeze(-1), BLOCK_KV, num_sms)
+    )
     return cutedsl_paged_mqa_logits(
         q_rows,
         data["kv_fused"],
         data["weights"],
-        context_lens,
+        expanded_ctx if draft_extend else context_lens,
         block_tables_expanded,
         schedule_metadata,
         max_model_len,
         q_offset=batch_size * next_n,
-        B=batch_size,
-        next_n=next_n,
-        is_target_verify=is_target_verify,
-        dsl_expand_factor=dsl_expand_factor,
-        dsl_atom=dsl_atom,
+        B=batch_size * next_n if draft_extend else batch_size,
+        next_n=1 if draft_extend else next_n,
+        is_target_verify=is_target_verify and not draft_extend,
+        dsl_expand_factor=1 if draft_extend else dsl_expand_factor,
+        dsl_atom=1 if draft_extend else dsl_atom,
         blocksize=BLOCK_KV,
         sm_count=num_sms,
         get_paged_mqa_logits_metadata_fn=get_metadata,
@@ -99,14 +84,24 @@ def _run_cutedsl_paged_mqa_logits(
     not is_sm100_supported(),
     reason="CuTe DSL FP8 Paged MQA Logits only supports SM 100 family.",
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6])
-@pytest.mark.parametrize("num_heads", [32, 64])
-@pytest.mark.parametrize("avg_ctx", [128, 1024, 4096, 16384])
-@pytest.mark.parametrize("draft_extend", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,next_n,num_heads,avg_ctx,draft_extend",
+    [
+        (*shape, False)
+        for shape in product(
+            [1, 2, 4, 8], [1, 2, 3, 4, 5, 6], [32, 64], [128, 1024, 4096, 16384]
+        )
+    ]
+    # Draft-extend changes row layout, not kernel tuning: cover both head counts,
+    # multiple requests, odd/even draft lengths, and short/long contexts.
+    + [
+        (1, 2, 32, 128, True),
+        (2, 3, 64, 1024, True),
+        (4, 5, 32, 4096, True),
+        (8, 6, 64, 16384, True),
+    ],
+)
 def test_cutedsl_paged_mqa_logits(batch_size, next_n, num_heads, avg_ctx, draft_extend):
-    if draft_extend and next_n == 1:
-        pytest.skip("draft extend scores next_n >= 2 rows per request")
     max_model_len = max(avg_ctx * 2, 2048)
     data = generate_paged_mqa_test_data(
         batch_size, next_n, num_heads, avg_ctx, max_model_len
