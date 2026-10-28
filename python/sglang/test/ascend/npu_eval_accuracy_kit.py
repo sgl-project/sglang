@@ -16,7 +16,6 @@ Usage::
         gsm8k_accuracy_thres = 0.6
 """
 
-import hashlib
 import math
 import os
 from pathlib import Path
@@ -34,22 +33,12 @@ _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
     "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
 )
 
-# sgl_eval fetches benchmark archives (the MMLU data.tar among them) with its own
-# httpx client: it ignores HF_ENDPOINT, prints nothing while downloading and
-# never retries, so a blocked or slow mirror is indistinguishable from a hang.
-# CI prefetches the archive through HF_ENDPOINT into this directory, and the shim
-# below hands the local copy to sgl_eval after re-checking the sha256 it pins --
-# a stale copy falls back to the original download instead of grading other data.
+# sgl_eval downloads benchmarks (MMLU data.tar included) with its own httpx
+# client: it ignores HF_ENDPOINT, prints nothing and never retries, so a blocked
+# mirror looks like a hang. CI prefetches the archive instead; the shim below
+# re-checks the pinned digest and feeds prepare the local file.
 _SGL_EVAL_ARCHIVE_DIR_ENV = "SGLANG_EVAL_ARCHIVE_DIR"
 _SGL_EVAL_ARCHIVE_DIR_DEFAULT = Path.home() / ".cache" / "sgl_eval" / "archives"
-
-
-def _sha256_of(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def honor_local_sgl_eval_archive():
@@ -64,7 +53,12 @@ def honor_local_sgl_eval_archive():
     except ImportError:
         return
     original = getattr(_loader, "_save_data_from_verified_archive", None)
-    if original is None or getattr(original, "_sglang_local_archive_shim", False):
+    file_sha256 = getattr(_loader, "_file_sha256", None)
+    if (
+        original is None
+        or file_sha256 is None
+        or getattr(original, "_sglang_local_archive_shim", False)
+    ):
         return
 
     def _save_data_from_verified_archive(
@@ -76,14 +70,13 @@ def honor_local_sgl_eval_archive():
             expected
             and hasattr(mod, "URL")
             and local.is_file()
-            and _sha256_of(local) == expected
+            and file_sha256(local) == expected
         ):
             return original(
                 mod, save_args, save_kwargs, archive_url, archive_sha256, work_dir
             )
-        # prepare.save_data() writes <work_dir>/<archive name>, while the
-        # prefetched archive lives in its own directory: pointing URL at it
-        # cannot make urlretrieve() truncate the source it is reading.
+        # save_data() writes <work_dir>/<archive name>; the prefetched copy
+        # lives elsewhere, so urlretrieve() cannot truncate its own source.
         original_url = mod.URL
         try:
             mod.URL = local.as_uri()
@@ -95,7 +88,7 @@ def honor_local_sgl_eval_archive():
     _loader._save_data_from_verified_archive = _save_data_from_verified_archive
 
 
-# Applied on import so every NPU accuracy case benefits; a no-op without the dir.
+# Applied on import, so no per-case wiring is needed; a no-op without the dir.
 honor_local_sgl_eval_archive()
 
 
