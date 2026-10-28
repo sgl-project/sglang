@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -90,6 +91,7 @@ from sglang.srt.mem_cache.page_interleave import (
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
+    PageInterleaveDSATokenToKVPool,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
@@ -514,11 +516,15 @@ class KVCacheConfigurator:
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
+    #    A ROCm DSA draft runs under DCP itself and shards like the target.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        replicated_draft = self.is_draft_worker and not dsa_draft_shards_under_dcp(
+            self.model_config.hf_config, dcp_size
+        )
+        return dcp_size if (replicated_draft and dcp_size > 1) else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -1923,8 +1929,8 @@ class KVCacheConfigurator:
     ) -> Optional[KVCache]:
         """Build a draft pool in its target's logical space, with its own KV.
 
-        This is a pool-level opt-in through a shared sharded allocator. Target
-        pool creation and speculative serving remain separate integration work.
+        The shared allocator fixes owner placement; target and draft retain
+        independent latent/indexer buffers, scratch and gather streams.
         """
         if not self.is_draft_worker:
             return None
@@ -1944,8 +1950,7 @@ class KVCacheConfigurator:
         if get_parallel().attn_dcp_size > 1:
             raise ValueError("MTP KV sharding is incompatible with DCP.")
         if (
-            is_dsa_model
-            or is_dsv4_model
+            is_dsv4_model
             or self.is_hybrid_swa
             or self.mambaish_config is not None
             or self.sliding_window_size is not None
@@ -1953,7 +1958,7 @@ class KVCacheConfigurator:
             or current_platform.is_out_of_tree()
             or _is_npu
         ):
-            raise ValueError("MTP KV sharding supports only dense MLA and MHA pools.")
+            raise ValueError("MTP KV sharding supports only MLA, DSA and MHA pools.")
         if (
             self.post_capture_kv_active
             or get_memory().enable_page_major_kv_layout
@@ -1973,6 +1978,8 @@ class KVCacheConfigurator:
                 "MTP and target sharded KV pools must have the same per-rank capacity."
             )
         target_is_mla = isinstance(target_pool, PageInterleaveMLATokenToKVPool)
+        if is_dsa_model != isinstance(target_pool, PageInterleaveDSATokenToKVPool):
+            raise ValueError("MTP and target must use the same DSA indexer layout.")
         if self.use_mla_backend != target_is_mla or not isinstance(
             target_pool,
             (PageInterleaveMLATokenToKVPool, PageInterleaveMHATokenToKVPool),
@@ -2013,6 +2020,28 @@ class KVCacheConfigurator:
             shard_spec=target_pool.shard_spec,
             shard_group=target_pool.shard_group,
         )
+        if is_dsa_model:
+            index_head_dim = get_dsa_index_head_dim(self.model_config.hf_config)
+            if (
+                get_dsa_index_kpool(self.model_config.hf_config) != 1
+                or get_dsa_index_kpool_compress(self.model_config.hf_config)
+                or index_head_dim != target_pool.index_head_dim
+                or calculate_mla_kv_cache_dim(
+                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                )
+                != target_pool.kv_cache_dim
+            ):
+                raise ValueError("MTP and target must use matching DSA cache geometry.")
+            # NextN owns its indexer even when the corresponding target depth
+            # shares top-k with a preceding target layer.
+            return PageInterleaveDSATokenToKVPool(
+                **kwargs,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                kv_cache_dim=target_pool.kv_cache_dim,
+                index_head_dim=index_head_dim,
+                index_kpool=1,
+            )
         if self.use_mla_backend:
             return PageInterleaveMLATokenToKVPool(
                 **kwargs,
@@ -2307,7 +2336,15 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse and not self.is_draft_worker:
+        if self.kv_shard_rank is not None:
+            if dsa_cp_layer_shard_rank is not None or get_memory().enable_hisparse:
+                raise ValueError(
+                    "DSA KV sharding cannot combine with layer split or HiSparse."
+                )
+            PoolCls = PageInterleaveDSATokenToKVPool
+            pool_kwargs["shard_spec"] = self.kv_shard_spec
+            pool_kwargs["shard_group"] = self.kv_shard_group
+        elif get_memory().enable_hisparse and not self.is_draft_worker:
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )

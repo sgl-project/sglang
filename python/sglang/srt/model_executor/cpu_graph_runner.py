@@ -1035,6 +1035,11 @@ class CPUGraphRunner:
                 if output.hidden_states is not None
                 else None
             ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_token]
+                if output.last_hidden_states is not None
+                else None
+            ),
         )
 
     def get_spec_info(self, num_tokens: int):
