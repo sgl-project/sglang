@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from xgrammar import StructuralTag
@@ -347,15 +348,60 @@ def _known_argument_format(
     return OrFormat(elements=variants)
 
 
+def _additional_key_pattern(excluded_keys: List[str]) -> str:
+    """Match an attribute name other than a declared property.
+
+    Subtract declared names using a trie rather than lookahead. Positive
+    Unicode ranges keep exclusions correct for non-ASCII property names.
+    """
+    allowed = r'[^"& \t\r\n\f\v=<>]'
+    if not excluded_keys:
+        return allowed + "+"
+    trie: Dict[str, Any] = {"": True}
+    nodes = [trie]
+    for key in excluded_keys:
+        if not re.fullmatch(allowed + "+", key):
+            continue
+        node = trie
+        for char in key:
+            if char not in node:
+                node[char] = {}
+                nodes.append(node[char])
+            node = node[char]
+        node[""] = True
+
+    patterns = {}
+    for node in reversed(nodes):
+        chars = sorted(key for key in node if key)
+        alternatives = [""] if "" not in node else []
+        excluded = sorted({ord(char) for char in '"& \t\r\n\f\v=<>' + "".join(chars)})
+        ranges = []
+        start = 0
+        for stop in [*excluded, 0x110000]:
+            if start < stop:
+                first = f"\\u{start:04x}" if start <= 0xFFFF else chr(start)
+                last = f"\\u{stop - 1:04x}" if stop - 1 <= 0xFFFF else chr(stop - 1)
+                ranges.append(first if start == stop - 1 else first + "-" + last)
+            start = stop + 1
+        other = "[" + "".join(ranges) + "]"
+        alternatives.append(other + allowed + "*")
+        alternatives.extend(
+            re.escape(char) + patterns[id(node[char])] for char in chars
+        )
+        patterns[id(node)] = "(?:" + "|".join(alternatives) + ")"
+    return patterns[id(trie)]
+
+
 def _dynamic_argument_format(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
     loose_strings: bool = False,
+    excluded_keys: Optional[List[str]] = None,
 ) -> Format:
     variants = [
         SequenceFormat(
             elements=[
-                RegexFormat(pattern=r'[^"& \t\r\n\f\v=<>]+'),
+                RegexFormat(pattern=_additional_key_pattern(excluded_keys or [])),
                 ConstStringFormat(
                     value=(f'" type="{_JSON_TO_XTML_TYPE[json_type]}"<|sep|>')
                 ),
@@ -410,10 +456,20 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
 
     additional = parameters.get("additionalProperties", True)
     if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
+        elements.append(
+            StarFormat(
+                content=_dynamic_argument_format(
+                    True, parameters, excluded_keys=list(properties)
+                )
+            )
+        )
     elif isinstance(additional, dict):
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            StarFormat(
+                content=_dynamic_argument_format(
+                    additional, parameters, excluded_keys=list(properties)
+                )
+            )
         )
     elif additional is not False:
         raise ValueError(

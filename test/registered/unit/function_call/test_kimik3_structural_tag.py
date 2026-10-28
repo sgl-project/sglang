@@ -27,6 +27,7 @@ from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_structural_tag,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -837,6 +838,66 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+class TestAdditionalPropertyNames(CustomTestCase):
+    def _check(self, tool, body, expected):
+        tag = get_kimik3_structural_tag([tool], tool_choice="required")
+        wire = _tools_section(_call("probe", 1, body))
+        assert _accepts(xgr.Grammar.from_structural_tag(tag), wire) == expected
+        assert _token_accepts(tag, wire) == expected
+
+    def test_declared_key_cannot_be_overwritten_by_additional_argument(self):
+        """A later extra argument must not replace a schema-checked value."""
+        for extra in [True, {"type": "string"}]:
+            for key in ["count", "co", "é", "a-b", "a]b", "a^b", "a\\b"]:
+                with self.subTest(extra=extra, key=key):
+                    tool = Tool(
+                        type="function",
+                        function=Function(
+                            name="probe",
+                            strict=True,
+                            parameters={
+                                "type": "object",
+                                "properties": {key: {"type": "integer", "minimum": 1}},
+                                "required": [key],
+                                "additionalProperties": extra,
+                            },
+                        ),
+                    )
+                    first = _argument(key, "number", "1")
+                    self._check(tool, first, True)
+                    self._check(
+                        tool, first + _argument(key + "x", "string", "ok"), True
+                    )
+                    self._check(
+                        tool, first + _argument(key, "string", "invalid"), False
+                    )
+
+    def test_skipped_optional_property_keeps_its_schema(self):
+        """Skipping an optional property must not admit it as an untyped extra."""
+        for extra in [True, {"type": "string"}]:
+            with self.subTest(extra=extra):
+                tool = Tool(
+                    type="function",
+                    function=Function(
+                        name="probe",
+                        strict=True,
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "ab": {"type": "integer"},
+                            },
+                            "required": ["ab"],
+                            "additionalProperties": extra,
+                        },
+                    ),
+                )
+                required = _argument("ab", "number", "1")
+                self._check(tool, _argument("a", "number", "1") + required, True)
+                self._check(tool, required + _argument("abc", "string", "ok"), True)
+                self._check(tool, required + _argument("a", "string", "invalid"), False)
 
 
 if __name__ == "__main__":

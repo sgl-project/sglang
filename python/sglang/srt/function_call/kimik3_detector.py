@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -228,6 +229,14 @@ class KimiK3Detector(BaseFormatDetector):
                     "dropping %d buffered chars",
                     len(section),
                 )
+            else:
+                last_end = max(match.end() for match in _CALL_RE.finditer(section))
+                if CALL_OPEN in section[last_end:]:
+                    logger.warning(
+                        "Kimi K3 tools section ended with an incomplete tool call; "
+                        "dropping %d buffered chars after the last complete call",
+                        len(section) - last_end,
+                    )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))
         return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))

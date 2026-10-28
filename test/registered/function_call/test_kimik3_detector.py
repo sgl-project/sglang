@@ -15,6 +15,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_OPEN,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -247,6 +248,41 @@ def test_detector_capabilities_and_registration() -> None:
     parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
     assert isinstance(parser.detector, KimiK3Detector)
     assert parser.get_structure_constraint("required") is not None
+
+
+class TestTrailingIncompleteCall(CustomTestCase):
+    def test_completed_call_does_not_hide_truncation(self):
+        """Report an unfinished call even when a preceding call was emitted."""
+        first = _call_block("probe", 1, {"count": ("number", "1")})
+        second = (
+            '<|open|>call tool="probe" index="2"<|sep|>'
+            '<|open|>argument key="count" type="number"<|sep|>2'
+        )
+        for size in [1, 7, 23, 10000]:
+            for complete_first in [False, True]:
+                with self.subTest(size=size, complete_first=complete_first):
+                    detector = KimiK3Detector()
+                    wire = TOOLS_OPEN + (first if complete_first else "") + second
+                    _, calls = _stream(detector, _chunks(wire, size), [])
+                    assert len(calls) == int(complete_first)
+                    if calls:
+                        assert json.loads(calls[0].parameters) == {"count": 1}
+                    with self.assertLogs(
+                        "sglang.srt.function_call.kimik3_detector", level="WARNING"
+                    ):
+                        assert detector.finish([]).calls == []
+
+    def test_complete_call_has_no_truncation_warning(self):
+        """A completed tools section must not trigger the new tail warning."""
+        first = _call_block("probe", 1, {"count": ("number", "1")})
+        for size in [1, 7, 23, 10000]:
+            with self.subTest(size=size):
+                detector = KimiK3Detector()
+                _stream(detector, _chunks(TOOLS_OPEN + first + TOOLS_CLOSE, size), [])
+                with self.assertNoLogs(
+                    "sglang.srt.function_call.kimik3_detector", level="WARNING"
+                ):
+                    assert detector.finish([]).calls == []
 
 
 if __name__ == "__main__":
