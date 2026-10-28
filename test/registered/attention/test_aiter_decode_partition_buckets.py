@@ -6,13 +6,12 @@ Partitions past a request's length exit early, so any count that covers the long
 request gives the same output; a count that does not drops KV silently.
 """
 
-import os
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,7 +34,6 @@ _DEVICE = "cuda"
 _NUM_Q_HEADS = 32
 _NUM_KV_HEADS = 8
 _HEAD_DIM = 128
-_SWITCH = "SGLANG_AITER_DECODE_PARTITION_BUCKETS"
 
 
 def _make_backend(context_len=131072, **flags):
@@ -68,7 +66,7 @@ class TestDecodePartitionBucketTable(CustomTestCase):
         backends = [_make_backend(16384)] + [
             _make_backend(**{flag: True}) for flag in ("use_mla", "unified", "vec5d")
         ]
-        with mock.patch.dict(os.environ, {_SWITCH: "0"}):
+        with envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.override(False):
             backends.append(_make_backend())
         for backend in backends:
             self.assertIsNone(_variants(backend))

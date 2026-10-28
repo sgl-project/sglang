@@ -263,9 +263,8 @@ def _paged_prefill_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
-# (graph variant label, longest request it serves) for paged_attention_ragged decode,
-# run with limit / partition size partitions. aiter JIT-builds a reduce kernel per
-# ceil(partitions / 64), so eager decode also uses only these counts.
+# (graph variant label, longest request it serves), run with limit / 256 partitions;
+# aiter JIT-builds a reduce kernel per ceil(partitions / 64), so eager uses only these.
 _DECODE_PARTITION_BUCKETS = (("p16", 4096), ("p128", 32768))
 _DECODE_PARTITION_FALLBACK = "pmax"
 
@@ -2017,7 +2016,7 @@ class AiterAttnBackend(AttentionBackend):
         if not (
             paged_ragged_decode
             and self.max_num_partitions >= 128
-            and get_bool_env_var("SGLANG_AITER_DECODE_PARTITION_BUCKETS", "1")
+            and envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.get()
         ):
             return (fallback,)
         buckets = [

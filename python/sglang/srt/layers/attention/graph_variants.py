@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -43,8 +45,7 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
-@dataclass(frozen=True)
-class SeqLenBucketGraphVariants:
+class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
     """Graphs keyed by the batch's longest request: the first bucket whose limit
     covers it, else the fallback, which must serve any length."""
 
@@ -58,7 +59,7 @@ class SeqLenBucketGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         # Only the host mirror is read: a device max would sync every replay.
-        lengths = getattr(forward_batch, "seq_lens_cpu", None)
+        lengths = forward_batch.seq_lens_cpu
         if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
             max_seq_len = int(lengths.max())
             for label, limit in self.graph_limits:
