@@ -1073,7 +1073,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=PS,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 tree_core_backend="python",
             )
         )
