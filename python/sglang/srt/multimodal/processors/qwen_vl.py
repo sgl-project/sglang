@@ -308,7 +308,7 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    if not is_cpu():
+    if not is_cpu() and video.device.type == "cpu":
         video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
