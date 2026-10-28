@@ -39,6 +39,12 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+if is_npu():
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        pass
+
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -58,12 +64,6 @@ from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
-
-if is_npu():
-    try:
-        import custom_ops  # noqa: F401
-    except ImportError:
-        pass
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
