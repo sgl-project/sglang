@@ -1,0 +1,23 @@
+{
+  "extra": {
+    "label": "run-ci-extra",
+    "workflows": [
+      ".github/workflows/pr-test-extra.yml",
+      ".github/workflows/pr-test-amd-extra.yml"
+    ]
+  },
+  "nv": {
+    "label": null,
+    "workflows": [
+      ".github/workflows/pr-test.yml",
+      ".github/workflows/lint.yml",
+      ".github/workflows/pr-test-sgl-router.yml",
+      ".github/workflows/pr-test-sgl-processor.yml",
+      ".github/workflows/pr-test-rust.yml",
+      ".github/workflows/pr-test-rust-exts.yml",
+      ".github/workflows/pr-test-rust-workspace.yml",
+      ".github/workflows/pr-benchmark-rust.yml",
+      ".github/workflows/ci-model-inventory.yml"
+    ]
+  }
+}

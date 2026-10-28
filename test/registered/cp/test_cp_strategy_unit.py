@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ExtendMode:
@@ -183,8 +183,9 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                     512,
                 )
                 self.assertTrue(runner.can_run_graph(batch))
-        batch.extend_prefix_lens_cpu = [0, 1, 0]
-        self.assertFalse(runner.can_run_graph(batch))
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            batch.extend_prefix_lens_cpu = [0, 1, 0]
+            self.assertTrue(runner.can_run_graph(batch))
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()

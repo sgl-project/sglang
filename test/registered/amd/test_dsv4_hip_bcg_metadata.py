@@ -933,7 +933,8 @@ class TestEncoderReplayRequestWindowHip(CustomTestCase):
     def _floor_passed(self, *, encoder_replay, swa_replay_start=None):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.token_to_kv_pool = SimpleNamespace(
-            request_window=SimpleNamespace(capacity=256)
+            # window_layout is mocked below; zero_row is only forwarded to it
+            request_window=SimpleNamespace(capacity=256, zero_row=0)
         )
         backend.encoder_replay = encoder_replay
         seen = {}
