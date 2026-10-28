@@ -2059,6 +2059,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
+            if _is_xpu:
+                return
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
