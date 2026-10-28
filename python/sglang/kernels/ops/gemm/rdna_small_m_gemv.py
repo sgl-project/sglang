@@ -34,11 +34,17 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 _BLOCK_N = 32
 _BLOCK_K = 512
-_MAX_SPLIT_K = 32
+# Measured on gfx1151 with cold weights (200 MB working set): K splits of 8-50 all
+# beat rocBLAS (1.37x at split_k=34 for 5120x17408, 1.27x at split_k=50 for
+# 5120x25600), so the cap only guards against pathological K rather than a
+# bandwidth crossover.
+_MAX_SPLIT_K = 64
 _SUPPORTED_ROWS = 1
 # Above this many n-tiles the GEMM is already wide enough to saturate the bus, and
-# splitting K only adds the partial/reduce traffic. Measured on gfx1151: the 151936
-# vocabulary head reaches 140 GB/s via rocBLAS and drops to 121 GB/s with split-K.
+# splitting K only adds the partial/reduce traffic. Measured on gfx1151 with cold
+# weights: the 151936 vocabulary head reaches 140 GB/s via rocBLAS and drops to
+# 121 GB/s with split-K; a 34816x5120 gate_up (1088 tiles) is 145.7 vs 133.0 GB/s,
+# i.e. the crossover sits right at this bound.
 _MAX_N_TILES = 1024
 
 
