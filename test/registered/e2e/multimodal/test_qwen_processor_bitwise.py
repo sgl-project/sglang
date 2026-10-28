@@ -15,7 +15,8 @@
 The same Python environment and checkpoint processor files serve both captures.
 Every turn supplies its full ordered media URL lists without session recipes.
 All output fields are compared unchanged, including item grouping, offsets and
-mRoPE; cache identity (item hash / pad value, padded IDs) only when both set it.
+mRoPE, except the cache identity (item hash / pad value, padded IDs), which the
+routes derive differently.
 Legacy resizes Qwen3-VL family videos with the Qwen2-VL factor, so its capture
 preprocesses them as the token-space route does (pinned to qwen-vl-utils elsewhere).
 No model weights or generation are needed. CUDA CI runs a small pinned matrix
@@ -86,12 +87,12 @@ def _snapshot(value):
     raise TypeError(f"Uncaptured processor output type: {type(value).__qualname__}")
 
 
-# Cache identity: legacy may key a hash by its artifact, token-space by tensor
-# content. Both are valid, so these are compared only when both sides set them.
+# Cache identity: legacy keys it by artifact or by feature bytes, token space by
+# feature bytes scoped by the item's grids, so the routes never compare it.
 _CACHE_IDENTITY_ITEM_FIELDS = ("hash", "pad_value", "pad_values", "identity")
 
 
-def _drop_unshared_cache_identity(reference_cases, candidate_cases):
+def _drop_cache_identity(reference_cases, candidate_cases):
     for case_id in reference_cases.keys() & candidate_cases.keys():
         sides = [
             cases[case_id].get("model_inputs")
@@ -100,14 +101,11 @@ def _drop_unshared_cache_identity(reference_cases, candidate_cases):
         ]
         if len(sides) != 2 or None in sides:
             continue
-        if any(side.get("padded_input_ids") is None for side in sides):
-            for side in sides:
-                side.pop("padded_input_ids", None)
-        for items in zip(*(side.get("mm_items") or [] for side in sides)):
-            for name in _CACHE_IDENTITY_ITEM_FIELDS:
-                if any(item.get(name) is None for item in items):
-                    for item in items:
-                        item.pop(name, None)
+        for side in sides:
+            side.pop("padded_input_ids", None)
+            for item in side.get("mm_items") or []:
+                for name in _CACHE_IDENTITY_ITEM_FIELDS:
+                    item.pop(name, None)
 
 
 def _assert_identical(reference, candidate, field="output"):
@@ -392,7 +390,7 @@ def _compare_routes(checkout, manifest_path, artifacts):
             snapshots.append(pickle.load(stream))
     _assert_identical(snapshots[0]["source"], snapshots[1]["source"], "source")
     assert not snapshots[0]["source"]["diff"], "Compared source must be clean"
-    _drop_unshared_cache_identity(snapshots[0]["cases"], snapshots[1]["cases"])
+    _drop_cache_identity(snapshots[0]["cases"], snapshots[1]["cases"])
     for field in ("manifest", "checkpoint_files", "dependencies", "python", "cases"):
         _assert_identical(snapshots[0][field], snapshots[1][field], field)
     print(f"Bitwise identical: {len(snapshots[0]['cases'])} benchmark turns")
