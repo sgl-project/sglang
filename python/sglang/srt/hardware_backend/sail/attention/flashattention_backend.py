@@ -29,12 +29,6 @@ class SailFlashAttentionBackend(FlashAttentionBackend):
         self._get_scheduler_metadata = get_scheduler_metadata
         self._get_fa_runtime_policy = None
 
-    def _call_flash_attn_with_kvcache(self, **kwargs):
-        return flash_attn_with_kvcache(**kwargs)
-
-    def _call_flash_attn_varlen_func(self, **kwargs):
-        return flash_attn_varlen_func(**kwargs)
-
 
 class SailFlashAttentionMultiStepBackend(FlashAttentionMultiStepBackend):
     def __init__(
