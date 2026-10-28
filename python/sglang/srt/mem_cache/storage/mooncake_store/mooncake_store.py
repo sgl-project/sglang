@@ -935,16 +935,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # meaningful. The pool reports how many leading complete blocks
                 # it holds as its own verdict and never gates the KV prefix.
                 block = max(1, int(transfer.block_pages))
-                boundary_idx = list(range(block - 1, kv_pages, block))
                 complete = 0
-                for idx in boundary_idx:
+                for idx in range(block - 1, kv_pages, block):
                     if not page_exists[idx]:
                         break
                     complete += 1
-                boundary = complete * block
                 # Not intersected into `restorable`: a pool whose data lives on
                 # a subset of the pages must not shorten the KV hit.
-                if boundary:
+                if complete:
                     hit_count[transfer.name] = complete
                 continue
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
