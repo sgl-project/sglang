@@ -49,6 +49,7 @@ def flash_attn_with_kvcache(
     ver=3,
     out=None,
     max_seqlen_k: Optional[int] = None,
+    mask_mod=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -139,6 +140,8 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
+    if mask_mod is not None and ver != 4:
+        raise NotImplementedError("mask_mod requires FlashAttention 4")
     if ver == 3:
         return fa3_flash_attn_with_kvcache(
             q,
@@ -208,6 +211,7 @@ def flash_attn_with_kvcache(
             pack_gqa=pack_gqa,
             sinks=sinks,
             score_mod=score_mod,
+            mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             sfq=sfq,
             sfk=sfk,
@@ -256,7 +260,10 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache=None,
     ver=3,
     out=None,
+    mask_mod=None,
 ):
+    if mask_mod is not None and ver != 4:
+        raise NotImplementedError("mask_mod requires FlashAttention 4")
     if ver == 3:
         return fa3_flash_attn_varlen_func(
             q,
@@ -311,6 +318,7 @@ def flash_attn_varlen_func(
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
+            mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             q_descale=q_descale,
             k_descale=k_descale,

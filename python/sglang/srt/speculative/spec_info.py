@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -139,9 +138,10 @@ class SpeculativeAlgorithm(Enum):
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
 
-        The backend must still declare a pre-replay read end. Other algorithms
-        must stage their draft's shared reads before publishing the target event.
+        The backend must still declare a pre-replay read end.
         """
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
         return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
@@ -300,19 +300,13 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
+    def get_platform_worker_cls(self) -> Optional[type]:
+        """Out-of-tree platform's replacement worker, or None for the built-in one."""
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            return None
+        return current_platform.get_speculative_worker_cls(algorithm=self.name)
 
     def create_worker(
         self, server_args: ServerArgs
@@ -322,6 +316,10 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        platform_worker_cls = self.get_platform_worker_cls()
+        if platform_worker_cls is not None:
+            return platform_worker_cls
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -397,6 +395,10 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Whether this input carries all state required for CUDA graph replay.
+    # Algorithm-specific dataclass subclasses can override this per input.
+    cuda_graph_compatible: bool = True
+
     # Per-request verify lengths for the ragged-verify graphs (see
     # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
     # supports_ragged_verify() override it per step. Must stay a class-level
@@ -422,6 +424,11 @@ class SpecInput(ABC):
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -446,6 +453,13 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
             SpecInputType.UNO_VERIFY,
         }
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        return None
 
 
 def spec_scale_global_num_tokens(

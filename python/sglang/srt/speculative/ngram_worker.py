@@ -7,7 +7,9 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.kernels.ops.speculative.reconstruct_tree import (
+    reconstruct_indices_from_tree_mask_func,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -32,15 +34,10 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
-
-if is_cuda():
-    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
-else:
-    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +86,6 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -99,7 +95,6 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = ps.tp_rank
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
@@ -155,15 +150,6 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
-
-    def update_weights_from_tensor(self, recv_req):
-        # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
-        # lookup structure built from request token streams — and its
-        # `model_runner` is shared with the target worker. The scheduler
-        # mixin dispatches via `self.draft_worker or self.tp_worker`, so
-        # without this method any caller of `update_weights_from_tensor`
-        # under `--speculative-algorithm NGRAM` raises AttributeError.
-        return self.target_worker.update_weights_from_tensor(recv_req)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -260,14 +246,17 @@ class NGRAMWorker(BaseSpecWorker):
         req_ids = [req.rid for req in batch.reqs]
         # Only the last max_trie_depth tokens can match; the ids are
         # array.array, so list() the tails for list concat below.
+        # multimodal cache padding contains identities, not vocabulary token IDs
         input_tails = [
-            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+            list(req.origin_input_ids_unpadded[-self.max_trie_depth :])
+            for req in batch.reqs
         ]
         output_tails = [
             list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
         ]
         base_lens = [
-            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+            len(req.origin_input_ids_unpadded) + len(req.output_ids)
+            for req in batch.reqs
         ]
 
         if use_prev_tokens:
@@ -350,7 +339,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
         # generate positions and some indices using tree_mask
-        reconstruct_indices_from_tree_mask(
+        reconstruct_indices_from_tree_mask_func(
             tree_mask,
             batch.seq_lens,
             positions,  # mutable
@@ -422,7 +411,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids[-self.max_trie_depth :]),
+                list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
@@ -487,7 +476,13 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                watermark_state=self.model_runner.watermark_state,
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -496,7 +491,17 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index].flatten()
+            accept_tokens = predict[accept_index]
+            if (
+                self.model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+            ):
+                self.model_runner.watermark_state.append_speculative(
+                    batch.req_pool_indices,
+                    accept_tokens,
+                    accept_lens,
+                )
+            accept_tokens = accept_tokens.flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's

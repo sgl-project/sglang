@@ -24,6 +24,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 @pytest.fixture
 def validator(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
+    monkeypatch.setattr(utils.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig.from_dict(
         {
             "stages_ms": {},
@@ -46,6 +47,19 @@ def test_slow_loading_fails_even_when_inference_passes(validator):
 
 def test_fast_loading_cannot_hide_inference_regression(validator):
     summary = PerformanceSummary(2000, 0, 0, {}, [], {}, {}, load_time_ms=1000)
+    validator.validate_load(summary)
+    with pytest.raises(AssertionError, match="E2E Latency"):
+        validator.validate_e2e(summary)
+
+
+def test_load_tolerance_widens_only_the_load_check(validator):
+    """A profile's load tolerance widens the load check alone; without one, load
+    stays on the E2E tolerance."""
+    summary = PerformanceSummary(1300, 0, 0, {}, [], {}, {}, load_time_ms=5500)
+    with pytest.raises(AssertionError, match="Load Latency"):
+        validator.validate_load(summary)
+
+    validator.tolerances = ToleranceConfig(0.25, 0, 0, 0, 0, load=0.4)
     validator.validate_load(summary)
     with pytest.raises(AssertionError, match="E2E Latency"):
         validator.validate_e2e(summary)
@@ -146,16 +160,19 @@ def test_server_load_clock_excludes_warmup(
         (message % args) + "\n"
     )
 
-    def ready():
-        clock[0] += 1_000_000_000
-        return {"status": "ready"}
+    def ready(payload, ranks, name_prefix):
+        restored_args = payload.materialize()
+        assert isinstance(restored_args, ServerArgs)
+        assert restored_args.num_gpus == workers
+        assert ranks == [(i, i) for i in range(workers)]
+        clock[0] += workers * 1_000_000_000
+        return [Mock() for _ in ranks]
 
-    worker_context = Mock()
-    worker_context.Pipe.side_effect = lambda **kwargs: (Mock(recv=ready), Mock())
-    monkeypatch.setattr(launcher.mp, "get_context", Mock(return_value=worker_context))
+    monkeypatch.setattr(launcher, "_start_scheduler_processes", ready)
     monkeypatch.setattr(launcher, "shutdown_scheduler_processes", Mock())
 
-    def warmup(args):
+    def warmup(args, *, worker_pids):
+        assert len(worker_pids) == workers
         clock[0] += warmup_seconds * 1_000_000_000
 
     monkeypatch.setattr(launcher, "launch_http_server_only", warmup)
@@ -178,12 +195,6 @@ def test_server_load_clock_excludes_warmup(
     manager = utils.ServerManager("test", 1234)
     monkeypatch.setattr(manager, "_wait_for_ready", Mock())
     context = manager.start()
-    launcher.mp.get_context.assert_called_once_with("spawn")
-    assert worker_context.Process.call_count == workers
-    for call in worker_context.Process.call_args_list:
-        restored_args = call.kwargs["args"][0].server_args.materialize()
-        assert isinstance(restored_args, ServerArgs)
-        assert restored_args.num_gpus == workers
     context._log_thread.join(timeout=5)
     assert not context._log_thread.is_alive()
     assert context.load_time_ms == workers * 1000

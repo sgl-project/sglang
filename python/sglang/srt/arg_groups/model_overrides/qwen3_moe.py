@@ -1,7 +1,4 @@
-"""Config-time override declarations for qwen3_moe.
-
-Architectures: InternS2PreviewForConditionalGeneration, Qwen3MoeForCausalLM, Qwen3NextForCausalLM, Qwen3VLMoeForConditionalGeneration, Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration, Qwen4ExpForConditionalGeneration.
-"""
+"""Config-time override declarations for qwen3_moe."""
 
 import logging
 from typing import Any, Dict

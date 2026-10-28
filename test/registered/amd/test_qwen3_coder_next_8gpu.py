@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=450, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=450, suite="nightly-amd-8-gpu-mi35x", nightly=True)
 
 QWEN3_CODER_NEXT_MODEL_PATH = "Qwen/Qwen3-Coder-Next"
 SERVER_LAUNCH_TIMEOUT = 1800
@@ -74,7 +74,7 @@ class TestQwen3CoderNext(CustomTestCase):
             num_questions=200,
             parallel=128,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -140,7 +140,7 @@ class TestQwen3CoderNextMTP(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

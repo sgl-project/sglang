@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -228,7 +227,6 @@ class MockGDNModelRunner(ModelRunner):
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
         self.gpu_id = 0
-        self.ps = ParallelState.trivial()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
@@ -324,15 +322,14 @@ class MockGDNModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
         )
+        self.is_draft_worker = False
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -565,6 +562,8 @@ def _make_forward_batch(
             else None
         ),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.kv_index_translator.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)

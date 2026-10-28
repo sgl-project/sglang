@@ -18,9 +18,104 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_mix_reduce_sinkhorn_vec,
+    )
+
 logger = logging.getLogger(__name__)
+
+_AITER_MHC_RUNTIME_DISABLED = False
+_AITER_MHC_ACTIVE_LOGGED = False
+
+
+def _use_aiter_mhc() -> bool:
+    return (
+        not _AITER_MHC_RUNTIME_DISABLED
+        and is_gfx95_supported()
+        and envs.SGLANG_USE_AITER.get()
+    )
+
+
+def _try_aiter_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    global _AITER_MHC_RUNTIME_DISABLED, _AITER_MHC_ACTIVE_LOGGED
+
+    try:
+        from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+    except Exception as err:
+        logger.warning("AITER mHC pre is unavailable, falling back: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
+    kwargs = {}
+    if norm_weight is not None:
+        kwargs["norm_weight"] = norm_weight
+        kwargs["norm_eps"] = norm_eps if norm_eps is not None else rms_eps
+
+    try:
+        result = aiter_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            **kwargs,
+        )
+    except Exception as err:
+        logger.warning("AITER mHC pre failed, disabling fast path: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
+    if not _AITER_MHC_ACTIVE_LOGGED:
+        logger.info("Using AITER gfx950 mHC pre/post kernels")
+        _AITER_MHC_ACTIVE_LOGGED = True
+    return result
+
+
+def _try_aiter_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor | None:
+    global _AITER_MHC_RUNTIME_DISABLED
+
+    try:
+        from aiter.ops.mhc import mhc_post as aiter_mhc_post
+    except Exception as err:
+        logger.warning("AITER mHC post is unavailable, falling back: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+
+    out = torch.empty_like(residual)
+    try:
+        aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
+    except Exception as err:
+        logger.warning("AITER mHC post failed, disabling fast path: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
+    return out
+
 
 # This module is imported during model-registry discovery. Do not import the real
 # TileLang package here: it loads native CUDA stubs. The proxy below lets
@@ -119,6 +214,24 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 
+
+def _use_deep_gemm_hc_prenorm() -> bool:
+    if is_hip() or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        return False
+
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return ENABLE_JIT_DEEPGEMM
+
+
+def _use_tilelang_mhc_pre() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
+
+
+def _use_tilelang_mhc_post() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
+
+
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
@@ -190,49 +303,6 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
                 T.pdl_trigger()
 
     return hc_split_sinkhorn_kernel_
-
-
-def _hc_split_sinkhorn_torch(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-):
-    """Pure-torch equivalent of hc_split_sinkhorn_kernel.
-
-    TileLang's CK-backed buffer addressing does not compile on gfx1250, so the
-    sinkhorn kernel is reimplemented here. Layout mirrors the kernel exactly:
-    the flattened ``mixes`` row holds ``pre`` (hc), ``post`` (hc) and the
-    ``comb`` matrix (hc * hc) consecutively.
-    """
-    b, s, _ = mixes.size()
-    hc = hc_mult
-    flat = mixes.reshape(-1, (2 + hc) * hc).float()
-    scale = hc_scale.float()
-    base = hc_base.float()
-
-    pre = torch.sigmoid(flat[:, :hc] * scale[0] + base[:hc]) + eps
-    post = 2 * torch.sigmoid(flat[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
-
-    comb = flat[:, 2 * hc :] * scale[2] + base[2 * hc :]
-    comb = comb.reshape(-1, hc, hc)
-
-    # Initial row softmax (numerically stabilized) then column normalize.
-    row_max = comb.amax(dim=2, keepdim=True)
-    comb = torch.exp(comb - row_max)
-    comb = comb / comb.sum(dim=2, keepdim=True) + eps
-    comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
-
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=2, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
-
-    pre = pre.reshape(b, s, hc).to(mixes.dtype)
-    post = post.reshape(b, s, hc).to(mixes.dtype)
-    comb = comb.reshape(b, s, hc, hc).to(mixes.dtype)
-    return pre, post, comb
 
 
 @triton.jit
@@ -373,7 +443,7 @@ def hc_split_sinkhorn(
         )
     if is_gfx1250_supported():
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
-        # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
+        # Triton port.
         return _hc_split_sinkhorn_triton(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
@@ -788,7 +858,11 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_schedule().chunked_prefill_size
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    if max_num_tokens is None or max_num_tokens <= 0:
+        # Chunked prefill disabled: bound by the prefill token budget.
+        max_num_tokens = schedule.max_prefill_tokens
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )
@@ -1041,7 +1115,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if _use_deep_gemm_hc_prenorm():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1196,7 +1270,16 @@ def mhc_pre(
     },
 )
 def mhc_post_tilelang(
-    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+    num_h_blocks: int = 1,
 ):
     n = T.dynamic("num_tokens")
     h = hidden
@@ -1209,7 +1292,7 @@ def mhc_post_tilelang(
     x: T.Tensor((n, hc, h), T.bfloat16)
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(n, threads=n_thr) as i_n:
+    with T.Kernel(n, num_h_blocks, threads=n_thr) as (i_n, i_h_block):
         if ENABLE_PDL:
             T.pdl_sync()
 
@@ -1226,7 +1309,8 @@ def mhc_post_tilelang(
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+        for i_h_iter in T.Pipelined(T.ceildiv(h, h_blk * num_h_blocks), num_stages=2):
+            i0_h = i_h_iter * num_h_blocks + i_h_block
             T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
             T.copy(d[i_n, i0_h * h_blk], d_shared)
 
@@ -1256,6 +1340,11 @@ def mhc_post(
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
+    hidden_size = residual.shape[-1]
+    # Small batches need more parallelism than one CTA per token.
+    num_h_blocks = (
+        hidden_size // math.gcd(hidden_size, 1024) if x.shape[0] <= 256 else 1
+    )
     mhc_post_tilelang(
         comb_res_mix,
         residual,
@@ -1263,7 +1352,8 @@ def mhc_post(
         x,
         out,
         residual.shape[-2],
-        residual.shape[-1],
+        hidden_size,
+        num_h_blocks=num_h_blocks,
     )
     return out
 
@@ -1653,7 +1743,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
@@ -1775,6 +1865,34 @@ def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.repeat(1, n)
 
 
+@triton.jit
+def _hc_broadcast_kernel(
+    x_ptr, y_ptr, H, x_stride_m, HC: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < H
+    x = tl.load(x_ptr + row * x_stride_m + offs, mask=mask)
+    y_row = y_ptr + row * (HC * H)
+    for k in tl.static_range(HC):
+        tl.store(y_row + k * H + offs, x, mask=mask)
+
+
+def hc_broadcast(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """[T, H] -> [T, hc_mult, H], every copy equal to x: the initial mHC residual."""
+    if not x.is_cuda or x.stride(-1) != 1:
+        return x.unsqueeze(1).repeat(1, hc_mult, 1)
+    num_tokens, hidden = x.shape
+    y = x.new_empty(num_tokens, hc_mult, hidden)
+    if num_tokens == 0:
+        return y
+    block_h = 1024
+    _hc_broadcast_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        x, y, hidden, x.stride(0), HC=hc_mult, BLOCK_H=block_h, num_warps=4
+    )
+    return y
+
+
 def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 
@@ -1847,7 +1965,25 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    if _use_aiter_mhc():
+        result = _try_aiter_mhc_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        if result is not None:
+            post_mix, comb_mix, layer_input = result
+            return post_mix, comb_mix, layer_input, norm_weight is not None
+
+    if not _use_tilelang_mhc_pre():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1886,7 +2022,17 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    if _use_aiter_mhc():
+        result = _try_aiter_mhc_post(
+            x=x,
+            residual=residual,
+            post_layer_mix=post_layer_mix,
+            comb_res_mix=comb_res_mix,
+        )
+        if result is not None:
+            return result
+
+    if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
@@ -2013,7 +2159,7 @@ def npu_hc_pre(
 
 
 @triton.jit
-def _hc_combine_kernel(
+def _mhc_combine_kernel(
     x_ptr,
     pre_ptr,
     y_ptr,
@@ -2037,6 +2183,32 @@ def _hc_combine_kernel(
         ).to(tl.float32)
         acc += pk * xv
     tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
+
+
+@triton.jit
+def _mhc_stream_mean_kernel(
+    x_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    x_stride_k,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    x_row = x_ptr + pid_m.to(tl.int64) * x_stride_m + offs_h
+    # Streams are added in order onto a +0 fp32 accumulator, as torch.mean's
+    # reduction does (so an all -0 row averages to +0).
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        acc += tl.load(x_row + k * x_stride_k, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        y_ptr + pid_m.to(tl.int64) * y_stride_m + offs_h, acc * (1.0 / HC), mask=mask
+    )
 
 
 @triton.jit
@@ -2132,10 +2304,11 @@ _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
-_HC_MIX_DOT_PRECISION = "tf32x3"
-# num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
-# short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
-_HC_MIX_NUM_STAGES = 2
+# Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
+_HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
+# num_stages only reorders memory issue, not arithmetic; AMD keeps 2, not measured.
+# Measured on B300 and H200: 1 stage beats 2-4 by 2-5x at every M in 1..4096.
+_HC_MIX_NUM_STAGES = 2 if _is_hip else 1
 
 # BLOCK_M 8/16/32 preserve each row's K reduction order; thresholds were measured on GB300.
 # Keep BLOCK_M below 64, where Triton lowers tf32x3 to plain TF32 and changes rounding.
@@ -2146,18 +2319,14 @@ _HC_MIX_MID_MAX_M = 2048
 
 def _block_m_for(m: int) -> int:
     """Row-tile choices preserve each row's arithmetic and may depend on M."""
+    if _is_hip:
+        # fp32 MFMA tile heights do not share a per-row reduction order, so one height serves every M
+        return _HC_MIX_BLOCK_M_MID
     if m <= _HC_MIX_BLOCK_M_SMALL:
         return _HC_MIX_BLOCK_M_SMALL
     if m <= _HC_MIX_MID_MAX_M:
         return _HC_MIX_BLOCK_M_MID
     return _HC_MIX_BLOCK_M
-
-
-def _num_stages_for(m: int, k: int) -> int:
-    # GB300 verify batches benefit from a smaller shared-memory footprint.
-    if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
-        return 1
-    return _HC_MIX_NUM_STAGES
 
 
 def _num_slices_for(k: int) -> int:
@@ -2210,7 +2379,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+        num_stages=_HC_MIX_NUM_STAGES,
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2342,8 +2511,26 @@ def hc_mix_stats_sinkhorn(
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+        num_stages=_HC_MIX_NUM_STAGES,
     )
+    if _is_hip:
+        hc_mix_reduce_sinkhorn_vec(
+            part_mix,
+            part_sq,
+            hc_scale,
+            hc_base,
+            pre,
+            post,
+            comb,
+            k=k,
+            rms_eps=rms_eps,
+            mix=mix,
+            hc_mult=hc_mult,
+            num_slices=num_slices,
+            sinkhorn_iters=sinkhorn_iters,
+            hc_eps=hc_eps,
+        )
+        return pre, post, comb
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
         part_sq,
@@ -2448,7 +2635,10 @@ def hc_mix_stats_sinkhorn_bf16x3(
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
+    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    assert x.is_contiguous() and x.dtype == torch.bfloat16
+    assert hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
@@ -2460,7 +2650,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
     post = torch.empty_like(pre)
     comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
-    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, block_m), slices)](
         x,
         *weight_parts,
         part_mix,
@@ -2471,7 +2661,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
         BLOCK_K=_HC_MIX_BLOCK_K,
-        BLOCK_M=_HC_MIX_BF16X3_BLOCK_M,
+        BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
     )
@@ -2550,15 +2740,16 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
-def hc_combine(
+def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    assert x_flat.stride(1) == 1
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
-    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+    _mhc_combine_kernel[(m, triton.cdiv(h, block_h))](
         x_flat,
         pre,
         y,
@@ -2566,6 +2757,37 @@ def hc_combine(
         x_flat.stride(0),
         pre.stride(0),
         pre.stride(1),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
+
+
+def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
+    into ``out`` when given."""
+    m, hc, h = x.shape
+    # Bitwise equality with torch's CUDA mean holds for 4 streams (the mHC width)
+    # over whole 1024-element blocks; torch orders some other widths differently.
+    if (
+        _is_hip
+        or x.device.type != "cuda"
+        or hc != 4
+        or h % 1024
+        or x.stride(2) != 1
+        or (out is not None and (out.dtype != x.dtype or out.stride(1) != 1))
+    ):
+        y = x.mean(dim=1)
+        return y if out is None else out.copy_(y)
+    y = torch.empty((m, h), dtype=x.dtype, device=x.device) if out is None else out
+    block_h = 1024
+    _mhc_stream_mean_kernel[(m, triton.cdiv(h, block_h))](
+        x,
+        y,
+        h,
+        x.stride(0),
+        x.stride(1),
         y.stride(0),
         HC=hc,
         BLOCK_H=block_h,

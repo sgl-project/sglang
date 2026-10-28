@@ -1,3 +1,4 @@
+import ctypes
 import io
 import logging
 import os
@@ -28,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 def configure_nixl_pd_backend(test_cls):
     test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-    # NIXL backend/network selection is driven by NIXL environment variables
-    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
-    # Mooncake-specific --disaggregation-ib-device argument.
+    # Keep these tests on the configured NIXL/UCX device selection rather than
+    # inheriting the Mooncake fixture's per-side RDMA device lists.
     test_cls.rdma_devices = []
 
 
@@ -96,6 +96,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
+            _warn_if_rdma_unopenable()
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
@@ -117,7 +118,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def rdma_devices_for(cls, gpu_indices) -> list:
         """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
-        if not is_in_ci():
+        if not is_in_ci() or not cls.rdma_devices:
             return cls.rdma_devices
         return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
@@ -404,6 +405,41 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
 _IB_SYSFS = "/sys/class/infiniband"
 
 
+# None means libibverbs is not loadable, not that no device is openable.
+def _ibverbs_device_names() -> Optional[set]:
+    try:
+        lib = ctypes.CDLL("libibverbs.so.1")
+    except OSError:
+        return None
+    lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
+    lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.ibv_get_device_name.restype = ctypes.c_char_p
+    lib.ibv_get_device_name.argtypes = [ctypes.c_void_p]
+    lib.ibv_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    num = ctypes.c_int(0)
+    devices = lib.ibv_get_device_list(ctypes.byref(num))
+    if not devices:
+        return set()
+    try:
+        return {lib.ibv_get_device_name(devices[i]).decode() for i in range(num.value)}
+    finally:
+        lib.ibv_free_device_list(devices)
+
+
+# Without an openable device the PD transfer backend silently falls back to TCP,
+# and transfers may then fail under load; warn so such failures are traceable.
+def _warn_if_rdma_unopenable() -> None:
+    if not _get_available_ib_devices():
+        return
+    if _ibverbs_device_names() == set():
+        logger.warning(
+            "Active RDMA devices are listed in %s but ibverbs can open none; "
+            "the PD transfer backend will fall back to TCP. "
+            "Check /dev/infiniband in the container.",
+            _IB_SYSFS,
+        )
+
+
 def _roce_v2_gid_index(device: str):
     """Return a RoCEv2 GID index for a device, preferring a global (routable)
     GID over a link-local (fe80::) one, or None if the device has no RoCEv2 GID.
@@ -490,9 +526,13 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
     if not devices:
         return False
-    net_devices = ",".join(f"{d}:1" for d in devices)
-    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
-    # device on the host, and that full-device init can stall inside the driver.
+    # UCX applies this list to every network device, not just the RDMA ones, so
+    # an RDMA-only list also drops tcp. NIXL opens an endpoint to itself during
+    # createBackend and tcp is the only transport left that can serve it, so
+    # keep loopback here.
+    net_devices = ",".join([*(f"{d}:1" for d in devices), "lo"])
+    # Limit default UCX device discovery; opening every RDMA device on the host
+    # can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices
     logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

@@ -31,6 +31,7 @@ References:
 - https://huggingface.co/lightonai/LightOnOCR-2-1B
 """
 
+from array import array
 from dataclasses import fields
 from typing import Iterable, List, Tuple
 
@@ -39,8 +40,8 @@ import torch.nn as nn
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -125,9 +126,8 @@ class LightOnOCRForConditionalGeneration(nn.Module):
             quant_config=quant_config,
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process images through vision encoder and projection pipeline."""

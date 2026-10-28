@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 
 register_cuda_ci(
     est_time=400,
-    stage="base-c",
+    stage="extra-b",
     runner_config="4-gpu-b200",
 )
 
@@ -28,6 +28,8 @@ class TestGLM52NVFP4TPMTP(
         "flashinfer_trtllm",
         "--quantization",
         "modelopt_fp4",
+        "--flashinfer-allreduce-fusion-backend",
+        "cutedsl",
     ]
 
 

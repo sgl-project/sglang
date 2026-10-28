@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -138,6 +140,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: bool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
@@ -250,6 +253,7 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: bool = False
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -325,6 +329,11 @@ class AnthropicTaskBudget(BaseModel):
     remaining: Optional[int] = Field(default=None, ge=0)
 
 
+class AnthropicJSONOutputFormat(BaseModel):
+    type: Literal["json_schema"]
+    schema_: dict[str, Any] = Field(alias="schema")
+
+
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
@@ -335,6 +344,7 @@ class AnthropicOutputConfig(BaseModel):
 
     effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
+    format: Optional[AnthropicJSONOutputFormat] = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -346,7 +356,7 @@ class AnthropicCountTokensRequest(BaseModel):
     thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
-    # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
+    # Claude 4.7 / SDK-compatibility fields; betas is accepted but ignored.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
@@ -357,7 +367,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(PDRoutingFields):
     """Anthropic Messages API request."""
 
     model: str
