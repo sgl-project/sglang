@@ -1571,7 +1571,7 @@ class CPUGraphRunner:
             self.model_runner.model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=None,
+            dynamic=True,
         ) as forward:
             dynamic_warmup_bs = [
                 bs
@@ -2149,7 +2149,7 @@ class CPUGraphRunner:
             self._prefill_graph_model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=None,
+            dynamic=True,
             model_forward=(
                 self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
@@ -2177,7 +2177,7 @@ class CPUGraphRunner:
             self._prefill_graph_model,
             self.enable_torch_compile,
             tp_group=get_parallel().tp_group,
-            dynamic=None,
+            dynamic=True,
             model_forward=(
                 self._prefill_original_forward
                 if self._prefill_uses_eager_logits_tail
