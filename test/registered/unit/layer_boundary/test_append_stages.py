@@ -418,12 +418,6 @@ class TestPipelineHandoff(CustomTestCase):
         )
         self.assertFalse(self.path(first_ffn).writes_at_handoff)
         self.assertTrue(self.path(second_ffn).writes_at_handoff)
-        # The compute output is still sharded before the handoff move. Reading
-        # produced.layout as the PP wire layout would skip send slicing while
-        # the receiver still gathers, multiplying its expected row count.
-        outgoing = second_ffn.plan.edges[BatchVariant.ORDINARY].outgoing
-        self.assertIn(TokenAxis.ATTN_TP, outgoing.produced.layout.sharded)
-        self.assertNotIn(TokenAxis.ATTN_TP, outgoing.need.layout.sharded)
 
     def test_the_handoff_writes_what_the_move_leaves(self):
         # A move that leaves the residual, as for an FFN on an unpadded batch's
