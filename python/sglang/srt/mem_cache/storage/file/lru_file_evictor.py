@@ -69,6 +69,7 @@ class LRUFileEvictor:
         *,
         owned_suffixes: Tuple[str, ...],
         tp_rank: int,
+        kv_sharded: bool = False,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -88,6 +89,13 @@ class LRUFileEvictor:
         self._load_config(extra_config or {})
 
         self._eviction_enabled = self.max_size_bytes > 0 or self.min_free_bytes > 0
+        if kv_sharded and self._eviction_enabled:
+            # Shard ranks share rank-free files; refuse before the startup scan
+            # evicts pages peers own.
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support HiCacheFile "
+                "eviction (max_size / min_free_space)."
+            )
         if not self._eviction_enabled:
             return
 

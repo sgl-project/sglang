@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     EvictParams,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import match_kv_cache
@@ -33,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
@@ -2486,6 +2488,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
@@ -2655,6 +2658,76 @@ class TestUnifiedRadixPrefetchCorruption(
             completed_tokens, "dropped"
         )
 
+        cache.sanity_check()
+
+    def test_rotation_declined_prefetch_reissues_before_admission(self):
+        """A KV-shard rotation decline drops the read; the request must stay out
+        of admission until the re-issue fires, or the L3-only tail is recomputed."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 2 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.completed_tokens = completed_tokens
+        operation.storage_start = 3 * self.ps
+        operation.hash_value = hashes
+        req_id = CacheRequestHandle("rotation-declined", 0)
+        operation.handle = req_id
+        operation.request_id = req_id.rid
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent_id,
+            prefetch_key,
+            host_indices,
+            operation,
+            cache.inc_host_lock_ref(parent_id).to_dec_params(),
+            {},
+        )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        declined = InsertResult(
+            prefix_len=0,
+            total_len=completed_tokens,
+            host_insert_dropped=True,
+            rotation_tail_declined=True,
+        )
+
+        with (
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache,
+                "_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(cache.cache_controller, "append_host_mem_release"),
+            mock.patch.object(operation, "is_terminated", return_value=False),
+            mock.patch.object(cache.tree_core, "insert_host", return_value=declined),
+        ):
+            self.assertFalse(cache.check_prefetch_progress(req_id))
+
+        # Even at the queue head, the re-issue is due now and resumes the span.
+        head = SimpleNamespace(rid=req_id.rid, storage_prefetch_retry_attempts=0)
+        self.assertEqual(
+            cache.storage_prefetch_retries.pop_ready(
+                [head], interval=8, max_attempts=3
+            ),
+            [(head, operation.storage_start + completed_tokens)],
+        )
         cache.sanity_check()
 
     def test_write_through_eviction_counts_unbacked_tokens(self):

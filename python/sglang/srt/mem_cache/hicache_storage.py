@@ -44,8 +44,19 @@ class HiCacheStorageConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     logical_page_size: Optional[int] = None
+    # Logical-page KV sharding: keys name the head shard (attn-TP), never the
+    # shard rank that holds a page; tp_rank/tp_size keep the rank-local roles.
+    key_tp_rank: Optional[int] = None
+    key_tp_size: Optional[int] = None
 
     def __post_init__(self):
+        if (self.key_tp_rank is None) != (self.key_tp_size is None):
+            raise ValueError("KV-sharded storage requires both key TP rank and size.")
+        if self.key_tp_rank is not None:
+            if self.key_tp_size <= 0 or not 0 <= self.key_tp_rank < self.key_tp_size:
+                raise ValueError("Invalid key TP size or rank for KV-sharded storage.")
+            if self.dcp_size != 1:
+                raise ValueError("KV-sharded storage and DCP are mutually exclusive.")
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
             raise ValueError("Invalid DCP size or rank for HiCache storage.")
         if self.dcp_size == 1:
@@ -67,10 +78,16 @@ class HiCacheStorageConfig:
 
     @property
     def is_storage_writer(self) -> bool:
-        """MLA replicas share one writer per DCP shard, in the first DCP group.
+        """Select writers among replicas without skipping any owned KV pages.
 
-        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        KV sharding without CP gives every MLA TP rank different pages. With
+        CP, only attention-TP rank 0 writes each CP rank's pages. Unsharded MLA
+        keeps one writer per DCP shard in the first DCP group.
         """
+        if self.key_tp_rank is not None:
+            return (
+                not self.is_mla_model or self.attn_cp_size <= 1 or self.key_tp_rank == 0
+            )
         return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
@@ -747,17 +764,24 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        kv_sharded = storage_config.key_tp_rank is not None
         shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
+        if attn_cp_size > 1 and not kv_sharded:
             shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
         # MLA KV is replicated across TP ranks and shares one file per page;
         # TP-sharded state is keyed by tp_config_suffix instead.
         self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
-        self.config_suffix = (
-            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
-        )
+        if is_mla_model:
+            self.config_suffix = f"_{model_name}{shard_suffix}"
+        elif kv_sharded:
+            self.config_suffix = (
+                f"_{model_name}_{storage_config.key_tp_rank}"
+                f"_{storage_config.key_tp_size}{shard_suffix}"
+            )
+        else:
+            self.config_suffix = self.tp_config_suffix
 
         # TODO: Include KV dtype and stored layout in keys for both DCP and
         # non-DCP caches; raw file payloads do not describe their format.
@@ -807,12 +831,16 @@ class HiCacheFile(HiCacheStorage):
         # Each rank owns its TP-sharded state; selected DCP writers also own
         # their shared MLA shard files.
         owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and storage_config.is_storage_writer:
+        if (
+            storage_config.is_storage_writer
+            and self.config_suffix != self.tp_config_suffix
+        ):
             owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
+            kv_sharded=kv_sharded,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

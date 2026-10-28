@@ -628,11 +628,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
+            # Key by head shard, independently of the rank selecting its NIC,
+            # storage segment and SSD directory.
+            key_rank = (
+                storage_config.key_tp_rank
+                if storage_config is not None and storage_config.key_tp_rank is not None
+                else self.local_rank
+            )
             if self.enable_pp:
-                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mha_suffix = f"{key_rank}_{self.pp_rank}"
                 self.mla_suffix = f"{self.pp_rank}"
             else:
-                self.mha_suffix = f"{self.local_rank}"
+                self.mha_suffix = f"{key_rank}"
                 self.mla_suffix = ""
 
             if self.dcp_size > 1:
