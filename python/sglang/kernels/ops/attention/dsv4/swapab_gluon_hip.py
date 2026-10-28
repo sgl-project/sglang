@@ -44,6 +44,69 @@ def _load_v4_hip(
     return gl.where(d[None, :] < 448, nope, rope)
 
 
+# a buffer descriptor's num_records (Triton sets 2**31 - 2 bytes); a cache past it
+# keeps the global-load path, whose offsets are 64-bit
+BUFFER_BYTES = gl.constexpr(2**31 - 2)
+
+
+@gluon.jit
+def _load_v4_buffer(
+    CACHE,
+    ids,
+    valid,
+    PAGE: gl.constexpr,
+    STRIDE: gl.constexpr,
+    KV_LAYOUT: gl.constexpr,
+    DATA_BYTES: gl.constexpr,
+    SCALE_BYTES: gl.constexpr,
+    TILE: gl.constexpr,
+):
+    # an invalid row's offsets start at 2**31, past num_records, so the hardware reads
+    # 0. Columns >= 448 of the fp8 and scale loads read the row's own rope and pad
+    # bytes, which the final select drops.
+    d = gl.arange(0, 512, gl.SliceLayout(0, KV_LAYOUT))
+    page = (ids // PAGE) * STRIDE
+    slot = ids % PAGE
+    row = gl.where(valid, page + slot * DATA_BYTES, -(2**31))[:, None]
+    bits = gl.amd.cdna4.buffer_load(CACHE, row + d[None, :])
+    scales = gl.where(valid, page + PAGE * DATA_BYTES + slot * SCALE_BYTES, -(2**31))
+    exponent = gl.amd.cdna4.buffer_load(CACHE, scales[:, None] + d[None, :] // TILE)
+    nope = gl.amd.cdna4.scaled_upcast(
+        bits.to(gl.float8e4nv, bitcast=True), exponent, gl.bfloat16
+    )
+    # a masked-off vector also reads 0: with `other` unset Triton adds no select
+    rope = gl.amd.cdna4.buffer_load(
+        CACHE.to(gl.pointer_type(gl.bfloat16)),
+        (row >> 1) + (d[None, :] - 224),
+        (d >= 448)[None, :],
+    )
+    return gl.where(d[None, :] < 448, nope, rope)
+
+
+@gluon.jit
+def _load_kv(
+    CACHE,
+    ids,
+    valid,
+    TOKENS: gl.constexpr,
+    PAGE: gl.constexpr,
+    STRIDE: gl.constexpr,
+    KV_LAYOUT: gl.constexpr,
+    DATA_BYTES: gl.constexpr,
+    SCALE_BYTES: gl.constexpr,
+    TILE: gl.constexpr,
+):
+    # the rope offsets count bf16 elements, so a row must start on an even byte
+    if TOKENS // PAGE * STRIDE <= BUFFER_BYTES and STRIDE % 2 == 0:
+        return _load_v4_buffer(
+            CACHE, ids, valid, PAGE, STRIDE, KV_LAYOUT, DATA_BYTES, SCALE_BYTES, TILE
+        )
+    else:
+        return _load_v4_hip(
+            CACHE, ids, valid, PAGE, STRIDE, KV_LAYOUT, DATA_BYTES, SCALE_BYTES, TILE
+        )
+
+
 @gluon.jit
 def partial_gluon(
     Q,
@@ -81,17 +144,21 @@ def partial_gluon(
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 32 or BT == 64 or BT == 128))
     b, t = gl.program_id(0), gl.program_id(1)
-    kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
+    # warps split the rows, so each register's columns, and with them the fp8 or
+    # rope side of 448, are known at compile time and the gather has no dead loads
+    kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
+    q_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
     if t < KT:
         at = t * BT + n
         length = gl.load(L + b)
-        ids = gl.load(IDX + b * IS + at, at < NK, -1)
+        ids = gl.amd.cdna4.buffer_load(IDX + b * IS, at, at < NK)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4_hip(
+        kv = _load_kv(
             K,
             gl.maximum(ids, 0),
             valid,
+            KTOKENS,
             KP,
             KS,
             kv_layout,
@@ -102,12 +169,13 @@ def partial_gluon(
     else:
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
-        ids = gl.load(EI + b * EIS + at, at < NE, -1)
+        ids = gl.amd.cdna4.buffer_load(EI + b * EIS, at, at < NE)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4_hip(
+        kv = _load_kv(
             E,
             gl.maximum(ids, 0),
             valid,
+            ETOKENS,
             EP,
             ES,
             kv_layout,
@@ -115,8 +183,8 @@ def partial_gluon(
             SCALE_BYTES,
             TILE,
         )
-    qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
-    qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
+    qh = gl.arange(0, H, gl.SliceLayout(1, q_layout))
+    qd = gl.arange(0, 512, gl.SliceLayout(0, q_layout))
     q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
     # transposed=False: a lane holds 4 consecutive d of one head in the PV result,
     # so `value` stores to PART [h, d] without an LDS relayout
