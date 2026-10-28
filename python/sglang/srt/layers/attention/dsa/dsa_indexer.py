@@ -14,6 +14,15 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
+from sglang.kernels.ops.attention.dsa.fused_mqa_topk import (
+    FUSED_MQA_TOPK_HEAD_DIM,
+    FUSED_MQA_TOPK_MIN_KEYS,
+    FUSED_MQA_TOPK_NUM_HEADS,
+    FUSED_MQA_TOPK_TOPK,
+    can_use_fused_mqa_topk_prefill,
+    fused_mqa_topk_prefill,
+    is_fused_mqa_topk_supported,
+)
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -21,7 +30,10 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -29,6 +41,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -249,6 +262,61 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
+# Lowest bounds at which the fused path was not slower than the dense one on
+# any measured GLM-5.2 layer (B200, single-request chunks, dense at its static
+# logits budget): keys the longest row sees, and query rows (one CTA scans 8
+# rows, so fewer rows idle SMs). The dense PAGED transform costs more than the
+# RAGGED one, which the unfused top-k matches; PAGED's bound is the shortest
+# length measured, as 20481 to 24575 keys were not. Re-measure when the kernel
+# changes.
+_FUSED_MQA_TOPK_MIN_KEYS_RAGGED = 32768
+_FUSED_MQA_TOPK_MIN_ROWS_RAGGED = 1024
+_FUSED_MQA_TOPK_MIN_KEYS_PAGED = 24576
+_FUSED_MQA_TOPK_MIN_ROWS_PAGED = 1024
+# A chunk past either keys bound is never too small for the op: K holds at least
+# the longest row's keys.
+assert (
+    min(_FUSED_MQA_TOPK_MIN_KEYS_RAGGED, _FUSED_MQA_TOPK_MIN_KEYS_PAGED)
+    >= FUSED_MQA_TOPK_MIN_KEYS
+)
+
+
+_FUSED_MQA_TOPK_LOGGED = False
+
+
+def _log_fused_mqa_topk_once(enabled: bool) -> None:
+    global _FUSED_MQA_TOPK_LOGGED
+    if _FUSED_MQA_TOPK_LOGGED:
+        return
+    _FUSED_MQA_TOPK_LOGGED = True
+    if enabled:
+        logger.info("Using the fused LiteTopK indexer top-k for DSA prefill")
+    else:
+        logger.warning(
+            "SGLANG_ENABLE_DSA_FUSED_MQA_TOPK is set but the DSA indexer cannot use "
+            "it: it needs CUDA SM100 with nvcc >= 12.9, 32 index heads of dim 128, "
+            "index_topk 2048, no index init/local tokens, no prefill context "
+            "parallelism and no deterministic inference"
+        )
+
+
+def _fused_mqa_topk_transform(
+    metadata: DSAIndexerMetadata, num_rows: int
+) -> Dict[str, torch.Tensor]:
+    """metadata.topk_transform's index transform as fused top-k arguments: the
+    fused RAGGED transform rebases onto the flattened KV, the fused PAGED one
+    maps through the page_size=1 table of the row's request, and the unfused
+    top-k leaves indices row-relative for the attention backend to transform."""
+    if not envs.SGLANG_DSA_FUSE_TOPK.get() or metadata.force_unfused_topk:
+        return {}
+    if metadata.topk_transform_method == TopkTransformMethod.RAGGED:
+        return {"out_offsets": metadata.attn_metadata.topk_indices_offset[:num_rows]}
+    return {
+        "page_table": metadata.get_page_table_1(),
+        "row_batch": metadata.get_token_to_batch_idx()[:num_rows],
+    }
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -420,6 +488,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        self.use_fused_mqa_topk = False
+        if _is_cuda and envs.SGLANG_ENABLE_DSA_FUSED_MQA_TOPK.get():
+            self.use_fused_mqa_topk = self._fused_mqa_topk_supported()
+            _log_fused_mqa_topk_once(self.use_fused_mqa_topk)
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
         # runtime half is dsa/utils.gfx950_fused_indexer_runtime_ok.
@@ -1460,6 +1532,73 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
+    def _fused_mqa_topk_supported(self) -> bool:
+        return (
+            self.n_heads == FUSED_MQA_TOPK_NUM_HEADS
+            and self.head_dim == FUSED_MQA_TOPK_HEAD_DIM
+            and self.index_topk == FUSED_MQA_TOPK_TOPK
+            # The fused top-k has no logits buffer to force these tokens into.
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+            and not self.dsa_enable_prefill_cp
+            # Ties at the k-th score are resolved in atomic arrival order.
+            and not get_exec().deterministic.enable_deterministic_inference
+            and is_fused_mqa_topk_supported()
+        )
+
+    def _fused_mqa_topk_prefill(
+        self,
+        *,
+        metadata: BaseIndexerMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        max_seq_len: int,
+        out: torch.Tensor,
+    ) -> bool:
+        """Writes ``out`` with the fused top-k when the call is covered and meets
+        the _FUSED_MQA_TOPK_MIN_* bounds (where the fused path was not slower than
+        the dense one); returns whether it did."""
+        if (
+            # _fused_mqa_topk_transform reads the RAGGED offsets or the PAGED
+            # page table off it.
+            not isinstance(metadata, DSAIndexerMetadata)
+            # Its per-stream workspace is allocated on first use, not under capture.
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        num_rows = q_fp8.shape[0]
+        transform = _fused_mqa_topk_transform(metadata, num_rows)
+        if "page_table" in transform:
+            min_keys = _FUSED_MQA_TOPK_MIN_KEYS_PAGED
+            min_rows = _FUSED_MQA_TOPK_MIN_ROWS_PAGED
+        else:
+            min_keys = _FUSED_MQA_TOPK_MIN_KEYS_RAGGED
+            min_rows = _FUSED_MQA_TOPK_MIN_ROWS_RAGGED
+        if (
+            max_seq_len < min_keys
+            or num_rows < min_rows
+            or not can_use_fused_mqa_topk_prefill(
+                q_fp8, k_fp8, k_scale, weights, self.index_topk
+            )
+        ):
+            return False
+        fused_mqa_topk_prefill(
+            q_fp8=q_fp8,
+            k_fp8=k_fp8,
+            k_scale=k_scale,
+            weights=weights,
+            starts=ks,
+            ends=ke,
+            topk=self.index_topk,
+            out=out,
+            **transform,
+        )
+        return True
+
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
@@ -1565,6 +1704,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        if self.use_fused_mqa_topk and self._fused_mqa_topk_prefill(
+            metadata=metadata,
+            q_fp8=q_fp8[:q_offset],
+            weights=weights[:q_offset],
+            k_fp8=k_fp8,
+            k_scale=k_scale,
+            ks=ks,
+            ke=ke,
+            max_seq_len=max_seq_len,
+            out=topk_result[:q_offset],
+        ):
+            return topk_result
+
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=q_offset,
             num_cols=k_offset,

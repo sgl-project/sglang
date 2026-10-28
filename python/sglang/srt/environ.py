@@ -2027,6 +2027,9 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in (CUDA SM100): DSA prefill top-k through the optimized
+    # LiteTopK fused indexer kernel, which never materializes the logits.
+    SGLANG_ENABLE_DSA_FUSED_MQA_TOPK = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
     # Separate from the CUDA flag: that one also packs wk+weights_proj.

@@ -344,6 +344,17 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.fused_mqa_topk_prefill",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.fused_mqa_topk:fused_mqa_topk_prefill",
+        # tcgen05 + TMEM; gates and dispatch tuned and validated on SM100 (B200) only.
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_k_indexer_norm_rope",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",

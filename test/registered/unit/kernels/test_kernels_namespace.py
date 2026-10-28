@@ -517,5 +517,15 @@ def test_deep_select_spec_matches_wrapper_architectures():
     )
 
 
+def test_fused_mqa_topk_spec_matches_wrapper_architectures():
+    """The group cannot import the wrapper, so this is the only link between the two SM lists."""
+    from sglang.kernels.ops.attention.dsa import fused_mqa_topk
+
+    spec = K.registry.get_backend("attention.fused_mqa_topk_prefill", KernelBackend.JIT)
+    assert spec.capabilities == frozenset(
+        Cap.cuda(min_sm=sm, max_sm=sm) for sm in fused_mqa_topk.SUPPORTED_CUDA_ARCHS
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
