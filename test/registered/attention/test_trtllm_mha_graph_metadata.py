@@ -24,19 +24,28 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args):
+    def parent_init(self, *args, **kwargs):
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -46,7 +55,9 @@ def make_xqa_backend(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
-    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "resolve_window_kv_pool", lambda *args: None
+    )
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -83,6 +94,7 @@ def make_xqa_backend(monkeypatch):
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
+            is_draft_worker=False,
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -113,7 +125,9 @@ def _run_decode_mode_extend(backend, monkeypatch, *, mode, width, decode):
     backend.forward_metadata = SimpleNamespace(
         is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
     )
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    )
     backend._should_use_fused_fp8_path = lambda *a: False
     backend._reshape_paged_kv_cache = lambda *a: (None, None)
     backend._get_bmm_scales = lambda *a: (1.0, 1.0)
@@ -235,7 +249,9 @@ def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
         page_table=torch.arange(bs, dtype=torch.int32)[:, None],
     )
     kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    )
     monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
     workspaces = {}
 
@@ -308,11 +324,12 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
     page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
     for row, pages in enumerate(row_pages):
         page_table[row, : len(pages)] = torch.tensor(pages)
-    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
-    v = torch.randn_like(k)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+    # V before K in one buffer: never the fused-halves layout fmha_v2 reads
+    # without a copy, so the prefill takes the copy path.
+    v, k = torch.randn(2, pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
+    backend.token_to_kv_pool = _routed(SimpleNamespace(get_kv_buffer=lambda _: (k, v)))
 
-    backend.kv_index_translator = SimpleNamespace(
+    backend.runner_ids = SimpleNamespace(
         read_table=lambda plan, rows: SimpleNamespace(
             ids=page_table, is_translated=True
         ),
@@ -342,7 +359,7 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
         extend_seq_lens_cpu=seq_lens.tolist(),
         extend_prefix_lens_cpu=[0, 0],
         req_pool_indices=torch.arange(2),
-        kv_loc_plan=None,
+        iteration_ids=None,
         _attn_output=None,
     )
     layer = SimpleNamespace(
@@ -490,7 +507,7 @@ def test_native_nvfp4_output_capacity_includes_unchunked_batch(
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
-    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
@@ -510,10 +527,12 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.draft_extend_metadata = {}
     # Passthrough source (static pool): every unified-arm branch stays off,
     # matching the real __init__'s parent binding.
-    backend.kv_index_translator = KVIndexTranslator(
+    backend.runner_ids = RunnerIds(
         req_to_token=backend.req_to_token,
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=PAGE_SIZE,
         device="cpu",
     )
@@ -620,8 +639,8 @@ def _translate_through_a_moving_page_map(backend):
     """Give the backend a translating pool whose virtual->physical page map the
     test rewrites before every replay, so a page-table column the refill missed
     still holds an earlier replay's page."""
-    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
     rows, width = backend.req_to_token.shape
     # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
@@ -629,21 +648,21 @@ def _translate_through_a_moving_page_map(backend):
         torch.arange(rows * width, dtype=torch.int32).view(rows, width) + PAGE_SIZE
     )
     v2p = torch.zeros(rows * width // PAGE_SIZE + 1, dtype=torch.int64)
-    translator = KVIndexTranslator.__new__(KVIndexTranslator)
-    translator.req_to_token = backend.req_to_token
-    translator.page_size = PAGE_SIZE
-    translator.device = "cpu"
-    translator.is_translating = True
-    translator.defer_read_translate = False
-    translator._capture_page_size = PAGE_SIZE
-    translator._full_v2p_table = v2p
-    translator._spaces = {
+    runner_ids = RunnerIds.__new__(RunnerIds)
+    runner_ids.req_to_token = backend.req_to_token
+    runner_ids.page_size = PAGE_SIZE
+    runner_ids.device = "cpu"
+    runner_ids.is_translating = True
+    runner_ids.defer_read_translate = False
+    runner_ids._capture_page_size = PAGE_SIZE
+    runner_ids._full_v2p_table = v2p
+    runner_ids._spaces = {
         IdSpaceKind.FULL: IdSpace(
             key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
         )
     }
-    translator._rows = torch.arange(rows, dtype=torch.int64)
-    backend.kv_index_translator = translator
+    runner_ids._rows = torch.arange(rows, dtype=torch.int64)
+    backend.runner_ids = runner_ids
     return v2p
 
 
@@ -700,14 +719,14 @@ def _replay_and_check_every_read(
     )
     v2p = _translate_through_a_moving_page_map(backend)
     capture = batch([1, 1])
-    bind_plan(backend.kv_index_translator, capture)
+    bind_plan(backend.runner_ids, capture)
     backend.init_forward_metadata_out_graph(capture, in_capture=True)
     backend.init_forward_metadata_in_graph(capture)
     # Rows grow across page boundaries and trade lengths between replays.
     for n, seq_lens in enumerate(replays, start=1):
         _move_every_page(v2p, n)
         replay = batch(seq_lens)
-        bind_plan(backend.kv_index_translator, replay)
+        bind_plan(backend.runner_ids, replay)
         backend.init_forward_metadata_out_graph(replay)
         backend.init_forward_metadata_in_graph(replay)
         _assert_reads_only_current_pages(backend, v2p)
@@ -724,7 +743,7 @@ def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
         monkeypatch,
         _make_backend_for_hook_test(),
         batch,
-        lambda translator, fb: translator.bind_own_plan(fb),
+        lambda runner_ids, fb: runner_ids.bind_own_plan(fb),
     )
 
 
@@ -754,32 +773,32 @@ def test_unified_eager_table_must_be_packed():
     backend = _make_backend_for_hook_test()
     v2p = _translate_through_a_moving_page_map(backend)
     _move_every_page(v2p, 1)
-    translator = backend.kv_index_translator
+    runner_ids = backend.runner_ids
 
     forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
+    runner_ids.bind_own_plan(forward_batch)
     backend.init_forward_metadata(forward_batch)
     assert backend.forward_metadata.page_table.is_contiguous()
     _assert_reads_only_current_pages(backend, v2p)
 
     forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
+    runner_ids.bind_own_plan(forward_batch)
     captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
-    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
+    runner_ids.copy_page_table(forward_batch.iteration_ids, out=captured[:2])
     with pytest.raises(AssertionError, match="packed rows"):
         backend.init_forward_metadata(forward_batch)
 
 
-def _bind_iteration_plan(translator, forward_batch, window=4):
+def _bind_iteration_plan(runner_ids, forward_batch, window=4):
     """The plan a speculative worker builds once per iteration: its reads reach
     the whole draft window past the committed lengths."""
-    translator.plan(
+    runner_ids.plan(
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         write_virtual=forward_batch.out_cache_loc,
         read_extent=window,
-    ).bind(forward_batch, translator)
+    ).bind(forward_batch, runner_ids)
 
 
 @pytest.mark.parametrize(
@@ -835,7 +854,7 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
         monkeypatch,
         backend,
         batch,
-        lambda translator, fb: _bind_iteration_plan(translator, fb, window=8),
+        lambda runner_ids, fb: _bind_iteration_plan(runner_ids, fb, window=8),
         replays=([5, 123], [300, 3]),
     )
 
@@ -857,7 +876,7 @@ def test_unified_eager_spec_table_covers_every_page_read(
     _move_every_page(v2p, 1)
     # 127 committed tokens plus the drafts reach a page the prefix does not.
     forward_batch = _eager_batch([127, 3], forward_mode, spec_info, tokens_per_req)
-    _bind_iteration_plan(backend.kv_index_translator, forward_batch)
+    _bind_iteration_plan(backend.runner_ids, forward_batch)
     backend.init_forward_metadata(forward_batch)
     _assert_reads_only_current_pages(backend, v2p)
 
@@ -882,7 +901,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
                 needs_cpu_seq_lens=False,
-                kv_index_translator=None,
+                runner_ids=None,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
             )
 
@@ -894,7 +913,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
-                kv_index_translator=None,
+                runner_ids=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
                 model_config=SimpleNamespace(context_len=2048),
             ),
@@ -1062,10 +1081,11 @@ def test_swa_cache_write_uses_metadata_slot_snapshot():
         raise AssertionError("cache writes must not read the live SWA mapping")
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend._swa_kv_pool = SimpleNamespace(
-        layers_mapping={1: (0, True)},
-        translate_loc_from_full_to_swa=translate_live_mapping,
+    swa_pool = SimpleNamespace(translate_loc_from_full_to_swa=translate_live_mapping)
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(IdSpaceKind.SLIDING_WINDOW, None, {1: 0})]
     )
+    backend._swa_kv_pool = swa_pool
     backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
     forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
 
@@ -1291,7 +1311,7 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
 def test_skip_page_table_updates_seqlens_only(pass_tables):
     """The unified-memory arm: skip_page_table=True must still rebuild the
     seqlen metadata in-graph but leave every page-table byte alone -- the bound
-    tables are capture-stable read tables the translator refreshes
+    tables are capture-stable read tables the `RunnerIds` refreshes
     out-of-graph, and an in-graph write would clobber them with virtual-derived
     pages. Covers both call shapes: page_table=None (what the backend passes)
     and a real sentinel-filled table (pins that the writes are compiled out,

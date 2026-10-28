@@ -39,7 +39,7 @@ from sglang.test.separate_buffer_allocator_double import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -513,6 +513,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         # auto-create one and break the `available_size() <= 0` comparison in
         # pop_preallocated.
         queue.req_to_token_pool.mamba_allocator = None
+        queue.req_to_token_pool.holds_state_slots = False
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64
         ).reshape(8, 16)

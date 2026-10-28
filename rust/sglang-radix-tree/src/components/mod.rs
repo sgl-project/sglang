@@ -60,6 +60,10 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 
+    /// What the driver keeps of a cached prefix; the core finds the window
+    /// or state slot by its family, never by its id.
+    fn family(&self) -> Family;
+
     /// Allocator slots reclaimed from this component's device value.
     /// Roots and absent device values contribute zero; splits preserve the total.
     fn reclaimable_value_len(&self, node: &Node<K>) -> usize {
@@ -77,15 +81,15 @@ pub trait TreeComponent<K: ChildKeyType> {
         host: bool,
     ) -> i64 {
         let component_type = self.component_type();
-        let existing = match (component_type, host) {
-            (ComponentType::Full, true) => tree_core.arena.node(node_id).full_host_uuid,
-            (ComponentType::Swa, true) => tree_core.arena.node(node_id).swa_host_uuid,
-            (ComponentType::Swa, false) => tree_core.arena.node(node_id).swa_uuid,
-            (ComponentType::Full, false) => {
-                panic!("get_or_fill_uuid is unsupported for Full device locks")
+        let existing = match (self.family(), host) {
+            (Family::Token, true) => tree_core.arena.node(node_id).full_host_uuid,
+            (Family::Window, true) => tree_core.arena.node(node_id).swa_host_uuid,
+            (Family::Window, false) => tree_core.arena.node(node_id).swa_uuid,
+            (Family::Token, false) => {
+                panic!("get_or_fill_uuid is unsupported for token device locks")
             }
-            (ComponentType::Mamba, _) => {
-                panic!("get_or_fill_uuid is unsupported for Mamba")
+            (Family::State, _) => {
+                panic!("get_or_fill_uuid is unsupported for state slots")
             }
         };
         if let Some(uuid) = existing {
@@ -94,11 +98,11 @@ pub trait TreeComponent<K: ChildKeyType> {
 
         let uuid = tree_core.next_component_uuid_(component_type);
         let node = tree_core.arena.node_mut(node_id);
-        match (component_type, host) {
-            (ComponentType::Full, true) => node.full_host_uuid = Some(uuid),
-            (ComponentType::Swa, true) => node.swa_host_uuid = Some(uuid),
-            (ComponentType::Swa, false) => node.swa_uuid = Some(uuid),
-            (ComponentType::Full, false) | (ComponentType::Mamba, _) => unreachable!(),
+        match (self.family(), host) {
+            (Family::Token, true) => node.full_host_uuid = Some(uuid),
+            (Family::Window, true) => node.swa_host_uuid = Some(uuid),
+            (Family::Window, false) => node.swa_uuid = Some(uuid),
+            (Family::Token, false) | (Family::State, _) => unreachable!(),
         }
         uuid
     }
@@ -509,6 +513,56 @@ pub trait TreeComponent<K: ChildKeyType> {
 }
 
 // Tree component types.
+
+/// What a tree slot keeps of a cached prefix: every token (`Token`), the
+/// trailing window (`Window`) or recurrent state checkpoints (`State`). The
+/// plan gives each slot its family; behavior follows the family, the slot id
+/// only names the slot.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum Family {
+    Token = 0,
+    Window = 1,
+    State = 2,
+}
+
+/// The slot id the native driver of `family` serves. Each native driver
+/// serves one fixed slot today; several window slots need per-instance ids.
+pub const fn native_slot(family: Family) -> ComponentType {
+    match family {
+        Family::Token => FULL,
+        Family::Window => SWA,
+        Family::State => MAMBA,
+    }
+}
+
+/// The family whose native driver serves `slot`, for callers that name slots
+/// by id (tests).
+pub fn native_family(slot: ComponentType) -> Family {
+    [Family::Token, Family::Window, Family::State]
+        .into_iter()
+        .find(|&family| native_slot(family) == slot)
+        .unwrap_or_else(|| panic!("no native driver serves slot {slot:?}"))
+}
+
+impl Family {
+    /// Families per tree; arrays indexed by `Family::idx` are sized to this.
+    pub const COUNT: usize = Family::State as usize + 1;
+
+    /// Index into a per-family array.
+    pub const fn idx(self) -> usize {
+        self as usize
+    }
+
+    /// The family a tree slot names (`TreeSlot.family` on the Python side).
+    pub fn parse(name: &str) -> Option<Family> {
+        match name {
+            "token" => Some(Family::Token),
+            "window" => Some(Family::Window),
+            "state" => Some(Family::State),
+            _ => None,
+        }
+    }
+}
 
 /// The tree components; discriminants define the per-component array indexes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
