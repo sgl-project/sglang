@@ -184,6 +184,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        # Static tables of a CUDA-graph captured prefill (gdn_prefill_graph.py).
+        graph_table_args = {}
+        if kwargs.get("chunk_indices") is not None:
+            graph_table_args = {
+                "chunk_indices": kwargs["chunk_indices"],
+                "chunk_offsets": kwargs["chunk_offsets"],
+            }
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -213,6 +220,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **graph_table_args,
         )
 
     def target_verify(

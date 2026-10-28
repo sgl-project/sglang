@@ -24,14 +24,6 @@ register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 class TestSelectExpertsPerRankSharedSlots(CustomTestCase):
     """Shared slots must not alter routed selection or normalization."""
 
-    def setUp(self):
-        super().setUp()
-        override = get_context().override_server_args(
-            disable_shared_experts_fusion=False
-        )
-        override.install()
-        self.addCleanup(override.restore)
-
     NUM_TOKENS, TOP_K, EP_SIZE, EP_RANK = 32, 8, 8, 3
     # (num_experts, num_expert_group, topk_group, scoring_func, biased); each row
     # reaches a different router.
@@ -67,7 +59,26 @@ class TestSelectExpertsPerRankSharedSlots(CustomTestCase):
                 "has_per_rank_fused_shared_slots",
                 side_effect=lambda num_fused: num_fused > 0,
             ),
-            get_parallel().override(moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK),
+            # Model one rank of TP=EP; routing itself issues no collectives.
+            get_parallel().override(
+                tp_size=self.EP_SIZE,
+                tp_rank=self.EP_RANK,
+                tp_group=None,
+                attn_tp_size=self.EP_SIZE,
+                attn_tp_rank=self.EP_RANK,
+                attn_tp_group=None,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_ep_size=self.EP_SIZE,
+                moe_ep_rank=self.EP_RANK,
+                moe_ep_group=None,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                moe_dp_size=1,
+                moe_dp_rank=0,
+            ),
         ):
             out = select_experts(
                 torch.empty(logits.shape[0], 16, device=logits.device),
