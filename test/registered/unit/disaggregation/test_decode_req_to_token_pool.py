@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+from sglang.srt.disaggregation.decode import (
+    DecodeReqToTokenPool,
+    HybridMambaDecodeReqToTokenPool,
+)
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.common import free_req_slot
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
