@@ -1,3 +1,4 @@
+# Created by OpenAI
 # fmt: off
 from math import prod
 
