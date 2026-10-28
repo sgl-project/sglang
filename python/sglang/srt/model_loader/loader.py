@@ -4284,9 +4284,9 @@ def get_model_loader(
         return RunaiModelStreamerLoader(load_config)
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        return IpcModelLoader(
+        return WeightCacheModelLoader(
             load_config=load_config,
             socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,

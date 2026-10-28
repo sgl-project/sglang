@@ -735,7 +735,7 @@ class TestLoadedModelKeepsItsMappings(CustomTestCase):
             def close(self):
                 closed.append(self)
 
-        loader = ipc_loader.IpcModelLoader(
+        loader = ipc_loader.WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE)
         )
         backend = loader._transport_backend = _Recording()
@@ -766,7 +766,7 @@ class TestDaemonExitWatcher(CustomTestCase):
 
         child = subprocess.Popen([sys.executable, "-c", "pass"])
         child.wait()
-        loader = ipc_loader.IpcModelLoader(
+        loader = ipc_loader.WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             weight_cache_mode="client",
         )

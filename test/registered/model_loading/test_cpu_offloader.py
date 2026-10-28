@@ -14,7 +14,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelL
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.utils.offloader import OffloaderV1, OffloaderV2
-from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -173,7 +173,7 @@ class TestCpuOffloader(CustomTestCase):
     def test_loaders_rebuild_replaced_convolution_view(self) -> None:
         for rebind in (
             PreshardedModelLoader._rebind_parameter_aliases,
-            IpcModelLoader._rebuild_stale_views,
+            WeightCacheModelLoader._rebuild_stale_views,
         ):
             with self.subTest(loader=rebind.__qualname__), torch.no_grad():
                 model = CachedConvolution("conv1d", self.device)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""IPC Model Loader — loads model weights from a Weight Cache Daemon.
+"""Weight cache model loader — loads model weights from a Weight Cache Daemon.
 
 Zero-copy mode: param.data points directly to transport-mapped GPU memory.
 The daemon picks the backend (--weight-cache-transport) and names it in its
@@ -57,8 +57,10 @@ _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 _LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
 
 
-class IpcModelLoader(BaseModelLoader):
-    """Load model weights from a Weight Cache Daemon via CUDA IPC handles.
+class WeightCacheModelLoader(BaseModelLoader):
+    """Load model weights from a Weight Cache Daemon through the transport the
+    daemon serves: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed
+    as file descriptors (vmm_fd).
 
     In daemon mode (weight_cache_mode="daemon"), the engine and daemon share
     the same GPU. Falling back to disk loading would cause OOM because both
@@ -126,7 +128,7 @@ class IpcModelLoader(BaseModelLoader):
         if cache_data is None:
             if self.weight_cache_mode == "daemon":
                 raise RuntimeError(
-                    f"[IpcModelLoader] Weight cache daemon not available at "
+                    f"[WeightCacheModelLoader] Weight cache daemon not available at "
                     f"{self.socket_path}. In daemon mode, fallback to disk "
                     f"loading is disabled because the daemon process already "
                     f"holds weights on the same GPU — loading from disk would "
@@ -134,8 +136,8 @@ class IpcModelLoader(BaseModelLoader):
                     f"running and the config matches."
                 )
             logger.warning(
-                "[IpcModelLoader] Weight cache not available or config mismatch, "
-                "falling back to disk load"
+                "[WeightCacheModelLoader] Weight cache not available or config "
+                "mismatch, falling back to disk load"
             )
             return self._fallback_load(model_config, device_config)
 
@@ -151,11 +153,11 @@ class IpcModelLoader(BaseModelLoader):
                 or preloaded_weights_bytes < 0
             ):
                 raise RuntimeError(
-                    "[IpcModelLoader] Daemon returned invalid weight-memory "
+                    "[WeightCacheModelLoader] Daemon returned invalid weight-memory "
                     f"metadata: {preloaded_weights_bytes=}"
                 )
             logger.info(
-                f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+                f"[WeightCacheModelLoader] Fetched {len(entries)} tensors from daemon "
                 f"(transport={self._transport_backend.name}) "
                 f"in {time.perf_counter() - tic:.2f}s"
             )
@@ -201,7 +203,8 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         logger.info(
-            f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
+            f"[WeightCacheModelLoader] Loaded model via IPC "
+            f"(mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
 
@@ -225,7 +228,7 @@ class IpcModelLoader(BaseModelLoader):
         """
         if not daemon_pid or daemon_pid <= 0:
             logger.warning(
-                "[IpcModelLoader] Daemon did not report a PID; skipping the "
+                "[WeightCacheModelLoader] Daemon did not report a PID; skipping the "
                 "daemon-liveness watchdog. A daemon crash will not be detected."
             )
             return
@@ -245,14 +248,15 @@ class IpcModelLoader(BaseModelLoader):
                 if not _daemon_alive(daemon_pid):
                     if not fatal:
                         logger.warning(
-                            f"[IpcModelLoader] Weight cache daemon "
+                            f"[WeightCacheModelLoader] Weight cache daemon "
                             f"(pid={daemon_pid}) exited. This engine's own VMM "
                             f"mappings keep its weights valid; serving continues."
                         )
                         return
                     logger.critical(
-                        f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
-                        f"died while this engine holds its weights via CUDA IPC. "
+                        f"[WeightCacheModelLoader] Weight cache daemon "
+                        f"(pid={daemon_pid}) died while this engine holds its "
+                        f"weights via CUDA IPC. "
                         f"The mapped weight pointers are now dangling; continuing "
                         f"would read freed GPU memory. Terminating this process."
                     )
@@ -263,7 +267,8 @@ class IpcModelLoader(BaseModelLoader):
             target=_watch, name="weight-cache-daemon-watchdog", daemon=True
         ).start()
         logger.info(
-            f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
+            f"[WeightCacheModelLoader] Started daemon-liveness watchdog for "
+            f"pid={daemon_pid}"
         )
 
     def _resolve_engine_quant(self, model_config):
@@ -306,7 +311,9 @@ class IpcModelLoader(BaseModelLoader):
                     count += 1
 
         if count > 0:
-            logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
+            logger.info(
+                f"[WeightCacheModelLoader] Rebuilt {count} stale conv_weights views"
+            )
 
     @staticmethod
     def _set_module_tensor(model, name, tensor, is_param=True):
@@ -425,8 +432,9 @@ class IpcModelLoader(BaseModelLoader):
 
         if mismatched:
             raise RuntimeError(
-                f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
-                f"mismatch between the IPC daemon and the meta-initialized model. "
+                f"[WeightCacheModelLoader] {len(mismatched)} tensor(s) have "
+                f"shape/dtype mismatch between the IPC daemon and the "
+                f"meta-initialized model. "
                 f"The quantization method passed the IPC allowlist gate "
                 f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
                 f"case — it indicates the daemon's weight fingerprint is "
@@ -456,7 +464,7 @@ class IpcModelLoader(BaseModelLoader):
 
         if still_on_meta_params or still_on_meta_buffers:
             raise RuntimeError(
-                f"[IpcModelLoader] After IPC mapping, "
+                f"[WeightCacheModelLoader] After IPC mapping, "
                 f"{len(still_on_meta_params)} parameter(s) and "
                 f"{len(still_on_meta_buffers)} buffer(s) remain on the meta device "
                 f"— the daemon did not export them. Refusing to fill them with "
@@ -482,7 +490,7 @@ class IpcModelLoader(BaseModelLoader):
         _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
 
         logger.info(
-            f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
+            f"[WeightCacheModelLoader] Zero-copy: mapped {imported_count} tensors "
             f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
         )
 
@@ -508,13 +516,14 @@ class IpcModelLoader(BaseModelLoader):
             st = os.lstat(self.socket_path)
         except FileNotFoundError:
             logger.info(
-                f"[IpcModelLoader] Daemon socket not found at {self.socket_path}."
+                f"[WeightCacheModelLoader] Daemon socket not found at "
+                f"{self.socket_path}."
             )
             return None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise RuntimeError(
-                f"[IpcModelLoader] Refusing to connect: {self.socket_path} is not "
-                f"a socket owned by this user."
+                f"[WeightCacheModelLoader] Refusing to connect: "
+                f"{self.socket_path} is not a socket owned by this user."
             )
 
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
@@ -528,14 +537,14 @@ class IpcModelLoader(BaseModelLoader):
         except ConnectionRefusedError:
             sock.close()
             raise RuntimeError(
-                f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
-                f"refused the connection. The daemon may have crashed after "
-                f"creating the socket. Check daemon logs."
+                f"[WeightCacheModelLoader] Daemon socket exists at "
+                f"{self.socket_path} but refused the connection. The daemon may "
+                f"have crashed after creating the socket. Check daemon logs."
             )
         except Exception as e:
             sock.close()
             raise RuntimeError(
-                f"[IpcModelLoader] Failed to connect to daemon at "
+                f"[WeightCacheModelLoader] Failed to connect to daemon at "
                 f"{self.socket_path}: {e}"
             ) from e
 
@@ -586,7 +595,7 @@ class IpcModelLoader(BaseModelLoader):
             )
 
             logger.info(
-                f"[IpcModelLoader] Requesting weights from daemon at "
+                f"[WeightCacheModelLoader] Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
                 f"model={engine_config.model_path}, "
                 f"arch={engine_config.model_arch}, "
@@ -601,7 +610,7 @@ class IpcModelLoader(BaseModelLoader):
             if result.get("status") != "ok":
                 daemon_config = result.get("daemon_config", {})
                 raise RuntimeError(
-                    f"[IpcModelLoader] Daemon config mismatch!\n"
+                    f"[WeightCacheModelLoader] Daemon config mismatch!\n"
                     f"  Engine config: {engine_config.to_dict()}\n"
                     f"  Daemon config: {daemon_config}"
                 )
@@ -616,7 +625,7 @@ class IpcModelLoader(BaseModelLoader):
             raise
         except Exception as e:
             raise RuntimeError(
-                f"[IpcModelLoader] Error communicating with daemon at "
+                f"[WeightCacheModelLoader] Error communicating with daemon at "
                 f"{self.socket_path}: {e}"
             ) from e
         finally:
