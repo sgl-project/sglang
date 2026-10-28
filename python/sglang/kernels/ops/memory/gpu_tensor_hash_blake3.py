@@ -234,7 +234,14 @@ def _blake3_device(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_cuda or tensor.layout != torch.strided:
         raise ValueError("BLAKE3 requires a dense CUDA tensor")
     with torch.cuda.device(tensor.device):
-        data = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
+        data = (
+            tensor.detach()
+            .resolve_conj()
+            .resolve_neg()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+        )
         n_chunks = max(triton.cdiv(data.numel(), 1024), 1)
         group = min(triton.next_power_of_2(n_chunks), 128)
         n_nodes = triton.cdiv(n_chunks, group)

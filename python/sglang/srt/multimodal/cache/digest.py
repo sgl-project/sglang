@@ -111,7 +111,7 @@ def _encode(value, gpu_digests) -> bytes:
             b"numpy",
             value.dtype.str.encode(),
             _encode(tuple(value.shape), gpu_digests),
-            blake3.blake3(memoryview(raw).cast("B")).digest(),
+            blake3.blake3(memoryview(raw.reshape(-1)).cast("B")).digest(),
         )
     if isinstance(value, (list, tuple)):
         return _frame(

@@ -11,6 +11,7 @@ from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
 from unittest.mock import patch
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.managers import mm_schedule
@@ -23,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +38,28 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_empty_numpy_retains_shape_and_dtype(self):
+        keys = [
+            structured_digest(np.empty(shape, dtype=dtype))
+            for shape, dtype in itertools.product(
+                ((0,), (0, 3), (0, 4)), (np.uint8, np.float32)
+            )
+        ]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_ocr_config_updates_finalized_identity(self):
+        keys = []
+        for width in (512, 1024, 512):
+            item = _item(torch.arange(8))
+            original = item.cache_key
+            # transport lifetime is owned by encoding, not by cache lookup
+            item.feature = object()
+            UnlimitedOCRProcessor._mix_config_into_hash([item], {"image_size": width})
+            self.assertNotEqual(item.cache_key, original)
+            keys.append(item.cache_key)
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertEqual(keys[0], keys[2])
+
     def test_structure_is_not_flattened(self):
         x = torch.arange(16, dtype=torch.uint8)
         pairs = [

@@ -102,6 +102,17 @@ class TestGpuTensorBlake3(CustomTestCase):
                 x[-1] ^= 1
                 self.assertNotEqual(before, gpu_tensor_blake3(x))
 
+    def test_lazy_views_hash_logical_values(self):
+        x = torch.arange(8, device="cuda", dtype=torch.float32)
+        values = (torch._neg_view(x), torch.complex(x, x + 1).conj())
+        for value in values:
+            with self.subTest(dtype=value.dtype):
+                resolved = value.resolve_neg().resolve_conj()
+                self.assertEqual(gpu_tensor_blake3(value), _reference(resolved))
+                self.assertEqual(
+                    structured_digest(value), structured_digest(value.cpu())
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,7 @@ class TestPixtralProcessor(CustomTestCase):
     def _make_processor(self):
         processor = object.__new__(PixtralProcessor)
         processor.use_cuda_ipc = True
+        processor.processor_fingerprint = "sha256:" + "12" * 32
         processor.image_size = 1024
         processor._effective_patch_size = 28
         processor._precompute_hashes_before_cpu_transfer = MagicMock()
