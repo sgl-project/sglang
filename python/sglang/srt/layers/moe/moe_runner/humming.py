@@ -100,13 +100,40 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     layer: torch.nn.Module
 
 
-@register_custom_op(out_shape="hidden_states")
+def _humming_moe_runner_core_run_fake(
+    moe_runner_id: int,
+    gemm_type: str,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output_dtype: torch.dtype,
+    expert_num_tokens: torch.Tensor | None = None,
+    expected_m: int | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
+    apply_routed_scaling_factor: bool = True,
+) -> torch.Tensor:
+    output_shape = hidden_states.shape
+    if gemm_type == "grouped_masked" and hidden_states.ndim == 2:
+        assert expert_num_tokens is not None
+        num_experts = expert_num_tokens.shape[0]
+        output_shape = (
+            num_experts,
+            hidden_states.shape[0] // num_experts,
+            hidden_states.shape[-1],
+        )
+    # DeepEP can dispatch FP8 inputs, but the GEMMs return the model dtype.
+    # Keep fake execution independent of the runtime runner registry.
+    return hidden_states.new_empty(output_shape, dtype=output_dtype)
+
+
+@register_custom_op(fake_impl=_humming_moe_runner_core_run_fake)
 def humming_moe_runner_core_run(
     moe_runner_id: int,
     gemm_type: str,
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    output_dtype: torch.dtype,
     expert_num_tokens: torch.Tensor | None = None,
     expected_m: int | None = None,
     hidden_states_scale: torch.Tensor | None = None,
@@ -514,15 +541,14 @@ class HummingRunnerCore(MoeRunnerCore):
                 )
             )
 
-        # To make it compatible with dynamic shapes in torch.compile,
-        # we wrap the main logic inside a torch op.
-        # (the moe_block_size selection in indexed gemm would break dynamic shapes).
+        # Keep kernel selection opaque to torch.compile.
         output = humming_moe_runner_core_run(
             moe_runner_id=id(self),
             gemm_type=runner_input.gemm_type.value,
             hidden_states=runner_input.hidden_states,
             topk_weights=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
+            output_dtype=self.layer.params_dtype,
             expected_m=runner_input.expected_m,
             expert_num_tokens=runner_input.expert_num_tokens,
             hidden_states_scale=runner_input.hidden_states_scale,

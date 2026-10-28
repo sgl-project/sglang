@@ -1106,8 +1106,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 name=name,
             )
             if getattr(param, "is_humming_input_scale", False):
-                # Use the existing per-tensor loader to retain both gate/up scales.
-                # Its input-scale branch would overwrite both shards on each load.
+                # Preserve checkpoint w1/w3 scales until Humming normalizes them;
+                # the generic input-scale loader overwrites both gate/up slots.
                 weight_name = f"{shard_id}_weight_scale"
             return weight_loader(
                 param,
