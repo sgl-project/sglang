@@ -287,6 +287,7 @@ def _make_processor(model_type="qwen3_vl"):
         ),
     )
     processor._disable_fast_image_processor = True
+    processor._serving_spec = processor._serving_spec_class(processor.hf_config)
     _attach_core(
         processor,
         QwenTokenSpaceProcessStrategy(
