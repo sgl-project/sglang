@@ -53,3 +53,7 @@ def test_text_loader_rejects_unmapped_weights(name):
     )
     with pytest.raises(ValueError, match="Unexpected LFM3 weights"):
         Lfm3ForCausalLM.load_weights(model, [(name, torch.zeros(1))])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

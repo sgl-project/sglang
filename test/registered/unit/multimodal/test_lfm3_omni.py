@@ -84,3 +84,7 @@ def test_interleaved_soundtrack_is_not_split_into_mel_bins():
     assert len(expanded) == 1
     assert expanded[0].feature.shape == (1, 128, 2048)
     assert expanded[0].offsets == item.offsets
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
