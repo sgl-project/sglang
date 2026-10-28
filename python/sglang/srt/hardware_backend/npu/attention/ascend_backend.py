@@ -2550,10 +2550,17 @@ class AscendAttnBackend(AttentionBackend):
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
-                sparse_mode = 0
+                # FIA only honours pre_tokens/next_tokens in the banded sparse
+                # modes, so an encoder-only SWA layer needs sparse_mode=4 too.
+                # next_tokens keeps the window symmetric (non-causal).
+                sparse_mode = 4 if is_swa_layer else 0
+                next_tokens = (
+                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
+                )
             else:
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
+                next_tokens = 0 if is_swa_layer else FULL_ATTENTION_WINDOW
 
             if self.is_hybrid_swa:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
@@ -2575,7 +2582,7 @@ class AscendAttnBackend(AttentionBackend):
                         if is_swa_layer
                         else FULL_ATTENTION_WINDOW
                     ),
-                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                    next_tokens=next_tokens,
                     learnable_sink=sinks,
                 )
             else:
