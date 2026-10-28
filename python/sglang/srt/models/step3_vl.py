@@ -50,8 +50,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -145,6 +145,7 @@ class Step3TextMoEMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -885,8 +886,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def forward(
