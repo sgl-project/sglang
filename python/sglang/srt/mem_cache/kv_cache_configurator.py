@@ -1381,6 +1381,10 @@ class KVCacheConfigurator:
 
         if decision.placement is None:
             return decision
+        if get_memory().enable_hierarchical_cache and self.spec_algorithm.is_eagle():
+            declined = self._hicache_fused_eagle_declined(decision.placement)
+            if declined is not None:
+                return FusedDraftDecision(declined=declined)
         draft = aux.draft_model_config
         return msgspec.structs.replace(
             decision,
@@ -1389,6 +1393,84 @@ class KVCacheConfigurator:
                 source=(draft.model_path, draft.revision),
             ),
         )
+
+    def _hicache_fused_eagle_declined(self, placement) -> Optional[str]:
+        """Why HiCache would not keep a fused EAGLE-family draft's rows with the
+        target's, or None. Host pools of whole entries carry the draft's rows,
+        where the storage backend keeps whole entries: on a hybrid-SWA host for
+        any draft, and on a full + state host for a NEXTN head. A backend that
+        copies rows layer by layer keeps them only as layers packed after the
+        target's, in the target's row shape, on a full + state host. Other hosts
+        are declined."""
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+        from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+        from sglang.srt.mem_cache.kv.memory.host import page_envelope_pair
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+        from sglang.srt.mem_cache.layout.fused_draft import MLADraftRegion
+        from sglang.srt.speculative.base_spec_worker import can_pack_hicache_mtp
+
+        plan = plan_kv_storage(
+            self._kv_layer_decls(), page_size=self.page_size, fused_draft=placement
+        )
+        backend = get_memory().hicache_storage_backend
+        keeps_entries = HybridCacheController.supports_page_envelope_host(backend)
+        if self.is_hybrid_swa and self.mambaish_config is None:
+            if page_envelope_pair(plan) is None:
+                return (
+                    "--enable-hierarchical-cache keeps a fused draft's rows in the "
+                    "target's page envelopes, which needs an MHA hybrid-SWA target"
+                )
+            if not keeps_entries:
+                return (
+                    "--enable-hierarchical-cache keeps a fused draft's rows in the "
+                    f"target's page envelopes, which storage backend {backend!r} "
+                    "does not keep"
+                )
+            return None
+        if (
+            self.is_hybrid_swa
+            or placement.hosts() != ("full",)
+            or any(
+                len(placement.lanes_for(runner, "full")) != 1
+                for runner in range(len(placement.runners))
+            )
+            or not can_pack_hicache_mtp(
+                self.spec_algorithm, (self.spec_aux_config.draft_model_config,)
+            )
+        ):
+            return (
+                "--enable-hierarchical-cache keeps a fused EAGLE-family draft on a "
+                "host with state only for a NEXTN head with one layer per runner, "
+                "on a host with full and state sub-pools"
+            )
+        if keeps_entries:
+            return None
+        declined = (
+            f"storage backend {backend!r} copies rows layer by layer, so a fused "
+            "draft's rows must pack after the target's: one lane per runner, in the "
+            "target's row shape and storage dtype, without replicated rows"
+        )
+        region = placement.region("full")
+        host = plan.sub_pool("full").spec
+        if region.token_replicas != 1:
+            return declined
+        if isinstance(region, MLADraftRegion):
+            packs = isinstance(host, MLASubPoolSpec) and (
+                region.kv_lora_rank,
+                region.qk_rope_head_dim,
+                region.store_dtype,
+            ) == (host.kv_lora_rank, host.qk_rope_head_dim, host.store_dtype)
+        else:
+            packs = isinstance(host, MHASubPoolSpec) and (
+                region.head_num,
+                region.head_dim,
+                region.resolved_v_head_dim(),
+                region.store_dtype,
+            ) == (host.head_num, host.head_dim, host.v_head_dim, host.store_dtype)
+        return None if packs else declined
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +

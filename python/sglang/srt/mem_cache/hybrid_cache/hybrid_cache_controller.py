@@ -1130,6 +1130,9 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=target_transfer.device_indices,
                         layer_mapper=draft_layer_mapper,
                         is_draft=True,
+                        # A fused draft's rows share the target's slots, so its
+                        # ids resolve to rows as the target's do.
+                        device_translate=target_transfer.device_translate,
                     )
                 )
         return transfers

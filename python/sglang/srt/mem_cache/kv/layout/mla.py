@@ -420,6 +420,11 @@ class MLAView(MLAKVView):
                 else self.host_capacity_tokens,
                 self.page_size,
             )
+        return self.per_layer_host_layout()
+
+    def per_layer_host_layout(self):
+        """Host rows layer by layer: this view's rows alone, even where its
+        entries also carry a fused draft's parts."""
         (info,) = self.get_device_pool_infos()
         return MLAHostLayout(
             buffer_info=info.buffer_info,

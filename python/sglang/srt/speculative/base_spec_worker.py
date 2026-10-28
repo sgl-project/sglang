@@ -17,6 +17,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
@@ -38,20 +39,20 @@ class HiCacheDraftPlan:
     device_pools: tuple[object, ...] = ()
 
 
-def _can_pack_hicache_mtp(
+def can_pack_hicache_mtp(
     spec_algorithm: SpeculativeAlgorithm,
-    draft_runners: tuple[ModelRunner, ...],
+    draft_model_configs: tuple[ModelConfig, ...],
 ) -> bool:
+    """Whether HiCache packs the draft's KV layers after the target's in the
+    target's host pool, one layer per draft runner."""
     is_nextn_mtp = (
         spec_algorithm.is_eagle()
         and not spec_algorithm.is_eagle3()
-        and all(
-            runner.model_config.num_nextn_predict_layers for runner in draft_runners
-        )
+        and all(config.num_nextn_predict_layers for config in draft_model_configs)
     )
     is_dspark_compressed_kv = (
         spec_algorithm.is_dspark()
-        and uses_compressed_kv_attention(draft_runners[0].model_config.hf_config)
+        and uses_compressed_kv_attention(draft_model_configs[0].hf_config)
     )
     return is_nextn_mtp or is_dspark_compressed_kv
 
@@ -280,21 +281,41 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        packable = can_pack_hicache_mtp(
+            spec_algorithm, tuple(runner.model_config for runner in draft_runners)
+        )
         if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
-            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-                validate_fused_hicache_draft,
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+                HybridCacheController,
             )
 
-            validate_fused_hicache_draft(
-                target_config=target_model_runner.kv_cache_configurator,
-                draft_device_pools=draft_pools,
+            # A fused draft's rows live in the target's entries, and a host pool
+            # of whole entries carries them. A storage backend that copies rows
+            # layer by layer cannot keep those, so a NEXTN head's rows pack after
+            # the target's instead; the boot gate admitted only that. Registration
+            # refuses any other host pool that does not keep the entries.
+            packs_rows = (
+                spec_algorithm.is_eagle()
+                and packable
+                and not HybridCacheController.supports_page_envelope_host(
+                    get_memory().hicache_storage_backend
+                )
             )
-            # The target's page envelopes already carry every draft layer.
-            # Packing or adding a sidecar would back up the same bytes twice.
-            return HiCacheDraftPlan(
-                mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
-            )
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            if not packs_rows:
+                from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                    validate_fused_hicache_draft,
+                )
+
+                validate_fused_hicache_draft(
+                    target_config=target_model_runner.kv_cache_configurator,
+                    draft_device_pools=draft_pools,
+                )
+                # The entries already carry every draft layer. Packing or adding
+                # a sidecar would back up the same bytes twice.
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
+                )
+        if packable:
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (
                 target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)

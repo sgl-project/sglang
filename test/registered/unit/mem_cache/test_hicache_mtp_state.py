@@ -8,6 +8,7 @@ import pytest
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
@@ -26,7 +27,7 @@ def _kv_pool(state_pool):
     )
 
 
-def _worker(monkeypatch, draft_config, target_pool, draft_pools):
+def _worker(monkeypatch, draft_config, target_pool, draft_pools, *, fused=False):
     monkeypatch.setattr(
         spec, "get_memory", lambda: SimpleNamespace(enable_hierarchical_cache=True)
     )
@@ -38,7 +39,7 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
         SimpleNamespace(
             model_config=draft_config,
             token_to_kv_pool=_kv_pool(pool),
-            runner_ids=SimpleNamespace(is_fused_draft=False),
+            runner_ids=SimpleNamespace(is_fused_draft=fused),
         )
         for pool in draft_pools
     )
@@ -132,6 +133,124 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+def _fused_plan(monkeypatch, *, backend=None, nextn=True, algorithm="EAGLE"):
+    """The plan for draft runners whose KV the binder fused into the target."""
+    draft_config = SimpleNamespace(
+        num_nextn_predict_layers=1 if nextn else None,
+        hf_config=SimpleNamespace(architectures=["DraftForCausalLM"]),
+    )
+    worker, target, runners = _worker(
+        monkeypatch, draft_config, None, (None, None), fused=True
+    )
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, hicache_storage_backend=backend
+        ),
+    )
+    target.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
+    target.kv_cache_configurator = SimpleNamespace()
+    return spec.BaseSpecWorker._build_hicache_draft_plan(worker), target, runners
+
+
+def test_whole_entries_carry_a_fused_draft(monkeypatch):
+    """A host pool of whole entries copies the draft's rows with them: the plan
+    backs up nothing of its own, once the shared check passes. Packed layers would
+    be a second copy of the same bytes."""
+    for backend in (None, "file", "mori"):
+        checks = []
+        monkeypatch.setattr(
+            hybrid_pool_assembler,
+            "validate_fused_hicache_draft",
+            lambda **kwargs: checks.append(kwargs),
+        )
+        plan, target, runners = _fused_plan(monkeypatch, backend=backend)
+        pools = tuple(r.token_to_kv_pool for r in runners)
+        assert plan.mode == spec.HiCacheDraftMode.FUSED
+        assert plan.device_pools == pools
+        assert checks == [
+            dict(target_config=target.kv_cache_configurator, draft_device_pools=pools)
+        ]
+        assert target.mtp_draft_device_pools == ()
+
+
+def test_a_row_backend_packs_a_fused_nextn_head(monkeypatch):
+    plan, target, runners = _fused_plan(monkeypatch, backend="mooncake")
+    assert plan.mode == spec.HiCacheDraftMode.PACKED
+    assert target.mtp_draft_device_pools == tuple(r.token_to_kv_pool for r in runners)
+
+
+def test_a_fused_draft_that_does_not_pack_stays_fused(monkeypatch):
+    """A fused draft that does not pack gets no sidecar over a device pool it
+    does not have: it stays fused, and registration refuses a host pool that
+    does not keep its rows."""
+    monkeypatch.setattr(
+        hybrid_pool_assembler, "validate_fused_hicache_draft", lambda **kwargs: None
+    )
+    for kwargs in (
+        dict(nextn=False),
+        dict(algorithm="EAGLE3"),
+        dict(algorithm="DFLASH"),
+        dict(algorithm="DSPARK"),
+    ):
+        plan, target, _ = _fused_plan(monkeypatch, backend="mooncake", **kwargs)
+        assert plan.mode == spec.HiCacheDraftMode.FUSED, kwargs
+        assert target.mtp_draft_device_pools == (), kwargs
+
+
+def test_a_fused_dsv4_dspark_draft_stays_fused(monkeypatch):
+    """The DSV4 predicate speaks for its private pool; fused, only the EAGLE
+    family packs, even for a backend that copies rows."""
+    monkeypatch.setattr(
+        hybrid_pool_assembler, "validate_fused_hicache_draft", lambda **kwargs: None
+    )
+    config = SimpleNamespace(
+        num_nextn_predict_layers=None,
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"]),
+    )
+    worker, target, _ = _worker(monkeypatch, config, None, (None,), fused=True)
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, hicache_storage_backend="mooncake"
+        ),
+    )
+    target.spec_algorithm = SpeculativeAlgorithm.DSPARK
+    target.kv_cache_configurator = SimpleNamespace()
+    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+    assert plan.mode == spec.HiCacheDraftMode.FUSED
+    assert target.mtp_draft_device_pools == ()
+
+
+def test_a_private_dsv4_dspark_draft_still_packs(monkeypatch):
+    """The private-pool route is untouched: the predicate, not fusion, decides."""
+    config = SimpleNamespace(
+        num_nextn_predict_layers=None,
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"]),
+    )
+    worker, target, _ = _worker(monkeypatch, config, None, (None,))
+    target.spec_algorithm = SpeculativeAlgorithm.DSPARK
+    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+    assert plan.mode == spec.HiCacheDraftMode.PACKED
+
+
+def test_a_private_nextn_draft_still_packs_with_any_backend(monkeypatch):
+    for backend in (None, "mooncake"):
+        draft_config = SimpleNamespace(num_nextn_predict_layers=1)
+        worker, target, runners = _worker(monkeypatch, draft_config, None, (None,))
+        monkeypatch.setattr(
+            spec,
+            "get_memory",
+            lambda: SimpleNamespace(
+                enable_hierarchical_cache=True, hicache_storage_backend=backend
+            ),
+        )
+        plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+        assert plan.mode == spec.HiCacheDraftMode.PACKED
 
 
 if __name__ == "__main__":
