@@ -119,6 +119,12 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             "file_path": save_file_path if not cloud_url else None,
             "file_size_bytes": file_size,
         }
+        # The requested format is not authoritative when Hunyuan3D painting
+        # is enabled: the shape/paint stages choose the final artifact path.
+        # Publish that actual extension so clients save a parseable mesh.
+        actual_format = os.path.splitext(save_file_path)[1].lower().lstrip(".")
+        if actual_format in ("glb", "obj"):
+            update_fields["format"] = actual_format
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
         )
