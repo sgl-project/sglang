@@ -169,7 +169,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_command_line,
     redact_watermark_secrets,
     resolve_watermark_request,
 )
@@ -185,6 +184,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.crash_dump import write_crash_dump
 from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
@@ -3436,43 +3436,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 data_to_dump.extend(unfinished_requests)
 
             if data_to_dump:
-                # Create a file
-                filename = os.path.join(
+                filename = write_crash_dump(
                     self.crash_dump_folder,
                     hostname,
-                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
+                    data_to_dump,
+                    server_args=self._server_args_for_dump(),
+                    resolved_config=self._dump_config_snapshot(),
+                    watermark_config=self.server_args.watermark_config,
                 )
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-                # Write the data to the file
-                data_to_dump_with_server_args = {
-                    "server_args": self._server_args_for_dump(),
-                    "config_updates": redact_watermark_secrets(
-                        get_context().overrides_log()
-                    ),
-                    "resolved_config": self._dump_config_snapshot(),
-                    "requests": redact_watermark_secrets(data_to_dump),
-                    "launch_command": redact_watermark_command_line(
-                        sys.argv, self.server_args.watermark_config
-                    ),
-                }
-                with open(filename, "wb") as f:
-                    try:
-                        pickle.dump(data_to_dump_with_server_args, f)
-                    except Exception as e:
-                        # When the server is launched with --trust-remote-code,
-                        # server_args sometimes fails to pickle. Retry without
-                        # server_args so the request data still gets persisted.
-                        logger.error(
-                            f"Failed to pickle dump with server_args: {e!r}; "
-                            "retrying without server_args"
-                        )
-                        f.seek(0)
-                        f.truncate()
-                        data_to_dump_with_server_args["server_args"] = None
-                        # The snapshot copies the same object field by field.
-                        data_to_dump_with_server_args["resolved_config"] = None
-                        pickle.dump(data_to_dump_with_server_args, f)
                 logger.error(
                     f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
                 )
