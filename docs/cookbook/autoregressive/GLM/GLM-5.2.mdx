@@ -348,3 +348,126 @@ When deploying with PD Disaggregation, the prefill node can choose to enable [La
 --cp-strategy interleave \
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
+
+### 3.6 PD Disaggregation on MI355X with the Infera Router
+
+This deployment serves `amd/GLM-5.2-MXFP4` on MI355X as prefill/decode disaggregation behind [Infera](https://github.com/AMD-AGI/Infera)'s KV-aware router, for agentic multi-turn traffic. Each worker is SGLang's own server (`sglang.launch_server`), started through Infera's launcher `python3 -m infera.engine.sglang`, which forwards every SGLang flag unchanged and registers the worker in etcd. The router discovers the workers there, scores prefill workers by the cached prefix each one holds (it reads SGLang's ZMQ KV events), keeps a session on one prefill worker, and balances decode DP ranks by booked tokens and held requests. It is the configuration submitted to SemiAnalysis InferenceX AgentX as `glm5.2-fp4-mi355x-infera-sglang-agentic-disagg`.
+
+<Note>
+The PP4 prefill needs [#21194](https://github.com/sgl-project/sglang/pull/21194): without it every pipeline stage that does not own the embedding fails at model construction. Decode with DP attention on gfx950 needs [#46830](https://github.com/sgl-project/sglang/pull/46830) and [#33059](https://github.com/sgl-project/sglang/pull/33059), and kv-aware routing needs [#46820](https://github.com/sgl-project/sglang/pull/46820). Until an image includes them, apply them on top of the image below.
+</Note>
+
+**Image and install.** Run every process in `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261018` with the RDMA NICs passed in (`--device /dev/infiniband`, `--cap-add IPC_LOCK`, `--ulimit memlock=-1`, `--network host --ipc=host`, on top of the ROCm device flags from the [Install panel](#install)). Infera is not in the image; install it without touching the image's packages (only `nats-py` is missing from it):
+
+```bash Command
+pip install --no-deps nats-py==2.16.0 amd-infera==0.3.2 \
+  --find-links https://github.com/AMD-AGI/Infera/releases/expanded_assets/v0.3.2
+```
+
+**Shapes.** The prefill worker is TP1 × PP4 on four GPUs with write-back HiCache; decode runs TP + DP attention. MTP is EAGLE 5-1-6 on both roles, so the KV transfer includes the draft layer.
+
+| Shape | Prefill | Decode | GPUs | Router `--decode-request-weight` |
+|---|---|---|---|---|
+| 1P1D | 1 × TP1·PP4 | TP8, DP-attention 8 | 12 | `1000000` |
+| 1P + 4-GPU decode | 1 × TP1·PP4 | TP4, DP-attention 4 | 8 | `0` |
+| 2P1D | 2 × TP1·PP4 on one node | TP8, DP-attention 8 | 16 | `0` |
+
+Start the processes in this order: etcd, the prefill worker(s), the decode worker, then the router. `$ETCD_IP` is the etcd host, `$NODE_IP` the worker's own routable address, and `$NIC` its network interface. A second prefill worker on the same node uses `HIP_VISIBLE_DEVICES=4,5,6,7` and different `--port`, `--disaggregation-bootstrap-port` and KV-events ports.
+
+**etcd:**
+
+```bash Command
+etcd --data-dir /tmp/etcd \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://$ETCD_IP:2379
+```
+
+**Environment for both roles:**
+
+```bash Command
+export GLOO_SOCKET_IFNAME=$NIC NCCL_SOCKET_IFNAME=$NIC NCCL_IB_DISABLE=1 NCCL_IGNORE_CPU_AFFINITY=1
+export HSA_NO_SCRATCH_RECLAIM=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 PYTHONHASHSEED=0
+export AITER_USE_FLYDSL_MOE_SORTING=1 SGLANG_DP_USE_GATHERV=1
+export SGLANG_OPT_USE_TOPK_V2=true SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK=0
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800 SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+export SGLANG_TIMEOUT_KEEP_ALIVE=900 INFERA_ENGINE_READY_TIMEOUT=3600
+# Mooncake: RDMA across nodes, the same rail on both ends, 1 GiB memory regions on ionic.
+export MC_DISABLE_HIP=1 MC_GID_INDEX=1 MC_ENABLE_DEST_DEVICE_AFFINITY=1 MC_MAX_MR_SIZE=1073741824 RDMAV_FORK_SAFE=1
+```
+
+**Prefill (TP1 × PP4, layers 20/20/20/18):**
+
+```bash Command
+HIP_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_PP_LAYER_PARTITION=20,20,20,18 \
+SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB=512 \
+python3 -m infera.engine.sglang \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --advertise-host $NODE_IP --request-transport http --kv-event-transport zmq --kv-events off \
+  --model-path amd/GLM-5.2-MXFP4 --served-model-name amd/GLM-5.2-MXFP4 --trust-remote-code \
+  --host 0.0.0.0 --port 30000 \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port 8998 \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7 \
+  --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' \
+  --tp-size 1 --pp-size 4 --ep-size 1 --disable-overlap-schedule \
+  --chunked-prefill-size 8192 --max-prefill-tokens 8192 --mem-fraction-static 0.88 \
+  --schedule-policy shortest-prefill-first \
+  --enable-hierarchical-cache --hicache-size 250 --hicache-ratio 1.5 \
+  --hicache-write-policy write_back --hicache-io-backend kernel --hicache-mem-layout page_first \
+  --kv-cache-dtype fp8_e4m3 --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --max-running-requests 256 \
+  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --disable-custom-all-reduce --enable-fused-qk-norm-rope --enable-aiter-allreduce-fusion \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-metrics --enable-cache-report --watchdog-timeout 3600 --skip-server-warmup \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+**Decode (TP8 + DP-attention 8; TP4 / DP4 for the 4-GPU decode):**
+
+```bash Command
+python3 -m infera.engine.sglang \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --advertise-host $NODE_IP --request-transport http --kv-event-transport zmq --kv-events off \
+  --no-enable-kv-events \
+  --model-path amd/GLM-5.2-MXFP4 --served-model-name amd/GLM-5.2-MXFP4 --trust-remote-code \
+  --host 0.0.0.0 --port 30100 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-ib-device rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7 \
+  --tp-size 8 --dp-size 8 --enable-dp-attention --ep-size 1 \
+  --chunked-prefill-size 32768 --mem-fraction-static 0.92 \
+  --cuda-graph-max-bs-decode 256 --tokenizer-worker-num 4 \
+  --kv-cache-dtype fp8_e4m3 --dsa-prefill-backend triton --dsa-decode-backend triton \
+  --max-running-requests 256 \
+  --json-model-override-args '{"index_share_for_mtp_iteration":false}' \
+  --disable-custom-all-reduce --enable-fused-qk-norm-rope --enable-aiter-allreduce-fusion \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-metrics --enable-cache-report --watchdog-timeout 3600 --skip-server-warmup \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+**Router** (OpenAI API on port 8000; `--decode-request-weight` per the table above):
+
+```bash Command
+python3 -m infera.server --router-backend rust \
+  --host 0.0.0.0 --port 8000 \
+  --discovery-backend etcd --etcd-endpoint http://$ETCD_IP:2379 \
+  --request-transport http --kv-event-transport zmq \
+  --router-tokenizer-path amd/GLM-5.2-MXFP4 --router-policy kv-aware \
+  --kv-prefill-overlap-weight 20 --kv-decode-overlap-weight 2 \
+  --session-affinity prefill --pd-prefill-guard-release completion \
+  --decode-input-demand on --decode-request-weight 1000000
+```
+
+Clients pass a session id in the `X-Session-ID` header so the router keeps a session's turns on the prefill worker that holds its prefix.
+
+Settings that matter on this deployment:
+
+- **`--disable-custom-all-reduce`.** With the AITER custom all-reduce on, decode output under DP attention with CUDA graphs is garbled.
+- **`--disable-overlap-schedule`** is required by pipeline parallelism on the prefill worker.
+- **`MC_MAX_MR_SIZE=1073741824`.** The ionic NIC rejects a 2 GiB dma-buf registration that starts 1 GiB-aligned; 1 GiB regions avoid it.
+- **HiCache sizing.** `--hicache-size 250` is per PP stage, so one prefill worker pins 1 TB of host memory for KV plus the DSA indexer's host pool (about 23% more). Releasing it after shutdown takes minutes; wait for it before restarting on the same node.
