@@ -380,6 +380,7 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        serves_fused_mxfp4: bool = True,
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -405,6 +406,10 @@ class FusedMoE(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
 
         self.params_dtype = params_dtype
+        # False for a model whose loader keeps compressed-tensors' `weight_packed`
+        # expert names; Mxfp4MoEMethod's fused `w13_weight`/`w2_weight` cannot
+        # serve those, so such a model routes to a compressed-tensors MoE scheme.
+        self.serves_fused_mxfp4 = serves_fused_mxfp4
         self.layer_name = prefix
         self.layer_id = layer_id
         self.is_draft = get_flags().moe.in_speculative_scope
@@ -1191,6 +1196,11 @@ class FusedMoE(torch.nn.Module):
         else:
             return -1
 
+    def _local_routed_expert_ids(self, physical_expert_ids: List[int]) -> List[int]:
+        start_idx = self._expert_storage_rank * self._num_local_routed
+        end_idx = start_idx + self._num_local_routed
+        return [i for i in physical_expert_ids if start_idx <= i < end_idx]
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -1258,6 +1268,10 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id, expert_id, require_global_experts
                 )
             )
+            if not require_global_experts:
+                # Before the local mapping: after an elastic EP scale-up, another rank's
+                # routed slot can lie past _num_global_routed and map to the shared slot.
+                physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(

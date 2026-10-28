@@ -553,5 +553,6 @@ POSITIONAL_FIELD_ORDER = (
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
     "moe_ascend_ops_config",
+    "engram_config",
 )
 # fmt: on
