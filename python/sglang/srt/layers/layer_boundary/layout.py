@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
 )
 from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
     is_moe_input_scattered_across_dp_ranks,
     post_experts_reduction_group,
 )
@@ -99,6 +100,23 @@ def _prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()
     return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+
+
+def input_scattered_configured() -> bool:
+    """Whether the parallel configuration allows input-scattered attention:
+    enabled, TP > 1, no attention DP, no prefill CP sharding the tokens, no
+    a2a MoE backend and no dense FFN fully data-parallel. Stages bind the
+    input-scattered variant exactly when this holds; the model's own
+    conditions (``AttnTpContext.init_context``) may only narrow it."""
+    parallel = get_parallel()
+    return (
+        parallel.enable_attn_tp_input_scattered
+        and parallel.tp_size > 1
+        and not parallel.attn_dp_enabled
+        and not _prefill_cp_shards_tokens()
+        and get_moe_a2a_backend().is_none()
+        and not is_dense_ffn_fully_dp()
+    )
 
 
 def _batch_size(forward_batch: ForwardBatch) -> int:

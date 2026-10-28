@@ -242,13 +242,17 @@ class ArceeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        attn, ffn = self.stage_facts(layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
+
+    @staticmethod
+    def stage_facts(layer_id: int):
+        """The stages every Arcee layer declares, an attention and a dense FFN:
+        the model's shared declaration function (see make_layers)."""
+        return (declare_attn(), declare_ffn(sparse=False, next_layer_sparse=False))
 
     def forward(
         self,
@@ -303,6 +307,7 @@ class ArceeModel(nn.Module):
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             prefix="model.layers",
+            stage_facts=ArceeDecoderLayer.stage_facts,
         )
 
         if self.pp_group.is_last_rank:

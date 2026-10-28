@@ -20,6 +20,7 @@
 """SGLang LLaDA2MoeModelLM model."""
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -33,7 +34,6 @@ from triton.language.extra import libdevice
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -56,7 +56,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -126,41 +125,21 @@ def _require_block_routing_simulated_experts_compatibility() -> None:
         )
 
 
-def _get_effective_moe_runner_backend(experts):
-    """Return the runner selected by the quant method, including auto selection."""
-    quant_method = getattr(experts, "quant_method", None)
-
-    # UnquantizedFusedMoEMethod keeps a Triton fallback in ``runner`` but
-    # forward_cuda executes this AITER runner first whenever auto selection
-    # created it. Resolve the runner that actually executes, not the fallback.
-    aiter_runner = getattr(quant_method, "_aiter_runner", None)
-    backend = getattr(aiter_runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    backend = getattr(quant_method, "_moe_runner_backend", None)
-    if backend is not None:
-        return backend
-
-    runner = getattr(quant_method, "runner", None)
-    backend = getattr(runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    runner = getattr(experts, "runner", None)
-    backend = getattr(runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    return get_moe_runner_backend()
-
-
-def _require_block_routing_runner_compatibility(experts) -> None:
-    backend = _get_effective_moe_runner_backend(experts)
+def _require_block_routing_runner_compatibility(experts, top_k: int) -> None:
+    backend = experts.runner_backend
+    if backend is None:
+        # Direct standard/local-ID kernels consume the block router's materialized output.
+        return
     if backend.is_flashinfer_trtllm():
         raise ValueError(
             "LLaDA2 block routing does not support --moe-runner-backend "
             "flashinfer_trtllm; use a compatible runner instead"
+        )
+    if backend.is_triton_kernels() and top_k & (top_k - 1):
+        raise ValueError(
+            "LLaDA2 block routing with --moe-runner-backend "
+            "triton_kernel requires num_experts_per_tok to be a "
+            f"power of two, got {top_k}"
         )
 
 
@@ -666,14 +645,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     f"expert_capacity={self.expert_capacity}, "
                     f"num_experts={self.num_experts}"
                 )
-            if get_moe_runner_backend().is_triton_kernels() and self.top_k & (
-                self.top_k - 1
-            ):
-                raise ValueError(
-                    "LLaDA2 block routing with --moe-runner-backend "
-                    "triton_kernel requires num_experts_per_tok to be a "
-                    f"power of two, got {self.top_k}"
-                )
 
         if self.score_function is not None:
             assert (
@@ -708,8 +679,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            _is_npu or self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if self.use_block_routing:
-            _require_block_routing_runner_compatibility(self.experts)
+            _require_block_routing_runner_compatibility(self.experts, self.top_k)
         # shared expert
         if config.num_shared_experts is not None:
             if hasattr(config, "moe_shared_expert_intermediate_size"):
@@ -790,15 +768,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         )
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-        runner_backend = _get_effective_moe_runner_backend(self.experts)
-        if not runner_backend.is_triton_kernels():
+        runner_backend = self.experts.runner_backend
+        if runner_backend is None or not runner_backend.is_triton_kernels():
             if (
-                runner_backend.is_aiter()
-                or getattr(
-                    self.experts,
-                    "should_fuse_routed_scaling_factor_in_topk",
-                    False,
-                )
+                runner_backend is not None
+                and runner_backend.is_aiter()
+                or self.experts.should_fuse_routed_scaling_factor_in_topk
             ) and self.routed_scaling_factor is not None:
                 topk_weights = topk_weights * self.routed_scaling_factor
             return StandardTopKOutput(
@@ -945,10 +920,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1150,7 +1121,6 @@ class LLaDA2MoeBlock(nn.Module):
         self.layer_id = layer_id
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
-        is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
 
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
@@ -1173,18 +1143,27 @@ class LLaDA2MoeBlock(nn.Module):
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id=layer_id),
+                next_layer_sparse=cls._is_layer_sparse(config, layer_id=layer_id + 1),
             ),
         )
 
-    def _is_layer_sparse(self, config: PretrainedConfig, layer_id: int) -> bool:
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
         return (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
         )
@@ -1253,6 +1232,7 @@ class LLaDA2MoeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(LLaDA2MoeBlock.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
@@ -1295,6 +1275,43 @@ class LLaDA2MoeModel(nn.Module):
             return hidden_states
 
 
+_EXPERT_PROJECTION_NAMES = frozenset({"gate_proj", "up_proj", "down_proj"})
+
+
+def _prepare_llada2_language_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    num_experts: int,
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Normalize language-model prefixes and expand fused expert tensors."""
+    for name, loaded_weight in weights:
+        if name.startswith("model.language_model."):
+            name = "model." + name.removeprefix("model.language_model.")
+        elif name.startswith("model.lm_head."):
+            name = "lm_head." + name.removeprefix("model.lm_head.")
+
+        expert_prefix, separator, projection_name = name.rpartition(".")
+        is_fused_expert = (
+            separator
+            and expert_prefix.endswith(".mlp.experts")
+            and projection_name in _EXPERT_PROJECTION_NAMES
+        )
+        if not is_fused_expert:
+            yield name, loaded_weight
+            continue
+
+        if loaded_weight.ndim != 3 or loaded_weight.shape[0] != num_experts:
+            raise ValueError(
+                f"Invalid fused expert weight {name!r}: expected first dimension "
+                f"{num_experts}, got shape={tuple(loaded_weight.shape)}"
+            )
+        for expert_id in range(num_experts):
+            yield (
+                f"{expert_prefix}.{expert_id}.{projection_name}.weight",
+                loaded_weight[expert_id],
+            )
+
+
 class LLaDA2MoeModelLM(nn.Module):
     def __init__(
         self,
@@ -1335,6 +1352,9 @@ class LLaDA2MoeModelLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
 
     def get_embed_and_head(self):
         """Used by the eagle_worker."""
@@ -1389,7 +1409,9 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _prepare_llada2_language_weights(
+            weights, num_experts=self.config.num_experts
+        ):
             if (
                 ("v_head" in name)
                 or ("inv_freq" in name)

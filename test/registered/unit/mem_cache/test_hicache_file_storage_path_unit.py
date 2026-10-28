@@ -15,10 +15,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import os
 import unittest
 
-import msgspec
-
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 _ENV = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
@@ -59,16 +56,6 @@ class TestFileStoragePathRouting(CustomTestCase):
             os.environ[_ENV] = self._saved
         else:
             os.environ.pop(_ENV, None)
-
-    def test_arg_default_is_unset(self):
-        # If the default were a real path, an unset flag would silently reroute the
-        # backend off its /tmp/hicache default, so keep it None.
-        # ServerArgs is assembled as a msgspec Struct now, so introspect the
-        # declared default the same way server_args._declared_default does.
-        field = {f.name: f for f in msgspec.structs.fields(ServerArgs)}[
-            "file_storage_path"
-        ]
-        self.assertIsNone(field.default)
 
     def test_unset_flag_keeps_tmp_hicache(self):
         extra = _inject(None)

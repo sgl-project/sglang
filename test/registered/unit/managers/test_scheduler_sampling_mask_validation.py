@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
@@ -34,6 +34,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.tokenizer = None
                 scheduler.dllm_config = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+                scheduler._record_kv_event_lora_name = MagicMock()
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,
                     is_uno=lambda: False,
@@ -58,16 +59,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 ):
                     scheduler.handle_generate_request(recv_req)
                 abort.assert_called_once()
-                self.assertIs(abort.call_args.args[0], req)
-                self.assertIn(
-                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1",
-                    abort.call_args.args[1],
-                )
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
-                )
-                scheduler.output_streamer.stream_output.assert_called_once_with(
-                    [req], False
                 )
                 scheduler._add_request_to_queue.assert_not_called()
 

@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -194,26 +198,20 @@ def create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif get_memory().enable_unified_cache_external_linker:
-        backend = get_memory().unified_cache_external_linker_backend
-        if backend == "mooncake":
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-                MooncakeDirectLinker,
-            )
-
-            linker_cls = MooncakeDirectLinker
-        elif backend == "mori":
-            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
-                UMBPDirectLinker,
-            )
-
-            linker_cls = UMBPDirectLinker
-        else:
-            raise ValueError(
-                f"Unknown unified cache external linker backend: {backend!r}"
-            )
+        from sglang.srt.mem_cache.unified_cache.linker_factory import (
+            create_unified_cache_linker,
+            get_startup_linker_config,
+        )
 
         cache.init_cache_linker(
-            linker_cls(server_args, params, components=set(cache.components))
+            create_unified_cache_linker(
+                server_args,
+                params,
+                backend=get_memory().unified_cache_external_linker_backend,
+                config=get_startup_linker_config(),
+                components=set(cache.components),
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
+            )
         )
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()

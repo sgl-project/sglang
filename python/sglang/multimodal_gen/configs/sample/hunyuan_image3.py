@@ -6,8 +6,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT = 16
-
 VALID_BOT_TASKS = {
     "auto",
     "image",
@@ -103,18 +101,3 @@ class HunyuanImage3SamplingParams(SamplingParams):
             or not 0.0 <= (self.output_pad_value) <= 1.0
         ):
             raise ValueError("output_pad_value must be a finite value in [0, 1]")
-
-
-def align_hunyuan_image3_dimension(value: int) -> int:
-    """Round a HunyuanImage-3 dimension up to a supported multiple."""
-    return max(
-        HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-        (value + HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT - 1)
-        // HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT
-        * HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-    )
-
-
-def align_hunyuan_image3_resolution(width: int, height: int) -> tuple[int, int]:
-    """Align both width and height to supported multiples."""
-    return align_hunyuan_image3_dimension(width), align_hunyuan_image3_dimension(height)

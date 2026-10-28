@@ -33,6 +33,10 @@ class TboAttnBackend(AttentionBackend):
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
     @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        return self.primary.prefill_cuda_graph_default_max_seq_len
+
+    @property
     def dllm_attention(self):
         return self.primary.dllm_attention
 
