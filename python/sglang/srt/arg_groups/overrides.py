@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -1003,7 +1004,14 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
-        backend = "cutedsl" if is_mimo else "auto"
+        if is_confidential_compute():
+            # mnnvl, cutedsl and multi-node fusion need NVLink multicast, which
+            # Confidential Computing does not provide.
+            if is_mimo or view.nnodes > 1:
+                return {}
+            backend = "trtllm"
+        else:
+            backend = "cutedsl" if is_mimo else "auto"
         logger.info(
             "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )

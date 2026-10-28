@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -38,7 +39,19 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import _declared_default
+from sglang.srt.utils.common import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 @dataclasses.dataclass
@@ -2604,6 +2617,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
+            _confidential_compute(False),
             override_platform(is_sm90=True),
             override_platform(is_sm100=False),
         ):
@@ -2648,6 +2662,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+        # SM100 auto-enables multi-node mnnvl, which needs NVLink multicast, so
+        # Confidential Computing keeps only single-node trtllm.
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+        ):
+            with _confidential_compute(False):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)),
+                    {"flashinfer_allreduce_fusion_backend": "auto"},
+                )
+            with _confidential_compute(True):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+                )
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view()),
+                    {"flashinfer_allreduce_fusion_backend": "trtllm"},
+                )
 
         # enforce-disable wins over everything
         self.assertEqual(

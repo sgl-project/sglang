@@ -19,9 +19,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
+    is_confidential_compute,
     is_flashinfer_available,
 )
-from sglang.srt.utils.common import is_confidential_compute
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -51,11 +51,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
-    # The mnnvl backend needs NVLink multicast, which is unavailable under
-    # NVIDIA Confidential Computing (CC). Force the multicast-free trtllm
-    # backend there.
     if is_confidential_compute():
-        if backend == "mnnvl" or backend == "cutedsl":
+        if backend in ("mnnvl", "cutedsl"):
             raise ValueError(
                 "FlashInfer allreduce fusion mnnvl/cutedsl backend requires NVLink "
                 "multicast, unavailable under NVIDIA Confidential Computing. "

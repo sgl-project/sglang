@@ -4,14 +4,27 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.utils.common import is_confidential_compute
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Collectives are mocked and world_size is a plain int, so the world_size=4
 # cases need one real CUDA device.
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 class _FakeWorkspace:
@@ -98,6 +111,10 @@ class TestFlashInferCommFusion(CustomTestCase):
     published bags -- so the cases here drive the dispatch directly.
     """
 
+    def setUp(self):
+        super().setUp()
+        self.enterContext(_confidential_compute(False))
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = ("auto", False)
         multi_node = ("auto", True)
@@ -181,6 +198,15 @@ class TestFlashInferCommFusion(CustomTestCase):
                     with self.subTest(backend=args[0], multi_node=args[1]):
                         with self.assertRaises(ValueError):
                             fusion._resolve_backend(*args)
+
+    def test_confidential_compute_allows_only_single_node_trtllm(self):
+        with override_platform(is_sm100=True), _confidential_compute(True):
+            self.assertEqual(fusion._resolve_backend("auto", False), "trtllm")
+            for backend in ("mnnvl", "cutedsl"):
+                with self.subTest(backend=backend), self.assertRaises(ValueError):
+                    fusion._resolve_backend(backend, False)
+            with self.assertRaises(ValueError):
+                fusion._resolve_backend("auto", True)
 
     def test_allreduce_fusion_backends_match_torch_baseline(self):
         fake_comm = _FakeFlashInferComm()
