@@ -2,6 +2,61 @@
   "_": "Cross-language JSON parity fixtures for sglang.api.v1. Each case: decoding `input` and re-encoding yields `canonical` byte for byte, and `canonical` re-encodes to itself. Checked by rust/sglang-api-types/tests/json_parity.rs and test/registered/unit/api/v1/test_parity.py.",
   "cases": [
     {
+      "type": "GenerateRequest",
+      "name": "empty labels are omitted while image options default to an empty prefix",
+      "input": {
+        "text": "hi",
+        "custom_labels": {},
+        "images_config": {}
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"images_config\":{\"prefix\":\"\"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "custom labels and typed image options round-trip",
+      "input": {
+        "text": "hi",
+        "custom_labels": {
+          "tenant": "team"
+        },
+        "images_config": {
+          "image_mode": "base",
+          "prefix": "OCR: "
+        }
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"},\"images_config\":{\"image_mode\":\"base\",\"prefix\":\"OCR: \"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "empty spans are omitted on nonterminal output",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "weight_versions": []
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "zero-length weight spans survive serialization",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 0
+            }
+          ]
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"weight_versions\":[{\"version\":\"v1\",\"start\":0,\"end\":0}]}}"
+    },
+    {
       "type": "ListModelsResponse",
       "name": "model cards preserve a uint64 context limit and omit absent parent",
       "input": {"models": [{"id": "model", "root": "model", "max_model_len": 4294967296}]},
@@ -47,7 +102,7 @@
           "max_new_tokens": 8
         }
       },
-      "canonical": "{\"text\":\"hi\",\"stream\":false,\"sampling_params\":{\"max_new_tokens\":8,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}}"
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"sampling_params\":{\"max_new_tokens\":8,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "GenerateRequest",
@@ -76,7 +131,7 @@
           null
         ]
       },
-      "canonical": "{\"text\":[\"a\",\"b\"],\"stream\":true,\"sampling_params\":[{\"max_new_tokens\":128,\"temperature\":1.0,\"top_p\":0.9,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false},{\"max_new_tokens\":128,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}],\"return_logprob\":true,\"bootstrap_host\":[null,\"h\"],\"bootstrap_port\":[8998,null]}"
+      "canonical": "{\"text\":[\"a\",\"b\"],\"stream\":true,\"sampling_params\":[{\"max_new_tokens\":128,\"temperature\":1.0,\"top_p\":0.9,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false},{\"max_new_tokens\":128,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}],\"return_logprob\":true,\"bootstrap_host\":[null,\"h\"],\"bootstrap_port\":[8998,null],\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "GenerateRequest",
@@ -100,7 +155,7 @@
         "return_hidden_states": true,
         "routed_dp_rank": 1
       },
-      "canonical": "{\"rid\":\"r-1\",\"input_ids\":[1,2,3],\"stream\":false,\"return_logprob\":true,\"logprob_start_len\":0,\"top_logprobs_num\":2,\"token_ids_logprob\":[5,6],\"return_hidden_states\":true,\"return_text_in_logprobs\":true,\"routed_dp_rank\":1}"
+      "canonical": "{\"rid\":\"r-1\",\"input_ids\":[1,2,3],\"stream\":false,\"return_logprob\":true,\"logprob_start_len\":0,\"top_logprobs_num\":2,\"token_ids_logprob\":[5,6],\"return_hidden_states\":true,\"return_text_in_logprobs\":true,\"routed_dp_rank\":1,\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "GenerateRequest",
@@ -125,9 +180,9 @@
           "h1",
           "h2"
         ],
-        "session_id": "ignored"
+        "conversation_id": "ignored"
       },
-      "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"
+      "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\",\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "SamplingParams",
@@ -183,7 +238,7 @@
     },
     {
       "type": "GenerateResponse",
-      "name": "terminal batch frame with every logprob family, null rows, hidden states, e2e_latency, cache and reasoning counts, index",
+      "name": "terminal batch frame with every logprob family, null rows, hidden states, e2e_latency, cache and reasoning counts, weight versions, media counts, index",
       "input": {
         "text": "ok",
         "meta_info": {
@@ -250,14 +305,28 @@
           ],
           "e2e_latency": 0.01,
           "cached_tokens": 4,
-          "reasoning_tokens": 2
+          "reasoning_tokens": 2,
+          "weight_version": "new",
+          "weight_versions": [
+            {
+              "version": "old",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "new",
+              "start": 1,
+              "end": 1
+            }
+          ],
+          "image_tokens": 8
         },
         "output_ids": [
           5
         ],
         "index": 0
       },
-      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01,\"cached_tokens\":4,\"reasoning_tokens\":2},\"output_ids\":[5],\"index\":0}"
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01,\"cached_tokens\":4,\"reasoning_tokens\":2,\"weight_version\":\"new\",\"weight_versions\":[{\"version\":\"old\",\"start\":0,\"end\":1},{\"version\":\"new\",\"start\":1,\"end\":1}],\"image_tokens\":8},\"output_ids\":[5],\"index\":0}"
     },
     {
       "type": "GenerateResponse",

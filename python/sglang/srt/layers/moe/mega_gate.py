@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch
@@ -20,6 +21,8 @@ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 # DeepGEMM bf16_mega_gate scores one token block per launch.
 _MEGA_GATE_MAX_ROWS = 2048
+# Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
+_ROW_MASKS_ATTR = "_mega_gate_row_masks"
 
 
 class MegaGateRouting(NamedTuple):
@@ -116,7 +119,57 @@ def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateRouting]:
+@contextmanager
+def mega_gate_forward_scope(forward_batch):
+    """One model forward: the gate's row masks are built once and shared by its
+    MoE layers. Each forward (eager, warmup or graph capture) builds its own."""
+    if forward_batch is None or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+        yield
+        return
+    try:
+        setattr(forward_batch, _ROW_MASKS_ATTR, {})
+    except (AttributeError, TypeError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            delattr(forward_batch, _ROW_MASKS_ATTR)
+        except AttributeError:
+            pass
+
+
+def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_batch):
+    """(valid-row mask, image-token mask) for the gate, built once per forward."""
+    cache = getattr(forward_batch, _ROW_MASKS_ATTR, None)
+    key = (
+        num_tokens,
+        id(bound) if bound is not None else None,
+        id(image_input_ids) if image_input_ids is not None else None,
+    )
+    if isinstance(cache, dict):
+        hit = cache.get(key)
+        # The cached inputs are held, so their ids cannot be reused this forward.
+        if hit is not None and hit[0] is bound and hit[1] is image_input_ids:
+            return hit[2], hit[3]
+    valid = None
+    if bound is not None:
+        valid = (
+            torch.arange(num_tokens, device=device, dtype=torch.int32)
+            < bound.reshape(-1)[:1]
+        )
+    image = None
+    if image_input_ids is not None:
+        image = (image_input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
+    if isinstance(cache, dict):
+        cache[key] = (bound, image_input_ids, valid, image)
+    return valid, image
+
+
+def run_mega_gate(
+    moe, hidden_states, input_ids, buf=None, forward_batch=None
+) -> Optional[MegaGateRouting]:
     bound, dispatch_info = moe.topk.routing_inputs()
     if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm in (
         "lp",
@@ -126,20 +179,25 @@ def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateR
     if moe.is_hash and input_ids is None:
         return None
     num_tokens = hidden_states.shape[0]
-    valid = None
-    if bound is not None:
-        valid = (
-            torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int32)
-            < bound.reshape(-1)[:1]
-        )
-    image = hash_ids = None
+    use_image = (
+        not moe.is_hash
+        and moe.gate.e_score_correction_bias_vl is not None
+        and input_ids is not None
+    )
+    valid, image = _gate_row_masks(
+        moe,
+        num_tokens,
+        bound,
+        input_ids if use_image else None,
+        hidden_states.device,
+        forward_batch,
+    )
+    hash_ids = None
     if moe.is_hash:
         token_ids = input_ids[:num_tokens]
         if valid is not None:
             token_ids = torch.where(valid, token_ids, 0)
         hash_ids = moe.topk.tid2eid[token_ids].to(torch.int64)
-    elif moe.gate.e_score_correction_bias_vl is not None and input_ids is not None:
-        image = (input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
