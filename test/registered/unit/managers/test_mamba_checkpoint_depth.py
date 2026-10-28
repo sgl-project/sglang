@@ -73,6 +73,12 @@ def _prepare_extend(
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
     # The plan is applied to the request at admission, not by the build.
     assert req.kv.mamba_last_track_seqlen is None
+    return entry, req
+
+
+def _track_seqlen(**kwargs) -> int | None:
+    """The donated depth of one extend, or None when it donates no checkpoint."""
+    entry, _ = _prepare_extend(**kwargs)
     if not entry.track_mask:
         return None
     return entry.checkpoint_seqlen
@@ -126,8 +132,8 @@ class TestMambaCheckpointDepth(unittest.TestCase):
 
 class TestMambaTrackPosition(unittest.TestCase):
     def test_track_position_is_taken_before_the_ping_pong_swap(self):
-        # prepare_for_extend gathers the slot id at this position; the read it
-        # replaced took buffer[mamba_next_track_idx] before the boundary swap.
+        # prepare_for_extend gathers the slot id at this position on the
+        # device; the build leaves the swap to admission.
         for next_idx in (0, 1):
             with self.subTest(next_idx=next_idx):
                 entry, req = _prepare_extend(
@@ -135,7 +141,7 @@ class TestMambaTrackPosition(unittest.TestCase):
                 )
                 self.assertTrue(entry.track_mask)
                 self.assertEqual(entry.track_position, next_idx)
-                self.assertEqual(req.kv.mamba_next_track_idx, 1 - next_idx)
+                self.assertEqual(req.kv.mamba_next_track_idx, next_idx)
 
 
 class TestMambaTrackGrid(unittest.TestCase):

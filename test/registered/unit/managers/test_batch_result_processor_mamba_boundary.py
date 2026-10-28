@@ -124,6 +124,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         req.kv.req_pool_idx = 0
         req.kv.kv_allocated_len = req.kv.kv_committed_len = 3
         req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
         processor = _make_processor()
@@ -208,10 +209,6 @@ class TestMambaBoundaryCommit(unittest.TestCase):
                 "sglang.srt.managers.schedule_batch.alloc_for_decode",
                 side_effect=alloc_for_decode,
             ),
-            patch(
-                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
-                side_effect=_set_mamba_track_indices_on_cpu,
-            ),
             patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
         ):
             with self.assertRaises(StopIteration):
@@ -242,6 +239,7 @@ class TestMambaSpecBoundaryCommit(unittest.TestCase):
         req.kv.req_pool_idx = 0
         req.kv.kv_allocated_len = req.kv.kv_committed_len = 3
         req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
         step.spec_algorithm = SpeculativeAlgorithm.EAGLE
@@ -266,10 +264,6 @@ class TestMambaSpecBoundaryCommit(unittest.TestCase):
                 _mamba_cache_chunk_size=TRACK_INTERVAL,
             ),
             patch("sglang.srt.speculative.eagle_utils.eagle_prepare_for_decode"),
-            patch(
-                "sglang.srt.speculative.spec_utils.set_mamba_track_indices_from_reqs",
-                side_effect=_set_mamba_track_indices_on_cpu,
-            ),
             patch(
                 "sglang.srt.managers.scheduler_components."
                 "request_retirer.release_kv_cache"
@@ -312,6 +306,7 @@ def _make_lazy_step(req: Req, *, spec: bool, other_slot: int = -1) -> ScheduleBa
     req.kv.mamba_ping_pong_track_buffer = torch.tensor(
         [_LAZY_CHECKPOINT_SLOT, other_slot]
     )
+    req.kv.mamba_ping_pong_empty = [False, other_slot == -1]
     req.kv.mamba_next_track_idx = 0
     req.kv.mamba_last_track_idx = 0
     req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
@@ -399,10 +394,6 @@ class TestMambaLazyInPlaceTrack(unittest.TestCase):
             patch(
                 "sglang.srt.managers.schedule_batch.alloc_for_decode",
                 side_effect=alloc_for_decode,
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
-                side_effect=_set_mamba_track_indices_on_cpu,
             ),
             patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
         ):
@@ -603,6 +594,7 @@ class TestMambaExtendAdmission(unittest.TestCase):
         next chunk the other ping-pong slot."""
         req, batch = _make_batch()
         req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
         batch.forward_mode = ForwardMode.EXTEND
