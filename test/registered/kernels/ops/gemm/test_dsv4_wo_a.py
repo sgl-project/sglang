@@ -88,6 +88,9 @@ def _mode_flags(mode):
 def _strided_bmm_cases(groups):
     cases = [("is_target_verify", rows) for rows in (9, 64, 100, 128, 384)]
     cases += [("is_prefill", rows) for rows in (4096, 8192, 16384, 65536)]
+    if groups == 8:
+        # 8 groups take prefill below 4096 rows too (short prompts, last chunks)
+        cases += [("is_prefill", rows) for rows in (1, 128, 2048, 4095)]
     if groups != 2:
         # 2 groups run 1-8 rows through the gemv and small-batch kernels instead
         cases += [("is_decode", 1)]
@@ -139,7 +142,7 @@ def test_wo_a_strided_bmm_graph_replay_matches_einsum(groups):
             assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
 
 
-@pytest.mark.parametrize("groups, rows", [(8, 4095), (4, 4095)])
+@pytest.mark.parametrize("groups, rows", [(2, 4095), (4, 4095)])
 def test_wo_a_strided_bmm_gate_rejects_unmeasured_prefill(groups, rows):
     """Prefill shapes outside the measured gate keep the einsum's group-major layout."""
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
