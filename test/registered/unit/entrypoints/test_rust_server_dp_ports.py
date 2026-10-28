@@ -25,7 +25,14 @@ def _launch_config():
             get_default_sampling_params=lambda: {},
         ),
         tokenizer_path="tokenizer",
+        tokenizer=None,
         max_total_num_tokens=1024,
+        max_req_input_len=1000,
+        kv_events_publisher=SimpleNamespace(
+            local_kv_event_sources=MagicMock(
+                return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
+            )
+        ),
         load_snapshot_writer=None,
     )
 
@@ -84,20 +91,23 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
         ServerArgs=MagicMock(return_value="server-args"),
     )
-    scheduler = _scheduler_for_typed_config()
+    launch_config = _launch_config()
     with (
-        get_context().override_server_args(grpc_port=50051, **overrides),
+        get_context().override_server_args(grpc_port=50051, page_size=16, **overrides),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        assert rust_config._build_server_args(**_launch_config()) == "server-args"
+        assert (
+            rust_config._build_server_args(**launch_config, default_max_new_tokens=None)
+            == "server-args"
+        )
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
     assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
-    scheduler.get_init_info.assert_not_called()
-    scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
+    publisher = launch_config["kv_events_publisher"]
+    publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
@@ -125,13 +135,13 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
         ServerArgs=MagicMock(return_value="server-args"),
     )
     with (
-        get_context().override_server_args(**server_args),
+        get_context().override_server_args(page_size=16, **server_args),
         get_parallel().override(**ranks),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        rust_config._build_server_args(_scheduler_for_typed_config())
+        rust_config._build_server_args(**_launch_config())
 
     deployment_info = json.loads(
         extension.ServerArgs.call_args.kwargs["deployment_info"]
@@ -143,7 +153,7 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
 def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
     extension = MagicMock()
     with (
-        get_context().override_server_args(enable_metrics=enable_metrics),
+        get_context().override_server_args(enable_metrics=enable_metrics, page_size=16),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
@@ -215,7 +225,10 @@ def test_dp_leaders_reuse_node_local_ports(
                         model_config=SimpleNamespace(is_multimodal=False),
                         processor=None,
                         tokenizer_path="tokenizer",
+                        tokenizer=None,
                         max_total_num_tokens=1024,
+                        max_req_input_len=1000,
+                        kv_events_publisher=None,
                         load_snapshot_writer=None,
                     ).http_port
                 )

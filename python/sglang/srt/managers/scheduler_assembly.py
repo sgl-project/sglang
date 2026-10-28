@@ -592,6 +592,14 @@ def assemble_scheduler(
     # it synchronously. (The listener is bound synchronously inside launch,
     # so the registry is accepting once this returns.) Must also precede
     # the request receiver, which takes the rust server as its ingress.
+    # The Rust frontend snapshots the local KV-event discovery metadata when it
+    # builds its typed server info, so the publisher precedes it.
+    kv_events_publisher = SchedulerKvEventsPublisher(
+        kv=kv,
+        send_metrics_from_scheduler=ipc_channels.send_metrics_from_scheduler,
+        capacity=capacity,
+        metrics_sink=metrics_sink,
+    )
     rust_server = None
     if _hosts_rust_server():
         rust_server = component_classes.rust_server.launch(
@@ -599,7 +607,10 @@ def assemble_scheduler(
             model_config=model_config,
             processor=processor,
             tokenizer_path=get_serving().tokenizer_path,
+            tokenizer=tokenizer,
             max_total_num_tokens=max_total_num_tokens,
+            max_req_input_len=max_req_input_len,
+            kv_events_publisher=kv_events_publisher,
             load_snapshot_writer=load_snapshot_writer,
         )
         # Park the idle loop on the request ring within the rank-0 rust-server
@@ -747,12 +758,6 @@ def assemble_scheduler(
         session_controller=session_controller,
         hisparse_coordinator=mode_owners.hisparse_coordinator,
         capacity=capacity,
-    )
-    kv_events_publisher = SchedulerKvEventsPublisher(
-        kv=kv,
-        send_metrics_from_scheduler=ipc_channels.send_metrics_from_scheduler,
-        capacity=capacity,
-        metrics_sink=metrics_sink,
     )
     # Router-facing load reporting; rank gating and no-op fallback live
     # inside the component. Same interval as the DP-balancing writer so
@@ -1012,6 +1017,8 @@ def assemble_scheduler(
             None if draft_worker is None else draft_worker.graph_time_usage
         ),
     )
+    if rust_server is not None:
+        rust_server.set_startup_time(startup_time)
     # Reads the startup time.
     internal_state = SchedulerInternalStateController(
         workers=workers,

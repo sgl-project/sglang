@@ -80,7 +80,10 @@ class TestRustServerExtension(CustomTestCase):
             model_config=SimpleNamespace(is_multimodal=True),
             processor=None,
             tokenizer_path="tokenizer",
+            tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_input_len=1000,
+            kv_events_publisher=None,
             load_snapshot_writer=None,
         )
         with launch_context(ModelServer) as build_args:
@@ -90,10 +93,14 @@ class TestRustServerExtension(CustomTestCase):
             server_args=launch_config["server_args"],
             model_config=launch_config["model_config"],
             tokenizer_path="tokenizer",
+            tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_input_len=1000,
+            kv_events_publisher=None,
             load_snapshot_writer=None,
             extension=extension,
             health_generate_headers={},
+            default_max_new_tokens=128,
         )
         extension.Server.assert_called_once_with(
             sentinel.args, cores=None, port_offset=1
@@ -148,7 +155,10 @@ class TestRustServerExtension(CustomTestCase):
             ),
             processor=sentinel.processor,
             tokenizer_path="tokenizer",
+            tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_input_len=1000,
+            kv_events_publisher=None,
             load_snapshot_writer=None,
         )
         with (

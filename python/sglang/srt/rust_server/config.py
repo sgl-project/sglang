@@ -38,6 +38,9 @@ from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+        SchedulerKvEventsPublisher,
+    )
     from sglang.srt.rust_extensions._server import ServerArgs
     from sglang.srt.server_args import ServerArgs as SglServerArgs
 
@@ -49,7 +52,10 @@ def _build_server_args(
     server_args: SglServerArgs,
     model_config: ModelConfig,
     tokenizer_path: str,
+    tokenizer: Any,
     max_total_num_tokens: int,
+    max_req_input_len: int,
+    kv_events_publisher: SchedulerKvEventsPublisher,
     load_snapshot_writer: Any,
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
@@ -106,8 +112,8 @@ def _build_server_args(
         # initialized KV publisher directly instead of calling get_init_info()
         # on a partially initialized scheduler.
         "hicache_host_total_tokens": None,
-        "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
-            scheduler.page_size * get_parallel().dcp_size
+        "kv_event_sources": kv_events_publisher.local_kv_event_sources(
+            get_schedule().page_size * get_parallel().dcp_size
         ),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
@@ -187,7 +193,7 @@ def _build_server_args(
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
         tokenizer_model_max_length=_tokenizer_model_max_length(
-            scheduler.tokenizer, mc.context_len
+            tokenizer, mc.context_len
         ),
         # Launch-time facts Python's /server_info reports from
         # scheduler_info / the package — stamped here so the rust endpoint
@@ -195,7 +201,11 @@ def _build_server_args(
         version=__version__,
         max_total_num_tokens=max_total_num_tokens,
         deployment_info=json.dumps(deployment_info),
-        launch_server_info=_launch_server_info(scheduler),
+        launch_server_info=_launch_server_info(
+            server_args=server_args,
+            max_total_num_tokens=max_total_num_tokens,
+            max_req_input_len=max_req_input_len,
+        ),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
@@ -211,7 +221,9 @@ def _build_server_args(
     )
 
 
-def _launch_server_info(scheduler: Scheduler) -> str:
+def _launch_server_info(
+    *, server_args: SglServerArgs, max_total_num_tokens: int, max_req_input_len: int
+) -> str:
     """The `/server_info` fields Python's HTTP server reports that are fixed
     at launch, as a JSON object: the resolved `server_args`,
     `launch_command`, `kv_events`, and the scheduler's init info less what is
@@ -220,13 +232,11 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     secrets are redacted as Python's HTTP and gRPC frontends redact them."""
     scheduler_info = {
         "status": "ready",
-        "max_total_num_tokens": scheduler.max_total_num_tokens,
-        "max_req_input_len": scheduler.max_req_input_len,
+        "max_total_num_tokens": max_total_num_tokens,
+        "max_req_input_len": max_req_input_len,
     }
     info = msgspec_to_builtins(
-        redact_watermark_secrets(
-            build_server_info(scheduler.server_args, scheduler_info)
-        )
+        redact_watermark_secrets(build_server_info(server_args, scheduler_info))
     )
     # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
     # router reads this key to pick its protocol.

@@ -47,6 +47,9 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+    from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+        SchedulerKvEventsPublisher,
+    )
     from sglang.srt.rust_extensions._server import MmSpec, Server
     from sglang.srt.server_args import ServerArgs
 
@@ -158,7 +161,10 @@ class RustServer:
         model_config: ModelConfig,
         processor,
         tokenizer_path: str,
+        tokenizer: Any,
         max_total_num_tokens: int,
+        max_req_input_len: int,
+        kv_events_publisher: SchedulerKvEventsPublisher,
         load_snapshot_writer: Any,
     ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
@@ -212,7 +218,10 @@ class RustServer:
                 server_args=server_args,
                 model_config=model_config,
                 tokenizer_path=tokenizer_path,
+                tokenizer=tokenizer,
                 max_total_num_tokens=max_total_num_tokens,
+                max_req_input_len=max_req_input_len,
+                kv_events_publisher=kv_events_publisher,
                 load_snapshot_writer=load_snapshot_writer,
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(
