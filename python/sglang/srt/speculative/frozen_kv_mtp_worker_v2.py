@@ -370,8 +370,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            kv_loc_plan=forward_batch.kv_loc_plan,
-            kv_loc_cols=forward_batch.kv_loc_cols,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):

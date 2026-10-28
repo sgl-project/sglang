@@ -84,7 +84,8 @@ from sglang.srt.mem_cache.common import (
     suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -136,9 +137,10 @@ def _uses_write_through_cache(cache: object) -> bool:
 
 
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
-    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
-    # full-attention layers, so translate to a full-attention-relative offset.
-    if not isinstance(pool, HybridLinearKVPool):
+    # A pool wrapping one token KV view (its other layers hold state) counts all
+    # layers in start_layer, but peer KV lists contain only full-attention
+    # layers, so translate to a full-attention-relative offset.
+    if pool.layer_router.wrapped_view() is None:
         return pool.start_layer
     return sum(
         1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
@@ -289,9 +291,15 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            self.token_to_kv_pool
+        storage = kv_storage_of(
+            self.scheduler.req_to_token_pool,
+            self.scheduler.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=(
+                self.draft_token_to_kv_pool if transfer_draft_cache else None
+            ),
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(storage)
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -332,6 +340,7 @@ class PrefillBootstrapQueue:
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            storage=storage,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -346,13 +355,11 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
 
-        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(
             kv_args,
-            self.token_to_kv_pool,
+            storage,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=req_to_token_pool,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -374,9 +381,7 @@ class PrefillBootstrapQueue:
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):
-            kv_pool = self.token_to_kv_pool
-            if hasattr(kv_pool, "full_kv_pool"):
-                kv_pool = kv_pool.full_kv_pool
+            kv_pool = self.token_to_kv_pool.layer_router.view(IdSpaceKind.FULL)
             staging_slots = build_staging_slot_metadata(
                 kv_layer_ids=kv_args.kv_layer_ids,
                 num_draft_entries=num_draft_entries,
@@ -1575,8 +1580,11 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
+                state_ids = self.token_to_kv_pool_allocator.state_ids(
+                    self.req_to_token_pool.state_sub_pool
+                )
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
+                    state_ids.ids(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
                             req.kv.req_pool_idx
                         ]
@@ -1586,8 +1594,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-                request_window = kvcache.request_window
+                allocator = self.token_to_kv_pool_allocator
+                kvcache = allocator.get_kvcache()
+                # A unified pool (one with transfer storage) keeps its window
+                # in a sub-pool, never in per-request window rows.
+                request_window = (
+                    None if allocator.storage is not None else kvcache.request_window
+                )
                 # Under encoder replay the scheduler is not hybrid SWA and keeps no
                 # window size; the pool holds it.
                 window_size = (

@@ -178,9 +178,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     conv_states = torch.zeros(16, 6, 2)[::2]
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
-                    backend.req_to_token_pool = SimpleNamespace(
-                        mamba2_layer_cache=lambda _: cache
-                    )
+                    backend.state_layer_cache = lambda _: cache
                     expected_indices = torch.arange(2) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):
