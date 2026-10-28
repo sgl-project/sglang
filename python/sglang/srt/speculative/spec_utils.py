@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
@@ -609,7 +609,7 @@ def generate_simulated_accept_index(
         simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
 
-    if _is_cuda and accept_index.is_cuda:
+    if (_is_cuda or _is_hip) and accept_index.is_cuda:
         return simulated_accept(
             accept_indices=accept_index,
             predict_tokens=predict,
