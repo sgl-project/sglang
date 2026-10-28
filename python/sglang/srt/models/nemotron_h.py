@@ -178,7 +178,7 @@ class _PrefillSharedExpertCall:
         self.done = torch.cuda.Event(external=True)
         self.output = None
 
-    def launch(self, module, hidden_states):
+    def launch(self, module, hidden_states) -> None:
         main_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.stream):
             if self.graph is None:
@@ -189,10 +189,9 @@ class _PrefillSharedExpertCall:
                 self.output.record_stream(main_stream)
             else:
                 self.graph.replay()
-        return self.output
 
 
-def _capture_prefill_shared_expert(module, hidden_states, call):
+def _capture_prefill_shared_expert(module, hidden_states, call) -> None:
     call.graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(
         call.graph,
@@ -204,14 +203,13 @@ def _capture_prefill_shared_expert(module, hidden_states, call):
         call.done.record()
     # The ready record belongs to the preceding main-stream graph. Do not
     # replay here: that graph has only been captured, not launched yet.
-    return call.output
 
 
-@eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
-def _launch_prefill_shared_expert(module, hidden_states, call):
+@eager_on_graph(True, on_capture=_capture_prefill_shared_expert)
+def _launch_prefill_shared_expert(module, hidden_states, call) -> None:
     # BCG retains this call, its graph, events and output until graph cleanup.
     # A replay launches on the same explicit stream for every layer.
-    return call.launch(module, hidden_states)
+    call.launch(module, hidden_states)
 
 
 def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
@@ -443,9 +441,8 @@ class NemotronHMoE(nn.Module):
         # one explicit stream, preserving overlap with the routed experts.
         call = _PrefillSharedExpertCall(_get_or_create_alt_stream(self.device_module))
         call.ready.record()
-        shared_output = _launch_prefill_shared_expert(
-            self.shared_experts, hidden_states, call
-        )
+        _launch_prefill_shared_expert(self.shared_experts, hidden_states, call)
+        shared_output = call.output
         router_logits = torch.mm(
             hidden_states, self.gate.weight.t(), out_dtype=torch.float32
         )

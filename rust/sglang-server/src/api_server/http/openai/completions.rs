@@ -14,12 +14,12 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Deserialize;
+use sglang_processor::dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
-use futures::StreamExt;
-use serde::Deserialize;
 
 use super::pd_routing::PDRoutingFields;
 use super::{
@@ -720,10 +720,10 @@ mod tests {
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{
+    use futures::StreamExt;
+    use sglang_processor::dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
-    use futures::StreamExt;
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {
