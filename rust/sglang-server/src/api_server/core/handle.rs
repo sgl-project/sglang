@@ -18,7 +18,7 @@ use crate::message::ids::Rid;
 use crate::message::io_struct::{
     CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
 };
-use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::request::{GenerateRequest, RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
@@ -76,7 +76,7 @@ impl From<&ServerArgs> for CoreMetadata {
         Self {
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
-            tokenizer_path: args.tokenizer_path.clone(),
+            tokenizer_path: args.public_tokenizer_path.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
             weight_version: args.weight_version.as_deref().map(Arc::from),
             load_format: args.load_format.clone(),
@@ -458,12 +458,21 @@ impl CoreHandle {
         text: String,
         add_special_tokens: bool,
     ) -> Result<TokenIds, CoreError> {
-        let mut call = self
-            .submit(RequestKind::Tokenize {
-                text,
-                add_special_tokens,
-            })
-            .await?;
+        self.tokenize_input(TokenizeInput::Text {
+            text,
+            add_special_tokens,
+        })
+        .await
+    }
+
+    /// Encode a rendered chat prompt on the tokenizer pool.
+    pub(crate) async fn tokenize_chat(&self, chat: RenderedChat) -> Result<TokenIds, CoreError> {
+        self.tokenize_input(TokenizeInput::Chat(Box::new(chat)))
+            .await
+    }
+
+    async fn tokenize_input(&self, input: TokenizeInput) -> Result<TokenIds, CoreError> {
+        let mut call = self.submit(RequestKind::Tokenize(input)).await?;
         match call.recv().await {
             Some(ResponseItem::TokenIds(ids)) => Ok(ids),
             Some(ResponseItem::Error(Error::Validation(message))) => {
@@ -804,6 +813,7 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
                 CoreEvent::Failed(CoreError::from_runtime_rejection(
                     message.to_owned(),
                     legacy_http_status,
+                    output.into(),
                 ))
             } else {
                 CoreEvent::Finished(output.into())
@@ -979,7 +989,7 @@ struct RuntimeCall {
 
 impl RuntimeCall {
     async fn recv(&mut self) -> Option<ResponseItem> {
-        let item = tokio::select! {
+        let mut item = tokio::select! {
             biased;
             _ = async {
                 match self.generation.as_mut() {
@@ -990,11 +1000,14 @@ impl RuntimeCall {
             item = self.response_rx.recv() => item,
         };
         self.observe(item.as_ref());
+        if let Some(item) = &mut item {
+            self.name_client_rid(item);
+        }
         item
     }
 
     fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
-        let item = if self
+        let mut item = if self
             .generation
             .as_ref()
             .is_some_and(Generation::is_cancelled)
@@ -1004,7 +1017,27 @@ impl RuntimeCall {
             self.response_rx.try_recv()?
         };
         self.observe(Some(&item));
+        self.name_client_rid(&mut item);
         Ok(item)
+    }
+
+    /// The scheduler knows a request by the rid this server sent it, which
+    /// carries [`Rid::from_client`]'s suffix. An abort message it writes
+    /// reaches the client, so name the request there by the client's rid.
+    ///
+    /// The message may hold the rid raw (`{rid}`) or as Python's `repr`
+    /// (`{rid=}`, `{rid!r}`), which escapes the client's part and quotes the
+    /// whole. The suffix is ASCII hex after `#`, so neither form changes it
+    /// or the quote `repr` picks: dropping the suffix leaves the client's rid
+    /// in the form the scheduler wrote, as Python's frontend shows it.
+    fn name_client_rid(&self, item: &mut ResponseItem) {
+        let client_rid = self.rid.client_facing();
+        if let ResponseItem::Done(output) = item
+            && client_rid.len() != self.rid.len()
+            && let Some(reason) = &mut output.finish_reason
+        {
+            reason.replace_in_abort_message(&self.rid.as_str()[client_rid.len()..], "");
+        }
     }
 
     fn observe(&mut self, item: Option<&ResponseItem>) {
@@ -1290,7 +1323,8 @@ mod tests {
             (503, CoreErrorKind::Unavailable),
             (504, CoreErrorKind::DeadlineExceeded),
         ] {
-            let error = CoreError::from_runtime_rejection("rejected".into(), status);
+            let error =
+                CoreError::from_runtime_rejection("rejected".into(), status, Default::default());
             assert_eq!(error.kind(), expected, "legacy status {status}");
             assert!(matches!(
                 error,
@@ -1381,6 +1415,69 @@ mod tests {
         assert!(call.recv().await.is_none());
         drop(call);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// A scheduler abort that carried a status fails the call with that
+    /// status and keeps the terminal output, and the scheduler's message
+    /// names the request by the client's rid, not the suffixed one this
+    /// server sent the scheduler — raw, or as Python's `repr` (`{rid=}`)
+    /// with the client's escaping and quoting kept, as Python shows it.
+    #[tokio::test]
+    async fn status_abort_names_the_client_rid() {
+        // (client rid, Python's `repr` of it)
+        for (client_rid, client_repr) in [
+            ("client-rid", "'client-rid'"),
+            (r"back\slash", r"'back\\slash'"),
+            ("new\nline", r"'new\nline'"),
+            ("it's", r#""it's""#),
+        ] {
+            let harness = Harness::unbounded(8);
+            let mut call = harness
+                .handle
+                .generate(GenerateRequest {
+                    rid: Rid::from_client(client_rid),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let internal = call.runtime.rid.as_str().to_owned();
+            let suffix = &internal[client_rid.len()..];
+            // `repr` of the suffixed rid: the suffix lands inside the quotes.
+            let (body, quote) = client_repr.split_at(client_repr.len() - 1);
+            let internal_repr = format!("{body}{suffix}{quote}");
+            let request = accept_intake(harness.intake_rx.recv().unwrap());
+            request
+                .sink
+                .try_send(ResponseItem::Done(ChunkEvent {
+                    prompt_tokens: 3,
+                    finish_reason: serde_json::from_value(serde_json::json!({
+                        "type": "abort",
+                        "message": format!(
+                            "Request {internal} failed: req.rid={internal_repr}"
+                        ),
+                        "status_code": 500,
+                        "err_type": null
+                    }))
+                    .unwrap(),
+                    ..Default::default()
+                }))
+                .unwrap();
+
+            let Some(CoreEvent::Failed(error)) = call.recv().await else {
+                panic!("a status abort fails the call");
+            };
+            let expected = format!("Request {client_rid} failed: req.rid={client_repr}");
+            assert_eq!(error.http_status().as_u16(), 500);
+            assert_eq!(error.to_string(), expected, "client rid {client_rid:?}");
+            let output = error
+                .into_rejected_output()
+                .expect("a status abort keeps its output");
+            assert_eq!(output.prompt_tokens, 3);
+            assert_eq!(
+                output.finish_reason.unwrap().abort_status(),
+                Some((500, expected.as_str()))
+            );
+        }
     }
 
     #[tokio::test]
@@ -1704,10 +1801,10 @@ mod tests {
         assert!(!request.rid.as_str().is_empty());
         assert!(matches!(
             &request.kind,
-            RequestKind::Tokenize {
+            RequestKind::Tokenize(TokenizeInput::Text {
                 text,
                 add_special_tokens: true,
-            } if text == "hi"
+            }) if text == "hi"
         ));
         request
             .sink

@@ -876,6 +876,7 @@ class DeepseekSparseAttnBackend(
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
     ) -> dict:
+        kv_indptr = kv_indptr[: bs + 1]
         self._ensure_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
             batch_size=bs,
@@ -2376,7 +2377,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
-            )
+            ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
             "flashmla_sparse_q8",
@@ -3460,13 +3461,15 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
+        # The kernel adds a singleton batch axis; attention padding expects
+        # the token axis first, as in q_all.
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
-        )
+        ).squeeze(0)
 
     def _forward_triton_decode(
         self,
@@ -3491,7 +3494,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
-        )
+        ).squeeze(0)
 
     def _forward_intel_xpu_sparse_decode(
         self,

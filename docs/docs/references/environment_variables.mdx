@@ -770,6 +770,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BEAM_DECODE_GEMV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run single-token Beam MoE decode through a fused GEMV on SM103 (GB300) for BF16 experts with MoE TP4 and EP1, where Beam fuses the expert sum into its all-reduce (Triton MoE runner). Requires <code>SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1</code>. Unsupported setups and forwards keep their normal MoE path. Only a failed static check (device, BF16 experts, MoE TP/EP or expert shape) logs that the switch is unused.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -1226,6 +1231,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When positive, host KV cache pools on the plain mmap path (<code>SGLANG_HUGEPAGE_SIZE</code> unset or failed) are mapped <code>MAP_PRIVATE | MAP_ANONYMOUS</code> with <code>MADV_HUGEPAGE</code> and <code>MADV_DONTFORK</code>, and prefaulted by this many threads before pinning. A <code>fork()</code>ed child cannot access the buffer. Any failure falls back to the default shared mapping. <code>0</code> disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HF3FS_CONFIG_PATH</code></td>
@@ -1874,8 +1884,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one. Faster, especially at decode batch sizes, but check accuracy: it lowers GSM8K on Qwen3-32B-FP8 by about 2 points.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one for faster decode. Accuracy differences depend on the evaluation setting: Qwen3-32B-FP8 is 1 point lower on 8-shot GSM8K with 512 output tokens, but only 0.26 points lower with 5 shots and 2048 output tokens, with MMLU unchanged (see <a href="https://github.com/sgl-project/sglang/issues/43526">#43526</a>). Set to <code>false</code> to use Triton.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_MOE_GU_ITLV</code></td>
@@ -1921,6 +1931,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
 </table>
