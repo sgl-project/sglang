@@ -23,7 +23,7 @@ pub struct MambaComponent {
     mamba_checkpoint_grid: usize,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     mamba_max_states_per_path: Option<usize>,
-    /// Host checkpoints count as a device-prefix match. Default off.
+    /// Host checkpoints count as a device-prefix match.
     mamba_host_only_checkpoint: bool,
 }
 
@@ -156,8 +156,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
             node.has_device_value(MAMBA)
-                || ((host_counts_as_device || !match_device_only)
-                    && node.has_host_value(MAMBA))
+                || ((host_counts_as_device || !match_device_only) && node.has_host_value(MAMBA))
         })
     }
 
@@ -206,20 +205,14 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             "mamba insert sets both a device slot and a host checkpoint"
         );
         if params.mamba_value.is_none() && params.mamba_host_value.is_none() {
-            if tree_core.allow_missing_mamba_insert {
+            if params.allow_missing_mamba {
                 result.mamba_exist = true;
                 return;
             }
         } else if params.mamba_value.is_none()
             && let Some(host_value) = params.mamba_host_value.as_ref()
         {
-            self.commit_host_only_checkpoint(
-                tree_core,
-                node_id,
-                host_value,
-                result,
-                cache_actions,
-            );
+            self.commit_host_only_checkpoint(tree_core, node_id, host_value, result, cache_actions);
             return;
         }
         let mamba_value = params
@@ -292,8 +285,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 break;
             }
             let node = tree_core.arena.node(node_id);
-            let host_only_holder =
-                !node.has_device_value(MAMBA) && node.has_host_value(MAMBA);
+            let host_only_holder = !node.has_device_value(MAMBA) && node.has_host_value(MAMBA);
             if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
                 continue;
             }

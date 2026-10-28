@@ -818,6 +818,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 mamba_host_value=params.mamba_host_value,
+                allow_missing_mamba=params.allow_missing_mamba,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
@@ -868,9 +869,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
-
-    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
-        self._binding.set_allow_missing_mamba_insert(bool(enabled))
 
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()

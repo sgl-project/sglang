@@ -1271,7 +1271,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
-            ring_indices = getattr(fm, "replayssm_ring_indices", None)
+            ring_indices = fm.replayssm_ring_indices
             if ring_indices is not None:
                 ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
@@ -1736,11 +1736,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         # Request-scoped rings are indexed by req_pool_idx. This kernel still
         # writes the ring through the mamba slot, so keep the Triton path.
-        if getattr(
-            getattr(self.req_to_token_pool, "mamba_pool", None),
-            "replayssm_request_ring",
-            False,
-        ):
+        if self.req_to_token_pool.mamba_pool.replayssm_request_ring:
             return False
         if importlib.util.find_spec("cutlass") is None:
             return False

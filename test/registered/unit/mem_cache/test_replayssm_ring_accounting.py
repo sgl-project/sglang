@@ -86,7 +86,7 @@ class TestReplaySSMRingAccounting(CustomTestCase):
 
     def test_kda_host_only_ring_follows_requests(self):
         per_req = _kda_params().replayssm_ring_bytes_per_req(record_len=RL)
-        # Flag off: the ring stays on every mamba slot.
+        # A slot-scoped ring charges every mamba slot.
         self.assertEqual(
             replayssm_ring_memory_charge(
                 per_req,

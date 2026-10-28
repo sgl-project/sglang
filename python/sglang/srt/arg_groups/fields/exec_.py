@@ -507,7 +507,7 @@ class ExecMamba(msgspec.Struct):
         "Matched prefixes and donated checkpoints then occupy no GPU mamba slot, "
         "so the mamba/max-running ratio drops to 1 active slot plus the ping-pong "
         "slots extra-buffer still writes (3 with overlap). Requires "
-        "--enable-hierarchical-cache. Default off; the off path is unchanged.",
+        "--enable-hierarchical-cache.",
     ] = False
     int8_mamba_ckpt_size: A[
         Optional[int],

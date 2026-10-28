@@ -1104,7 +1104,7 @@ def commit_mamba_states_after_verify(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
         ring_indices = None
-        if getattr(mamba_pool, "replayssm_request_ring", False):
+        if mamba_pool.replayssm_request_ring:
             ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,

@@ -617,6 +617,7 @@ pub struct InsertParamsBinding {
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub mamba_host_value: Option<Py<PyAny>>,
+    pub allow_missing_mamba: bool,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
@@ -628,7 +629,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -645,6 +646,7 @@ impl InsertParamsBinding {
         track_adopted_ranges: bool,
         rotation_base: Option<i64>,
         mamba_host_value: Option<Py<PyAny>>,
+        allow_missing_mamba: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -655,6 +657,7 @@ impl InsertParamsBinding {
             session_id,
             mamba_value,
             mamba_host_value,
+            allow_missing_mamba,
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
@@ -1213,6 +1216,7 @@ macro_rules! tree_core_methods {
                     value: value.0,
                     mamba_value,
                     mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1258,6 +1262,7 @@ macro_rules! tree_core_methods {
                     value: value.0,
                     mamba_value,
                     mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1733,11 +1738,6 @@ macro_rules! tree_core_methods {
             /// Mark the host tier (HiCache) as wired.
             fn set_hicache_enabled(&self, py: Python<'_>) {
                 py.detach(|| self.core().set_hicache_enabled());
-            }
-
-            /// Let one host-only insert omit mamba when the leaf already has it.
-            fn set_allow_missing_mamba_insert(&self, py: Python<'_>, enabled: bool) {
-                py.detach(|| self.core().set_allow_missing_mamba_insert(enabled));
             }
 
             /// Whether the host tier (HiCache) is wired.
@@ -3197,18 +3197,6 @@ macro_rules! tree_core_binding {
             fn set_hicache_enabled(&self, py: Python<'_>) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_hicache_enabled(py);
-                    Ok(())
-                })
-            }
-
-            /// Let one host-only insert omit mamba when the leaf already has it.
-            fn set_allow_missing_mamba_insert(
-                &self,
-                py: Python<'_>,
-                enabled: bool,
-            ) -> PyResult<()> {
-                catch_native_panic(|| {
-                    self.inner.set_allow_missing_mamba_insert(py, enabled);
                     Ok(())
                 })
             }

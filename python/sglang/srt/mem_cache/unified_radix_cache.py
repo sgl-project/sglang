@@ -419,7 +419,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        self.ongoing_load_back: dict[
+            int, _OngoingLoadBack | list[_OngoingLoadBack]
+        ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -1214,7 +1216,6 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         reuse_existing_mamba = False
-        # Flag off leaves this false, so insert is the previous call.
         if self._mamba_host_only_checkpoint():
             mamba = self.components.get(ComponentType.MAMBA)
             if mamba is not None:
@@ -1222,12 +1223,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     insert_params, radix_key
                 )
         if reuse_existing_mamba:
-            self.tree_core.set_allow_missing_mamba_insert(True)
+            insert_params.allow_missing_mamba = True
         try:
             result = self.insert(insert_params)
         finally:
             if reuse_existing_mamba:
-                self.tree_core.set_allow_missing_mamba_insert(False)
+                insert_params.allow_missing_mamba = False
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -1920,15 +1921,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # A host-only checkpoint stays off the device, so a second request can
         # load the same anchor before the first ack. Keep every receipt.
-        # Flag off overwrites the single entry, as before.
         if self._mamba_host_only_checkpoint():
             pending = self.ongoing_load_back.get(node_id)
             if pending is None:
-                self.ongoing_load_back[node_id] = receipt
-            elif isinstance(pending, list):
-                pending.append(receipt)
+                self.ongoing_load_back[node_id] = [receipt]
             else:
-                self.ongoing_load_back[node_id] = [pending, receipt]
+                pending.append(receipt)
         else:
             self.ongoing_load_back[node_id] = receipt
 
@@ -3559,14 +3557,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 if self._mamba_host_only_checkpoint():
                     entry = self.ongoing_load_back[ack_id]
-                    if isinstance(entry, list):
-                        node, lock_params, host_lock_params = entry.pop(0)
-                        if not entry:
-                            del self.ongoing_load_back[ack_id]
-                    else:
-                        node, lock_params, host_lock_params = (
-                            self.ongoing_load_back.pop(ack_id)
-                        )
+                    node, lock_params, host_lock_params = entry.pop(0)
+                    if not entry:
+                        del self.ongoing_load_back[ack_id]
                 else:
                     node, lock_params, host_lock_params = self.ongoing_load_back.pop(
                         ack_id

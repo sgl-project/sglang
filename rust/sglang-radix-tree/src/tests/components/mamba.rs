@@ -65,6 +65,7 @@ fn insert_params_mamba<'k>(
         value: Tensor::from_slice(value),
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
         mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -656,8 +657,9 @@ fn missing_mamba_insert_keeps_the_existing_checkpoint_when_allowed() {
     params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
     tc.insert(&params);
 
-    tc.set_allow_missing_mamba_insert(true);
-    let result = tc.insert(&insert_params_mamba(&key, &[10, 11], None));
+    let mut repeat = insert_params_mamba(&key, &[10, 11], None);
+    repeat.allow_missing_mamba = true;
+    let result = tc.insert(&repeat);
     assert!(result.mamba_exist);
     let leaf = tc
         .arena
@@ -670,7 +672,6 @@ fn missing_mamba_insert_keeps_the_existing_checkpoint_when_allowed() {
             .expect("host checkpoint")
             .equal(&Tensor::from_slice(&[42i64]))
     );
-    tc.set_allow_missing_mamba_insert(false);
 }
 
 #[test]
@@ -697,7 +698,10 @@ fn insert_host_only_checkpoint_keeps_no_gpu_slot() {
     assert!(tc.host_lru_list(MAMBA).in_list(Some(leaf)));
     let matched = tc.match_prefix(&match_params(&key));
     assert_eq!(matched.best_match_node_id, tc.arena.node(leaf).id);
-    assert_eq!(matched.last_device_node_id, tc.arena.node(tc.arena.root()).id);
+    assert_eq!(
+        matched.last_device_node_id,
+        tc.arena.node(tc.arena.root()).id
+    );
     assert_eq!(matched.mamba_host_hit_length, 1);
 }
 

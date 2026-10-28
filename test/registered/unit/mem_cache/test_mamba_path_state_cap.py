@@ -76,6 +76,7 @@ def _build_unified_chain(cap, length=3):
     component = object.__new__(MambaComponent)
     component.cache = cache
     component.tree_core = core
+    component.host_only_checkpoint = False
     component.mamba_max_states_per_path = cap
 
     nodes = []

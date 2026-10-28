@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
@@ -1336,6 +1337,35 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.FULL))
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
+
+
+class TestInflightAnchorStillLoads(CustomTestCase):
+    def test_inflight_anchor_still_loads(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = SimpleNamespace(
+            buffer_pipeline=None,
+            linker=None,
+            ongoing_load_back={7: object()},
+            tree_core=SimpleNamespace(
+                is_full_device_evicted=lambda _node_id: True,
+                collect_full_device_indices=lambda *_a, **_k: torch.tensor([1, 2]),
+            ),
+        )
+        cache.load_back = lambda *_a, **_k: True
+        req = SimpleNamespace(
+            last_node=3,
+            rid="r",
+            swa_host_hit_length=0,
+            mamba_host_hit_length=0,
+        )
+        loaded = UnifiedRadixCache.init_load_back(
+            cache,
+            InitLoadBackParams(best_match_node=7, host_hit_length=1, req=req),
+        )
+        self.assertEqual(loaded, (2, 7))
 
 
 define_config_test_classes(UnifiedRadixCacheLoadBackSuite, globals())

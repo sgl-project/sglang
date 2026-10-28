@@ -84,6 +84,9 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.host_only_checkpoint = bool(
+            get_exec().mamba.enable_mamba_host_only_checkpoint
+        )
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -228,22 +231,11 @@ class MambaComponent(TreeComponent):
         return result
 
     def _mamba_host_only_checkpoint(self) -> bool:
-        from sglang.srt.runtime_context import get_context, get_exec
-
-        # Default off. Callers that have not published exec (unit fixtures)
-        # stay on the existing GPU-donate path.
-        if not get_context().is_config_namespace_published("exec"):
-            return False
-        return bool(get_exec().mamba.enable_mamba_host_only_checkpoint)
+        return self.host_only_checkpoint
 
     def _copy_mamba_slot_to_host(
         self, insert_params: InsertParams, slot: torch.Tensor
     ) -> None:
-        """Copy one GPU mamba slot into the hicache host pool.
-
-        The radix node stores the host index only. The source GPU slot stays
-        with the request (or is freed by cleanup on finish).
-        """
         host_pool = self._mamba_pool_host
         if host_pool is None:
             raise RuntimeError(
@@ -270,12 +262,6 @@ class MambaComponent(TreeComponent):
     def _backup_mamba_slot(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> None:
-        """Copy one slot through the hicache transfer engine.
-
-        The engine translates virtual mamba ids, holds the layout lease, and
-        uses the configured io backend. The copy finishes before the caller
-        stores the host index or frees the source slot.
-        """
         from sglang.srt.managers.cache_controller import CacheOperation
 
         controller = self.cache.cache_controller
@@ -297,22 +283,18 @@ class MambaComponent(TreeComponent):
         completion = controller.l2_transfer_engine.submit_device_to_host(
             controller._l2_transfers(write_host, write_device, write_pools)
         )
+        # The transfer engine owns the layout lease. Finish before the host
+        # index is stored or the source slot is freed.
         completion.finish_event.synchronize()
 
     def _stash_host_checkpoint_source(
         self, insert_params: InsertParams, slot: torch.Tensor
     ) -> None:
-        """Remember the GPU slot. The D2H runs in materialize, after the key exists."""
         insert_params.mamba_host_src = slot.reshape(-1).to(dtype=torch.int64)
 
     def materialize_host_only_checkpoint(
         self, insert_params: InsertParams, key
     ) -> bool:
-        """Copy the stashed slot, unless this key already ends on a mamba node.
-
-        Returns True when the insert should keep the node's existing mamba and
-        both insert values stay None. The caller then allows that one insert.
-        """
         src = insert_params.mamba_host_src
         if src is None:
             return False
@@ -323,10 +305,7 @@ class MambaComponent(TreeComponent):
         return False
 
     def _destination_has_mamba(self, key) -> bool:
-        """True when match ends on this key and that node already holds mamba.
-
-        Uses the tree walk only. It does not COW a GPU slot.
-        """
+        # Match only. This walk does not COW a GPU slot.
         if len(key) == 0:
             return False
         result = self.cache.tree_core.match_prefix(MatchPrefixParams(key=key))
@@ -387,8 +366,7 @@ class MambaComponent(TreeComponent):
             assert params.mamba_value is None
             self._commit_host_only_checkpoint(node, params, result, cache_actions)
             return
-        if params.mamba_value is None and self.tree_core.allow_missing_mamba_insert:
-            # The caller probed this leaf and left both values empty on purpose.
+        if params.mamba_value is None and params.allow_missing_mamba:
             result.mamba_exist = True
             return
         assert params.mamba_value is not None
@@ -904,7 +882,6 @@ class MambaComponent(TreeComponent):
                 return
 
             # Host-only copies the request slot; it does not donate it.
-            # Flag off only frees when the device value was not inserted.
             request_slot_still_owned = not mamba_value_inserted or (
                 self._mamba_host_only_checkpoint()
                 and (insert_params is None or insert_params.mamba_value is None)

@@ -600,8 +600,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return bool(mamba_pool.enable_linear_replayssm)
 
     def _replayssm_request_ring(self) -> bool:
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        return bool(getattr(mamba_pool, "replayssm_request_ring", False))
+        return self.req_to_token_pool.mamba_pool.replayssm_request_ring
 
     def _fill_replayssm_ring_indices(
         self,
@@ -764,9 +763,7 @@ class MambaAttnBackendBase(AttentionBackend):
             if self.replayssm_force_flush_list is not None
             else None
         )
-        replayssm_ring_indices = self._fill_replayssm_ring_indices(
-            bs, req_pool_indices
-        )
+        replayssm_ring_indices = self._fill_replayssm_ring_indices(bs, req_pool_indices)
 
         if forward_mode.is_target_verify() and self.topk > 1:
             # retrieve_* are None during capture, so skip the copy.
@@ -1612,7 +1609,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
             ring_indices = None
-            if getattr(mamba_pool, "replayssm_request_ring", False):
+            if mamba_pool.replayssm_request_ring:
                 ring_indices = req_pool_indices[:request_number]
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,

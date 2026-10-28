@@ -869,6 +869,7 @@ fn insert_params_swa<'k>(
         value: Tensor::from_slice(value),
         mamba_value: None,
         mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len,
         swa_evicted_seqlen,
         swa_branching_seqlen: None,

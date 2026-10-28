@@ -428,7 +428,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
-        self.allow_missing_mamba_insert = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
@@ -988,12 +987,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _device_prefix_covered_by_match(
         self, best_match_node: UnifiedTreeNode
     ) -> Optional[tuple[UnifiedTreeNode, int]]:
-        """Contiguous GPU Full prefix of ``best_match_node``.
-
-        Mamba is satisfied by the checkpoint at the best match, so intermediate
-        nodes do not need their own state. Other device validators still apply.
-        The walk stops at the first evicted Full page and does not resume.
-        """
         mamba = self.components_by_type.get(ComponentType.MAMBA)
         host_only = mamba._mamba_host_only_checkpoint() if mamba is not None else False
         if (
@@ -1018,6 +1011,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         running_len = 0
         for n in path:
             full_value = n.component_data[BASE_COMPONENT_TYPE].value
+            # Stop at the first evicted Full page and do not resume.
             if n.evicted or full_value is None:
                 break
             running_len += len(full_value)
@@ -2424,10 +2418,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
-
-    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
-        """Let one host-only insert omit mamba when the leaf already has it."""
-        self.allow_missing_mamba_insert = bool(enabled)
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
