@@ -169,6 +169,19 @@ def _extract_failure_tail(full_output: str, max_lines: int = 20) -> list[str]:
     return lines[-max_lines:]
 
 
+def _read_failure_reasons(xml_path: str | None) -> list[str]:
+    if xml_path is None or not Path(xml_path).exists():
+        return []
+
+    reasons = []
+    for testcase in ET.parse(xml_path).getroot().iter("testcase"):
+        for failure in (*testcase.findall("failure"), *testcase.findall("error")):
+            name = f"{testcase.get('classname', '')}::{testcase.get('name', '')}"
+            message = failure.get("message") or failure.text or ""
+            reasons.append(f"{name}\n{message}".rstrip())
+    return reasons
+
+
 def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
     for line in summary_lines:
         lowered = line.lower()
@@ -374,7 +387,9 @@ def run_pytest(
 
     _print_attempt_tail_summary(attempt_reports, len(files))
     if failure_summary is not None and returncode not in (0, 5):
-        failure_summary.extend(attempt_reports[-1]["failure_tail"])
+        failure_summary.extend(
+            _read_failure_reasons(junit_xml_path) or attempt_reports[-1]["failure_tail"]
+        )
     return (
         0 if returncode == 5 else returncode,
         list(all_executed_cases),
