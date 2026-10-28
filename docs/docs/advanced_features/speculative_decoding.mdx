@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, CLOVER, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, CLOVER, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -18,6 +18,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+- [Clover autoregressive verification](#clover-autoregressive-verification)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -34,6 +35,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **You have a CloverMoeModelLM checkpoint**: Use **CLOVER** with `--speculative-algorithm CLOVER`; no separate draft model is needed.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -102,6 +104,13 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CLOVER</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shared-model preview with autoregressive verification</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm CLOVER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CloverMoeModelLM checkpoints only; CUDA BF16; <code>pp_size == 1</code>; approximate acceptance</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -653,6 +662,44 @@ Off by default; with it unset the captured body is `select` itself, so temperatu
 LiLiCorr composes with the grouped dynamic convolutions that wrap each DFlash sublayer, and serving one needs no extra flag: the convolution belongs to the DFlash backbone, so `LiLiCorrDraftModel` inherits the builder and picks it up from `conv_kernel_size` and `conv_group_size` in `dflash_config`.
 
 Both keys default to `0`, so a checkpoint whose config lost them builds no convolution modules and the backbone loader then drops every convolution tensor it cannot resolve. That is correct for rotary caches and the worst case here, because the draft would serve as its convolution-free parent at a lower but entirely believable acceptance length. The loader therefore refuses any checkpoint whose convolution tensors and built modules disagree, in either direction.
+
+---
+
+## Clover autoregressive verification
+
+Clover uses one `CloverMoeModelLM` checkpoint for both draft generation and target verification. Its noncausal preview pathway proposes a block of tokens, the autoregressive pathway verifies them, and SGLang commits only the accepted prefix plus one bonus token. A separate draft checkpoint is not used.
+
+Clover checkpoints require an explicit `--speculative-algorithm CLOVER`; selecting another algorithm or omitting it is rejected.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --speculative-algorithm CLOVER \
+    --cuda-graph-bs-decode 1 2 4
+```
+
+`--speculative-num-draft-tokens` controls the preview and verification width. It defaults to the checkpoint's `block_size`; an explicit value must be at least 2 and divide that checkpoint block size. For example, a checkpoint with `block_size: 32` accepts widths 2, 4, 8, 16, and 32.
+
+### Acceptance rules
+
+Select the rule with `--speculative-clover-accept-rule`:
+
+- `threshold` is the default. It accepts a proposal when its target probability is at least `min(ratio, delta * exp(-entropy))` and greater than zero. Configure the ceiling and entropy-scaled factor with `--speculative-clover-accept-ratio` (default `1.0`) and `--speculative-clover-accept-delta` (default `0.6`).
+- `exact` accepts only proposals matching the penalty-adjusted target verify argmax, stopping at the first mismatch.
+
+<Warning>
+Neither rule is distribution-preserving stochastic speculative sampling. Draft generation uses argmax, while temperature, top-k, and top-p apply only to bonus-token sampling. Exact greedy AR equivalence additionally requires identical target-logit processing.
+</Warning>
+
+Clover sets preferred sampling defaults of `presence_penalty=0.9` and `repetition_penalty=1.05`. It also enables `dllm_length_penalty=10` and `dllm_think_end_bias=10` through request `custom_params`. To disable all four, set `presence_penalty=0`, `repetition_penalty=1.0`, and request `custom_params` of `{"dllm_length_penalty": 0, "dllm_think_end_bias": 0}`. Explicit server or request preferences take precedence over these defaults.
+
+### Requirements and limitations
+
+- Requires CUDA and BF16. Current end-to-end validation uses NVIDIA H200 GPUs.
+- Uses FlashInfer for full attention and Triton or FlashInfer for linear attention.
+- Requires pipeline parallel size 1. Attention DP/CP, DCP, and all-to-all MoE backends are gated; EP is supported only with the Triton MoE runner.
+- Does not support quantized checkpoints, LoRA, `torch.compile`, adaptive speculation, a separate dLLM algorithm, disaggregation, HiCache, or watermarking.
+- Does not support `min_p`, structured-output constraints, logit bias, logprobs, returned hidden states or routed experts, custom logit processors, or input embedding overrides.
 
 ---
 
