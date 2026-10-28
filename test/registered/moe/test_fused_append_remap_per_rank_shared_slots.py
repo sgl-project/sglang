@@ -330,9 +330,7 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                                 num_fused_shared_experts=s
                             ),
                         )
-                        ntnp = torch.tensor(
-                            n_valid, dtype=torch.int32, device=device
-                        )
+                        ntnp = torch.tensor(n_valid, dtype=torch.int32, device=device)
                         parallel = types.SimpleNamespace(
                             moe_ep_size=ep_size, moe_ep_rank=ep_rank
                         )

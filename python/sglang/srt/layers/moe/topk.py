@@ -2661,9 +2661,7 @@ def _post_process_topk_ids(
         # deliberately leaves padded weights live, and on the per-rank path the
         # id fold still engages there (aiter needs in-range ids) -- so gate the
         # weight fold on _skip_hip_pad_mask, not just on the id fold.
-        _fold_pad_weights_into_append = (
-            _fold_pad_into_append and not _skip_hip_pad_mask
-        )
+        _fold_pad_weights_into_append = _fold_pad_into_append and not _skip_hip_pad_mask
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
