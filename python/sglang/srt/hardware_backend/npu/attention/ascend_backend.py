@@ -635,9 +635,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         if forward_batch.seq_lens is not None:
-            self.forward_metadata.seq_lens = forward_batch.seq_lens.to(
-                dtype=torch.int32, copy=self.use_flash_mla or self.use_mojo_mtp
-            )
+            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
         else:
             self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
                 self.device
