@@ -1,6 +1,6 @@
 import torch
 from sgl_kernel import gated_delta_rule, gated_delta_rule_verify
-from sgl_kernel.mamba import causal_conv1d_update_verify_xpu
+from sgl_kernel.mamba import causal_conv1d_update_verify_xpu, causal_conv1d_update_xpu
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 
@@ -32,6 +32,21 @@ def causal_conv1d_verify_xpu(
         activation=activation,
         cache_indices=conv_state_indices,
     )
+
+
+def causal_conv1d_update_xpu_dispatch(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    if "intermediate_conv_window" in kwargs:
+        return causal_conv1d_verify_xpu(
+            x, conv_state, weight, bias, activation, **kwargs
+        )
+    return causal_conv1d_update_xpu(x, conv_state, weight, bias, activation, **kwargs)
 
 
 class XpuGDNKernel(TritonGDNKernel):
