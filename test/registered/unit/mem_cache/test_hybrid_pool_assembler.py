@@ -127,6 +127,8 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         token_to_kv_pool_allocator=SimpleNamespace(state=state),
                         tp_cache_group=None,
                         pp_cache_group=None,
+                        attn_cp_cache_group=None,
+                        attn_tp_cache_group=None,
                     )
                     controller = SimpleNamespace(transfer_layer_id_max=4)
                     built = (
@@ -1613,6 +1615,58 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
                     for host in allocated:
                         host.destroy()
                     allocated.clear()
+
+
+class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
+    """The full + window + state stack builds its controller and state host the
+    way the full + window and full + state stacks do."""
+
+    def test_passes_the_attention_groups(self):
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(pool=object())
+            ),
+            tp_cache_group=object(),
+            pp_cache_group=object(),
+            attn_cp_cache_group=object(),
+            attn_tp_cache_group=object(),
+        )
+        kvcache = SimpleNamespace(
+            layers_mapping={0: (0, False), 1: (0, True)},
+            start_layer=0,
+            full_kv_pool=object(),
+            swa_kv_pool=object(),
+        )
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_hybrid_mamba_swa_stack",
+            return_value=(MagicMock(), MagicMock()),
+        ) as build:
+            _MambaSwaStrategy().build(
+                cache=SimpleNamespace(page_size=1),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        kwargs = build.call_args.kwargs
+        self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
+        self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
+
+    def test_state_host_has_no_kv_split(self):
+        for layout, expected in (
+            ("page_first_kv_split", "page_first_direct"),
+            ("page_first", "page_first"),
+        ):
+            with (
+                self.subTest(layout=layout),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(hicache_mem_layout=layout),
+                ),
+            ):
+                self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
 
 
 if __name__ == "__main__":
