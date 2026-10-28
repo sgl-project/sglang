@@ -382,8 +382,8 @@ def _merge_topk_attn_out_kernel(
 def flash_decode_with_gqa_share_sparse(
     q: torch.Tensor,  # [batch_size, num_q_heads, head_dim]
     sink: Optional[torch.Tensor],
-    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
-    v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
+    k_cache: Union[torch.Tensor, Nvfp4Cache],  # [max_slots, num_kv_heads, head_dim]
+    v_cache: Union[torch.Tensor, Nvfp4Cache],  # [max_slots, num_kv_heads, head_dim]
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     seq_lens: torch.Tensor,  # [batch_size, ]
     slot_ids: torch.Tensor,  # [batch_size, ]

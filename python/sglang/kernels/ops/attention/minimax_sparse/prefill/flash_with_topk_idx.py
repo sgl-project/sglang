@@ -642,7 +642,7 @@ def _use_fused_index_topk(
 @torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
-    k_cache: torch.Tensor,  # paged
+    k_cache: Union[torch.Tensor, Nvfp4Cache],  # paged
     v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
     sink: Optional[torch.Tensor],
     req_to_token: torch.Tensor,
