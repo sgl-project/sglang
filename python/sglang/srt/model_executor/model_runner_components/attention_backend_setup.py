@@ -274,14 +274,14 @@ def _build_resolved_backend(
 
 
 def _require_spec_mode(model_runner: ModelRunner, backend: AttentionBackend) -> None:
-    """A speculative runner's own backend runs target verify (the target) or
-    draft extend (a draft); it must implement that forward for this runner."""
+    """Require the speculative forward this runner executes."""
     if model_runner.spec_algorithm.is_none():
         return
     backend.require_spec_mode(
         model_runner,
         SpecMode.DRAFT_EXTEND
         if model_runner.is_draft_worker
+        and not model_runner.spec_algorithm.supports_target_verify_for_draft()
         else SpecMode.TARGET_VERIFY,
     )
 

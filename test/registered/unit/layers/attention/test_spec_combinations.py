@@ -340,10 +340,10 @@ class TestDraftFactory(unittest.TestCase):
         self._extend(TRTLLMHAAttnBackend, "trtllm_mha", no_window)
 
 
-class TestRunnerBackend(unittest.TestCase):
+class TestRunnerBackend(CustomTestCase):
     """A speculative runner checks its own backend: target verify on the
-    target, draft extend on a draft; a split pair answers with the child
-    that runs the forward."""
+    target or a verify-style draft, draft extend on other drafts; a split
+    pair answers with the child that runs the forward."""
 
     def _build(
         self,
@@ -416,6 +416,78 @@ class TestRunnerBackend(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "AiterAttnBackend.*draft extend"):
             self._build(AiterAttnBackend, AiterAttnBackend, combination, draft=True)
         self._build(TritonAttnBackend, TritonAttnBackend, combination, draft=True)
+
+    def test_verify_draft_runners_check_target_verify_capabilities(self):
+        """A verify-style draft builds on window backends that support verification."""
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            for cuda_graph in (False, True):
+                with self.subTest(algorithm=algorithm, cuda_graph=cuda_graph):
+                    combination = _combination(
+                        SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph
+                    )
+                    self._build(
+                        TRTLLMHAAttnBackend,
+                        TRTLLMHAAttnBackend,
+                        combination,
+                        draft=True,
+                        algorithm=algorithm,
+                    )
+                    window = _combination(SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph)
+                    with self.assertRaisesRegex(
+                        ValueError, "FlashInferAttnBackend.*target verify with sliding"
+                    ):
+                        self._build(
+                            FlashInferAttnBackend,
+                            FlashInferAttnBackend,
+                            window,
+                            draft=True,
+                            algorithm=algorithm,
+                        )
+
+    def test_verify_drafts_check_the_selected_verify_child(self):
+        """A split draft checks the child selected for verification."""
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            for cuda_graph in (False, True):
+                with self.subTest(algorithm=algorithm, cuda_graph=cuda_graph):
+                    combination = _combination(
+                        SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph
+                    )
+                    self._build(
+                        TritonAttnBackend,
+                        FlashInferAttnBackend,
+                        combination,
+                        draft=True,
+                        algorithm=algorithm,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "FlashInferAttnBackend.*target verify with sliding"
+                    ):
+                        self._build(
+                            TritonAttnBackend,
+                            FlashInferAttnBackend,
+                            combination,
+                            draft=True,
+                            mode="decode",
+                            algorithm=algorithm,
+                        )
+
+    def test_eagle_draft_runner_keeps_draft_extend_capabilities(self):
+        """An EAGLE draft still requires support for draft extend."""
+        for cuda_graph in (False, True):
+            with self.subTest(cuda_graph=cuda_graph):
+                combination = _combination(SpecMode.DRAFT_EXTEND, cuda_graph=cuda_graph)
+                with self.assertRaisesRegex(
+                    ValueError, "TRTLLMHAAttnBackend.*draft extend"
+                ):
+                    self._build(
+                        TRTLLMHAAttnBackend,
+                        TRTLLMHAAttnBackend,
+                        combination,
+                        draft=True,
+                    )
+                self._build(
+                    TritonAttnBackend, TritonAttnBackend, combination, draft=True
+                )
 
     def test_a_runner_without_speculation_is_not_checked(self):
         combination = _combination(SpecMode.TARGET_VERIFY)
