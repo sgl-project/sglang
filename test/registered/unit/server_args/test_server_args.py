@@ -1956,6 +1956,61 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             handle_a2a_moe(server_args)
 
 
+class TestMoriEpv2AsyncLLResolution(CustomTestCase):
+    """MORI EPv2 runs low_latency and SDMA on its AsyncLL kernels, so neither
+    is downgraded; a MORI build without them must still fall back to EPv1."""
+
+    def setUp(self):
+        self._env = patch.dict(os.environ)
+        self._env.start()
+        envs.SGLANG_USE_AITER.set(True)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _resolve(self, deepep_mode, async_ll, sdma=False):
+        import torch
+
+        # A fallback writes SGLANG_MORI_EP_V2=false, and an explicit value skips
+        # the checks, so start every resolution unset.
+        os.environ.pop("SGLANG_MORI_EP_V2", None)
+        os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="mori",
+            deepep_mode=deepep_mode,
+            tp_size=8,
+            chunked_prefill_size=1024,
+        )
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.moe_hook._mori_has_epv2_async_ll",
+                return_value=async_ll,
+            ),
+            patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True),
+        ):
+            handle_a2a_moe(server_args)
+        return envs.SGLANG_MORI_EP_V2.get(), resolution_result(
+            server_args, "deepep_mode"
+        )
+
+    def test_resolution(self):
+        for deepep_mode, async_ll, sdma, expected in (
+            ("low_latency", True, False, (True, "low_latency")),
+            ("low_latency", False, False, (False, "low_latency")),
+            ("normal", False, True, (False, "normal")),
+            # The capability probe gates only the AsyncLL entries.
+            ("normal", False, False, (True, "normal")),
+        ):
+            with self.subTest(deepep_mode=deepep_mode, async_ll=async_ll, sdma=sdma):
+                self.assertEqual(self._resolve(deepep_mode, async_ll, sdma), expected)
+
+
 class TestFlashinferMegaMoeConfig(CustomTestCase):
     def setUp(self):
         self._combine_dtype_backup = os.environ.get(
