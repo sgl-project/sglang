@@ -22,6 +22,9 @@ from sglang.srt.multimodal.serving_preprocessing import (
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
+)
 from sglang.srt.multimodal.transport.feature_transport import MultimodalFeatureTransport
 from sglang.srt.runtime_context import get_exec, get_mm
 
@@ -59,18 +62,28 @@ class TokenSpaceSGLangProcessor:
 
     prefer_tokenized_input = True
     _strategy_class = None
+    _serving_spec_class = TokenSpaceServingSpec
+
+    @classmethod
+    def for_strategy(cls, strategy_class, serving_spec_class=TokenSpaceServingSpec):
+        return cls._for_model(strategy_class, serving_spec_class)
 
     @classmethod
     @functools.cache
-    def for_strategy(cls, strategy_class):
+    def _for_model(cls, strategy_class, serving_spec_class):
+        # Cached with both classes, so a defaulted spec maps to the same class.
         return type(
             f"{cls.__name__}[{strategy_class.__name__}]",
             (cls,),
-            {"_strategy_class": strategy_class},
+            {
+                "_strategy_class": strategy_class,
+                "_serving_spec_class": serving_spec_class,
+            },
         )
 
     def __init__(self, hf_config, server_args, _processor, transport_mode, **kwargs):
         strategy_class = self._strategy_class
+        serving_spec = self._serving_spec_class(hf_config)
         self._server_args = server_args
         mm = get_mm()
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
@@ -100,7 +113,9 @@ class TokenSpaceSGLangProcessor:
                 declared=None,
             ),
             mm_io_worker_num=mm.mm_io_worker_num
-            or int(os.environ.get("SGLANG_IO_WORKERS", 0)),
+            or int(os.environ.get("SGLANG_IO_WORKERS", 0))
+            or serving_spec.auto_mm_io_worker_num
+            or 0,
             allowed_media_domains=mm.allowed_media_domains,
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
@@ -112,6 +127,8 @@ class TokenSpaceSGLangProcessor:
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
+        # Request validation reads the prompt's media markers through it.
+        self.mm_tokens = serving_spec.build_mm_tokens(_processor)
         self._image_device = self._serving_image_processor_device()
 
     @property

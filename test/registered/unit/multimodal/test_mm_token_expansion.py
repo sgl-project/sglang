@@ -23,6 +23,7 @@ TokenSpaceProcessor.process(media, IDs)
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy keeps its legacy processor's loader and worker defaults
+  registered serving spec -> mm_tokens and IO threads; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   adjacent images -> two offsets from mm_spans, not one scanned run
@@ -57,7 +58,11 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
 from sglang.srt.multimodal.token_space_mm_process.registry import (
+    TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
+)
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
 )
 from sglang.srt.multimodal.token_space_mm_process.sglang import (
     TokenSpaceSGLangProcessor,
@@ -424,6 +429,49 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         self.assertEqual(output.input_ids, [1, IMAGE, IMAGE, 2])
         self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2)]])
         self.assertEqual(output.im_token_id, IMAGE)
+
+    def test_serving_spec_is_selected_apart_from_the_strategy(self):
+        """The wrapper reads the spec registered for the architecture, else the defaults."""
+        mm_tokens = object()
+
+        class _MarkerSpec(TokenSpaceServingSpec):
+            models = _ImageWidthStrategy.models
+            auto_mm_io_worker_num = 7
+
+            def build_mm_tokens(self, processor):
+                return mm_tokens
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        config = SimpleNamespace(
+            architectures=list(_ImageWidthStrategy.models),
+            model_type="image_width",
+            to_dict=lambda: {"model_type": "image_width"},
+        )
+        strategies = {_ImageWidthStrategy.models[0]: _ImageWidthStrategy}
+        for specs, expected_tokens, expected_io in (
+            ({_ImageWidthStrategy.models[0]: _MarkerSpec}, mm_tokens, 7),
+            ({}, None, TokenSpaceProcessor.auto_mm_io_worker_num),
+        ):
+            with (
+                self.subTest(spec_registered=bool(specs)),
+                patch.dict(TOKEN_SPACE_STRATEGY_MAPPING, strategies, clear=True),
+                patch.dict(TOKEN_SPACE_SERVING_SPEC_MAPPING, specs, clear=True),
+            ):
+                processor = get_mm_processor(
+                    config, server_args, _bare_tokenizer(), None
+                )
+                self.addCleanup(processor.shutdown)
+                self.assertIs(processor.mm_tokens, expected_tokens)
+                self.assertEqual(processor._core.mm_io_worker_num, expected_io)
 
     def test_served_core_applies_the_server_media_url_policy(self):
         """Building a core resets the process-wide URL policy to its config's.
