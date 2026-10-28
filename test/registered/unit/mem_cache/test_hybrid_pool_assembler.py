@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     validate_fused_hicache_draft,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHAHostLayout
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -1370,8 +1370,9 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 self.subTest(full_indices=full_indices),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(None)),
                 patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
-                patch(
-                    _ASSEMBLER + "build_kv_host_pool",
+                patch.object(
+                    MHAHostLayout,
+                    "build",
                     side_effect=NotImplementedError("packed pool reached host factory"),
                 ),
                 patch.object(
@@ -1527,8 +1528,9 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                 self.subTest(backend=backend),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(backend)),
                 patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
-                patch(
-                    _ASSEMBLER + "build_kv_host_pool",
+                patch.object(
+                    MHAHostLayout,
+                    "build",
                     side_effect=NotImplementedError("kv host"),
                 ),
                 patch.object(

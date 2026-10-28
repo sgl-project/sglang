@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
+from sglang.srt.mem_cache.device_pool_info import MHABufferInfo
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.base import (
+    HostPoolOptions,
     SubPoolSpec,
     _check_row_alignment,
     _store_dtype_for,
@@ -463,6 +466,18 @@ class MHAView(MHAKVView):
 
     # -- host transfer and PD --
 
+    def host_layout(self):
+        (info,) = self.get_device_pool_infos()
+        return MHAHostLayout(
+            buffer_info=info.buffer_info,
+            capacity=self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            write_back_staging=self.hicache_write_back_staging,
+        )
+
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """The view's buffers, as host assembly reads them."""
         from sglang.srt.mem_cache.device_pool_info import (
@@ -625,3 +640,54 @@ class DraftMHAView(MHAView):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV")
+
+
+class MHAHostLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """MHA host rows and their layer order; transfers read the declared buffers."""
+
+    buffer_info: MHABufferInfo
+    capacity: int
+    start_layer: int
+    end_layer: int
+    write_back_staging: object = None
+
+    @property
+    def device_layer_num(self) -> int:
+        return len(self.buffer_info.buffers.k)
+
+    def build(self, options: HostPoolOptions, *, draft_buffer_infos=()):
+        from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
+        from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        if options.dcp_size != 1:
+            raise ValueError("MHA host transfers require unsharded token ids")
+        info = self.buffer_info
+        page_layout = None
+        if options.layout == "page_unified":
+            page_layout = PageUnifiedLayout(
+                page_size=options.page_size,
+                layer_num=self.device_layer_num + len(draft_buffer_infos),
+                head_num=info.head_num,
+                head_group_num=resolve_head_group_num(info.head_num),
+                head_dim=info.head_dim,
+                itemsize=info.dtype.itemsize,
+                is_mla=False,
+            )
+        return get_mha_host_pool_cls(info)(
+            info,
+            options.ratio,
+            options.size,
+            options.page_size,
+            options.layout,
+            pin_memory=options.pin_memory,
+            allocator_type=options.allocator_type,
+            pool_label=options.pool_label,
+            device_capacity_tokens=self.capacity,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            draft_buffer_infos=draft_buffer_infos,
+            write_back_staging=self.write_back_staging,
+            page_unified_layout=page_layout,
+            head_group_num=1 if page_layout is None else page_layout.head_group_num,
+        )

@@ -5,10 +5,13 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
+import msgspec
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.base import (
+    HostPoolOptions,
     SubPoolSpec,
     _check_row_alignment,
     _store_dtype_for,
@@ -352,6 +355,18 @@ class MLAView(MLAKVView):
 
     # -- host transfer and PD --
 
+    def host_layout(self):
+        (info,) = self.get_device_pool_infos()
+        return MLAHostLayout(
+            buffer_info=info.buffer_info,
+            capacity=self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            write_back_staging=self.hicache_write_back_staging,
+        )
+
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """The view's buffers, as host assembly reads them."""
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLABufferInfo
@@ -428,3 +443,54 @@ class MLAView(MLAKVView):
                     self.kv_buffer[0].device, non_blocking=True
                 )
         current_platform.synchronize()
+
+
+class MLAHostLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Latent host rows, including the physical page width under DCP."""
+
+    buffer_info: MLABufferInfo
+    capacity: int
+    start_layer: int
+    end_layer: int
+    write_back_staging: object = None
+
+    @property
+    def device_layer_num(self) -> int:
+        return self.buffer_info.device_layer_num
+
+    def build(self, options: HostPoolOptions, *, draft_buffer_infos=()):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        info = self.buffer_info
+        page_layout = None
+        if options.layout == "page_unified":
+            page_layout = PageUnifiedLayout(
+                page_size=options.page_size // options.dcp_size,
+                layer_num=self.device_layer_num + len(draft_buffer_infos),
+                head_num=1,
+                head_group_num=1,
+                head_dim=info.kv_cache_dim,
+                itemsize=info.dtype.itemsize,
+                is_mla=True,
+            )
+        return MLATokenToKVPoolHost(
+            info,
+            options.ratio,
+            options.size,
+            options.page_size,
+            options.layout,
+            pin_memory=options.pin_memory,
+            allocator_type=options.allocator_type,
+            pool_label=options.pool_label,
+            device_capacity_tokens=self.capacity,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            target_layer_num=self.device_layer_num,
+            override_kv_cache_dim=info.kv_cache_dim,
+            draft_buffer_infos=draft_buffer_infos,
+            write_back_staging=self.write_back_staging,
+            page_unified_layout=page_layout,
+            dcp_size=options.dcp_size,
+            dcp_rank=options.dcp_rank,
+        )

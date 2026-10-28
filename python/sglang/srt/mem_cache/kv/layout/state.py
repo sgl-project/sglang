@@ -6,10 +6,12 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions, SubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import DraftStateRegion
 from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
@@ -295,6 +297,16 @@ class StateView:
 
     # -- host transfer and PD --
 
+    def host_layout(self):
+        (info,) = self.get_device_pool_infos()
+        return StateHostLayout(
+            buffer_info=info.buffer_info,
+            capacity=self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            layer_ids=info.layer_ids,
+        )
+
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """Checkpoint buffers for host transfer, without the speculative work
         space."""
@@ -416,3 +428,35 @@ class DraftStateView(StateView):
 
     def load_cpu_copy(self, mamba_cache_cpu, indices) -> None:
         raise NotImplementedError("CPU offloading is unsupported for fused draft state")
+
+
+class StateHostLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Checkpoint host rows; speculative scratch never enters a checkpoint."""
+
+    buffer_info: MambaStateBufferInfo
+    capacity: int
+    layer_ids: tuple[int, ...]
+
+    @property
+    def device_layer_num(self) -> int:
+        return len(self.layer_ids)
+
+    def build(self, options: HostPoolOptions, *, draft_buffer_infos=()):
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+        self.buffer_info.validate(layer_ids=self.layer_ids)
+        for info in draft_buffer_infos:
+            info.validate()
+        layout = options.layout
+        if layout == "page_first_kv_split":
+            layout = "page_first_direct"
+        return MambaPoolHost(
+            self.buffer_info,
+            options.ratio,
+            options.size,
+            device_capacity=self.capacity,
+            pin_memory=options.pin_memory,
+            allocator_type=options.allocator_type,
+            layout=layout,
+            mtp_draft_buffer_infos=draft_buffer_infos,
+        )
