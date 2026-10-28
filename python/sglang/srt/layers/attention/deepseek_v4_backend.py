@@ -1399,8 +1399,8 @@ class DeepseekV4AttnBackend(
         return ""
 
     def glue_draft_metadata(self) -> str:
-        # Live sequence lengths stay on device; host geometry depends only on
-        # the batch and block sizes.
+        # The draft block prep is host-free (host inputs follow from bs, CPU lengths
+        # feed only asserts) except in these cases.
         for bad, why in (
             (not self.is_dspark_draft, "not the DSpark draft runner"),
             (self.needs_cpu_seq_lens, "host sequence lengths"),
@@ -2212,14 +2212,13 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        seq_lens_cpu_list = (
-            [int(x) for x in seq_lens_cpu.tolist()]
-            if seq_lens_cpu is not None
-            else None
-        )
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu_list,
+            seq_lens_cpu=(
+                None
+                if seq_lens_cpu is None
+                else [int(x) for x in seq_lens_cpu.tolist()]
+            ),
             extend_len=block_size,
         )
         extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
@@ -2665,7 +2664,6 @@ class DeepseekV4AttnBackend(
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        uses_cpu_seq_lens = self.needs_cpu_seq_lens
 
         if in_capture:
             # Captured graph does no real cache writes, so synthesize a dummy
@@ -2680,13 +2678,15 @@ class DeepseekV4AttnBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_cpu = seq_lens.cpu() if uses_cpu_seq_lens else None
+            seq_lens_cpu = seq_lens.cpu() if self.needs_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            seq_lens_cpu = forward_batch.seq_lens_cpu if uses_cpu_seq_lens else None
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
+            )
 
         if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
@@ -2696,7 +2696,7 @@ class DeepseekV4AttnBackend(
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-            if uses_cpu_seq_lens:
+            if self.needs_cpu_seq_lens:
                 seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device

@@ -290,11 +290,10 @@ def compute_uniform_extend_lengths(
     seq_lens_cpu: Optional[List[int]],
     extend_len: int,
 ) -> VerifyExtendLengths:
-    # Only batch/block geometry is static; live lengths stay on the device.
     batch_size = seq_lens.shape[0]
     seq_lens_extended = seq_lens + extend_len
     seq_lens_cpu_extended = (
-        [x + extend_len for x in seq_lens_cpu] if seq_lens_cpu is not None else None
+        None if seq_lens_cpu is None else [x + extend_len for x in seq_lens_cpu]
     )
     extend_seq_lens_cpu = [extend_len] * batch_size
     num_tokens = extend_len * batch_size
