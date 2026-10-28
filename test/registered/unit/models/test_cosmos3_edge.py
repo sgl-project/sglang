@@ -245,6 +245,7 @@ class TestCosmos3EdgePromptExpansion(CustomTestCase):
 
 def _processed_input_processor():
     processor = object.__new__(Cosmos3EdgeProcessor)
+    processor.processor_fingerprint = "cosmos3-edge-test-config"
     processor.IMAGE_TOKEN_ID = 19
     processor.VIDEO_TOKEN_ID = 18
     processor.IM_START_TOKEN_ID = 20

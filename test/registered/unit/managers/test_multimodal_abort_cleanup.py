@@ -76,10 +76,10 @@ def _publish(pool):
         shape=(768,),
         dtype=torch.uint8,
     )
-    return [
-        MultimodalDataItem(modality=Modality.IMAGE, feature=copy.deepcopy(proxy)),
-        MultimodalDataItem(modality=Modality.IMAGE, feature=copy.deepcopy(proxy)),
-    ]
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=pool.memory_pool[256:])
+    item.set_pad_value()
+    item.feature = proxy
+    return [copy.deepcopy(item), copy.deepcopy(item)]
 
 
 def _rank(rank):
@@ -122,14 +122,14 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
     items = _publish(vmm_pool)
     cache = MultiModalStaticCache(1 << 20)
     cached = torch.ones(1, 2)
-    cache.set(cache.combine_hashes([123]), EmbeddingResult(embedding=cached))
-    cache.set(123, EmbeddingResult(embedding=cached))
+    cache_key = items[0].cache_key
+    cache.set(cache.combine_hashes([cache_key]), EmbeddingResult(embedding=cached))
+    cache.set(cache_key, EmbeddingResult(embedding=cached))
 
     def encode(_):
         pytest.fail("cache hit unexpectedly ran the encoder")
 
     for rank, item in enumerate(items):
-        item.hash = 123
         item.offsets = [(0, 0)]
         with _rank(rank), patch.object(mm_schedule, "embedding_cache", cache):
             if path == "full":
@@ -157,7 +157,7 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
                     [request],
                     torch.device("cpu"),
                 )
-                embedding = embeddings[(123, 1)]
+                embedding = embeddings[(cache_key, 1)]
         assert torch.equal(embedding, cached)
         assert not item.feature._consumer_acknowledged, (
             "cache eviction may need this input again"
