@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.prefill_cost_model import TOKEN_COUNT_COST_MODEL
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -84,6 +86,19 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        # Marconi eviction (--radix-eviction-policy marconi): checkpoints are
+        # ranked by recency and prefill FLOPs saved per state byte rather than
+        # walked in LRU order. The session cursor protocol keeps LRU.
+        self.marconi_eviction = (
+            params.eviction_policy.lower() == "marconi"
+            and not params.enable_session_radix_cache
+        )
+        self.prefill_cost_model = params.prefill_cost_model or TOKEN_COUNT_COST_MODEL
+        self._marconi_heap: list[tuple[tuple[bool, float], int, UnifiedTreeNode]] = []
+        self._marconi_scale = (0.0, 1.0, 0.0, 1.0)
+        self._marconi_alpha = 1.0
+        self._marconi_depth: dict[int, int] = {}
+        self._marconi_anchor: Optional[UnifiedTreeNode] = None
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -373,7 +388,10 @@ class MambaComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        if self.tree_core.enable_session_radix_cache:
+        if self.marconi_eviction:
+            self._marconi_begin()
+            self._evict_device_cursor = None
+        elif self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
             self._evict_device_cursor = lru.cursor_next()
@@ -397,6 +415,10 @@ class MambaComponent(TreeComponent):
         from the partition sentinel with session refs on, else it restarts at
         the LRU tail.
         """
+        if self.marconi_eviction:
+            return self._marconi_next_node(
+                tracker, device_frees, host_frees, cache_actions
+            )
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -461,6 +483,177 @@ class MambaComponent(TreeComponent):
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
+        self._marconi_heap = []
+        self._marconi_depth = {}
+        self._marconi_anchor = None
+
+    # ---- Marconi eviction (arXiv:2411.19379) ----
+    #
+    # A checkpoint's utility is norm(last_access_time) + alpha * norm(FLOPs
+    # saved per state byte), min-max normalized over the checkpoints in the
+    # LRU list when the walk starts; the lowest utility goes first. A
+    # checkpoint with two or more children is a branch point that several
+    # continuations share, so it goes only after every other candidate.
+    #
+    # The saving is marginal: dropping the checkpoint at depth d makes a later
+    # hit fall back to the nearest ancestor that still holds a state, at
+    # depth a, and recompute F(d) - F(a). An ancestor tombstoned during the
+    # walk therefore raises its descendants' savings, and removing a leaf can
+    # leave its nearest stateful ancestor with fewer children. The heap is
+    # lazy: a popped entry whose utility has risen is re-pushed, and the
+    # stateful ancestor of every removed leaf is re-pushed with its new key.
+
+    def _marconi_depth_of(self, node: UnifiedTreeNode) -> int:
+        """Prefix length of ``node`` in tokens (cached for one walk)."""
+        root = self.tree_core.root_node
+        path = []
+        x = node
+        while x is not None and x is not root and x.id not in self._marconi_depth:
+            path.append(x)
+            x = x.parent
+        depth = 0 if x is None or x is root else self._marconi_depth[x.id]
+        for y in reversed(path):
+            depth += len(y.key)
+            self._marconi_depth[y.id] = depth
+        return depth
+
+    def _marconi_stateful_ancestor(
+        self, node: UnifiedTreeNode
+    ) -> Optional[UnifiedTreeNode]:
+        """The nearest proper ancestor that holds a device state, if any."""
+        ct = self.component_type
+        root = self.tree_core.root_node
+        x = node.parent
+        while x is not None and x is not root:
+            if x.component_data[ct].value is not None:
+                return x
+            x = x.parent
+        return None
+
+    def _marconi_flops_per_byte(self, node: UnifiedTreeNode) -> float:
+        ancestor = self._marconi_stateful_ancestor(node)
+        cached_len = 0 if ancestor is None else self._marconi_depth_of(ancestor)
+        return self.prefill_cost_model.flops_per_state_byte(
+            cached_len, self._marconi_depth_of(node)
+        )
+
+    def _marconi_key(self, node: UnifiedTreeNode) -> tuple[bool, float]:
+        t_lo, t_span, e_lo, e_span = self._marconi_scale
+        recency = (node.last_access_time - t_lo) / t_span
+        efficiency = (self._marconi_flops_per_byte(node) - e_lo) / e_span
+        return len(node.children) >= 2, recency + self._marconi_alpha * efficiency
+
+    def _marconi_push(self, node: UnifiedTreeNode) -> None:
+        heapq.heappush(self._marconi_heap, (self._marconi_key(node), node.id, node))
+
+    def _marconi_begin(self) -> None:
+        lru = self.tree_core.lru_lists[self.component_type]
+        self._marconi_alpha = self.tree_core.eviction_strategy.alpha
+        self._marconi_depth = {}
+        self._marconi_anchor = None
+        nodes = []
+        x = lru.get_lru_no_lock()
+        while x is not None:
+            nodes.append(x)
+            x = lru.get_prev_no_lock(x)
+        if not nodes:
+            self._marconi_heap = []
+            return
+        times = [n.last_access_time for n in nodes]
+        effs = [self._marconi_flops_per_byte(n) for n in nodes]
+        t_lo, e_lo = min(times), min(effs)
+        self._marconi_scale = (
+            t_lo,
+            (max(times) - t_lo) or 1.0,
+            e_lo,
+            (max(effs) - e_lo) or 1.0,
+        )
+        self._marconi_heap = [(self._marconi_key(n), n.id, n) for n in nodes]
+        heapq.heapify(self._marconi_heap)
+
+    def _marconi_is_candidate(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        return (
+            cd.value is not None
+            and cd.lock_ref == 0
+            and self.tree_core.lru_lists[self.component_type].in_list(node)
+        )
+
+    def _marconi_pop(self) -> Optional[UnifiedTreeNode]:
+        heap = self._marconi_heap
+        while heap:
+            key, node_id, node = heapq.heappop(heap)
+            if not self._marconi_is_candidate(node):
+                continue
+            current = self._marconi_key(node)
+            if current > key:
+                heapq.heappush(heap, (current, node_id, node))
+                continue
+            return node
+        return None
+
+    def _marconi_refresh_anchor(self) -> None:
+        """Re-key the nearest stateful ancestor of the last removed leaf: it may
+        have lost a child, which lowers its key."""
+        anchor, self._marconi_anchor = self._marconi_anchor, None
+        root = self.tree_core.root_node
+        while anchor is not None and anchor is not root:
+            if self._marconi_is_candidate(anchor):
+                self._marconi_push(anchor)
+                return
+            anchor = anchor.parent
+
+    def _marconi_next_node(
+        self,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> NodeId | InternalStateBackup | None:
+        """One Marconi eviction step, with the same per-step contract as the
+        LRU walk: return a leaf for the caller to evict, ask for a HiCache
+        backup, or tombstone one internal state."""
+        ct = self.component_type
+        if tracker[ct] >= self._evict_device_request_cnt:
+            return None
+        self._marconi_refresh_anchor()
+        x = self._evict_device_cursor
+        # A cursor set by a resumed HiCache backup is re-selected first.
+        if x is None or not self._marconi_is_candidate(x):
+            x = self._marconi_pop()
+        self._evict_device_cursor = None
+        if x is None:
+            return None
+        if x in self.tree_core.evictable_device_leaves:
+            self._marconi_anchor = x.parent
+            return x.id
+        cd = x.component_data[ct]
+        if (
+            self.tree_core.enable_hicache
+            and self.tree_core.is_write_back
+            and cd.host_value is None
+            and not x.backuped
+            and x.component_data[BASE_COMPONENT_TYPE].value is not None
+        ):
+            return InternalStateBackup(node_id=x.id, num_tokens=1)
+        self.tree_core._evict_component_and_detach_lru(
+            x,
+            self,
+            target=EvictLayer.DEVICE,
+            tracker=tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            cache_actions=cache_actions,
+        )
+        self.tree_core._cascade_evict(
+            x,
+            self,
+            tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            cache_actions=cache_actions,
+        )
+        return None
 
     def acquire_component_lock(
         self,

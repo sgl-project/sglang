@@ -270,6 +270,18 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "option that selected another tree cache for this model."
             )
 
+    if get_memory().radix_eviction_policy == "marconi":
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # Marconi ranks the recurrent-state checkpoints of the MAMBA component;
+        # without one it would silently be LRU.
+        if not (isinstance(cache, UnifiedRadixCache) and ctx.is_hybrid_ssm):
+            raise ValueError(
+                "--radix-eviction-policy marconi needs a hybrid recurrent model "
+                "(Mamba2, GDN, KDA, ...) on UnifiedRadixCache, but tree_cache is "
+                f"{type(cache).__name__} and is_hybrid_ssm={ctx.is_hybrid_ssm}."
+            )
+
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     if get_serving().enable_streaming_session and not isinstance(

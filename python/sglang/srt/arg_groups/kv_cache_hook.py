@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
@@ -348,6 +349,34 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
         )
 
 
+def validate_marconi_eviction_policy(cfg: Any) -> None:
+    """Reject a marconi eviction policy the server cannot honour."""
+    if cfg.radix_eviction_policy != "marconi":
+        return
+    alpha = (cfg.radix_eviction_policy_config or {}).get("alpha", 1.0)
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(alpha)
+        or alpha < 0
+    ):
+        raise ValueError(
+            "--radix-eviction-policy marconi requires a finite, non-negative "
+            f"'alpha' in --radix-eviction-policy-config, got {alpha!r}."
+        )
+    if cfg.enable_session_radix_cache:
+        raise ValueError(
+            "--radix-eviction-policy marconi is not supported with "
+            "--enable-session-radix-cache, whose session partitions fix the "
+            "recurrent-state eviction order."
+        )
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            "--radix-eviction-policy marconi is not yet supported with "
+            "--enable-hierarchical-cache."
+        )
+
+
 def handle_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if (
@@ -389,6 +418,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
+
+    validate_marconi_eviction_policy(cfg)
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(

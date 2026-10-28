@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.prefill_cost_model import maybe_build_prefill_cost_model
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -405,6 +406,11 @@ def build_kv_cache(
         pp_cache_group=parallel.pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
+        prefill_cost_model=maybe_build_prefill_cost_model(
+            get_memory().radix_eviction_policy,
+            model_config,
+            tp_worker.model_runner.model,
+        ),
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
