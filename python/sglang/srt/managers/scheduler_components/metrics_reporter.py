@@ -97,6 +97,53 @@ class _CacheHitRateWindow:
         return self.hit_tokens / self.total_tokens if self.total_tokens > 0 else 0.0
 
 
+class _PrefixCachingMetrics:
+    """Token-weighted hit rate over the most recent N admitted requests.
+
+    One (requests, queries, hits) sample per admission batch, evicted
+    oldest-first. `queries` / `hits` are request-level: the full prompt length
+    and the device-tier radix cache match at admission, so a prompt split
+    across batches counts once.
+    """
+
+    def __init__(self, max_recent_requests: int = 1000) -> None:
+        self.max_recent_requests = max_recent_requests
+        self.requests = 0
+        self.query_tokens = 0
+        self.hit_tokens = 0
+        self._samples: deque = deque()
+
+    def observe(self, requests: int, query_tokens: int, hit_tokens: int) -> None:
+        # Skip empty samples: they would push real data out of the window.
+        if requests == 0:
+            return
+        self._samples.append((requests, query_tokens, hit_tokens))
+        self.requests += requests
+        self.query_tokens += query_tokens
+        self.hit_tokens += hit_tokens
+        while len(self._samples) > 1 and self.requests > self.max_recent_requests:
+            old_requests, old_queries, old_hits = self._samples.popleft()
+            self.requests -= old_requests
+            self.query_tokens -= old_queries
+            self.hit_tokens -= old_hits
+
+    def reset(self) -> None:
+        self.requests = 0
+        self.query_tokens = 0
+        self.hit_tokens = 0
+        self._samples.clear()
+
+    @property
+    def empty(self) -> bool:
+        return self.requests == 0
+
+    @property
+    def hit_rate(self) -> float:
+        if self.query_tokens == 0:
+            return 0.0
+        return self.hit_tokens / self.query_tokens
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -131,6 +178,10 @@ class PrefillStats:
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
+    # Request-level prefix-cache samples for the hit-rate window.
+    log_cache_num_reqs: int = 0
+    log_cache_query_tokens: int = 0
+    log_cache_hit_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -155,6 +206,9 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            log_cache_num_reqs=adder.log_cache_num_reqs,
+            log_cache_query_tokens=adder.log_cache_query_tokens,
+            log_cache_hit_tokens=adder.log_cache_hit_tokens,
         )
 
 
@@ -259,9 +313,16 @@ class SchedulerMetricsReporter:
             deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
         ]
         self.cache_hit_rate_window = _CacheHitRateWindow()
-        # Windowed rate for waiting-queue load estimation only; the exported
-        # cache_hit_rate stats keep their per-report semantics.
+        # 15s time-window rate, used only for waiting-queue load estimation.
         self.recent_cache_hit_rate = 0.0
+        # Hit rate over the most recent 1000 admitted requests (vLLM semantics).
+        # Owned by the prefill path -- cache admission only happens there -- and
+        # re-printed by decode ticks, which must not reset it. Fed and printed
+        # only when --enable-prefix-cache-hit-rate-window is set.
+        self.enable_prefix_cache_hit_rate_window = (
+            get_observability().enable_prefix_cache_hit_rate_window
+        )
+        self.prefix_caching_metrics = _PrefixCachingMetrics()
 
     def _current_gen_throughput(self, now: float) -> float:
         """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
@@ -715,6 +776,9 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        # A flushed cache has no prefix to hit; keep the window from reporting
+        # the pre-flush rate (matches vLLM's reset_prefix_cache behaviour).
+        self.prefix_caching_metrics.reset()
 
     def report_prefill_stats(
         self,
@@ -743,6 +807,16 @@ class SchedulerMetricsReporter:
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
+
+        # Fed outside the metrics block so the log line carries a hit rate
+        # even when --enable-metrics is off.
+        if self.enable_prefix_cache_hit_rate_window:
+            self.prefix_caching_metrics.observe(
+                requests=prefill_stats.log_cache_num_reqs,
+                query_tokens=prefill_stats.log_cache_query_tokens,
+                hit_tokens=prefill_stats.log_cache_hit_tokens,
+            )
+
         batch_iter = (
             batch.forward_iter
             if batch is not None and batch.forward_iter is not None
@@ -750,11 +824,22 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
+        # Empty window (flag just turned on, after a flush, or on a PD decode
+        # node that never admits) prints nothing: 0.0% would read as a real
+        # measurement.
+        cache_hit_rate_msg = (
+            f"cache hit rate: {self.prefix_caching_metrics.hit_rate * 100:.1f}%, "
+            if self.enable_prefix_cache_hit_rate_window
+            and not self.prefix_caching_metrics.empty
+            else ""
+        )
+
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{cache_hit_rate_msg}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
@@ -823,6 +908,9 @@ class SchedulerMetricsReporter:
                 )
 
             priority_enabled = self.scheduler.enable_priority_scheduling
+            # First-attempt cache hit rate: reprocessed (retracted) tokens are
+            # subtracted so the rate measures the cache itself rather than work
+            # the scheduler had to redo.
             effective_input_tokens = (
                 prefill_stats.log_input_tokens
                 - prefill_stats.reprocessed_log_input_tokens
@@ -1036,8 +1124,15 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
+        cache_hit_rate_msg = (
+            f"cache hit rate: {self.prefix_caching_metrics.hit_rate * 100:.1f}%, "
+            if self.enable_prefix_cache_hit_rate_window
+            and not self.prefix_caching_metrics.empty
+            else ""
+        )
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+            f"{cache_hit_rate_msg}"
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )

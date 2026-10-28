@@ -9,6 +9,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_observability,
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
@@ -679,6 +680,15 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        # Request-level prefix-cache samples, fed to the hit-rate window. See
+        # `_record_prefix_cache_sample`.
+        self.log_cache_num_reqs = 0
+        self.log_cache_query_tokens = 0
+        self.log_cache_hit_tokens = 0
+        # Off by default: sampling stays a no-op unless the flag below is set.
+        self.enable_prefix_cache_hit_rate_window = (
+            get_observability().enable_prefix_cache_hit_rate_window
+        )
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -969,6 +979,16 @@ class PrefillAdder:
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
 
+    def _record_prefix_cache_sample(self, req: Req, hit_tokens: int) -> None:
+        # Called once per admission, so a chunked prompt yields one sample.
+        # hits is the device tier only: vLLM counts external (host/storage)
+        # hits separately instead of folding them into the window.
+        if not self.enable_prefix_cache_hit_rate_window:
+            return
+        self.log_cache_num_reqs += 1
+        self.log_cache_query_tokens += len(req.full_untruncated_fill_ids)
+        self.log_cache_hit_tokens += hit_tokens
+
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard
@@ -981,6 +1001,7 @@ class PrefillAdder:
             )
             return
 
+        device_hit = 0
         if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
@@ -992,6 +1013,7 @@ class PrefillAdder:
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
+        self._record_prefix_cache_sample(req=req, hit_tokens=device_hit)
 
         fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
         reason = None
