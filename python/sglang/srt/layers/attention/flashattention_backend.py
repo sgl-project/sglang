@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -20,7 +21,9 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+)
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
@@ -33,10 +36,9 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -57,17 +59,12 @@ from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-
-from sglang.kernels.ops.attention.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -204,7 +201,7 @@ class FlashAttentionBackend(AttentionBackend):
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.skip_prefill = skip_prefill
         self.attn_cp_size = get_parallel().attn_cp_size
         self._verify_mask = None
@@ -212,9 +209,8 @@ class FlashAttentionBackend(AttentionBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+        self.use_sliding_window_kv_pool = self.kv_layers.routes_to(
+            IdSpaceKind.SLIDING_WINDOW
         )
 
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
@@ -265,7 +261,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             # Its page-table builder indexes prefill_lens by POOL SLOT,
             # incompatible with the batch-row canonical source.
-            assert not self.kv_index_translator.is_translating, (
+            assert not self.runner_ids.is_translating, (
                 "--enable-unified-memory does not support the prefill-aware "
                 "SWA decode mode; disable it for this model."
             )
@@ -282,10 +278,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import (
+            from sgl_kernel.flash_attn import get_scheduler_metadata
+
+            from sglang.kernels.ops.attention.flash_attention_v3 import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
-                get_scheduler_metadata,
             )
 
             self._get_scheduler_metadata = get_scheduler_metadata
@@ -320,6 +317,7 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
+        # Every kernel call goes through these; a subclass swaps the FA build here.
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
@@ -390,7 +388,7 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         # Local attention re-translates metadata.page_table through the static
         # full->swa map, which is meaningless on the unified pool's physical tables.
-        assert not self.kv_index_translator.is_translating, (
+        assert not self.runner_ids.is_translating, (
             "--enable-unified-memory does not support local-attention models "
             "on the fa3/fa4 backend."
         )
@@ -403,7 +401,7 @@ class FlashAttentionBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             device=self.device,
             swa_translate=(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa
+                functools.partial(self.runner_ids.ids_in, IdSpaceKind.SLIDING_WINDOW)
                 if self.use_sliding_window_kv_pool
                 else None
             ),
@@ -463,7 +461,7 @@ class FlashAttentionBackend(AttentionBackend):
         # qk_sf_vec_size / v_sf_vec_size default to 32 inside the FA4 interface
         # when sf tensors are given, so they don't need to be passed here (the
         # flash_attn_with_kvcache / varlen wrappers don't forward them anyway).
-        k_sf, v_sf = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+        k_sf, v_sf = self.kv_layers.read(layer.layer_id).kv_scales()
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
     def _capture_unified_verify_metadata(self, forward_batch: ForwardBatch) -> bool:
@@ -472,7 +470,7 @@ class FlashAttentionBackend(AttentionBackend):
         return (
             forward_batch.forward_mode.is_target_verify()
             and self.fa_impl_ver == 4
-            and self.kv_index_translator.reads_are_translated
+            and self.runner_ids.reads_are_translated
             and self.topk <= 1
             and forward_batch.encoder_lens is None
             and forward_batch.ragged_verify_layout is None
@@ -481,8 +479,8 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         if self._capture_unified_verify_metadata(forward_batch):
             metadata = self.target_verify_metadata[forward_batch.batch_size]
-            translator = self.kv_index_translator
-            swa = translator.space(IdSpaceKind.SLIDING_WINDOW)
+            runner_ids = self.runner_ids
+            swa = runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
             normal_decode_set_metadata(
                 metadata.cache_seqlens_int32,
                 metadata.cu_seqlens_k,
@@ -494,7 +492,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 self.page_size,
                 metadata.swa_page_table,
-                full_v2p=translator.space(IdSpaceKind.FULL).read_v2p,
+                full_v2p=runner_ids.space(IdSpaceKind.FULL).read_v2p,
                 swa_v2p=None if swa is None else swa.read_v2p,
                 zero_tail=True,
             )
@@ -503,7 +501,7 @@ class FlashAttentionBackend(AttentionBackend):
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
             return
-        if self.kv_index_translator.is_translating:
+        if self.runner_ids.is_translating:
             # The draft-extend runners record this call unconditionally; a
             # translating backend rebuilds these tables out of graph, and a
             # captured req_to_token gather would overwrite them with virtual ids.
@@ -535,7 +533,7 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_draft_extend_metadata_staging(self) -> bool:
         return (
             self.topk == 1
-            and not self.kv_index_translator.is_translating
+            and not self.runner_ids.is_translating
             and self.draft_extend_metadata_captured_in_graph()
         )
 
@@ -546,17 +544,17 @@ class FlashAttentionBackend(AttentionBackend):
         self.init_forward_metadata_in_graph(forward_batch)
 
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
-        # The in-graph SWA translation needs the raw mapping tensor; v2p-table
-        # pools (UnifiedSWAKVPool) keep it None and must stay on the eager
-        # rebuild path.
-        if not self.use_sliding_window_kv_pool:
+        # The in-graph SWA translation needs a static pool's raw mapping
+        # tensor; a translating runner's window ids go through its allocator's
+        # tables on the eager rebuild path.
+        if not self.use_sliding_window_kv_pool or self.runner_ids.is_translating:
             return None
         return self.token_to_kv_pool.full_to_swa_index_mapping
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         # A translating backend rebuilds out of graph: the captured gather
         # would bake raw req_to_token (virtual) ids into the page table.
-        if self.kv_index_translator.is_translating:
+        if self.runner_ids.is_translating:
             return False
         return (
             not self.use_sliding_window_kv_pool
@@ -582,9 +580,7 @@ class FlashAttentionBackend(AttentionBackend):
     def _get_swa_write_locations(self, forward_batch: ForwardBatch):
         """This step's sliding-window write ids: the plan's, sliced per
         draft step the way `out_cache_loc` is."""
-        locations = self.kv_index_translator.write_ids(
-            forward_batch, IdSpaceKind.SLIDING_WINDOW
-        )
+        locations = self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
         if (
             locations is not None
             and forward_batch.forward_mode.is_decode_or_idle()
@@ -681,7 +677,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return
 
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -734,7 +730,7 @@ class FlashAttentionBackend(AttentionBackend):
             # A stale non-None seq_lens_cpu buffer would under-size max_seq_pages
             # (stale page-table rows -> OOB); force None under sync-free.
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -810,17 +806,17 @@ class FlashAttentionBackend(AttentionBackend):
         m.cu_seqlens_q[1:].copy_(
             torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
         )
-        translating = self.kv_index_translator.is_translating
+        translating = self.runner_ids.is_translating
         max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
         if translating:
             # Unified pool: the plan's page table, physical page ids from this
             # iteration's v2p, copied into these capture-stable buffers.
-            self.kv_index_translator.copy_page_table(
-                forward_batch.kv_loc_plan, out=m.page_table
+            self.runner_ids.copy_page_table(
+                forward_batch.iteration_ids, out=m.page_table
             )
             if self.use_sliding_window_kv_pool:
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan,
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids,
                     out=m.swa_page_table,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                 )
@@ -837,8 +833,8 @@ class FlashAttentionBackend(AttentionBackend):
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
                 # SWA cache locations, then reduce to SWA page indices.
-                swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_indices
+                swa_starts = self.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, page_indices
                 )
                 m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -855,9 +851,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
             else:
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                    self.kv_index_translator.write_ids(
-                        forward_batch, IdSpaceKind.SLIDING_WINDOW
-                    )
+                    self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
                 )
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
@@ -1270,7 +1264,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Safe to rebind: every eager branch above produced a fresh tensor.
         _unified_read = (
-            self.kv_index_translator.is_translating and metadata.page_table is not None
+            self.runner_ids.is_translating and metadata.page_table is not None
         )
         swa_out_cache_loc = (
             self._get_swa_write_locations(forward_batch)
@@ -1281,24 +1275,22 @@ class FlashAttentionBackend(AttentionBackend):
             # The plan's table covers this forward's reads, a verify's and a
             # draft decode's window included; the kernels bound each row by
             # `cache_seqlens`.
-            kv_view = self.kv_index_translator.read_table(
-                forward_batch.kv_loc_plan, rows=forward_batch.batch_size
+            kv_view = self.runner_ids.read_table(
+                forward_batch.iteration_ids, rows=forward_batch.batch_size
             )
             metadata.page_table = kv_view.ids
             if self.use_sliding_window_kv_pool:
-                metadata.swa_page_table = self.kv_index_translator.read_table(
-                    forward_batch.kv_loc_plan,
+                metadata.swa_page_table = self.runner_ids.read_table(
+                    forward_batch.iteration_ids,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                     rows=forward_batch.batch_size,
                 ).ids
                 metadata.swa_out_cache_loc = swa_out_cache_loc
         elif self.use_sliding_window_kv_pool:
             # FA3 requires an int32 page_table.
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
+            metadata.swa_page_table = self.runner_ids.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+            ).to(torch.int32)
             metadata.swa_out_cache_loc = swa_out_cache_loc
 
         # Logical-page KV sharding: capture the batch's gather plan and swap the
@@ -1306,8 +1298,8 @@ class FlashAttentionBackend(AttentionBackend):
         # the assembled [prefix | chunk] scratch, never the striped pool rows;
         # the plan capture also kicks the first layer's prefix gather.
         #
-        # Runs after KVIndexTranslator and before the `// page_size` reduction.
-        # The unified-memory UnifiedKVPool and page-interleaved pools are
+        # Runs after RunnerIds and before the `// page_size` reduction.
+        # The unified-memory arena and page-interleaved pools are
         # alternatives, so at most one translation fires.
         if self._kv_shard_pool is not None and prepare_kv_shard_forward(
             self._kv_shard_pool,
@@ -1379,7 +1371,7 @@ class FlashAttentionBackend(AttentionBackend):
         *,
         head_group_num: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
         key_cache = paged_kv_view(
             key_cache, self.page_size, layer.tp_k_head_num, layer.head_dim
         )
@@ -1446,7 +1438,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.kv_cache_dtype != torch.bfloat16
             or self.use_mla
             or layer.is_cross_attention
-            or self.kv_index_translator.is_translating
+            or self.runner_ids.is_translating
             or self._kv_shard_pool is not None
             or self.fa_skip_kv_cache
             or layer.tp_k_head_num != layer.tp_v_head_num
@@ -1466,7 +1458,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         if locations is None:
             return None
-        buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        buffers = self.kv_layers.read(layer.layer_id).kv()
         shapes = (
             (layer.tp_k_head_num, layer.head_dim),
             (layer.tp_v_head_num, layer.v_head_dim),
@@ -1516,7 +1508,7 @@ class FlashAttentionBackend(AttentionBackend):
                             forward_batch, layer, k, k_rope
                         )
                     else:
-                        self.token_to_kv_pool.set_mla_kv_buffer(
+                        self.kv_layers.layer(layer.layer_id).store_mla(
                             layer,
                             KVWriteLoc.for_layer(forward_batch, layer),
                             k,
@@ -1538,7 +1530,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -1679,8 +1671,8 @@ class FlashAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        metadata.page_table
+                    page_table = self.runner_ids.ids_in(
+                        IdSpaceKind.SLIDING_WINDOW, metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -1704,7 +1696,7 @@ class FlashAttentionBackend(AttentionBackend):
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
-                    return flash_attn_with_kvcache(
+                    return self.flash_attn_with_kvcache(
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
@@ -1719,7 +1711,6 @@ class FlashAttentionBackend(AttentionBackend):
                         softcap=layer.logit_cap,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
-                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
 
@@ -1789,7 +1780,7 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1805,7 +1796,6 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     out=_fa_out,
-                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
 
@@ -1840,30 +1830,31 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                 )
             elif use_cascade_attn:
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # The suffix table stores physical token slots, so expose
-                    # the paged cache as page-size-one blocks.
-                    k_cache=paged_view(
-                        key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
-                    ),
-                    v_cache=paged_view(
-                        value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        1,
-                    ),
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=True,
-                    num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
+                o_expand, softmax_lse_expand, *rest_expand = (
+                    self.flash_attn_with_kvcache(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        # The suffix table stores physical token slots, so expose
+                        # the paged cache as page-size-one blocks.
+                        k_cache=paged_view(
+                            key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
+                        ),
+                        v_cache=paged_view(
+                            value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                            1,
+                        ),
+                        page_table=self.forward_metadata_spec_decode_expand.page_table,
+                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                        softmax_scale=layer.scaling,
+                        causal=False,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=True,
+                        num_splits=self.num_splits,
+                        **kwargs,
+                    )
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -1891,7 +1882,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -1903,7 +1894,6 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=False,
                         return_softmax_lse=True,
                         out=_fa_out,
-                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 else:
@@ -1918,7 +1908,7 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -1930,7 +1920,6 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
                         out=_fa_out,
-                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -1944,9 +1933,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
-                )
+                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = paged_view(k_rope, self.page_size)
@@ -1981,7 +1968,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
-                        return flash_attn_with_kvcache(
+                        return self.flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
@@ -1999,7 +1986,6 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=fa_k_descale,
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
                         )
 
                     cp_strategy = get_cp_strategy()
@@ -2012,7 +1998,7 @@ class FlashAttentionBackend(AttentionBackend):
                         attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
                     )
                 else:
-                    result = flash_attn_with_kvcache(
+                    result = self.flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
                         v_cache=c_kv_cache,
@@ -2029,12 +2015,11 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=fa_v_descale,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
-                        ver=self.fa_impl_ver,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
                         o_expand, softmax_lse_expand, *rest_expand = (
-                            flash_attn_with_kvcache(
+                            self.flash_attn_with_kvcache(
                                 q=q_rope,
                                 k_cache=k_rope_cache,
                                 v_cache=c_kv_cache,
@@ -2052,7 +2037,6 @@ class FlashAttentionBackend(AttentionBackend):
                                 v_descale=fa_v_descale,
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
-                                ver=self.fa_impl_ver,
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -2103,7 +2087,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_layer(
                             forward_batch,
@@ -2116,7 +2100,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_scale,
                     )
                 else:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         KVWriteLoc.for_layer(forward_batch, layer),
                         k,
@@ -2209,7 +2193,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Always use non-chunked logic for cross-attention
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -2223,14 +2207,13 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -2244,7 +2227,6 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             else:
@@ -2253,11 +2235,9 @@ class FlashAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
+                        page_table = self.runner_ids.ids_in(
+                            IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+                        ).to(torch.int32)
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
 
@@ -2285,7 +2265,7 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -2306,7 +2286,6 @@ class FlashAttentionBackend(AttentionBackend):
                         else self.num_splits
                     ),
                     out=_fa_out,
-                    ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
                 )
@@ -2321,7 +2300,7 @@ class FlashAttentionBackend(AttentionBackend):
                             self.forward_metadata_spec_decode_expand.max_seq_len_k
                         )
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self.flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -2336,7 +2315,6 @@ class FlashAttentionBackend(AttentionBackend):
                             softcap=layer.logit_cap,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
                             **kwargs,
                         )
                     )
@@ -2350,7 +2328,7 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = paged_view(k_rope, self.page_size)
@@ -2366,7 +2344,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
-            result = flash_attn_with_kvcache(
+            result = self.flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -2383,29 +2361,29 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=fa_v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
-                ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
-                    v_cache=c_kv_cache,
-                    qv=q_nope,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=fa_k_descale,
-                    v_descale=fa_v_descale,
-                    return_softmax_lse=True,
-                    num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                o_expand, softmax_lse_expand, *rest_expand = (
+                    self.flash_attn_with_kvcache(
+                        q=q_rope,
+                        k_cache=k_rope_cache,
+                        v_cache=c_kv_cache,
+                        qv=q_nope,
+                        page_table=self.forward_metadata_spec_decode_expand.page_table,
+                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                        softmax_scale=layer.scaling,
+                        causal=False,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=fa_k_descale,
+                        v_descale=fa_v_descale,
+                        return_softmax_lse=True,
+                        num_splits=self.num_splits,
+                    )
                 )
                 o, _ = merge_state_v2(
                     o,
@@ -2955,7 +2933,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _set_decode_page_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         metadata,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -2966,7 +2944,7 @@ class FlashAttentionBackend(AttentionBackend):
         Under the unified pool the page tables are the plan's, copied in, so
         the fused kernel is left with the prefix sum alone.
         """
-        translated = self.kv_index_translator.reads_are_translated
+        translated = self.runner_ids.reads_are_translated
         normal_decode_set_metadata(
             metadata.cache_seqlens_int32,
             metadata.cu_seqlens_k,
@@ -2981,6 +2959,7 @@ class FlashAttentionBackend(AttentionBackend):
             full_to_swa_index_mapping=(
                 self.token_to_kv_pool.full_to_swa_index_mapping
                 if self.use_sliding_window_kv_pool
+                and not self.runner_ids.is_translating
                 else None
             ),
             skip_page_table=translated,
@@ -2989,9 +2968,9 @@ class FlashAttentionBackend(AttentionBackend):
             # The plan's table reaches `cache_seqlens_int32`, which the kernels
             # bound their reads by: a draft decode reads past `seq_lens`.
             bs = int(req_pool_indices.numel())
-            self.kv_index_translator.copy_page_table(plan, out=metadata.page_table[:bs])
+            self.runner_ids.copy_page_table(plan, out=metadata.page_table[:bs])
             if metadata.swa_page_table is not None:
-                self.kv_index_translator.copy_page_table(
+                self.runner_ids.copy_page_table(
                     plan,
                     out=metadata.swa_page_table[:bs],
                     kind=IdSpaceKind.SLIDING_WINDOW,
@@ -2999,7 +2978,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _apply_cuda_graph_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -3324,16 +3303,14 @@ class FlashAttentionBackend(AttentionBackend):
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            if self.kv_index_translator.reads_are_translated:
+            if self.runner_ids.reads_are_translated:
                 rows = int(req_pool_indices.numel())
-                self.kv_index_translator.copy_page_table(
-                    plan, out=metadata.page_table[:rows]
-                )
+                self.runner_ids.copy_page_table(plan, out=metadata.page_table[:rows])
                 if (
                     self.use_sliding_window_kv_pool
                     and metadata.swa_page_table is not None
                 ):
-                    self.kv_index_translator.copy_page_table(
+                    self.runner_ids.copy_page_table(
                         plan,
                         out=metadata.swa_page_table[:rows],
                         kind=IdSpaceKind.SLIDING_WINDOW,
@@ -3347,10 +3324,8 @@ class FlashAttentionBackend(AttentionBackend):
                     self.use_sliding_window_kv_pool
                     and metadata.swa_page_table is not None
                 ):
-                    swa_page_indices = (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            page_indices
-                        )
+                    swa_page_indices = self.runner_ids.ids_in(
+                        IdSpaceKind.SLIDING_WINDOW, page_indices
                     )
                     metadata.swa_page_table[:, :max_seq_pages].copy_(
                         swa_page_indices // self.page_size
@@ -3447,11 +3422,11 @@ class FlashAttentionBackend(AttentionBackend):
         page_table_a = metadata.page_table
         page_table_b = metadata_expand.page_table
         if self.use_sliding_window_kv_pool:
-            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                page_table_a
+            page_table_a = self.runner_ids.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, page_table_a
             ).to(torch.int32)
-            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                page_table_b
+            page_table_b = self.runner_ids.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, page_table_b
             ).to(torch.int32)
 
         prepare_swa_spec_page_table_triton(
@@ -3492,7 +3467,7 @@ class FlashAttentionMultiStepBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(

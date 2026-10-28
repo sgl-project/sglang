@@ -54,6 +54,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -882,6 +883,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_megamoe()
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -979,6 +981,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -1002,6 +1005,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -2052,9 +2056,13 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
-        self.dcp_size = (
-            1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
-        )
+        self.dcp_size = get_parallel().attn_dcp_size
+        if (
+            is_nextn
+            and self.use_dsa
+            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
+        ):
+            self.dcp_size = 1
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
