@@ -246,6 +246,7 @@ def _build_full_state(
     )
     mamba_slot_allocator = _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
+        take=allocator.alloc_state_slots,
         req_to_token_pool=req_to_token_pool,
         device=ctx.device,
     )
@@ -332,6 +333,7 @@ def _build_full_window_state(
     )
     _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
+        take=allocator.alloc_state_slots,
         req_to_token_pool=req_to_token_pool,
         device=ctx.device,
     )

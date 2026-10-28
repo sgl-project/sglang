@@ -10,9 +10,9 @@ admission, reclaim and compaction outcomes.
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -22,12 +22,47 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _relieve_for_alloc,
 )
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    ChainSnapshot,
+    FloatChain,
+    TokenEnds,
+    ends_available_tokens,
+    ends_can_reserve,
+    ends_fit,
+    ends_realization,
+    ends_reclaim_plan,
+    float_available_tokens,
+    float_byte_shortfall,
+    float_can_reserve,
+    float_end_certificate,
+    float_fit,
+    float_high_target,
+    float_reclaim_satisfied,
+    float_token_id_capacity,
+)
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+
+class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
+    """Which admission rule a unified chain uses.
+
+    `window` says how window tokens are admitted: "none" (no window sub-pool),
+    "split" (checked apart from the owner's tokens) or "joint" (owner and window
+    tokens in one reservation over the shared bytes).
+    """
+
+    window: Literal["none", "split", "joint"]
+    # Full-token equivalents one new state slot takes from the shared bytes; 0: no state.
+    state_slot_cost: int = 0
+
+
+def _snapshot(c: ChainAllocator) -> ChainSnapshot:
+    return c.pricing_snapshot()
 
 
 class _InterimPolicy:
@@ -56,12 +91,8 @@ class _InterimPolicy:
     def prealloc_fits(self, c: ChainAllocator, tree_cache, *args, **kwargs) -> bool:
         return BaseTokenToKVPoolAllocator.prealloc_fits(c, tree_cache, *args, **kwargs)
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        return BaseTokenToKVPoolAllocator.create_prefill_budget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
-        )
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        raise NotImplementedError
 
     def max_new_tokens_for_memory(self, c: ChainAllocator, *args, **kwargs):
         return BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(c, *args, **kwargs)
@@ -78,9 +109,6 @@ class _InterimPolicy:
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
-
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
-        return 0
 
     def resize(self, c: ChainAllocator, config) -> None:
         raise NotImplementedError(
@@ -134,7 +162,12 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         if target_size > c.mamba_allocator.available_size():
             _relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        return ChainAdmissionRules(
+            window="none", state_slot_cost=self._state_slot_cost(c)
+        )
+
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
         prefill planner reserves this so admission stays inside the JOINT budget,
         rounded UP. The `dcp_size` factor is there because that budget is in widened
@@ -275,49 +308,32 @@ class _TokenEndsPolicy(_WindowPolicy):
     """Two token ends: the owner and its window, with asymmetric shared-byte
     reservations."""
 
+    def __init__(self, c: ChainAllocator, **kwargs):
+        super().__init__(c, **kwargs)
+        self._ends_memo: Optional[Tuple[tuple, TokenEnds]] = None
+
     @property
     def unit_name(self) -> str:
         return "two token ends"
 
+    def _ends(self, c: ChainAllocator) -> TokenEnds:
+        constants = (self._empty_shared_gap_bytes, self._size_full, self._size_swa)
+        memo = self._ends_memo
+        if memo is None or memo[0] != constants:
+            ends = TokenEnds(
+                owner=c.roles.owner,
+                window=c.roles.window,
+                empty_gap_bytes=constants[0],
+                size_full=constants[1],
+                size_swa=constants[2],
+            )
+            memo = self._ends_memo = (constants, ends)
+        return memo[1]
+
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint byte budget in TOKENS: each chain alloc(1) consumes one
         full-side AND one swa-side page under the same virtual id."""
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        e_f = fa.entry_bytes_per_page
-        e_s = sa.entry_bytes_per_page
-        # Direction-agnostic shared gap: the free byte band between the two pools.
-        if fa.grow_direction == "up":
-            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
-        else:
-            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
-        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        if not c.lazy_compaction:
-            pages_by_bytes = gap_bytes // (e_f + e_s)
-            return min(pages_by_bytes, R_f, R_s) * c.page_size
-
-        H_f = len(fa._free_phys_pages)
-        H_s = len(sa._free_phys_pages)
-
-        K1 = min(H_f, H_s)  # Phase 1: both drain
-
-        # Phase 2: fewer-holes side extends; more-holes side keeps draining.
-        if H_f <= H_s:
-            e_phase2 = e_f
-            K_phase2_max = H_s
-        else:
-            e_phase2 = e_s
-            K_phase2_max = H_f
-        K2_room = K_phase2_max - K1
-        K2 = min(K2_room, gap_bytes // e_phase2) if e_phase2 > 0 else K2_room
-        gap_bytes -= K2 * e_phase2
-
-        K3 = gap_bytes // (e_f + e_s)  # Phase 3: both extend
-
-        K_total = K1 + K2 + K3
-        K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
-        return K_total * c.page_size
+        return ends_available_tokens(_snapshot(c), self._ends(c))
 
     def flush_targets(self, c: ChainAllocator):
         """Flush ALL members, including ones that are not short themselves: a
@@ -399,78 +415,16 @@ class _TokenEndsPolicy(_WindowPolicy):
         empty_pool: bool = False,
         prefer_swa: bool = False,
     ) -> Optional[Tuple[int, int]]:
-        """Return cumulative FULL/SWA eviction targets, or None if impossible.
-
-        The tree evicts FULL before SWA. Minimize required SWA reclaim with all
-        evictable FULL available, then trim excess FULL reclaim. FULL eviction's
-        actual SWA cascade is counted by the tree's shared eviction tracker.
-        With ``prefer_swa``, minimize FULL reclaim first and trim SWA instead.
-        """
-        if full_tokens < 0 or swa_tokens < 0:
-            return None
-
-        page_size = c.page_size
-        full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
-        swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
-        # Restoring host SWA for device-resident FULL can require more new
-        # SWA pages than new FULL pages; only the shared budget constrains it.
-
-        compacted = empty_pool or not c.lazy_compaction or self._compaction_allowed(c)
-
-        def fits(full_reclaim_pages: int, swa_reclaim_pages: int) -> bool:
-            return self._fits_page_demand(
-                c,
-                full_pages,
-                swa_pages,
-                full_reclaim_pages=full_reclaim_pages,
-                swa_reclaim_pages=swa_reclaim_pages,
-                compacted=compacted,
-                empty_pool=empty_pool,
-            )
-
-        if empty_pool:
-            return (0, 0) if fits(0, 0) else None
-        if fits(0, 0):
-            return (0, 0)
-
-        max_full_pages = min(
-            c.full_attn_allocator.allocated_count() // page_size,
-            max(0, int(full_evictable_tokens)) // page_size,
-        )
-        max_swa_pages = min(
-            c.swa_attn_allocator.allocated_count() // page_size,
-            max(0, int(swa_evictable_tokens)) // page_size,
-        )
-        if not fits(max_full_pages, max_swa_pages):
-            return None
-
-        def first_fit(high: int, predicate: Callable[[int], bool]) -> int:
-            low = 0
-            while low < high:
-                mid = (low + high) // 2
-                if predicate(mid):
-                    high = mid
-                else:
-                    low = mid + 1
-            return low
-
-        if prefer_swa:
-            full_reclaim_pages = first_fit(
-                max_full_pages, lambda value: fits(value, max_swa_pages)
-            )
-            swa_reclaim_pages = first_fit(
-                max_swa_pages, lambda value: fits(full_reclaim_pages, value)
-            )
-        else:
-            swa_reclaim_pages = first_fit(
-                max_swa_pages, lambda value: fits(max_full_pages, value)
-            )
-            full_reclaim_pages = first_fit(
-                max_full_pages, lambda value: fits(value, swa_reclaim_pages)
-            )
-        return (
-            full_reclaim_pages * page_size,
-            swa_reclaim_pages * page_size,
+        """Return cumulative FULL/SWA eviction targets, or None if impossible."""
+        return ends_reclaim_plan(
+            _snapshot(c),
+            self._ends(c),
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+            empty_pool=empty_pool,
+            prefer_swa=prefer_swa,
         )
 
     def can_reserve(
@@ -484,107 +438,16 @@ class _TokenEndsPolicy(_WindowPolicy):
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
-        """Check pending FULL/SWA demand against the shared byte envelope.
-
-        Scheduler admission keeps the historical one-token strict slack at an
-        empty-pool boundary. Live admission checks the state reachable after
-        reclaiming the currently evictable pages from both sides.
-        """
-        if full_tokens < 0 or swa_tokens < 0:
-            return False
-        if require_token_slack and (
-            full_tokens >= self._size_full or swa_tokens >= self._size_swa
-        ):
-            return False
-
-        return (
-            c.reclaim_plan(
-                full_tokens,
-                swa_tokens,
-                full_evictable_tokens=full_evictable_tokens,
-                swa_evictable_tokens=swa_evictable_tokens,
-                empty_pool=empty_pool,
-            )
-            is not None
-        )
-
-    def _compaction_allowed(self, c: ChainAllocator) -> bool:
-        return all(
-            not allocator.moves_blocked()
-            for allocator in (c.full_attn_allocator, c.swa_attn_allocator)
-        )
-
-    def _fits_page_demand(
-        self,
-        c: ChainAllocator,
-        num_full_pages: int,
-        num_swa_pages: int,
-        *,
-        full_reclaim_pages: int = 0,
-        swa_reclaim_pages: int = 0,
-        compacted: bool,
-        empty_pool: bool = False,
-    ) -> bool:
-        """Check one FULL/SWA page demand against a single allocator snapshot."""
-        if min(num_full_pages, num_swa_pages) < 0:
-            return False
-
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        if empty_pool:
-            full_live_pages = swa_live_pages = 0
-            full_reclaim_pages = swa_reclaim_pages = 0
-        else:
-            full_live_pages = fa.allocated_count() // c.page_size
-            swa_live_pages = sa.allocated_count() // c.page_size
-            full_reclaim_pages = min(full_live_pages, max(0, int(full_reclaim_pages)))
-            swa_reclaim_pages = min(swa_live_pages, max(0, int(swa_reclaim_pages)))
-
-        full_live_pages -= full_reclaim_pages
-        swa_live_pages -= swa_reclaim_pages
-        full_total_pages = full_live_pages + num_full_pages
-        swa_total_pages = swa_live_pages + num_swa_pages
-        virtual_page_capacity = fa.num_virtual_ids - fa.min_page_index
-        full_page_capacity = min(
-            virtual_page_capacity,
-            fa.num_pages - fa.min_page_index,
-        )
-        swa_page_capacity = min(
-            virtual_page_capacity,
-            sa.num_pages - sa.min_page_index,
-        )
-        if full_total_pages > full_page_capacity or swa_total_pages > swa_page_capacity:
-            return False
-
-        if compacted:
-            full_virtual_room = virtual_page_capacity - full_live_pages
-            full_holes = swa_holes = 0
-            full_index_room = full_page_capacity - full_live_pages
-            swa_index_room = swa_page_capacity - swa_live_pages
-            gap_bytes = (
-                self._empty_shared_gap_bytes
-                - full_live_pages * fa.entry_bytes_per_page
-                - swa_live_pages * sa.entry_bytes_per_page
-            )
-        else:
-            full_virtual_room = len(fa.free_virtual_ids) + full_reclaim_pages
-            full_holes = len(fa._free_phys_pages) + full_reclaim_pages
-            swa_holes = len(sa._free_phys_pages) + swa_reclaim_pages
-            full_index_room = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-            swa_index_room = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-            gap_bytes = fa._current_gap_bytes()
-
-        if num_full_pages > full_virtual_room:
-            return False
-        if num_full_pages > full_holes + full_index_room:
-            return False
-        if num_swa_pages > swa_holes + swa_index_room:
-            return False
-        full_extensions = max(0, num_full_pages - full_holes)
-        swa_extensions = max(0, num_swa_pages - swa_holes)
-        return (
-            full_extensions * fa.entry_bytes_per_page
-            + swa_extensions * sa.entry_bytes_per_page
-            <= max(0, gap_bytes)
+        """Check pending FULL/SWA demand against the shared byte envelope."""
+        return ends_can_reserve(
+            _snapshot(c),
+            self._ends(c),
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+            empty_pool=empty_pool,
+            require_token_slack=require_token_slack,
         )
 
     def ensure_capacity(
@@ -598,39 +461,20 @@ class _TokenEndsPolicy(_WindowPolicy):
         page_size = c.page_size
         num_full_pages = (int(full_tokens) + page_size - 1) // page_size
         num_swa_pages = (int(swa_tokens) + page_size - 1) // page_size
-        if self._fits_page_demand(
-            c,
-            num_full_pages,
-            num_swa_pages,
-            compacted=False,
-        ):
-            return True
-        if not c.lazy_compaction or not self._compaction_allowed(c):
-            return False
-        if not self._fits_page_demand(
-            c,
-            num_full_pages,
-            num_swa_pages,
-            compacted=True,
-        ):
-            return False
+        ends = self._ends(c)
+        realization = ends_realization(
+            _snapshot(c), ends, num_full_pages, num_swa_pages
+        )
+        if not realization.flush_ends:
+            return realization.fits
         c.full_attn_allocator.flush_for_allocation()
         c.swa_attn_allocator.flush_for_allocation()
-        return self._fits_page_demand(
-            c,
-            num_full_pages,
-            num_swa_pages,
-            compacted=False,
+        return ends_fit(
+            _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
         )
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
-
-        return SharedSWAPrefillBudget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
-        )
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        return ChainAdmissionRules(window="joint")
 
     def swa_capacity_and_available(
         self, c: ChainAllocator, *, full_capacity, swa_capacity
@@ -652,8 +496,13 @@ class _TokenEndsPolicy(_WindowPolicy):
     ) -> int | None:
         from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 
+        # The search does not change the chain: price every candidate on one snapshot.
+        snap, ends = _snapshot(c), self._ends(c)
+
         def fits(candidate):
-            return c.can_reserve(
+            return ends_can_reserve(
+                snap,
+                ends,
                 input_tokens + candidate + c.page_size,
                 estimate_swa_kv_tokens(
                     input_tokens,
@@ -797,6 +646,19 @@ class _FloatChainPolicy(_WindowPolicy):
 
     # -- capacity --
 
+    def __init__(self, c: ChainAllocator, **kwargs):
+        super().__init__(c, **kwargs)
+        self._float_chain: Optional[FloatChain] = None
+
+    def _chain(self, c: ChainAllocator) -> FloatChain:
+        chain = getattr(self, "_float_chain", None)
+        if chain is None:
+            roles = c.roles
+            chain = self._float_chain = FloatChain(
+                owner=roles.owner, window=roles.window, state=roles.state
+            )
+        return chain
+
     def can_reserve(
         self,
         c: ChainAllocator,
@@ -808,18 +670,14 @@ class _FloatChainPolicy(_WindowPolicy):
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
-        if (
-            full_tokens < 0
-            or swa_tokens < 0
-            or full_evictable_tokens
-            or swa_evictable_tokens
-            or empty_pool
-        ):
-            return False
-        return self._fits_page_demand(
-            c,
-            math.ceil(full_tokens / c.page_size),
-            math.ceil(swa_tokens / c.page_size),
+        return float_can_reserve(
+            _snapshot(c),
+            self._chain(c),
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+            empty_pool=empty_pool,
         )
 
     def prealloc_fits(
@@ -841,8 +699,11 @@ class _FloatChainPolicy(_WindowPolicy):
         cannot see.
         """
         page_size = c.page_size
-        if not self._fits_page_demand(
-            c, -(-full_tokens // page_size), -(-swa_tokens // page_size)
+        if not float_fit(
+            _snapshot(c),
+            self._chain(c),
+            -(-full_tokens // page_size),
+            -(-swa_tokens // page_size),
         ):
             return False
         return full_tokens <= full_budget_tokens and (
@@ -893,236 +754,43 @@ class _FloatChainPolicy(_WindowPolicy):
             )
             return c.can_reserve(full_tokens, swa_tokens)
         need_tokens = -(-int(full_tokens) // c.page_size) * c.page_size
-        if not self._token_id_capacity(c, need_tokens):
+        chain = self._chain(c)
+        if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
             return False
         if need_tokens <= c.available_size():
             return True
-        if self._token_end_reclaim_satisfied(c, need_tokens):
+        if float_end_certificate(_snapshot(c), chain, need_tokens):
             # The certificate preserves FLOAT holes in place. Absorbing FLOAT
             # boundaries first would describe a different allocation layout.
             c.full_attn_allocator.flush_for_allocation()
             c.mamba_allocator.flush_for_allocation()
             return need_tokens <= c.available_size()
-        if self._token_float_high_target(c, need_tokens) is not None:
+        if float_high_target(_snapshot(c), chain, need_tokens) is not None:
             c.full_attn_allocator.flush_for_allocation()
             c.mamba_allocator.flush_for_allocation()
-            if not self._token_id_capacity(c, need_tokens):
+            if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
                 return False
             if need_tokens <= c.available_size():
                 return True
             # Recompute from actual frontiers: no credit for another END flush.
-            target = self._token_float_high_target(c, need_tokens, flush_ends=False)
+            target = float_high_target(
+                _snapshot(c), chain, need_tokens, flush_ends=False
+            )
             if target is None:
                 return False
             c.swa_attn_allocator.make_room(side="high", min_bytes=target)
-            return self._token_id_capacity(c, need_tokens) and (
+            return float_token_id_capacity(_snapshot(c), chain, need_tokens) and (
                 need_tokens <= c.available_size()
             )
-        if self._token_allocation_byte_shortfall(c, need_tokens) > 0:
+        if float_byte_shortfall(_snapshot(c), chain, need_tokens) > 0:
             return False
+        # Today's last resort, imperative: where the float's holes sit decides it.
         return _relieve_for_alloc(c, need_tokens)
-
-    def _token_id_capacity(self, c: ChainAllocator, num_tokens: int) -> bool:
-        sa = c.swa_attn_allocator
-        return (
-            num_tokens // c.page_size <= c.full_attn_allocator.free_virtual_ids.numel()
-            and num_tokens // c.page_size
-            <= sa.num_pages - sa.min_page_index - sa._live_pages()
-        )
-
-    def _token_reclaim_satisfied(self, c: ChainAllocator, num_tokens: int) -> bool:
-        """Pure sufficient recovery query; False leaves FLOAT geometry unknown."""
-        return self._token_end_reclaim_satisfied(c, num_tokens) or (
-            self._token_float_high_target(c, num_tokens) is not None
-        )
-
-    def _token_end_frontiers(
-        self, c: ChainAllocator, num_tokens: int, *, flush_ends: bool = True
-    ):
-        """FULL before/after allocation and Mamba after permitted END flushes.
-
-        Pending reuse is never credited. Unflushed FULL holes remain allocatable.
-        """
-        fa, ma = c.full_attn_allocator, c.mamba_allocator
-
-        def end_credit(member):
-            if not flush_ends or not member.lazy_compaction:
-                return 0
-            if member.moves_blocked():
-                return 0
-            return member._free_phys_pages.numel()
-
-        full_credit, state_credit = end_credit(fa), end_credit(ma)
-        full_holes = fa._free_phys_pages.numel() if fa.lazy_compaction else 0
-        pages = num_tokens // c.page_size
-        full_extension = max(0, pages - (full_holes - full_credit))
-        full_before = fa._byte_low_frontier() + full_credit * fa.entry_bytes_per_page
-        full_after = full_before - full_extension * fa.entry_bytes_per_page
-        state_after = ma._byte_high_frontier() - state_credit * ma.entry_bytes_per_page
-        return full_before, full_after, state_after
-
-    def _token_end_reclaim_satisfied(self, c: ChainAllocator, num_tokens: int) -> bool:
-        """Sufficient allocation certificate requiring only allowed END flushes."""
-        if not self._token_id_capacity(c, num_tokens):
-            return False
-        if num_tokens <= c.available_size():
-            return True
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        _, full_after, state_after = self._token_end_frontiers(c, num_tokens)
-        pages = num_tokens // c.page_size
-        if full_after < fa.min_page_index * fa.entry_bytes_per_page:
-            return False
-        if sa._is_frontier_transparent():
-            return pages <= sa.pages_in_band(low_byte=state_after, high_byte=full_after)
-        if full_after < sa._byte_high_frontier():
-            return False
-        swa_extension = max(0, pages - sa._hole_pages())
-        return swa_extension <= max(
-            sa.pages_in_band(low_byte=state_after, high_byte=sa._byte_low_frontier()),
-            sa.pages_in_band(low_byte=sa._byte_high_frontier(), high_byte=full_after),
-        )
-
-    def _token_float_high_target(
-        self, c: ChainAllocator, num_tokens: int, *, flush_ends: bool = True
-    ) -> Optional[int]:
-        """Absolute HIGH band target after END preparation; None means unknown.
-
-        Reserve fresh LOW destinations for every moved FLOAT page and fresh HIGH
-        pages for SWA after FULL allocation. No FLOAT hole positions or pending
-        reuse are credited. The callback performs no movement or device reads.
-        """
-        if not self._token_id_capacity(c, num_tokens):
-            return None
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        if sa._is_frontier_transparent():
-            return None
-        if sa.moves_blocked():
-            return None
-        full_before, full_after, state_after = self._token_end_frontiers(
-            c, num_tokens, flush_ends=flush_ends
-        )
-        if full_after < fa.min_page_index * fa.entry_bytes_per_page:
-            return None
-        e_s = sa.entry_bytes_per_page
-        low = max(-(-state_after // e_s), sa.min_page_index)
-        high = min(full_before // e_s, sa.num_pages)
-        high_after = min(full_after // e_s, sa.num_pages)
-        limit = high_after - num_tokens // c.page_size
-        retreat = sa.high_wm_page - limit
-        if retreat <= 0 or sa.low_wm_page - low < retreat:
-            return None
-        # The far gap supplies all retreat destinations even with adverse holes.
-        # Retreating HIGH to limit leaves the requested SWA pages after FULL.
-        return (high - limit) * e_s
-
-    def _token_allocation_byte_shortfall(
-        self,
-        c: ChainAllocator,
-        num_tokens: int,
-        *,
-        full_reclaim: int = 0,
-        swa_reclaim: int = 0,
-        state_reclaim: int = 0,
-    ) -> int:
-        """Optimistic byte lower bound; zero does not certify FLOAT geometry."""
-        fa, sa, ma = (
-            c.full_attn_allocator,
-            c.swa_attn_allocator,
-            c.mamba_allocator,
-        )
-        live_bytes = sum(
-            max(0, member.allocated_count() - reclaim) * member.entry_bytes
-            for member, reclaim in (
-                (fa, full_reclaim),
-                (sa, swa_reclaim),
-                (ma, state_reclaim),
-            )
-        )
-        sink_bytes = min(
-            member.min_page_index * member.entry_bytes_per_page
-            for member in (fa, sa, ma)
-        )
-        required_bytes = (
-            num_tokens
-            // c.page_size
-            * (fa.entry_bytes_per_page + sa.entry_bytes_per_page)
-        )
-        return max(
-            0,
-            required_bytes + live_bytes + sink_bytes - c.unified_buffer.total_bytes,
-        )
-
-    def _fits_page_demand(
-        self, c: ChainAllocator, full_pages: int, swa_pages: int
-    ) -> bool:
-        """Price FULL first, then SWA in one contiguous band on the float grid."""
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
-        h_s = sa._hole_pages()
-        r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-        if full_pages > h_f + r_f or swa_pages > h_s + r_s:
-            return False
-        full_bytes = max(0, full_pages - h_f) * fa.entry_bytes_per_page
-        if full_bytes > fa._current_gap_bytes():
-            return False
-        ext_s = max(0, swa_pages - h_s)
-        full_low_after = fa._byte_low_frontier() - full_bytes
-        if sa._is_frontier_transparent():
-            room = sa.pages_in_band(
-                low_byte=sa._chain_high_frontier_below_bytes(),
-                high_byte=full_low_after,
-            )
-            return ext_s <= room
-        p_low = sa.pages_in_band(
-            low_byte=sa._chain_high_frontier_below_bytes(),
-            high_byte=sa._byte_low_frontier(),
-        )
-        p_high = sa.pages_in_band(
-            low_byte=sa._byte_high_frontier(),
-            high_byte=full_low_after,
-        )
-        return ext_s <= max(p_low, p_high)
 
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
-        as tail allocation. FULL takes the high band before SWA binds its pages.
-        """
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
-        h_s = sa._hole_pages()
-        r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-        # Allocator state is stable throughout this query. Snapshot the band
-        # geometry once instead of walking the chain at every binary-search step.
-        full_gap = fa._current_gap_bytes()
-        full_low = fa._byte_low_frontier()
-        full_page_bytes = fa.entry_bytes_per_page
-        swa_chain_low = sa._chain_high_frontier_below_bytes()
-        if sa._is_frontier_transparent():
-            swa_high_band_low = swa_chain_low
-            swa_low_room = 0
-        else:
-            swa_high_band_low = sa._byte_high_frontier()
-            swa_low_room = sa.pages_in_band(
-                low_byte=swa_chain_low, high_byte=sa._byte_low_frontier()
-            )
-
-        lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
-        while lo_n < hi_n:
-            mid = (lo_n + hi_n + 1) // 2
-            full_bytes = max(0, mid - h_f) * full_page_bytes
-            swa_room = max(
-                swa_low_room,
-                sa.pages_in_band(
-                    low_byte=swa_high_band_low, high_byte=full_low - full_bytes
-                ),
-            )
-            if full_bytes <= full_gap and max(0, mid - h_s) <= swa_room:
-                lo_n = mid
-            else:
-                hi_n = mid - 1
-        return lo_n * c.page_size
+        as tail allocation. FULL takes the high band before SWA binds its pages."""
+        return float_available_tokens(_snapshot(c), self._chain(c))
 
     def flush_targets(self, c: ChainAllocator):
         """All three members, float FIRST: its zero-copy boundary absorption must
@@ -1164,21 +832,17 @@ class _FloatChainPolicy(_WindowPolicy):
         c.full_attn_allocator.flush_for_allocation()
         _relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
         a tri-pool token costs e_f + e_s bytes, and the quotient is rounded UP."""
         e_tok = c.full_attn_allocator.entry_bytes + c.swa_attn_allocator.entry_bytes
         return -(-c.mamba_allocator.entry_bytes_per_page // e_tok)
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        # Mamba competes for the shared gap too; retain the tri-pool's existing
-        # token and state-slot admission until it has a three-way reservation.
-        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
-
-        return SWAPrefillBudget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        # State competes for the shared gap too; keep the split token admission
+        # plus the state-slot gate until one reservation prices all three.
+        return ChainAdmissionRules(
+            window="split", state_slot_cost=self._state_slot_cost(c)
         )
 
     def swa_capacity_and_available(
@@ -1200,8 +864,12 @@ class _FloatChainPolicy(_WindowPolicy):
         if c.free_group is not None:
             c.flush_deferred_full_frees()
         num_tokens = -(-num_tokens // c.page_size) * c.page_size
+        chain = self._chain(c)
         # Immediate capacity needs no reclaim plan or layout preparation.
-        if self._token_id_capacity(c, num_tokens) and num_tokens <= c.available_size():
+        if (
+            float_token_id_capacity(_snapshot(c), chain, num_tokens)
+            and num_tokens <= c.available_size()
+        ):
             return True
 
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -1222,8 +890,9 @@ class _FloatChainPolicy(_WindowPolicy):
             - sa.min_page_index
             - sa._live_pages()
             + swa_reclaim // c.page_size
-            or self._token_allocation_byte_shortfall(
-                c,
+            or float_byte_shortfall(
+                _snapshot(c),
+                chain,
                 num_tokens,
                 full_reclaim=full_reclaim,
                 swa_reclaim=swa_reclaim,
@@ -1241,8 +910,8 @@ class _FloatChainPolicy(_WindowPolicy):
         if full_reclaim or swa_reclaim:
             result = tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
-                allocation_reclaim_satisfied=lambda: self._token_reclaim_satisfied(
-                    c, num_tokens
+                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
+                    _snapshot(c), chain, num_tokens
                 ),
             )
             state_freed = result.mamba_num_evicted
@@ -1262,8 +931,8 @@ class _FloatChainPolicy(_WindowPolicy):
         if state_quota and tree_cache.mamba_evictable_size():
             result = tree_cache.evict_for_alloc(
                 EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: self._token_reclaim_satisfied(
-                    c, num_tokens
+                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
+                    _snapshot(c), chain, num_tokens
                 ),
             )
             if (
@@ -1273,7 +942,8 @@ class _FloatChainPolicy(_WindowPolicy):
             ):
                 return c.ensure_capacity(num_tokens, num_tokens)
         return (
-            self._token_id_capacity(c, num_tokens) and num_tokens <= c.available_size()
+            float_token_id_capacity(_snapshot(c), chain, num_tokens)
+            and num_tokens <= c.available_size()
         )
 
 

@@ -10,10 +10,12 @@ from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
+from sglang.srt.mem_cache.kv.alloc.pricing import ends_compaction_allowed
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
 
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
@@ -65,7 +67,9 @@ class TestHostGateCapacity(unittest.TestCase):
         self.assertEqual(full._chain_capacity_epoch(), epoch)
         self.assertEqual(full.schedulable_available_size(), full.available_size())
         self.assertGreater(before, full.schedulable_available_size())
-        self.assertFalse(allocator._policy._compaction_allowed(allocator))
+        self.assertFalse(
+            ends_compaction_allowed(chain_snapshot(allocator), token_ends(allocator))
+        )
         self.assertEqual(allocator.verify_byte_accounting(), [])
         state["open"] = True
         self.assertEqual(full.schedulable_available_size(), before)

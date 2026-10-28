@@ -204,11 +204,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Return the shared-pool donor capability, if this allocator has one."""
         return None
 
-    def mamba_slot_full_token_cost(self) -> int:
-        """Full-token equivalents of the shared bytes one state slot takes;
-        0 when state slots do not share bytes with the token pool."""
-        return 0
-
     def debug_print(self) -> str:
         return ""
 

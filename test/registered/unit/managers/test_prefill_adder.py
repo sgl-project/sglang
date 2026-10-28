@@ -26,8 +26,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
+    ChainPrefillBudget,
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
@@ -97,7 +99,6 @@ class TestPrefillAdder(CustomTestCase):
     ) -> MagicMock:
         allocator = MagicMock()
         allocator.has_window_pool = False
-        allocator.mamba_slot_full_token_cost.return_value = 0
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
@@ -1608,9 +1609,17 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
+        allocator = self.mock_token_allocator
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            ChainPrefillBudget(
+                allocator,
+                tree_cache,
+                rules=ChainAdmissionRules(window="none", state_slot_cost=64),
+                **kwargs,
+            )
+        )
         adder = self.create_adder(self.create_running_batch())
-        adder._mamba_slot_cost = 64
-        adder.rem_mamba_slots = available_slots
+        adder.memory_budget.rem_state_slots = available_slots
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
         req.kv.holds_mamba = holds_state
@@ -1637,7 +1646,9 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator.available_size.return_value = capacity
                 result = adder.add_one_req(req, False, None)
                 self.assertEqual(adder.can_run_list, [req] if admitted else [])
-                self.assertEqual(adder.rem_mamba_slots, 0 if admitted else slots)
+                self.assertEqual(
+                    adder.memory_budget.rem_state_slots, 0 if admitted else slots
+                )
                 if admitted:
                     self.mock_tree_cache.init_load_back.assert_called_once()
                     self.assertEqual(
@@ -1663,10 +1674,9 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        next_adder._mamba_slot_cost = 64
-        next_adder.rem_mamba_slots = 0
+        next_adder.memory_budget.rem_state_slots = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
-        self.assertEqual(next_adder.rem_mamba_slots, 0)
+        self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):

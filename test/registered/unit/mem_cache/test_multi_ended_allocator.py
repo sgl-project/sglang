@@ -20,6 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -673,8 +675,9 @@ class TestWindowChainAllocator(unittest.TestCase):
                             (full * page_size, swa * page_size)
                             for swa in range(max_swa + 1)
                             for full in range(max_full + 1)
-                            if allocator._policy._fits_page_demand(
-                                allocator,
+                            if ends_fit(
+                                chain_snapshot(allocator),
+                                token_ends(allocator),
                                 full_pages,
                                 swa_pages,
                                 full_reclaim_pages=full,
@@ -3296,7 +3299,7 @@ class TestDcpWidening(unittest.TestCase):
         return cache, walk
 
     def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
-        """The planner charges `mamba_slot_full_token_cost()` against a budget
+        """Admission charges the state-slot cost against a budget
         fed by `available_size()`. Both are bytes/entry_bytes conversions, so
         both carry `dcp_size`; if only the budget widens, every Mamba state is
         under-reserved by that factor and a batch is admitted whose later
@@ -3304,7 +3307,7 @@ class TestDcpWidening(unittest.TestCase):
         for page_size in (1, 8):
             with self._dcp(1):
                 base = self._build_composite(page_size=page_size)
-                base_cost = base.mamba_slot_full_token_cost()
+                base_cost = base.admission_rules().state_slot_cost
                 base_avail = base.available_size()
                 self.assertGreater(base_cost, 0)
             for dcp_size in (2, 4):
@@ -3313,7 +3316,7 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(a.available_size(), base_avail * dcp_size)
                     mamba_bytes = a.mamba_allocator.entry_bytes_per_page
                     full_entry = a.full_attn_allocator.entry_bytes
-                    cost = a.mamba_slot_full_token_cost()
+                    cost = a.admission_rules().state_slot_cost
                     # A widened token is `full_entry / dcp_size` bytes, so the
                     # reservation covers the slot...
                     self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
@@ -3340,7 +3343,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertEqual(bound, expected)
                 self.assertLessEqual(
                     bound,
-                    missing_slots * allocator.mamba_slot_full_token_cost(),
+                    missing_slots * allocator.admission_rules().state_slot_cost,
                 )
 
     def test_allocation_flush_public_wrapper_is_urgent(self):
