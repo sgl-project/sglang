@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import hashlib
+import importlib
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -43,6 +44,7 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
@@ -83,15 +85,20 @@ def get_eviction_strategy(
     return factory(**config) if config else factory()
 
 
-def _custom_mem_pool_providers() -> List[Callable[[str], Tuple]]:
-    from sglang.srt.disaggregation.mooncake.utils import (
-        init_mooncake_custom_mem_pool,
-    )
-    from sglang.srt.disaggregation.mori.custom_mem_pool import (
-        init_mori_custom_mem_pool,
-    )
-
-    return [init_mooncake_custom_mem_pool, init_mori_custom_mem_pool]
+# (enabled, module, function): the module is imported only when enabled, since
+# importing a transfer backend package requires its optional library.
+_CUSTOM_MEM_POOL_PROVIDERS: List[Tuple[Callable[[], bool], str, str]] = [
+    (
+        lambda: envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None,
+        "sglang.srt.disaggregation.mooncake.utils",
+        "init_mooncake_custom_mem_pool",
+    ),
+    (
+        lambda: envs.SGLANG_MORI_BACKEND.get().strip().lower() == "fabric",
+        "sglang.srt.disaggregation.mori.custom_mem_pool",
+        "init_mori_custom_mem_pool",
+    ),
+]
 
 
 def maybe_init_custom_mem_pool(
@@ -109,8 +116,10 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    for provider in _custom_mem_pool_providers():
-        result = provider(device)
+    for enabled, module, function in _CUSTOM_MEM_POOL_PROVIDERS:
+        if not enabled():
+            continue
+        result = getattr(importlib.import_module(module), function)(device)
         if result[0]:
             return result
     return False, None, None
