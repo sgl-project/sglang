@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_uti
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_cancel
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
 from sglang.multimodal_gen.runtime.managers import request_cancel
+from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.progress_reporter import ReportingTqdm
 from sglang.multimodal_gen.runtime.managers.request_cancel import (
@@ -142,6 +143,9 @@ def test_publish_without_publisher_is_a_no_op(monkeypatch):
     "module",
     [
         "sglang.multimodal_gen.runtime.managers.request_cancel",
+        "sglang.multimodal_gen.runtime.managers.request_cancel_error",
+        "sglang.multimodal_gen.runtime.utils.logging_utils",
+        "sglang.multimodal_gen.runtime.utils.perf_logger",
         "sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel",
         "sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor",
     ],
@@ -693,6 +697,37 @@ def test_merged_batch_is_cancellable_only_when_each_member_is(
     merged = scheduler._try_merge_generation_reqs(reqs)
 
     assert merged.cancellable is cancellable
+
+
+@pytest.mark.parametrize("native_grouped", [False, True])
+def test_cancelled_batch_returns_cancelled_outputs(monkeypatch, native_grouped):
+    """A merged dynamic batch and a native grouped batch keep the cancel."""
+    scheduler = object.__new__(Scheduler)
+    scheduler._async_output_save = False
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: False,
+            supports_native_grouped_requests=lambda: native_grouped,
+            supports_sequential_dit_inference=lambda: False,
+        )
+    )
+    scheduler.worker = SimpleNamespace(
+        is_sleeping=lambda: False,
+        execute_forward=Mock(
+            return_value=OutputBatch(
+                error="Request job0, job1 was cancelled", cancelled=True
+            )
+        ),
+    )
+    monkeypatch.setattr(scheduler, "_try_merge_generation_reqs", lambda reqs: reqs[0])
+    error = Mock()
+    monkeypatch.setattr(scheduler_module.logger, "error", error)
+
+    outputs = scheduler._handle_generation([_req("job0"), _req("job1")])
+
+    assert [output.cancelled for output in outputs] == [True, True]
+    assert all("cancelled" in output.error for output in outputs)
+    error.assert_not_called()
 
 
 def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):

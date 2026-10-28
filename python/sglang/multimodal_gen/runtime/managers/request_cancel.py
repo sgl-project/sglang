@@ -10,7 +10,6 @@ step and no rank waits in a collective that the others left.
 
 from __future__ import annotations
 
-import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -21,6 +20,9 @@ import zmq
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_replica_group,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -34,30 +36,34 @@ logger = init_logger(__name__)
 _MAX_CANCELLED_IDS = 4096
 
 
-class RequestCancelledError(RuntimeError):
-    def __init__(self, request_ids: list[str]):
-        self.request_ids = request_ids
-        super().__init__(f"Request {', '.join(request_ids)} was cancelled")
-
-
 class CancelListener:
-    """Receives cancelled request ids on a replica driver."""
+    """Receives cancelled request ids on a replica driver.
+
+    Only the scheduler thread of the driver uses it.
+    """
 
     def __init__(self, context: zmq.Context, endpoint: str):
+        # pipelines_core imports the stages, which import this module, so
+        # import it when the scheduler starts, not at module import
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+            split_output_request_id,
+        )
+
+        self._split_output_request_id = split_output_request_id
         self._socket = context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.SUBSCRIBE, b"")
         self._socket.connect(endpoint)
         self._cancelled: OrderedDict[str, None] = OrderedDict()
-        self._lock = threading.Lock()
 
     def is_cancelled(self, request_ids: list[str]) -> bool:
         """Return True when each request, or the job that it is an output of, is cancelled."""
-        with self._lock:
-            self._receive()
-            return bool(request_ids) and all(
-                self._is_cancelled(request_id) for request_id in request_ids
-            )
+        self._receive()
+        if not self._cancelled:
+            return False
+        return bool(request_ids) and all(
+            self._is_cancelled(request_id) for request_id in request_ids
+        )
 
     def _receive(self) -> None:
         while True:
@@ -71,15 +77,10 @@ class CancelListener:
                 self._cancelled.popitem(last=False)
 
     def _is_cancelled(self, request_id: str) -> bool:
-        # pipelines_core imports the stages, which import this module
-        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
-            split_output_request_id,
-        )
-
         if request_id in self._cancelled:
             return True
         # a job with n outputs may run as n requests, see expand_request_outputs
-        output = split_output_request_id(request_id)
+        output = self._split_output_request_id(request_id)
         return output is not None and output[0] in self._cancelled
 
 

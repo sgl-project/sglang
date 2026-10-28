@@ -408,6 +408,11 @@ class Scheduler(
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                if output_batch.cancelled:
+                    # the worker logged the cancel
+                    return self._build_dynamic_batch_error_outputs(
+                        reqs=reqs, error_msg=output_batch.error, cancelled=True
+                    )
                 if output_batch.error:
                     logger.error(
                         "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
@@ -457,6 +462,11 @@ class Scheduler(
 
         try:
             output_batch = self.worker.execute_forward(reqs)
+            if output_batch.cancelled:
+                # the worker logged the cancel
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs, error_msg=output_batch.error, cancelled=True
+                )
             if output_batch.error:
                 logger.error(
                     "Native grouped execution returned error. Returning per-request errors: %s",
@@ -841,8 +851,9 @@ class Scheduler(
         self,
         reqs: List[Req],
         error_msg: str,
+        cancelled: bool = False,
     ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg) for _ in reqs]
+        return [OutputBatch(error=error_msg, cancelled=cancelled) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
@@ -1111,8 +1122,10 @@ class Scheduler(
             if req.report_progress and req.request_id is not None
         ]
         merged_req.report_progress = bool(merged_req.merged_request_ids)
-        # the batch stops only when each member is cancelled, so the ids must
-        # name each member
+        # The batch stops only when each member is cancelled, so the ids must
+        # name each member. video_api sets report_progress with cancellable,
+        # so each cancellable member is in merged_request_ids; the length check
+        # keeps that true if another caller sets cancellable alone.
         merged_req.cancellable = all(req.cancellable for req in reqs) and len(
             merged_req.merged_request_ids
         ) == len(reqs)
