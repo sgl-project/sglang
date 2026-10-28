@@ -178,7 +178,7 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
 - **Chunked-prefill size is regime-dependent.** For long-input balanced workloads, start with `--chunked-prefill-size 32768` and tune it together with `--max-running-requests` for your input length and KV capacity. Keep the default chunked-prefill size for the high-throughput recipe unless profiling shows that prefill is the bottleneck.
 
 - **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.3`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.3-BF16`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there. Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). GLM-5.3 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
-- **MTP / EAGLE speculative decoding** is disabled for AMD in the Deploy panel because the gfx950 spec-decode draft kernel is not yet validated on this hardware (and at `--speculative-num-steps > 3` hits a separate build issue). Until MTP is validated on gfx950, omit the `--speculative-*` flags and serve without MTP.
+- **MTP / EAGLE speculative decoding on AMD.** On MI355X, the FP8 low-latency Deploy cell serves EAGLE with 3 steps, top-k 1, and 4 draft tokens, as the agentic recipe of [section 3.6](#amd-agentic) does. The Playground's 1-1-2 and 5-1-6 presets also run on the MI355X FP8 cells, except 5-1-6 on the high-throughput cell, which runs out of memory at startup. The other AMD Deploy cells serve without MTP, and MTP is not validated with the BF16 checkpoint or on MI300X / MI325X.
 
 ## 3. Advanced Usage
 
@@ -335,3 +335,59 @@ When deploying with PD Disaggregation, a **prefill worker using the Mooncake tra
 --cp-strategy interleave \
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
+
+<a id="amd-agentic" />
+
+### 3.6 Agentic Long-Context on MI355X (FP8, MTP)
+
+Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. The command serves the FP8 checkpoint on one 8-GPU MI355X node with EAGLE MTP, an FP8 E4M3 KV cache, and the AMD monokernel.
+
+- `--enable-amd-monokernel` runs the target model's verify step on the gfx950 monokernel when one or two requests are running (4 or 8 tokens a step). Larger steps take the normal forward, so the kernel serves fewer steps as concurrency grows.
+- Keep `--kv-cache-dtype fp8_e4m3`. The monokernel also accepts the BF16 cache, but BF16 KV slows the DSA prefill and raises TTFT on long agentic prompts.
+- Use `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028` or a later MI35x image. Its SGLang pins sgl-amd-mono [`90c2355`](https://github.com/sgl-project/sgl-amd-mono/commit/90c23551a323d5badd5b86c1e92151e319072d87), which contains the FP8 KV support of [sgl-amd-mono#60](https://github.com/sgl-project/sgl-amd-mono/pull/60). With an older pin, the monokernel does not accept the FP8 KV cache, and the server exits at startup.
+
+The braced value `{max-running-requests}` follows concurrency and sets both `--max-running-requests` and `--cuda-graph-max-bs-decode`:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700, width: "40%"}}>Concurrency</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>1</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>2</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>4</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>10</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>max-running-requests</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>2</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>4</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>8</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>20</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --tp 8 \
+  --ep-size 1 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-amd-monokernel \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 32768 \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {max-running-requests} \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 1800
+```
