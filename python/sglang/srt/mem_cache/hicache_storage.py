@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
 
 import torch
 
@@ -40,6 +41,37 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+        ):
+            raise ValueError("DCP storage requires a DCP-aligned logical page size.")
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -171,6 +203,91 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def disabled_l3_layout(
+    reason: str, *, backend: Optional[str] = None, page_size: Optional[int] = None
+) -> dict:
+    return {
+        "enabled": False,
+        "backend": backend,
+        "page_size": page_size,
+        "hicache_object_layout": {"pools": []},
+        "reason": reason,
+    }
+
+
+def _l3_layout_pp_rank(layout: dict) -> Optional[int]:
+    inner = layout.get("hicache_object_layout")
+    return inner.get("pp_rank") if isinstance(inner, dict) else None
+
+
+def _l3_layout_stage_independent(layout: dict) -> dict:
+    """The part of a reply that must agree across pipeline stages."""
+    inner = layout.get("hicache_object_layout")
+    if not isinstance(inner, dict):
+        return layout
+    rest = {k: v for k, v in inner.items() if k not in ("pp_rank", "pools")}
+    return {**layout, "hicache_object_layout": rest}
+
+
+def _l3_layout_unavailable(layout: dict, reason: str) -> dict:
+    inner = {**layout["hicache_object_layout"], "pools": []}
+    return {
+        **layout,
+        "enabled": False,
+        "hicache_object_layout": inner,
+        "reason": reason,
+    }
+
+
+def merge_l3_layouts(layouts: Sequence[Optional[dict]]) -> Optional[dict]:
+    """Merge scheduler replies: replicas must match, PP stages are concatenated."""
+    if not layouts or all(layout is None for layout in layouts):
+        # Absence is reserved for older engines, not an explicitly disabled L3.
+        return None
+    inconsistent = "Inconsistent HiCache L3 layouts across schedulers"
+    if any(layout is None for layout in layouts):
+        return disabled_l3_layout(inconsistent)
+    stages = {}
+    for layout in layouts:
+        if stages.setdefault(_l3_layout_pp_rank(layout), layout) != layout:
+            return disabled_l3_layout(inconsistent)
+    if None in stages:
+        return layouts[0] if len(stages) == 1 else disabled_l3_layout(inconsistent)
+    ordered = [stages[rank] for rank in sorted(stages)]
+    first = ordered[0]
+    if any(
+        _l3_layout_stage_independent(s) != _l3_layout_stage_independent(first)
+        for s in ordered[1:]
+    ):
+        return disabled_l3_layout(inconsistent)
+    if not first.get("enabled"):
+        return first
+    inner = first["hicache_object_layout"]
+    pp_size = inner.get("pp_size", 1)
+    if type(pp_size) is not int:
+        return disabled_l3_layout(inconsistent)
+    if sorted(stages) != list(range(pp_size)):
+        return _l3_layout_unavailable(
+            first, "Incomplete pipeline-parallel stage layouts"
+        )
+    if pp_size == 1:
+        return first
+    # A layout spanning several stages belongs to none of them: pp_rank is null.
+    pools = [p for s in ordered for p in s["hicache_object_layout"]["pools"]]
+    return {
+        **first,
+        "hicache_object_layout": {**inner, "pools": pools, "pp_rank": None},
+    }
+
+
+def merge_scheduler_info_layouts(infos: Sequence[dict]) -> None:
+    """Give every startup info the merged layout, so any entry is representative."""
+    if any("hicache_object_layout" in info for info in infos):
+        layout = merge_l3_layouts([info.get("hicache_object_layout") for info in infos])
+        for info in infos:
+            info["hicache_object_layout"] = layout
 
 
 class HiCacheStorage(ABC):
@@ -394,6 +511,220 @@ class MetadataCache:
             self.cache.clear()
 
 
+def _maybe_wrap_hicache_storage_failure_injector(
+    backend: HiCacheStorage,
+) -> HiCacheStorage:
+    """Wrap storage with random delay/failure injection when test env vars are set."""
+    random_delay_limit = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY.get()
+    failure_prob = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE.get()
+    if random_delay_limit is None and failure_prob is None:
+        return backend
+    assert random_delay_limit is None or random_delay_limit >= 0
+    assert failure_prob is None or 0 <= failure_prob <= 1
+    logger.info(
+        "HiCache storage test injector enabled "
+        f"(random_delay_limit={random_delay_limit or 0.0}s, "
+        f"failure_prob={failure_prob or 0.0})"
+    )
+    return HiCacheStorageFailureInjector(
+        backend,
+        random_delay_limit or 0.0,
+        failure_prob or 0.0,
+    )
+
+
+class HiCacheStorageFailureInjector(HiCacheStorage):
+    """Proxy that injects random delay and failures before each storage API call."""
+
+    _backend: HiCacheStorage
+    _random_delay_limit: float
+    _failure_prob: float
+    _thread_local = threading.local()
+
+    def __init__(
+        self,
+        backend: HiCacheStorage,
+        random_delay_limit: float,
+        failure_prob: float,
+    ):
+        self._backend = backend
+        self._random_delay_limit = random_delay_limit
+        self._failure_prob = failure_prob
+
+    def _thread_local_random(self) -> random.Random:
+        # We cannot use random.uniform() or random.random() directly, because
+        # TP/PP ranks have the same random seed at startup, so they would produce
+        # the same sequence of random numbers here.  We expect TP/PP ranks behave
+        # differently by injecting random failures and delays, in order to expose
+        # potential bugs.
+        if not hasattr(self._thread_local, "random"):
+            self._thread_local.random = random.Random()
+        return self._thread_local.random
+
+    def _inject_delay(self, func_name: str) -> None:
+        if self._random_delay_limit > 0:
+            r = self._thread_local_random()
+            delay_secs = r.uniform(0.0, self._random_delay_limit)
+            logger.debug(f"Inject delay {delay_secs}s in {func_name}")
+            time.sleep(delay_secs)
+
+    def _inject_failure(self, func_name: str) -> bool:
+        if self._failure_prob > 0:
+            r = self._thread_local_random()
+            if r.random() < self._failure_prob:
+                logger.debug(f"Inject failure in {func_name}")
+                return True
+        return False
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self._backend.register_mem_pool_host(mem_pool_host)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        self._backend.register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def on_host_pools_registered(self) -> None:
+        self._backend.on_host_pools_registered()
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        func_name = "batch_exists_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return PoolTransferResult.empty()
+        return self._backend.batch_exists_v2(keys, pool_transfers, extra_info)
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        func_name = "batch_get_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return {
+                transfer.name: [False] * len(transfer.keys or [])
+                for transfer in transfers
+            }
+        return self._backend.batch_get_v2(transfers, extra_info)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        func_name = "batch_set_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return {
+                transfer.name: [False] * len(transfer.keys or [])
+                for transfer in transfers
+            }
+        return self._backend.batch_set_v2(transfers, extra_info)
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_get_v1"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(keys)
+        return self._backend.batch_get_v1(keys, host_indices, extra_info)
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_set_v1"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(keys)
+        return self._backend.batch_set_v1(keys, host_indices, extra_info)
+
+    def get(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        func_name = "get"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return None
+        return self._backend.get(key, target_location, target_sizes)
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        func_name = "batch_get"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [None] * len(keys)
+        return self._backend.batch_get(keys, target_locations, target_sizes)
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        func_name = "set"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.set(key, value, target_location, target_sizes)
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        func_name = "batch_set"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.batch_set(keys, values, target_locations, target_sizes)
+
+    def exists(self, key: str) -> bool:
+        func_name = "exists"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.exists(key)
+
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        func_name = "batch_exists"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return 0
+        return self._backend.batch_exists(keys, extra_info)
+
+    def clear(self) -> None:
+        return self._backend.clear()
+
+    def get_stats(self):
+        return self._backend.get_stats()
+
+    def close(self):
+        self._backend.close()
+
+
 class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -427,6 +758,17 @@ class HiCacheFile(HiCacheStorage):
         self.config_suffix = (
             f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
         )
+
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file.
+            dcp_suffix = (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
+            self.config_suffix += dcp_suffix
+            self.tp_config_suffix += dcp_suffix
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -462,10 +804,10 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Each rank creates and evicts its TP-sharded files; rank 0 also owns
-        # the shared MLA files.
+        # Each rank owns its TP-sharded state; selected DCP writers also own
+        # their shared MLA shard files.
         owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and tp_rank == 0:
+        if is_mla_model and storage_config.is_storage_writer:
             owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
@@ -486,7 +828,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -660,31 +1002,35 @@ class HiCacheFile(HiCacheStorage):
         )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             name = transfer.name
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+                pool_restorable = set(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
+                pool_restorable = set()
+                for prefix_len in range(1, kv_pages + 1):
                     if all(
                         has_component(i, name)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.add(prefix_len)
+                boundary = max(pool_restorable, default=0)
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            restorable = [p for p in restorable if p in pool_restorable]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"

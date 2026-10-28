@@ -808,7 +808,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     alpha_key = name + ".alpha"
                     adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
                     if alpha_key in self.lora_adapters[nickname]:
-                        inferred_alpha = int(
+                        inferred_alpha = float(
                             self.lora_adapters[nickname][alpha_key].item()
                         )
                     elif adapter_lora_alpha is not None:
@@ -1028,7 +1028,7 @@ class LoRAPipeline(ComposedPipelineBase):
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
-            name = name.replace(".weight", "")
+            name = name.removesuffix(".weight")
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
@@ -1037,8 +1037,8 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
-                # A/B of one fused layer must be laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B")):
+                # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
+                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
                     continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
