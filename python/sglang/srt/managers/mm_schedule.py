@@ -573,8 +573,12 @@ def _get_chunked_prefill_embedding(
         if extend_seq_len <= 0:
             continue
 
-        # Skip if all items already prefilled.
-        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+        # Multi-span items (e.g. videos) use the full encoder path below.
+        # Do not encode them for chunks before, after, or between their spans.
+        if not any(
+            end >= extend_prefix_len and start < extend_prefix_len + extend_seq_len
+            for start, end in items_offset
+        ):
             continue
 
         req_info = PerImageRequestInfo(
@@ -651,7 +655,15 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
-    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
+    # placeholder_tensor arrives sorted from embed_mm_inputs. torch.isin
+    # brute-forces only while P < 10 * N**0.145 (P placeholders, N ids); past
+    # that it sorts with unique(), whose count syncs the host. The sorted
+    # lookup never syncs.
+    assert placeholder_tensor.numel() > 0
+    placeholders = placeholder_tensor.to(input_ids.dtype)
+    idx = torch.searchsorted(placeholders, input_ids)
+    idx.clamp_(max=placeholders.numel() - 1)
+    return (placeholders[idx] == input_ids).unsqueeze(-1)
 
 
 def _count_mm_tokens_in_extend(

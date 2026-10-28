@@ -579,6 +579,7 @@ class DiffGenerator:
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
             action=output_batch.action_pred,
+            lidar=output_batch.lidar,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=select_output_rollout_trajectory(
@@ -692,55 +693,6 @@ class DiffGenerator:
         )
         # _send_lora_request already raises on error, so output.error is always None here
         return output.output or {}
-
-    def _ensure_lora_state(
-        self,
-        lora_path: str | None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-    ) -> None:
-        """
-        Ensure the LoRA state matches the desired configuration.
-
-        Note: This method does not cache client-side state. The server handles
-        idempotent operations, so redundant calls are safe but may have minor overhead.
-        """
-        if lora_path is None:
-            # Unmerge all LoRA weights when no lora_path is provided
-            self.unmerge_lora_weights()
-            return
-
-        lora_nickname = lora_nickname or self.server_args.lora_nickname
-
-        # Set the LoRA adapter (server handles idempotent logic)
-        self.set_lora(lora_nickname, lora_path)
-
-        # Merge or unmerge based on the merge_lora flag
-        if merge_lora:
-            self.merge_lora_weights()
-        else:
-            self.unmerge_lora_weights()
-
-    def generate_with_lora(
-        self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        *,
-        lora_path: str | None = None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-        **kwargs,
-    ):
-        self._ensure_lora_state(
-            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
-        )
-        return self.generate(
-            sampling_params_kwargs=dict(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                **kwargs,
-            )
-        )
 
     def shutdown(self):
         """

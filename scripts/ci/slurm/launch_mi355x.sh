@@ -194,6 +194,7 @@ emit("DIST_SOCK", rt.get("dist_socket_ifname", ""))
 # hardcoded value) so EP<=8 recipes stay byte-identical; wide-EP spur recipes
 # set mooncake, which is the validated cross-node KV path there.
 emit("XFER", rt.get("kv_transfer_backend", "mori"))
+emit("MC_DISABLE_HIP", rt.get("mc_disable_hip", 0))
 # SGLANG_USE_ROCM700A toggles the ROCm-7.0.0-alpha codepath. Default 1 (the
 # pre-wide hardcoded value) keeps EP<=8 recipes byte-identical; the validated
 # wide-EP run on the rocm720 0715 image needs 0, set via runtime.rocm700a.
@@ -292,7 +293,7 @@ if (( (PN_PER > 1 && PW > 1) || (DN_PER > 1 && DW > 1) )); then
     echo "ERROR: a wide engine (nodes/engine>1) cannot have >1 worker of that role (got PW=$PW PN_PER=$PN_PER DW=$DW DN_PER=$DN_PER)" >&2
     exit 1
 fi
-echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
+echo "recipe: xfer=$XFER image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -474,6 +475,15 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
     if [[ "$CLUSTER" == "spur" ]]; then
         MORI_ENV="$MORI_ENV -e MORI_RDMA_DEVICES=$IB"
     fi
+fi
+
+# Mooncake KV transfer: it moves KV over its own RDMA engine, so the mori env above
+# is irrelevant to it. MC_GID_INDEX=1 picks the routable RoCEv2 IPv4 GID on the
+# routed L3 fabric; MC_DISABLE_HIP (when the recipe sets runtime.mc_disable_hip=1)
+# keeps cross-node requests off the intra-node-only hip transport.
+if [[ "$XFER" == "mooncake" ]]; then
+    MORI_ENV="$MORI_ENV -e MC_GID_INDEX=1"
+    [[ "$MC_DISABLE_HIP" == "1" ]] && MORI_ENV="$MORI_ENV -e MC_DISABLE_HIP=1"
 fi
 
 # Model-specific docker `-e` env + sglang server args from the recipe's optional
