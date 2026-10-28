@@ -47,6 +47,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import msgspec
+
 logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = os.path.join(
@@ -210,8 +212,7 @@ def intree_out_dir() -> str:
     return os.path.join(tempfile.gettempdir(), f"sglang_aiter_intree_{os.getuid()}")
 
 
-@dataclass(frozen=True)
-class IntreeTable:
+class IntreeTable(msgspec.Struct, frozen=True):
     """An aiter tuned-config table that in-tree rows patch: aiter's variable for it, the
     ``AITER_CONFIGS`` attribute that resolves it, the in-tree CSV, the merged file's name
     stem, and the table's key and kernel columns."""
