@@ -828,7 +828,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             page_size=1,
             tree_cache=cache,
             token_to_kv_pool_allocator=allocator,
-            running_batch=None,
+            running_reqs=None,
             new_token_ratio=1.0,
             rem_input_tokens=100,
             rem_chunk_tokens=None,
