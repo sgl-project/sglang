@@ -2630,7 +2630,10 @@ class MHATokenToKVPool(KVCache):
                             shape, dtype=self.store_dtype, device=self.device
                         )
 
-                    if k_shape == v_shape:
+                    # Only CUDA's trtllm fmha_v2 prefill reads the fused layout,
+                    # and same-node Mooncake PD on ROCm decodes garbage when V
+                    # sits inside K's allocation, so ROCm allocates them apart.
+                    if k_shape == v_shape and not _is_hip:
                         # Store K and V as block-aligned halves of one allocation
                         # so paged kernels with a single pool base can reach V
                         # via block offsets. Each half keeps its standalone
