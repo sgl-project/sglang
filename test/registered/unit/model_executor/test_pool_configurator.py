@@ -1451,6 +1451,47 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_draft_on_the_target_swa_slots_is_charged_per_swa_token(self):
+        """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA: an all-sliding-window draft holds one
+        row per target SWA slot, so its bytes ride the SWA term (scaled by the
+        SWA:full ratio of 0.5) instead of costing a row per full token."""
+        from sglang.srt.environ import envs
+
+        draft_kv_per_token = 10_240
+
+        def _cell_size(*, env, draft_full_layers):
+            mr = _make_model_runner(
+                self,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_algorithm.is_dflash.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                draft_model_config=SimpleNamespace(
+                    is_hybrid_swa=True, full_attention_layer_ids=draft_full_layers
+                ),
+            )
+            with mock_cpu_env(), envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.override(env):
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                return create_memory_pool_configurator(mr)._cell_size
+
+        per_full_token = _cell_size(env=False, draft_full_layers=[])
+        self.assertEqual(
+            per_full_token - _cell_size(env=True, draft_full_layers=[]),
+            draft_kv_per_token * 0.5,
+        )
+        # A draft with a full-attention layer keeps its row per full token.
+        self.assertEqual(_cell_size(env=True, draft_full_layers=[0]), per_full_token)
+
 
 class TestSWAPoolFloor(CustomTestCase):
     """An SWA pool below the prefill admission floor must fail here, not livelock

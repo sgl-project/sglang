@@ -3,8 +3,10 @@
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -92,6 +94,38 @@ class TestResolveSwaKvPool(CustomTestCase):
                     allocator_kvcache=swa,
                 )
                 self.assertIs(resolve(runner), swa)
+
+
+class TestEncoderOnlyVerifyPageTable(CustomTestCase):
+    """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA: the expanded ENCODER_ONLY verify rows
+    gather the SWA page table on a draft whose layers sit in the SWA sub-pool,
+    and only there; a target reading it would get a wrong row, with no crash."""
+
+    def _reads_swa(self, *, env=True, is_draft_worker=True, swa_layer_ids=(0, 1)):
+        backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+        backend.expand_encoder_only_verify = True
+        backend._swa_kv_pool = MagicMock(
+            layers_mapping={0: (0, 0 in swa_layer_ids), 1: (1, 1 in swa_layer_ids)}
+        )
+        layers = []
+        for layer_id in (0, 1):
+            layer = MagicMock(spec=RadixAttention)
+            layer.layer_id, layer.attn_type = layer_id, AttentionType.ENCODER_ONLY
+            layers.append(layer)
+        runner = MagicMock(is_draft_worker=is_draft_worker)
+        runner.model.modules.return_value = layers
+        # override() restores the env only on a clean exit, so nothing raises inside.
+        with envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.override(env):
+            try:
+                return backend._resolve_encoder_only_reads_swa(runner)
+            except NotImplementedError as error:
+                return error
+
+    def test_only_a_draft_on_swa_slots_reads_the_swa_page_table(self):
+        self.assertTrue(self._reads_swa())
+        self.assertFalse(self._reads_swa(env=False))
+        self.assertFalse(self._reads_swa(is_draft_worker=False))
+        self.assertIsInstance(self._reads_swa(swa_layer_ids=(0,)), NotImplementedError)
 
 
 if __name__ == "__main__":

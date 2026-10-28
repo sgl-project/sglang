@@ -419,6 +419,110 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             injected["cache_loc_2d"], physical.view(2, 2), rtol=0, atol=0
         )
 
+    def test_draft_on_the_target_swa_slots_writes_at_the_target_swa_ids(self):
+        """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA keeps an all-sliding-window DFLASH
+        draft's KV on the target's SWA slots: both target-hidden writers must put
+        each token at the target's SWA id, where the draft's SWA page table reads
+        it, never at its full id (a wrong row, with no crash)."""
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        # A real pool's KV write picks its kernel by platform, not by tensor device:
+        # on a CUDA host it is the CUDA-only store_cache, so the pool must sit there.
+        dev = torch.device("cuda" if torch.cuda.is_available() else _DEV)
+        full = torch.tensor([4, 5, 6, 9], dtype=torch.int64, device=dev)
+        swa = torch.tensor([11, 3, 7, 2], dtype=torch.int64, device=dev)
+        target_translator, draft_translator = object(), object()
+        plan = SimpleNamespace(
+            write_ids=lambda reader, cols=None, kind=None: (
+                swa.clone()
+                if reader is target_translator and kind == IdSpaceKind.SLIDING_WINDOW
+                else full.clone()
+            )
+        )
+        layer = SimpleNamespace(layer_id=0, k_scale=None, v_scale=None)
+        attn = SimpleNamespace(
+            kv_proj_only=lambda h: (h[:, :4], h[:, 4:]),
+            apply_k_norm=lambda k: k,
+            apply_k_rope=lambda pos, k: k,
+            num_kv_heads=1,
+            head_dim=4,
+            attn=layer,
+        )
+
+        def worker_with_pool():
+            pool = SWAKVPool(
+                size=32,
+                size_swa=16,
+                page_size=1,
+                dtype=torch.float32,
+                head_num=1,
+                head_dim=4,
+                swa_attention_layer_ids=[0],
+                full_attention_layer_ids=[],
+                device=dev,
+            )
+            worker = SimpleNamespace(
+                _draft_kv_on_swa=True,
+                model_runner=SimpleNamespace(
+                    device=dev, kv_index_translator=target_translator
+                ),
+                draft_model_runner=SimpleNamespace(
+                    kv_index_translator=draft_translator, token_to_kv_pool=pool
+                ),
+                draft_model=SimpleNamespace(
+                    project_target_hidden=lambda h: h,
+                    prepare_context_hidden_for_kv=lambda layer, h: h,
+                    layers=[SimpleNamespace(self_attn=attn)],
+                ),
+                draft_owns_attention=False,
+                lilicorr=None,
+                _use_fused_kv_materialize=False,
+                _fused_kv_helper=None,
+            )
+            worker._append_target_hidden_sequential = lambda **kw: (
+                DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
+            )
+            return worker, pool.swa_kv_pool.k_buffer[0]
+
+        hidden = torch.arange(32, dtype=torch.float32, device=dev).view(4, 8)
+        k_rows = hidden[:, :4].view(4, 1, 4)
+
+        def write(worker, **kw):
+            DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
+                worker,
+                target_hidden=hidden,
+                cache_loc=DFlashWorkerV2._draft_write_ids(worker, plan),
+                positions=torch.arange(4, device=dev),
+                swa_cache_loc=DFlashWorkerV2._draft_swa_write_ids(worker, plan),
+                **kw,
+            )
+
+        # Prefill: every token, at its SWA id.
+        worker, swa_k = worker_with_pool()
+        write(worker)
+        torch.testing.assert_close(swa_k[swa], k_rows, rtol=0, atol=0)
+
+        # Post-verify commit of [2, 1] tokens: only the committed rows, at SWA ids.
+        worker, swa_k = worker_with_pool()
+        write(
+            worker,
+            cache_loc_2d=full.view(2, 2),
+            commit_lens=torch.tensor([2, 1], dtype=torch.int32, device=dev),
+        )
+        torch.testing.assert_close(swa_k[swa[:3]], k_rows[:3], rtol=0, atol=0)
+        self.assertEqual(int(swa_k[swa[3]].abs().sum()), 0)
+
+        # Without SWA ids the pool refuses rather than writing full ids.
+        with self.assertRaises(AssertionError):
+            worker.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                layer,
+                full.view(2, 2),
+                torch.tensor([2, 2], dtype=torch.int32, device=dev),
+                k_rows,
+                k_rows,
+            )
+
     def test_full_v2p_table_per_disposition(self):
         """The v2p accessor must hand a DCP table builder exactly what
         `translate_kv_loc` would use: the shared v2p table on the target and

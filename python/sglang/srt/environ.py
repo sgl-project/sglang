@@ -1607,6 +1607,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Store an all-sliding-window DFLASH draft's KV on a hybrid-SWA target's SWA
+    # slots (window-sized) instead of one slot per target token.
+    SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

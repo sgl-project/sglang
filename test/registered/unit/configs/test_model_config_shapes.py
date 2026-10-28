@@ -53,6 +53,40 @@ class TestModelConfigShapes(CustomTestCase):
         )
         self.assertEqual(self._derive_shapes(mla).attention_arch, AttentionArch.MLA)
 
+    def test_dflash_draft_on_swa_slots_needs_an_all_sliding_window_draft(self):
+        """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA turns only an all-sliding-window DFLASH
+        draft into an all-SWA hybrid model; any other model keeps its split."""
+        from sglang.srt.environ import envs
+
+        def derive(
+            *, env=True, is_draft_model=True, algorithm="DFLASH", layer_types=None
+        ):
+            config = _make_text_config(
+                architectures=["DFlashDraftModel"],
+                layer_types=layer_types or ["sliding_attention"] * 2,
+            )
+            model_config = ModelConfig.__new__(ModelConfig)
+            model_config.hf_config = model_config.hf_text_config = config
+            model_config.num_hidden_layers = config.num_hidden_layers
+            model_config.is_draft_model = is_draft_model
+            model_config.speculative_algorithm = algorithm
+            model_config.disable_hybrid_swa_memory = False
+            with envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.override(env):
+                model_config._derive_hybrid_model()
+            return model_config
+
+        draft = derive()
+        self.assertTrue(draft.is_hybrid_swa)
+        self.assertEqual(draft.swa_attention_layer_ids, [0, 1])
+        self.assertEqual(draft.full_attention_layer_ids, [])
+        for other in (
+            derive(env=False),
+            derive(is_draft_model=False),
+            derive(algorithm="DSPARK"),
+            derive(layer_types=["sliding_attention", "full_attention"]),
+        ):
+            self.assertFalse(other.is_hybrid_swa)
+
     def test_optional_head_dims_default_when_none(self):
         text_config = _make_text_config(
             head_dim=None,
