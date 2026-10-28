@@ -84,6 +84,12 @@ class TestKernel(unittest.TestCase):
             with self.subTest(n=n, k=k):
                 self._run_case(n, k)
 
+    def test_large_model_shapes(self):
+        # Qwen3.5-4B / Qwen3.8-27B dense shapes, including a split_k=34 down_proj.
+        for n, k in [(10240, 2560), (18432, 2560), (2560, 9216), (5120, 17408)]:
+            with self.subTest(n=n, k=k):
+                self._run_case(n, k)
+
     def test_batch_invariant(self):
         """Same output regardless of what else is in flight."""
         from sglang.kernels.ops.gemm.rdna_small_m_gemv import rdna_splitk_gemv
