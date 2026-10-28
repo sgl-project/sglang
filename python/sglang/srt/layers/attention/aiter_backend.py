@@ -15,17 +15,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.utils import (
-    assert_buffer_fits,
-    create_flashinfer_kv_indices_triton,
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    kv_indices_num_token_blocks,
-)
-from sglang.kernels.ops.kvcache.aiter_unified_attention import (
+from sglang.kernels.ops.attention.aiter_unified_page_table import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    spec_kv_index_token_blocks,
+)
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -72,12 +72,13 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.kernels.ops.attention.merge_state import merge_state_triton
-from sglang.kernels.ops.attention.utils import (
-    launch_reshape_and_cache_flash,
-    pad_sequence_with_mask,
+from sglang.kernels.ops.attention.dcp_kernels import (
+    compact_dcp_verify_token_table_to_ragged,
+    create_mla_kv_page_table_for_dcp,
 )
+from sglang.kernels.ops.attention.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
+from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
@@ -104,6 +105,37 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
 
+# Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
+_MLA_ASM_PS_MAX_QLEN = 4
+
+# (query head count -> query lengths) at which aiter's scheduler treats the
+# count as native, on gfx950 with an fp8 query and KV. None means any length.
+# This map is copied from natively_supported in aiter/ops/attention.py. See
+# https://github.com/ROCm/aiter/blob/bf37db00749722ae29ac27c101f534da43c586f5/aiter/ops/attention.py#L1669-L1706
+_MLA_ASM_CPRR_NATIVE_QLENS = {
+    16: None,
+    32: frozenset({4}),
+    96: frozenset(range(1, 6 + 1)),
+    128: None,
+}
+
+
+def _asm_cprr_supports_shape(heads: int, q_len: int) -> bool:
+    """Whether aiter schedules this head count natively at this query length."""
+    if heads not in _MLA_ASM_CPRR_NATIVE_QLENS:
+        return False
+    allowed = _MLA_ASM_CPRR_NATIVE_QLENS[heads]
+    return allowed is None or q_len in allowed
+
+
+def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
+    """The smallest supported head count at or above the gathered one, or 0."""
+    for heads in sorted(_MLA_ASM_CPRR_NATIVE_QLENS):
+        if heads >= gathered_heads and _asm_cprr_supports_shape(heads, q_len):
+            return heads
+    return 0
+
+
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
 # instantiation. This map is copied from MLA_REDUCE_ROUTER in
 # aiter/csrc/kernels/mla/reduce.cu. See https://github.com/ROCm/aiter/blob/7915f53a4225b3f9cb632a97a23369dbebcf1be0/csrc/kernels/mla/reduce.cu#L923
@@ -121,13 +153,6 @@ _MLA_REDUCE_V1_HEADS = {
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
-
-
-# Token-block parallel KV-index building is enabled only where it pays:
-# the speculative-decoding paths (target_verify / draft_extend / draft
-# decode) of long-context servers. Everything else keeps the historical
-# one-program-per-request launch.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
 class WrapperDispatch(Enum):
@@ -176,6 +201,8 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # (capturing, seq_lens + max_q_len) for target-verify attention
+    verify_seqused_k: Optional[tuple] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
     asm_ctx_ready: bool = False
@@ -186,6 +213,13 @@ class ForwardMetadata:
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
+    # cprr
+    global_kv_indptr: Optional[torch.Tensor] = None
+    use_asm_cprr_verify: bool = False
+    cprr_kernel_heads: int = 0
+    cprr_kv_indices: Optional[torch.Tensor] = None
+    cprr_kv_indptr: Optional[torch.Tensor] = None
+    cprr_empty_rows: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -313,6 +347,9 @@ class AiterAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
+    use_mla_auto_kv_splits: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -350,18 +387,33 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
-        self.mla_dcp_decode_backend = (
-            envs.SGLANG_AITER_MLA_DCP_DECODE_BACKEND.get().lower()
-        )
-        if self.mla_dcp_decode_backend not in ("gluon", "asm"):
+        self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
+        if self.mla_decode_backend not in ("gluon", "asm"):
             raise ValueError(
-                "SGLANG_AITER_MLA_DCP_DECODE_BACKEND must be 'gluon' or 'asm', "
-                f"got {self.mla_dcp_decode_backend!r}"
+                "SGLANG_AITER_MLA_DECODE_BACKEND must be 'gluon' or 'asm', "
+                f"got {self.mla_decode_backend!r}"
             )
         self.use_mla_dcp_asm = (
             self.use_mla
             and self.dcp_world_size > 1
-            and self.mla_dcp_decode_backend == "asm"
+            and self.mla_decode_backend == "asm"
+        )
+        self.mla_verify_backend = envs.SGLANG_AITER_MLA_VERIFY_BACKEND.get().lower()
+        if self.mla_verify_backend not in ("gluon", "asm"):
+            raise ValueError(
+                "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'gluon' or 'asm', "
+                f"got {self.mla_verify_backend!r}"
+            )
+        self._cprr_launch_logged = False
+        # fast_mode / intra_batch_mode for the cp verify schedule. Not the
+        # module defaults: those size reduce_partial_map at 65536 entries
+        # instead of 1276, and mla_decode_fwd then asks for a 64 GiB logits
+        # buffer.
+        self.cprr_fast_mode = True
+        self.cprr_intra_batch_mode = False
+        gathered_heads = self.num_head * self.dcp_world_size
+        self.cprr_kernel_heads = _asm_cprr_kernel_heads(
+            gathered_heads, self.num_draft_tokens or 1
         )
 
         # Get v_head_dim based on model type
@@ -483,6 +535,14 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
+        # Decode metadata format. unified_attention and pa_decode_gluon (the
+        # SHUFFLE 5D decode kernel) both read kv_indices as a 2-D
+        # (bs, max_num_blocks_per_seq) page table; the remaining decode kernels
+        # read flat per-token kv_indices addressed through kv_indptr.
+        self.decode_uses_page_table = (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        )
+
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
@@ -511,9 +571,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
-        )
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32
+        ).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -570,10 +630,10 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
-            # current mla_decode_fwd only support fake-nps in num_head == 16
-            # so all num_head size does not use qh16 kernel to simulate
-            # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
-            # it will cause gpu-fault or accuracy issue.
+            # fake-nps (fast_mode False, intra_batch_mode True) picks aiter's
+            # v1_0 scheduler, which folds these counts to 16 while the gfx950
+            # fp8 launch does not. Both sides must fold alike or the kernel
+            # faults. At 16 neither folds, so fake-nps is correct there.
             if self.mla_kernel_num_head_padded in (32, 64, 128):
                 fast_mode = True
                 intra_batch_mode = False
@@ -592,14 +652,16 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
             if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
-                if prefer_mla_gluon_decode(
-                    head_pad_mode=self.head_pad_mode,
-                    num_head=self.num_head,
-                    kv_cache_dtype=self.kv_cache_dtype,
+                if (
+                    prefer_mla_gluon_decode(
+                        head_pad_mode=self.head_pad_mode,
+                        num_head=self.num_head,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                    and not self._asm_ps_supports_decode_and_verify()
                 ):
                     _use_mla_ps_kernel = False
                     fast_mode = False
@@ -611,6 +673,27 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.num_draft_tokens is None and use_any_mla_persist:
                 self.max_split_per_batch = 64
+
+            # When the env var is on, aiter plans the KV splits. The default
+            # scheduler gives every request ceil(num_cu / batch_size) splits.
+            # It ignores the KV length. That clamp is inside the kernel, so no
+            # host value lifts it. The v1_2 scheduler sizes the count from the
+            # workload. A max_split_per_batch of -1 selects its auto branch.
+            #
+            # Under DCP the cp verify route already runs the v1_2 scheduler:
+            # make_mla_decode_meta_data_buffer takes cprr_fast_mode and
+            # cprr_intra_batch_mode instead. There only the -1 has an effect.
+            self.use_mla_auto_kv_splits = (
+                use_any_mla_persist and envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.get()
+            )
+            if self.use_mla_auto_kv_splits:
+                logger.info(
+                    "aiter MLA: aiter plans the KV splits "
+                    "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
+                )
+                fast_mode = True
+                intra_batch_mode = False
+                self.max_split_per_batch = -1
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
@@ -664,6 +747,21 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
+    def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``q`` to fp8 with the static q scale.
+
+        Returns ``(q_fp8, q_descale)``; ``q_descale`` must be passed as the
+        attention kernel's ``q_descale``. The KV cache ``k_scale`` is calibrated
+        for K, not q, so it cannot stand in for q's scale. The quant kernel
+        saturates, whereas ``.to(fp8)`` turns out-of-range values into NaN on
+        e4m3fnuz. ``q`` is often a strided view into the fused qkv output, and
+        the quant kernel reads its input as contiguous rows.
+        """
+        q_fp8, _ = scaled_fp8_quant(
+            q.reshape(q.shape[0], -1).contiguous(), self.q_scale
+        )
+        return q_fp8.view(q.shape), self.q_scale
+
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
 
@@ -688,13 +786,21 @@ class AiterAttnBackend(AttentionBackend):
         *,
         metadata_fast_mode: Optional[bool] = None,
         metadata_intra_batch_mode: Optional[bool] = None,
+        nhead_override: Optional[int] = None,
+        max_split_per_batch: Optional[int] = None,
     ):
+        """Allocate the PS work-schedule buffers, sized for nhead_override."""
         # Under DCP this is the gathered head count (num_head * dcp_world_size);
         # equals num_head_padded when DCP is off.
-        nhead = self.mla_kernel_num_head_padded
+        nhead = (
+            self.mla_kernel_num_head_padded
+            if nhead_override is None
+            else nhead_override
+        )
         dtype = self.kv_cache_dtype
 
-        if self.attn_dp_enabled:
+        # The auto count is -1, which this min() would turn into a real cap.
+        if self.attn_dp_enabled and not self.use_mla_auto_kv_splits:
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
@@ -728,6 +834,11 @@ class AiterAttnBackend(AttentionBackend):
             fast_mode=metadata_fast_mode,
             num_kv_splits=self.max_split_per_batch,
             intra_batch_mode=metadata_intra_batch_mode,
+            **(
+                {}
+                if max_split_per_batch is None
+                else {"max_split_per_batch": max_split_per_batch}
+            ),
         )
 
         # aiter implementation
@@ -777,16 +888,23 @@ class AiterAttnBackend(AttentionBackend):
         fast_mode,
         max_split_per_batch,
         intra_batch_mode,
+        is_cp_round_robin=False,
+        nhead_override=None,
     ):
         nhead_kv = 1
         page_size = self.page_size
         dtype = self.kv_cache_dtype
+        nhead = (
+            self.mla_kernel_num_head_padded
+            if nhead_override is None
+            else nhead_override
+        )
 
         meta = get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self.mla_kernel_num_head_padded // nhead_kv,
+            nhead // nhead_kv,
             nhead_kv,
             False,
             work_metadata,
@@ -801,6 +919,7 @@ class AiterAttnBackend(AttentionBackend):
             fast_mode=fast_mode,
             max_split_per_batch=max_split_per_batch,
             intra_batch_mode=intra_batch_mode,
+            is_cp_round_robin=is_cp_round_robin,
             dtype_q=dtype,
             dtype_kv=dtype,
         )
@@ -1100,10 +1219,6 @@ class AiterAttnBackend(AttentionBackend):
             bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
         )
 
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
         cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
         cu_seqlens_q[1:] = torch.cumsum(
             forward_batch.extend_seq_lens.to(torch.int32), dim=0
@@ -1287,6 +1402,52 @@ class AiterAttnBackend(AttentionBackend):
                 f"Got topk={self.topk}."
             )
 
+    def _asm_ps_supports_decode_and_verify(self) -> bool:
+        """Whether the asm PS MLA kernels support both decode and target verify."""
+        verify_q_len = self.num_draft_tokens or 1
+        if self.dcp_world_size > 1:
+            if _asm_cprr_supports_shape(self.cprr_kernel_heads, verify_q_len):
+                return True
+            logger.info(
+                "aiter MLA decode and verify stay on the Gluon kernel: the cp "
+                "verify kernel supports no %d-token window at %d gathered heads.",
+                verify_q_len,
+                self.num_head * self.dcp_world_size,
+            )
+            return False
+        if self._asm_ps_supports_qlen(verify_q_len):
+            return True
+        logger.info(
+            "aiter MLA decode and verify stay on the Gluon kernel: target "
+            "verify is %d tokens wide and the asm kernels support at most %d at "
+            "%d heads. A DSPARK block size of %d or lower would fit.",
+            verify_q_len,
+            _MLA_ASM_PS_MAX_QLEN,
+            self.mla_kernel_num_head_padded,
+            _MLA_ASM_PS_MAX_QLEN - 1,
+        )
+        return False
+
+    def _asm_ps_supports_qlen(self, q_len: int) -> bool:
+        """Whether the asm PS dispatch has a kernel for this query length."""
+        return q_len <= _MLA_ASM_PS_MAX_QLEN or (
+            self.kv_cache_dtype == fp8_dtype
+            and self.mla_kernel_num_head_padded == 16
+            and is_gfx95_supported()
+        )
+
+    def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
+        """Whether this topology has an asm cp kernel for DCP target verify."""
+        return (
+            _use_mla_ps_kernel
+            and self.mla_verify_backend == "asm"
+            and self.dcp_world_size > 1
+            and self.kv_cache_dtype == fp8_dtype
+            and q_len is not None
+            and self.cprr_kernel_heads > 0
+            and _asm_cprr_supports_shape(self.cprr_kernel_heads, q_len)
+        )
+
     def _mla_decode_fwd_with_head_pad(
         self,
         q: torch.Tensor,
@@ -1301,6 +1462,27 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        if (
+            _use_mla_ps_kernel
+            and self.dcp_world_size <= 1
+            and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
+        ):
+            # The asm kernel reads KV row 0 for masked positions and weights it
+            # by p = 0. A NaN there spreads to every request, because
+            # 0 * NaN = NaN. Row 0 is where CUDA-graph padding tokens write
+            # their KV, and that KV can be NaN. Gluon, the kernel this path
+            # replaces, does not read row 0.
+            k_buffer_flat[0].zero_()
+        if (
+            self.kv_cache_dtype == fp8_dtype
+            and self.mla_kernel_num_head_padded == 16
+            and is_gfx95_supported()
+            and (kwargs.get("max_seqlen_q") or 1) > _MLA_ASM_PS_MAX_QLEN
+            and q.dtype != fp8_dtype
+        ):
+            q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)
+            kwargs["q_scale"] = torch.ones((), dtype=torch.float32, device=q.device)
+            q = q_flat.view(q.shape)
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
@@ -1367,6 +1549,17 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return int(seq_lens.max().item())
 
+    def _kernel_num_kv_splits(self) -> Optional[int]:
+        """The split count for a decode kernel call, None to let aiter pick.
+
+        The metadata call takes an int and gets -1 for the auto branch. The
+        kernel takes None instead. mla.py re-decides persistent mode only on
+        None. It would read -1 as a real count.
+        """
+        if self.use_mla_auto_kv_splits:
+            return None
+        return self.forward_metadata.num_kv_splits
+
     def _forward_mla_decode(
         self,
         q: torch.Tensor,
@@ -1382,6 +1575,10 @@ class AiterAttnBackend(AttentionBackend):
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
+        ) and not (
+            _use_mla_ps_kernel
+            and self.mla_decode_backend == "asm"
+            and self._asm_ps_supports_qlen(max_q_len)
         ):
             return mla_gluon_decode(
                 q=q,
@@ -1401,7 +1598,7 @@ class AiterAttnBackend(AttentionBackend):
         reduce_indptr = self.forward_metadata.reduce_indptr
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
-        num_kv_splits = self.forward_metadata.num_kv_splits
+        num_kv_splits = self._kernel_num_kv_splits()
 
         return self._mla_decode_fwd_with_head_pad(
             q,
@@ -1426,10 +1623,17 @@ class AiterAttnBackend(AttentionBackend):
             num_kv_splits=num_kv_splits,
         )
 
-    def _get_dcp_graph_max_local_kv_len(self) -> int:
-        """Static upper bound on this rank's shard, ceil(max_context_len / W)."""
+    def _dcp_max_local_kv_len(self, max_global_kv_len: int) -> int:
+        """Widest shard one rank can hold for a global kv length."""
         w = max(self.dcp_world_size, 1)
-        return (self.max_context_len + w - 1) // w
+        return (max_global_kv_len + w - 1) // w
+
+    def _dcp_graph_max_local_kv_len(self) -> int:
+        """Static upper bound on this rank's shard under a cuda graph."""
+        max_global_kv_len = self.max_context_len
+        if self._asm_cprr_supports_verify_shape(self.num_draft_tokens):
+            max_global_kv_len += self.num_draft_tokens
+        return self._dcp_max_local_kv_len(max_global_kv_len)
 
     def _forward_decode_dcp(self, q, k_buffer, layer, k_descale):
         """Attend this rank's KV shard for decode -> (out, natural-log lse)."""
@@ -1446,8 +1650,12 @@ class AiterAttnBackend(AttentionBackend):
             q_mla = q.view(bs, num_heads, layer.qk_head_dim)
             q_scale = k_descale
             if q_mla.dtype != fp8_dtype:
-                q_mla, q_scale = scaled_fp8_quant(q_mla.reshape(bs, -1))
-                q_mla = q_mla.view(bs, num_heads, layer.qk_head_dim)
+                q_mla = (
+                    q_mla.reshape(bs, -1)
+                    .to(fp8_dtype)
+                    .view(bs, num_heads, layer.qk_head_dim)
+                )
+                q_scale = torch.ones((), dtype=torch.float32, device=q.device)
 
             out = torch.empty(
                 (bs, num_heads, layer.v_head_dim),
@@ -1465,7 +1673,7 @@ class AiterAttnBackend(AttentionBackend):
                 fm.max_q_len or 1,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
-                num_kv_splits=fm.num_kv_splits,
+                num_kv_splits=self._kernel_num_kv_splits(),
                 work_meta_data=fm.work_metadata,
                 work_indptr=fm.work_indptr,
                 work_info_set=fm.work_info_set,
@@ -1496,19 +1704,139 @@ class AiterAttnBackend(AttentionBackend):
         )
         return out, lse.view(bs, num_heads)
 
-    def _forward_verify_dcp(self, q, k_window, layer, k_descale):
-        """Attend the committed prefix and the verify window separately, then
-        merge -> (out, natural-log lse).
+    def _forward_verify_asm_cprr(self, q, layer, k_descale, n_rows):
+        """DCP target verify on the asm cp round-robin kernel: one masked pass."""
+        fm = self.forward_metadata
+        num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
+        kernel_heads = fm.cprr_kernel_heads or num_heads
+        if not self._cprr_launch_logged:
+            self._cprr_launch_logged = True
+            logger.info(
+                "aiter DCP cp verify: gathered=%d kernel_heads=%d%s "
+                "intra_batch=%s max_q_len=%d reduce_partial_map=%d",
+                num_heads,
+                kernel_heads,
+                " (padded)" if kernel_heads != num_heads else " (native)",
+                self.cprr_intra_batch_mode,
+                fm.max_q_len,
+                fm.reduce_partial_map.numel(),
+            )
+        # torch.full, not torch.as_tensor: as_tensor copies from host memory,
+        # which a cuda graph capture cannot record.
+        kv_scale = torch.full(
+            (),
+            self._resolve_fp8_kv_scale_float(layer, k_descale),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        kv_indices, kv_indptr = fm.cprr_kv_indices, fm.cprr_kv_indptr
+        q_in = (
+            q.view(n_rows, -1).to(fp8_dtype).view(n_rows, num_heads, layer.qk_head_dim)
+        )
+        q_scale = torch.ones((), dtype=torch.float32, device=q.device)
+        if kernel_heads != num_heads:
+            q_in = self.pad_heads(q_in, kernel_heads)
+        out = q.new_empty(
+            (n_rows, kernel_heads, layer.v_head_dim), dtype=self.input_dtype
+        )
+        _, lse = mla_decode_fwd(
+            q_in,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, 1, 1, layer.qk_head_dim
+            ),
+            out,
+            fm.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            fm.kv_last_page_len,
+            fm.max_q_len,
+            sm_scale=layer.scaling,
+            work_meta_data=fm.work_metadata,
+            work_indptr=fm.work_indptr,
+            work_info_set=fm.work_info_set,
+            reduce_indptr=fm.reduce_indptr,
+            reduce_final_map=fm.reduce_final_map,
+            reduce_partial_map=fm.reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            intra_batch_mode=self.cprr_intra_batch_mode,
+            num_kv_splits=self._kernel_num_kv_splits(),
+            return_lse=True,
+            g_kv_indptr=fm.global_kv_indptr,
+            cp_world_size=self.dcp_world_size,
+            cp_rank=get_parallel().attn_dcp_rank,
+            causal=True,
+        )
+        lse = lse.view(n_rows, kernel_heads)
+        if kernel_heads != num_heads:
+            out = out[:, :num_heads, :]
+            lse = lse[:, :num_heads]
+        return out, lse
 
-        Splitting at the window boundary avoids the one thing the decode kernel
-        cannot do under DCP: mask on the GLOBAL position g(j) = j * W + r.
-        """
+    def _build_dcp_verify_ragged_indices(
+        self,
+        verify_token_table: torch.Tensor,
+        local_kv_lens: torch.Tensor,
+        bs: int,
+        q_len: int,
+        out_indices: Optional[torch.Tensor] = None,
+        out_indptr: Optional[torch.Tensor] = None,
+        out_empty: Optional[torch.Tensor] = None,
+    ):
+        """This rank's verify shard as ragged (kv_indices, kv_indptr, empty_rows)."""
+        # Pass out_* to use the address-stable buffers of the cuda graph.
+        # Omit them to allocate new tensors.
+        # The .contiguous() call is necessary. The slice has stride q_len, and
+        # .to() returns an int32 tensor unchanged, so without the copy the
+        # kernel reads lens[req] instead of lens[req * q_len]. The two agree
+        # only at batch size 1.
+        lens = local_kv_lens[: bs * q_len : q_len].to(torch.int32).contiguous()
+        # The kernel faults on a zero-length shard, so give every shard a slot.
+        clamped = lens.clamp_min(1)
+        if out_indptr is None:
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=lens.device)
+        else:
+            kv_indptr = out_indptr[: bs + 1]
+            # Not kv_indptr[0] = 0: that copies from host memory, which a
+            # cuda graph capture cannot record.
+            kv_indptr[:1].zero_()
+        torch.cumsum(clamped, dim=0, out=kv_indptr[1:])
+
+        if out_indices is None:
+            kv_indices = verify_token_table.new_empty(
+                (int(clamped.sum().item()),), dtype=torch.int32
+            )
+        else:
+            kv_indices = out_indices
+        compact_dcp_verify_token_table_to_ragged[(bs,)](
+            verify_token_table,
+            lens,
+            kv_indptr,
+            kv_indices,
+            table_stride=verify_token_table.shape[1],
+            Q_LEN=q_len,
+            BLOCK_SIZE=_DCP_VERIFY_TABLE_COLS_PER_BLOCK,
+        )
+        empty_rows = local_kv_lens[: bs * q_len].eq(0)
+        if out_empty is not None:
+            empty_rows = out_empty[: bs * q_len].copy_(empty_rows)
+        return kv_indices, kv_indptr, empty_rows
+
+    def _forward_verify_dcp(self, q, k_window, layer, k_descale):
+        """DCP target verify -> (out, natural-log lse) for the cross-rank merge."""
         fm = self.forward_metadata
         q_len = fm.max_q_len
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
         seqused_k = fm.local_kv_lens
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
+
+        if fm.use_asm_cprr_verify:
+            out_a, lse_a = self._forward_verify_asm_cprr(q, layer, k_descale, n_rows)
+            empty = fm.cprr_empty_rows
+            out_a.masked_fill_(empty[:, None, None], 0.0)
+            lse_a.masked_fill_(empty[:, None], -1e30)
+            return out_a, lse_a
 
         out_a, lse_a = mla_gluon_decode(
             q=q.view(n_rows, num_heads, layer.qk_head_dim),
@@ -1650,9 +1978,12 @@ class AiterAttnBackend(AttentionBackend):
         return output, final_lse
 
     def _kv_index_blocks(self, bs: int) -> int:
-        if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
-            return 1
-        return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
+        return spec_kv_index_token_blocks(
+            self.req_to_token.shape[1],
+            kv_lens_sum=None,
+            batch_size=bs,
+            context_len=self.max_context_len,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -1730,12 +2061,15 @@ class AiterAttnBackend(AttentionBackend):
         # dcp metadata
         local_kv_lens = None
         verify_token_table = None
+        global_kv_indptr = None
+        use_asm_cprr_verify = False
+        cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
@@ -1800,7 +2134,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
-                if self.use_triton_unified_attention and not self.use_mla:
+                if self.decode_uses_page_table and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
                     kv_indices, swa_page_table = (
                         self._build_unified_page_table_from_spec(spec_info, bs)
@@ -1967,7 +2301,8 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                if self.dcp_world_size > 1:
+                use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(draft_num)
+                if self.dcp_world_size > 1 and not use_asm_cprr_verify:
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
                 else:
@@ -2001,6 +2336,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.dcp_world_size > 1:
+                    global_kv_indptr = kv_indptr.clone()
                     self._plan_dcp_decode_metadata(
                         kv_indptr,
                         kv_indices,
@@ -2016,11 +2352,27 @@ class AiterAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices,
                         bs,
                         draft_num,
-                        (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
+                        self._dcp_max_local_kv_len(
+                            max_kv_len + (draft_num if use_asm_cprr_verify else 0)
+                        ),
                     )
 
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if use_asm_cprr_verify:
+                    (
+                        cprr_kv_indices,
+                        cprr_kv_indptr,
+                        cprr_empty_rows,
+                    ) = self._build_dcp_verify_ragged_indices(
+                        verify_token_table, local_kv_lens, bs, draft_num
+                    )
+                if _use_mla_ps_kernel and (
+                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                ):
                     max_seqlen_qo = draft_num
+                    is_cp_round_robin = self.dcp_world_size > 1
+                    metadata_heads = (
+                        self.cprr_kernel_heads if use_asm_cprr_verify else None
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -2028,13 +2380,26 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(
+                        max_seqlen_qo,
+                        bs,
+                        metadata_fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else None
+                        ),
+                        metadata_intra_batch_mode=(
+                            self.cprr_intra_batch_mode if use_asm_cprr_verify else None
+                        ),
+                        nhead_override=metadata_heads,
+                        max_split_per_batch=(
+                            self.max_split_per_batch if use_asm_cprr_verify else None
+                        ),
+                    )
 
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        kv_indptr,
+                        cprr_kv_indptr if use_asm_cprr_verify else kv_indptr,
                         self.kv_last_page_len[:bs],
                         work_metadata,
                         work_info_set,
@@ -2043,9 +2408,17 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                         max_seqlen_qo,
-                        fast_mode=fast_mode,
+                        fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
+                        ),
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=intra_batch_mode,
+                        intra_batch_mode=(
+                            self.cprr_intra_batch_mode
+                            if use_asm_cprr_verify
+                            else intra_batch_mode
+                        ),
+                        is_cp_round_robin=is_cp_round_robin,
+                        nhead_override=metadata_heads,
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -2066,6 +2439,14 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    global_kv_indptr=global_kv_indptr,
+                    use_asm_cprr_verify=use_asm_cprr_verify,
+                    cprr_kernel_heads=self.cprr_kernel_heads
+                    if use_asm_cprr_verify
+                    else 0,
+                    cprr_kv_indices=cprr_kv_indices,
+                    cprr_kv_indptr=cprr_kv_indptr,
+                    cprr_empty_rows=cprr_empty_rows,
                 )
             else:
                 draft_num = forward_batch.input_ids.shape[0] // bs
@@ -2226,7 +2607,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
-                    None,
+                    self.indices_updater_prefill.qo_indptr[: bs + 1],
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -2395,10 +2776,8 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_verify_local_kv_lens = torch.zeros(
                     (n_verify_rows,), dtype=torch.int32, device=self.device
                 )
-                # Capture-stable token table, filled out-of-graph. One column per
-                # TOKEN, so the width is the worst-case shard ceil(ctx_len / W).
                 self.cuda_graph_verify_token_table = torch.zeros(
-                    (n_verify_rows, self._get_dcp_graph_max_local_kv_len()),
+                    (n_verify_rows, self._dcp_graph_max_local_kv_len()),
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -2406,9 +2785,23 @@ class AiterAttnBackend(AttentionBackend):
                 # verify plan without a sync; see _plan_dcp_decode_metadata.
                 self.cuda_graph_dcp_static_local_kv_lens = torch.full(
                     (max_bs,),
-                    self._get_dcp_graph_max_local_kv_len(),
+                    self._dcp_graph_max_local_kv_len(),
                     dtype=torch.int32,
                     device="cpu",
+                )
+                self.cuda_graph_global_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_cprr_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_cprr_kv_indices = torch.zeros(
+                    (max_bs * (self._dcp_graph_max_local_kv_len() + 1),),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.cuda_graph_cprr_empty_rows = torch.zeros(
+                    (n_verify_rows,), dtype=torch.bool, device=self.device
                 )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -2441,9 +2834,9 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
-            # Keep a distinct page-table buffer for unified attention.  Sharing
-            # cuda_graph_kv_indices with non-unified token indices makes
+        if self.decode_uses_page_table:
+            # Keep a distinct page-table buffer for page-table decode.  Sharing
+            # cuda_graph_kv_indices with flat per-token indices makes
             # page-table width ambiguous after the token buffer is expanded.
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -2471,6 +2864,9 @@ class AiterAttnBackend(AttentionBackend):
                 (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
             )
 
+            graph_use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
+                self.num_draft_tokens
+            )
             (
                 self.work_metadata,
                 self.work_indptr,
@@ -2481,8 +2877,37 @@ class AiterAttnBackend(AttentionBackend):
             ) = self.make_mla_decode_meta_data_buffer(
                 max_seqlen_qo,
                 max_bs,
-                metadata_fast_mode=metadata_fast_mode,
-                metadata_intra_batch_mode=metadata_intra_batch_mode,
+                metadata_fast_mode=(
+                    self.cprr_fast_mode
+                    if graph_use_asm_cprr_verify
+                    else metadata_fast_mode
+                ),
+                metadata_intra_batch_mode=(
+                    self.cprr_intra_batch_mode
+                    if graph_use_asm_cprr_verify
+                    else metadata_intra_batch_mode
+                ),
+                nhead_override=(
+                    self.cprr_kernel_heads if graph_use_asm_cprr_verify else None
+                ),
+                max_split_per_batch=(
+                    self.max_split_per_batch if graph_use_asm_cprr_verify else None
+                ),
+            )
+            logger.info(
+                "aiter DCP cp verify graph buffers: use_asm_cprr_verify=%s num_draft_tokens=%s "
+                "max_seqlen_qo=%d max_bs=%d nhead=%s intra=%s split_cap=%s "
+                "reduce_partial_map=%d",
+                graph_use_asm_cprr_verify,
+                self.num_draft_tokens,
+                max_seqlen_qo,
+                max_bs,
+                self.cprr_kernel_heads if graph_use_asm_cprr_verify else None,
+                self.cprr_intra_batch_mode
+                if graph_use_asm_cprr_verify
+                else metadata_intra_batch_mode,
+                self.max_split_per_batch if graph_use_asm_cprr_verify else None,
+                self.reduce_partial_map.numel(),
             )
 
         else:
@@ -2536,6 +2961,9 @@ class AiterAttnBackend(AttentionBackend):
         # DCP metadata which will be populated for MLA decode when dcp enabled
         local_kv_lens = None
         verify_token_table = None
+        global_kv_indptr = None
+        cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
+        use_asm_cprr_verify = False
 
         swa_page_table = None
         # Unified verify never reads this host max (replay sizes from
@@ -2553,14 +2981,12 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = None
             max_q_len = None
 
-            if spec_info is None or (
-                self.use_triton_unified_attention and not self.use_mla
-            ):
+            if spec_info is None or (self.decode_uses_page_table and not self.use_mla):
                 max_num_blocks_per_seq = (
                     self.max_context_len + self.page_size - 1
                 ) // self.page_size
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -2712,9 +3138,12 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.use_mla:
+                use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
+                    self.num_draft_tokens
+                )
                 kv_lens = (
                     seq_lens
-                    if self.dcp_world_size > 1
+                    if (self.dcp_world_size > 1 and not use_asm_cprr_verify)
                     else seq_lens + self.num_draft_tokens
                 )
             else:
@@ -2748,6 +3177,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla and self.dcp_world_size > 1:
+                global_kv_indptr = self.cuda_graph_global_kv_indptr[: bs + 1]
+                global_kv_indptr.copy_(kv_indptr[: bs + 1])
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
@@ -2767,19 +3198,36 @@ class AiterAttnBackend(AttentionBackend):
                     req_pool_indices,
                     bs,
                     self.num_draft_tokens,
-                    self._get_dcp_graph_max_local_kv_len(),
+                    self._dcp_graph_max_local_kv_len(),
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
                 )
+                if use_asm_cprr_verify:
+                    (
+                        cprr_kv_indices,
+                        cprr_kv_indptr,
+                        cprr_empty_rows,
+                    ) = self._build_dcp_verify_ragged_indices(
+                        verify_token_table,
+                        local_kv_lens,
+                        bs,
+                        self.num_draft_tokens,
+                        out_indices=self.cuda_graph_cprr_kv_indices,
+                        out_indptr=self.cuda_graph_cprr_kv_indptr,
+                        out_empty=self.cuda_graph_cprr_empty_rows,
+                    )
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if _use_mla_ps_kernel and (
+                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                ):
                     num_kv_splits = self.max_split_per_batch
+                    is_cp_round_robin = self.dcp_world_size > 1
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        kv_indptr,
+                        cprr_kv_indptr if use_asm_cprr_verify else kv_indptr,
                         kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
@@ -2788,9 +3236,19 @@ class AiterAttnBackend(AttentionBackend):
                         self.reduce_final_map,
                         self.reduce_partial_map,
                         max_q_len,
-                        fast_mode=fast_mode,
+                        fast_mode=(
+                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
+                        ),
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=intra_batch_mode,
+                        intra_batch_mode=(
+                            self.cprr_intra_batch_mode
+                            if use_asm_cprr_verify
+                            else intra_batch_mode
+                        ),
+                        is_cp_round_robin=is_cp_round_robin,
+                        nhead_override=(
+                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        ),
                     )
 
                     work_metadata = self.work_metadata
@@ -2817,6 +3275,14 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    global_kv_indptr=global_kv_indptr,
+                    use_asm_cprr_verify=use_asm_cprr_verify,
+                    cprr_kernel_heads=self.cprr_kernel_heads
+                    if use_asm_cprr_verify
+                    else 0,
+                    cprr_kv_indices=cprr_kv_indices,
+                    cprr_kv_indptr=cprr_kv_indptr,
+                    cprr_empty_rows=cprr_empty_rows,
                 )
             else:
                 max_q_len = verify_tokens_per_req
@@ -3368,8 +3834,6 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and self.dcp_world_size > 1
             ):
-                # two-stage dcp verify, dispatched before the dims below: the
-                # model provides the per rank kvcache slices.
                 return self._forward_verify_dcp(q, k, layer, k_descale)
 
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -3534,6 +3998,10 @@ class AiterAttnBackend(AttentionBackend):
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
+                ) and not (
+                    _use_mla_ps_kernel
+                    and self.mla_verify_backend == "asm"
+                    and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
                 ):
                     return mla_gluon_decode(
                         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -3727,6 +4195,17 @@ class AiterAttnBackend(AttentionBackend):
                         and not layer.logit_cap
                         and sinks is None
                     )
+                    # One add per forward, shared by every layer, so the asm kernel's
+                    # per-forward seg-plan cache (keyed on this tensor) hits after layer 0.
+                    md = self.forward_metadata
+                    cap = torch.cuda.is_current_stream_capturing()
+                    hit = md.verify_seqused_k
+                    if hit is None or hit[0] != cap:
+                        hit = md.verify_seqused_k = (
+                            cap,
+                            forward_batch.seq_lens + md.max_q_len,
+                        )
+                    seqused_k = hit[1]
                     if use_unified_attention_3d_mtp:
                         unified_attention_3d_mtp_func(
                             q=q_unified,
@@ -3734,9 +4213,7 @@ class AiterAttnBackend(AttentionBackend):
                             v=v_unified,
                             out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                             cu_seqlens_q=self.forward_metadata.qo_indptr,
-                            seqused_k=(
-                                forward_batch.seq_lens + self.forward_metadata.max_q_len
-                            ),
+                            seqused_k=seqused_k,
                             max_seqlen_q=self.forward_metadata.max_q_len,
                             max_seqlen_k=max_kv_len,
                             softmax_scale=layer.scaling,
@@ -3765,9 +4242,7 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -3964,7 +4439,7 @@ class AiterAttnBackend(AttentionBackend):
                         self.k_scale.reshape(1),  # Q is cast at unit scale.
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4040,7 +4515,7 @@ class AiterAttnBackend(AttentionBackend):
                         fp8_q_descale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4079,8 +4554,8 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_q_descale.reshape(1),
                     k_descale.reshape(1),
                     v_descale.reshape(1),
-                    self.qo_indptr[:bs0],
-                    self.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,
                     self.forward_metadata.max_q_len,
                     softmax_scale=layer.scaling,
@@ -4121,8 +4596,7 @@ class AiterAttnBackend(AttentionBackend):
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                q, q_descale = self._quantize_q_fp8(q)
 
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -4169,7 +4643,7 @@ class AiterAttnBackend(AttentionBackend):
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
@@ -4363,10 +4837,7 @@ class AiterAttnBackend(AttentionBackend):
                     return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q, _ = scaled_fp8_quant(q, q_descale)
+                    q, q_descale = self._quantize_q_fp8(q)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -4385,7 +4856,7 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
-                    softcap=0,
+                    softcap=layer.logit_cap,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -4414,8 +4885,8 @@ class AiterAttnBackend(AttentionBackend):
                     aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    k_descale if k_descale is not None else self.k_scale,
+                    v_descale if v_descale is not None else self.v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )
@@ -4670,12 +5141,12 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        num_token_blocks = (
-            kv_indices_num_token_blocks(
-                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
-            )
-            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
-            else 1
+        num_token_blocks = spec_kv_index_token_blocks(
+            self.pool_len,
+            kv_lens_sum=None,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            context_len=self.max_context_len,
         )
         src = self.kv_index_translator.read_source(
             forward_batch.kv_loc_plan,

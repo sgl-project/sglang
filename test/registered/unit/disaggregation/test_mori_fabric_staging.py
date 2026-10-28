@@ -112,7 +112,9 @@ class TestFabricStaging(CustomTestCase):
     def test_slot_size_and_chunk_cap(self):
         mib = 1 << 20
         kv_args = types.SimpleNamespace(page_size=256, kv_item_lens=[mib, mib])
-        with patch.object(envs.SGLANG_MORI_FABRIC_STAGING_STATE_MB, "get", return_value=3):
+        with patch.object(
+            envs.SGLANG_MORI_FABRIC_STAGING_STATE_MB, "get", return_value=3
+        ):
             # 8 pages for 2048 tokens plus one for a mid-page start.
             self.assertEqual(slot_bytes_for(kv_args, 2048), (9 * 2 + 3) * mib)
         args = types.SimpleNamespace(chunked_prefill_size=1000)
@@ -201,7 +203,11 @@ class TestFabricStaging(CustomTestCase):
             )
             # room, start, stop, last, kv/state bytes, ip, port, rank, slot, gen, epoch
             msg = [FABRIC_CHUNK_READY, b"11", b"0", b"2", b"0", b"512", b"0"]
-            return manager, msg + [b"10.0.0.1", b"6000", b"0", b"0", b"1", room.epoch], replies
+            return (
+                manager,
+                msg + [b"10.0.0.1", b"6000", b"0", b"0", b"1", room.epoch],
+                replies,
+            )
 
         for field, value in ((3, b"99"), (10, b"-1"), (12, b"old")):
             manager, msg, replies = ready()

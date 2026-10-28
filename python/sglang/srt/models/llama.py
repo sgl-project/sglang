@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -48,6 +49,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -65,14 +67,12 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     add_prefix,
-    is_cuda,
     is_npu,
     is_xpu,
     make_pp_layers,
 )
 from sglang.utils import get_exception_traceback
 
-_is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -118,14 +118,25 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
+        self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
 
     def forward(
         self,
         x,
         forward_batch=None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+                x = self.activation_quant.forward_decode(
+                    gate_up, self.act_fn, self.down_proj
+                )
+            else:
+                x = self.act_fn(gate_up)
+
         x, _ = self.down_proj(x)
         return x
 
@@ -360,15 +371,24 @@ class LlamaDecoderLayer(nn.Module):
             return
         self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
         self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(read=self._attn_readout(layer_id)), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
-    def _attn_readout(self, layer_id: int):
+    @classmethod
+    def stage_facts(cls, config: LlamaConfig, layer_id: int):
+        """The stages a layer of this class declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). A subclass's attention read takes part."""
+        return (
+            declare_attn(read=cls._attn_readout(layer_id)),
+            declare_ffn(sparse=False, next_layer_sparse=False),
+        )
+
+    @classmethod
+    def _attn_readout(cls, layer_id: int):
         return NORM_QUANT_READOUT
 
     def forward(
@@ -391,7 +411,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
@@ -433,6 +453,7 @@ class LlamaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix="model.layers",
+            stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

@@ -144,6 +144,11 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    # Share of the full / SWA KV pool held by decode requests whose KV transfer
+    # is still pending (preallocated, not yet running), on the capacity basis of
+    # full_token_usage / swa_token_usage; the difference is the running batch's share.
+    prealloc_full_token_usage: float = 0.0
+    prealloc_swa_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -163,6 +168,9 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
+    hicache_host_mamba_used_states: int = 0
+    hicache_host_mamba_total_states: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -215,11 +223,18 @@ class DPBalanceStats(msgspec.Struct, frozen=True):
     the gathered MLP-sync values, so on speculative-decode steps they are
     batch rows (requests); the verify width is uniform across ranks, which
     leaves the ratios unchanged.
+
+    ``*_attention_pairs`` are the causal (query, key) pairs the step attends
+    (``dp_attn._local_attention_pairs``). Tokens price the MoE and the
+    projections, which run on the gathered padded rows; pairs price attention,
+    which runs on local rows, so pair skew is what shows up as sync wait.
     """
 
     local_tokens: int
     max_tokens: int
     sum_tokens: int
+    local_attention_pairs: int
+    max_attention_pairs: int
     num_ranks: int
     # Wall time of this rank's scheduler MLP-sync all-gather. On the gloo path
     # (the default with overlap scheduling) this is waiting for the slowest
@@ -228,15 +243,28 @@ class DPBalanceStats(msgspec.Struct, frozen=True):
 
     @classmethod
     def create(
-        cls, local_tokens: int, global_num_tokens: List[int], sync_wait_seconds: float
+        cls,
+        *,
+        local_tokens: int,
+        global_num_tokens: List[int],
+        local_attention_pairs: int,
+        global_attention_pairs: List[int],
+        sync_wait_seconds: float,
     ) -> DPBalanceStats:
         max_tokens = max(global_num_tokens)
         if max_tokens == 0:
             raise ValueError("DP balance stats need a rank with tokens")
+        max_attention_pairs = max(global_attention_pairs)
+        if max_attention_pairs == 0:
+            # Every row attends at least one key, so this is a gather or
+            # pair-count bug, not a quiet step.
+            raise ValueError("A rank with tokens attends at least one pair")
         return cls(
             local_tokens=local_tokens,
             max_tokens=max_tokens,
             sum_tokens=sum(global_num_tokens),
+            local_attention_pairs=local_attention_pairs,
+            max_attention_pairs=max_attention_pairs,
             num_ranks=len(global_num_tokens),
             sync_wait_seconds=sync_wait_seconds,
         )
@@ -244,6 +272,10 @@ class DPBalanceStats(msgspec.Struct, frozen=True):
     @property
     def imbalance_tokens(self) -> int:
         return self.max_tokens - self.local_tokens
+
+    @property
+    def imbalance_attention_pairs(self) -> int:
+        return self.max_attention_pairs - self.local_attention_pairs
 
     @property
     def max_over_mean(self) -> float:
@@ -620,6 +652,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.prealloc_full_token_usage = Gauge(
+            name="sglang:prealloc_full_token_usage",
+            documentation="Share of the full-attention KV pool held by decode requests whose KV transfer is pending (preallocated, not yet running); same capacity basis as sglang:full_token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_swa_token_usage = Gauge(
+            name="sglang:prealloc_swa_token_usage",
+            documentation="Share of the SWA KV pool held by decode requests whose KV transfer is pending; same capacity basis as sglang:swa_token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
@@ -732,6 +776,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_used_states = Gauge(
+                name="sglang:hicache_host_mamba_used_states",
+                documentation="Number of state slots currently used in the host Mamba cache (hybrid-SSM models only).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_total_states = Gauge(
+                name="sglang:hicache_host_mamba_total_states",
+                documentation="Total capacity of the host Mamba cache in state slots (hybrid-SSM models only).",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1093,6 +1149,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["rank_state"],
         )
+        self.dp_attention_pairs_total = Counter(
+            name="sglang:dp_attention_pairs_total",
+            documentation=(
+                "Causal (query, key) pairs attended by MLP-sync steps on this DP "
+                "rank, pricing every layer as full attention: a decode row reads "
+                "its sequence, a prefill chunk its prefix plus the pairs within "
+                "the chunk. kind=scheduled: this rank; kind=imbalance: the busiest "
+                "rank's excess over this rank. The context-length counterpart of "
+                "sglang:dp_attention_tokens_total; like it, speculative-decode "
+                "steps count one query per row. Sliding-window layers execute "
+                "fewer pairs than counted, so on hybrid-SWA models long rows are "
+                "overstated."
+            ),
+            labelnames=list(labels.keys()) + ["kind"],
+        )
         self.dp_attention_token_imbalance_ratio = Histogram(
             name="sglang:dp_attention_token_imbalance_ratio",
             documentation=(
@@ -1101,23 +1172,23 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 "once per engine, by the scheduler of DP rank 0."
             ),
             labelnames=labels.keys(),
+            # Coarse, widely supported boundaries: downstream metrics gateways
+            # with a fixed bucket preset drop the series when a boundary is not in it.
             buckets=(
                 1.0,
-                1.05,
-                1.1,
-                1.25,
                 1.5,
                 2.0,
+                2.5,
                 3.0,
                 4.0,
-                6.0,
-                8.0,
-                12.0,
-                16.0,
-                24.0,
-                32.0,
-                48.0,
-                64.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
             ),
         )
         self.dp_attention_sync_wait_seconds = Histogram(
@@ -1154,6 +1225,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._dp_attention_steps = {
             state: self.dp_attention_steps_total.labels(**labels, rank_state=state)
             for state in ("active", "idle")
+        }
+        self._dp_attention_pairs = {
+            kind: self.dp_attention_pairs_total.labels(**labels, kind=kind)
+            for kind in ("scheduled", "imbalance")
         }
         self._dp_attention_token_imbalance_ratio = (
             self.dp_attention_token_imbalance_ratio.labels(**labels)
@@ -1283,7 +1358,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
         parallel = get_parallel()
-        is_stats_logging_rank = parallel.attn_tp_rank == 0
+        is_stats_logging_rank = (
+            parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        )
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
@@ -1467,6 +1544,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._dp_attention_tokens["scheduled"].inc(stats.local_tokens)
         if stats.imbalance_tokens:
             self._dp_attention_tokens["imbalance"].inc(stats.imbalance_tokens)
+        if stats.local_attention_pairs:
+            self._dp_attention_pairs["scheduled"].inc(stats.local_attention_pairs)
+        if stats.imbalance_attention_pairs:
+            self._dp_attention_pairs["imbalance"].inc(stats.imbalance_attention_pairs)
         rank_state = "idle" if stats.local_tokens == 0 else "active"
         self._dp_attention_steps[rank_state].inc(1)
         self._dp_attention_sync_wait_seconds.observe(stats.sync_wait_seconds)
@@ -1626,6 +1707,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.prealloc_full_token_usage, stats.prealloc_full_token_usage)
+        self._log_gauge(self.prealloc_swa_token_usage, stats.prealloc_swa_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1651,6 +1734,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            # Non-hybrid models have no host Mamba pool; skip the series rather
+            # than exporting a permanent 0/0.
+            if stats.hicache_host_mamba_total_states > 0:
+                self._log_gauge(
+                    self.hicache_host_mamba_used_states,
+                    stats.hicache_host_mamba_used_states,
+                )
+                self._log_gauge(
+                    self.hicache_host_mamba_total_states,
+                    stats.hicache_host_mamba_total_states,
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -1705,6 +1799,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
+
+
+def tokenizer_metric_labels() -> Dict[str, str]:
+    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
+    and custom labels start empty; each request fills them in."""
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            get_disagg().disaggregation_mode
+        ),
+    }
+    if get_schedule().enable_priority_scheduling:
+        labels["priority"] = ""
+    for label in get_observability().tokenizer_metrics_allowed_custom_labels or ():
+        labels[label] = ""
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
+    return labels
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
@@ -2128,7 +2240,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap means the live device prefix diverged from the "
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
-            "reusable when cache-mode admission ran.",
+            "reusable when cache-mode admission ran; deadline means the "
+            "storage prefetch stop policy ended the read before it completed.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2137,6 +2250,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_capacity",
             "device_covered",
             "storage_transfer",
+            "deadline",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",

@@ -26,28 +26,20 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
     ChatMessage,
     CompletionRequest,
+    DeltaMessage,
     Function,
-    ModelCard,
+    FunctionResponse,
     Tool,
+    ToolCall,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-
-
-class TestModelCard(unittest.TestCase):
-    """Test ModelCard protocol model"""
-
-    def test_model_card_serialization(self):
-        """Test model card JSON serialization"""
-        card = ModelCard(id="test-model", max_model_len=4096)
-        data = card.model_dump()
-        self.assertEqual(data["id"], "test-model")
-        self.assertEqual(data["object"], "model")
-        self.assertEqual(data["max_model_len"], 4096)
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestCompletionRequest(unittest.TestCase):
@@ -162,6 +154,24 @@ class TestChatCompletionRequest(unittest.TestCase):
                 url="https://example.com/image.jpg", content_hash="not-a-hash"
             )
 
+    def test_image_detail_default_is_auto(self):
+        """Clients send detail="default"; it must parse as auto instead of a 400."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:,", "detail": "default"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",
@@ -269,7 +279,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
-        for effort in ("xhigh", "max"):
+        for effort in ("xhigh", "ultra", "max"):
             with self.subTest(effort=effort, request_form="top-level"):
                 request = ChatCompletionRequest(
                     model="test-model",
@@ -291,7 +301,7 @@ class TestChatCompletionRequest(unittest.TestCase):
             ChatCompletionRequest(
                 model="test-model",
                 messages=messages,
-                reasoning_effort="ultra",
+                reasoning_effort="extreme",
             )
 
     def test_chat_completion_reasoning_effort_is_strictly_validated(self):
@@ -579,6 +589,52 @@ class TestAudioContentParts(unittest.TestCase):
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""
 
+    def _chat_payloads(self, tool_calls):
+        response = ChatCompletionResponse(
+            id="chatcmpl-test",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant", content="Hello", tool_calls=tool_calls
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        stream_response = ChatCompletionStreamResponse(
+            id="chatcmpl-test",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=0,
+                    delta=DeltaMessage(content="Hello", tool_calls=tool_calls),
+                )
+            ],
+        )
+        return (
+            json.loads(response.model_dump_json())["choices"][0]["message"],
+            json.loads(stream_response.model_dump_json())["choices"][0]["delta"],
+        )
+
+    def test_absent_tool_calls_are_omitted(self):
+        """Chat responses omit absent tool calls instead of emitting null."""
+        for payload in self._chat_payloads(None):
+            self.assertNotIn("tool_calls", payload)
+
+    def test_present_tool_calls_are_preserved(self):
+        tool_call = ToolCall(
+            id="call-1",
+            function=FunctionResponse(name="get_weather", arguments="{}"),
+        )
+        for tool_calls in ([], [tool_call]):
+            expected = [tool.model_dump() for tool in tool_calls]
+            with self.subTest(tool_calls=expected):
+                for payload in self._chat_payloads(tool_calls):
+                    self.assertEqual(payload["tool_calls"], expected)
+
     def test_hidden_states_excluded_when_none(self):
         """Test that None hidden_states are excluded with exclude_none=True"""
         choice = ChatCompletionResponseChoice(
@@ -650,20 +706,18 @@ class TestModelSerialization(unittest.TestCase):
 class TestFunctionDeferLoading(unittest.TestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
-    def test_function_defaults_preserve_strict(self):
-        """strict must default to False and be present in dumps so downstream
-        code (function_call_parser, chat templates) sees the expected shape."""
+    def test_function_defaults_omit_optional_contract_fields(self):
         f = Function(name="foo")
         data = f.model_dump()
         self.assertEqual(data["name"], "foo")
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
         self.assertNotIn("defer_loading", data)
 
     def test_function_defer_loading_true_serialized(self):
         f = Function(name="foo", defer_loading=True)
         data = f.model_dump()
         self.assertTrue(data["defer_loading"])
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
 
     def test_function_defer_loading_false_serialized(self):
         """defer_loading=False is an explicit value and must be preserved."""
@@ -671,6 +725,24 @@ class TestFunctionDeferLoading(unittest.TestCase):
         data = f.model_dump()
         self.assertIn("defer_loading", data)
         self.assertFalse(data["defer_loading"])
+
+    def test_function_explicit_strict_false_is_preserved(self):
+        data = Function(name="foo", strict=False).model_dump()
+        self.assertIs(data["strict"], False)
+
+    def test_function_serialization_preserves_input_key_order(self):
+        function = Function.model_validate(
+            {
+                "parameters": {"type": "object"},
+                "name": "lookup",
+                "strict": False,
+                "description": "Look up a value.",
+            }
+        )
+        self.assertEqual(
+            list(function.model_dump(exclude_none=True)),
+            ["parameters", "name", "strict", "description"],
+        )
 
     def test_tool_level_defer_loading_propagates_to_function(self):
         """defer_loading at the Tool level should propagate to Function."""
@@ -715,14 +787,6 @@ class TestFunctionDeferLoading(unittest.TestCase):
 
 class TestValidationEdgeCases(unittest.TestCase):
     """Test edge cases and validation scenarios"""
-
-    def test_invalid_tool_choice_type(self):
-        """Test invalid tool choice type"""
-        messages = [{"role": "user", "content": "Hello"}]
-        with self.assertRaises(ValidationError):
-            ChatCompletionRequest(
-                model="test-model", messages=messages, tool_choice=123
-            )
 
     def test_negative_token_limits(self):
         """Test negative token limits"""

@@ -7,7 +7,7 @@ RadixCache.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -58,8 +58,8 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertIs(zeroed.best_match_node, tree.root_node)
         self.assertEqual(zeroed.host_hit_length, 0)
 
-    def test_chunk_cache_is_passthrough(self):
-        class _StubChunkCache:
+    def test_non_sharing_cache_is_passthrough(self):
+        class _StubNonSharingCache:
             def supports_prefix_sharing(self) -> bool:
                 return False
 
@@ -70,13 +70,13 @@ class TestZeroMatchResult(unittest.TestCase):
             best_match_node=None,
             host_hit_length=0,
         )
-        self.assertIs(zero_match_result(_StubChunkCache(), original), original)
+        self.assertIs(zero_match_result(_StubNonSharingCache(), original), original)
 
 
 class TestMatchKvCacheForceMiss(unittest.TestCase):
     def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
         class _StubTreeCache:
-            def swa_reprefill_tail_tokens(self):
+            def swa_reprefill_tail_tokens(self, req=None):
                 return 0
 
             def match_prefix(self, params):

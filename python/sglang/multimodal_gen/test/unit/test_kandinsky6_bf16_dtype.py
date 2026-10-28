@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.models.dits.kandinsky6 import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6.denoising import (
     Kandinsky6DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
 
@@ -73,6 +76,8 @@ def test_bf16_projection_accepts_fp32_conditioning(modulation):
 def test_attention_backend_dispatch_and_repeated_forward(monkeypatch, backend, lengths):
     if backend == "FA" and torch.cuda.get_device_capability()[0] == 12:
         pytest.skip("the platform currently resolves FA to SDPA on SM12.x")
+    if backend == "FA" and current_platform.is_rocm():
+        pytest.skip("the platform currently resolves FA to SDPA on ROCm")
     if backend == "SAGE_ATTN_3":
         if importlib.util.find_spec("sageattn3") is None:
             pytest.skip("requires the optional SageAttention3 extension")

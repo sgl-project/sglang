@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -78,8 +78,11 @@ class TestEnableMetrics(CustomTestCase):
                     {"mode": "decode"},
                 ),
                 ("sglang:dp_attention_tokens_total", {"kind": "scheduled"}),
+                ("sglang:dp_attention_pairs_total", {"kind": "scheduled"}),
                 ("sglang:dp_attention_steps_total", {"rank_state": "active"}),
-                ("sglang:dp_attention_token_imbalance_ratio_count", {}),
+                # Only the attention-rank-0 scheduler observes the ratio; the
+                # other rank's pre-seeded empty histogram must not be picked.
+                ("sglang:dp_attention_token_imbalance_ratio_count", {"tp_rank": "0"}),
                 ("sglang:dp_attention_sync_wait_seconds_count", {}),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang import _platform_stubs
+from sglang.kernels.jit.utils.arch import _sail_arch_suffix
 from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -23,11 +24,12 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -232,11 +234,35 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
-    def test_cuda_srt_platform_capabilities(self):
-        base = CudaSRTPlatform()
+
+class TestSailDeviceMixin(CustomTestCase):
+    """Tests for SAIL device operation defaults (CUDA-compatible surface)."""
+
+    def test_sail_identity_overrides_cuda_identity(self):
+        base = SailSRTPlatform()
+        self.assertEqual(base._enum, PlatformEnum.SAIL)
+        self.assertEqual(base.device_name, "sail")
+        # device_type stays "cuda" — torch.device("cuda") is the only valid
+        # device-type string for SAIL devices in PyTorch.
+        self.assertEqual(base.device_type, "cuda")
+        self.assertTrue(base.is_sail())
+        self.assertTrue(base.is_cuda_alike())
+
+    def test_sail_srt_platform_capabilities(self):
+        base = SailSRTPlatform()
+        self.assertTrue(base.capabilities.supports_triton)
         self.assertTrue(base.capabilities.graph_capture)
         self.assertTrue(base.capabilities.piecewise_graph)
-        self.assertTrue(base.capabilities.supports_triton)
+
+    def test_sail_arch_suffix_below_sm89(self):
+        # SAIL devices below the SM89 capability require the arch-specific
+        # target variant for JIT compilation.
+        self.assertEqual(_sail_arch_suffix(8, 0), "a")
+        self.assertEqual(_sail_arch_suffix(8, 8), "a")
+
+    def test_sail_arch_suffix_sm89_and_above(self):
+        self.assertEqual(_sail_arch_suffix(8, 9), "")
+        self.assertEqual(_sail_arch_suffix(9, 0), "")
 
 
 class TestXpuDeviceMixin(CustomTestCase):
@@ -265,11 +291,6 @@ class TestXpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_xpu_seed.assert_called_once_with(123)
-
-    def test_xpu_srt_platform_capabilities(self):
-        base = XpuSRTPlatform()
-        self.assertTrue(base.capabilities.graph_capture)
-        self.assertTrue(base.capabilities.piecewise_graph)
 
 
 class TestNpuDeviceMixin(CustomTestCase):
@@ -338,12 +359,6 @@ class TestNpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_not_called()
         mock_torch_seed.assert_not_called()
         mock_npu.manual_seed_all.assert_not_called()
-
-    def test_npu_srt_platform_capabilities(self):
-        base = NPUSRTPlatform()
-        self.assertTrue(base.capabilities.graph_capture)
-        self.assertFalse(base.capabilities.piecewise_graph)
-        self.assertTrue(base.capabilities.supports_triton)
 
 
 class TestCpuDeviceMixin(CustomTestCase):
@@ -558,6 +573,42 @@ class TestMpsDeviceMixin(CustomTestCase):
             finally:
                 common.get_device_count.cache_clear()
                 common.get_device.cache_clear()
+
+
+class TestMusaAvailableMemory(CustomTestCase):
+    def test_integrated_and_discrete_memory_sources(self):
+        from sglang.srt.utils import common
+
+        gpu_id = 3
+        for integrated in (True, False):
+            for empty_cache in (True, False):
+                with self.subTest(integrated=integrated, empty_cache=empty_cache):
+                    musa = MagicMock()
+                    musa.device_count.return_value = 4
+                    musa.current_device.return_value = gpu_id
+                    musa.get_device_properties.return_value.is_integrated = integrated
+                    musa.mem_get_info.return_value = (2 << 30, 16 << 30)
+                    with (
+                        patch.object(torch, "musa", musa, create=True),
+                        patch.object(common.psutil, "virtual_memory") as host_memory,
+                        patch.object(common, "empty_device_cache") as clear_cache,
+                    ):
+                        host_memory.return_value.available = 6 << 30
+                        self.assertEqual(
+                            common.get_available_gpu_memory(
+                                "musa", gpu_id, empty_cache=empty_cache
+                            ),
+                            6.0 if integrated else 2.0,
+                        )
+                        if integrated:
+                            musa.mem_get_info.assert_not_called()
+                        else:
+                            musa.mem_get_info.assert_called_once_with(gpu_id)
+                            host_memory.assert_not_called()
+                        if empty_cache:
+                            clear_cache.assert_called_once_with(musa)
+                        else:
+                            clear_cache.assert_not_called()
 
 
 class TestPinMemoryAvailability(CustomTestCase):

@@ -51,6 +51,7 @@ _REOPENABLE_LOAD_FORMATS = (
     LoadFormat.AUTO,
     LoadFormat.SAFETENSORS,
     LoadFormat.FASTSAFETENSORS,
+    LoadFormat.INSTANTTENSOR,
     LoadFormat.MISTRAL,
     LoadFormat.PT,
     LoadFormat.NPCACHE,
