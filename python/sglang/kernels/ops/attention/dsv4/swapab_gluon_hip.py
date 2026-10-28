@@ -158,11 +158,21 @@ def partial_gluon(
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
     q_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
-    if t < KT:
-        at = t * BT + n
-        length = gl.load(L + b)
-        ids = gl.amd.cdna4.buffer_load(IDX + b * IS, at, at < NK)
-        q = _load_q(Q, QS, QH, H, q_layout)
+    side_k = t < KT
+    at = gl.where(side_k, t, t - KT) * BT + n
+    row = gl.where(side_k, IDX, EI) + b * gl.where(side_k, IS, EIS)
+    if NK % BT == 0 and NE % BT == 0:
+        ids = gl.amd.cdna4.buffer_load(row, at)
+    else:
+        ids = gl.amd.cdna4.buffer_load(row, at, at < gl.where(side_k, NK, NE))
+    length = gl.load(gl.where(side_k, L, EL) + b)
+    # opaque copy of t: stops the scheduler from hoisting the K/E side constants
+    # above the ids and length loads
+    tk = gl.inline_asm_elementwise(
+        "s_mov_b32 $0, $1", "=s,s", [t], dtype=gl.int32, is_pure=False, pack=1
+    )
+    q = _load_q(Q, QS, QH, H, q_layout)
+    if tk < KT:
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
         kv = _load_kv(
             K,
@@ -177,10 +187,6 @@ def partial_gluon(
             TILE,
         )
     else:
-        at = (t - KT) * BT + n
-        length = gl.load(EL + b)
-        ids = gl.amd.cdna4.buffer_load(EI + b * EIS, at, at < NE)
-        q = _load_q(Q, QS, QH, H, q_layout)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
         kv = _load_kv(
             E,
