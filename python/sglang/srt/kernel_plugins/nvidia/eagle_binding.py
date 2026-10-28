@@ -36,6 +36,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 
@@ -255,7 +256,7 @@ class EagleBinding:
         )
 
     def _mamba(self, backend: Any) -> MambaPoolBuffers:
-        return mamba_pool_buffers(backend.req_to_token_pool)
+        return mamba_pool_buffers(backend.token_to_kv_pool)
 
 
 def split_backend(backend: Any) -> tuple[Any, Optional[Any]]:
@@ -301,12 +302,10 @@ def kv_pool_buffers(
 ) -> KvPoolBuffers:
     """A full-attention backend's KV pool, per layer."""
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
-        layer_ids = tuple(pool.get_kv_layer_ids())
-    else:
-        layer_ids = tuple(range(pool.start_layer, pool.start_layer + pool.layer_num))
+    router = pool.layer_router
+    layer_ids = router.layer_ids()
+    routed_layers = tuple(router.read(i) for i in layer_ids)
     layers = {
         module.layer_id: module
         for module in model.modules()
@@ -322,19 +321,25 @@ def kv_pool_buffers(
 
     return KvPoolBuffers(
         layer_ids=layer_ids,
-        k=tuple(pool.get_key_buffer(i) for i in layer_ids),
-        v=tuple(pool.get_value_buffer(i) for i in layer_ids),
+        k=tuple(
+            layer.view.get_key_buffer(layer.view_layer_id) for layer in routed_layers
+        ),
+        v=tuple(
+            layer.view.get_value_buffer(layer.view_layer_id) for layer in routed_layers
+        ),
         k_scale=tuple(scale(i, "k_scale") for i in layer_ids),
         v_scale=tuple(scale(i, "v_scale") for i in layer_ids),
     )
 
 
-def mamba_pool_buffers(req_pool: Any) -> MambaPoolBuffers:
-    """The GDN state pool and its ReplaySSM ring."""
-    mamba_pool = req_pool.mamba_pool
-    state = req_pool.get_speculative_mamba2_params_all_layers()
+def mamba_pool_buffers(pool: Any) -> MambaPoolBuffers:
+    """The GDN state pool and its ReplaySSM ring, in storage layer order."""
+    router = pool.layer_router
+    mamba_pool = router.part_view(STATE_PART)
+    layer_indices = router.part_indices(STATE_PART)
+    state = mamba_pool.get_speculative_mamba2_params_all_layers()
     return MambaPoolBuffers(
-        layer_ids=tuple(sorted(req_pool.mamba_map, key=req_pool.mamba_map.get)),
+        layer_ids=tuple(sorted(layer_indices, key=layer_indices.get)),
         conv=tuple(state.conv),
         temporal=state.temporal,
         intermediate_conv_window=tuple(state.intermediate_conv_window),
