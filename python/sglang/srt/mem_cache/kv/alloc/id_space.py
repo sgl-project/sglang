@@ -257,8 +257,8 @@ class WindowRead(msgspec.Struct, frozen=True, kw_only=True):
         ``width``. A tree row's query sits at its depth in the tree, not at
         its row index, so a kernel's row-indexed window would misplace it;
         the window is folded into the mask instead, and the kernel is planned
-        without one. Each row keeps its tree columns and sees the prefix
-        columns inside its own window. ``read_lens_sum`` is ``lens.sum()``,
+        without one. Each row sees only the prefix columns and tree ancestors
+        inside its own window. ``read_lens_sum`` is ``lens.sum()``,
         known on the host."""
         device = mask.device
         lens = self.lens.to(torch.int64)
@@ -278,6 +278,7 @@ class WindowRead(msgspec.Struct, frozen=True, kw_only=True):
         tree = mask[tree_idx.clamp(max=mask.numel() - 1)].to(torch.bool)
         # Each row sees itself and its ancestors: its depth is one less.
         depth = tree.sum(-1) - 1
+        tree = tree & (depth[:, :, None] - depth[:, None, :] <= self.window)
         read_row = lens + width
         read_end = torch.cumsum(read_row * width, 0)
         total = read_lens_sum * width + width * width * bs
