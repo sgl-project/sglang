@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.mori.fabric_staging import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -181,6 +182,21 @@ class TestFabricMemoryPool(CustomTestCase):
                         self.assertIs(
                             pool.custom_mem_pool, None if staging else fabric_pool
                         )
+
+    def test_mori_rdma_keeps_mooncake_pool_selection(self):
+        mooncake = (True, object(), "NVLINK")
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mori"
+            ),
+            envs.SGLANG_MORI_BACKEND.override("rdma"),
+            envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"),
+            patch(
+                "sglang.srt.disaggregation.mooncake.utils.init_mooncake_custom_mem_pool",
+                return_value=mooncake,
+            ),
+        ):
+            self.assertIs(maybe_init_custom_mem_pool("cpu"), mooncake)
 
 
 class TestFabricStagingSizing(CustomTestCase):
