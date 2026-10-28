@@ -9,7 +9,7 @@ import torch
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -27,6 +27,10 @@ class _ReadStream:
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
+
+    def space(self, kind):
+        # A pool without a window sub-pool has no window id space.
+        return None
 
     def pack_read_stream(
         self,

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -428,6 +429,8 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             kvcache=pool,
             need_sort=False,
         )
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
         tree = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,
@@ -451,7 +454,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             origin_input_ids=array("q", self.PROMPT),
             sampling_params=SamplingParams(max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         kv_indices = allocator.alloc(len(self.PROMPT))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices

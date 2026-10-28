@@ -21,6 +21,7 @@ Addressing law under test:
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -30,13 +31,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
     UnifiedMHATokenToKVPool,
 )
 
@@ -275,7 +275,7 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
     full = full_spec if full_spec is not None else _mha_spec()
     swa = _swa_spec()
     total = full.entry_bytes() * _N_FULL + swa.entry_bytes() * _N_SWA
-    return UnifiedKVPool(
+    return arena_of(
         total_bytes=total,
         sub_pool_specs=[full, swa],
         device=device,
@@ -291,7 +291,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         for ps in (1, 4):
             pool = _make_pool(ps=ps)
             for name, spec in (("full", _mha_spec()), ("swa", _swa_spec())):
-                k, v = pool.mha_views_for(name)
+                k, v = pool.spec(name).views(pool)
                 for t in (k[0], v[0], k[-1], v[-1]):
                     self.assertEqual(t.dim(), 3, f"{name} at ps={ps}")
                     self.assertEqual(t.stride(0) * _ITEM, spec.entry_bytes())
@@ -302,7 +302,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         for ps in (1, 4):
             kv = _make_pool(ps)
             self.assertEqual(
-                kv._raw.numel(),
+                kv.raw.numel(),
                 _mha_spec().entry_bytes() * _N_FULL
                 + _swa_spec().entry_bytes() * _N_SWA,
             )
@@ -315,8 +315,8 @@ def _layer(l):
 def _make_pool_and_kv(ps, device=_DEV):
     kv = _make_pool(ps=ps, device=device)
     return kv, UnifiedMHATokenToKVPool(
-        unified_buffer=kv,
-        sub_pool_name="full",
+        arena=kv,
+        spec=kv.spec("full"),
         page_size=ps,
         enable_alt_stream=False,
     )
@@ -328,7 +328,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         device-side size_limit; `size + page_size` must be the view row count."""
         for ps in (1, 4):
             unified_kv, pool_under_test = _make_pool_and_kv(ps)
-            n_rows = (unified_kv.max_slots("full") // ps) * ps
+            n_rows = (unified_kv.num_entries("full") // ps) * ps
             self.assertEqual(pool_under_test.size, n_rows - ps)
             self.assertEqual(pool_under_test.k_buffer[0].shape[0], n_rows)
 
@@ -340,10 +340,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         for ps in (1, 4):
             kv, pool = _make_pool_and_kv(ps, device=_STORE_DEV)
             sk, sv = _reference_paged_views(
-                kv._raw,
+                kv.raw,
                 page_size=ps,
-                num_pages=kv.max_slots("full") // ps,
-                anchor_bytes=kv.anchor_bytes("full"),
+                num_pages=kv.num_entries("full") // ps,
+                anchor_bytes=0,
             )
             probes = [(1, 0), (2, ps - 1), (5, ps // 2)]
             for l in range(_L):
@@ -364,20 +364,18 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                         f"V (l={l}, p={p}, s={s}, ps={ps}) not at the envelope cell",
                     )
 
-    def test_move_kv_cache_relocates_whole_envelopes(self):
-        """Compaction hands PHYSICAL token runs. The override must relocate
-        exactly the page envelopes those runs name."""
+    def test_arena_moves_whole_envelopes(self):
+        """Compaction names PHYSICAL pages of a band. The arena must relocate
+        exactly the page envelopes named."""
         ps = 4
         kv, pool = _make_pool_and_kv(ps)
-        live = kv._raw.numel()
+        live = kv.raw.numel()
         seed = (torch.arange(live, dtype=torch.float32) % 251).to(torch.uint8)
-        kv._raw[:] = seed
+        kv.raw[:] = seed
         page_bytes = ps * _mha_spec().entry_bytes()
 
         src_pages, tgt_pages = torch.tensor([5, 6]), torch.tensor([2, 3])
-        offs = torch.arange(ps)
-        run = lambda p: (p[:, None] * ps + offs).reshape(-1)
-        pool.move_kv_cache(run(tgt_pages), run(src_pages))
+        kv.move_units("full", tgt_pages, src_pages)
 
         want = seed.clone()
         for sp, tp in zip(src_pages.tolist(), tgt_pages.tolist()):
@@ -385,7 +383,7 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                 sp * page_bytes : (sp + 1) * page_bytes
             ]
         self.assertTrue(
-            torch.equal(kv._raw, want),
+            torch.equal(kv.raw, want),
             "envelope move did not relocate exactly the named pages",
         )
 
@@ -406,8 +404,8 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         self.assertEqual(len(ptrs), 1)
         self.assertEqual(len(lens), 1)
         self.assertEqual(len(item_lens), 1)
-        self.assertEqual(ptrs[0], kv._raw.data_ptr())
-        self.assertEqual(lens[0], kv._raw.numel())
+        self.assertEqual(ptrs[0], kv.raw.data_ptr())
+        self.assertEqual(lens[0], kv.raw.numel())
         self.assertEqual(item_lens[0], pool._page_bytes)
         # The whole addressable page range must fit the registered region, or
         # the last page's write would run off the end of the RDMA mapping.
@@ -444,9 +442,9 @@ class TestFactoryViews(unittest.TestCase):
     def _bundle(self):
         # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
         # 8/8 dims, ps = 1) -- small enough that per-layer views build on CPU.
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        return init_unified_swa_pools(
+        return build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=2,
@@ -469,14 +467,18 @@ class TestFactoryViews(unittest.TestCase):
     def test_factory_builds_per_layer_views(self):
         b = self._bundle()
         # Sub-pools expose stock 3-D per-layer views.
-        self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
-        self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("full").k_buffer[0].dim(), 3
+        )
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("swa").k_buffer[0].dim(), 3
+        )
 
     @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
     def test_swa_factory_preserves_fp8_logical_dtype(self):
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        b = init_unified_swa_pools(
+        b = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float8_e4m3fn,
             head_num=2,
@@ -497,7 +499,7 @@ class TestFactoryViews(unittest.TestCase):
         )
 
         self.assertEqual(b.token_to_kv_pool.dtype, torch.float8_e4m3fn)
-        for pool in (b.token_to_kv_pool.full_kv_pool, b.token_to_kv_pool.swa_kv_pool):
+        for pool in map(b.token_to_kv_pool.layer_router.view, ("full", "swa")):
             self.assertEqual(pool.dtype, torch.float8_e4m3fn)
             self.assertEqual(pool.store_dtype, torch.uint8)
             self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)

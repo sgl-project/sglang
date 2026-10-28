@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     _symmetric_scratch_layout,
     _symmetric_scratch_supported,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
@@ -2052,8 +2053,11 @@ class TestOwnedRows(CustomTestCase):
         host = pool.alloc(6 * PS, start_owner=0)
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.is_kv_sharded = True
-        entry = SimpleNamespace(host_pool=pool, device_pool=object(), layer_mapper=None)
-        indexer = SimpleNamespace(
+        entry = PoolEntry(
+            name=PoolName.KV, host_pool=pool, device_pool=object(), layer_mapper=None
+        )
+        indexer = PoolEntry(
+            name=PoolName.INDEXER,
             host_pool=SimpleNamespace(can_use_write_back_jit=False),
             device_pool=object(),
             layer_mapper=None,

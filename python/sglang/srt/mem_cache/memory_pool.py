@@ -32,7 +32,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,6 +67,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
@@ -96,7 +100,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -384,6 +387,14 @@ class ReqToTokenPool:
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    # A table without recurrent state holds no state slots: no state pool, slot
+    # allocator or checkpoint pool. Tables with state set all three.
+    mamba_pool: Optional[MambaPool] = None
+    mamba_allocator = None
+    mamba_ckpt_pool = None
+    state: Optional[StateStorage] = None
+    # Whether a row names its request's state slot (the hybrid tables).
+    holds_state_slots: bool = False
 
     def __init__(
         self,
@@ -1356,6 +1367,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    holds_state_slots = True
+    # The state sub-pool the slot ids in `req_index_to_mamba_index_mapping`
+    # name; the allocator's id space for it says how the pool indexes them.
+    state_sub_pool: str = "mamba"
 
     def __init__(
         self,
@@ -1402,7 +1417,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
-        self.layer_transfer_counter = None
         self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
@@ -1442,6 +1456,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
+        self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1564,181 +1579,65 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         return clone
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+    # The state storage, under the names its callers still read through the
+    # table.
+    @property
+    def mamba_pool(self):
+        return self.state.pool
 
-    # For chunk prefill req, we do not need to allocate mamba cache,
-    # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
-        fresh_req_rows = [req.kv.req_pool_idx is None for req in reqs]
-        select_index = super().alloc(reqs)
-        if select_index is None:
-            return None
+    @mamba_pool.setter
+    def mamba_pool(self, value) -> None:
+        self.state.pool = value
 
-        spec_write_pos = self.mamba_pool.replayssm_spec_write_pos
-        if spec_write_pos is not None:
-            fresh_indices = [
-                idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
-            ]
-            if fresh_indices:
-                fresh_rows = async_h2d(
-                    fresh_indices, dtype=torch.int64, device=self.device
-                )
-                spec_write_pos.index_fill_(0, fresh_rows, 0)
-                self.mamba_pool.replayssm_cache_base.index_fill_(0, fresh_rows, 0)
-                self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
+    @property
+    def mamba_allocator(self):
+        return self.state.slots
 
-        mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
-        for req in reqs:
-            if req.kv.holds_mamba:  # for radix cache / continuing chunked
-                pass
-            else:
-                mid = self.mamba_allocator.alloc(1)
-                assert mid is not None, (
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
-                )
-                req.kv.mamba_pool_idx = mid[0]
-                req.kv.mamba_needs_clear = True
-                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
-                # ring. write_pos=0 means "ring empty", so the decode kernel
-                # ignores ring contents and reads only the checkpoint state
-                # (the post-prefill state that prefill wrote into this slot).
-                if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
-            mamba_indices.append(req.kv.mamba_pool_idx)
-            if self.enable_mamba_extra_buffer:
-                if req.kv.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(
-                    req.kv.mamba_ping_pong_track_buffer
-                )
-        assert len(select_index) == len(mamba_indices), (
-            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        )
-        if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
-                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-            )
-        # Device rows: indexing a device tensor with a Python list syncs the host.
-        rows = async_h2d(select_index, dtype=torch.int64, device=self.device)
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
-        if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
-                ping_pong_tensor
-            )
-        return select_index
+    @mamba_allocator.setter
+    def mamba_allocator(self, value) -> None:
+        self.state.slots = value
+
+    @property
+    def mamba_map(self) -> Dict[int, int]:
+        return self.state.layer_map
+
+    @mamba_map.setter
+    def mamba_map(self, value: Dict[int, int]) -> None:
+        self.state.layer_map = value
+
+    @property
+    def short_conv_pool(self):
+        return self.state.short_conv_pool
+
+    @short_conv_pool.setter
+    def short_conv_pool(self, value) -> None:
+        self.state.short_conv_pool = value
+
+    @property
+    def ngram_pool(self):
+        return self.state.ngram_pool
+
+    @ngram_pool.setter
+    def ngram_pool(self, value) -> None:
+        self.state.ngram_pool = value
+
+    @property
+    def mamba_ckpt_pool(self):
+        return self.state.ckpt_pool
+
+    @mamba_ckpt_pool.setter
+    def mamba_ckpt_pool(self, value) -> None:
+        self.state.ckpt_pool = value
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
-    @property
-    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
-        """The mamba virtual->physical slot table, or None when the ids this
-        pool hands out are already physical."""
-        return None
-
-    @property
-    def mamba_translate_is_fusable(self) -> bool:
-        """Whether `fused_replay_state_indices` can reproduce this pool's
-        `translate_mamba_indices` in its own launch.
-
-        The kernel expresses exactly two shapes: the identity, and one gather
-        through `mamba_v2p_table`. A subclass that replaces the translate with
-        anything else is excluded here rather than silently mis-served.
-        """
-        if self.mamba_v2p_table is not None:
-            return True
-        return (
-            type(self).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
-        )
-
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
-        """Virtual->physical mamba-slot translate. Identity for a static pool
-        (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
-        unified memory pool, where mamba slot ids are virtual. Callers translate
-        before calling the pool's physical-id state ops (copy_from / clear_slots
-        / get_cpu_copy / load_cpu_copy)."""
+        """The state pool's slot ids for ``mamba_indices``: the same ids, since a
+        static table's slots index its state pool as they are. sglang's own code
+        maps state slot ids through the allocator's id space; this stays for
+        integrations outside sglang that call it (LMCache's sglang adapter)."""
         return mamba_indices
-
-    def mamba2_layer_index(self, layer_id: int) -> int:
-        """Pool-side index of ``layer_id``'s state, gated on its HiCache transfer.
-
-        For a caller that wants one specific state tensor: it indexes the pool
-        tensor itself instead of taking a ``State`` sliced over every field.
-        """
-        assert layer_id in self.mamba_map
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.mamba_map[layer_id]
-
-    def mamba2_layer_cache(self, layer_id: int):
-        return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
-
-    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.short_conv_pool.layer_cache(layer_id)
-
-    def short_conv_layer_intermediate_cache(
-        self, layer_id: int
-    ) -> Optional[torch.Tensor]:
-        return self.short_conv_pool.layer_intermediate_cache(layer_id)
-
-    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
-        # Read once per forward, BEFORE the decoder-layer loop, so unlike
-        # short_conv_layer_cache it has no per-layer barrier of its own. The
-        # host tier restores side state on the first Mamba layer's transfer, so
-        # wait for that layer before reading the history.
-        if (
-            self.layer_transfer_counter is not None
-            and self.layer_transfer_counter.consumer_index >= 0
-            and self.mamba_map
-        ):
-            first_mamba_layer = min(self.mamba_map)
-            self.layer_transfer_counter.wait_until(first_mamba_layer - self.start_layer)
-        return self.ngram_pool.get_context(ngram_indices)
-
-    def set_ngram_context(
-        self, ngram_indices: torch.Tensor, context: torch.Tensor
-    ) -> None:
-        self.ngram_pool.set_context(ngram_indices, context)
-
-    def set_ngram_intermediate_context(
-        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
-    ) -> None:
-        self.ngram_pool.set_intermediate_context(context, indices)
-
-    def copy_mamba_state(
-        self, src_index: torch.Tensor, dst_index: torch.Tensor
-    ) -> None:
-        if src_index.numel() == 0:
-            return
-        if (
-            self.layer_transfer_counter is not None
-            and self.layer_transfer_counter.consumer_index >= 0
-        ):
-            last_mamba_layer = max(self.mamba_map)
-            self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
-        self.mamba_pool.copy_from(src_index, dst_index)
-
-    def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
-        return self.mamba_pool.get_speculative_mamba2_params_all_layers()
-
-    def get_state_buf_infos(self):
-        return self.mamba_pool.get_contiguous_buf_infos()
-
-    def get_state_dim_per_tensor(self):
-        return self.mamba_pool.get_state_dim_per_tensor()
-
-    def get_state_slice_outer_counts(self):
-        return self.mamba_pool.get_state_slice_outer_counts()
-
-    def get_state_conv_shard_groups(self):
-        return self.mamba_pool.get_state_conv_shard_groups()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1749,37 +1648,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state."""
         return req.kv.mamba_last_track_idx
-
-    def _alloc_ping_pong_buffer(self, req: Req):
-        """Allocate the ping-pong track buffer for a new request.
-
-        Lazy mode allocates 1 slot with the second set to -1 (allocated
-        on demand at track boundaries). Normal mode allocates all slots upfront.
-        """
-        n = self.mamba_initial_tracking_slots
-        slots = self.mamba_allocator.alloc(n)
-        assert slots is not None, (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
-        buf = torch.full(
-            (self.mamba_ping_pong_track_buffer_size,),
-            -1,
-            dtype=slots.dtype,
-            device=slots.device,
-        )
-        buf[:n] = slots
-        req.kv.mamba_ping_pong_track_buffer = buf
-        req.kv.mamba_ping_pong_empty = [False] * n + [True] * (
-            self.mamba_ping_pong_track_buffer_size - n
-        )
-        req.kv.mamba_prev_track_seqlen = None
-        req.kv.mamba_next_track_idx = 0
-        req.kv.mamba_last_track_idx = (
-            0
-            if self.enable_mamba_extra_buffer_lazy
-            else self.get_mamba_ping_pong_other_idx(0)
-        )
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1823,55 +1691,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
-    def free_mamba_cache(
-        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
-    ):
-        mamba_index = req.kv.mamba_pool_idx
-        assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_allocator.free(mamba_index.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-
-        if self.enable_mamba_extra_buffer:
-            size = self.mamba_ping_pong_track_buffer_size
-            keep = mamba_ping_pong_track_buffer_to_keep
-            assert keep in (None, 0, 1) and (keep != 1 or size == 2), (
-                f"cannot keep ping-pong entry {keep} of {size}"
-            )
-            empty = req.kv.mamba_ping_pong_empty
-            positions = [p for p in range(size) if p != keep and not empty[p]]
-            row = self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.kv.req_pool_idx
-            ]
-            if len(positions) == size:
-                self.mamba_allocator.free(row)
-            else:
-                for p in positions:
-                    self.mamba_allocator.free(row[p : p + 1])
-            # Match the req.kv.mamba_pool_idx=None clear above so the next
-            # alloc() doesn't see a stale ping-pong reference on the req
-            # and skip allocation (which would silently reuse a freed
-            # tensor on the req side while the new pool slot leaks).
-            req.kv.mamba_ping_pong_track_buffer = None
-            req.kv.mamba_ping_pong_empty = None
-            req.kv.mamba_next_track_idx = None
-            req.kv.mamba_last_track_idx = None
-            req.kv.mamba_last_track_seqlen = None
-            req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
-
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
-        self.mamba_allocator.clear()
-        self.short_conv_pool.clear()
-        self.ngram_pool.clear()
-        # The int8 checkpoint pool holds radix-cached states in its own slots; a
-        # flush/reset drops the radix tree, so its slots must be released too,
-        # otherwise the (now unreferenced) slots leak and break the int8-pool
-        # invariant (int8_available + radix_cached != int8_total).
-        if self.mamba_ckpt_pool is not None:
-            self.mamba_ckpt_pool.clear()
+        self.state.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
@@ -2005,6 +1828,11 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Prepared before final KV sizing; reused by the host pool after resizing.
+    # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
+    hicache_write_back_staging: (
+        torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | None
+    ) = None
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
@@ -2050,6 +1878,20 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def id_spaces(self) -> Dict[str, IdSpace]:
+        """How each token sub-pool of this pool names a slot when no allocator
+        translates: by the pool's own id, keyed by sub-pool name."""
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+    @cached_property
+    def layer_router(self) -> KVLayerRouter:
+        """Routes each layer this pool serves to the sub-pool view holding it."""
+        return self._build_layer_router()
+
+    def _build_layer_router(self) -> KVLayerRouter:
+        # A plain pool is one sub-pool, and its own view.
+        return PlainPoolRouter(self, IdSpaceKind.FULL)
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Persistent buffers for migrated host consumers; see device_pool_info.py.
@@ -2139,10 +1981,6 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    # Optional translation from controller IDs to this pool's buffer indices.
-    # L2TransferEngine resolves it on the transfer stream; move gates prevent
-    # relocation until the transfer is acknowledged.
-    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     # Token capacity for host sizing; `size` may count rows in per-layer views.
     host_capacity_tokens: Optional[int] = None
     # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
@@ -2181,9 +2019,7 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
-class MHATokenToKVPool(KVCache):
-    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-
+class MHATokenToKVPool(KVCache, MHAKVView):
     def __init__(
         self,
         size: int,
@@ -2627,7 +2463,10 @@ class MHATokenToKVPool(KVCache):
                             shape, dtype=self.store_dtype, device=self.device
                         )
 
-                    if k_shape == v_shape:
+                    # Only CUDA's trtllm fmha_v2 prefill reads the fused layout,
+                    # and same-node Mooncake PD on ROCm decodes garbage when V
+                    # sits inside K's allocation, so ROCm allocates them apart.
+                    if k_shape == v_shape and not _is_hip:
                         # Store K and V as block-aligned halves of one allocation
                         # so paged kernels with a single pool base can reach V
                         # via block offsets. Each half keeps its standalone
@@ -4474,6 +4313,21 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def _build_layer_router(self) -> KVLayerRouter:
+        # Only the full-attention layers hold KV here; the KV cache
+        # configurator binds the state layers to this router
+        # (`StateStorage.bind_routes`).
+        return KVLayerRouter.from_layer_maps(
+            self,
+            [
+                (
+                    IdSpaceKind.FULL,
+                    self.full_kv_pool,
+                    self.full_attention_layer_id_mapping,
+                )
+            ],
+        )
+
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
@@ -4568,6 +4422,8 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
+            # MLA pools whose set_kv_buffer takes no layer_id_override (the
+            # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
@@ -4614,10 +4470,14 @@ class HybridLinearKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
-        with self._transfer_id_context(layer):
-            self.full_kv_pool.set_mla_kv_buffer(
-                layer, loc_info, cache_k_nope, cache_k_rope
-            )
+        kv = self.layer_router.layer(layer.layer_id)
+        kv.view.set_mla_kv_buffer(
+            layer,
+            loc_info,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=kv.view_layer_id,
+        )
 
     def get_mla_kv_buffer(
         self,
@@ -4627,13 +4487,14 @@ class HybridLinearKVPool(KVCache):
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         # Wait for HiCache load-back here; the inner pool's counter is disabled.
-        self._wait_for_layer(layer.layer_id)
+        kv = self.layer_router.read(layer.layer_id)
         # Read door -- same physical-id contract as the write door: `loc` is
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.
-        with self._transfer_id_context(layer):
-            return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+        return kv.view.get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=kv.view_layer_id
+        )
 
     def set_index_k_scale_buffer(
         self,
@@ -4751,7 +4612,7 @@ class HybridLinearKVPool(KVCache):
         )
 
 
-class MLATokenToKVPool(KVCache):
+class MLATokenToKVPool(KVCache, MLAKVView):
     def __init__(
         self,
         size: int,
@@ -4998,6 +4859,8 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=get_parallel().attn_dcp_rank,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
@@ -5077,9 +4940,12 @@ class MLATokenToKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
@@ -5248,12 +5114,15 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
         )
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
 
         if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here

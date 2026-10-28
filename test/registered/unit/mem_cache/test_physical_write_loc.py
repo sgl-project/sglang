@@ -30,20 +30,19 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
     write_loc_is_physical,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
     UnifiedMHATokenToKVPool,
-    init_unified_swa_pools,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
@@ -57,8 +56,10 @@ _DTYPE = torch.float16
 def _plain_translator():
     return KVIndexTranslator(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )
@@ -100,7 +101,7 @@ def _unified_mha_pool(ps=1):
         store_dtype=_DTYPE,
         grow_direction="up",
     )
-    kv = UnifiedKVPool(
+    kv = arena_of(
         total_bytes=full.entry_bytes() * 32 + swa.entry_bytes() * 16,
         sub_pool_specs=[full, swa],
         device=_DEV,
@@ -108,7 +109,7 @@ def _unified_mha_pool(ps=1):
         page_size=ps,
     )
     return UnifiedMHATokenToKVPool(
-        unified_buffer=kv, sub_pool_name="full", page_size=ps, enable_alt_stream=False
+        arena=kv, spec=kv.spec("full"), page_size=ps, enable_alt_stream=False
     )
 
 
@@ -195,7 +196,7 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         self.assertTrue(torch.all(pool.k_buffer[0][2] == 1))
 
     def test_swa_composite_forwards_the_mark(self):
-        b = init_unified_swa_pools(
+        b = build_test_unified_pools(
             device=_DEV,
             kv_cache_dtype=_DTYPE,
             head_num=_H,

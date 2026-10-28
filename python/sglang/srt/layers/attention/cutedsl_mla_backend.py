@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism."""
 
+    # Its decode kernel takes the global causal bound and returns the
+    # rank-local LSE, so it verifies under DCP (`_run_decode_kernel`).
+    supports_dcp_target_verify = True
+
     def __init__(
         self,
         model_runner: ModelRunner,

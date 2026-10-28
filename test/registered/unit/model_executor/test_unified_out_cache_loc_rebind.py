@@ -29,8 +29,8 @@ from unittest.mock import create_autospec
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,8 +62,10 @@ def _armed_source(v2p, swa_map):
     in test_kv_index_translator.py over the real allocator)."""
     src = KVIndexTranslator(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device=_DEV,
     )
@@ -250,7 +252,7 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         recorded = {}
 
         class _RecordingLeafPool:
-            def get_mla_kv_buffer(self, layer, loc, dst_dtype):
+            def get_mla_kv_buffer(self, layer, loc, dst_dtype, layer_id_override):
                 recorded["loc"] = loc
                 return None, None
 
