@@ -61,6 +61,30 @@ provided by the companion in-process Dynamo SGLang integration. A query is
 advisory; terminal delivery determines which pages are usable. Missing hints
 do not authorize fetching from an unrelated replica.
 
+For backend-owned routing inventory, opt in with `"publish_inventory": true`
+in the backend extra configuration and configure a ZMQ KV-event publisher
+with `"format": "dynamo"` when using Dynamo routing.
+Framework GPU and HiCache-host events remain unowned; only committed KVCR DRAM
+stores/removals carry `ownership="kvcr"`. A logical page is advertised after
+all required physical pools and attention shards own it, and withdrawn when
+any required shard/pool removes it. Trailing/checkpoint admission is still
+verified by the storage query and terminal read.
+
+The companion Dynamo integration requires its KV state-agent host, started
+with `DYN_NAMESPACE=<worker-namespace> python -m dynamo.kv_state_agent` before
+the workers. It consumes SGLang's reported event/control endpoints and fresh
+engine-lifetime owner IDs. Do not run the legacy publisher in parallel with
+this mode. The reported raw topic includes that owner identity, isolating
+replacement engines even when they reuse the same TCP port. Inventory is not
+persistent across worker shutdown; it is withdrawn
+on detach. A detected event-stream gap fails the source closed; this live stream
+is not a durable replay journal. Runtime storage attach/detach requires a worker
+restart in inventory mode so startup source metadata cannot silently go stale.
+The default `publish_inventory: false` preserves existing behavior.
+Enable this mode only with matching Dynamo frontend, worker and state-agent
+builds supporting `sglang_hicache_v1`; upgrading the worker alone is not enough.
+It requires remote hints enabled and an explicit `control_advertise_host`.
+
 `share_replicated_mla: true` is an explicit assertion that KV and indexer bytes
 are identical across attention TP ranks. It stores one copy on TP0 while every
 rank restores into its own host buffers. It requires physical MLA KV, CP=1,
