@@ -110,6 +110,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
+from sglang.srt.model_executor.device_memory_monitor import DeviceMemoryMonitor
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -435,6 +436,15 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        # Per-rank device-memory accounting and the opt-in all-rank
+        # allocator-cache release (sgl-project/sglang#46831). Each scheduler
+        # process is the TP worker process for its own rank, so this is
+        # inherently a per-rank monitor and needs no collective to stay
+        # consistent across a TP group. None unless the SGLANG_DEVICE_MEMORY_*
+        # knobs ask for it.
+        self.device_memory_monitor = DeviceMemoryMonitor.maybe_create(
+            rank_info={"is_draft_worker": is_draft_worker}
+        )
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -1248,6 +1258,13 @@ class ModelRunner:
 
         prebuild_deepep_v2_buffer(model=self.model)
 
+        # Baseline allocator state after graph capture: #46831 compares
+        # mem-fraction settings *after* capture, so the post-capture footprint
+        # is the reference point for the growth it measured. Written once --
+        # a later recapture does not overwrite it.
+        if self.device_memory_monitor is not None:
+            self.device_memory_monitor.write_baseline_snapshot()
+
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
             # Capture is target-only. The draft worker runs in the same process
@@ -1938,6 +1955,19 @@ class ModelRunner:
             and not self._elastic_cuda_graph_enabled()
         ):
             self.maybe_join_ep_ranks()
+
+        # Per-rank device-memory accounting and the opt-in all-rank cache
+        # release (#46831). Only decode passes are counted; ``input_ids.numel()``
+        # is a metadata-only read, so this adds no device sync to the loop.
+        if self.device_memory_monitor is not None:
+            input_ids = forward_batch.input_ids
+            self.device_memory_monitor.observe(
+                is_decode=forward_batch.forward_mode.is_decode(),
+                batch_size=forward_batch.batch_size,
+                num_tokens=input_ids.numel() if input_ids is not None else 0,
+                forward_mode=forward_batch.forward_mode.name,
+                can_run_graph=output.can_run_graph,
+            )
 
         return output
 

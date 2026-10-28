@@ -681,7 +681,38 @@ class Envs:
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
     # in seconds. Set if you observe high memory accumulation over a long serving period.
+    # NOTE: this is honoured on rank 0 only -- the IdleSleeper that carries it is
+    # created only where pp_rank == 0 and attn_tp_rank == 0 and attn_cp_rank == 0,
+    # because the sockets it polls exist only there. See
+    # sglang.srt.model_executor.device_memory_monitor for an all-rank alternative.
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
+    # ===================================================================
+    # Per-rank device memory accounting (sgl-project/sglang#46831)
+    # ===================================================================
+    # Number of decode iterations between per-rank device-memory log lines.
+    # Each line records memory_allocated / memory_reserved / mem_get_info and
+    # the decode batch shape. 0 disables the logging entirely, which is the
+    # default so the engine's behavior is unchanged.
+    SGLANG_DEVICE_MEMORY_LOG_INTERVAL = EnvInt(0)
+    # Comma-separated log targets for the device-memory logs. Empty means stdout.
+    # Any other target is treated as a directory that receives
+    # "{hostname}_{rank}.log" files.
+    SGLANG_DEVICE_MEMORY_LOG_TARGET = EnvStr("")
+    # Release the PyTorch allocator cache on EVERY rank when the
+    # driver-reported free device memory (mem_get_info, i.e. what the HIP/CUDA
+    # runtime aborts on) drops below this many MiB. 0 disables the policy.
+    #
+    # This is deliberately driver-reported rather than torch-reserved: the
+    # allocator's cached blocks are invisible to mem_get_info's "reserved"
+    # accounting but do occupy the device, and #46831 measured a rank aborting
+    # while torch's own reserved/allocated gap was far below the amount the
+    # driver had actually handed out.
+    SGLANG_DEVICE_MEMORY_FREE_THRESHOLD_MB = EnvFloat(0)
+    # Check the free-memory threshold every N decode iterations.
+    SGLANG_DEVICE_MEMORY_RELEASE_INTERVAL = EnvInt(8)
+    # Directory that receives torch.cuda.memory_snapshot() JSON dumps
+    # (one per release, plus a baseline snapshot). Empty disables snapshots.
+    SGLANG_DEVICE_MEMORY_SNAPSHOT_DIR = EnvStr("")
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
