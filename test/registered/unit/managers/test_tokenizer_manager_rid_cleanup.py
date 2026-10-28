@@ -52,6 +52,62 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
+
+class TestResponseAbortOwnership(unittest.IsolatedAsyncioTestCase):
+    async def _run_cleanup(self, *, replace_during_delay=False, already_reused=False):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        old = SimpleNamespace(rid="reused-rid", is_single=True)
+        current = SimpleNamespace(obj=old)
+        manager.rid_to_state = {old.rid: current}
+        manager.abort_request = Mock()
+        if already_reused:
+            manager.rid_to_state[old.rid] = SimpleNamespace(obj=object())
+
+        async def delay(seconds):
+            if replace_during_delay:
+                manager.rid_to_state[old.rid] = SimpleNamespace(obj=object())
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.asyncio.sleep", side_effect=delay
+        ):
+            await manager.create_abort_task(old)()
+        return manager
+
+    async def test_disconnected_response_cancels_its_own_request(self):
+        manager = await self._run_cleanup()
+        manager.abort_request.assert_called_once_with("reused-rid")
+
+    async def test_old_cleanup_does_not_cancel_retry_started_during_delay(self):
+        manager = await self._run_cleanup(replace_during_delay=True)
+        manager.abort_request.assert_not_called()
+
+    async def test_old_cleanup_does_not_cancel_already_reused_rid(self):
+        manager = await self._run_cleanup(already_reused=True)
+        manager.abort_request.assert_not_called()
+
+    async def test_batch_cleanup_only_cancels_owned_items(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        items = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
+
+        class Batch:
+            is_single = False
+            rid = [item.rid for item in items]
+
+            def __getitem__(self, index):
+                return items[index]
+
+        manager.rid_to_state = {
+            "a": SimpleNamespace(obj=items[0]),
+            "b": SimpleNamespace(obj=object()),
+        }
+        manager.abort_request = Mock()
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.asyncio.sleep", new=AsyncMock()
+        ):
+            await manager.create_abort_task(Batch())()
+        manager.abort_request.assert_called_once_with("a")
+
+
 # ---------------------------------------------------------------------------
 # Per-request field defaults for BatchStrOutput construction.
 # Categorised by value shape so that _make_batch_str_output can assign

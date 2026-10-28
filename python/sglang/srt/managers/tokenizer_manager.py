@@ -2428,10 +2428,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
-            for rid in rids:
-                if rid in self.rid_to_state:
-                    self.abort_request(rid)
+            requests = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+            for request in requests:
+                state = self.rid_to_state.get(request.rid)
+                # A retry may already have reused the RID after this response
+                # ended. Its state belongs to a different request object.
+                if state is not None and state.obj is request:
+                    self.abort_request(request.rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)

@@ -7,6 +7,7 @@ acknowledgement goes on its response ring instead.
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,6 +23,23 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestHealthCheckSignal(CustomTestCase):
+    def test_dead_pd_receiver_reaches_scheduler_error_path(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        check_health = MagicMock(side_effect=RuntimeError("receiver exited"))
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(check_worker_health=check_health)
+        )
+        with self.assertRaisesRegex(RuntimeError, "receiver exited"):
+            scheduler._check_disaggregation_worker_health()
+
+    def test_other_backends_and_non_pd_schedulers_are_unchanged(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._check_disaggregation_worker_health()
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace()
+        )
+        scheduler._check_disaggregation_worker_health()
+
     def _scheduler(self, rust_server, pending) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
         s.rust_server = rust_server

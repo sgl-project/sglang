@@ -2184,6 +2184,13 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
+    def _check_disaggregation_worker_health(self):
+        queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        if queue is not None:
+            check_health = getattr(queue.kv_manager, "check_worker_health", None)
+            if check_health is not None:
+                check_health()
+
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
@@ -2194,6 +2201,9 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        # An unexpected receiver exit must reach the scheduler's fatal-error
+        # path, rather than leave HTTP health green while all KV handshakes stall.
+        self._check_disaggregation_worker_health()
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (

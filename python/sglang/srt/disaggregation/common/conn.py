@@ -398,7 +398,7 @@ class CommonKVManager(BaseKVManager):
             zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
         )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            self._zmq_ctx, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip, restrict_peers=True
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 

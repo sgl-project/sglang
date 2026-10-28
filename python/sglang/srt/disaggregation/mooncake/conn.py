@@ -2973,78 +2973,98 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                if self._handle_abort_notification(waiting_req_bytes):
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
-                            )
-                        )
-                        self._init_dcp_pack_buffers_once(
-                            decode_kv_args.dst_dcp_size, include_draft=True
-                        )
-                    layout_mismatch = self._publish_peer_registration(
-                        mooncake_session_id, decode_kv_args
-                    )
-                    if layout_mismatch is not None:
-                        logger.error(
-                            "Rejecting state transfers to decode session %s: %s",
-                            mooncake_session_id,
-                            layout_mismatch,
-                        )
-                    else:
-                        logger.debug(
-                            f"Register KVArgs from {mooncake_session_id} successfully"
-                        )
-                    continue
-                else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
+                self._handle_prefill_bootstrap_message(waiting_req_bytes)
 
         t = threading.Thread(target=bootstrap_thread, daemon=True)
+        self._bootstrap_thread = t
         t.start()
         self._worker_threads.append(t)
+
+    def check_worker_health(self):
+        thread = getattr(self, "_bootstrap_thread", None)
+        if thread is not None and not self._stopped and not thread.is_alive():
+            raise RuntimeError(
+                "Mooncake prefill bootstrap receiver exited unexpectedly"
+            )
+
+    def _handle_prefill_bootstrap_message(self, waiting_req_bytes: List[bytes]):
+        try:
+            room = waiting_req_bytes[0].decode("ascii")
+            if (
+                room in ("WATERMARK", "STAGING_RSP")
+                and getattr(self, "_staging_ctx", None) is None
+            ):
+                raise ValueError("Staging control received without staging enabled")
+            if room == "WATERMARK":
+                handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                return
+            if room == "STAGING_RSP":
+                handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                return
+            if self._handle_abort_notification(waiting_req_bytes):
+                return
+            mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+            if room == "None":
+                decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+            else:
+                # Parse the complete message before publishing any room state.
+                transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                room = transfer_info.room
+                if room < 0 or transfer_info.required_dst_info_num <= 0:
+                    raise ValueError("Invalid bootstrap room or destination count")
+        except (ValueError, IndexError, struct.error) as exc:
+            # Do not log peer bytes: metadata may include addresses or user data.
+            logger.warning(
+                "Dropping malformed PD bootstrap metadata: %s (%d frames)",
+                type(exc).__name__,
+                len(waiting_req_bytes),
+            )
+            return
+
+        if room == "None":
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size,
+                decode_kv_args.dst_dcp_rank,
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                num_entries = len(self.kv_args.kv_item_lens)
+                num_draft = self.kv_args.num_draft_entries
+                dst_item_lens: List[Optional[int]] = [
+                    decode_kv_args.dst_kv_item_len
+                ] * (num_entries - num_draft) + [None] * num_draft
+                decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                    dst_item_lens,
+                    decode_kv_args.dst_dcp_size,
+                )
+                self._init_dcp_pack_buffers_once(
+                    decode_kv_args.dst_dcp_size, include_draft=True
+                )
+            layout_mismatch = self._publish_peer_registration(
+                mooncake_session_id, decode_kv_args
+            )
+            if layout_mismatch is not None:
+                logger.error(
+                    "Rejecting state transfers to decode session %s: %s",
+                    mooncake_session_id,
+                    layout_mismatch,
+                )
+            else:
+                logger.debug(f"Register KVArgs from {mooncake_session_id} successfully")
+            return
+
+        room_infos = self.transfer_infos.setdefault(room, {})
+        room_infos[mooncake_session_id] = transfer_info
+        if len(room_infos) == transfer_info.required_dst_info_num:
+            self.resolve_kv_replica_factor(room_infos)
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in room_infos.values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
+            )
+            self.update_status(room, KVPoll.WaitingForInput)
 
     def start_decode_thread(self):
         recv = self._make_worker_recv(self.server_socket)
