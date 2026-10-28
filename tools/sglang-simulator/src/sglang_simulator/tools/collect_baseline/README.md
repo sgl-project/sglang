@@ -41,7 +41,7 @@ arrival; subsequent entries measure time between output-producing steps.
 `client_created_time` in sampling `custom_params`, when supplied in Unix seconds,
 is preferred as the normalized arrival timestamp.
 
-Step timing synchronizes the device before and after `Scheduler.run_batch`.
+Step timing synchronizes the device before and after `Scheduler.launch_step`.
 Features are captured before execution; start/end step timestamps use
 `perf_counter`. This requires `--disable-overlap-schedule` and changes execution
 timing. The initial scope is ordinary text generation, not speculative decoding

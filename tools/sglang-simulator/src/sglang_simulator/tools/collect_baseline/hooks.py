@@ -274,9 +274,11 @@ class SchedulerCollectionHook(BaseHook):
         from sglang.srt.managers.utils import is_health_check_generate_req
 
         original_input = target.process_input_requests
-        original_run = target.run_batch
+        # The scheduler launches each step's forward through launch_step.
+        original_run = target.launch_step
         original_result = target.process_batch_result
-        original_profiler = target.init_profiler
+        # The profiler manager is built with the scheduler's parts.
+        original_profiler = target.init_loop_state
 
         @wraps(original_input)
         def process_input(
@@ -286,7 +288,7 @@ class SchedulerCollectionHook(BaseHook):
             return original_input(self, recv_reqs, *args, **kwargs)
 
         @wraps(original_run)
-        def run_batch(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+        def launch_step(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
             if not COLLECTION_STATE.active:
                 return original_run(self, batch, *args, **kwargs)
 
@@ -362,13 +364,13 @@ class SchedulerCollectionHook(BaseHook):
         @wraps(original_profiler)
         def init_profiler(self: Any, *args: Any, **kwargs: Any) -> Any:
             result = original_profiler(self, *args, **kwargs)
-            self.profiler_manager._profile = _handle_profile_request
+            self.parts.profiler_manager._profile = _handle_profile_request
             return result
 
         target.process_input_requests = process_input
-        target.run_batch = run_batch
+        target.launch_step = launch_step
         target.process_batch_result = process_result
-        target.init_profiler = init_profiler
+        target.init_loop_state = init_profiler
 
 
 _FRONTEND_HOOKS_INSTALLED = False
