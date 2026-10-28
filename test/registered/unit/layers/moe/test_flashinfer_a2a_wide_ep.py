@@ -8,8 +8,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-    _max_tokens_per_scattered_source,
     _max_tokens_for_namespace,
+    _max_tokens_per_scattered_source,
 )
 from sglang.srt.layers.quantization import fp8  # noqa: F401
 from sglang.test.ci.ci_register import register_cuda_ci
