@@ -20,6 +20,7 @@ TOOL_CALL_PARSER_NAMES = [
     "glm",
     "glm45",
     "glm47",
+    "flint",
     "gpt-oss",
     "k2_horizon",
     "kimi_k2",
