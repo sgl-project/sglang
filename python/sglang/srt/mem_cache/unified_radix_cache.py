@@ -24,6 +24,11 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    fold_u64,
+    get_shm_exchange,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -111,15 +116,23 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
@@ -153,6 +166,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -301,6 +315,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        # Host backups of restores whose host-to-device copies may still be in
+        # flight, each with its copy's finish event; their host slots are
+        # returned once the copy has finished.
+        self._pending_restore_backups: list[tuple[object, RetractionBackup]] = []
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -314,6 +332,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Session of the insert whose actions are being applied (see ``insert``).
+        self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -410,6 +430,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # In-flight restores still read their host slots; finish them first.
+        self._discard_restore_backups()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -613,11 +635,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        return self._finalize_match_result(params, result)
+
+    def _finalize_match_result(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if self.linker is not None and params.req is not None:
+        # PD decode has no linker load-back path, so it only offloads.
+        if (
+            self.linker is not None
+            and params.req is not None
+            and get_disagg().disaggregation_mode != "decode"
+        ):
             result = self.linker.match(params.key, params.req, result)
         return result
 
@@ -645,6 +677,8 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
+        # External linker offloads (BackupKV) issued by this insert carry its session.
+        self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -657,7 +691,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 step = self.tree_core.resume_insert()
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
-            self._apply_cache_actions(self.tree_core.end_insert())
+            try:
+                self._apply_cache_actions(self.tree_core.end_insert())
+            finally:
+                self.insert_session_id = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
@@ -825,6 +862,13 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             self._drain_host_frees(host_frees)
 
+    def _apply_eviction_result(self, result: BaseEvictionResult) -> None:
+        """Drain a tree step before the next allocator-dependent decision."""
+        try:
+            self._free_values(result.device_frees, result.host_frees)
+        finally:
+            self._apply_cache_actions(result.cache_actions)
+
     def _accumulate_tracker(
         self,
         tracker: dict[ComponentType, int],
@@ -842,7 +886,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if result.mamba_backup_node_id is not None:
             assert component_type == ComponentType.MAMBA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # Reserve a host state slot and wait for the backup acknowledgment
             # before freeing device state. If allocation fails, eviction still
@@ -856,7 +903,10 @@ class UnifiedRadixCache(BasePrefixCache):
         elif result.swa_backup_node_id is not None:
             assert component_type == ComponentType.SWA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # The backup can cover several unbacked SWA segments. Reserve host
             # space for the whole window before copying it, then resume eviction
@@ -868,7 +918,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(needed, ComponentType.SWA)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_swa_state_eviction(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -883,7 +933,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -895,7 +945,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
         """Demote a backed-up node, consuming its step result."""
         result = self.tree_core.demote(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         self._accumulate_tracker(tracker, result.tracker)
 
     def _drop_subtree_no_host(
@@ -903,7 +953,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
         result = self.tree_core.drop_subtree_no_host(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if result.is_dropped:
             self._record_dropped_tokens(
                 result.tracker.get(BASE_COMPONENT_TYPE, 0), reason="host_pressure"
@@ -1072,7 +1122,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable or lock is None or lock.swa_released:
             return
         result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         lock.swa_released = True
 
     def release_swa_prefix_lock(self, req: Req) -> None:
@@ -1099,6 +1149,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
+
+    def free_kv_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
+        # A restore's host-to-device copy may still be writing this row's
+        # pages; they must not return to the allocator before it finishes.
+        self._finish_restore(kv)
+        super().free_kv_row(kv, ranges)
 
     def claim_kv_row(self, req: Req) -> bool:
         # Retraction also enters here: retain its ticket until actual finish.
@@ -1401,7 +1457,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----
@@ -1482,8 +1538,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     window_indices
                 )
             )
-            assert bool((swa_indices > 0).all()), (
-                f"unmapped SWA window positions for request {req.rid}"
+            # Checked on the device: a host-side check would wait for the GPU.
+            torch._assert_async(
+                (swa_indices > 0).all(),
+                f"unmapped SWA window positions for request {req.rid}",
             )
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
@@ -1512,6 +1570,29 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return 0
         return self.evict_host(num_tokens)
+
+    def _discard_restore_backups(self) -> None:
+        """Wait for every pending restore copy and return its host slots."""
+        for finish_event, backup in self._pending_restore_backups:
+            finish_event.synchronize()
+            self.discard_kv_cache_backup(backup)
+        self._pending_restore_backups = []
+
+    def _finish_restore(self, kv: ReqKvInfo) -> None:
+        """Wait for the copy restoring ``kv``'s row, if any, and return its host
+        slots. Host capacity changes only here and when the cache is reset, at
+        points every rank reaches alike, never when one rank's copy happens to
+        finish."""
+        event = kv.restore_done_event
+        if event is None:
+            return
+        event.synchronize()
+        kv.restore_done_event = None
+        for i, (finish_event, backup) in enumerate(self._pending_restore_backups):
+            if finish_event is event:
+                del self._pending_restore_backups[i]
+                self.discard_kv_cache_backup(backup)
+                return
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1554,6 +1635,17 @@ class UnifiedRadixCache(BasePrefixCache):
         return backup
 
     def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+        self.start_restore_kv_cache(req, backup)
+        # Order later work on this stream after the copy instead of blocking
+        # the scheduler on it: the forward is ordered behind this stream.
+        device_module.current_stream().wait_event(req.kv.restore_done_event)
+
+    def start_restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+        """Start copying ``backup`` into ``req``'s row without ordering later
+        work after the copy; the row may be read once ``req.kv.restore_done_event``
+        has completed. Page moves and frees wait for the copy as for a HiCache
+        load; the host slots stay reserved until finish_restore_kv_cache, or
+        freeing the row (free_kv_row), returns them after the copy."""
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1597,8 +1689,15 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
-        completion.finish_event.synchronize()
-        self.discard_kv_cache_backup(backup)
+        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
+            (id(self), "restore"), completion.finish_event
+        )
+        req.kv.restore_done_event = completion.finish_event
+        self._pending_restore_backups.append((completion.finish_event, backup))
+
+    def finish_restore_kv_cache(self, req: Req) -> None:
+        """Return the host slots of ``req``'s restore once its copy has finished."""
+        self._finish_restore(req.kv)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
@@ -1711,9 +1810,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Preserve the ordinary controller API when no shard owner is present.
+        start_owner = self.tree_core.rotation_phase_of(node_id)
+        shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            flush=False,
+            **shard_kwargs,
         )
 
     def _track_write_through_node(
@@ -3397,6 +3503,18 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
+        exchange = self._shm_count_exchange()
+        if exchange is not None:
+            values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
+            # Storage adds a count per extra host pool; a row wider than the table
+            # takes the gloo reduce below.
+            if len(values) <= exchange.width:
+                rows = exchange.allgather(values)
+                assert all(row[-2:] == rows[0][-2:] for row in rows), (
+                    "write_back duplicate-reclaim victims diverged across TP ranks"
+                )
+                mins = [min(col) for col in zip(*rows)]
+                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3424,6 +3542,24 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pool_names,
         )
 
+    def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
+        # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
+        if self.pp_size > 1 or self.cache_controller is None:
+            return None
+        groups = [
+            g
+            for g in (self.attn_cp_group, self.attn_tp_group)
+            if g is not None and torch.distributed.get_world_size(group=g) > 1
+        ]
+        if len(groups) > 1:
+            return None
+        group = (
+            groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
+        )
+        # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
+        # the request broadcast stays on gloo there, a one-source broadcast does not gain.
+        return get_shm_exchange(group, "hicache", multihost=True)
+
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
     ) -> None:
@@ -3434,7 +3570,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing(wait_for_forward=True)
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()

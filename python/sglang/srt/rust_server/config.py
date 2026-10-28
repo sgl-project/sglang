@@ -17,6 +17,8 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -114,9 +116,14 @@ def _build_server_args(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
+        hicache_storage_backend=get_memory().hicache_storage_backend,
+        hicache_storage_backend_extra_config=get_memory().hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy=get_memory().hicache_storage_prefetch_policy,
+        hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
         # The shared field is also populated for legacy SMG mode; only forward
@@ -125,6 +132,9 @@ def _build_server_args(
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
@@ -192,13 +202,34 @@ def _build_server_args(
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
         accelerator=_accelerator_name(),
         num_accelerators=_num_accelerators_per_dp_rank(),
+        metrics=(
+            _build_metrics_config(ext) if get_observability().enable_metrics else None
+        ),
+    )
+
+
+def _build_metrics_config(ext: ModuleType):
+    """What the Rust server needs to record ``TokenizerMetricsCollector``'s
+    families as Python does, and where every process's samples live."""
+    obs = get_observability()
+
+    def token_buckets(rule: Optional[List[str]]) -> Optional[List[float]]:
+        # The default rule keeps the Rust side's copy of Python's defaults.
+        if not rule or rule[0] == "default":
+            return None
+        return generate_buckets(rule, [])
+
+    return ext.MetricsConfig(
         # Every process writes its prometheus_client samples under this
         # directory (set before the schedulers start); `/metrics` merges them.
-        metrics=(
-            ext.MetricsConfig(multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
-            if get_observability().enable_metrics
-            else None
-        ),
+        multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        labels=tokenizer_metric_labels(),
+        priority_label=get_schedule().enable_priority_scheduling,
+        bucket_time_to_first_token=obs.bucket_time_to_first_token,
+        bucket_inter_token_latency=obs.bucket_inter_token_latency,
+        bucket_e2e_request_latency=obs.bucket_e2e_request_latency,
+        bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
+        bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
     )
 
 

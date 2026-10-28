@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import (
+    async_h2d,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_hip,
@@ -58,9 +59,9 @@ import hashlib
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
-from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from typing import (
@@ -125,6 +126,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -151,6 +153,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
@@ -340,31 +343,6 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
-
-
-class Modality(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    AUDIO = auto()
-
-    @staticmethod
-    def from_str(modality_str: str):
-        try:
-            return Modality[modality_str.upper()]
-        except KeyError:
-            raise ValueError(
-                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
-            )
-
-    @staticmethod
-    def all():
-        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
-
-
-class MultimodalInputFormat(Enum):
-    NORMAL = auto()
-    PROCESSOR_OUTPUT = auto()
-    PRECOMPUTED_EMBEDDING = auto()
 
 
 # Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
@@ -992,10 +970,17 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # Per entry of the ping-pong buffer: True where it holds no slot (-1).
+    mamba_ping_pong_empty: Optional[list[bool]] = None
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -1163,14 +1148,16 @@ class Req(ReqDllmMixin):
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
+        self._think_start_match_len = 0
 
-        # Only custom logit processors need the "__req__" reference cycle.
+        # Only custom logit processors read "__req__", and the reference is weak
+        # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
-                "__req__": self
+                "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
@@ -1201,6 +1188,8 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Owned by Scheduler.defer_response until its completion is retired.
+        self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
@@ -2091,6 +2080,7 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_ping_pong_empty = None
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
@@ -2275,6 +2265,30 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
 
+    def update_self_opened_reasoning_tokens(
+        self, token_id, think_start_ids, think_end_ids
+    ):
+        """Count reasoning the model opens itself; an output not opening with the start tag has none."""
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        consumed = 0
+        while self._think_start_match_len < len(think_start_ids):
+            if consumed == len(token_id):
+                return
+            if token_id[consumed] != think_start_ids[self._think_start_match_len]:
+                self._is_reasoning_over = True
+                return
+            self._think_start_match_len += 1
+            consumed += 1
+            if self._think_start_match_len == len(think_start_ids):
+                self.reasoning_tokens += len(think_start_ids)
+
+        self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -2286,8 +2300,17 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    track_position: int
     track_seqlen: int
+
+
+def _gather_mamba_track_indices(
+    ping_pong_mapping: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    track_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Each request's ping-pong slot id at its track position, read on the device."""
+    return ping_pong_mapping[req_pool_indices, track_positions]
 
 
 def mamba_lazy_spec_in_window(
@@ -2311,10 +2334,7 @@ def set_mamba_track_indices_from_reqs(
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare).
     """
-    req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
@@ -2332,17 +2352,9 @@ def set_mamba_track_indices_from_reqs(
         i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
     ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    idx = (
-        torch.tensor(
-            track_positions,
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    positions = async_h2d(track_positions, dtype=torch.int64, device=mapping.device)
+    batch.mamba_track_indices = _gather_mamba_track_indices(
+        mapping, batch.req_pool_indices, positions
     )
     if freed_rows:
         # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
@@ -2533,6 +2545,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
+    # Per engram layer, the rows the scheduler staged (EngramRowStager).
+    engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -2918,7 +2932,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
         mamba_track_mask_cpu = []
-        mamba_track_indices_cpu = []
+        mamba_track_positions_cpu = []
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
@@ -2991,7 +3005,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if get_exec().mamba.enable_mamba_extra_buffer:
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
-                mamba_track_indices_cpu.append(track_entry.track_index)
+                mamba_track_positions_cpu.append(track_entry.track_position)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
 
             if self.return_logprob:
@@ -3098,21 +3112,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
+            # Ping-pong slot ids live on the device; gather them there.
+            track_positions = torch.tensor(
+                mamba_track_positions_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
+            self.mamba_track_indices = _gather_mamba_track_indices(
+                self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                self.req_pool_indices,
+                track_positions,
             )
             self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
+                mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
             self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+                mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -3174,9 +3188,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -3228,7 +3240,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
-            track_index=track_index,
+            track_position=track_position,
             track_seqlen=mamba_track_seqlen,
         )
 
@@ -3627,7 +3639,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            if buf[other_idx].item() != -1:
+            if not req.kv.mamba_ping_pong_empty[other_idx]:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
@@ -3688,7 +3700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
+            has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None

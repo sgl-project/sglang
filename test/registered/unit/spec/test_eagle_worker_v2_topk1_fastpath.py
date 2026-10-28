@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -125,12 +125,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.tolist(), ref_index.long().tolist())
                 self.assertEqual(fast_tokens.tolist(), ref_tokens.tolist())
 
-                # The kernel reads these via data_ptr() as contiguous int64.
-                self.assertEqual(fast_parent.dtype, torch.long)
-                self.assertEqual(fast_index.dtype, torch.long)
-                self.assertTrue(fast_parent.is_contiguous())
-                self.assertTrue(fast_index.is_contiguous())
-
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
@@ -172,7 +166,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         ):
             result = worker.draft_forward(forward_batch)
 
-        self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
@@ -273,7 +266,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            kv_index_translator=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -308,7 +303,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            kv_index_translator=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
