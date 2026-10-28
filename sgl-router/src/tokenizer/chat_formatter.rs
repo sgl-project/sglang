@@ -85,8 +85,9 @@ impl ChatFormatter {
             .json("tokenizer_config.json")?
             .unwrap_or_else(|| serde_json::json!({}));
         let jinja = files.text("chat_template.jinja")?;
-        let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
-            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
+        let mut formatter =
+            Self::from_tokenizer_config_with_type(cfg, jinja.as_deref(), model_type.as_deref())?
+                .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
             formatter.attach_deepseek_tokenizer(files)?;
         }
@@ -114,8 +115,19 @@ impl ChatFormatter {
     /// `chat_template.jinja` when present (transformers' precedence); `Ok(None)`
     /// when the model ships neither.
     pub fn from_tokenizer_config(
+        cfg: JsonValue,
+        chat_template_jinja: Option<&str>,
+    ) -> Result<Option<Self>> {
+        Self::from_tokenizer_config_with_type(cfg, chat_template_jinja, None)
+    }
+
+    /// [`Self::from_tokenizer_config`], with the checkpoint's `model_type` so
+    /// MiniMax-M3 is keyed on it (Python's `is_minimax_m3`) rather than the
+    /// template text.
+    pub fn from_tokenizer_config_with_type(
         mut cfg: JsonValue,
         chat_template_jinja: Option<&str>,
+        model_type: Option<&str>,
     ) -> Result<Option<Self>> {
         let config = cfg
             .as_object_mut()
@@ -163,9 +175,11 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`, which knows
-        // them by their template.
-        let processor = ProcessorFormatter::from_tokenizer_config(&cfg)
+        // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`. M3 is
+        // keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`), the
+        // others on their template.
+        let processor =
+            ProcessorFormatter::from_tokenizer_config_with_type(&cfg, model_type)
             .ok()
             .filter(|formatter| {
                 matches!(

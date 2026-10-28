@@ -81,4 +81,42 @@ mod tests {
             );
         }
     }
+
+    /// MiniMax-M3's request validation is a hard error, not a decline: Python
+    /// rejects these with 400 (`_validate_minimax_m3_request`), and sglang-server
+    /// has no engine to fall back to — so they must not reach the generic
+    /// template, which would serve a late `root` or an unanswered tool call.
+    #[test]
+    fn minimax_m3_validation_errors_do_not_fall_back() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sglang-processor/tests/fixtures/parity/minimax-m3.1-flash.json"
+        );
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let template = fixture["chat_template"].as_str().unwrap();
+        let formatter = checkpoint_formatter(&fixture["config"], template);
+        assert!(matches!(formatter, ChatFormatter::MiniMaxM3(_)));
+
+        // An assistant tool call answered by a *second*, unpaired tool message:
+        // `_validate_minimax_m3_request` rejects it (tool calls and results must
+        // pair up), so rendering must fail rather than fall back to the template.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "foo", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "r"},
+                {"role": "tool", "tool_call_id": "b", "content": "extra"},
+            ],
+        });
+        let request: CreateChatCompletionRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        match render_chat(&formatter, body, &request, &HashMap::new()) {
+            Err(TemplateError::Renderer { .. }) => {}
+            Err(other) => panic!("expected a Renderer error, got {other:?}"),
+            Ok(_) => panic!("an unpaired tool message must not render"),
+        }
+    }
 }

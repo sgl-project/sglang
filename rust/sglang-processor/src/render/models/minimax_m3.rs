@@ -51,7 +51,7 @@ pub(crate) fn render(
         return Err("messages must be an array".into());
     };
     let mut messages: Vec<Value> = messages.into_iter().map(engine_message).collect();
-    validate(&request, &messages)?;
+    validate(&request, &messages).map_err(RenderError::Failed)?;
     let args = template_args(&request, defaults)?;
     let tools = template_tools(&request)?;
     for message in &mut messages {
@@ -70,7 +70,9 @@ pub(crate) fn render(
     if messages.is_empty() {
         return Err("no messages to render".into());
     }
-    messages.iter_mut().for_each(join_text_parts);
+    for message in &mut messages {
+        join_text_parts(message)?;
+    }
     if messages
         .iter()
         .chain(tools.iter().flatten())
@@ -209,7 +211,9 @@ fn template_args(
         .iter()
         .find(|key| kwargs.contains_key(**key))
     {
-        return Err(RenderError::Declined(format!("chat_template_kwargs.{key}")));
+        // Python's `apply_chat_template` rejects these rather than rendering a
+        // different template, so this is a request error (400), not a decline.
+        return Err(RenderError::Failed(format!("chat_template_kwargs.{key}")));
     }
     // `render_jinja_template` raises unless `documents` iterates as dicts.
     if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
@@ -391,14 +395,20 @@ fn template_message(mut message: Value) -> Result<Value, RenderError> {
 }
 
 /// The template concatenates text parts, where Dynamo joins them with newlines.
-fn join_text_parts(message: &mut Value) {
-    if let Some(parts) = message["content"].as_array() {
-        message["content"] = parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<String>()
-            .into();
+///
+/// A non-empty parts list whose texts join to `""` is truthy in the template's
+/// `{%- if message.content -%}` checks — Python hands it the list, so a system
+/// or root message renders an empty block rather than the default prompt.
+/// Joining it to `""` would be falsy, so decline instead of mis-rendering.
+fn join_text_parts(message: &mut Value) -> Result<(), RenderError> {
+    if let Some(parts) = message["content"].as_array().filter(|parts| !parts.is_empty()) {
+        let text: String = parts.iter().filter_map(|part| part["text"].as_str()).collect();
+        if text.is_empty() {
+            return Err(RenderError::Declined("content parts with no text".into()));
+        }
+        message["content"] = text.into();
     }
+    Ok(())
 }
 
 /// The template context SGLang builds, as the request Dynamo renders.
