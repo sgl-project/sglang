@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -72,10 +73,9 @@ def make_metadata_backend():
     backend = object.__new__(MambaAttnBackendBase)
     backend.device = "cpu"
     backend.topk = 1
-    backend.req_to_token_pool = SimpleNamespace(
-        get_mamba_indices=lambda rows: rows,
-        translate_mamba_indices=lambda slots: slots,
-    )
+    backend.req_to_token_pool = SimpleNamespace(get_mamba_indices=lambda rows: rows)
+    backend.state_pool = None
+    backend._state_ids = IdSpace(key=("mamba", None))
     return backend
 
 
@@ -269,7 +269,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
             # A pass-through runner: its plan hands the batch its ids untouched.
-            kv_index_translator=SimpleNamespace(
+            runner_ids=SimpleNamespace(
                 own_plan=lambda batch: SimpleNamespace(
                     bind=lambda batch, reader, cols=None: None
                 )

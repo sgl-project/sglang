@@ -492,9 +492,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
@@ -776,7 +774,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -1077,7 +1075,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
             # tables refreshed before each replay.
-            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            layer_cache = self.state_layer_cache(layer.layer_id)
             return kda_extend_in_graph(
                 layer=layer,
                 meta=self.prefill_graph_metadata,
@@ -1092,7 +1090,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
@@ -1257,7 +1255,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = fm.retrieve_next_sibling
         retrieve_parent_token = fm.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)

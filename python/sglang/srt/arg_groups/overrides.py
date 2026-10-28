@@ -1846,10 +1846,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
     if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
+        from sglang.srt.mem_cache.kv.plan import resized_after_capture
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        if not resized_after_capture(declared_lifetime_types(model_config)):
             return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
