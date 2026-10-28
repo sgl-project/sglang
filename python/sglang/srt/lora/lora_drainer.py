@@ -14,16 +14,16 @@
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+import msgspec
 
 from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class Drain:
+class Drain(msgspec.Struct, frozen=True):
     """
     The drained adapter leaves the batch around when `anchor_req` finishes,
     freeing its slot for `starving_adapter` (None is the base model).
@@ -53,16 +53,17 @@ class LoRADrainer:
         self.max_loras_per_batch = max_loras_per_batch
         self.max_wait_time_secs = max_wait_time_secs
         self.drained_adapter_to_drain: Dict[Optional[str], Drain] = {}
-        self.running_req_ids: set[int] = set()
 
     def update_draining_state(
         self,
         waiting_queue: List[Req],
         running_reqs: List[Req],
+        *,
+        pinned_loras: Optional[set[str]] = None,
     ) -> None:
         """Ends drains that are no longer needed; starts drains for starving adapters."""
+        pinned_loras = pinned_loras or set()
         running_reqs = [req for req in running_reqs if not req.finished()]
-        self.running_req_ids = {id(req) for req in running_reqs}
         running_adapters = {req.lora_id for req in running_reqs}
         waiting_adapters = {req.lora_id for req in waiting_queue}
 
@@ -77,9 +78,10 @@ class LoRADrainer:
                 logger.debug(f"LoRA adapter {adapter} stopped draining")
                 del self.drained_adapter_to_drain[adapter]
 
-        if len(running_adapters) >= self.max_loras_per_batch:
+        # Pinned adapters reserve slots even when they have no running requests.
+        if len(running_adapters | pinned_loras) >= self.max_loras_per_batch:
             starving_adapters = self._starving_adapters(waiting_queue)
-            self._start_drains(starving_adapters, running_reqs)
+            self._start_drains(starving_adapters, running_reqs, pinned_loras)
 
     def can_schedule(self, req: Req) -> bool:
         """
@@ -94,7 +96,7 @@ class LoRADrainer:
 
         anchor_req = drain.anchor_req
         # A retracted or preempted anchor no longer makes progress.
-        if anchor_req.finished() or id(anchor_req) not in self.running_req_ids:
+        if anchor_req.finished() or anchor_req.is_retracted:
             return False
 
         return req.sampling_params.max_new_tokens <= _max_rem_tokens(anchor_req)
@@ -119,7 +121,10 @@ class LoRADrainer:
         )
 
     def _start_drains(
-        self, starving_adapters: List[Optional[str]], running_reqs: List[Req]
+        self,
+        starving_adapters: List[Optional[str]],
+        running_reqs: List[Req],
+        pinned_loras: set[str],
     ) -> None:
         # Each adapter in the batch leaves it once its request with the most tokens
         # left finishes.
@@ -136,6 +141,7 @@ class LoRADrainer:
         for starving_adapter in starving_adapters:
             if (
                 starving_adapter in running_adapters
+                or starving_adapter in pinned_loras
                 or starving_adapter in already_drained_for
             ):
                 continue
@@ -144,6 +150,7 @@ class LoRADrainer:
                 adapter
                 for adapter in running_adapters
                 if adapter not in self.drained_adapter_to_drain
+                and adapter not in pinned_loras
             ]
             if not candidates:
                 return
