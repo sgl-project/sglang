@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -296,15 +296,23 @@ def monokernel_weights_iterator(
 
 
 def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
-    """The graph key of a DECODE or TARGET_VERIFY step, else None."""
-    mode = forward_batch.forward_mode
+    """The graph key of a DECODE, TARGET_VERIFY or DRAFT_EXTEND_V2 step, else None."""
+    mode, bs = forward_batch.forward_mode, int(forward_batch.batch_size)
+    ids = forward_batch.input_ids
+    # a draft decode replay plans its metadata before its steps set input_ids
+    rows = bs if ids is None and mode.is_decode() else int(ids.shape[0])
+    return _shape_key(mode, bs, rows)
+
+
+def _shape_key(mode: ForwardMode, bs: int, rows: int) -> Optional[ShapeKey]:
     if mode.is_decode():
         name = "decode"
     elif mode.is_target_verify():
         name = "target_verify"
+    elif mode.is_draft_extend_v2():
+        name = "draft_extend"
     else:
         return None
-    bs, rows = int(forward_batch.batch_size), int(forward_batch.input_ids.shape[0])
     if bs <= 0 or rows % bs:
         return None
     return ShapeKey(forward_mode=name, batch_size=bs, tokens_per_request=rows // bs)
@@ -316,6 +324,26 @@ def is_metadata_unread(
     """Whether the monokernel forward that runs this step never reads the metadata."""
     served, unread = model.__dict__.get("_monokernel_unread_metadata", ((), ()))
     return metadata in unread and shape_key(forward_batch) in served
+
+
+def unread_capture_sizes(
+    model: torch.nn.Module,
+    metadata: StepMetadata,
+    *,
+    forward_mode: ForwardMode,
+    capture_bs: Iterable[int],
+    tokens_per_request: int,
+) -> frozenset[int]:
+    """The captured batch sizes whose graphs run the monokernel forward, which never
+    reads the metadata."""
+    served, unread = model.__dict__.get("_monokernel_unread_metadata", ((), ()))
+    if metadata not in unread:
+        return frozenset()
+    return frozenset(
+        bs
+        for bs in capture_bs
+        if _shape_key(forward_mode, bs, bs * tokens_per_request) in served
+    )
 
 
 def install_monokernel_forward(
@@ -389,31 +417,46 @@ def install_monokernel_forward(
     if reasons:
         raise ValueError(f"{FLAG}: " + "; ".join(reasons))
 
-    mode, tokens = _server_step()
-    if spec.tokens_per_request is not None:
-        tokens = spec.tokens_per_request(model)
-    capture_keys = _capture_keys(mode=mode, tokens=tokens)
-    capture_rows = {k.rows for k in capture_keys}
-    # Eager execution can use every supported width.
-    widths = tuple(
-        w
-        for w in spec.widths(isa)
-        if w % tokens == 0 and (not capture_keys or w in capture_rows)
-    )
-    served = _served_keys(mode=mode, widths=widths, tokens=tokens)
+    if spec.step_modes is not None:
+        steps = list(spec.step_modes(model))
+        if not steps:
+            # a draft spec whose kernels cannot serve this draft
+            logger.info("monokernel %s serves no step: the normal forward", spec.name)
+            return
+    else:
+        mode, tokens = _server_step()
+        if spec.tokens_per_request is not None:
+            tokens = spec.tokens_per_request(model)
+        steps = [(mode, tokens)]
+    max_rows = spec.devices[isa].max_rows.get(get_parallel().tp_size)
+    served, graphs_on = frozenset(), False
+    for mode, tokens in steps:
+        capture_keys = _capture_keys(mode=mode, tokens=tokens)
+        graphs_on = bool(capture_keys)
+        capture_rows = {k.rows for k in capture_keys}
+        # Eager execution can use every supported width.
+        mode_widths = tuple(
+            w
+            for w in spec.widths(isa)
+            if w % tokens == 0
+            and (not capture_keys or w in capture_rows)
+            and (max_rows is None or w <= max_rows)
+        )
+        served |= _served_keys(mode=mode, widths=mode_widths, tokens=tokens)
+    widths = tuple(sorted({k.rows for k in served}))
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError(f"{FLAG}: the ranks route different graph keys")
     if not served:
         raise ValueError(
-            f"{FLAG}: {spec.name} has no width for this "
-            f"server's steps ({tokens} tokens a request)"
+            f"{FLAG}: {spec.name} has no width for this server's steps {steps}"
         )
     build_context = BuildContext(
         isa=isa,
         widths=widths,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         copies=copies,
+        served=served,
     )
     build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
     built = spec.build(model, hf_config, build_context)
@@ -434,7 +477,7 @@ def install_monokernel_forward(
         build_context.deadline_s,
         _format_weight_copies(copies),
     )
-    if capture_keys:
+    if graphs_on:
         capture_tail_hooks.append(_CaptureCheck(spec=spec, isa=isa, served=served))
     else:
         # Without CUDA graphs every step runs eagerly, routed by its own key.
@@ -447,7 +490,9 @@ def install_monokernel_forward(
 
 
 class _CaptureCheck:
-    """Check the captured decode graphs, not the configured sizes, once all are in.
+    """Check each graph runner's captured graphs, not the configured sizes, once all
+    of that runner's are in (a draft model has a draft decode and a draft extend
+    runner).
 
     Logs the steps that run the monokernels, captured and eager, and refuses a
     runner none of whose graphs run them.
@@ -455,8 +500,9 @@ class _CaptureCheck:
 
     def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
         self.spec, self.isa, self.served = spec, isa, served
-        self.captured: dict[int, Optional[ShapeKey]] = {}
-        self.is_done = False
+        # runner class -> batch size -> the graph's key
+        self.captured: dict[str, dict[int, Optional[ShapeKey]]] = {}
+        self.done: set[str] = set()
 
     def __call__(
         self,
@@ -465,28 +511,33 @@ class _CaptureCheck:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        if self.is_done or not torch.cuda.is_current_stream_capturing():
+        name = type(runner).__name__
+        if name in self.done or not torch.cuda.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
-        self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
-        if not set(runner.capture_bs) <= set(self.captured):
+        captured = self.captured.setdefault(name, {})
+        captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
+        if not set(runner.capture_bs) <= set(captured):
             return
-        self.is_done = True
-        routed = [k for k in self.captured.values() if k in self.served]
+        self.done.add(name)
+        routed = [k for k in captured.values() if k in self.served]
         if not routed:
             raise ValueError(
-                f"{FLAG}: none of the "
-                f"{len(self.captured)} captured decode graphs (batch sizes "
-                f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
+                f"{FLAG}: none of the {len(captured)} graphs {name} captured (batch "
+                f"sizes {sorted(captured)}) runs {self.spec.name}'s monokernels"
             )
-        eager = _eager_keys(served=self.served, captured=self.captured.values())
+        eager = _eager_keys(
+            served={k for k in self.served if k.forward_mode == routed[0].forward_mode},
+            captured=captured.values(),
+        )
         logger.info(
-            "monokernel %s on %s runs %s (%d of %d captured decode graphs)%s; every "
-            "other step runs the standard path",
+            "monokernel %s on %s runs %s (%d of %d graphs of %s)%s; every other step "
+            "runs the standard path",
             self.spec.name,
             self.isa,
             _format_steps(routed),
             len(routed),
-            len(self.captured),
+            len(captured),
+            name,
             f", and eagerly {_format_steps(eager)}" if eager else "",
         )
 
@@ -529,18 +580,18 @@ def _install_forward(
     """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
     allowed = spec.requires.attention_backends
-    is_backend_checked = not allowed
+    # the step modes whose attention backend is checked
+    checked: set[str] = set()
 
     # Graph runners inspect the original parameters to select forward arguments.
     @functools.wraps(original)
     def forward(*args, **kwargs):
-        nonlocal is_backend_checked
         # model forwards take (input_ids, positions, forward_batch, ...)
         batch = kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         key = shape_key(batch)
         if key not in served:
             return original(*args, **kwargs)
-        if not is_backend_checked:
+        if allowed and key.forward_mode not in checked:
             # a draft runner may override the backend the launcher checked: read the
             # one this step runs on, as model dispatch does, before the first forward
             _, configured = attention_backends()
@@ -551,7 +602,7 @@ def _install_forward(
                     f"attention backend in {sorted(allowed)}, this runner's is "
                     f"{attention!r}"
                 )
-            is_backend_checked = True
+            checked.add(key.forward_mode)
         return built.forward(Plan(key=key), *args, **kwargs)
 
     model.forward = forward

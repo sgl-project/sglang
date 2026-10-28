@@ -50,10 +50,12 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_for_fp8_no_rope,
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
@@ -522,6 +524,7 @@ class DeepseekSparseAttnBackend(
     ):
         super().__init__()
         self.forward_metadata: DSAMetadata
+        self.model_runner = model_runner
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
@@ -1085,6 +1088,8 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if not in_capture and self._replay_metadata_unread(forward_batch):
+            return
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1098,6 +1103,33 @@ class DeepseekSparseAttnBackend(
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
+
+    def _replay_metadata_unread(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this replay's monokernel forward reads no metadata but, at most,
+        the page table, which is then the only one rebuilt."""
+        bs = forward_batch.batch_size
+        model = self.model_runner.model
+        if bs not in self.decode_cuda_graph_metadata or not is_metadata_unread(
+            model, forward_batch, StepMetadata.DSA_REPLAY_PLAN
+        ):
+            return False
+        metadata = self.decode_cuda_graph_metadata[bs]
+        if not is_metadata_unread(
+            model, forward_batch, StepMetadata.DSA_REPLAY_PAGE_TABLE
+        ):
+            if not forward_batch.forward_mode.is_decode():
+                return False
+            page_indices = self.req_to_token[
+                forward_batch.req_pool_indices[:bs],
+                : self._graph_page_table_width(metadata),
+            ]
+            # the attention's table: page_table_1 itself at a physical page size of 1
+            real_table = self._transform_table_1_to_real(page_indices)
+            metadata.real_page_table[
+                : real_table.shape[0], : real_table.shape[1]
+            ].copy_(real_table)
+        self.forward_metadata = metadata
+        return True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -4302,6 +4334,11 @@ class DeepseekSparseAttnMultiStepBackend:
                 )
             return
 
+        if all(
+            b._replay_metadata_unread(forward_batch)
+            for b in self.attn_backends[: self.speculative_num_steps - 1]
+        ):
+            return
         bs = forward_batch.batch_size
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(

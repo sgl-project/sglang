@@ -29,11 +29,15 @@ READS = {
         "forward_mode",
         "batch_size",
         "input_ids",
+        "is_draft_extend_v2",
     ),
     "srt/model_executor/model_runner_components/weight_updater.py": (
         '"_derived_weight_cache_error"',
     ),
     "srt/model_executor/runner/decode_cuda_graph_runner.py": ("capture_bs",),
+    # the draft model's graph runners, which run its capture tail hooks
+    "srt/speculative/eagle_draft_cuda_graph_runner.py": ("capture_bs",),
+    "srt/speculative/eagle_draft_extend_cuda_graph_runner.py": ("capture_bs",),
     "srt/runtime_context.py": ('"tp_group"',),
 }
 
