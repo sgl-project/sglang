@@ -5,7 +5,6 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 """
 
 import unittest
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -72,10 +71,12 @@ class _FakeBatch:
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(
+    tree_cache=None, decode_offload_manager=None
+) -> SchedulerBatchResultProcessor:
     kv = SimpleNamespace(
         token_to_kv_pool_allocator=None,
-        tree_cache=None,
+        tree_cache=tree_cache,
         req_to_token_pool=None,
     )
     return SchedulerBatchResultProcessor(
@@ -88,7 +89,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
             ),
             output_streamer=SimpleNamespace(),
         ),
-        decode_offload_manager=None,
+        decode_offload_manager=decode_offload_manager,
         metrics_collector=None,
         workers=SimpleNamespace(
             draft_worker=None,
@@ -271,9 +272,12 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
 
 class TestFinishedMambaSpecCheckpoint(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology(disable_overlap_schedule=True))
+
     def test_finished_checkpoint_boundaries(self):
-        processor = replace(
-            _make_processor(), tree_cache=SimpleNamespace(supports_mamba=lambda: True)
+        processor = _make_processor(
+            tree_cache=SimpleNamespace(supports_mamba=lambda: True)
         )
         cases = (
             ("grammar", [4], 1, 1, 0, False),
@@ -300,8 +304,8 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
                 req.kv.mamba_ping_pong_track_buffer = (
                     torch.arange(slots) if slots else None
                 )
-                result = _make_result(3, [3], [4, 5, 6])
-                result.num_correct_drafts_per_req_cpu = [2]
+                # Two correct drafts plus the non-draft tokens.
+                result = _make_result(3, [2 + non_draft], [4, 5, 6])
                 result.num_non_draft_tokens_per_req = non_draft
                 result.grammar_retained_tokens = [retained]
                 self.assertEqual(
@@ -327,8 +331,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             tree.supports_mamba.return_value = True
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
-            processor = replace(
-                _make_processor(),
+            processor = _make_processor(
                 tree_cache=tree,
                 decode_offload_manager=SimpleNamespace(
                     offload_kv_cache=lambda req: True

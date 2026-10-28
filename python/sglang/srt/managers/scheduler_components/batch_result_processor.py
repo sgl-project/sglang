@@ -1295,10 +1295,11 @@ class SchedulerBatchResultProcessor:
     def _mamba_can_cache_finished_req(
         self, req: Req, result: GenerationBatchResult, i: int
     ) -> bool:
+        num_correct_drafts = result.num_correct_drafts_per_req()
         if (
-            result.num_correct_drafts_per_req_cpu is None
+            num_correct_drafts is None
             or req.kv.mamba_ping_pong_track_buffer is not None
-            or not self.tree_cache.supports_mamba()
+            or not self.kv.tree_cache.supports_mamba()
         ):
             return True
 
@@ -1310,10 +1311,7 @@ class SchedulerBatchResultProcessor:
         if retained is None or retained[i] is None:
             return True
 
-        num_verified = (
-            result.num_correct_drafts_per_req_cpu[i]
-            + result.num_non_draft_tokens_per_req
-        )
+        num_verified = num_correct_drafts[i] + result.num_non_draft_tokens_per_req
         return len(retained[i]) == num_verified
 
     def _mamba_prefix_cache_update(
