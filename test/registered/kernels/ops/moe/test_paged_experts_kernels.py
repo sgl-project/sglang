@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -163,8 +164,14 @@ class TestPagedExpertsKernels(CustomTestCase):
 
         del expert
         gc.collect()
-        # Unregistering again must fail: the pages are no longer registered.
-        self.assertNotEqual(int(torch.cuda.cudart().cudaHostUnregister(ptr)), 0)
+        # Unregistering again must fail: the pages are no longer registered. In a thread of its
+        # own, as CUDA keeps the error as the thread's last error for a later call to report.
+        rc = []
+        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+        thread = threading.Thread(target=unregister)
+        thread.start()
+        thread.join()
+        self.assertNotEqual(rc[0], 0)
 
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
