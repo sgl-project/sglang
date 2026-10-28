@@ -1,5 +1,5 @@
-"""DFLASH and DSPARK must honor repetition/frequency/presence penalties and
-min_tokens, which they silently ignored (sgl-project/sglang#46752)."""
+"""DFLASH and DSPARK must not silently drop request penalties at verify
+(sgl-project/sglang#46752); like EAGLE, they cumulate one token per step."""
 
 import unittest
 from types import SimpleNamespace
@@ -40,6 +40,7 @@ DRAFT_TOKEN_NUM = 3
 REPETITION_PENALTIES = (2.0, 1.0)
 FREQUENCY_PENALTIES = (0.5, 1.5)
 LAST_OUTPUT_TOKENS = (5, 1)
+GRAMMAR_BANNED_TOKEN = 3
 
 
 def _make_req(repetition_penalty, frequency_penalty, last_output_token):
@@ -87,7 +88,8 @@ def _verify_logits(bs):
 
 
 class TestDFlashVerifyAppliesPenalties(CustomTestCase):
-    def _assert_matches_spec_penalty_semantics(self, batch, sampling_info):
+    def _assert_matches_spec_penalty_semantics(self, grammar_mask=None):
+        batch = _make_penalized_batch()
         orchestrator = batch.sampling_info.penalizer_orchestrator
         orchestrator.cumulate_output_tokens(torch.tensor(LAST_OUTPUT_TOKENS))
         logits = _verify_logits(len(batch.reqs))
@@ -95,9 +97,14 @@ class TestDFlashVerifyAppliesPenalties(CustomTestCase):
         orchestrator.apply(expected, repeat=DRAFT_TOKEN_NUM)
         self.assertFalse(torch.equal(expected, logits))
 
+        sampling_info = batch.sampling_info.copy_for_forward()
+        if grammar_mask is not None:
+            sampling_info.grammar_mask = grammar_mask
+            grammar_mask.apply(expected)
+
         apply_dflash_verify_logits_adjustments(
             next_token_logits=logits,
-            sampling_info=sampling_info(batch.sampling_info),
+            sampling_info=sampling_info,
             draft_token_num=DRAFT_TOKEN_NUM,
         )
 
@@ -106,14 +113,16 @@ class TestDFlashVerifyAppliesPenalties(CustomTestCase):
     def test_scheduler_handoff_penalties_reach_every_verify_row(self):
         """Every verify row gets its request's penalties from the
         copy_for_forward() sampling info the scheduler hands the worker."""
-        self._assert_matches_spec_penalty_semantics(
-            _make_penalized_batch(), lambda info: info.copy_for_forward()
-        )
+        self._assert_matches_spec_penalty_semantics()
 
-    def test_live_penalizer_keeps_multiplicative_penalties(self):
-        """repetition_penalty survives when a live penalizer reaches verify."""
+    def test_grammar_mask_keeps_repetition_penalty(self):
+        """A grammar-constrained batch keeps repetition_penalty at verify."""
         self._assert_matches_spec_penalty_semantics(
-            _make_penalized_batch(), lambda info: info
+            grammar_mask=SimpleNamespace(
+                apply=lambda logits: logits[:, GRAMMAR_BANNED_TOKEN].fill_(
+                    float("-inf")
+                )
+            )
         )
 
 

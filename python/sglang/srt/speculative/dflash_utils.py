@@ -220,9 +220,8 @@ def apply_dflash_verify_logits_adjustments(
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while broadcasting per-request
-    penalties over the verify block instead of allocating a repeated
-    `[bs * draft_token_num, vocab]` penalty tensor every step.
+    Per-request penalties are broadcast over the verify block instead of
+    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
     """
     if sampling_info is None:
         return
@@ -249,7 +248,6 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_additive_penalties = sampling_info.acc_additive_penalties
     acc_scaling_penalties = sampling_info.acc_scaling_penalties
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -261,14 +259,12 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Same order as SamplingBatchInfo.apply_logits_bias. copy_for_forward() folds
-    # the penalizer into the acc_* buffers; a live penalizer is the uncopied path.
+    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
+    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
     if acc_additive_penalties is not None:
         get_logits_3d().add_(acc_additive_penalties[:, None, :])
     if acc_scaling_penalties is not None:
         apply_scaling_penalties(get_logits_3d(), acc_scaling_penalties[:, None, :])
-    if penalizer is not None and penalizer.is_required:
-        penalizer.apply(next_token_logits, repeat=draft_token_num)
 
     if grammar_mask is not None:
         vocab_mask_bias = torch.zeros(
