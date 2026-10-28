@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
 with patch.dict(
@@ -66,7 +67,7 @@ def _construct_sparse_backend(
         device="cpu",
         decode_cuda_graph_metadata={},
         req_to_token_pool=req_pool,
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool=routed(SimpleNamespace()),
         page_size=1,
     )
     model_runner = SimpleNamespace(
@@ -364,7 +365,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             device="cpu",
             decode_cuda_graph_metadata={},
             req_to_token_pool=req_pool,
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=routed(SimpleNamespace()),
             page_size=1,
         )
         hf_config = SimpleNamespace(
@@ -632,7 +633,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(2, 1, 1))
         )
@@ -702,7 +703,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
             forward_decode=Mock(),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(1, 1, 1))
         )
@@ -772,7 +773,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(2, 1, 1))
         )
@@ -960,7 +961,9 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         pool = SimpleNamespace(get_key_buffer=lambda _layer_id: torch.empty(1, 1, 1))
 
         with (
-            patch.object(sparse_utils, "get_token_to_kv_pool", return_value=pool),
+            patch.object(
+                sparse_utils, "get_kv_layers", return_value=routed(pool).layer_router
+            ),
             patch.object(sparse_utils, "compress_k_core_new") as compress,
         ):
             sparse_utils.get_compress_k_v2(

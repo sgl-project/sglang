@@ -257,11 +257,8 @@ class DllmFlashAttention:
 
     @cache
     def _supports_layer(self, layer, dtype):
-        pool = self.backend.token_to_kv_pool
-        buffers = (
-            pool.get_key_buffer(layer.layer_id),
-            pool.get_value_buffer(layer.layer_id),
-        )
+        kv = self.backend.kv_layers.read(layer.layer_id)
+        buffers = (kv.key(), kv.value())
         return (
             layer.qk_head_dim == layer.v_head_dim
             and layer.qk_head_dim in (256, 512)

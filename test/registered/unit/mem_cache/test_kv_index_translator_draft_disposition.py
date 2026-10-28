@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_draft_pool import (
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     plan_stand_in,
@@ -365,17 +366,19 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
                 writes["loc_2d"] = cache_loc_2d
 
         attn = SimpleNamespace(
+            layer_id=0,
             kv_proj_only=lambda h: (h[:, :4], h[:, 4:]),
             apply_k_norm=lambda k: k,
             apply_k_rope=lambda pos, k: k,
             num_kv_heads=1,
             head_dim=4,
-            attn=SimpleNamespace(k_scale=None, v_scale=None),
+            attn=SimpleNamespace(layer_id=0, k_scale=None, v_scale=None),
         )
         worker = SimpleNamespace(
             model_runner=SimpleNamespace(device=torch.device(_DEV)),
             draft_model_runner=SimpleNamespace(
-                kv_index_translator=draft_translator, token_to_kv_pool=_DflashPool()
+                kv_index_translator=draft_translator,
+                token_to_kv_pool=routed(_DflashPool()),
             ),
             draft_model=SimpleNamespace(
                 project_target_hidden=lambda h: h,
@@ -423,7 +426,8 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         injector = TargetHiddenKvInjector(
             draft_model=SimpleNamespace(write_target_hidden_kv=write_target_hidden_kv),
             draft_model_runner=SimpleNamespace(
-                kv_index_translator=draft_translator, token_to_kv_pool=SimpleNamespace()
+                kv_index_translator=draft_translator,
+                token_to_kv_pool=routed(SimpleNamespace()),
             ),
             model_runner=SimpleNamespace(device=torch.device(_DEV)),
             device=torch.device(_DEV),
