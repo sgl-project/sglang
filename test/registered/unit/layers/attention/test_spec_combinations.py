@@ -14,10 +14,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config  # noqa: E402
+from sglang.srt.arg_groups.overrides import resolution_result  # noqa: E402
 from sglang.srt.layers.attention import base_attn_backend  # noqa: E402
 from sglang.srt.layers.attention import hybrid_attn_backend  # noqa: E402
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend  # noqa: E402
@@ -48,9 +50,15 @@ from sglang.srt.layers.attention.trtllm_mha_backend import (  # noqa: E402
 from sglang.srt.layers.attention.trtllm_mla_backend import (  # noqa: E402
     TRTLLMMLABackend,
 )
+from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.model_runner_components import (  # noqa: E402
     attention_backend_setup as setup,
 )
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.speculative import draft_utils  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -107,7 +115,16 @@ def _graphs(combination: SpecCombination):
         base_attn_backend,
         "get_exec",
         return_value=SimpleNamespace(
-            graph=SimpleNamespace(disable_cuda_graph=not combination.cuda_graph)
+            graph=SimpleNamespace(
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(
+                        backend=(
+                            Backend.FULL if combination.cuda_graph else Backend.DISABLED
+                        )
+                    ),
+                    prefill=PhaseConfig(backend=Backend.DISABLED),
+                )
+            )
         ),
     )
 
@@ -121,6 +138,73 @@ def _combination(mode, *, window=True, cuda_graph=True, translated=True):
     return SpecCombination(
         mode=mode, window=window, cuda_graph=cuda_graph, translated=translated
     )
+
+
+class TestResolvedGraphConfig(CustomTestCase):
+    def test_speculative_modes_follow_the_resolved_decode_backend(self):
+        cases = (
+            ({"cuda_graph_backend_decode": Backend.DISABLED}, False),
+            (
+                {
+                    "cuda_graph_config": {
+                        "decode": {"backend": Backend.DISABLED},
+                        "prefill": {"backend": Backend.FULL},
+                    }
+                },
+                False,
+            ),
+            (
+                {
+                    "disable_cuda_graph": True,
+                    "cuda_graph_backend_decode": Backend.BREAKABLE,
+                },
+                True,
+            ),
+            (
+                {
+                    "disable_cuda_graph": True,
+                    "cuda_graph_config": {"decode": {"backend": Backend.FULL}},
+                },
+                True,
+            ),
+            (
+                {
+                    "disable_decode_cuda_graph": True,
+                    "cuda_graph_config": {"decode": {"backend": Backend.FULL}},
+                },
+                True,
+            ),
+            ({"disable_decode_cuda_graph": True}, False),
+            ({"disable_cuda_graph": True}, False),
+            ({"cuda_graph_config": {"prefill": {"backend": Backend.DISABLED}}}, True),
+        )
+        for inputs, captures_decode in cases:
+            args = ServerArgs(model_path="dummy", **inputs)
+            parse_cuda_graph_config(args)
+            graph = SimpleNamespace(
+                disable_cuda_graph=args.disable_cuda_graph,
+                cuda_graph_config=resolution_result(args, "cuda_graph_config"),
+            )
+            with patch.object(
+                base_attn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+            ):
+                for mode in SpecMode:
+                    with self.subTest(inputs=inputs, mode=mode):
+                        runner = _runner(_combination(mode))
+                        self.assertEqual(
+                            SpecCombination.of_runner(runner, mode).cuda_graph,
+                            captures_decode,
+                        )
+                # Draft extend shares the decode capture phase with draft decode
+                # and target verify, even when prefill has another backend.
+                runner = _runner(_combination(SpecMode.DRAFT_EXTEND), draft=True)
+                backend = _built(FlashInferAttnBackend)
+                with self.subTest(inputs=inputs, gate="window draft extend"):
+                    if captures_decode:
+                        with self.assertRaisesRegex(ValueError, "with CUDA graphs"):
+                            backend.require_spec_mode(runner, SpecMode.DRAFT_EXTEND)
+                    else:
+                        backend.require_spec_mode(runner, SpecMode.DRAFT_EXTEND)
 
 
 class TestDeclarations(unittest.TestCase):

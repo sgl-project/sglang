@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import is_npu
@@ -104,7 +105,9 @@ class SpecCombination(msgspec.Struct, frozen=True, kw_only=True):
         return cls(
             mode=mode,
             window=window is not None and window > 0,
-            cuda_graph=not get_exec().graph.disable_cuda_graph,
+            cuda_graph=(
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            ),
             translated=model_runner.kv_index_translator.is_translating,
         )
 
