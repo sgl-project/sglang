@@ -97,7 +97,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
-            attr_name = self._get_update_attr_name()
+            attr_name = self.backend.get_update_attr_name()
             cpu_update_input = [{attr_name: sl} for sl in seq_lens_for_each_draft_step]
             return self.backend.replay_with_input_update(
                 shape_key, seq_lens=None, cpu_update_input=cpu_update_input
