@@ -48,7 +48,6 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -752,16 +751,6 @@ class _Accumulator(ABC):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
-        # Pipeline stages own different layers and do not finish their
-        # forwards together. Aggregate only within the current TP stage.
-        parallel = get_parallel()
-        self._group = parallel.tp_group.device_group if parallel.pp_size > 1 else None
-        self._root_rank = (
-            torch.distributed.get_global_rank(self._group, 0)
-            if self._group is not None
-            else 0
-        )
-
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
 
@@ -794,7 +783,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
-            self._rank = torch.distributed.get_rank(group=self._group)
+            self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
@@ -835,25 +824,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count,
-            dst=self._root_rank,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self._group,
+            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
 
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            per_layer_utilization = compute_utilization_rate(gpu_physical_count)
-            if self._group is None:
-                utilization_rate_gpu = torch.mean(per_layer_utilization)
-            else:
-                # Nonlocal PP layers have zero counts and a smoothed ratio of
-                # one. Exclude them so they do not inflate stage balancedness.
-                active_layers = gpu_physical_count.sum(dim=-1) > 0
-                utilization_rate_gpu = (
-                    torch.where(active_layers, per_layer_utilization, 0.0).sum() + 1e-5
-                ) / (active_layers.sum() + 1e-5)
+            utilization_rate_gpu = torch.mean(
+                compute_utilization_rate(gpu_physical_count)
+            )
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -1013,9 +992,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self._group,
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
         )
 
         output = dict(
@@ -1050,15 +1027,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=get_device_namespace().device,
+                device="cuda",
             )
         else:
-            avg_rate_tensor = torch.empty(
-                1, dtype=torch.float32, device=get_device_namespace().device
-            )
-        torch.distributed.broadcast(
-            avg_rate_tensor, src=self._root_rank, group=self._group
-        )
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 
