@@ -720,6 +720,11 @@ def fused_verify_topk_idx(
     )
     if out is None:
         out = torch.empty((num_heads, rows, topk), dtype=torch.int32, device=q.device)
+    else:
+        # the merge writes num_heads * rows flat rows through stride(1)
+        assert out.shape == (num_heads, rows, topk) and out.dtype == torch.int32
+        assert out.stride(2) == 1
+        assert num_heads == 1 or out.stride(0) == rows * out.stride(1)
     _verify_index_topk_merge_kernel[(num_heads * rows,)](
         part_k,
         part_n,
