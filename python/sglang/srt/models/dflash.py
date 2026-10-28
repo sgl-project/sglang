@@ -428,4 +428,12 @@ class DFlashDraftModel(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = DFlashDraftModel
+class DFlashAdaFlashDraftModel(DFlashDraftModel):
+    """AdaFlash draft model: a DFlash drafter with a verification-length head.
+
+    Registered under its own name to match the ``architectures`` field of the
+    released AdaFlash checkpoints.
+    """
+
+
+EntryClass = [DFlashDraftModel, DFlashAdaFlashDraftModel]
