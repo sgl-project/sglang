@@ -2,6 +2,7 @@
 through its named methods."""
 
 import ast
+import dataclasses
 import unittest
 import warnings
 from pathlib import Path
@@ -25,30 +26,6 @@ _LENGTH_FIELDS = {
     "component_evicted_seqlens",
 }
 _DICT_MUTATORS = {"clear", "pop", "popitem", "setdefault", "update"}
-
-# (path relative to python/sglang/srt, enclosing scope) of writers not yet
-# routed through a ReqKvInfo method.
-_ALLOWED_WRITERS = {
-    ("beam_search/fork.py", "free_member_rows"),
-    ("disaggregation/decode.py", "_bind_root_prefix"),
-    ("disaggregation/decode.py", "DecodePreallocQueue.pop_preallocated"),
-    ("disaggregation/decode.py", "DecodePreallocQueue._pre_alloc"),
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc_hisparse"),
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc"),
-    ("dllm/mixin/scheduler.py", "SchedulerDllmMixin._stash_dllm_context"),
-    ("managers/schedule_batch.py", "Req.init_next_round_input"),
-    ("managers/schedule_batch.py", "Req.reset_for_retract"),
-    ("managers/schedule_policy.py", "PrefillAdder.add_one_req"),
-    ("managers/scheduler.py", "Scheduler._get_new_batch_prefill_raw"),
-    (
-        "managers/scheduler_components/batch_result_processor.py",
-        "SchedulerBatchResultProcessor.process_batch_result_prefill",
-    ),
-    (
-        "managers/scheduler_components/batch_result_processor.py",
-        "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
-    ),
-}
 
 
 def _writes(node):
@@ -99,22 +76,14 @@ def _scan(path):
 
 class TestReqKvLengthWriters(CustomTestCase):
     def test_only_req_kv_info_methods_assign_lengths(self):
-        found, allowed_seen = [], set()
+        found = []
         for path in sorted(_SRT_DIR.rglob("*.py")):
             rel = path.relative_to(_SRT_DIR).as_posix()
             for scope, field, line in _scan(path):
-                if (rel, scope) in _ALLOWED_WRITERS:
-                    allowed_seen.add((rel, scope))
-                else:
-                    found.append(f"{rel}:{line} {scope} writes {field}")
+                found.append(f"{rel}:{line} {scope} writes {field}")
         self.assertFalse(
             found,
             "Write these lengths through a ReqKvInfo method:\n  " + "\n  ".join(found),
-        )
-        self.assertEqual(
-            _ALLOWED_WRITERS - allowed_seen,
-            set(),
-            "allowlisted writers that are gone; drop them from _ALLOWED_WRITERS",
         )
 
 
@@ -191,6 +160,51 @@ class TestReqKvLengthMethods(CustomTestCase):
                 expected = {**_lengths(kv), **changed}
                 getattr(kv, method)(*args)
                 self.assertEqual(_lengths(kv), expected)
+
+    def test_reset_for_retract_resets_only_its_subset(self):
+        kv = ReqKvInfo(
+            cache_protected_len=4,
+            cache_inserted_len=8,
+            kv_committed_len=8,
+            kv_allocated_len=10,
+            swa_evict_floor=2,
+            retraction_backup=object(),
+            restore_done_event=object(),
+            mamba_ping_pong_empty=[True, False],
+            mamba_next_track_idx=1,
+            mamba_last_track_idx=0,
+            mamba_last_track_seqlen=8,
+            mamba_prev_track_seqlen=4,
+            mamba_untracked_decode_batch_idx=3,
+            mamba_needs_clear=True,
+        )
+        kv.set_evicted_seqlen(ComponentType.SWA, 6)
+        reset = {
+            "cache_protected_len",
+            "cache_inserted_len",
+            "kv_committed_len",
+            "mamba_pool_idx",
+            "mamba_ping_pong_track_buffer",
+            "mamba_ping_pong_empty",
+            "mamba_next_track_idx",
+            "mamba_last_track_idx",
+            "mamba_last_track_seqlen",
+            "mamba_prev_track_seqlen",
+            "mamba_untracked_decode_batch_idx",
+            "mamba_cow_src_index",
+            "mamba_needs_clear",
+        }
+        fresh = ReqKvInfo()
+        before = {f.name: getattr(kv, f.name) for f in dataclasses.fields(kv)}
+        kv.reset_for_retract()
+        for name, value in before.items():
+            expected = getattr(fresh, name) if name in reset else value
+            with self.subTest(field=name):
+                self.assertEqual(getattr(kv, name), expected)
+
+        kv.req_pool_idx = 0
+        with self.assertRaises(AssertionError):
+            kv.reset_for_retract()
 
 
 if __name__ == "__main__":

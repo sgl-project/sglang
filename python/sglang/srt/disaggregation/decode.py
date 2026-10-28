@@ -165,8 +165,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.last_host_node = req.last_node
     req.best_match_node = req.last_node
     req.lock = None
-    req.kv.cache_protected_len = 0
-    req.kv.cache_inserted_len = 0
+    req.kv.clear_tree_prefix()
     req.num_matched_prefix_tokens = 0
     req.host_hit_length = 0
 
@@ -1636,7 +1635,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=num_device_preallocated + 1,
                 )
-            decode_req.req.kv.cache_protected_len = total_prefix_len
+            decode_req.req.kv.protect_prefix(total_prefix_len)
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -2264,7 +2263,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv.kv_committed_len = fill_len
+        req.kv.commit_prealloc(fill_len)
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
@@ -2403,7 +2402,7 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    req.kv.kv_allocated_len = fill_len
+    req.kv.allocate_prealloc(fill_len)
     device = allocator.device
     prefix_lens = async_h2d([0], dtype=torch.int64, device=device)
     prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
@@ -2448,7 +2447,7 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
-    req.kv.kv_allocated_len = fill_len
+    req.kv.allocate_prealloc(fill_len)
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:

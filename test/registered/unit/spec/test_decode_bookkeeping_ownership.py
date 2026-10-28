@@ -1,8 +1,9 @@
 """Ownership contract for per-request bookkeeping clocks.
 
 Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
-clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
-`spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
+clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks and the
+`ReqKvInfo` methods that write them, `spec_verify_ct`, and the
+`maybe_evict_swa()` call) must only be advanced by
 the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
 repeat any of them (the scheduler-driven free function / resolve path already
 does).
@@ -35,9 +36,25 @@ _TRACKED_ATTRS = (
     "spec_verify_ct",
 )
 _EVICT_METHOD = "maybe_evict_swa"
+# ReqKvInfo methods that write kv_committed_len / kv_allocated_len, counted
+# where a request's kv record calls them.
+_KV_WATERMARK_METHODS = (
+    "allocate_extend",
+    "allocate_decode",
+    "allocate_spec_decode",
+    "allocate_prealloc",
+    "commit_prealloc",
+    "commit_decode",
+    "commit_finished",
+    "truncate_committed",
+    "truncate",
+    "free_tail",
+    "rewind",
+)
 
 # {(path relative to srt/, scope, kind): mutation count}. Kind is the mutated
-# attribute (`= 0` resets exempt) or "evict" for a `maybe_evict_swa()` call.
+# attribute (`= 0` resets exempt), "evict" for a `maybe_evict_swa()` call, or
+# the ReqKvInfo watermark method a kv record calls.
 # Any added/removed/recounted site fails until reviewed here.
 _SB = "managers/schedule_batch.py"
 _EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
@@ -55,16 +72,31 @@ _RESOLVE = (
 )
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
+    # The watermarks are written only by ReqKvInfo's own methods.
+    (_SB, "ReqKvInfo.allocate_extend", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.allocate_extend", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.allocate_decode", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.allocate_decode", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.allocate_spec_decode", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.allocate_prealloc", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.commit_prealloc", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.commit_decode", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.commit_finished", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.truncate_committed", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.truncate", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.truncate", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.free_tail", "kv_allocated_len"): 1,
+    (_SB, "ReqKvInfo.free_tail", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.rewind", "kv_committed_len"): 1,
+    (_SB, "ReqKvInfo.rewind", "kv_allocated_len"): 1,
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_extend", "allocate_extend"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_committed_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode_default", "allocate_decode"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
@@ -80,29 +112,29 @@ _OWNER_SITES = {
     (
         "mem_cache/allocation.py",
         "alloc_for_spec_decode",
-        "kv_allocated_len",
+        "allocate_spec_decode",
     ): 1,
-    (*_RESOLVE, "kv_committed_len"): 1,
+    (*_RESOLVE, "commit_decode"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     # Mixed-chunk spec tails: the mixed prefill step commits the pending
     # bonus token, advancing the watermark by exactly that one token.
     (
         "managers/scheduler_components/batch_result_processor.py",
         "SchedulerBatchResultProcessor.process_batch_result_prefill",
-        "kv_committed_len",
+        "commit_decode",
     ): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
         "disaggregation/decode.py",
         "DecodePreallocQueue._pre_alloc",
-        "kv_committed_len",
+        "commit_prealloc",
     ): 1,
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
+    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "allocate_prealloc"): 1,
     (
         "disaggregation/decode.py",
         "alloc_for_decode_prealloc_hisparse",
-        "kv_allocated_len",
+        "allocate_prealloc",
     ): 1,
     # Beam member rows alias the leader's decode region, so releasing them
     # rewinds the leader's watermarks to keep its own per-Req release from
@@ -110,33 +142,21 @@ _OWNER_SITES = {
     (
         "beam_search/fork.py",
         "free_member_rows",
-        "kv_committed_len",
-    ): 1,
-    (
-        "beam_search/fork.py",
-        "free_member_rows",
-        "kv_allocated_len",
+        "rewind",
     ): 1,
     # A completed dLLM canvas is discarded while the context and slot stay owned.
     (
         "dllm/mixin/scheduler.py",
         "SchedulerDllmMixin._stash_dllm_context",
-        "kv_committed_len",
-    ): 1,
-    (
-        "dllm/mixin/scheduler.py",
-        "SchedulerDllmMixin._stash_dllm_context",
-        "kv_allocated_len",
+        "rewind",
     ): 1,
     # streaming session tail trimming
-    (_SS, "StreamingSession._free_tail", "kv_committed_len"): 1,
-    (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 1,
-    (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
-    (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
+    (_SS, "StreamingSession._free_tail", "free_tail"): 1,
+    (_SS, "StreamingSession._trim_overshoot", "truncate"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
-    (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    (_SS, "StreamingSession.try_cache_finished_req", "commit_finished"): 1,
     # NPU page-boundary clamp on the shared req/slot clock.
-    (_SS, "StreamingSession.try_match_prefix", "kv_committed_len"): 1,
+    (_SS, "StreamingSession.try_match_prefix", "truncate_committed"): 1,
 }
 
 
@@ -180,7 +200,21 @@ def _scan_tree(tree):
             and node.func.attr == _EVICT_METHOD
         ):
             sites[(scope, "evict")] += 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _KV_WATERMARK_METHODS
+            and _is_kv_record(node.func.value)
+        ):
+            sites[(scope, node.func.attr)] += 1
     return sites
+
+
+def _is_kv_record(node):
+    """`<expr>.kv` or a local named `kv`: a request's ReqKvInfo."""
+    return (isinstance(node, ast.Attribute) and node.attr == "kv") or (
+        isinstance(node, ast.Name) and node.id == "kv"
+    )
 
 
 def _parse(path: Path):

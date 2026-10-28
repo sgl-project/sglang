@@ -1578,7 +1578,7 @@ class PrefillAdder:
                         return admission
                 req.prefix_len += req.host_loaded_length
                 if self.tree_cache.load_back_is_cache_owned():
-                    req.kv.cache_protected_len = req.prefix_len
+                    req.kv.protect_prefix(req.prefix_len)
 
             if (
                 self.kv_shard_scratch_spec is not None

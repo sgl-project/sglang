@@ -198,8 +198,7 @@ class SchedulerDllmMixin:
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv.kv_committed_len = context_len
-        req.kv.kv_allocated_len = context_len
+        req.kv.rewind(context_len)
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
         self.stash_chunked_request(req)

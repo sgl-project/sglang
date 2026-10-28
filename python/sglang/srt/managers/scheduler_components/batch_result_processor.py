@@ -375,7 +375,7 @@ class SchedulerBatchResultProcessor:
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
                     ):
-                        req.kv.kv_committed_len += 1
+                        req.kv.commit_decode(1)
                     if req.finished():
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
@@ -828,7 +828,7 @@ class SchedulerBatchResultProcessor:
 
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
-                req.kv.kv_committed_len += num_accept_tokens
+                req.kv.commit_decode(num_accept_tokens)
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]

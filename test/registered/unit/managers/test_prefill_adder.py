@@ -9,7 +9,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -125,7 +125,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
-        req.kv = SimpleNamespace(req_pool_idx=None)
+        req.kv = ReqKvInfo()
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -1610,10 +1610,10 @@ class TestPrefillAdder(CustomTestCase):
         adder.rem_mamba_slots = available_slots
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
-        req.kv.holds_mamba = holds_state
+        req.kv.mamba_pool_idx = torch.tensor([0]) if holds_state else None
 
         def load_back(params):
-            req.kv.holds_mamba = True
+            req.kv.mamba_pool_idx = torch.tensor([0])
             return req.host_hit_length, req.last_node
 
         self.mock_tree_cache.init_load_back.side_effect = load_back
