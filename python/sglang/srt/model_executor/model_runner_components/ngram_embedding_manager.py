@@ -7,14 +7,16 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
+from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
+    from sglang.srt.layers.engram_staging import EngramRowStager
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -26,6 +28,7 @@ class NgramEmbeddingManager:
     n: int
     # Draft runners have no hasher even when their config has engram layers.
     engram_hasher: Optional[EngramHasher] = None
+    engram_stager: Optional[EngramRowStager] = None
 
     @classmethod
     def from_model(
@@ -58,7 +61,7 @@ class NgramEmbeddingManager:
                     module.init_buffers(
                         max_running_requests, chunked_prefill_size, device
                     )
-        engram_hasher = None
+        engram_hasher = engram_stager = None
         if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
 
@@ -67,11 +70,18 @@ class NgramEmbeddingManager:
                     assert engram_hasher is None, "one engram hasher per model"
                     module.init_history(req_to_token_pool.req_to_token.shape[0], device)
                     engram_hasher = module
+            if engram_hasher is not None:
+                from sglang.srt.layers.engram_staging import EngramRowStager
+
+                engram_stager = EngramRowStager.from_model(
+                    model, engram_hasher, torch.device(device)
+                )
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
             n=model_config.ngram_embedding_n,
             engram_hasher=engram_hasher,
+            engram_stager=engram_stager,
         )
 
     def update_after_decode(
@@ -115,6 +125,8 @@ class NgramEmbeddingManager:
             return batch
         if self.engram_hasher is not None:
             self._prepare_engram_history(batch)
+        if self.engram_stager is not None:
+            batch.engram_staged_rows = self.engram_stager.stage(batch)
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
@@ -122,9 +134,10 @@ class NgramEmbeddingManager:
             all_tokens = []
             column_starts = []
             request_lengths = []
-            for req in batch.reqs:
-                start = len(req.prefix_indices)
-                end = start + req.extend_range.length
+            for req, start, extend_len in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+            ):
+                end = start + extend_len
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -179,28 +192,28 @@ class NgramEmbeddingManager:
             for req in batch.reqs:
                 # full_untruncated_fill_ids is only refreshed on the extend and
                 # decode paths, which a PD decode request has not run yet.
-                fill_ids = req.origin_input_ids + req.output_ids
-                end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
-                rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
+                # Slice the tail first: origin_input_ids can be ~100k tokens.
+                tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
+                rows.append(self.engram_hasher.history_row(tail[:-1]))
+            # Pinned copies keep the admission fence from stalling the CPU.
+            slots = async_h2d(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
                 device=history.device,
             )
-            history[slots] = torch.tensor(
+            history[slots] = async_h2d(
                 rows, dtype=history.dtype, device=history.device
             ).view(len(rows), n1)
             return
         if not batch.forward_mode.is_extend_without_speculative():
             return
         rows = []
-        for req in batch.reqs:
-            start = req.extend_range.start
+        for req, start in zip(batch.reqs, batch.prefix_lens, strict=True):
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
-            rows.append([0] * (n1 - len(ids)) + list(ids))
-        batch.engram_history = torch.tensor(
+            rows.append(self.engram_hasher.history_row(ids))
+        # The forward stream waits on the schedule stream, which orders this copy.
+        batch.engram_history = async_h2d(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
         ).view(len(rows), n1)
 

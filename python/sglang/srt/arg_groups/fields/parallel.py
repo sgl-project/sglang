@@ -73,8 +73,19 @@ class Parallel(msgspec.Struct):
     dp_size: A[
         int,
         Arg(
-            help="The data parallelism size.",
+            help="The number of data-parallel replicas of the model.",
             aliases=["--data-parallel-size"],
+            resolvable=True,
+        ),
+    ] = 1
+    attn_dp_size: A[
+        int,
+        Arg(
+            help="The attention data parallelism size: the number of "
+            "data-parallel attention groups inside the TP group, one scheduler "
+            "each, while the FFN stays tensor parallel.",
+            aliases=["--attention-data-parallel-size"],
+            resolvable=True,
         ),
     ] = 1
     load_balance_method: A[
@@ -118,10 +129,10 @@ class Parallel(msgspec.Struct):
         Arg(
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
+            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
@@ -150,6 +161,17 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -159,14 +181,17 @@ class Parallel(msgspec.Struct):
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
     ] = False
-    # DP attention
-    enable_dp_attention: A[
+    enable_kv_cache_sharding: A[
         bool,
-        Arg(
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
-            resolvable=True,
-        ),
+        "Shard at-rest KV cache storage at page granularity across the group "
+        "that currently replicates it (attention-CP ranks for GQA models "
+        "under prefill CP; attention-TP ranks for MLA models), multiplying "
+        "the group's unique KV capacity. Prefill workers of PD "
+        "disaggregation only.",
     ] = False
+    # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
+    # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
+    enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
@@ -184,7 +209,7 @@ class Parallel(msgspec.Struct):
             help="Use all-to-all instead of TP all-gather followed by DP scatter "
             "for the TP-sharded LM head under DP attention. By default this is "
             "enabled only on decode-only PD nodes with pure DP attention "
-            "(tp_size == dp_size > 1 and attn_cp_size == 1), and disabled on "
+            "(tp_size == attn_dp_size > 1 and attn_cp_size == 1), and disabled on "
             "prefill-only and colocated nodes. Pass "
             "--no-enable-tp-lm-head-all-to-all to opt out. The path is "
             "incompatible with --enable-dp-lm-head; batches without an equal "
@@ -195,7 +220,10 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_attn_tp_input_scattered: A[
         bool,
-        "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        Arg(
+            help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+            resolvable=True,
+        ),
     ] = False
     enable_shared_experts_attn_tp: A[
         bool,
@@ -217,7 +245,19 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
+        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
+        "NVLink/NVSwitch.",
+    ] = False
+    enable_megamoe_for_layernorm_sp: A[
+        bool,
+        "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+        "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+        "MoE runner and all-reduce, sharing expert weights with prefill. "
+        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+        "and NVLink/NVSwitch. "
+        "No FlashInfer A2A backend is required when enabled.",
     ] = False
     disable_attn_tp_gather: A[
         bool,
@@ -279,10 +319,18 @@ class Parallel(msgspec.Struct):
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
     )
-    attn_dp_size = Derived(
-        fn="sglang.srt.runtime_context.attn_dp_size_of",
-        doc="Attention data-parallel width: `dp_size` when DP attention is "
-        "on, otherwise one.",
+    attn_dp_enabled = Derived(
+        fn="sglang.srt.runtime_context.attn_dp_enabled_of",
+        doc="Whether attention runs data parallel: `attn_dp_size` is wider "
+        "than one, or this process is an elastic EP scale joiner, which joins "
+        "an attention-DP deployment with a group of its own that may be one "
+        "rank wide.",
+    )
+    num_dp_ranks = Derived(
+        fn="sglang.srt.runtime_context.num_dp_ranks_of",
+        doc="How many data-parallel ranks the deployment serves with, one "
+        "scheduler each: `dp_size * attn_dp_size`. Elastic EP scale-up widens "
+        "it as ranks join.",
     )
     attn_dcp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dcp_size_of",

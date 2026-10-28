@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
@@ -20,12 +22,19 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
 )
+from sglang.srt.hardware_backend.npu.moe.routing import (
+    INT8_QUANT_MODE,
+    npu_moe_finalize_routing,
+    npu_moe_init_routing,
+    quant_mode_dtype,
+)
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
@@ -36,6 +45,8 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
     has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
 
+    if config.activation == "situ":
+        return False
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if has_clamp:
@@ -53,6 +64,19 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     return kernel.use_fused_gmm1
 
 
+def _reshape_received_scale(received_scale: torch.Tensor) -> torch.Tensor:
+    """Normalize communicated MX scales, including zero-row receives."""
+    if received_scale.ndim == 3 and received_scale.shape[-1] == 2:
+        return received_scale
+    if received_scale.ndim != 2 or received_scale.shape[1] % 2 != 0:
+        raise RuntimeError(
+            f"invalid communicated MoE scale shape: {tuple(received_scale.shape)}"
+        )
+    return received_scale.reshape(
+        received_scale.shape[0], received_scale.shape[1] // 2, 2
+    )
+
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -64,9 +88,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
+    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
@@ -126,8 +154,8 @@ class AscendRunnerCore(MoeRunnerCore):
             # activation step — run() skips it. Left None on purpose so that
             # reaching for it fails loudly instead of silently applying an
             # unfused swiglu to already-requantised activations. This holds
-            # for both dispatchers: ascend_tp gets its activation quant fused
-            # into routing, DeepEP dispatches bf16 and gmm1 quantises it
+            # for every transport: the no-A2A path gets its activation quant
+            # fused into routing, DeepEP dispatches bf16 and gmm1 quantises it
             # itself.
             self.activation = None
         elif (
@@ -136,8 +164,9 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
-        elif get_moe_a2a_backend().is_deepep():
-            # DeepEP path: use a unified kernel that decides quantisation
+        elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
+            # DeepEP / Ascend Ops path: the dispatcher hands over tokens grouped
+            # by expert, so use a unified kernel that decides quantisation.
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
@@ -168,7 +197,7 @@ class AscendRunnerCore(MoeRunnerCore):
                     limit=config.gemm1_clamp_limit,
                 )
         else:
-            # Non‑DeepEP (ascend_tp) path
+            # Non-DeepEP, no-A2A routing path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
                 inner = NPUSwigluQuant()
@@ -300,17 +329,208 @@ class AscendQuantInfo(MoeQuantInfo):
 # ---------------------------------------------------------------------------
 
 
-@register_pre_permute("ascend_tp", "ascend")
-def pre_permute_ascend_tp_to_ascend(
-    dispatch_output: AscendTPDispatchOutput,
+def _routing_layer(runner_config: MoeRunnerConfig):
+    """The layer the Ascend routing state lives on.
+
+    ``AscendRunnerCore`` reads ``config.layer`` for its kernels, so the permute
+    hooks can rely on it too; fail loudly instead of silently routing nothing.
+    """
+    layer = getattr(runner_config, "layer", None)
+    if layer is None:
+        raise RuntimeError("Ascend MoE routing requires runner_config.layer to be set.")
+    return layer
+
+
+@register_pre_permute("standard", "ascend")
+def pre_permute_standard_to_ascend(
+    dispatch_output: StandardDispatchOutput,
     quant_info: AscendQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
+    """Sort tokens by expert and (optionally) quantize them in the same op."""
+    # Imported here, not at module scope: ``topk`` pulls in eplb/observability/
+    # disaggregation, which imports ``configs.model_config`` while it is still
+    # initializing (model_config -> quantization -> ... -> this module).
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    topk_output = dispatch_output.topk_output
+    if not TopKOutputChecker.format_is_standard(topk_output):
+        raise NotImplementedError(
+            "Ascend MoE routing requires a standard top-k output, got "
+            f"{type(topk_output).__name__}."
+        )
+    if dispatch_output.hidden_states_pre_quant is not None:
+        raise NotImplementedError(
+            "Ascend MoE routing quantizes inside npu_moe_init_routing_v2 and "
+            "cannot consume a pre-quantized routed input."
+        )
+
+    layer = _routing_layer(runner_config)
+    hidden_states = dispatch_output.hidden_states
+    topk_weights = topk_output.topk_weights.to(hidden_states.dtype)
+    topk_ids = topk_output.topk_ids.to(torch.int32)
+
+    quant_mode, tp_all_gather, group_list_type = ascend_dispatch.get_routing(layer)
+
+    routed = npu_moe_init_routing(
+        hidden_states,
+        topk_ids,
+        runner_config.num_experts,
+        quant_mode=quant_mode,
+        active_num=topk_ids.numel(),
+    )
+
+    running_state["ascend_routing"] = {
+        "expanded_row_idx": routed.expanded_row_idx,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "tp_all_gather": tp_all_gather,
+    }
+
     return AscendRunnerInput(
-        hidden_states=dispatch_output.hidden_states,
-        hidden_states_scale=dispatch_output.hidden_states_scale,
-        expert_tokens=dispatch_output.expert_tokens,
+        hidden_states=routed.hidden_states,
+        hidden_states_scale=routed.scale,
+        expert_tokens=routed.expert_tokens,
+        group_list_type=group_list_type,
+    )
+
+
+@register_pre_permute("ascend_ops", "ascend")
+def pre_permute_ascend_ops_to_ascend(
+    dispatch_output: AscendOpsDispatchOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    """Regroup the communicated rows into local-expert order."""
+    mode = dispatch_output.exec_mode
+    if mode == "alltoallv":
+        return _pre_permute_alltoallv(dispatch_output, runner_config, running_state)
+    if mode == "allgather":
+        return _pre_permute_allgather(dispatch_output, runner_config, running_state)
+    if mode == "mc2":
+        # Decode MC2 dispatch already groups rows per expert.
+        if dispatch_output.forward_state is None:
+            raise RuntimeError("MC2 dispatch output is missing forward state")
+        running_state["ascend_ops_forward_state"] = dispatch_output.forward_state
+        return AscendRunnerInput(
+            hidden_states=dispatch_output.hidden_states,
+            hidden_states_scale=dispatch_output.hidden_states_scale,
+            expert_tokens=dispatch_output.expert_tokens.to(torch.int64),
+            group_list_type=dispatch_output.group_list_type,
+        )
+    raise NotImplementedError(f"unknown ascend_ops exec mode {mode!r}")
+
+
+def _pre_permute_alltoallv(
+    dispatch_output: AscendOpsDispatchOutput,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    """Regroup the a2a-received rows into local-expert order.
+
+    A second scale-reusing routing pass does the regrouping; with a single
+    local expert the wire order already is expert order.
+    """
+    received = dispatch_output.hidden_states
+    received_scale = dispatch_output.hidden_states_scale
+    recv_counts = dispatch_output.recv_counts
+    if recv_counts is None:
+        raise RuntimeError("alltoallv dispatch output is missing recv_counts")
+    num_local_experts = runner_config.num_local_experts
+    quant_mode = dispatch_output.quant_mode
+
+    local_counts = recv_counts.reshape(-1)
+    local_ids = (
+        torch.arange(num_local_experts, dtype=torch.int32, device=received.device)
+        .repeat(recv_counts.shape[0], 1)
+        .reshape(-1)
+    )
+    local_ids = torch.repeat_interleave(local_ids, local_counts).view(-1, 1)
+
+    if quant_mode not in (-1, INT8_QUANT_MODE) and received_scale is not None:
+        received_scale = _reshape_received_scale(received_scale)
+
+    if num_local_experts > 1 and received.shape[0] > 0:
+        routed = npu_moe_init_routing(
+            received,
+            local_ids,
+            num_local_experts,
+            quant_mode=quant_mode,
+            scale=received_scale,
+        )
+        local_permuted = routed.hidden_states
+        local_expanded_row_idx = routed.expanded_row_idx
+        local_scale = routed.scale
+    else:
+        local_permuted = received
+        local_expanded_row_idx = torch.arange(
+            received.shape[0], dtype=torch.int32, device=received.device
+        )
+        local_scale = received_scale
+
+    if quant_mode != -1 and num_local_experts > 1:
+        local_permuted = local_permuted.view(quant_mode_dtype(quant_mode))
+
+    state = dispatch_output.forward_state
+    if state is None:
+        raise RuntimeError("alltoallv dispatch output is missing forward state")
+    state.local_expanded_row_idx = local_expanded_row_idx
+    running_state["ascend_ops_forward_state"] = state
+    return AscendRunnerInput(
+        hidden_states=local_permuted,
+        hidden_states_scale=local_scale,
+        expert_tokens=recv_counts.sum(dim=0).to(torch.int64),
+        group_list_type=dispatch_output.group_list_type,
+    )
+
+
+def _pre_permute_allgather(
+    dispatch_output: AscendOpsDispatchOutput,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    """Keep only the local-expert routes and group them by expert.
+
+    Non-local routes get weight 0 and the sentinel expert id
+    ``num_local_experts`` — never -1, which corrupts expert counts even at
+    weight zero.
+    """
+    num_local_experts = runner_config.num_local_experts
+    topk_ids = dispatch_output.topk_ids
+    local_ids = topk_ids - runner_config.moe_ep_rank * num_local_experts
+    is_local = (local_ids >= 0) & (local_ids < num_local_experts)
+    topk_weights = dispatch_output.topk_weights.masked_fill(~is_local, 0)
+    local_ids = local_ids.masked_fill(~is_local, num_local_experts)
+
+    routed = npu_moe_init_routing(
+        dispatch_output.hidden_states,
+        local_ids,
+        num_local_experts,
+        quant_mode=dispatch_output.quant_mode,
+        scale=dispatch_output.hidden_states_scale,
+        active_num=local_ids.numel(),
+    )
+    # Dropped routes must not read garbage: point their reverse-mapping rows
+    # at the last capacity row, which the post-permute zeroes before finalize.
+    expanded_row_idx = routed.expanded_row_idx.masked_fill(
+        ~is_local.reshape(-1), local_ids.numel() - 1
+    )
+
+    state = dispatch_output.forward_state
+    if state is None:
+        raise RuntimeError("allgather dispatch output is missing forward state")
+    state.topk_weights = topk_weights
+    state.expanded_row_idx = expanded_row_idx
+    state.topk_ids = local_ids
+    state.expert_tokens = routed.expert_tokens
+    state.num_routes = local_ids.numel()
+    running_state["ascend_ops_forward_state"] = state
+    return AscendRunnerInput(
+        hidden_states=routed.hidden_states,
+        hidden_states_scale=routed.scale,
+        expert_tokens=routed.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
     )
 
@@ -371,16 +591,110 @@ def pre_permute_deepep_ll_to_ascend(
     )
 
 
-@register_post_permute("ascend", "ascend_tp")
-def post_permute_ascend_to_ascend_tp(
+@register_post_permute("ascend", "standard")
+def post_permute_ascend_to_standard(
     runner_output: AscendRunnerOutput,
     quant_info: AscendQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> AscendTPCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
+) -> StandardCombineInput:
+    """Weighted top-k sum of the grouped expert output back into ``[T, H]``."""
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+    )
 
-    return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
+    state = running_state.pop("ascend_routing")
+    final_hidden_states = npu_moe_finalize_routing(
+        runner_output.hidden_states,
+        state["expanded_row_idx"],
+        topk_weights=state["topk_weights"],
+        topk_ids=state["topk_ids"],
+    )
+    if state["tp_all_gather"] and get_parallel().tp_size > 1:
+        # GGUF keeps full, non-intermediate-sharded expert weights, so the
+        # hidden dim must be gathered back after finalize.
+        final_hidden_states = tensor_model_parallel_all_gather(
+            final_hidden_states, dim=-1
+        )
+
+    return StandardCombineInput(hidden_states=final_hidden_states)
+
+
+@register_post_permute("ascend", "ascend_ops")
+def post_permute_ascend_to_ascend_ops(
+    runner_output: AscendRunnerOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendOpsCombineInput:
+    """Undo the pre-permute's regrouping before the dispatcher's combine."""
+    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+        AscendOpsCombineInput,
+        _AllGatherState,
+        _AllToAllVState,
+    )
+
+    state = running_state.pop("ascend_ops_forward_state", None)
+    if state is None:
+        raise RuntimeError("Ascend Ops dispatch output is missing forward state")
+    if isinstance(state, _AllToAllVState):
+        local_expanded_row_idx = state.local_expanded_row_idx
+        if local_expanded_row_idx is None:
+            raise RuntimeError("alltoallv forward state is missing local row map")
+        hidden_states = runner_output.hidden_states
+        if runner_config.num_local_experts > 1 and hidden_states.shape[0] > 0:
+            hidden_states = npu_moe_finalize_routing(
+                hidden_states, local_expanded_row_idx
+            )
+    elif isinstance(state, _AllGatherState):
+        hidden_states = _allgather_weighted_sum(runner_output, runner_config, state)
+    else:
+        # MC2 / decode: the combine op applies the top-k weights itself.
+        hidden_states = runner_output.hidden_states
+    return AscendOpsCombineInput(
+        hidden_states=hidden_states,
+        forward_state=state,
+    )
+
+
+def _allgather_weighted_sum(
+    runner_output: AscendRunnerOutput,
+    runner_config: MoeRunnerConfig,
+    state,
+) -> torch.Tensor:
+    """Weighted top-k sum over the full gathered route capacity.
+
+    Finalize mode 2 requires the full ``[global_tokens * top_k, hidden]``
+    shape; unused capacity rows are zeroed so dropped routes never read NaN.
+    """
+    if (
+        state.num_routes is None
+        or state.expert_tokens is None
+        or state.expanded_row_idx is None
+        or state.topk_weights is None
+        or state.topk_ids is None
+    ):
+        raise RuntimeError("allgather forward state is incomplete")
+    hidden_states = runner_output.hidden_states
+    expert_output = torch.zeros(
+        (state.num_routes, runner_config.hidden_size),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    expert_output[: hidden_states.shape[0]].copy_(hidden_states)
+    unused_rows = (
+        torch.arange(expert_output.shape[0], device=expert_output.device)
+        >= state.expert_tokens.sum()
+    )
+    expert_output.masked_fill_(unused_rows[:, None], 0)
+    # Keep weighted expert sums in FP32 across ranks: rounding each rank's
+    # partial output to BF16 before the ReduceScatter loses precision.
+    return npu_moe_finalize_routing(
+        expert_output,
+        state.expanded_row_idx,
+        topk_weights=state.topk_weights,
+        topk_ids=state.topk_ids,
+    )
 
 
 @register_post_permute("ascend", "deepep_normal")

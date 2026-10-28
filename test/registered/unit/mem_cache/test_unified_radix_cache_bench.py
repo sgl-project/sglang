@@ -28,18 +28,22 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=26, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -221,6 +225,10 @@ def create_bench_cache(
             need_sort=False,
         )
 
+    if req_to_token_pool.mamba_pool is not None:
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
+
     # --- tree ---
     backend_override = (
         envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(_TREE_CORE_TEST_BACKEND)
@@ -234,7 +242,9 @@ def create_bench_cache(
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,
                 disable=False,
-                tree_components=components,
+                tree_slots=tree_slots_of(
+                    components, window=sliding_window_size if has_swa else None
+                ),
                 sliding_window_size=sliding_window_size if has_swa else None,
             )
         )
@@ -252,7 +262,7 @@ def create_bench_cache(
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
     return tree, allocator, req_to_token_pool, make_req
@@ -507,7 +517,7 @@ def bench_match_prefix(
         k = RadixKey(array("q", q))
         r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
         r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
-        assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
+        assert r1.device_prefix_len == r2.device_prefix_len, "match not idempotent"
 
     warmup = min(20, len(queries) // 10)
     return bench_api(
@@ -592,7 +602,7 @@ def bench_lock_unlock(
     )
 
 
-def bench_cache_finished(
+def bench_release(
     num_seqs=5000,
     chunk_len=256,
     kv_size=500_000,
@@ -600,9 +610,9 @@ def bench_cache_finished(
     verify=False,
     page_size=1,
 ):
-    """cache_finished_req throughput — full request lifecycle.
+    """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → cache_finished_req.
+    Simulates: match_prefix → lock → alloc → fill req_to_token → checkpoint + free + unlock.
     """
     env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 
@@ -611,7 +621,7 @@ def bench_cache_finished(
     for seq in env.seqs:
         key = RadixKey(array("q", seq))
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
-        matched_len = len(mr.device_indices)
+        matched_len = mr.device_prefix_len
         node = mr.last_device_node
         lr = env.tree.inc_lock_ref(node)
 
@@ -624,35 +634,33 @@ def bench_cache_finished(
                     lr.to_dec_params(),
                 )
                 continue
-            kv_indices = torch.cat([mr.device_indices, v])
+            kv_indices = torch.cat(
+                [env.tree.path_device_indices(mr.last_device_node), v]
+            )
         else:
-            kv_indices = mr.device_indices
+            kv_indices = env.tree.path_device_indices(mr.last_device_node)
 
         req = env.make_req()
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "to_dec_params"):
-            req.lock_receipt = lr.to_dec_params()
+            req.lock = TreeLock(node, lr.to_dec_params())
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
     if not req_items:
-        return BenchResult("cache_finished", 0, 0, 0, [])
+        return BenchResult("release", 0, 0, 0, [])
 
     warmup = min(20, len(req_items) // 10)
     return bench_api(
-        "cache_finished",
+        "release",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(
-            req, owned_kv_len=req.kv.kv_committed_len
-        ),
+        lambda req: finish_req(env.tree, req, req.kv.kv_committed_len),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
@@ -669,7 +677,7 @@ ALL_BENCHMARKS = {
     "match": bench_match_prefix,
     "evict": bench_evict,
     "lock": bench_lock_unlock,
-    "cache_finished": bench_cache_finished,
+    "release": bench_release,
 }
 
 
@@ -791,8 +799,8 @@ class _BenchSuite:
     def test_bench_lock_unlock(self):
         self._run(bench_lock_unlock)
 
-    def test_bench_cache_finished(self):
-        self._run(bench_cache_finished)
+    def test_bench_release(self):
+        self._run(bench_release)
 
 
 for _cfg in _CI_BENCH_CONFIGS:
@@ -837,7 +845,7 @@ def _run_bench_cli():
         "--benchmarks",
         nargs="+",
         default=["all"],
-        help="insert match evict lock cache_finished all",
+        help="insert match evict lock release all",
     )
     args, _ = parser.parse_known_args()
 

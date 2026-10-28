@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import os
+import platform
 import resource
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu, is_xpu
 
 
 def is_cuda_v2():
@@ -138,6 +139,19 @@ class BaseEnv:
 
         for k, v in env_info.items():
             print(f"{k}: {v}")
+
+
+class CPUEnv(BaseEnv):
+    """Environment checker for CPU-only systems."""
+
+    def get_info(self):
+        return {
+            "CPU Architecture": platform.machine(),
+            "CPU Count": os.cpu_count(),
+        }
+
+    def get_topology(self):
+        return {}
 
 
 class GPUEnv(BaseEnv):
@@ -294,6 +308,31 @@ class HIPEnv(BaseEnv):
             }
         except subprocess.SubprocessError:
             return {}
+
+
+class XPUEnv(BaseEnv):
+    """Environment checker for Intel XPU."""
+
+    def get_info(self):
+        xpu_info = {"XPU available": torch.xpu.is_available()}
+
+        if xpu_info["XPU available"]:
+            xpu_info["XPU count"] = torch.xpu.device_count()
+            xpu_info.update(self.get_device_info())
+
+        return xpu_info
+
+    def get_device_info(self):
+        devices = defaultdict(list)
+        for k in range(torch.xpu.device_count()):
+            devices[torch.xpu.get_device_name(k)].append(str(k))
+
+        return {
+            f"XPU {','.join(device_ids)}": name for name, device_ids in devices.items()
+        }
+
+    def get_topology(self):
+        return {}
 
 
 class NPUEnv(BaseEnv):
@@ -580,15 +619,21 @@ class MPSEnv(BaseEnv):
         return {}
 
 
-if __name__ == "__main__":
+def _get_env():
     if is_cuda_v2():
-        env = GPUEnv()
-    elif is_hip():
-        env = HIPEnv()
-    elif is_npu():
-        env = NPUEnv()
-    elif is_musa():
-        env = MUSAEnv()
-    elif is_mps():
-        env = MPSEnv()
-    env.check_env()
+        return GPUEnv()
+    if is_hip():
+        return HIPEnv()
+    if is_npu():
+        return NPUEnv()
+    if is_musa():
+        return MUSAEnv()
+    if is_xpu():
+        return XPUEnv()
+    if is_mps():
+        return MPSEnv()
+    return CPUEnv()
+
+
+if __name__ == "__main__":
+    _get_env().check_env()

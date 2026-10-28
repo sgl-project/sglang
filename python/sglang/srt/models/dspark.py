@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Callable, Iterable, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    MarkovGreedyStep,
-)
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+    recommended_max_tokens,
+)
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -25,10 +32,90 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
 
 logger = logging.getLogger(__name__)
 
-StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+# fp8 target lm_head GEMM for the DSPARK verify logits, opt-in via
+# SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
+# [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-decode-step cost
+# that grows with the verify batch; running it in fp8 (per-token activation
+# scale + per-output-channel weight scale) roughly halves that GEMM. The weight
+# is fp8-quantized once and cached on the module. Evaluated once at import to
+# keep the per-token decode path free of env lookups.
+#
+# Platform guard: the fp8 _scaled_mm path is validated on gfx95x (MI355X). On
+# gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
+# arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
+# (the flag stays inert) rather than silently hitting the accuracy issue.
+_DSPARK_FP8_LM_HEAD = (
+    envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
+)
+if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
+    logger.warning(
+        "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
+        "supported on gfx95x; keeping the bf16 head matmul on this device."
+    )
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+
+
+def _fp8_quant_per_row(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row (dim=-1) symmetric fp8 quant. Returns (fp8 tensor, float32 scale [rows,1])."""
+    amax = x.abs().amax(dim=-1, keepdim=True).to(torch.float32).clamp_(min=1e-6)
+    scale = amax / _FP8_MAX
+    x_fp8 = (x.to(torch.float32) / scale).clamp_(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return x_fp8, scale
+
+
+def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """logits = hidden @ weight.T computed in fp8 via torch._scaled_mm."""
+    weight = lm_head.weight  # [N(vocab_slice), K(hidden)]
+    w_fp8 = getattr(lm_head, "_fp8_weight_cache", None)
+    w_scale = getattr(lm_head, "_fp8_wscale_cache", None)
+    if w_fp8 is None or w_fp8.shape != weight.shape:
+        w_fp8, w_scale = _fp8_quant_per_row(weight)  # [N,K], [N,1]
+        lm_head._fp8_weight_cache = w_fp8
+        lm_head._fp8_wscale_cache = w_scale
+    h_fp8, h_scale = _fp8_quant_per_row(hidden)  # [M,K], [M,1]
+    # a=[M,K] fp8, b=[K,N] fp8 (col-major via .t()); scale_a per-row [M,1],
+    # scale_b per-col [1,N]. Output cast back to hidden dtype.
+    return torch._scaled_mm(
+        h_fp8,
+        w_fp8.t(),
+        scale_a=h_scale,
+        scale_b=w_scale.t(),
+        out_dtype=hidden.dtype,
+    )
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and n & (n - 1) == 0
+
+
+class FusedKvWriteBundle(msgspec.Struct, frozen=True):
+    """Per-pool state of the fused draft K norm + RoPE + KV write."""
+
+    project: Callable[[torch.Tensor], torch.Tensor]
+    meta: torch.Tensor
+    k_norm_weights: torch.Tensor
+    cos_sin: torch.Tensor
+    eps: float
+    num_layers: int
+    kv_size: int
+    head_dim: int
+    rotary_dim: int
+    is_neox_style: bool
+
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def gather_and_crop_vocab(
@@ -45,46 +132,60 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
+    if (
+        _DSPARK_FP8_LM_HEAD
+        and weight.is_floating_point()
+        and hidden.shape[0] > 0
+        and weight.shape[-1] % 16 == 0
+    ):
+        return _fp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
-def run_markov_block(
-    head: nn.Module,
-    base_logits: torch.Tensor,
-    *,
-    first_prev_tokens: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    sampler: StepSampler,
-    collect_corrected: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    batch_size, proposal_len = base_logits.shape[:2]
-    if proposal_len == 0:
-        empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-        return empty, base_logits
+class VocabShard(msgspec.Struct, frozen=True):
+    """Where a rank's vocab slice starts, and the gather over its group."""
 
-    sampled_tokens = []
-    corrected_logits = []
-    prev_tokens = first_prev_tokens.long()
-    for step_idx in range(proposal_len):
-        step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
-        )
-        next_tokens = sampler(step_logits, step_idx)
-        sampled_tokens.append(next_tokens)
-        if collect_corrected:
-            corrected_logits.append(step_logits.unsqueeze(1))
-        prev_tokens = next_tokens
-    return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-    )
+    start: int
+    gather: VocabGather
 
 
-class VanillaMarkov(nn.Module):
-    markov_head_type = "vanilla"
+class BaseDSparkMarkovHead(nn.Module, ABC):
+    """Corrects a draft block step by step: each step's base logits get a bias
+    computed from the token drafted at the step before."""
+
+    vocab_size: int
+    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
+    vocab_shard: Optional[VocabShard] = None
+
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        del hidden_states
+        return None
+
+    @abstractmethod
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return this step's bias and the state the next step reads."""
+
+    @abstractmethod
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        """The dtype of ``base_logits + bias``."""
+
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        """The w2 weight when the bias is exactly the GEMV of the previous
+        token's embedding, for the fused greedy kernel; otherwise None."""
+        return None
+
+
+class VanillaMarkov(BaseDSparkMarkovHead):
+    # This rank's lm_head vocab rows of markov_w2; None biases the whole vocab.
+    _w2_rows: Optional[slice] = None
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
         super().__init__()
@@ -97,91 +198,80 @@ class VanillaMarkov(nn.Module):
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
+    def configure_tp_shard(self, *, lm_head: nn.Module, prefer_nvlink: bool) -> None:
+        """Bias only this rank's lm_head vocab slice; each step then exchanges
+        per-block candidates instead of the base logits being gathered whole."""
+        if int(lm_head.org_vocab_size) != self.vocab_size:
+            raise ValueError(
+                "DSpark markov_w2 TP-shard requires lm_head.org_vocab_size == "
+                f"markov vocab_size, got {int(lm_head.org_vocab_size)} vs "
+                f"{self.vocab_size}."
+            )
+        tp_size = int(lm_head.tp_size)
+        per_partition = int(lm_head.num_embeddings_per_partition)
+        # Follow lm_head's group: attn_tp_group under a DP lm_head.
+        parallel = get_parallel()
+        group = (
+            parallel.attn_tp_group
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else parallel.tp_group
+        )
+        if group.world_size != tp_size:
+            raise ValueError(
+                "DSpark markov_w2 TP-shard needs the step gather group to equal "
+                f"the lm_head shard group, got {group.world_size} vs {tp_size}. "
+                "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
+            )
+        start = int(lm_head.shard_indices.org_vocab_start_index)
+        end = int(lm_head.shard_indices.org_vocab_end_index)
+        self._w2_rows = slice(start, end)
+        gather = make_vocab_gather(
+            group,
+            local_width=per_partition,
+            dtype=self.step_logits_dtype(lm_head.weight.dtype),
+            prefer_nvlink=prefer_nvlink,
+        )
+        if group.rank_in_group == 0:
+            logger.info(f"DSpark markov_w2 vocab gather: {type(gather).__name__}")
+        self.vocab_shard = VocabShard(start=start, gather=gather)
+
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
 
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
 
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias comes out in the embedding's dtype.
+        return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
-    def apply_step_logits(
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        return logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if base_logits.size(-2) == 0:
-            return base_logits
-        return base_logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
+        state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
+        del hidden_states
+        latent = self.get_prev_embeddings(prev_tokens)
+        if self._w2_rows is None:
+            return self.project_bias(latent), state
+        return F.linear(latent, self.markov_w2.weight[self._w2_rows]), state
 
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Greedy-only draft-block sampling via the fused per-step
-        [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
-        markov_w2 per step instead of GEMV + add + two-pass argmax, and no
-        full-vocab bias/step-logits materialization.
-
-        Only valid for the vanilla step bias (bias = w2 @ w1[prev]); subclasses
-        whose step bias depends on hidden state override this to return None so
-        the caller falls back to sample_block.
-        """
-        if not base_logits.is_cuda:
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        # The fused kernel picks a token from its own columns, no cross-rank exchange.
+        if self._w2_rows is not None or not self._bias_is_w2_gemv():
             return None
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            return torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-        sampled_tokens = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_embeds = self.get_prev_embeddings(prev_tokens)
-            prev_tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits[:, step_idx, :],
-                prev_embeds=prev_embeds,
-                w2_weight=self.markov_w2.weight,
-            )
-            sampled_tokens.append(prev_tokens)
-        return torch.stack(sampled_tokens, dim=1)
+        return self.markov_w2.weight
+
+    def _bias_is_w2_gemv(self) -> bool:
+        # The fused kernel recomputes this class's bias; a subclass that changes
+        # it keeps the shared op.
+        cls = type(self)
+        return (
+            cls.step_bias is VanillaMarkov.step_bias
+            and cls.project_bias is VanillaMarkov.project_bias
+        )
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -218,8 +308,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-    markov_head_type = "gated"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
@@ -235,31 +323,21 @@ class GatedMarkovHead(VanillaMarkov):
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
 
-    def compute_step_bias(
+    def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
+        *,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        gate = self.compute_gate(token_ids, hidden_states).to(
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        prev_embeddings = self.get_prev_embeddings(prev_tokens)
+        gate = self.compute_gate(prev_tokens, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
-        return self.project_bias(gate * prev_embeddings)
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        # The gated step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
-        return None
+        return self.project_bias(gate * prev_embeddings), state
 
 
 class RNNHead(VanillaMarkov):
-    markov_head_type = "rnn"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.hidden_size = int(hidden_size)
@@ -280,94 +358,28 @@ class RNNHead(VanillaMarkov):
         bias = self.project_bias(torch.tanh(output_raw))
         return new_state, bias
 
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        state = torch.zeros_like(prev_embeddings)
-        _, bias = self._rnn_step(state, prev_embeddings, hidden_states)
-        return bias
-
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        block_size = base_logits.size(-2)
-        if block_size == 0:
-            return base_logits
-        leading_shape = base_logits.shape[:-2]
-        state = torch.zeros(
-            *leading_shape,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        output_logits = []
-        for k in range(block_size):
-            prev_emb = self.get_prev_embeddings(token_ids[..., k])
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[..., k, :])
-            output_logits.append(base_logits[..., k, :] + bias)
-        return torch.stack(output_logits, dim=-2)
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            empty = torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-            return empty, base_logits
-
-        state = torch.zeros(
-            batch_size,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        sampled_tokens = []
-        corrected_logits = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_emb = self.get_prev_embeddings(prev_tokens)
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
-            step_logits = base_logits[:, step_idx, :] + bias
-            next_tokens = sampler(step_logits, step_idx)
-            sampled_tokens.append(next_tokens)
-            if collect_corrected:
-                corrected_logits.append(step_logits.unsqueeze(1))
-            prev_tokens = next_tokens
-        return (
-            torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-        )
-
-    def sample_block_greedy_fused(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        # The recurrent step bias depends on hidden state; the fused vanilla
-        # kernel does not apply.
-        return None
+        if hidden_states is None:
+            raise ValueError("RNNHead requires hidden_states.")
+        return torch.zeros(
+            hidden_states.shape[0],
+            self.markov_rank,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        prev_emb = self.get_prev_embeddings(prev_tokens)
+        state, bias = self._rnn_step(state, prev_emb, hidden_states)
+        return bias, state
 
 
 def build_markov_head(config) -> Optional[nn.Module]:
@@ -426,7 +438,6 @@ class DSparkConfidenceHead(nn.Module):
         self.register_buffer(
             "sts_temperatures", torch.ones((), dtype=torch.float32), persistent=False
         )
-        self._last_confidence_raw: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -448,8 +459,29 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(features).squeeze(-1)
 
     def apply_sts(self, confidence_raw: torch.Tensor) -> torch.Tensor:
-        self._last_confidence_raw = confidence_raw
         return torch.sigmoid(confidence_raw.float() / self.sts_temperatures)
+
+    def predict(
+        self,
+        features: torch.Tensor,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        markov_head: BaseDSparkMarkovHead,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The [bs, gamma] confidence of a drafted block and its raw logit."""
+        bs, gamma = draft_tokens.shape
+        if self.with_markov:
+            prev_tokens = torch.cat(
+                [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
+            )
+            markov_embed_stack = markov_head.get_prev_embeddings(prev_tokens)
+        else:
+            markov_embed_stack = None
+        confidence_raw = self(features.view(bs, gamma, -1), markov_embed_stack)
+        confidence = self.apply_sts(confidence_raw)
+        expect(_CONFIDENCE, confidence)
+        return confidence, confidence_raw
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
@@ -478,12 +510,21 @@ def build_confidence_head(config) -> Optional[nn.Module]:
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
+def _has_mla_layers(layers) -> bool:
+    # MLA layers have no qkv_proj to slice; they write their own latent rows.
+    return any(isinstance(layer.self_attn, DFlashMLAAttention) for layer in layers)
+
+
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
+    # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
+    # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
+    supports_vocab_parallel_draft_logits = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
+        self._base_logits_gatherer: Optional[MultimemAllGatherer] = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -517,6 +558,24 @@ class DSparkDraftMixin:
         if not self.is_nemotron_35_draft:
             self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        if (
+            not self.supports_vocab_parallel_draft_logits
+            or int(getattr(lm_head, "tp_size", 1)) <= 1
+        ):
+            return
+        if (
+            type(self.markov_head) is VanillaMarkov
+            and envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        ):
+            self.markov_head.configure_tp_shard(
+                lm_head=lm_head,
+                prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+            )
+        elif not getattr(lm_head, "use_attn_tp_group", False):
+            # Base logits rows are bs * gamma, within the spec-decode batch.
+            self._base_logits_gatherer = MultimemAllGatherer(
+                max_tokens=recommended_max_tokens(include_prefill=False)
+            )
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -526,8 +585,9 @@ class DSparkDraftMixin:
 
     def compute_base_logits(
         self, hidden: torch.Tensor
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Project the draft's raw final hidden through the target lm_head.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project the draft's raw final hidden through the target lm_head;
+        also returns the features the confidence head reads.
 
         muP targets (Inkling) train the draft against a FOLDED head (weights
         pre-divided by logits_mup_width_multiplier) while serving attaches the
@@ -541,11 +601,33 @@ class DSparkDraftMixin:
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
+        confidence_features = hidden
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         local_logits = project_through_lm_head(hidden, self.lm_head)
+        if self.markov_head.vocab_shard is not None:
+            return local_logits, confidence_features
+        if self._base_logits_gatherer is not None:
+            full_logits = self._base_logits_gatherer(local_logits)
+            return full_logits[..., : int(self.lm_head.org_vocab_size)], (
+                confidence_features
+            )
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
-        return base_logits, None
+        return base_logits, confidence_features
+
+    def compute_confidence(
+        self,
+        *,
+        anchor_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []
@@ -626,31 +708,59 @@ class DSparkDraftMixin:
         self._fused_kv_write_cache = (id(pool), bundle)
         return bundle
 
-    def _build_fused_kv_write_bundle(self, pool):
+    def _build_fused_kv_write_bundle(self, pool) -> Optional[FusedKvWriteBundle]:
         layers = list(self.layers)
-        if not layers:
+        if not layers or _has_mla_layers(layers):
             return None
-        if not (hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")):
+        weights = []
+        for layer in layers:
+            attn = layer.self_attn
+            ok, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
+            if not ok or attn.qkv_proj.bias is not None:
+                return None
+            w = attn.qkv_proj.weight[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            if w.dtype != torch.bfloat16:
+                return None
+            weights.append(w)
+        w_all = torch.cat(weights, dim=0).contiguous()
+        return self._fused_kv_write_layout(pool, project=lambda x: F.linear(x, w_all))
+
+    def _fused_k_norm_weights(self) -> list[torch.Tensor]:
+        """Per-layer multipliers the K norm applies to the normalized row."""
+        return [layer.self_attn.k_norm.weight.data for layer in self.layers]
+
+    def _fused_kv_write_layout(self, pool, *, project) -> Optional[FusedKvWriteBundle]:
+        """Validate the bf16 pool layout and plain RoPE the fused kernel needs.
+
+        ``project`` maps the context hidden to every layer's [K | V] columns,
+        layer-major.
+        """
+        layers = list(self.layers)
+        if not layers or not (
+            hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
+        ):
             return None
+        k_norm_weights = self._fused_k_norm_weights()
         attn0 = layers[0].self_attn
         head_dim = attn0.head_dim
         kv_size = attn0.kv_size
         rotary = attn0.rotary_emb
-        if type(rotary).__name__ != "RotaryEmbedding":
+        if type(rotary).__name__ != "RotaryEmbedding" or rotary.position_start != 0:
             return None
-        if getattr(rotary, "rotary_dim", None) != head_dim:
+        rotary_dim = getattr(rotary, "rotary_dim", None)
+        pass_dim = head_dim - (rotary_dim if isinstance(rotary_dim, int) else 0)
+        if not (
+            isinstance(rotary_dim, int)
+            and 2 <= rotary_dim <= head_dim
+            and _is_pow2(head_dim)
+            and _is_pow2(rotary_dim)
+            and (pass_dim == 0 or _is_pow2(pass_dim))
+        ):
             return None
         eps = attn0.k_norm.variance_epsilon
-        weights, knws, meta_rows = [], [], []
+        meta_rows = []
         for layer in layers:
             attn = layer.self_attn
-            ok, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
-            if not ok:
-                return None
-            if attn.qkv_proj.bias is not None:
-                return None
-            if attn.attn.k_scale is not None or attn.attn.v_scale is not None:
-                return None
             if attn.head_dim != head_dim or attn.kv_size != kv_size:
                 return None
             if attn.rotary_emb is not rotary and not torch.equal(
@@ -661,9 +771,11 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
-            k_buf = pool.get_key_buffer(attn.attn.layer_id)
-            v_buf = pool.get_value_buffer(attn.attn.layer_id)
+            k_buf = pool.layer_router.read(attn.attn.layer_id).key()
+            v_buf = pool.layer_router.read(attn.attn.layer_id).value()
             nh = kv_size // head_dim
+            # A bf16 pool stores K/V unscaled (set_kv_buffer applies k/v scales
+            # only when quantizing), so layer scales do not gate the fused write.
             for buf in (k_buf, v_buf):
                 if buf.dtype != torch.bfloat16:
                     return None
@@ -671,21 +783,24 @@ class DSparkDraftMixin:
                     return None
                 if buf.stride(1) != head_dim or buf.stride(2) != 1:
                     return None
-            kv_slice = slice(attn.q_size, attn.q_size + 2 * attn.kv_size)
-            w = attn.qkv_proj.weight[kv_slice]
-            if w.dtype != torch.bfloat16:
-                return None
-            weights.append(w)
-            knws.append(attn.k_norm.weight.data)
             meta_rows.append(
                 [k_buf.data_ptr(), v_buf.data_ptr(), k_buf.stride(0), v_buf.stride(0)]
             )
-        device = weights[0].device
-        w_all = torch.cat(weights, dim=0).contiguous()
-        knw = torch.stack(knws).to(device)
-        meta = torch.tensor(meta_rows, dtype=torch.int64, device=device)
-        cos_sin = rotary.cos_sin_cache.to(device)
-        return (w_all, meta, knw, cos_sin, eps, len(layers), kv_size, head_dim)
+        device = k_norm_weights[0].device
+        # k_buf/v_buf data_ptr() can set the top bit on XPU (USM addresses),
+        # which dtype=torch.int64 rejects while unpacking; pack unsigned and view.
+        return FusedKvWriteBundle(
+            project=project,
+            meta=make_ptr_table(meta_rows, device=device),
+            k_norm_weights=torch.stack(k_norm_weights).to(device),
+            cos_sin=rotary.cos_sin_cache.to(device),
+            eps=eps,
+            num_layers=len(layers),
+            kv_size=kv_size,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            is_neox_style=rotary.is_neox_style,
+        )
 
     def _stacked_ctx_kv_params(self) -> Optional[dict]:
         """Stack every layer's KV projection into one weight (exact: the input
@@ -693,7 +808,7 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
-        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
+        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get() or _has_mla_layers(self.layers):
             return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
@@ -748,8 +863,6 @@ class DSparkDraftMixin:
                 fused_kv_norm_rope_write,
             )
 
-            w_all, meta, knw, cos_sin, eps, num_layers, kv_size, head_dim = bundle
-            kv_all = F.linear(ctx_hidden, w_all)
             if cache_loc_2d is not None and commit_lens is not None:
                 locs = cache_loc_2d.reshape(-1)
                 write_commit_lens = commit_lens
@@ -759,19 +872,20 @@ class DSparkDraftMixin:
                 write_commit_lens = None
                 locs_row_width = None
             fused_kv_norm_rope_write(
-                kv_all,
-                meta,
-                knw,
-                cos_sin,
+                bundle.project(ctx_hidden),
+                bundle.meta,
+                bundle.k_norm_weights,
+                bundle.cos_sin,
                 positions,
                 locs,
-                num_layers,
-                kv_size,
-                head_dim,
-                eps,
+                bundle.num_layers,
+                bundle.kv_size,
+                bundle.head_dim,
+                bundle.eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
-                is_neox_style=self.layers[0].self_attn.rotary_emb.is_neox_style,
+                is_neox_style=bundle.is_neox_style,
+                rotary_dim=bundle.rotary_dim,
             )
             return
 
@@ -782,6 +896,16 @@ class DSparkDraftMixin:
             )
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=pool,
+                    positions=positions,
+                    hidden_states=ctx_hidden,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                continue
             if stacked is not None:
                 k = k_all[i]
                 v = v_all[i]
@@ -802,9 +926,11 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
-                pool.set_kv_buffer(
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    cache_loc,
+                    KVWriteLoc(cache_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,

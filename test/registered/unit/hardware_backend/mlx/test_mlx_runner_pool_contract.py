@@ -11,6 +11,9 @@ attention backend named by ``server_args.attention_backend``; MLX never
 uses one, and some backends read real KV buffers in ``__init__``, which
 crashes on ``_DummyKVCache``.
 
+The graph runners select ``model.shared_experts_config`` during warmup. The
+Torch model loader sets it, so the stub's placeholder model must carry one.
+
 The base ``preloaded_weights_bytes`` property reads the Torch model loader.
 The MLX stub never creates one because its native runner owns model loading
 and KV sizing, so it must report zero for the Torch accounting hook.
@@ -23,7 +26,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,12 +39,48 @@ _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxRunnerPoolContract(CustomTestCase):
     """Guard the stub's scheduler-facing ``ModelRunner`` contracts."""
+
+    def test_worker_startup_uses_mlx_token_capacity(self):
+        """MLX startup must report its own pool capacity without a Torch configurator."""
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.max_total_num_tokens = 64
+        runner.max_running_requests = 2
+        runner.is_hybrid_swa = False
+        runner.forward_stream = None
+        runner.req_to_token_pool = ReqToTokenPool(
+            size=2,
+            max_context_len=128,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        runner.token_to_kv_pool = SimpleNamespace(size=64)
+        runner.token_to_kv_pool_allocator = SimpleNamespace()
+        worker = object.__new__(TpModelWorker)
+        worker._model_runner = runner
+        worker.model_runner_list = [runner]
+        worker.model_config = SimpleNamespace(context_len=128)
+        worker.dllm_algorithm = None
+        worker.random_seed = 0
+        worker.device = "cpu"
+
+        with get_context().override_server_args(
+            max_prefill_tokens=128, max_queued_requests=None
+        ):
+            worker.alloc_memory_pool()
+            info = worker.get_worker_info()
+
+        self.assertEqual(info[0], 64)
+        self.assertEqual(info[4], 63)
+        self.assertEqual(info[5], 58)
 
     def test_stub_reports_no_preloaded_torch_weights(self):
         runner = object.__new__(MlxModelRunnerStub)
@@ -47,6 +88,26 @@ class TestMlxRunnerPoolContract(CustomTestCase):
         self.assertEqual(runner.preloaded_weights_bytes, 0)
         runner.account_preloaded_weights(runner.preloaded_weights_bytes)
         self.assertEqual(runner.pre_model_load_memory, 1.0)
+
+    def test_stub_model_supports_runner_model_context(self):
+        """Runner warmup must find a shared-expert layout on the stub model."""
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.model_config = SimpleNamespace(
+            is_hybrid_swa=False,
+            sliding_window_size=None,
+            attention_chunk_size=None,
+            dtype=None,
+        )
+        runner.load_model()
+        graph_runner = SimpleNamespace(model_runner=runner)
+
+        with (
+            get_context().override_server_args(),
+            BaseRunner.model_context(graph_runner),
+        ):
+            pass
+
+        self.assertEqual(runner.model.shared_experts_config.num_fused_shared_experts, 0)
 
     def test_stub_overrides_base_alloc_memory_pool(self):
         self.assertIn(

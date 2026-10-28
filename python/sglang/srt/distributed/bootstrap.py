@@ -79,14 +79,11 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
     from sglang.srt.utils import numa_utils
 
     parallel = get_parallel()
-    # With --enable-dp-attention, dp partitions the existing TP group rather
-    # than spawning additional processes, so dp_size must not be multiplied
-    # into the process count here (unlike regular DP, where dp_size * tp_size *
-    # pp_size is the true worker count).
-    dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
+    # Attention DP partitions the existing TP group rather than spawning
+    # additional processes, so only the replicas multiply the process count.
     return numa_utils.init_threads_binding(
         numa_index=get_device().gpu_id,
-        world_size=dp_size * parallel.tp_size * parallel.pp_size,
+        world_size=parallel.dp_size * parallel.tp_size * parallel.pp_size,
     )
 
 
@@ -116,6 +113,12 @@ def init_parallel_runtime(
 
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
+
+    # NPU: install transfer_to_npu to route torch.cuda.* to torch.npu.*
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+        init_npu_backend()
 
     backend = _resolve_backend(device=device)
     if not get_parallel().enable_p2p_check:
@@ -170,6 +173,19 @@ def init_parallel_runtime(
         and parallel.tp_size > 1
     ):
         _prewarm_tp_lm_head_all_to_all()
+
+    # EPLB uses the default process group, not the TP/EP coordinators.
+    # Limit warmup to static, single-node full-EP layouts for now.
+    if (
+        device == "cuda"
+        and backend == "nccl"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+        and parallel.nnodes == 1
+        and parallel.pp_size == 1
+        and parallel.moe_ep_size == parallel.tp_size > 1
+    ):
+        _prewarm_eplb_p2p()
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
@@ -353,12 +369,47 @@ def _prewarm_nccl() -> None:
     )
 
 
+def _prewarm_eplb_p2p() -> None:
+    """Materialize EPLB's default-group NCCL transports before KV sizing."""
+    warmup_start = time.perf_counter()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    free_before, _ = torch.cuda.mem_get_info()
+    # Exercise bulk transfers as well as communicator creation.
+    bytes_per_peer = 4 << 20
+    send = torch.empty(bytes_per_peer, dtype=torch.uint8, device="cuda")
+    recv = torch.empty(
+        (world_size - 1, bytes_per_peer), dtype=torch.uint8, device="cuda"
+    )
+    ops = []
+    for slot, peer in enumerate(p for p in range(world_size) if p != rank):
+        ops.extend(
+            [
+                dist.P2POp(dist.isend, send, peer),
+                dist.P2POp(dist.irecv, recv[slot], peer),
+            ]
+        )
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    current_platform.synchronize()
+    del ops, send, recv
+    current_platform.empty_cache()
+    free_after, _ = torch.cuda.mem_get_info()
+    logger.info(
+        "EPLB default-group P2P warmup completed in %.3fs "
+        "(world_size=%d, free memory delta=%.2f MiB)",
+        time.perf_counter() - warmup_start,
+        world_size,
+        (free_before - free_after) / (1 << 20),
+    )
+
+
 def _prewarm_tp_lm_head_all_to_all() -> None:
     """Materialize PyNCCL P2P resources before model-memory accounting."""
     warmup_start = time.perf_counter()
     tp_group = get_tp_group()
-    pynccl_comm = tp_group.pynccl_comm
-    if pynccl_comm is None or not pynccl_comm.available:
+    pynccl_comm = tp_group.get_available_pynccl_comm()
+    if pynccl_comm is None:
         raise RuntimeError(
             "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
             "communicator for CUDA graph capture."

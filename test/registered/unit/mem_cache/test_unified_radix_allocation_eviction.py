@@ -1,24 +1,25 @@
 """CPU-only tests for allocation-aware UnifiedRadixCache eviction."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.interim import (
+    _FloatChainPolicy,
+    _TokenAndSlotEndsPolicy,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestUnifiedRadixAllocationEviction(CustomTestCase):
@@ -27,10 +28,12 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
+        cache.tree_core.full_evictable_size.return_value = 80
 
         capacity = {"available": 30}
         allocator = MagicMock()
@@ -70,6 +73,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             if tri_pool
             else (ComponentType.FULL, ComponentType.MAMBA)
         )
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = tri_pool
         cache.cache_controller = None
         cache.metrics_collector = None
@@ -78,16 +82,14 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.tree_core.mamba_evictable_size.return_value = 8
 
         capacity = {"free_ids": free_ids, "byte_slots": byte_slots}
-        allocator_cls = (
-            UnifiedMambaSWATokenToKVPoolAllocator
-            if tri_pool
-            else UnifiedMambaTokenToKVPoolAllocator
+        allocator = object.__new__(ChainAllocator)
+        allocator._policy = object.__new__(
+            _FloatChainPolicy if tri_pool else _TokenAndSlotEndsPolicy
         )
-        allocator = object.__new__(allocator_cls)
         allocator.free_group = None
         allocator.free_page_reps_group = None
-        if tri_pool:
-            allocator.full_free_group = []
+        allocator.full_page_reps_group = []
+        allocator.full_free_group = []
         allocator.full_attn_allocator = MagicMock()
         allocator.full_attn_allocator.schedulable_available_size.return_value = 100
         allocator.mamba_allocator = MagicMock()
@@ -98,8 +100,12 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             capacity["free_ids"], capacity["byte_slots"]
         )
         allocator.full_tokens_before_mamba_recheck = MagicMock(return_value=1)
+        # The window band takes no part in the full donor path.
+        allocator.swa_attn_allocator = None
+        allocator.members = (allocator.full_attn_allocator, allocator.mamba_allocator)
+        allocator.state = SimpleNamespace(slots=allocator.mamba_allocator)
         cache.token_to_kv_pool_allocator = allocator
-        cache.req_to_token_pool = MagicMock(mamba_allocator=allocator.mamba_allocator)
+        cache.req_to_token_pool = MagicMock()
         return cache, capacity, allocator
 
     def test_allocation_eviction_stops_when_shared_capacity_is_sufficient(self):
@@ -111,6 +117,32 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         self.assertEqual(leaf_count["value"], 1)
         self.assertEqual(result.num_tokens_evicted, 20)
         self.assertEqual(result.mamba_num_evicted, 1)
+
+    def test_allocation_eviction_runs_to_the_target_when_frees_stay_hidden(self):
+        """An allocator can hide freed pages behind a clamp or page rounding, so
+        freeing exactly the shortfall may leave its availability target unmet;
+        an allocation-driven FULL walk must keep going until the target shows."""
+        cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=0)
+        cache.tree_core.full_evictable_size.return_value = 60
+        quota = {}
+        cache.tree_core.evict_device_start.side_effect = quota.__setitem__
+
+        def next_node(component_type, tracker):
+            # The tree yields victims only up to the quota the walk opened with.
+            if tracker[component_type] >= quota[component_type]:
+                return None, False
+            return leaf_count["value"] + 1, True
+
+        cache._evict_device_next_node.side_effect = next_node
+
+        result = cache.evict_for_alloc(EvictParams(num_tokens=20))
+
+        self.assertEqual(leaf_count["value"], 2)
+        self.assertEqual(capacity["available"], 50)
+        self.assertEqual(result.num_tokens_evicted, 40)
+        cache.tree_core.evict_device_start.assert_called_once_with(
+            ComponentType.FULL, 60
+        )
 
     def test_explicit_evict_preserves_component_count_semantics(self):
         cache, _, leaf_count = self._build_cache(collateral_capacity_gain=70)
@@ -138,6 +170,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
@@ -150,7 +183,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         mamba_allocator.schedulable_available_size.side_effect = lambda: capacity[
             "available"
         ]
-        cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_allocator)
+        cache.token_to_kv_pool_allocator.state_slots = mamba_allocator
+        cache.req_to_token_pool = MagicMock()
 
         def next_node(component_type, tracker):
             return (None, False) if tracker[component_type] >= 3 else (1, True)
@@ -553,7 +587,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.supports_prefix_sharing.return_value = True
         from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         allocator = object.__new__(TokenToKVPoolAllocator)

@@ -1,0 +1,426 @@
+{
+  "parser": "deepseek-v4",
+  "inputs": [
+    {"chunks": ["Let me think", " about it", "</think>", "Paris", " is"]},
+    {"chunks": ["Let me think</th", "ink>Answer"]},
+    {"chunks": ["</think>", "Answer only"]},
+    {"chunks": ["<think>", "reason", "</think>", "done"]},
+    {"chunks": ["reasoning\n\n", "<｜DSM", "L｜tool_calls>", "rest"]},
+    {"chunks": ["mention ", "<｜DSML｜tool_calls>", " inline", "</think>", "ans"]},
+    {"chunks": ["cut off mid reasoning"]},
+    {"chunks": ["cut </thi"]},
+    {"chunks": ["ends at\n<｜DSM"]},
+    {"chunks": ["a", "b", "c", "</think>"]},
+    {"chunks": ["", "x", "", "</think>", "", "y"]},
+    {"chunks": ["reason", "</think>", "line1\n", "<think>not reasoning</think>"]},
+    {"chunks": ["思考中", "……", "</think>", "答案"]}
+  ],
+  "cases": [
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "steps": [["Let me think", ""], [" about it", ""], ["", ""], ["", "Paris"], ["", " is"], ["", ""]],
+      "unary": ["Let me think about it", "Paris is"]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["Let me think about it", ""], ["", "Paris"], ["", " is"], ["", ""]],
+      "unary": ["Let me think about it", "Paris is"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Let me think"],
+        ["", " about it"],
+        ["", "</think>"],
+        ["", "Paris"],
+        ["", " is"],
+        ["", ""]
+      ],
+      "unary": ["", "Let me think about it</think>Paris is"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Let me think"],
+        ["", " about it"],
+        ["", "</think>"],
+        ["", "Paris"],
+        ["", " is"],
+        ["", ""]
+      ],
+      "unary": ["", "Let me think about it</think>Paris is"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": true,
+      "steps": [["Let me think", ""], ["", "Answer"], ["", ""]],
+      "unary": ["Let me think", "Answer"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["Let me think", "Answer"], ["", ""]],
+      "unary": ["Let me think", "Answer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Let me think</th"], ["", "ink>Answer"], ["", ""]],
+      "unary": ["", "Let me think</think>Answer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Let me think</th"], ["", "ink>Answer"], ["", ""]],
+      "unary": ["", "Let me think</think>Answer"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": true,
+      "steps": [["", ""], ["", "Answer only"], ["", ""]],
+      "unary": ["", "Answer only"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", "Answer only"], ["", ""]],
+      "unary": ["", "Answer only"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": true,
+      "steps": [["", "</think>"], ["", "Answer only"], ["", ""]],
+      "unary": ["", "</think>Answer only"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": false,
+      "steps": [["", "</think>"], ["", "Answer only"], ["", ""]],
+      "unary": ["", "</think>Answer only"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": true,
+      "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": true,
+      "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": true,
+      "steps": [["reasoning\n\n", ""], ["", ""], ["", "<｜DSML｜tool_calls>"], ["", "rest"], ["", ""]],
+      "unary": ["reasoning\n\n", "<｜DSML｜tool_calls>rest"]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["reasoning\n\n", "<｜DSML｜tool_calls>"], ["", "rest"], ["", ""]],
+      "unary": ["reasoning\n\n", "<｜DSML｜tool_calls>rest"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": true,
+      "steps": [["", "reasoning\n\n"], ["", ""], ["", "<｜DSML｜tool_calls>"], ["", "rest"], ["", ""]],
+      "unary": ["", "reasoning\n\n<｜DSML｜tool_calls>rest"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": false,
+      "steps": [["", "reasoning\n\n"], ["", ""], ["", "<｜DSML｜tool_calls>"], ["", "rest"], ["", ""]],
+      "unary": ["", "reasoning\n\n<｜DSML｜tool_calls>rest"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["mention ", ""],
+        ["<｜DSML｜tool_calls>", ""],
+        [" inline", ""],
+        ["", ""],
+        ["", "ans"],
+        ["", ""]
+      ],
+      "unary": ["mention <｜DSML｜tool_calls> inline", "ans"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["mention <｜DSML｜tool_calls> inline", ""],
+        ["", "ans"],
+        ["", ""]
+      ],
+      "unary": ["mention <｜DSML｜tool_calls> inline", "ans"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "mention "],
+        ["", "<｜DSML｜tool_calls>"],
+        ["", " inline"],
+        ["", "</think>"],
+        ["", "ans"],
+        ["", ""]
+      ],
+      "unary": ["", "mention <｜DSML｜tool_calls> inline</think>ans"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "mention "],
+        ["", "<｜DSML｜tool_calls>"],
+        ["", " inline"],
+        ["", "</think>"],
+        ["", "ans"],
+        ["", ""]
+      ],
+      "unary": ["", "mention <｜DSML｜tool_calls> inline</think>ans"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": true,
+      "steps": [["cut off mid reasoning", ""], ["", ""]],
+      "unary": ["cut off mid reasoning", ""]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["cut off mid reasoning", ""]],
+      "unary": ["cut off mid reasoning", ""]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": true,
+      "steps": [["", "cut off mid reasoning"], ["", ""]],
+      "unary": ["", "cut off mid reasoning"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": false,
+      "steps": [["", "cut off mid reasoning"], ["", ""]],
+      "unary": ["", "cut off mid reasoning"]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": true,
+      "steps": [["cut ", ""], ["</thi", ""]],
+      "unary": ["cut </thi", ""]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["cut </thi", ""]],
+      "unary": ["cut </thi", ""]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": true,
+      "steps": [["", "cut </thi"], ["", ""]],
+      "unary": ["", "cut </thi"]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": false,
+      "steps": [["", "cut </thi"], ["", ""]],
+      "unary": ["", "cut </thi"]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": true,
+      "steps": [["ends at\n", ""], ["", ""]],
+      "unary": ["ends at\n", ""]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["ends at\n", ""]],
+      "unary": ["ends at\n", ""]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": true,
+      "steps": [["", "ends at\n<｜DSM"], ["", ""]],
+      "unary": ["", "ends at\n<｜DSM"]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": false,
+      "steps": [["", "ends at\n<｜DSM"], ["", ""]],
+      "unary": ["", "ends at\n<｜DSM"]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": true,
+      "steps": [["a", ""], ["b", ""], ["c", ""], ["", ""], ["", ""]],
+      "unary": ["abc", ""]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["", ""], ["abc", ""], ["", ""]],
+      "unary": ["abc", ""]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": true,
+      "steps": [["", "a"], ["", "b"], ["", "c"], ["", "</think>"], ["", ""]],
+      "unary": ["", "abc</think>"]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": false,
+      "steps": [["", "a"], ["", "b"], ["", "c"], ["", "</think>"], ["", ""]],
+      "unary": ["", "abc</think>"]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": true,
+      "steps": [["", ""], ["x", ""], ["", ""], ["", ""], ["", ""], ["", "y"], ["", ""]],
+      "unary": ["x", "y"]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["", ""], ["x", ""], ["", ""], ["", "y"], ["", ""]],
+      "unary": ["x", "y"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": true,
+      "steps": [["", ""], ["", "x"], ["", ""], ["", "</think>"], ["", ""], ["", "y"], ["", ""]],
+      "unary": ["", "x</think>y"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": false,
+      "steps": [["", ""], ["", "x"], ["", ""], ["", "</think>"], ["", ""], ["", "y"], ["", ""]],
+      "unary": ["", "x</think>y"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": true,
+      "steps": [["reason", ""], ["", ""], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
+      "unary": ["reason", "line1\n<think>not reasoning</think>"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["reason", ""], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
+      "unary": ["reason", "line1\n<think>not reasoning</think>"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": true,
+      "steps": [["", "reason"], ["", "</think>"], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
+      "unary": ["reason", "line1\n<think>not reasoning</think>"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": false,
+      "steps": [["", "reason"], ["", "</think>"], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
+      "unary": ["reason", "line1\n<think>not reasoning</think>"]
+    },
+    {
+      "input": 12,
+      "force": true,
+      "stream": true,
+      "steps": [["思考中", ""], ["……", ""], ["", ""], ["", "答案"], ["", ""]],
+      "unary": ["思考中……", "答案"]
+    },
+    {
+      "input": 12,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["思考中……", ""], ["", "答案"], ["", ""]],
+      "unary": ["思考中……", "答案"]
+    },
+    {
+      "input": 12,
+      "force": false,
+      "stream": true,
+      "steps": [["", "思考中"], ["", "……"], ["", "</think>"], ["", "答案"], ["", ""]],
+      "unary": ["", "思考中……</think>答案"]
+    },
+    {
+      "input": 12,
+      "force": false,
+      "stream": false,
+      "steps": [["", "思考中"], ["", "……"], ["", "</think>"], ["", "答案"], ["", ""]],
+      "unary": ["", "思考中……</think>答案"]
+    }
+  ]
+}

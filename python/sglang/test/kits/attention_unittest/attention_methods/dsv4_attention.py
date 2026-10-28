@@ -19,13 +19,11 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -36,6 +34,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -345,9 +346,8 @@ class MockDSV4ModelRunner:
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
+        # The fixture uses unquantized projections, with no FP8 wo_a epilogue.
+        self.model = nn.Module()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -367,7 +367,6 @@ class MockDSV4ModelRunner:
             disaggregation_mode=None,
             dp_size=1,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",
@@ -422,8 +421,19 @@ class MockDSV4ModelRunner:
         # Register identity full->swa mapping over swa_size full locs.
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
         self.token_to_kv_pool.register_mapping(identity)
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.attn_cp_size = 1
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
+        self.runner_ids = RunnerIds(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            token_to_kv_pool=self.token_to_kv_pool,
+            page_size=case.page_size,
+            device=device,
+        )
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -666,6 +676,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
     # extend_* fields are only populated for extend-shaped modes. DECODE leaves
     # them at their defaults; the flash_mla path reads metadata directly from
     # DSV4AttnMetadata so the extend fields are unused for the compress_ratio=0

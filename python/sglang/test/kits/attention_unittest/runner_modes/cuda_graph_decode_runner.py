@@ -297,6 +297,8 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         encoder_lens=batch.encoder_lens,
         extend_seq_lens=getattr(batch, "extend_seq_lens", None),
         out_cache_loc=getattr(batch, "out_cache_loc", None),
+        iteration_ids=batch.iteration_ids,
+        iteration_cols=batch.iteration_cols,
         spec_info=batch.spec_info,
     )
     backend.init_forward_metadata_out_graph(fb_view)
