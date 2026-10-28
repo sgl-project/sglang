@@ -35,12 +35,6 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
-@functools.lru_cache(maxsize=1)
-def is_npu_a3() -> bool:
-    """Whether the runtime is an Ascend 910_93-series A3 device."""
-    return is_npu() and torch.npu.get_device_name().startswith("Ascend910_93")
-
-
 def use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
     """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
 

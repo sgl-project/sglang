@@ -28,7 +28,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_a3, is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -401,15 +401,14 @@ class AscendAttnBackend(AttentionBackend):
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
-        flash_mla_requested = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
-        self.use_flash_mla = flash_mla_requested and (is_npu_arch35() or is_npu_a3())
-        if flash_mla_requested and not self.use_flash_mla:
-            logger.warning(
-                "NPU FlashMLA requires Ascend A3 or A5; using the original "
-                "MLA attention and KV cache on this device."
-            )
+        # Keep non-speculative decode on the default attention/cache path.
+        self.use_flash_mla = (
+            self.use_mla
+            and not self.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+            and envs.SGLANG_NPU_USE_FLASH_MLA.get()
+        )
         if self.use_flash_mla:
-            spec_algorithm = model_runner.spec_algorithm
             if (
                 self.use_dsa
                 or self.model_dtype != torch.bfloat16
@@ -419,15 +418,10 @@ class AscendAttnBackend(AttentionBackend):
                 or get_parallel().dcp_enabled
                 or model_runner.is_hybrid_swa
                 or model_runner.server_args.enable_mixed_chunk
-                or (
-                    spec_algorithm is not None
-                    and not spec_algorithm.is_none()
-                    and not spec_algorithm.is_dspark()
-                )
             ):
                 raise ValueError(
                     "NPU FlashMLA supports ordinary BF16 MLA (latent 512, RoPE 64), "
-                    "decode and static DSpark verify, without CP or mixed chunks."
+                    "static DSpark target verify, without CP or mixed chunks."
                 )
             if is_npu_arch35():
                 from cann_ops_transformer.ops.attention.flash_mla import (
@@ -893,8 +887,8 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if self.use_flash_mla and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_idle()
         ):
             self._prepare_flash_mla_metadata(
                 self.forward_metadata,
@@ -1392,14 +1386,11 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        if getattr(spec_info, "ragged_verify_layout", None) is not None:
+        if not (forward_mode.is_target_verify() or forward_mode.is_idle()) or (
+            getattr(spec_info, "ragged_verify_layout", None) is not None
+        ):
             raise ValueError("NPU FlashMLA currently requires static DSpark verify")
-        query_len = (
-            self.speculative_num_draft_tokens if forward_mode.is_target_verify() else 1
-        )
-        offset = query_len if forward_mode.is_target_verify() else 0
-        if forward_mode.is_decode_or_idle() and spec_info is not None:
-            offset = self.speculative_step_id + 1
+        query_len = self.speculative_num_draft_tokens
         if metadata.flash_mla_seq_lens is None:
             metadata.flash_mla_seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
             metadata.flash_mla_seqused_q = torch.empty_like(seq_lens, dtype=torch.int32)
@@ -1407,7 +1398,7 @@ class AscendAttnBackend(AttentionBackend):
         # Own the effective lengths: never add the verify width into the input
         # prefix tensor, and keep the addresses read by captured graphs stable.
         metadata.flash_mla_seq_lens.copy_(
-            torch.where(active, seq_lens + offset, 0).to(torch.int32)
+            torch.where(active, seq_lens + query_len, 0).to(torch.int32)
         )
         metadata.flash_mla_seqused_q.copy_(active.to(torch.int32) * query_len)
         if seq_lens.numel() == 0:
@@ -1446,11 +1437,7 @@ class AscendAttnBackend(AttentionBackend):
     def _forward_flash_mla(self, q, q_rope, layer, forward_batch):
         metadata = self.forward_metadata
         batch_size = metadata.flash_mla_seq_lens.shape[0]
-        query_len = (
-            self.speculative_num_draft_tokens
-            if forward_batch.forward_mode.is_target_verify()
-            else 1
-        )
+        query_len = self.speculative_num_draft_tokens
         num_tokens = batch_size * query_len
         q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
         if batch_size == 0:
@@ -3246,9 +3233,6 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if self.use_flash_mla:
-            return self._forward_flash_mla(q, q_rope, layer, forward_batch)
-
         if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
@@ -3792,8 +3776,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
-            if self.use_flash_mla:
-                return self._forward_flash_mla(q, q_rope, layer, forward_batch)
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)

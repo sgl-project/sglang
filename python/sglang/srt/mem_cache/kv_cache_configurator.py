@@ -2269,6 +2269,11 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            use_flash_mla=(
+                envs.SGLANG_NPU_USE_FLASH_MLA.get()
+                and self.spec_algorithm.is_dspark()
+                and not self.is_draft_worker
+            ),
         )
         return token_to_kv_pool
 
