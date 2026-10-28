@@ -184,6 +184,7 @@ class Gemma4Router(nn.Module):
         )
         # Per-dimension learned scale, applied after norm + root_size
         self.scale = nn.Parameter(torch.ones(self.hidden_size))
+        self.scale.weight_loader = self._load_scale
         # Constant 1/sqrt(hidden_size) scaling factor
         self.register_buffer(
             "root_size",
@@ -202,9 +203,16 @@ class Gemma4Router(nn.Module):
 
     def fuse_scale(self):
         """Fold scale * root_size into norm.weight so forward needs no extra mul."""
-        fused = (self.scale * self.root_size).to(self.norm.weight.dtype)
+        # With --cpu-offload-gb, scale is on the CPU when loaded; the buffers are not.
+        scale = self.scale.to(self.root_size.device)
+        fused = (scale * self.root_size).to(self.norm.weight.dtype)
         self.norm.weight.data.copy_(fused)
         self._scale_fused = True
+
+    def _load_scale(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight)
+        # Refold here, not on the next forward: CUDA graph replay skips that check.
+        self.fuse_scale()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
