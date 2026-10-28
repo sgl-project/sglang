@@ -208,6 +208,15 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+elif is_xpu():
+    from sgl_kernel.mamba import causal_conv1d_fn_xpu
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_xpu import (
+        causal_conv1d_update_xpu_dispatch,
+    )
+
+    causal_conv1d_fn = causal_conv1d_fn_xpu
+    causal_conv1d_update = causal_conv1d_update_xpu_dispatch
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -566,28 +575,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
-        self._causal_conv1d_fn = causal_conv1d_fn
-        self._causal_conv1d_update = causal_conv1d_update
-        self._causal_conv1d_verify = causal_conv1d_update
-        if is_xpu() and any(
-            backend.is_intel_xpu()
-            for backend in (backends.decode, backends.prefill, backends.verify)
-        ):
-            from sgl_kernel.mamba import (
-                causal_conv1d_fn_xpu,
-                causal_conv1d_update_xpu,
-            )
-
-            if backends.prefill.is_intel_xpu():
-                self._causal_conv1d_fn = causal_conv1d_fn_xpu
-            if backends.decode.is_intel_xpu():
-                self._causal_conv1d_update = causal_conv1d_update_xpu
-            if backends.verify.is_intel_xpu():
-                from sglang.srt.layers.attention.linear.kernels.gdn_xpu import (
-                    causal_conv1d_verify_xpu,
-                )
-
-                self._causal_conv1d_verify = causal_conv1d_verify_xpu
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
@@ -1037,7 +1024,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             assert isinstance(mixed_qkv, torch.Tensor)
 
         if not conv_already_applied:
-            mixed_qkv = self._causal_conv1d_update(
+            mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
                 conv_states,
                 layer.conv_weights,
@@ -1111,7 +1098,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         block_table = self.forward_metadata.conv_block_table
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
-        return self._causal_conv1d_fn(
+        return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1320,7 +1307,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = self._causal_conv1d_verify(
+            mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,

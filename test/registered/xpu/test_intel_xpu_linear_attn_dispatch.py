@@ -67,6 +67,21 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
 
         self.assertIsInstance(dispatcher.verify_kernel, TritonGDNKernel)
 
+    @unittest.skipUnless(gdn_backend.is_xpu(), "Requires XPU platform")
+    def test_triton_gdn_backend_still_uses_xpu_conv(self):
+        from sgl_kernel.mamba import causal_conv1d_fn_xpu
+
+        GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+        )
+        self.assertIs(gdn_backend.causal_conv1d_fn, causal_conv1d_fn_xpu)
+        self.assertIs(
+            gdn_backend.causal_conv1d_update,
+            gdn_xpu.causal_conv1d_update_xpu_dispatch,
+        )
+
     def test_conv_verify_adapter_preserves_linear_and_tree_links(self):
         with patch.object(gdn_xpu, "causal_conv1d_update_verify_xpu") as kernel:
             for links in (
@@ -101,9 +116,56 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
                         cache_indices=sentinel.cache_indices,
                     )
 
-    def test_prefill_conv_uses_selected_kernel_and_optional_block_table(self):
+    def test_conv_update_dispatches_decode_and_verify(self):
+        with (
+            patch.object(gdn_xpu, "causal_conv1d_update_xpu") as decode,
+            patch.object(gdn_xpu, "causal_conv1d_verify_xpu") as verify,
+        ):
+            args = (
+                sentinel.x,
+                sentinel.conv_state,
+                sentinel.weight,
+                sentinel.bias,
+                "silu",
+            )
+            result = gdn_xpu.causal_conv1d_update_xpu_dispatch(
+                *args, conv_state_indices=sentinel.cache_indices
+            )
+            self.assertIs(result, decode.return_value)
+            decode.assert_called_once_with(
+                *args, conv_state_indices=sentinel.cache_indices
+            )
+            verify.assert_not_called()
+
+            for links in (
+                (None, None, None),
+                (sentinel.next_token, sentinel.next_sibling, sentinel.parent_token),
+            ):
+                with self.subTest(links=links):
+                    verify.reset_mock()
+                    result = gdn_xpu.causal_conv1d_update_xpu_dispatch(
+                        *args,
+                        conv_state_indices=sentinel.cache_indices,
+                        intermediate_conv_window=sentinel.window,
+                        intermediate_state_indices=sentinel.intermediate_indices,
+                        retrieve_next_token=links[0],
+                        retrieve_next_sibling=links[1],
+                        retrieve_parent_token=links[2],
+                    )
+                    self.assertIs(result, verify.return_value)
+                    verify.assert_called_once_with(
+                        *args,
+                        conv_state_indices=sentinel.cache_indices,
+                        intermediate_conv_window=sentinel.window,
+                        intermediate_state_indices=sentinel.intermediate_indices,
+                        retrieve_next_token=links[0],
+                        retrieve_next_sibling=links[1],
+                        retrieve_parent_token=links[2],
+                    )
+            decode.assert_called_once()
+
+    def test_prefill_conv_uses_device_kernel_and_optional_block_table(self):
         backend = object.__new__(GDNAttnBackend)
-        backend._causal_conv1d_fn = Mock(side_effect=lambda x, *args, **kwargs: x)
         x = torch.zeros(3, 4)
         state = torch.zeros(1, 4, 2)
         weight = torch.zeros(4, 3)
@@ -114,21 +176,23 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
         )
         starts = torch.tensor([0, 3], dtype=torch.int32)
         indices = torch.tensor([0], dtype=torch.int32)
-        for block_table in (None, torch.tensor([[0, 0]], dtype=torch.int32)):
-            with self.subTest(block_table=block_table):
-                backend.forward_metadata = SimpleNamespace(
-                    query_start_loc=starts, conv_block_table=block_table
-                )
-                backend._causal_conv1d_fn.reset_mock()
-                torch.testing.assert_close(
-                    backend._convolve_prefill(layer, batch, x, state, indices), x
-                )
-                kwargs = backend._causal_conv1d_fn.call_args.kwargs
-                self.assertEqual("block_table" in kwargs, block_table is not None)
-                if block_table is not None:
-                    self.assertIs(kwargs["block_table"], block_table)
-                self.assertIs(kwargs["conv_states"], state)
-                self.assertIs(kwargs["cache_indices"], indices)
+        kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+        with patch.object(gdn_backend, "causal_conv1d_fn", kernel):
+            for block_table in (None, torch.tensor([[0, 0]], dtype=torch.int32)):
+                with self.subTest(block_table=block_table):
+                    backend.forward_metadata = SimpleNamespace(
+                        query_start_loc=starts, conv_block_table=block_table
+                    )
+                    kernel.reset_mock()
+                    torch.testing.assert_close(
+                        backend._convolve_prefill(layer, batch, x, state, indices), x
+                    )
+                    kwargs = kernel.call_args.kwargs
+                    self.assertEqual("block_table" in kwargs, block_table is not None)
+                    if block_table is not None:
+                        self.assertIs(kwargs["block_table"], block_table)
+                    self.assertIs(kwargs["conv_states"], state)
+                    self.assertIs(kwargs["cache_indices"], indices)
 
 
 class TestIntelXpuKDADispatch(CustomTestCase):
