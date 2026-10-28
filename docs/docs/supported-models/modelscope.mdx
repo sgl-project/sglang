@@ -54,4 +54,11 @@ Only repository roots are supported. Select versions with `--revision` or
 handles authentication and caching (`--download-dir`); failed downloads do not
 switch Hubs. ModelScope sources require the `modelscope` package.
 
+Downloads select the requested weight format (`auto` prefers safetensors),
+without fetching alternate formats. Tokenizer-only and `dummy` loads fetch
+metadata only. Other supported load formats are `safetensors`, `fastsafetensors`,
+`instanttensor`, `pt`, `npcache`, and `mistral`; use a local snapshot for other loaders.
+With `--trust-remote-code`, cross-repository `auto_map` code uses the same Hub as
+its model or tokenizer, without modifying the cached repository files.
+
 Unprefixed IDs, local paths, and existing remote-storage URLs are unchanged.
