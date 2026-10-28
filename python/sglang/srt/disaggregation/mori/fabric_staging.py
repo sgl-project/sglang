@@ -55,10 +55,8 @@ def fabric_staging_enabled() -> bool:
 
 
 def default_slot_tokens(server_args, page_size: int) -> int:
-    """Tokens one slot holds: the env override, else one prefill chunk."""
-    tokens = envs.SGLANG_MORI_FABRIC_STAGING_TOKENS.get()
-    if tokens <= 0:
-        tokens = int(getattr(server_args, "chunked_prefill_size", 0) or 0)
+    """Tokens one slot holds: one prefill chunk."""
+    tokens = int(getattr(server_args, "chunked_prefill_size", 0) or 0)
     return staging_grid_tokens(tokens if tokens > 0 else None, page_size)
 
 

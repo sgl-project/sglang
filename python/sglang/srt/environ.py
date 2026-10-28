@@ -847,14 +847,9 @@ class Envs:
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Data-plane backend used by the MoRI PD-disaggregation connector.
     SGLANG_MORI_BACKEND = EnvStr("rdma")
-    # Number of streams and events in the MoRI fabric backend pools.
-    SGLANG_MORI_FABRIC_STREAMS = EnvInt(64)
-    SGLANG_MORI_FABRIC_EVENTS = EnvInt(64)
     # Stage fabric transfers through fixed registered slots, one per transfer
     # shard, so KV/state pools can stay in ordinary device memory.
     SGLANG_MORI_FABRIC_STAGING = EnvBool(False)
-    # Tokens one staging slot must hold; <=0 uses --chunked-prefill-size.
-    SGLANG_MORI_FABRIC_STAGING_TOKENS = EnvInt(0)
     # Per-slot room for the terminal chunk's request state (DSV4-Pro needs ~28).
     SGLANG_MORI_FABRIC_STAGING_STATE_MB = EnvInt(64)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).

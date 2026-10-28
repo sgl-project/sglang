@@ -361,13 +361,7 @@ def _create_fabric_backend(engine: IOEngine) -> None:
             "SGLANG_MORI_BACKEND=fabric requires a Mori build with "
             "fabric backend support"
         ) from exc
-    engine.create_backend(
-        backend_type,
-        FabricBackendConfig(
-            envs.SGLANG_MORI_FABRIC_STREAMS.get(),
-            envs.SGLANG_MORI_FABRIC_EVENTS.get(),
-        ),
-    )
+    engine.create_backend(backend_type, FabricBackendConfig())
 
 
 @dataclasses.dataclass(frozen=True)
