@@ -16,7 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # The Rust frontend decodes these headers and renders their `meta_info` keys
 # (rust/sglang-server/src/api_server/core/frame.rs); they must match Python.
@@ -236,30 +236,101 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
 
-    def test_startup_time_takes_the_engine_shape(self):
-        """The frontend's end-to-end phase runs from its process's spawn."""
-        server = RustServer(Mock(), http_port=30000)
-        self.assertIsNone(server.startup_time)
-        process = SimpleNamespace(create_time=lambda: 100.0)
+    def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
+        """Every rank joins the collective; only listener ranks contribute an
+        entry, an unspecified bind host is replaced by a reachable one, and
+        the table comes back sorted by DP rank."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+                None,
+                obj,
+                None,
+            ]
+
         with (
-            patch.object(server_module, "time", SimpleNamespace(time=lambda: 110.0)),
             patch.object(
-                server_module, "psutil", SimpleNamespace(Process=lambda: process)
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
             ),
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    nnodes=1,
+                    pp_size=1,
+                    tp_size=2,
+                    tp_rank=0,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    attn_dp_size=2,
+                    attn_dp_rank=0,
+                    dp_rank=0,
+                    world_group=SimpleNamespace(all_gather_object=all_gather_object),
+                ),
+            ),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch.object(server_module, "get_local_ip_auto", return_value="10.0.0.1"),
         ):
-            server.set_startup_time(
-                {
-                    "load_weight": 1.0,
-                    "kv_cache_allocation": 0.5,
-                    "scheduler_e2e": 3.0,
-                    "cuda_graph": {"decode": 2.0},
-                }
+            table = RustServer.gather_server_endpoints(hosts_listener=True)
+            others_only = RustServer.gather_server_endpoints(hosts_listener=False)
+
+        self.assertEqual(
+            gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+        )
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        self.assertEqual(
+            others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
+        )
+        self.assertEqual(
+            table,
+            [
+                {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+            ],
+        )
+
+    def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
+        """A multi-node launch whose listener is loopback warns, naming the
+        host and rendezvous address, unless the nodes rendezvous on loopback
+        too (several nodes emulated on one machine), and still gathers."""
+        all_gather_object = Mock(return_value=[None, None])
+        for dist_init_addr, warns in (
+            ("10.0.0.1:5000", True),
+            ("127.0.0.1:5000", False),
+            ("[::1]:5000", False),
+            (None, True),
+        ):
+            parallel = SimpleNamespace(
+                nnodes=2,
+                dist_init_addr=dist_init_addr,
+                world_group=SimpleNamespace(all_gather_object=all_gather_object),
             )
-        startup_time = server.startup_time
-        self.assertEqual(startup_time["tokenizer_e2e"], 10.0)
-        self.assertEqual(startup_time["scheduler_e2e"], 3.0)
-        self.assertEqual(startup_time["load_weight"], 1.0)
-        self.assertEqual(startup_time["cuda_graph"]["decode"], 2.0)
+            with (
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_serving",
+                    return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+                ),
+                patch.object(server_module.logger, "warning") as warning,
+            ):
+                RustServer.gather_server_endpoints(hosts_listener=False)
+            self.assertEqual(warning.called, warns, dist_init_addr)
+            if warns:
+                self.assertIn("127.0.0.1", warning.call_args.args[1])
+                self.assertEqual(warning.call_args.args[3], dist_init_addr)
+        self.assertEqual(all_gather_object.call_count, 4)
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a

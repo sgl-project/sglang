@@ -13,11 +13,12 @@ from sglang.srt.disaggregation.common.dcp_pack import (
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -90,11 +91,12 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     token_to_kv_pool_allocator=SimpleNamespace(
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
+                        state_ids=lambda sub_pool: IdSpace(key=(sub_pool, None)),
                     ),
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=torch.arange(total).reshape(1, -1),
                         req_index_to_mamba_index_mapping=torch.tensor([17]),
-                        translate_mamba_indices=lambda x: x,
+                        state_sub_pool="mamba",
                     ),
                     disagg_metadata_buffers=Mock(),
                     disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),

@@ -1,12 +1,13 @@
 //! DeepSeek-V4 and V4.1 (`DeepSeekV4Detector` and `DeepSeekV41ReasoningDetector`
 //! in `parser/reasoning_parser.py`).
 
-use crate::think::TagConfig;
+use crate::think::{ReasoningDefault, TagConfig};
 
 pub(super) const THINK: TagConfig = TagConfig {
     start: "<think>",
     end: "</think>",
     tool_start: Some("<｜DSML｜tool_calls>"),
+    reasoning_default: ReasoningDefault::off_unless("thinking"),
     tool_start_at_line_start: true,
 };
 
