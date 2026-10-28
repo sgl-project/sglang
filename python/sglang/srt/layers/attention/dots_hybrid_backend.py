@@ -324,9 +324,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch, layer_id: int
     ):
         assert self._prefill_metadata is not None
-        return self.token_to_kv_pool.get_key_buffer(layer_id)[
-            self._prefill_metadata.kv_indices
-        ]
+        return self.kv_layers.read(layer_id).key()[self._prefill_metadata.kv_indices]
 
     def forward_swa_mla_expanded(self, q, k, v, layer, forward_batch=None):
         """Run dense SWA after Dots expands its compact MLA cache."""
@@ -384,7 +382,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             bs,
         )
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,

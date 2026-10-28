@@ -265,7 +265,7 @@ class XPUAttentionBackend(AttentionBackend):
         v: torch.Tensor,
     ):
         if self.dcp_size == 1:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                 k,
@@ -275,7 +275,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             return
 
-        self.token_to_kv_pool.set_kv_buffer(
+        self.kv_layers.layer(layer.layer_id).store(
             layer,
             KVWriteLoc(
                 self.dcp_metadata.local_cache_loc,
@@ -714,7 +714,7 @@ class XPUAttentionBackend(AttentionBackend):
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): the layer reuses another
             # layer's KV cache. The paged kernel reads K/V directly via
-            # page_table, and pool.get_kv_buffer(layer.layer_id) routes
+            # page_table, and pool.layer_router.read(layer.layer_id).kv() routes
             # to the correct sub-pool because RadixAttention is initialized
             # with layer_id=kv_shared_layer_index for shared layers. No
             # materialization needed; just skip the write path.
@@ -731,7 +731,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     self._set_kv_buffer_mha(layer, forward_batch, cache_loc, k, v)
                 else:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         cache_loc,
                         k,
@@ -833,7 +833,7 @@ class XPUAttentionBackend(AttentionBackend):
             # chunked-prefix varlen kernels there keep their own default.
             kwargs["num_splits"] = self.num_splits
 
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -1016,9 +1016,7 @@ class XPUAttentionBackend(AttentionBackend):
                 assert not layer.logit_cap, "MLA prefill does not support logit_cap"
 
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
-                )
+                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
 
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1212,7 +1210,7 @@ class XPUAttentionBackend(AttentionBackend):
                 q.new_full((tokens, heads), -float("inf"), dtype=torch.float32),
             )
 
-        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
         out, softmax_lse, *_ = flash_attn_with_kvcache(
             q=q,
             k_cache=key_cache.view(
@@ -1387,7 +1385,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     # Pass k_rope as-is like forward_extend: when rope is folded into
                     # k (k_rope is None), set_mla_kv_buffer stores the whole kv row.
-                    self.token_to_kv_pool.set_mla_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store_mla(
                         layer,
                         cache_loc,
                         k,
@@ -1453,7 +1451,7 @@ class XPUAttentionBackend(AttentionBackend):
             # (no split-KV), so it needs no deterministic override here.
             kwargs["num_splits"] = self.num_splits
 
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = self.kv_layers.read(layer.layer_id).kv()
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -1588,7 +1586,7 @@ class XPUAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
             assert not use_cascade_attn, "Cascade attention is not supported with MLA"
 
             if q_rope is not None:

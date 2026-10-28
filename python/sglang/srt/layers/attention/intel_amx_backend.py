@@ -243,15 +243,15 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_buffer = self.kv_layers.read(layer.layer_id).key()
+        value_buffer = self.kv_layers.read(layer.layer_id).value()
         if save_kv_cache and k is not None and v is not None:
             # Cross-attention never writes to the SWA pool, so only thread the
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
             write_loc = KVWriteLoc(cache_loc, swa_loc)
             if not self.use_mla and key_buffer.dtype == torch.float8_e4m3fn:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     write_loc,
                     k,
@@ -260,7 +260,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                     v_scale=layer.v_scale_float,
                 )
             else:
-                self.token_to_kv_pool.set_kv_buffer(layer, write_loc, k, v)
+                self.kv_layers.layer(layer.layer_id).store(layer, write_loc, k, v)
 
         # Precomputed once per forward pass in init_forward_metadata (spec
         # verify batches carry no extend_* fields; see _build_extend_metadata).
@@ -344,8 +344,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_buffer = self.kv_layers.read(layer.layer_id).key()
+        value_buffer = self.kv_layers.read(layer.layer_id).value()
         key_scale = layer.k_scale_float or 1.0
         value_scale = layer.v_scale_float or 1.0
         cache_loc = (
@@ -360,7 +360,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             and key_buffer.dtype == torch.float8_e4m3fn
         ):
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(cache_loc, swa_loc),
                 k,

@@ -1492,7 +1492,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1733,7 +1733,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None

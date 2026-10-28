@@ -656,6 +656,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             return_value=torch.tensor([[[0]]], dtype=torch.int32)
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
@@ -729,6 +730,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend._compress_decode_keys = Mock()
         backend.get_topk_for_sparse = Mock(return_value=None)
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
@@ -797,6 +799,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             return_value=torch.tensor([[[0, 1], [0, 1]]], dtype=torch.int32)
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
