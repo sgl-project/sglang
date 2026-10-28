@@ -18,7 +18,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# These vary per replay; specializing on them compiles in the pre-replay host refresh.
+@triton.jit(do_not_specialize=["bs", "num_tokens", "num_padding"])
 def _qsa_graph_layout_kernel(
     # Request-level inputs.
     seq_lens_ptr,  # [bs] base lengths
@@ -66,7 +67,7 @@ def _qsa_graph_layout_kernel(
         tl.store(row_req_pool_ptr + row, req.to(tl.int32))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bs", "num_padding"])
 def _qsa_graph_row_metadata_kernel(
     # Row layout buffers (filled by the layout kernel).
     row_seq_lens_ptr,
@@ -221,7 +222,8 @@ def launch_graph_metadata(
     )
 
 
-@triton.jit
+# The inlined row kernel takes this kernel's specializations, so the flags go here too.
+@triton.jit(do_not_specialize=["bs", "num_padding"])
 def _qsa_draft_graph_metadata_kernel(
     buffers,
     seq_lens,
