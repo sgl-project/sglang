@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -357,6 +358,7 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -385,6 +387,23 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
             self.layer_info.swa_attention_layer_ids
         )
+        quant_config = getattr(self.model, "quant_config", None)
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            if (
+                quant_config.requested_kv_cache_dtype == "fp8_e4m3"
+                and not self.use_mla_backend
+            ):
+                raise ValueError(
+                    "ModelSlim static FP8 KV cache currently supports MLA only"
+                )
+            self.modelslim_cache_layout = quant_config.get_modelslim_kv_cache_layout(
+                self.model,
+                use_mla_backend=self.use_mla_backend,
+            )
 
     def hybrid_swa_token_capacity(
         self,
@@ -2268,7 +2287,9 @@ class KVCacheConfigurator:
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
         use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
+            self.kv_cache_dtype == torch.float8_e4m3fn
+            and is_arch35
+            and self.modelslim_cache_layout is None
         )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
@@ -2293,6 +2314,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 
@@ -2688,6 +2710,12 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
+            )
+        if self.modelslim_cache_layout is not None:
+            full_pool_class = partial(
+                full_pool_class,
+                modelslim_cache_layout=self.modelslim_cache_layout,
+                is_draft_worker=self.is_draft_worker,
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,

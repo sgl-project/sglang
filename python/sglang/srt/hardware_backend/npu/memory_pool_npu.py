@@ -26,29 +26,29 @@ if is_npu():
 
 
 def _mla_fia_nz_scatter_indices(
-    loc: torch.Tensor, head_dim: int, page_size: int
+    loc: torch.Tensor, head_dim: int, page_size: int, tile_size: int = 16
 ) -> torch.Tensor:
     """Return physical rows for token-wise writes into an MLA NZ cache.
 
     The storage allocation remains page-major ``[page, slot, 1, D]`` for
     transfer and bookkeeping compatibility. FIA reads that storage as
-    ``[page, 1, D / 16, page_size, 16]``. A token-major scatter would therefore
+    ``[page, 1, D / tile_size, page_size, tile_size]``. A token-major scatter would therefore
     write the wrong physical rows, so every logical token expands to its
-    ``D / 16`` NZ tiles.
+    ``D / tile_size`` NZ tiles.
     """
-    if head_dim % 16:
+    if head_dim % tile_size:
         raise ValueError(
-            "FIA NZ MLA cache requires a head dimension divisible by 16, "
+            f"FIA NZ MLA cache requires a head dimension divisible by {tile_size}, "
             f"got {head_dim}."
         )
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}.")
 
-    num_tiles = head_dim // 16
+    num_tiles = head_dim // tile_size
     page = torch.div(loc, page_size, rounding_mode="floor")
     slot = torch.remainder(loc, page_size)
     tiles = torch.arange(num_tiles, dtype=loc.dtype, device=loc.device)
-    # Flatten [token, tile] in the same order as source.view(T, tiles, 16).
+    # Flatten [token, tile] in the same order as source.view(T, tiles, tile_size).
     rows = ((page[:, None] * num_tiles + tiles) * page_size) + slot[:, None]
     return rows.reshape(-1, 1)
 
@@ -645,6 +645,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        modelslim_cache_layout=None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -701,10 +702,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
             )
             self.store_dtype = dtype
+        if modelslim_cache_layout is not None:
+            self.store_dtype = dtype
         self.kv_cache_dim = (
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.rope_dtype = (
+            modelslim_cache_layout.value_dtype
+            if modelslim_cache_layout is not None
+            else self.store_dtype
+        )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -751,7 +759,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=(
                         torch.bfloat16
                         if self.dsa_kv_cache_store_fp8
-                        else self.store_dtype
+                        else self.rope_dtype
                     ),
                     device=self.device,
                 )
@@ -1024,7 +1032,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-        if cache_k.dtype != self.dtype:
+        modelslim_kv_scheme = getattr(layer, "scheme", None)
+        if modelslim_kv_scheme is not None:
+            cache_k, cache_v, _ = modelslim_kv_scheme.quantize_cache(cache_k, cache_v)
+        elif cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -1059,12 +1070,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Store MLA latent and RoPE KV tensors in FIA's NZ tile order."""
 
         def scatter(cache: torch.Tensor, values: torch.Tensor, head_dim: int):
-            num_tiles = head_dim // 16
-            indices = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
+            tile_size = 32 // cache.element_size()
+            num_tiles = head_dim // tile_size
+            indices = _mla_fia_nz_scatter_indices(
+                loc, head_dim, self.page_size, tile_size
+            )
             # Destination rows are ordered [page, tile, slot]. Source rows use
             # the matching [token, tile] order after this reshape.
-            dst = cache.view(-1, 1, num_tiles, self.page_size, 16).view(-1, 16)
-            src = values.contiguous().view(-1, num_tiles, 16).view(-1, 16)
+            dst = cache.view(-1, 1, num_tiles, self.page_size, tile_size).view(
+                -1, tile_size
+            )
+            src = values.contiguous().view(-1, num_tiles, tile_size).view(-1, tile_size)
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
         offset = layer_id - self.start_layer

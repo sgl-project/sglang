@@ -35,6 +35,9 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
         return torch.int32
 
     def _replay_graph(self, shape_key, forward_batch):
+        modelslim_cache_layout = (
+            self.model_runner.kv_cache_configurator.modelslim_cache_layout
+        )
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
@@ -43,7 +46,11 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             return self.backend.replay_with_input_update(
                 shape_key,
                 seq_lens=seq_lens,
-                attr_name="actual_seq_lengths_kv",
+                attr_name=(
+                    "actual_seq_kvlen"
+                    if modelslim_cache_layout is not None
+                    else "actual_seq_lengths_kv"
+                ),
                 attr_type=[],
             )
         else:

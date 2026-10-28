@@ -126,7 +126,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # valid when per-rank batch sizes diverge.
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.if_use_v2 = any(
+        modelslim_cache_layout = (
+            model_runner.kv_cache_configurator.modelslim_cache_layout
+        )
+        self.if_use_v2 = modelslim_cache_layout is not None or any(
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])

@@ -48,6 +48,7 @@ from sglang.srt.model_loader.utils import (
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
+    maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -344,6 +345,16 @@ class DeepseekV2WeightLoaderMixin:
                                     >= self.config.num_hidden_layers
                                 ):
                                     continue
+
+                if (
+                    _is_npu
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "modelslim"
+                    and name.endswith((".scale", ".offset"))
+                ):
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
 
                 if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue

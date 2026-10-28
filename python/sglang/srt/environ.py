@@ -1127,6 +1127,7 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE = EnvStr(None)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time so arch35 (Atlas A5) dense linears run on the native quantized

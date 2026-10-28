@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
@@ -14,12 +15,14 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
+    ModelSlimQFP8DynamicKVFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A4MXFP4MoE,
@@ -37,7 +40,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
@@ -97,6 +99,8 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        self.requested_kv_cache_dtype = "auto"
+        self.kv_quant_type_override = None
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -200,6 +204,92 @@ class ModelSlimConfig(QuantizationConfig):
         }
 
         self.quant_description = quant_config
+
+    def configure_kv_cache_quantization(self, dtype, *, override=None):
+        """Set this model's KV cache dtype and optional quantization format override."""
+        self.requested_kv_cache_dtype = dtype
+        self.kv_quant_type_override = (
+            (override.strip() or None) if override is not None else None
+        )
+        if self.kv_quant_type_override is not None:
+            logger.info(
+                "ModelSlim KV quant_type override: %s",
+                self.kv_quant_type_override,
+            )
+
+    def get_modelslim_kv_cache_layout(self, model, *, use_mla_backend):
+        """Return the layout of this worker's installed ModelSlim KV scheme."""
+        for module in model.modules():
+            if isinstance(
+                getattr(module, "quant_method", None), ModelSlimKVCacheMethod
+            ):
+                return module.scheme.get_cache_layout(
+                    use_mla_backend=use_mla_backend
+                )
+        return None
+
+    @staticmethod
+    def _kv_scheme_class(quant_type):
+        # Map supported ModelSlim KV formats to their scheme classes.
+        kv_quant_schemes = {
+            "Q_FP8_DYNAMIC_KV_FP8": ModelSlimQFP8DynamicKVFP8Scheme,
+        }
+        scheme_class = kv_quant_schemes.get(quant_type)
+        if scheme_class is None:
+            raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
+        return scheme_class
+
+    def get_modelslim_kv_scheme(self, prefix):
+        if self.requested_kv_cache_dtype in ("auto", "bf16", "bfloat16"):
+            return None
+        # Map the model's layer prefix to checkpoint-name candidates, e.g.
+        # with or without "language_model."; try the original name first.
+        resolved_prefix = prefix
+        candidates = self._quant_prefix_candidates(prefix)
+        kv_suffixes = (
+            "quant_type",
+            "fa_k.scale",
+            "fa_k.offset",
+            "fa_v.scale",
+            "fa_v.offset",
+        )
+        has_layer_metadata = False
+        # Resolve to the first candidate with a quant_type or fa_k/fa_v key.
+        for candidate in candidates:
+            if any(
+                f"{candidate}.{suffix}" in self.quant_description
+                for suffix in kv_suffixes
+            ):
+                resolved_prefix = candidate
+                has_layer_metadata = True
+                break
+        raw = self.quant_description.get(f"{resolved_prefix}.quant_type")
+        if raw == "FLOAT" or any(
+            fnmatchcase(resolved_prefix, ignored)
+            or resolved_prefix.startswith(ignored + ".")
+            for ignored in self.ignore
+        ):
+            raise ValueError(
+                "ModelSlim quantized KV cache cannot share a pool "
+                f"with unquantized attention layer {resolved_prefix}. "
+                "Remove that layer's ignore/FLOAT declaration or use "
+                "--kv-cache-dtype auto for a BF16 cache."
+            )
+        if not has_layer_metadata:
+            raise ValueError(
+                f"{resolved_prefix}: ModelSlim quantized KV cache requires "
+                "a per-layer FA quantization declaration; an override does not "
+                "create quantized layers"
+            )
+        effective = self.kv_quant_type_override or raw
+        try:
+            scheme_class = self._kv_scheme_class(effective)
+        except ValueError as error:
+            raise ValueError(
+                f"{resolved_prefix}: unsupported ModelSlim KV format "
+                f"(raw={raw!r}, effective={effective!r})"
+            ) from error
+        return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
@@ -470,6 +560,23 @@ class ModelSlimConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class ModelSlimKVCacheMethod(QuantizeMethodBase):
+    """Use the attention layer's scheme without GPU per-tensor KV fallbacks."""
+
+    def create_weights(self, layer, **kwargs):
+        layer.scheme.create_weights(layer, **kwargs)
+
+    def process_weights_after_loading(self, layer):
+        layer.scheme.process_weights_after_loading(layer)
+
+    def restore_weights_before_loading(self, layer):
+        for parameter in layer.parameters(recurse=False):
+            parameter.modelslim_loaded = False
+
+    def apply(self, layer, k, v):
+        return layer.scheme.quantize_cache(k, v)
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):
