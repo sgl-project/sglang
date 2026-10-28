@@ -144,6 +144,7 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.qr_comm = None
     coordinator.pymscclpp_comm = None
     coordinator.torch_symm_mem_comm = None
+    coordinator.b12x_comm = None
     coordinator._fi_workspace_hint = None
     coordinator.ca_comm = Mock(disabled=False)
     coordinator.ca_comm.should_custom_ar.return_value = True

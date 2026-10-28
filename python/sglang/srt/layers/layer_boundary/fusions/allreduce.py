@@ -27,6 +27,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     Fp8Input,
     NormQuantReadout,
     aiter_ar_fusion_applies,
+    b12x_ar_fusion_applies,
     flashinfer_ar_fusion_applies,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -78,7 +79,7 @@ def fused_attn_input(
     keep_bf16: bool,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Complete the sum the previous layer left, add it to the residual and
-    apply the input norm in one aiter or flashinfer kernel; None when the
+    apply the input norm in one aiter, flashinfer or b12x kernel; None when the
     kernel does not take this batch. The optional FP8 result follows the consumer read declaration;
     the separate ``quant_format`` path remains the read adapter's responsibility."""
     if (
@@ -93,6 +94,7 @@ def fused_attn_input(
     if not (
         aiter_ar_fusion_applies(hidden_states, forward_batch)
         or flashinfer_ar_fusion_applies(hidden_states.shape[0])
+        or b12x_ar_fusion_applies(hidden_states.shape[0])
     ):
         return None
     if fuses_quant:
@@ -153,11 +155,12 @@ def fused_ffn_input(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """The attention-TP all-reduce, residual add and norm in one aiter or
-    flashinfer kernel; None when neither takes the batch."""
+    """The attention-TP all-reduce, residual add and norm in one aiter,
+    flashinfer or b12x kernel; None when none takes the batch."""
     if not (
         aiter_ar_fusion_applies(hidden_states, forward_batch)
         or flashinfer_ar_fusion_applies(hidden_states.shape[0])
+        or b12x_ar_fusion_applies(hidden_states.shape[0])
     ):
         return None
     return plan.norm.forward_with_allreduce_fusion(

@@ -20,6 +20,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
@@ -155,6 +156,20 @@ def flashinfer_ar_fusion_applies(batch_size: int):
         # before reaching them.
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+    )
+
+
+# The b12x fused all-reduce + RMSNorm kernel is specialized for small token
+# counts; keep this in sync with _FUSED_MAX_ROWS in b12x_pcie_ar.py.
+_B12X_FUSED_MAX_ROWS = 36
+
+
+def b12x_ar_fusion_applies(batch_size: int):
+    return (
+        envs.SGLANG_B12X_PCIE_AR.get()
+        and not is_dp_attention_enabled()
+        and batch_size > 0
+        and batch_size <= _B12X_FUSED_MAX_ROWS
     )
 
 
