@@ -28,7 +28,6 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1554,25 +1553,16 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one.
     The index-K scales are FP32 or packed UE8M0 in the same bytes, so they are part of it."""
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
-        dsv4_fp8_index_cache_is_ue8m0,
-    )
-    from sglang.srt.layers.attention.dsa.utils import dsa_index_k_cache_is_ue8m0
+    from sglang.srt.layers.attention.dsa.utils import index_k_cache_is_ue8m0
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
+    ue8m0 = index_k_cache_is_ue8m0(token_to_kv_pool)
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         layout = token_to_kv_pool.pd_kv_layout()
-        if dsv4_fp8_index_cache_is_ue8m0() and not (
-            get_exec().kernel.enable_deepseek_v4_fp4_indexer
-        ):
-            layout += ",index_k:ue8m0"
-        return layout
-    dsa_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
-    if isinstance(dsa_pool, DSATokenToKVPool):
-        ue8m0 = dsa_index_k_cache_is_ue8m0(kpool=dsa_pool.index_kpool > 1)
-        return f"index_k:{'ue8m0' if ue8m0 else 'fp32'}"
-    return None
+        return f"{layout},index_k:ue8m0" if ue8m0 else layout
+    if ue8m0 is None:
+        return None
+    return f"index_k:{'ue8m0' if ue8m0 else 'fp32'}"
 
 
 def pd_kv_layouts_match(prefill: Optional[str], decode: Optional[str]) -> bool:

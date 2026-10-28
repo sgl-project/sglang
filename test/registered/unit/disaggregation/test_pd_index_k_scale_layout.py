@@ -1,4 +1,5 @@
-"""PD peers must agree on the index-K scale bytes: FP32 or DeepGEMM's packed UE8M0."""
+"""PD peers and HiCache storage must agree on the index-K scale bytes: FP32 or
+DeepGEMM's packed UE8M0."""
 
 import unittest
 from contextlib import ExitStack
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from sglang.srt.disaggregation.utils import get_pd_kv_layout, pd_kv_layouts_match
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_index_k_cache_is_ue8m0
+from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,9 +39,6 @@ def _device(stack, *, sm100=True, backend="auto", fp4_indexer=False):
             "sglang.srt.layers.attention.dsa.paged_mqa_logits_backend.get_platform",
             return_value=SimpleNamespace(is_sm100=sm100),
         )
-    )
-    stack.enter_context(
-        patch("sglang.srt.disaggregation.utils.get_exec", return_value=exec_args)
     )
 
 
@@ -91,6 +90,20 @@ class TestPdIndexKScaleLayout(CustomTestCase):
         self.assertFalse(pd_kv_layouts_match("index_k:fp32", "index_k:ue8m0"))
         self.assertTrue(pd_kv_layouts_match("index_k:ue8m0", "index_k:ue8m0"))
 
+    def test_storage_keys_name_a_ue8m0_index_cache(self):
+        host_pool = SimpleNamespace(storage_format_tag=None)
+        for device, want in [
+            (dict(backend="deepgemm"), "org/model-index_k-ue8m0"),
+            (dict(backend="cutedsl"), "org/model"),
+            (dict(sm100=False), "org/model"),
+        ]:
+            with self.subTest(device=device), ExitStack() as stack:
+                _device(stack, **device)
+                self.assertEqual(
+                    storage_model_name("org/model", host_pool, _dsa_pool()), want
+                )
+        self.assertEqual(storage_model_name("org/model", host_pool), "org/model")
+
     def test_dsv4_layout_names_a_ue8m0_fp8_index_cache(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         cases = [
@@ -111,8 +124,7 @@ class TestPdIndexKScaleLayout(CustomTestCase):
                 )
                 stack.enter_context(
                     patch(
-                        "sglang.srt.layers.attention.deep_gemm_mqa_logits."
-                        "dsv4_fp8_index_cache_is_ue8m0",
+                        f"{_UTILS}.dsv4_fp8_index_cache_is_ue8m0",
                         return_value=ue8m0,
                     )
                 )

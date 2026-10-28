@@ -7,6 +7,7 @@ import triton
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    dsv4_fp8_index_cache_is_ue8m0,
     fp8_mqa_logits,
     fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
@@ -372,6 +373,23 @@ def dsa_index_k_cache_is_ue8m0(kpool: bool) -> bool:
         get_exec().kernel.dsa_paged_mqa_logits_backend
     )
     return kpool or (backend.is_deepgemm() and not _use_torch_mqa_logits())
+
+
+def index_k_cache_is_ue8m0(kv_pool) -> Optional[bool]:
+    """Whether ``kv_pool``'s index-K cache stores packed UE8M0 scales rather than
+    FP32 in the same bytes; None for pools without a DSA / DSV4 FP8 index-K cache."""
+    # Imported here: the memory pools import the attention backends
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if isinstance(kv_pool, DeepSeekV4TokenToKVPool):
+        return dsv4_fp8_index_cache_is_ue8m0() and not (
+            get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        )
+    dsa_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
+    if isinstance(dsa_pool, DSATokenToKVPool):
+        return dsa_index_k_cache_is_ue8m0(kpool=dsa_pool.index_kpool > 1)
+    return None
 
 
 @lru_cache(maxsize=1)

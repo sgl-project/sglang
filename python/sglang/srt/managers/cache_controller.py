@@ -58,14 +58,19 @@ device_module = get_device_module()
 
 
 def storage_model_name(
-    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+    model_name: Optional[str],
+    host_pool: HostKVCache | LogicalHostPool,
+    device_pool: Any = None,
 ) -> Optional[str]:
     """The model name storage backends key pages on, tagged with the host
-    pool's page format when it has one of its own."""
-    tag = host_pool.storage_format_tag
-    if tag is None:
-        return model_name
-    return f"{model_name}-{tag}" if model_name else tag
+    pool's page format when it has one of its own, and with a UE8M0 index-K
+    cache, whose scales share their bytes with the FP32 format."""
+    from sglang.srt.layers.attention.dsa.utils import index_k_cache_is_ue8m0
+
+    tags = [host_pool.storage_format_tag]
+    if index_k_cache_is_ue8m0(device_pool):
+        tags.append("index_k-ue8m0")
+    return "-".join(part for part in (model_name, *tags) if part) or None
 
 
 class LayerLoadingEvent:
@@ -804,7 +809,9 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
-        model_name = storage_model_name(model_name, self.storage_host_pool)
+        model_name = storage_model_name(
+            model_name, self.storage_host_pool, self.mem_pool_device
+        )
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
