@@ -721,13 +721,14 @@ def alloc_for_spec_decode(
     *,
     reqs: list[Req],
     req_pool_indices: torch.Tensor,
-    cur_kv_lens: torch.Tensor,
+    cur_kv_lens: Optional[torch.Tensor],
     cur_kv_lens_cpu: torch.Tensor,
-    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens: Optional[torch.Tensor],
     nxt_kv_lens_cpu: torch.Tensor,
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    # the device lengths are read only when tokens are allocated
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)

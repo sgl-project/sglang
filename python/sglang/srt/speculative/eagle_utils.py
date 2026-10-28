@@ -1033,15 +1033,16 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-    # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    # barrier has chained to the prev forward -> host stalls a full forward. Only an
+    # allocation reads them: most steps fit in the pages already allocated.
+    cur_kv_lens = nxt_kv_lens = None
+    if num_needed_tokens > 0:
+        cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     tree_cache = batch.tree_cache
     req_to_token_pool = batch.req_to_token_pool
     req_pool_indices = batch.req_pool_indices
     reqs = batch.reqs
-    cur_kv_lens = cur_kv_lens_device
-    nxt_kv_lens = nxt_kv_lens_device
     alloc_for_spec_decode(
         tree_cache,
         req_to_token_pool,

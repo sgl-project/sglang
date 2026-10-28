@@ -1704,6 +1704,17 @@ class Scheduler(
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
             )
+        # The forward stream gathers the relayed lengths itself, with no host copy and
+        # no event wait (HIP), so only a mixed chunk's tails or the confidence relay
+        # wait on the publish event.
+        self._gpu_only_lens = (
+            _is_hip
+            and self._confidence_budget_prepare is None
+            and not getattr(self.future_map, "needs_cpu_seq_lens", True)
+        )
+        self.future_map.record_publish = (
+            not self._gpu_only_lens or self.is_mixed_chunk or needs_confidence_relay
+        )
 
         # If enable async D2H copy when overlap is enabled
         # Currently used by NVIDIA Confidential Computing (CC) only
@@ -4747,11 +4758,7 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                gpu_only_lens = (
-                    _is_hip
-                    and self._confidence_budget_prepare is None
-                    and not getattr(self.future_map, "needs_cpu_seq_lens", True)
-                )
+                gpu_only_lens = self._gpu_only_lens
                 if not gpu_only_lens:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
