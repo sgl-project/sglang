@@ -233,6 +233,19 @@ def _check_native_batch(batch: int, timestep, context) -> None:
             )
 
 
+def _push_worker_status() -> None:
+    """Send the status text to the ComfyUI page so SGLDWorkerStatus updates mid-run."""
+    try:
+        from server import PromptServer
+    except ImportError:  # not running inside ComfyUI
+        return
+    from ..core.generator import SGLDiffusionGenerator
+
+    PromptServer.instance.send_sync(
+        "sgld.worker_status", {"text": SGLDiffusionGenerator.shared().status_text()}
+    )
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
@@ -241,6 +254,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     native_batching = "off"
     # Lowered for the rest of a sampler run after the worker runs out of memory.
     _run_batching = None
+    # The worker's RequestMetrics for the latest DiT call; read by SGLDWorkerStatus.
+    last_metrics = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -425,6 +440,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
             if _is_out_of_memory(output_batch.error):
                 raise WorkerOutOfMemoryError(message)
             raise RuntimeError(message)
+        self.last_metrics = output_batch.metrics
+        _push_worker_status()
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):

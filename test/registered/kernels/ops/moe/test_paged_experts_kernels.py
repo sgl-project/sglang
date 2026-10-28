@@ -29,9 +29,14 @@ class _State:
         self.dst = torch.zeros(K, **i32)
         self.count = torch.zeros(1, **i32)
 
-    def decide(self, topk):
+    def decide(self, topk, weights=None):
+        """Run the decide kernel; return the runner inputs it wrote (slots, weights)."""
+        if weights is None:
+            weights = torch.ones(topk.shape, device="cuda")
+        run_ids, run_w = torch.empty_like(topk), torch.empty_like(weights)
         paged_experts_decide(
             topk,
+            weights,
             self.step,
             self.slot_expert,
             self.expert_slot,
@@ -39,7 +44,10 @@ class _State:
             self.src,
             self.dst,
             self.count,
+            run_ids,
+            run_w,
         )
+        return run_ids, run_w
 
 
 class _Reference:
@@ -87,13 +95,29 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertEqual(state.expert_slot.tolist(), expert_slot)
 
     def test_decide_matches_reference(self):
+        """The LRU decision and plan, and the runner inputs: each entry's slot and weight,
+        slot 0 and weight 0 for padding."""
         generator = torch.Generator().manual_seed(0)
         state, ref = _State(), _Reference()
         for _ in range(200):
             topk = _random_topk(generator, int(torch.randint(1, K + 1, (1,))))
+            weights = torch.rand(topk.shape, generator=generator)
             plan = ref.decide(topk.tolist())
-            state.decide(topk.cuda())
+            run_ids, run_w = state.decide(topk.cuda(), weights.cuda())
             self.assert_state(state, ref, plan)
+            routed = topk >= 0
+            slots = [ref.slot_expert.index(e) if e >= 0 else 0 for e in topk.tolist()]
+            self.assertEqual(run_ids.tolist(), slots)
+            self.assertTrue(torch.equal(run_w.cpu(), weights.masked_fill(~routed, 0)))
+
+    def test_decide_pads_ids_outside_the_experts(self):
+        topk = torch.tensor([3, E, -1, 3, E + 5], dtype=torch.int32, device="cuda")
+        weights = torch.arange(1, 6, dtype=torch.float32, device="cuda")
+        state = _State()
+        run_ids, run_w = state.decide(topk, weights)
+        self.assertEqual(run_ids.tolist(), [3, 0, 0, 3, 0])
+        self.assertEqual(run_w.tolist(), [1.0, 0.0, 0.0, 4.0, 0.0])
+        self.assertEqual(state.count.item(), 0)
 
     def test_decide_rejects_more_entries_than_slots(self):
         with self.assertRaises(Exception):
@@ -105,6 +129,8 @@ class TestPagedExpertsKernels(CustomTestCase):
             torch.randint(0, 100, (E, 12), dtype=torch.int32).pin_memory(),
             torch.randn(E, dtype=torch.float32).pin_memory(),  # 4-byte rows
             torch.randn(E, 3, dtype=torch.float32).pin_memory(),  # 12-byte rows
+            torch.randn(E, dtype=torch.bfloat16).pin_memory(),  # 2-byte rows
+            torch.randn(E, 3, dtype=torch.bfloat16).pin_memory(),  # 6-byte rows
         ]
         gpus = [
             torch.zeros(K, *h.shape[1:], dtype=h.dtype, device="cuda") for h in hosts
@@ -161,7 +187,7 @@ def _gather_args(hosts, gpus):
         for v in (
             [paged_experts_host_device_pointer(h) for h in hosts],
             [g.data_ptr() for g in gpus],
-            [h[0].numel() * h.element_size() // 4 for h in hosts],
+            [h[0].numel() * h.element_size() for h in hosts],
         )
     ]
 

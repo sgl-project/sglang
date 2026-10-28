@@ -37,7 +37,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=37, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
@@ -365,6 +365,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -382,6 +383,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -491,6 +493,9 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.staging_handler = None
     q.tree_cache = MagicMock()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
+    q.metadata_buffers.clear_slot = lambda idx: (
+        q.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+    )
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
         enable_decode_hicache=False,
