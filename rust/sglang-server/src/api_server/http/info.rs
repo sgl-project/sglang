@@ -1,6 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`,
-//! `/abort_request`, backed by typed operations on
+//! `/start_profile`, `/stop_profile`, `/abort_request`, backed by typed operations on
 //! [`crate::api_server::handlers::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
@@ -25,7 +25,9 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::handlers::ProfileOutcome;
 use crate::message::info::ServerInfo;
+use crate::message::io_struct::ProfileOptions;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -39,6 +41,8 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/model_info", get(model_info))
         .route("/flush_cache", get(flush_cache).post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
+        .route("/start_profile", get(start_profile).post(start_profile))
+        .route("/stop_profile", get(stop_profile).post(stop_profile))
         .route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
@@ -290,6 +294,79 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
     (status, Json(Value::Object(response))).into_response()
 }
 
+/// Python's `ProfileReq` body for `/start_profile`. `req_type` is accepted
+/// only as one of Python's `ProfileReqType` values and then ignored: the route
+/// always starts.
+#[derive(Deserialize)]
+struct StartProfileBody {
+    #[serde(default)]
+    req_type: Option<u8>,
+    #[serde(flatten)]
+    options: ProfileOptions,
+}
+
+/// `GET|POST /start_profile` — the scheduler ranks start their profilers
+/// with the body's options (Python's defaults for an absent or `null` body);
+/// which ranks under attention DP: see `ProfileReq`.
+/// Python's plain-text 200 once started.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<Option<StartProfileBody>>(&body) {
+            Ok(None) => ProfileOptions::default(),
+            Ok(Some(StartProfileBody {
+                req_type: None | Some(1 | 2),
+                options,
+            })) => options,
+            Ok(Some(_)) => {
+                return native_error(
+                    StatusCode::BAD_REQUEST,
+                    "req_type: Input should be 1 or 2",
+                    false,
+                );
+            }
+            Err(error) => {
+                return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false);
+            }
+        }
+    };
+    profile_response(
+        state.core.start_profile(options).await,
+        "Start profiling.\n",
+    )
+}
+
+/// `GET|POST /stop_profile` — the scheduler ranks stop their profilers and
+/// write their traces (which ranks under attention DP: see `ProfileReq`);
+/// any body is ignored, as Python ignores it.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_response(
+        state.core.stop_profile().await,
+        "Stop profiling. This will take some time.\n",
+    )
+}
+
+/// Python's responses for both profile routes: 200 with `ok_body` and no
+/// content type. A scheduler refusal (e.g. already profiling) is the
+/// `RuntimeError` Python raises in the route, which reaches the client as the
+/// framework's bare 500 `Internal Server Error`; the reason is only logged.
+fn profile_response(outcome: Result<ProfileOutcome, CoreError>, ok_body: &'static str) -> Response {
+    match outcome {
+        Ok(ProfileOutcome { success: true, .. }) => Response::new(Body::from(ok_body)),
+        Ok(ProfileOutcome { message, .. }) => {
+            tracing::error!(%message, "profile request failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+        }
+        Err(CoreError::Unavailable) => native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        ),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
 /// Python's `AbortReq` body: the fields `/abort_request` reads.
 #[derive(Deserialize)]
 struct AbortRequestBody {
@@ -343,6 +420,7 @@ mod tests {
     use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
+    use crate::utils::environ;
 
     fn test_state(
         server_args: ServerArgs,
@@ -863,6 +941,240 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
             assert!(intake_rx.try_recv().is_err(), "{body}");
         }
+    }
+
+    /// Send `body` to `uri`, answer the one `ProfileReq` it submits with
+    /// `outcome`, and return its decoded header and the HTTP response.
+    async fn profile_round_trip(
+        method: &str,
+        uri: &str,
+        body: &'static str,
+        outcome: (bool, &str),
+    ) -> (Vec<rmpv::Value>, Response) {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state).oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake {
+            request: runtime_request,
+            admission,
+        } = intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("{uri} must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let RequestKind::Control(control) = &runtime_request.kind else {
+            panic!("{uri} must submit a control request");
+        };
+        let header = control.encode().unwrap();
+        let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+        let rmpv::Value::Array(header) = header else {
+            panic!("{uri}: the header must be an array");
+        };
+
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(
+            &mut payload,
+            &rmpv::Value::Map(vec![
+                (rmpv::Value::from("rid"), rmpv::Value::from("x")),
+                (rmpv::Value::from("http_worker_ipc"), rmpv::Value::Nil),
+                (rmpv::Value::from("success"), rmpv::Value::from(outcome.0)),
+                (rmpv::Value::from("message"), rmpv::Value::from(outcome.1)),
+            ]),
+        )
+        .unwrap();
+        runtime_request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(payload)))
+            .unwrap();
+        (header, response.await.unwrap().unwrap())
+    }
+
+    async fn plain_text(response: Response) -> (StatusCode, Option<String>, String) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    /// `/start_profile` relays one `ProfileReq` carrying the body's fields
+    /// (Python's defaults for a missing or `null` body, a numeric-string
+    /// `start_step` as Python's validation coerces it) and answers with
+    /// Python's plain-text 200; a refused start is Python's bare 500. A
+    /// malformed body is refused before anything reaches the scheduler.
+    #[tokio::test]
+    async fn start_profile_relays_the_body_and_the_scheduler_outcome() {
+        // The stack/shape defaults come from the process env, which the
+        // resolution test drives with an injected reader; here expect what
+        // this env resolves to instead of assuming the knobs are unset.
+        let env_with_stack = environ::get_bool_env_var("SGLANG_PROFILE_WITH_STACK", true);
+        let env_record_shapes = environ::get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", true);
+        let (header, response) = profile_round_trip(
+            "POST",
+            "/start_profile",
+            r#"{"output_dir": "/traces", "start_step": "15", "num_steps": 5,
+                "activities": ["CPU", "GPU"], "profile_by_stage": true,
+                "with_stack": false, "profile_id": "run-1", "merge_profiles": true,
+                "profile_prefix": "pre", "profile_stages": ["decode"],
+                "detailed_annotations": true, "req_type": 2, "rid": "ignored",
+                "unknown": 1}"#,
+            (true, "Succeeded"),
+        )
+        .await;
+        let expected: Vec<rmpv::Value> = vec![
+            "ProfileReq".into(),
+            header[1].clone(), // the minted rid
+            rmpv::Value::Nil,
+            1.into(), // START_PROFILE even though the body said 2
+            "/traces".into(),
+            15.into(),
+            5.into(),
+            rmpv::Value::Array(vec!["CPU".into(), "GPU".into()]),
+            true.into(),
+            false.into(),
+            env_record_shapes.into(), // absent from the body
+            "run-1".into(),
+            true.into(),
+            "pre".into(),
+            rmpv::Value::Array(vec!["decode".into()]),
+            true.into(),
+        ];
+        assert_eq!(header, expected);
+        assert_ne!(header[1].as_str(), Some("ignored"));
+        assert_eq!(
+            plain_text(response).await,
+            (StatusCode::OK, None, "Start profiling.\n".to_owned())
+        );
+
+        for (method, body) in [("GET", ""), ("POST", "null"), ("POST", "{}")] {
+            let (header, response) =
+                profile_round_trip(method, "/start_profile", body, (true, "Succeeded")).await;
+            assert_eq!(header.len(), 16, "{body:?}");
+            assert_eq!(header[3].as_u64(), Some(1), "{body:?}");
+            for i in [4, 5, 6, 7, 13, 14] {
+                assert!(header[i].is_nil(), "{body:?}: idx {i}");
+            }
+            for i in [8, 12, 15] {
+                assert_eq!(header[i].as_bool(), Some(false), "{body:?}: idx {i}");
+            }
+            assert_eq!(
+                header[9].as_bool(),
+                Some(env_with_stack),
+                "{body:?}: with_stack"
+            );
+            assert_eq!(
+                header[10].as_bool(),
+                Some(env_record_shapes),
+                "{body:?}: record_shapes"
+            );
+            assert!(
+                header[11].as_str().unwrap().parse::<f64>().is_ok(),
+                "{body:?}: profile_id is the start time"
+            );
+            assert_eq!(plain_text(response).await.0, StatusCode::OK, "{body:?}");
+        }
+
+        let (_, response) = profile_round_trip(
+            "POST",
+            "/start_profile",
+            "",
+            (
+                false,
+                "Profiling is already in progress. Call /stop_profile first.",
+            ),
+        )
+        .await;
+        assert_eq!(
+            plain_text(response).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("text/plain; charset=utf-8".to_owned()),
+                "Internal Server Error".to_owned()
+            )
+        );
+
+        for body in [
+            r#"{"num_steps": 5.5}"#,
+            r#"{"num_steps": "five"}"#,
+            r#"{"profile_by_stage": null}"#,
+            r#"{"with_stack": "yes"}"#,
+            r#"{"activities": "CPU"}"#,
+            r#"{"output_dir": 5}"#,
+            r#"{"req_type": 7}"#,
+            "{",
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/start_profile")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert!(intake_rx.try_recv().is_err(), "{body}");
+        }
+    }
+
+    /// `/stop_profile` ignores its body, relays a STOP `ProfileReq` with every
+    /// other field at its default, and answers with Python's plain-text 200;
+    /// a refused stop (nothing running) is Python's bare 500.
+    #[tokio::test]
+    async fn stop_profile_relays_the_scheduler_outcome() {
+        for (method, body) in [("POST", "{}"), ("GET", ""), ("POST", r#"{"num_steps": 5}"#)] {
+            let (header, response) =
+                profile_round_trip(method, "/stop_profile", body, (true, "Succeeded.")).await;
+            assert_eq!(header.len(), 16, "{body:?}");
+            assert_eq!(header[0].as_str(), Some("ProfileReq"));
+            assert_eq!(header[3].as_u64(), Some(2), "{body:?}: STOP_PROFILE");
+            for i in [4, 5, 6, 7, 9, 10, 11, 13, 14] {
+                assert!(header[i].is_nil(), "{body:?}: idx {i}");
+            }
+            assert_eq!(
+                plain_text(response).await,
+                (
+                    StatusCode::OK,
+                    None,
+                    "Stop profiling. This will take some time.\n".to_owned()
+                )
+            );
+        }
+
+        let (_, response) = profile_round_trip(
+            "POST",
+            "/stop_profile",
+            "",
+            (
+                false,
+                "Profiling is not in progress. Call /start_profile first.",
+            ),
+        )
+        .await;
+        assert_eq!(
+            plain_text(response).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("text/plain; charset=utf-8".to_owned()),
+                "Internal Server Error".to_owned()
+            )
+        );
     }
 
     /// `/abort_request` cancels the live generation submitted under the body's
