@@ -71,6 +71,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -81,6 +82,7 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+from sglang.srt.layers.dcp.layout import dcp_extend_gathers_kv
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -2212,6 +2214,22 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -3509,7 +3527,32 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu or is_deepseek_dsa(self.config):
+        if _is_npu:
+            # NPU decode and short-tail extends gather the query (#37787) and
+            # read rank-local metadata off the attention backend. A DSA extend
+            # whose prefix is cheaper to move than its queries gathers the KV
+            # instead, which needs this; its presence is what selects that path.
+            # The gathered-KV operator path is bf16/fp16 only; any other KV
+            # dtype keeps the query gather rather than raising there.
+            if not self.use_dsa or kv_cache_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                return None
+            prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
+            parallel = get_parallel()
+            if not dcp_extend_gathers_kv(
+                [prefix_sum],
+                [seq_lens_sum - prefix_sum],
+                self.config.num_attention_heads
+                * parallel.attn_dcp_size
+                // parallel.attn_tp_size,
+                self.config.kv_lora_rank,
+                self.config.qk_rope_head_dim,
+                kv_cache_dtype.itemsize,
+            ):
+                return None
+        elif is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

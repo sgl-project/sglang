@@ -872,6 +872,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Gather ``(nope, rope)`` at physical rows ``loc``.
+
+        Overridden because the inherited Triton read assumes one fused buffer
+        and this pool keeps the halves apart. ``loc`` is already rank-local and
+        physical (the read door's contract), so no owner filter here.
+        """
+        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        idx = loc.to(torch.int64)
+        cache_k_nope = k.index_select(0, idx).unsqueeze(1)
+        cache_k_rope = v.index_select(0, idx).unsqueeze(1)
+        if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
+            cache_k_nope = cache_k_nope.to(dst_dtype)
+            cache_k_rope = cache_k_rope.to(dst_dtype)
+        return cache_k_nope, cache_k_rope
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []

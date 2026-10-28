@@ -29,9 +29,15 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_key_lens,
+    dsa_token_shard_cumulative_query_lens,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
+    dcp_crop_free_extend,
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
@@ -1108,6 +1114,74 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = True
 
+    def _forward_sparse_dcp_gathered(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        gathered: tuple[torch.Tensor, torch.Tensor],
+        topk_indices: Optional[torch.Tensor],
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        forward_batch: ForwardBatch,
+        dsa_token_shard_plan,
+    ) -> torch.Tensor:
+        """DCP extend over the context the model gathered, one contiguous run
+        per request: TND keys, cumulative lengths, no block table.
+
+        Relative indices, cumulative lengths. Three of the four conventions
+        return plausible garbage: re-probe before changing.
+        """
+        if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                f"KV cache dtype {self.kv_cache_dtype} with decode context "
+                "parallelism is not supported: the gathered extend path is "
+                "bf16/fp16 only."
+            )
+        key_nope, key_rope = gathered
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        seq_lengths_kv = forward_batch.attn_dcp_metadata.dcp_kv_indptr[1:]
+        sparse_mode = 3
+        if dsa_token_shard_plan is not None:
+            if dcp_crop_free_extend(
+                forward_batch,
+                topk_indices.shape[-1] if topk_indices is not None else None,
+            ):
+                # Full per-request KV lengths, no crop: no request's start moves.
+                # dcp_crop_free_extend has checked the bound.
+                sparse_mode = 0
+            else:
+                # Lengths double as request boundaries: shortening is safe only
+                # for a single request, and the plan refuses more.
+                seq_lengths_kv = dsa_token_shard_cumulative_key_lens(
+                    forward_batch, dsa_token_shard_plan, q_nope.device
+                )
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=key_nope,
+            value=key_nope,
+            query_rope=q_pe,
+            key_rope=key_rope,
+            sparse_indices=_expand_dsa_sparse_indices(topk_indices),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            # layout_kv must equal layout_query unless it is PA_BSND. The block
+            # table is omitted, not passed as None: to a tiling function the two
+            # are not always the same thing.
+            layout_kv="TND",
+            sparse_mode=sparse_mode,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return attn_out
+
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
@@ -1487,8 +1561,18 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # The token shard replaces the query lengths, built once per forward.
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        dsa_token_shard_qlen = None
+        if dsa_token_shard_plan is not None:
+            dsa_token_shard_qlen = dsa_token_shard_cumulative_query_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_token_shard_qlen is not None:
+                actual_seq_qlen = dsa_token_shard_qlen
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1538,6 +1622,20 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            # Set by the model only for a DCP extend that gathered the KV.
+            gathered = forward_batch.npu_dcp_extend_kv
+            if gathered is not None:
+                return self._forward_sparse_dcp_gathered(
+                    q_nope,
+                    q_pe,
+                    gathered,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    forward_batch,
+                    dsa_token_shard_plan,
+                )
+
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)

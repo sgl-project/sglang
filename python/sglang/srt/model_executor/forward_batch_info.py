@@ -74,6 +74,7 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
+    from sglang.srt.layers.dcp.layout import DcpExtendGatherPlan
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -787,6 +788,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Decode context parallel KV write mask.
     dcp_kv_mask: Optional[torch.Tensor] = None
+    # NPU DSA extend that gathers the prefix KV under DCP: the gather plan,
+    # built by the first layer and reused by the rest, and the current layer's
+    # gathered (latent, rope) KV, which the sparse operator reads in place of
+    # the paged pool.
+    npu_dcp_extend_gather: Optional[DcpExtendGatherPlan] = None
+    npu_dcp_extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Whether that extend may drop the operator's causal crop; cached by
+    # `dcp_crop_free_extend` for the forward.
+    npu_dcp_crop_free: Optional[bool] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None

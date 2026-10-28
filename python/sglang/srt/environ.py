@@ -1155,6 +1155,19 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries, and the top-k is all-gathered.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: each attention-TP rank computes every head for its slice of
+    # the tokens. Consumes no ranks. Under DCP, only on forwards whose extend
+    # gathers the KV; the query-gather path needs every head-sharded row.
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
