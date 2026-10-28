@@ -139,11 +139,6 @@ class BailingMMMultimodalProcessor(BaseMultimodalProcessor):
             + cls._token_string(processor, tokenizer, end_attrs, end_fallback)
         )
 
-    def _mm_preprocessing_device_choice(self) -> Optional[str]:
-        # process_mm_data below hands the base placement to its processor
-        # call, so report that placement for worker sizing and JPEG decode.
-        return super()._mm_preprocessing_device_choice()
-
     def process_mm_data(
         self,
         input_text,

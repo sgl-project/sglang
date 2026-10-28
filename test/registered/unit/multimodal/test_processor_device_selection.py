@@ -4,7 +4,7 @@ The device comes from the processor's own ServerArgs (regression: it once read
 the published global ServerArgs, so every processor answered with one
 process-wide device, which the encode-server DP workers cannot express). One
 resolver, `_resolve_mm_preprocessing_device`, ranks `--mm-preprocessing-device`
-over the class default over the platform; `process_mm_data` hands its answer
+over the platform; `process_mm_data` hands its answer
 to the HF processor call and the worker-count decision reads the same answer.
 """
 
@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_mm, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,14 +34,6 @@ class _Processor:
 class _StubProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(self, *args, **kwargs):
         raise NotImplementedError
-
-
-class _CpuDefaultProcessor(_StubProcessor):
-    mm_preprocessing_device = "cpu"
-
-
-class _Cuda1DefaultProcessor(_StubProcessor):
-    mm_preprocessing_device = "cuda:1"
 
 
 class _CpuVideoProcessor(_StubProcessor):
@@ -132,23 +124,6 @@ class TestResolveMmPreprocessingDevice(CustomTestCase):
                     expected,
                 )
 
-    def test_class_default_replaces_the_serving_gpu_on_cuda_platforms(self):
-        self.assertIsNone(_StubProcessor.mm_preprocessing_device)
-        self.assertEqual(self._device(_make(base_gpu_id=3)), "cuda:3")
-        self.assertEqual(
-            self._device(_make(_CpuDefaultProcessor, base_gpu_id=3)), "cpu"
-        )
-        self.assertEqual(
-            self._device(_make(_Cuda1DefaultProcessor, base_gpu_id=3)), "cuda:1"
-        )
-
-    def test_class_default_yields_to_cpu_xpu_and_npu_platforms(self):
-        processor = _make(_Cuda1DefaultProcessor, base_gpu_id=3)
-        self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
-        self.assertEqual(self._device(processor, _is_xpu=True), "xpu")
-        with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
-            self.assertEqual(processor._mm_preprocessing_device_choice(), "npu")
-
     def test_the_choice_is_pure_and_applies_no_npu_patches(self):
         """The constructor sizes the worker pool from the choice, so it must
         not import or apply the NPU processor patches; those run on the first
@@ -184,27 +159,29 @@ class TestResolveMmPreprocessingDevice(CustomTestCase):
                 SimpleNamespace(mm_preprocessing_device=ok, device="cuda")
             )
 
-    def test_server_cpu_wins_over_the_class_default(self):
-        processor = _make(
-            _Cuda1DefaultProcessor, base_gpu_id=3, mm_preprocessing_device="cpu"
-        )
+    def test_server_cpu_overrides_the_serving_gpu(self):
+        processor = _make(base_gpu_id=3, mm_preprocessing_device="cpu")
         self.assertEqual(self._device(processor), "cpu")
 
-    def test_server_cuda_is_the_serving_gpu_and_wins_over_the_class_default(self):
-        processor = _make(
-            _CpuDefaultProcessor, base_gpu_id=3, mm_preprocessing_device="cuda"
-        )
+    def test_server_cuda_uses_the_worker_gpu_ordinal(self):
+        processor = _make(base_gpu_id=3, mm_preprocessing_device="cuda")
         self.assertEqual(self._device(processor), "cuda:3")
 
     def test_server_cpu_wins_over_the_platform(self):
         processor = _make(base_gpu_id=3, mm_preprocessing_device="cpu")
         self.assertEqual(self._device(processor, _is_xpu=True), "cpu")
 
-    def test_server_auto_defers_to_class_default_then_platform(self):
+    def test_server_auto_preserves_the_platform_default(self):
         self.assertEqual(ServerArgs(model_path="dummy").mm_preprocessing_device, "auto")
         auto = dict(base_gpu_id=3, mm_preprocessing_device="auto")
-        self.assertEqual(self._device(_make(_CpuDefaultProcessor, **auto)), "cpu")
         self.assertEqual(self._device(_make(**auto)), "cuda:3")
+
+    def test_resolved_setting_controls_decode_and_processor_together(self):
+        processor = _make(base_gpu_id=3)
+        with get_mm().override(mm_preprocessing_device="cpu"):
+            self.assertEqual(self._device(processor), "cpu")
+            self.assertFalse(processor._resolve_gpu_image_decode())
+        self.assertEqual(self._device(processor), "cuda:3")
 
 
 class _FastImageProcessor:
@@ -247,48 +224,18 @@ class TestPreprocessingCompetesWithTheScheduler(CustomTestCase):
     def test_fast_processor_on_the_serving_gpu_competes(self):
         self.assertEqual(self._competes(_fast_path_processor()), (True, 1))
 
-    def test_class_cpu_default_does_not_compete(self):
-        processor = _fast_path_processor(_CpuDefaultProcessor)
-        self.assertEqual(self._competes(processor), (False, 2))
-
     def test_server_cpu_does_not_compete(self):
         processor = _fast_path_processor(mm_preprocessing_device="cpu")
         self.assertEqual(self._competes(processor), (False, 2))
 
-    def test_server_cuda_competes_despite_a_class_cpu_default(self):
-        processor = _fast_path_processor(
-            _CpuDefaultProcessor, mm_preprocessing_device="cuda"
-        )
+    def test_server_cuda_competes(self):
+        processor = _fast_path_processor(mm_preprocessing_device="cuda")
         self.assertEqual(self._competes(processor), (True, 1))
 
     def test_pil_backend_never_competes(self):
         processor = _fast_path_processor()
         processor.disable_fast_image_processor = True
         self.assertEqual(self._competes(processor), (False, 2))
-
-    def test_the_choice_override_is_what_counts(self):
-        """A subclass that places the work itself reports it via the choice."""
-
-        class PlacesOnTheGpu(_CpuDefaultProcessor):
-            def _mm_preprocessing_device_choice(self):
-                return "cuda:0"
-
-        processor = _fast_path_processor(PlacesOnTheGpu)
-        self.assertEqual(self._competes(processor), (True, 1))
-
-    def test_a_class_placing_its_own_call_is_sized_for_the_platform(self):
-        """Neither the server setting nor a class default reaches the fast
-        processor call of a class with its own ``process_mm_data``, so the
-        worker count assumes the platform device (the serving GPU here)."""
-
-        class OwnPlacement(_CpuDefaultProcessor):
-            def process_mm_data(self, *args, **kwargs):
-                raise NotImplementedError
-
-        processor = _fast_path_processor(OwnPlacement, mm_preprocessing_device="cpu")
-        self.assertTrue(processor._places_preprocessing_itself())
-        self.assertEqual(self._competes(processor), (True, 1))
-        self.assertFalse(_fast_path_processor()._places_preprocessing_itself())
 
 
 class _Feature:
@@ -350,25 +297,16 @@ class TestProcessMmDataDevice(CustomTestCase):
         self.assertEqual(self._call_device(events)[0], "cuda:0")
         self.assertTrue(mem_pool.called)
 
-    def test_class_cpu_default_reaches_the_call_and_skips_the_pool(self):
-        processor, events = self._harness(_CpuDefaultProcessor)
-        with self._cuda_pool_spy() as mem_pool:
-            processor.process_mm_data("t", images=["image"])
-        self.assertEqual(self._call_device(events)[0], "cpu")
-        self.assertFalse(mem_pool.called)
-        self.assertIn(("copy", "cpu"), events)
-
     def test_server_cpu_reaches_the_call_and_skips_the_pool(self):
         processor, events = self._harness(mm_preprocessing_device="cpu")
         with self._cuda_pool_spy() as mem_pool:
             processor.process_mm_data("t", images=["image"])
         self.assertEqual(self._call_device(events)[0], "cpu")
         self.assertFalse(mem_pool.called)
+        self.assertIn(("copy", "cpu"), events)
 
-    def test_server_cuda_reaches_the_call_over_a_class_cpu_default(self):
-        processor, events = self._harness(
-            _CpuDefaultProcessor, mm_preprocessing_device="cuda"
-        )
+    def test_server_cuda_reaches_the_call(self):
+        processor, events = self._harness(mm_preprocessing_device="cuda")
         with self._cuda_pool_spy() as mem_pool:
             processor.process_mm_data("t", images=["image"])
         self.assertEqual(self._call_device(events)[0], "cuda:0")
@@ -406,7 +344,7 @@ class TestProcessMmDataDevice(CustomTestCase):
     def test_gemma4_delegated_call_follows_the_setting(self):
         """Gemma4 overrides ``process_mm_data`` only to prepare its inputs and
         then delegates to the base call, so the setting reaches that call and
-        the worker count and the ignored-setting warning follow it."""
+        the worker count follows it without a marker override."""
         from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
 
         for setting, device, competes in (
@@ -419,20 +357,11 @@ class TestProcessMmDataDevice(CustomTestCase):
                 )
                 with self._cuda_pool_spy():
                     processor.process_mm_data("t", images=["image"])
-                    self.assertFalse(processor._places_preprocessing_itself())
                     self.assertEqual(
                         processor._preprocessing_competes_with_the_scheduler(),
                         competes,
                     )
                 self.assertEqual(self._call_device(events)[0], device)
-
-    def test_a_class_that_places_its_own_call_is_still_detected(self):
-        from sglang.srt.multimodal.processors.ernie45_vl import (
-            Ernie4_5_VLImageProcessor,
-        )
-
-        processor = _make(Ernie4_5_VLImageProcessor, mm_preprocessing_device="cpu")
-        self.assertTrue(processor._places_preprocessing_itself())
 
 
 class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
@@ -453,13 +382,6 @@ class TestGpuImageDecodeFollowsThePlacement(CustomTestCase):
     def test_server_cpu_turns_gpu_decode_off(self):
         self.assertTrue(_StubProcessor.gpu_image_decode)
         self.assertFalse(self._decode(_make(mm_preprocessing_device="cpu")))
-
-    def test_class_cpu_default_turns_gpu_decode_off(self):
-        self.assertFalse(self._decode(_make(_CpuDefaultProcessor)))
-        # The server setting outranks the class default in both directions.
-        self.assertTrue(
-            self._decode(_make(_CpuDefaultProcessor, mm_preprocessing_device="cuda"))
-        )
 
     def test_other_placements_keep_the_class_default(self):
         class NoGpuDecode(_StubProcessor):
@@ -672,10 +594,8 @@ class TestModelProcessorsUseTheResolver(CustomTestCase):
         ):
             processor.process_mm_data("t", images=["image"])
             choice = processor._mm_preprocessing_device_choice()
-            places_itself = processor._places_preprocessing_itself()
         (device,) = calls
         self.assertEqual(device, choice)
-        self.assertFalse(places_itself)
         return device
 
     def test_bailing_visual_call_follows_the_resolver(self):
@@ -685,6 +605,58 @@ class TestModelProcessorsUseTheResolver(CustomTestCase):
                     self._bailing_call_device(mm_preprocessing_device=setting),
                     expected,
                 )
+
+    def test_ernie_cpu_setting_reaches_preprocessing_and_preserves_normalization(self):
+        """ERNIE's hardcoded CUDA call used to ignore explicit CPU placement."""
+        from sglang.srt.multimodal.processors.ernie45_vl import (
+            Ernie4_5_VLImageProcessor,
+        )
+
+        calls = []
+        pixels = torch.arange(24, dtype=torch.float32).reshape(2, 12)
+
+        class Processor:
+            image_processor = _FastImageProcessor()
+
+            def __call__(self, **kwargs):
+                calls.append(kwargs.get("device"))
+                return {
+                    "images": pixels.clone(),
+                    "grid_thw": torch.tensor([[1, 1, 2]]),
+                }
+
+        for setting, expected in (("cpu", "cpu"), ("auto", "cuda:3")):
+            with self.subTest(setting=setting):
+                processor = _make(
+                    Ernie4_5_VLImageProcessor,
+                    base_gpu_id=3,
+                    mm_preprocessing_device=setting,
+                )
+                processor._processor = Processor()
+                processor._tokenizer = None
+                processor.disable_fast_image_processor = False
+                processor.image_config = {}
+                processor.use_cuda_ipc = False
+                processor.image_processor = SimpleNamespace(
+                    image_mean=[0.5] * 3,
+                    image_std=[0.25] * 3,
+                    rescale_factor=1 / 255,
+                )
+                processor.hf_config = SimpleNamespace(
+                    dtype=torch.float32,
+                    vision_config=SimpleNamespace(patch_size=2),
+                )
+                with (
+                    _gpu_platform(),
+                    patch("sglang.srt.multimodal.processors.ernie45_vl._is_npu", False),
+                ):
+                    result = processor.process_mm_data("t", images=["image"])
+                self.assertEqual(calls[-1], expected)
+                torch.testing.assert_close(
+                    result["pixel_values"], (pixels / 255 - 0.5) / 0.25
+                )
+                self.assertEqual(result["image_grid_thw"].tolist(), [[1, 1, 2]])
+                self.assertNotIn("pixel_values_videos", result)
 
 
 if __name__ == "__main__":

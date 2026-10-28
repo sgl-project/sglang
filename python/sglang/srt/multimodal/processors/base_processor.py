@@ -227,11 +227,6 @@ class BaseMultimodalProcessor(ABC):
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
-    # The model's default device for fast visual (image and video)
-    # preprocessing: a device string, or None for the platform's choice. See
-    # `_resolve_mm_preprocessing_device` for how it ranks against the server
-    # setting; the device is handed to the HF processor call as a whole.
-    mm_preprocessing_device: Optional[str] = None
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
@@ -271,17 +266,6 @@ class BaseMultimodalProcessor(ABC):
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.gpu_image_decode = self._resolve_gpu_image_decode()
-        if (
-            server_args.mm_preprocessing_device != "auto"
-            and self._places_preprocessing_itself()
-        ):
-            logger.warning(
-                "--mm-preprocessing-device=%s is not applied to the fast "
-                "processor call of %s, which places its own preprocessing; "
-                "only JPEG decode follows the setting.",
-                server_args.mm_preprocessing_device,
-                type(self).__name__,
-            )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config
@@ -746,8 +730,7 @@ class BaseMultimodalProcessor(ABC):
         """The JPEG decode mode: the class default unless preprocessing is on CPU.
 
         nvJPEG decode would create a CUDA context on the current device just
-        as the fast processor would, so a CPU placement (from the server
-        setting or the class default) turns it off as well.
+        as the fast processor would, so a CPU placement turns it off as well.
         """
         if self._mm_preprocessing_device_choice() == "cpu":
             return False
@@ -760,16 +743,6 @@ class BaseMultimodalProcessor(ABC):
         image_processor = getattr(processor, "image_processor", None)
         return isinstance(image_processor, BaseImageProcessor)
 
-    def _places_preprocessing_itself(self) -> bool:
-        """Whether this class overrides ``process_mm_data`` without overriding
-        the placement decision, so the base resolver never sees its call."""
-        cls = type(self)
-        return (
-            cls.process_mm_data is not BaseMultimodalProcessor.process_mm_data
-            and cls._mm_preprocessing_device_choice
-            is BaseMultimodalProcessor._mm_preprocessing_device_choice
-        )
-
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether visual preprocessing submits its work to the serving GPU.
 
@@ -777,18 +750,11 @@ class BaseMultimodalProcessor(ABC):
         default, on ``cuda:{base_gpu_id}`` -- the device the scheduler serves
         from. A second preprocessing worker there is one more competitor for
         that device rather than added parallelism. The answer follows the same
-        placement decision that ``process_mm_data`` uses. A class that places
-        the fast processor call itself (its own ``process_mm_data``, no
-        ``_mm_preprocessing_device_choice`` override) is sized for the
-        platform's device, since neither the server setting nor a class
-        default reaches its call.
+        placement decision that the shared and model-specific HF calls use.
         """
         if not self._uses_fast_image_processor(self._processor):
             return False
-        if self._places_preprocessing_itself():
-            device = self._platform_mm_preprocessing_device()
-        else:
-            device = self._mm_preprocessing_device_choice()
+        device = self._mm_preprocessing_device_choice()
         return device is not None and torch.device(device).type != "cpu"
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
@@ -816,8 +782,7 @@ class BaseMultimodalProcessor(ABC):
     def _platform_mm_preprocessing_device(self) -> Optional[str]:
         """The platform's device for fast visual preprocessing.
 
-        The answer comes from this processor's own ``server_args``: engines
-        sharing a tokenizer process each carry their own ``base_gpu_id``.
+        The GPU ordinal stays worker-local for encoder DP placement.
         """
         server_args = self.server_args
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
@@ -832,35 +797,17 @@ class BaseMultimodalProcessor(ABC):
         return f"{platform.device_type}:{server_args.base_gpu_id}"
 
     def _mm_preprocessing_device_choice(self) -> Optional[str]:
-        """Where fast visual preprocessing runs; pure and safe to call from
-        ``__init__`` (reads only ``server_args``, class attributes and the
-        platform flags, never ``self._processor``).
+        """Resolve the CLI choice without initializing a device or patching HF.
 
-        Precedence: ``--mm-preprocessing-device`` when it is not ``auto``;
-        otherwise the platform, except that on a CUDA platform the class's
-        ``mm_preprocessing_device`` replaces ``cuda:{base_gpu_id}`` when set.
-        A class default therefore cannot move XPU or NPU preprocessing onto a
-        CUDA device.
-
-        This is the override point for a subclass whose ``process_mm_data``
-        places the work itself: report that placement here so the worker
-        count and the JPEG decode mode follow it. The override must be
-        init-safe under the same rule.
+        ``auto`` preserves platform defaults. Custom HF call sites must use
+        ``_resolve_mm_preprocessing_device`` to apply this choice too.
         """
-        server_args = self.server_args
-        configured = server_args.mm_preprocessing_device
+        configured = get_mm().mm_preprocessing_device
         if configured == "cpu":
             return "cpu"
         if configured == "cuda":
-            return f"cuda:{server_args.base_gpu_id}"
-        platform = self._platform_mm_preprocessing_device()
-        if (
-            platform is not None
-            and platform.startswith("cuda")
-            and self.mm_preprocessing_device is not None
-        ):
-            return self.mm_preprocessing_device
-        return platform
+            return f"cuda:{self.server_args.base_gpu_id}"
+        return self._platform_mm_preprocessing_device()
 
     def _resolve_mm_preprocessing_device(self, processor) -> Optional[str]:
         """The device to hand to this fast processor call, or None to leave

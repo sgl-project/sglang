@@ -31,6 +31,28 @@ python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-7B-Instruct --log-l
 wait_for_server(f"http://localhost:{port}", process=vision_process)
 ```
 
+### Choosing preprocessing settings
+
+These options control different stages; CPU feature transport alone does **not** disable GPU preprocessing.
+
+| Option | Controls |
+| --- | --- |
+| `--image-processor-backend` | HF implementation: `auto`, `torchvision`, or `pil`. Torchvision can run on CPU or GPU. |
+| `--mm-preprocessing-device` | Shared HF visual preprocessing: `auto` preserves platform defaults; `cpu` also disables GPU JPEG decode; `cuda` selects the serving GPU. |
+| `--mm-feature-transport` | How prepared features reach the scheduler: CPU memory, CUDA IPC, or CUDA VMM. |
+
+For example, on NVIDIA CUDA, keep torchvision but move Qwen2.5-VL preprocessing to CPU to leave more GPU memory for serving:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+  --image-processor-backend torchvision \
+  --mm-preprocessing-device cpu \
+  --mm-feature-transport cpu
+```
+
+This is a memory-saving option, not a universally fastest configuration or a peak-VRAM limit. It does not move the vision encoder to CPU. CUDA IPC/VMM can still allocate GPU memory, and custom paths such as Kimi-K3 preprocessing do not yet follow this device option. Existing model-specific video placement remains in effect. Leave worker counts on auto initially; increasing concurrency can increase peak memory. `--disable-fast-image-processor` is a deprecated alias for `--image-processor-backend pil`, not a device selector.
+
 ## Using cURL
 
 Once the server is up, you can send test requests using curl or requests.

@@ -127,10 +127,11 @@ class Mm(msgspec.Struct):
     mm_preprocessing_device: A[
         Literal["auto", "cpu", "cuda"],
         "Device for fast visual (image and video) preprocessing, which runs in "
-        "the tokenizer process. 'auto' takes the model processor's default, "
-        "otherwise the platform's choice (the serving GPU on CUDA). 'cpu' keeps "
-        "base preprocessing and JPEG decode off the GPU. Custom processors "
-        "and feature transports may still use CUDA. 'cuda' forces the serving GPU.",
+        "the tokenizer process. 'auto' preserves platform defaults. 'cpu' runs "
+        "shared HF preprocessing and JPEG decode on CPU without changing the "
+        "image processor backend. 'cuda' selects the serving GPU. Model-specific "
+        "video placement still takes precedence. Custom processors and GPU "
+        "feature transports may still use CUDA; this is not a VRAM limit.",
     ] = "auto"
     mm_global_cache_backend: A[
         str,
