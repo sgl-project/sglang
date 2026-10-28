@@ -196,7 +196,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     The implementation may be inherited from a shared unified allocator base,
     but inheriting the static allocator's identity would put virtual IDs on the
-    wire and silently corrupt KV. Gate installation must reach every member.
+    wire and silently corrupt KV. Gate installation must reach every member, and
+    so must every event that orders a member's page moves.
     """
 
     @staticmethod
@@ -288,6 +289,50 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                         expected,
                         f"{name}.{slot} does not cover every member",
                     )
+
+    def _ordering_events_received(self, cls_name: str) -> dict:
+        """Send each move-ordering event once to a stub composite and report, per
+        member, what it received."""
+        alloc = object.__new__(self._allocator_class(cls_name))
+        received = {attr: {} for attr in self._MEMBER_ATTRS}
+        for attr, got in received.items():
+            member = type("_Member", (), {})()
+            member.set_hicache_transfer_done_event = lambda key, event, got=got: (
+                got.__setitem__("hicache", event)
+            )
+            member.set_latest_forward_done_event = lambda event, got=got: (
+                got.__setitem__("forward_done", event)
+            )
+            member.set_inflight_forward = lambda event, ids, got=got: got.__setitem__(
+                "inflight", ids
+            )
+            setattr(alloc, attr, member)
+        event, ids = object(), torch.tensor([5, 6])
+        alloc.set_hicache_transfer_done_event("load", event)
+        alloc.set_latest_forward_done_event(event)
+        alloc.set_inflight_forward(event, ids)
+        return {attr: got for attr, got in received.items() if got}
+
+    def test_every_ordering_event_reaches_every_member(self):
+        """Every member that can relocate pages must hear each event its moves
+        wait on: a member that misses a HiCache copy's event may move a page the
+        copy still reads or writes. Recurrent state is written by its own
+        kernels, so its member gets no in-flight token ids."""
+        for name, expected in self._EXPECTED_COVERAGE.items():
+            received = self._ordering_events_received(name)
+            for hook in ("hicache", "forward_done", "inflight"):
+                with self.subTest(composite=name, hook=hook):
+                    self.assertEqual(
+                        {attr for attr, got in received.items() if hook in got},
+                        expected,
+                        f"{name} does not send {hook} to every member",
+                    )
+            with self.subTest(composite=name, hook="inflight ids"):
+                for attr, got in received.items():
+                    if attr == "mamba_allocator":
+                        self.assertIsNone(got["inflight"])
+                    else:
+                        self.assertEqual(got["inflight"].tolist(), [5, 6])
 
     def test_swa_composite_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id
