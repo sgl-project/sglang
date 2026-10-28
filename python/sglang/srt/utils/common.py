@@ -1272,6 +1272,18 @@ def is_gfx1250_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx1151_supported():
+    """
+    Returns whether the current platform is AMD RDNA3.5 gfx1151 (Strix Halo APU).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1151" in gcn_arch
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

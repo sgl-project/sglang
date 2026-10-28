@@ -602,7 +602,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif (
-            _use_rdna_splitk_gemv is not None
+            # The raw Triton launch cannot be traced; compiled graphs keep the GEMM.
+            not torch.compiler.is_compiling()
+            and _use_rdna_splitk_gemv is not None
             and bias is None
             and x.is_contiguous()
             and layer.weight.is_contiguous()

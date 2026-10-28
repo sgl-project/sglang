@@ -1,4 +1,8 @@
-"""Split-K bf16 GEMV for single-row decode on RDNA (gfx11) APUs.
+"""Split-K bf16 GEMV for single-row decode on RDNA APUs.
+
+Enabled on gfx1151 (Strix Halo); the tuning constants below were measured there and
+have not been re-measured on the wider RDNA parts, which have enough compute units
+that the rocBLAS tile already covers the machine.
 
 Motivation
 ----------
@@ -30,7 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx1151_supported
 
 _BLOCK_N = 32
 _BLOCK_K = 512
@@ -87,16 +92,8 @@ def _reduce_split_k_kernel(
 
 
 @lru_cache(maxsize=1)
-def _is_rdna() -> bool:
-    if not is_hip():
-        return False
-    arch = torch.cuda.get_device_properties(0).gcnArchName
-    return arch.startswith("gfx11")
-
-
-@lru_cache(maxsize=1)
 def _is_disabled() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_RDNA_SPLITK_GEMV", "false")
+    return envs.SGLANG_ROCM_DISABLE_RDNA_SPLITK_GEMV.get()
 
 
 def use_rdna_splitk_gemv(m: int, n: int, k: int, weight_dtype: torch.dtype) -> bool:
@@ -114,13 +111,21 @@ def use_rdna_splitk_gemv(m: int, n: int, k: int, weight_dtype: torch.dtype) -> b
         # split_k == 1 has no occupancy problem to fix; a very large split_k turns
         # the reduction into the bottleneck.
         return False
-    return _is_rdna()
+    return is_gfx1151_supported()
 
 
 def rdna_splitk_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x[1, K] @ weight[N, K].T`` for bf16 weights, returning bf16 ``[1, N]``."""
     n, k = weight.shape
     split_k = k // _BLOCK_K
+    # The kernel has no tail mask: it reads one contiguous K-row per weight row and
+    # writes whole n-tiles.
+    assert (
+        weight.is_contiguous()
+        and x.numel() == k
+        and n % _BLOCK_N == 0
+        and k % _BLOCK_K == 0
+    ), (weight.shape, weight.stride(), x.shape)
     x_flat = x.reshape(-1)
     partial = torch.empty((split_k, n), dtype=torch.float32, device=x.device)
     out = torch.empty((1, n), dtype=torch.bfloat16, device=x.device)
@@ -132,6 +137,7 @@ def rdna_splitk_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         N=n,
         BLOCK_N=_BLOCK_N,
         BLOCK_K=_BLOCK_K,
+        num_warps=4,
     )
     _reduce_split_k_kernel[(triton.cdiv(n, _BLOCK_N),)](
         partial,
@@ -139,5 +145,6 @@ def rdna_splitk_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         N=n,
         SPLIT_K=split_k,
         BLOCK_N=_BLOCK_N,
+        num_warps=4,
     )
     return out

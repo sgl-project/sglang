@@ -392,6 +392,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.rdna_splitk_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.rdna_small_m_gemv:rdna_splitk_gemv",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",

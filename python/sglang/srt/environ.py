@@ -1063,6 +1063,9 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    # Route single-row bf16 decode projections to the RDNA split-K GEMV on
+    # gfx1151. Set to 1 to benchmark the rocBLAS path without the kernel.
+    SGLANG_ROCM_DISABLE_RDNA_SPLITK_GEMV = EnvBool(False)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
