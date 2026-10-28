@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.qsa.metadata import QSA_RING_GROUPS
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
 logger = logging.getLogger(__name__)
@@ -162,15 +163,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
         # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # only the pending group's members must survive a forward, addressed as
+        # ``req_pool_idx * ring + position % ring``; the ring holds two groups
+        # (``QSA_RING_GROUPS``) so a verify window never overwrites them.
+        # Request slot 0 is never allocated, so rows [0, ring) are the inert dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = (
+            self.qsa_num_request_slots * QSA_RING_GROUPS * self.qsa_compress_ratio
+        )
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the

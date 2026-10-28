@@ -225,6 +225,13 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         )
 
 
+# The pending index-key ring holds two groups a request: slot = position % (2 *
+# ratio). A verify window of up to ``ratio + 1`` rows then never overwrites a
+# member of the group still pending before it, within a forward or across
+# forwards whose later rows were rejected.
+QSA_RING_GROUPS = 2
+
+
 def build_pending_ring_slots(
     *,
     token_to_batch_idx: torch.Tensor,
@@ -234,17 +241,19 @@ def build_pending_ring_slots(
     compress_ratio: int,
     is_extend: bool,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
-    On extend, tokens before the pending tail dump into rows [0, ratio),
-    which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    """Pending-ring slot ``req_pool_idx * ring + position % ring`` per token
+    (``ring = QSA_RING_GROUPS * ratio``). On extend, tokens before the pending
+    tail dump into rows [0, ring), which no request owns (request slot 0 is never
+    allocated); CUDA-graph safe."""
+    ring = QSA_RING_GROUPS * compress_ratio
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * ring + positions % ring
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % ring)
     return slots
 
 
@@ -265,7 +274,8 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    ring = QSA_RING_GROUPS * compress_ratio
+    return requests[:, None] * ring + positions % ring
 
 
 def build_rope_position_matrix(
@@ -312,6 +322,7 @@ def compressed_decode_view(
 __all__ = [
     "QSAIndexerMetadata",
     "build_qsa_row_ranges",
+    "QSA_RING_GROUPS",
     "build_pending_ring_slots",
     "build_group_ring_slots",
     "build_rope_position_matrix",

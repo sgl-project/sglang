@@ -18,6 +18,8 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
+    build_group_ring_slots,
+    build_pending_ring_slots,
     build_qsa_row_ranges,
 )
 from sglang.srt.layers.attention.qsa.mqa import (
@@ -44,6 +46,32 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+@pytest.mark.parametrize("start", range(8))
+def test_verify_rows_never_overwrite_a_pending_group(start):
+    # A verify window of `ratio` rows writes ring slots that the members of the
+    # group pending before it never share, so the group compresses from its own
+    # keys, also after later rows were rejected and the group completes later.
+    ratio, req = 4, torch.tensor([3])
+    rows = torch.arange(start, start + ratio)
+    written = build_pending_ring_slots(
+        token_to_batch_idx=torch.zeros(ratio, dtype=torch.long),
+        req_pool_indices=req,
+        sequence_lengths=torch.tensor([start]),
+        logical_positions=rows,
+        compress_ratio=ratio,
+        is_extend=False,
+    )
+    group_end = torch.tensor([start // ratio * ratio + ratio - 1])
+    members = build_group_ring_slots(
+        req_pool_indices=req,
+        group_end_positions=group_end,
+        sequence_ids=torch.tensor([0]),
+        compress_ratio=ratio,
+    )[0]
+    pending = members[: start % ratio]  # the group's members before the window
+    assert not set(pending.tolist()) & set(written.tolist())
 
 
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
