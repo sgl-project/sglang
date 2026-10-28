@@ -72,6 +72,8 @@ class TestAutoRoundCPU(CustomTestCase):
                     "--trust-remote-code",
                     "--quantization",
                     "auto-round",
+                    "--dtype",
+                    "bfloat16",
                     "--mem-fraction-static",
                     "0.3",
                 ]
