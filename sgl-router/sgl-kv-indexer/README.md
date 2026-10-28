@@ -66,24 +66,14 @@ whole-block events. `REPORT` replaces the component snapshot for one
 `(worker, tier, block)` placement. `REVOKE` removes that placement, and
 `CLEAR_ALL_AT_TIER` removes every placement for the worker at that tier.
 
-For workers sharing an external DRAM owner (such as standalone UMBP), set
-`KV_INDEXER_DRAM_POOL_ID` on each bridge along with `KV_INDEXER_CACHE_COMPONENTS`
-and the matching SWA window. Choose an id for one physically shared key space;
-members must use the same model, page size and key layout. The bridge refreshes
-the worker's pool binding at startup and every 30 seconds while idle, and only
-forwards HBM mutations in this mode, including for `AllBlocksCleared`.
-
-The owner sends `ApplyExternalKvBatch` with `dram_pool_id`, empty worker identity,
-DRAM-only actions, and a component/window `cache_spec` whose `dram_pool_id` is
-empty. Pool REPORT requires explicit masks and positive token counts. Worker and
-pool ids have separate namespaces. Pool spec conflicts are rejected before any
-mutation; members can bind before the owner first reports. Queries combine a
-member's own HBM with the pool's DRAM using the existing component rules, and
-return actual worker ids/addresses. REVOKE/CLEAR on either owner remains scoped
-to that identity. An empty pool binding restores the worker's private-tier mode.
-Shared placements are expanded at query time; they do not populate per-worker
-holdings or the derived FULL-only fast path. A storage owner must refresh its
-residency after Indexer restart; binding refresh does not recover HBM events.
+For shared DRAM, set `KV_INDEXER_DRAM_POOL_ID` and a matching component/window
+spec on each bridge. The owner reports DRAM once using the request's pool id,
+empty worker identity and explicit component masks/token counts. Members must
+share the model, page size and key layout. Queries combine worker HBM with pool
+DRAM; clear/revoke remain scoped to the named owner. An empty binding restores
+private-tier mode. Pool members publish HBM only and refresh bindings every 30s,
+including at startup; the owner must refresh residency after Indexer restart.
+No HBM replay, TTL or fencing is added.
 
 ## Build
 

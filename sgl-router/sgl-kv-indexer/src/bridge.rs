@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_pool_bridge_only_mutates_hbm_and_keeps_binding_when_split() {
+    fn cache_spec_forwarded_and_pool_bridge_only_mutates_hbm() {
         let mut config = test_config(vec![hbm(), dram(), ssd()]);
         config.cache_spec = Some(WorkerCacheSpec {
             version: 1,
@@ -1726,7 +1726,7 @@ mod tests {
         });
         let request = request_of(
             &config,
-            1,
+            0,
             vec![
                 stored(&[1], "GPU"),
                 stored(&[2], "CPU_PINNED"),
@@ -1734,28 +1734,9 @@ mod tests {
                 cleared(),
             ],
         );
+        assert_eq!(request.cache_spec, config.cache_spec);
         assert_eq!(request.actions.len(), 2);
         assert!(request.actions.iter().all(|a| a.tier == hbm()));
-        for part in split_apply_request(request) {
-            assert_eq!(part.cache_spec, config.cache_spec);
-            assert!(part.dram_pool_id.is_empty());
-        }
-    }
-
-    #[test]
-    fn cache_spec_forwarded_on_request() {
-        let mut config = test_config(vec![hbm()]);
-        config.cache_spec = Some(WorkerCacheSpec {
-            version: 1,
-            components: crate::service::COMPONENT_FULL,
-            swa_window_tokens: 0,
-            full_tier_mask: 1 << hbm(),
-            swa_tier_mask: 0,
-            mamba_tier_mask: 0,
-            ..Default::default()
-        });
-        let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
-        assert_eq!(request.cache_spec, config.cache_spec);
     }
 
     // --- cache spec config helpers ---

@@ -263,71 +263,51 @@ where
 
 fn validate_owner(request: &ApplyExternalKvBatchRequest) -> Result<(), Status> {
     let pool = !request.dram_pool_id.is_empty();
-    if request.dram_pool_id.is_empty() == request.worker_id.is_empty() {
+    if request.dram_pool_id.is_empty() == request.worker_id.is_empty()
+        || (pool && !request.worker_address.is_empty())
+    {
         return Err(Status::invalid_argument(
-            "set exactly one of worker_id or dram_pool_id",
+            "set a worker identity or a DRAM pool id",
         ));
     }
-    if pool {
-        if !request.worker_address.is_empty() {
-            return Err(Status::invalid_argument(
-                "a DRAM pool has no worker_address",
-            ));
-        }
-        let spec = request
-            .cache_spec
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("a DRAM pool requires cache_spec"))?;
-        validate_pool_spec(spec)?;
-        if !spec.dram_pool_id.is_empty() {
-            return Err(Status::invalid_argument(
-                "a pool cannot reference another pool",
-            ));
-        }
-        for action in &request.actions {
-            if action.tier != TierType::TierDram as i32 {
-                return Err(Status::invalid_argument("pool actions must target DRAM"));
-            }
-            if action.r#type == ExternalKvActionType::ActionReport as i32
-                && (action.component_masks.len() != action.hashes.len()
-                    || action.block_sizes.len() != action.hashes.len()
-                    || action
-                        .component_masks
-                        .iter()
-                        .any(|m| *m == 0 || m & !spec.components != 0)
-                    || action.block_sizes.contains(&0))
-            {
-                return Err(Status::invalid_argument(
-                    "pool reports require valid components and token counts",
-                ));
-            }
-        }
-    } else if let Some(spec) = request
-        .cache_spec
-        .as_ref()
-        .filter(|s| !s.dram_pool_id.is_empty())
-    {
-        validate_pool_spec(spec)?;
-        if request
-            .actions
-            .iter()
-            .any(|a| a.tier != TierType::TierHbm as i32)
-        {
-            return Err(Status::invalid_argument(
-                "pool members may only mutate their own HBM",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_pool_spec(spec: &WorkerCacheSpec) -> Result<(), Status> {
-    if spec.version > SUPPORTED_SPEC_VERSION
+    let spec = match request.cache_spec.as_ref() {
+        Some(spec) if pool || !spec.dram_pool_id.is_empty() => spec,
+        _ if pool => return Err(Status::invalid_argument("a DRAM pool requires cache_spec")),
+        _ => return Ok(()),
+    };
+    if (pool && !spec.dram_pool_id.is_empty())
+        || spec.version > SUPPORTED_SPEC_VERSION
         || spec.components & COMPONENT_FULL == 0
         || spec.components & !(COMPONENT_FULL | COMPONENT_SWA | COMPONENT_MAMBA) != 0
         || (spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0)
     {
         return Err(Status::invalid_argument("invalid shared DRAM cache spec"));
+    }
+    let tier = if pool {
+        TierType::TierDram
+    } else {
+        TierType::TierHbm
+    };
+    for action in &request.actions {
+        if action.tier != tier as i32 {
+            return Err(Status::invalid_argument(
+                "pool owners mutate DRAM; members mutate HBM",
+            ));
+        }
+        if pool
+            && action.r#type == ExternalKvActionType::ActionReport as i32
+            && (action.component_masks.len() != action.hashes.len()
+                || action.block_sizes.len() != action.hashes.len()
+                || action
+                    .component_masks
+                    .iter()
+                    .any(|m| *m == 0 || m & !spec.components != 0)
+                || action.block_sizes.contains(&0))
+        {
+            return Err(Status::invalid_argument(
+                "pool reports require components and token counts",
+            ));
+        }
     }
     Ok(())
 }

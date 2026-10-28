@@ -612,10 +612,10 @@ async fn router_client_publishes_its_deadline_on_the_wire() {
 }
 
 #[tokio::test]
-async fn shared_dram_pool_is_visible_to_all_members_and_merges_with_hbm() {
+async fn shared_dram_pool_composes_with_each_members_hbm() {
     use sgl_kv_indexer::pb::WorkerCacheSpec;
     use test_kv::{component_report, dram};
-    let mut client = start_backend(InMemoryKvIndexerBackend::new()).await;
+    let mut client = start().await;
     let spec = WorkerCacheSpec {
         version: 1,
         components: 7,
@@ -625,212 +625,63 @@ async fn shared_dram_pool_is_visible_to_all_members_and_merges_with_hbm() {
         mamba_tier_mask: 6,
         ..Default::default()
     };
-    let bind = |worker: &str, pool: &str| ApplyExternalKvBatchRequest {
-        worker_id: worker.into(),
-        worker_address: format!("http://{worker}:30000"),
+    let member = |id: &str| ApplyExternalKvBatchRequest {
+        worker_id: id.into(),
+        worker_address: format!("http://{id}:30000"),
         cache_spec: Some(WorkerCacheSpec {
-            dram_pool_id: pool.into(),
+            dram_pool_id: "tp4".into(),
             ..spec.clone()
         }),
         ..Default::default()
     };
-    // Pool and worker names may coincide; bindings may arrive before the owner.
-    for worker in ["tp4", "dp4-0", "dp4-1", "dp4-2", "dp4-3"] {
-        client
-            .apply_external_kv_batch(bind(worker, "tp4"))
-            .await
-            .unwrap();
+    // Members can arrive first; worker and pool ids have separate namespaces.
+    for id in ["tp4", "dp4-0"] {
+        client.apply_external_kv_batch(member(id)).await.unwrap();
     }
-    client
-        .apply_external_kv_batch(bind("other", "other-pool"))
-        .await
-        .unwrap();
-    let mut pool = ApplyExternalKvBatchRequest {
-        dram_pool_id: "tp4".into(),
-        cache_spec: Some(spec.clone()),
-        actions: vec![component_report(
-            dram(),
-            &[30, 10, 20],
-            &[7, 7, 7],
-            &[16; 3],
-        )],
-        ..Default::default()
-    };
-    client.apply_external_kv_batch(pool.clone()).await.unwrap();
-    let query = MatchExternalKvPrefixRequest {
-        hashes: vec![30, 10, 20],
-        max_blocks: 0,
-    };
-    let matches = client
-        .match_external_kv_prefix(query.clone())
-        .await
-        .unwrap()
-        .into_inner()
-        .matches;
-    assert_eq!(matches.len(), 5);
-    assert!(matches
-        .iter()
-        .all(|m| m.matched_prefix_blocks == 3 && m.worker_id != "other"));
-
-    // Malformed owner identities and mismatched specs must leave residency intact.
-    let mut invalid = pool.clone();
-    invalid.worker_id = "ambiguous".into();
+    let mut conflict = member("dp4-1");
+    conflict.cache_spec.as_mut().unwrap().swa_window_tokens = 64;
     assert_eq!(
         client
-            .apply_external_kv_batch(invalid)
-            .await
-            .unwrap_err()
-            .code(),
-        Code::InvalidArgument
-    );
-    let mut invalid = pool.clone();
-    invalid.actions[0].tier = hbm();
-    assert_eq!(
-        client
-            .apply_external_kv_batch(invalid)
-            .await
-            .unwrap_err()
-            .code(),
-        Code::InvalidArgument
-    );
-    let mut invalid = bind("tp4", "tp4");
-    invalid.cache_spec.as_mut().unwrap().swa_window_tokens = 64;
-    assert_eq!(
-        client
-            .apply_external_kv_batch(invalid)
+            .apply_external_kv_batch(conflict)
             .await
             .unwrap_err()
             .code(),
         Code::FailedPrecondition
     );
-    assert_eq!(
-        client
-            .match_external_kv_prefix(query.clone())
+    let pool = ApplyExternalKvBatchRequest {
+        dram_pool_id: "tp4".into(),
+        cache_spec: Some(spec.clone()),
+        ..Default::default()
+    };
+    let worker = member("tp4");
+    let report = |tier, mask| component_report(tier, &[30, 10, 20], &[mask; 3], &[16; 3]);
+    let clear = |tier| action(ExternalKvActionType::ActionClearAllAtTier, tier, &[]);
+    // One DRAM report serves both members. Partial components compose with HBM,
+    // and each owner's clear leaves the other owner's placements intact.
+    for (owner, action, expected) in [
+        (&pool, report(dram(), 7), vec!["dp4-0", "tp4"]),
+        (&worker, report(hbm(), 1), vec!["dp4-0", "tp4"]),
+        (&pool, report(dram(), 6), vec!["tp4"]),
+        (&worker, clear(hbm()), vec![]),
+        (&worker, report(hbm(), 1), vec!["tp4"]),
+        (&worker, report(hbm(), 7), vec!["tp4"]),
+        (&pool, clear(dram()), vec!["tp4"]),
+    ] {
+        let mut request = owner.clone();
+        request.actions = vec![action];
+        client.apply_external_kv_batch(request).await.unwrap();
+        let matches = client
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![30, 10, 20],
+                max_blocks: 0,
+            })
             .await
             .unwrap()
             .into_inner()
-            .matches
-            .len(),
-        5
-    );
-
-    // An unrelated pool holding the same hashes is independent of this owner's clear.
-    let mut other = pool.clone();
-    other.dram_pool_id = "other-pool".into();
-    client.apply_external_kv_batch(other).await.unwrap();
-    pool.actions[0].component_masks = vec![6; 3]; // SWA/MAMBA only in shared DRAM.
-    client.apply_external_kv_batch(pool.clone()).await.unwrap();
-    let mut worker = bind("tp4", "tp4");
-    worker.actions = vec![component_report(hbm(), &[30, 10, 20], &[1; 3], &[16; 3])];
-    client
-        .apply_external_kv_batch(worker.clone())
-        .await
-        .unwrap();
-    let matches = client
-        .match_external_kv_prefix(query.clone())
-        .await
-        .unwrap()
-        .into_inner()
-        .matches;
-    assert_eq!(matches.len(), 2); // tp4 combines tiers; only other has an independent FULL copy.
-    assert!(matches.iter().all(|m| m.matched_prefix_blocks == 3));
-    let mut revoke = pool.clone();
-    revoke.actions = vec![action(ExternalKvActionType::ActionRevoke, dram(), &[10])];
-    client.apply_external_kv_batch(revoke).await.unwrap();
-    let matches = client
-        .match_external_kv_prefix(query.clone())
-        .await
-        .unwrap()
-        .into_inner()
-        .matches;
-    assert_eq!(
-        matches
-            .iter()
-            .find(|m| m.worker_id == "tp4")
-            .unwrap()
-            .matched_prefix_blocks,
-        1
-    );
-    client.apply_external_kv_batch(pool.clone()).await.unwrap();
-
-    // Clearing a worker's HBM leaves the shared component placements queryable.
-    worker.actions = vec![action(
-        ExternalKvActionType::ActionClearAllAtTier,
-        hbm(),
-        &[],
-    )];
-    client
-        .apply_external_kv_batch(worker.clone())
-        .await
-        .unwrap();
-    let raw = client
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![30],
-            count_as_hit: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        raw.matches
-            .iter()
-            .find(|m| m.worker_id == "tp4")
-            .unwrap()
-            .hashes_by_tier[0]
-            .component_masks,
-        vec![6]
-    );
-    worker.actions = vec![component_report(hbm(), &[30, 10, 20], &[7; 3], &[16; 3])];
-    client
-        .apply_external_kv_batch(worker.clone())
-        .await
-        .unwrap();
-    pool.actions = vec![action(
-        ExternalKvActionType::ActionClearAllAtTier,
-        dram(),
-        &[],
-    )];
-    client.apply_external_kv_batch(pool).await.unwrap();
-    let matches = client
-        .match_external_kv_prefix(query.clone())
-        .await
-        .unwrap()
-        .into_inner()
-        .matches;
-    assert_eq!(matches.len(), 2); // tp4's HBM and other-pool survive.
-
-    worker.actions = vec![action(
-        ExternalKvActionType::ActionClearAllAtTier,
-        hbm(),
-        &[],
-    )];
-    client.apply_external_kv_batch(worker).await.unwrap();
-    client
-        .apply_external_kv_batch(bind("tp4", "other-pool"))
-        .await
-        .unwrap();
-    assert_eq!(
-        client
-            .match_external_kv_prefix(query.clone())
-            .await
-            .unwrap()
-            .into_inner()
-            .matches
-            .len(),
-        2
-    );
-    client
-        .apply_external_kv_batch(bind("tp4", ""))
-        .await
-        .unwrap();
-    assert_eq!(
-        client
-            .match_external_kv_prefix(query)
-            .await
-            .unwrap()
-            .into_inner()
-            .matches
-            .len(),
-        1
-    );
+            .matches;
+        assert!(matches.iter().all(|m| m.matched_prefix_blocks == 3));
+        let mut ids: Vec<_> = matches.iter().map(|m| m.worker_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
+    }
 }

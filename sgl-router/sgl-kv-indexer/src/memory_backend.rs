@@ -60,7 +60,8 @@ struct WorkerRecord {
 
 #[derive(Debug, Default)]
 struct PoolRecord {
-    spec: Option<WorkerCacheSpec>,
+    components: u32,
+    swa_window_tokens: u32,
     holdings: HashSet<i64>,
     members: HashSet<String>,
 }
@@ -134,28 +135,21 @@ impl InMemoryKvIndexerBackend {
             .map(|s| s.dram_pool_id.as_str())
             .unwrap_or("");
         if let Some(spec) = req.cache_spec.as_ref().filter(|_| !pool_id.is_empty()) {
-            if let Some(pool_spec) = state.pools.get(pool_id).and_then(|p| p.spec.as_ref()) {
-                check_pool_compatibility(pool_spec, spec)?;
-            }
+            pool_for_spec(&mut state, pool_id, spec)?
+                .members
+                .insert(worker_id.clone());
         }
         // Binding is a snapshot, including detach/switch; no placements are copied.
         if let Some(old_pool) = state
             .workers
             .get(&worker_id)
             .and_then(|w| w.spec.as_ref())
+            .filter(|s| s.dram_pool_id != pool_id)
             .map(|s| s.dram_pool_id.clone())
         {
             if let Some(pool) = state.pools.get_mut(&old_pool) {
                 pool.members.remove(&worker_id);
             }
-        }
-        if !pool_id.is_empty() {
-            state
-                .pools
-                .entry(pool_id.to_owned())
-                .or_default()
-                .members
-                .insert(worker_id.clone());
         }
 
         let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
@@ -568,16 +562,25 @@ fn effective_placements<'a>(
     private.chain(shared)
 }
 
-fn check_pool_compatibility(
-    pool: &WorkerCacheSpec,
-    worker: &WorkerCacheSpec,
-) -> Result<(), Status> {
-    if pool.components != worker.components || pool.swa_window_tokens != worker.swa_window_tokens {
+fn pool_for_spec<'a>(
+    state: &'a mut State,
+    id: &str,
+    spec: &WorkerCacheSpec,
+) -> Result<&'a mut PoolRecord, Status> {
+    let pool = state
+        .pools
+        .entry(id.to_owned())
+        .or_insert_with(|| PoolRecord {
+            components: spec.components,
+            swa_window_tokens: spec.swa_window_tokens,
+            ..Default::default()
+        });
+    if pool.components != spec.components || pool.swa_window_tokens != spec.swa_window_tokens {
         return Err(Status::failed_precondition(
             "DRAM pool component/window spec mismatch",
         ));
     }
-    Ok(())
+    Ok(pool)
 }
 
 fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) -> Result<(), Status> {
@@ -585,18 +588,8 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) -> Result<(),
         .cache_spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("a DRAM pool requires cache_spec"))?;
-    if let Some(pool) = state.pools.get(&req.dram_pool_id) {
-        if let Some(old) = &pool.spec {
-            check_pool_compatibility(old, spec)?;
-        }
-        for member in &pool.members {
-            if let Some(worker_spec) = state.workers.get(member).and_then(|w| w.spec.as_ref()) {
-                check_pool_compatibility(spec, worker_spec)?;
-            }
-        }
-    }
+    pool_for_spec(state, &req.dram_pool_id, spec)?;
     let id = req.dram_pool_id;
-    state.pools.entry(id.clone()).or_default().spec = req.cache_spec;
     for action in req.actions {
         if action.r#type == ExternalKvActionType::ActionReport as i32 {
             apply_report_chain(state, action.parent_block_hash, &action.hashes);
