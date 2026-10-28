@@ -254,16 +254,80 @@ where
         request: Request<ApplyExternalKvBatchRequest>,
     ) -> Result<Response<ApplyExternalKvBatchResponse>, Status> {
         let request = request.into_inner();
-        validate_worker_id(&request.worker_id)?;
+        validate_owner(&request)?;
         validate_actions(&request.actions)?;
         let response = self.backend.apply_external_kv_batch(request).await?;
         Ok(Response::new(response))
     }
 }
 
-fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
-    if worker_id.is_empty() {
-        return Err(Status::invalid_argument("worker_id must not be empty"));
+fn validate_owner(request: &ApplyExternalKvBatchRequest) -> Result<(), Status> {
+    let pool = !request.dram_pool_id.is_empty();
+    if request.dram_pool_id.is_empty() == request.worker_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "set exactly one of worker_id or dram_pool_id",
+        ));
+    }
+    if pool {
+        if !request.worker_address.is_empty() {
+            return Err(Status::invalid_argument(
+                "a DRAM pool has no worker_address",
+            ));
+        }
+        let spec = request
+            .cache_spec
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("a DRAM pool requires cache_spec"))?;
+        validate_pool_spec(spec)?;
+        if !spec.dram_pool_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "a pool cannot reference another pool",
+            ));
+        }
+        for action in &request.actions {
+            if action.tier != TierType::TierDram as i32 {
+                return Err(Status::invalid_argument("pool actions must target DRAM"));
+            }
+            if action.r#type == ExternalKvActionType::ActionReport as i32
+                && (action.component_masks.len() != action.hashes.len()
+                    || action.block_sizes.len() != action.hashes.len()
+                    || action
+                        .component_masks
+                        .iter()
+                        .any(|m| *m == 0 || m & !spec.components != 0)
+                    || action.block_sizes.contains(&0))
+            {
+                return Err(Status::invalid_argument(
+                    "pool reports require valid components and token counts",
+                ));
+            }
+        }
+    } else if let Some(spec) = request
+        .cache_spec
+        .as_ref()
+        .filter(|s| !s.dram_pool_id.is_empty())
+    {
+        validate_pool_spec(spec)?;
+        if request
+            .actions
+            .iter()
+            .any(|a| a.tier != TierType::TierHbm as i32)
+        {
+            return Err(Status::invalid_argument(
+                "pool members may only mutate their own HBM",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pool_spec(spec: &WorkerCacheSpec) -> Result<(), Status> {
+    if spec.version > SUPPORTED_SPEC_VERSION
+        || spec.components & COMPONENT_FULL == 0
+        || spec.components & !(COMPONENT_FULL | COMPONENT_SWA | COMPONENT_MAMBA) != 0
+        || (spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0)
+    {
+        return Err(Status::invalid_argument("invalid shared DRAM cache spec"));
     }
     Ok(())
 }
@@ -301,8 +365,8 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
 }
 
 fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
-    // An empty actions list is a no-op that only refreshes the worker's recorded
-    // address. Non-empty batches still have every action validated below.
+    // An empty actions list only refreshes identity/spec metadata and bindings.
+    // Non-empty batches still have every action validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
         return Err(Status::resource_exhausted(format!(
             "batch contains {} actions; maximum is {MAX_ACTIONS_PER_BATCH}",
@@ -534,7 +598,7 @@ impl WorkerPrefixScanner {
             Some(spec) => PrefixScanState::ComponentAware {
                 active: true,
                 best: 0,
-                spec: *spec,
+                spec: spec.clone(),
                 swa_run: 0,
                 swa_head_broken: false,
             },
@@ -892,8 +956,12 @@ mod tests {
 
     #[test]
     fn validate_worker_id_rejects_empty_value() {
-        assert!(validate_worker_id("").is_err());
-        assert!(validate_worker_id("worker-1").is_ok());
+        assert!(validate_owner(&ApplyExternalKvBatchRequest::default()).is_err());
+        assert!(validate_owner(&ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".into(),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     // --- component-aware prefix rule engine ---
@@ -937,6 +1005,7 @@ mod tests {
             full_tier_mask: tmask(full_tiers),
             swa_tier_mask: tmask(swa_tiers),
             mamba_tier_mask: tmask(mamba_tiers),
+            ..Default::default()
         }
     }
 
