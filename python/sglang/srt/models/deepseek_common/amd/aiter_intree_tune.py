@@ -165,7 +165,7 @@ def apply_intree_rows(table, intree, key_cols=_KEY_COLS, kernel_cols=_KERNEL_COL
         key = tuple(_norm(row[c]) for c in key_cols)
         replaces = has_base and not row[base_cols].isna().any()
         hits = index.get(key, [])
-        if not hits and not replaces:
+        if key not in index and not replaces:
             added.append(row[shared])
             index[key] = []  # a second in-tree row for this key counts as missing
             stats[ADDED] += 1
