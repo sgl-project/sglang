@@ -41,7 +41,7 @@ def _probe_hash(tag, t):
     data = t.detach().float().contiguous().cpu().numpy().tobytes()
     with open(path, "a") as fh:
         fh.write(
-            f"[flux3-hash] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
+            f"[flux3-hash] {tag} shape={'x'.join(map(str, t.shape))} dtype={t.dtype} "
             f"sha1={hashlib.sha1(data).hexdigest()[:12]} "
             f"absmean={t.detach().float().abs().mean().item():.8f}\n"
         )

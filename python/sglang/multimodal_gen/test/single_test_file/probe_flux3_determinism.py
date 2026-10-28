@@ -111,6 +111,13 @@ class ProbeFlux3EditStages(CustomTestCase):
             flush=True,
         )
         lines = _hash_lines(hash_file)
+        raw = hash_file.read_text().splitlines() if hash_file.exists() else []
+        print(
+            f"[flux3-probe] raw hash lines: {len(raw)}, parsed: {len(lines)}",
+            flush=True,
+        )
+        for r in raw[:3]:
+            print(f"[flux3-probe] raw: {r}", flush=True)
         runs = [lines[marks[i] : marks[i + 1]] for i in range(1, len(marks) - 1)]
         print(
             f"[flux3-probe] edit runs: {len(runs)}, hashes per run: "
