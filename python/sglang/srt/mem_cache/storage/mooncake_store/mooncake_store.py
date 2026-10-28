@@ -427,6 +427,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            local_buffer_size = (extra_config or {}).get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            )
+            if (
+                isinstance(local_buffer_size, bool)
+                or not isinstance(local_buffer_size, int)
+                or local_buffer_size < 0
+            ):
+                raise ValueError(
+                    "Mooncake local_buffer_size must be a non-negative integer."
+                )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -505,7 +516,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    local_buffer_size,
                     self.config.client_server_address,
                 )
             else:
@@ -570,7 +581,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            local_buffer_size,
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,

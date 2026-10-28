@@ -77,6 +77,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        self.page_wise_load = extra_config.get("page_wise_load", False)
+        self.page_wise_load_threshold = extra_config.get("page_wise_load_threshold", 10)
+        if not isinstance(self.page_wise_load, bool):
+            raise ValueError("Mooncake page_wise_load must be a boolean.")
+        if (
+            isinstance(self.page_wise_load_threshold, bool)
+            or not isinstance(self.page_wise_load_threshold, int)
+            or self.page_wise_load_threshold < 1
+        ):
+            raise ValueError(
+                "Mooncake page_wise_load_threshold must be a positive integer."
+            )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -313,6 +325,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
         started = []
+        page_wise_complete = False
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
@@ -329,12 +342,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
+                # A partial start still owns the successful sessions. Register
+                # the batch before validation so every exit cleans them up.
+                started.append(keys)
                 if list(result) != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
                         f"results={result}"
                     )
-                started.append(keys)
+
+            if (
+                self.page_wise_load
+                and sum(len(keys) for keys, _ in batches.values())
+                >= self.page_wise_load_threshold
+            ):
+                self._load_page_wise(batches)
+                page_wise_complete = True
+                return
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -370,8 +394,55 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 try:
                     self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
+                    page_wise_complete = False
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+            # Page-wise reads give up layer overlap. Publish nothing until all
+            # ranges and session cleanup have completed successfully.
+            if page_wise_complete:
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+
+    def _load_page_wise(self, batches) -> None:
+        """Read all layers and physical pools in one existing range-get call."""
+        all_keys, all_ptrs, all_sizes, all_offsets = [], [], [], []
+        for name, (keys, locations) in batches.items():
+            ptrs = [[] for _ in keys]
+            sizes = [[] for _ in keys]
+            offsets = [[] for _ in keys]
+            for layer in range(self.num_layers):
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                layer_ptrs, layer_sizes, layer_offsets = meta
+                if not (
+                    len(layer_ptrs)
+                    == len(layer_sizes)
+                    == len(layer_offsets)
+                    == len(keys)
+                ):
+                    raise ValueError(
+                        f"Mooncake pool={name} layer={layer} range count does not "
+                        f"match {len(keys)} keys."
+                    )
+                for i in range(len(keys)):
+                    ptrs[i].extend(layer_ptrs[i])
+                    sizes[i].extend(layer_sizes[i])
+                    offsets[i].extend(layer_offsets[i])
+            all_keys.extend(keys)
+            all_ptrs.extend(ptrs)
+            all_sizes.extend(sizes)
+            all_offsets.extend(offsets)
+
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            all_keys, all_ptrs, all_sizes, all_offsets
+        )
+        expected = [sum(sizes) for sizes in all_sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            raise RuntimeError(
+                f"Mooncake page-wise range get failed for pools={list(batches)}: "
+                f"transferred={result}, expected={expected}"
+            )
 
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
