@@ -165,8 +165,8 @@ class TestNPUDeepSeekV4FlashDSPARK(TestNpuPerformanceTestCaseBase):
     max_attempts = 3
     accept_rate = 0.5
 
-    def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms(self):
-        """Run NPU performance test for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
+    def test_npu_deepseek_v4_flash_fp8_4p_dspark(self):
+        """Run NPU performance test for DeepSeek-V4-Flash FP8 4p DSPARK."""
         self.run_throughput()
 
 
