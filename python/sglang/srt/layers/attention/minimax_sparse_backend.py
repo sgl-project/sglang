@@ -34,6 +34,8 @@ if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
         topk_index_reduce,
     )
+if is_hip():
+    from sglang.srt.layers.attention import minimax_sparse_backend_hip as _hip
 
 # Adaptive block_size_q thresholds (cut K-cache traffic; affects only the serial loop).
 _BSQ_THRESHOLD_64 = 4096  # max_seqlen_k >= 4K  -> BSQ=64
@@ -277,6 +279,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
+        self.kv_is_nvfp4 = False
+        if self.is_hip:
+            _hip.init_sparse_backend(self, spec)
         if self.is_hip and spec.speculative_algorithm is not None:
             if spec.speculative_eagle_topk != 1:
                 raise NotImplementedError(
@@ -1453,6 +1458,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_q: torch.Tensor,
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
+        out_quant: str = "",
     ):
         if self.is_hip and forward_batch.forward_mode.is_target_verify():
             meta = self._linear_verify_meta
@@ -1474,9 +1480,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q=idx_q,
                 idx_k=idx_k,
                 idx_v=idx_v,
+                out_quant=out_quant,
             )
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
+        kv_cached_by_fusion = not save_kv_cache or self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
@@ -1498,6 +1505,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_cache = None
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
+        if self.kv_is_nvfp4:
+            k_cache, v_cache, idx_k_cache = _hip.nvfp4_layer_caches(
+                self.kv_pool, layer.layer_id, k_cache, v_cache, idx_k_cache
+            )
 
         cached = self._prefill_seqblock_meta
         if cached is None or cached[0] is not forward_batch:
@@ -1645,6 +1656,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cached_topk_idx=cached_topk_idx,
                 return_topk_idx=want_topk,
                 loc_mapping=self._loc_mapping,
+                # A quantized O cannot take the DP padding rows appended below.
+                out_quant=(
+                    out_quant if actual_num_tokens == original_num_tokens else ""
+                ),
             )
             if want_topk:
                 idx_o, o, reduced_topk_idx = result
@@ -1659,13 +1674,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     [idx_o, idx_o.new_zeros(pad_len, *idx_o.shape[1:])], dim=0
                 )
 
+        if not isinstance(o, tuple):
+            o = o.reshape(original_num_tokens, -1).contiguous()
         return (
             (
                 None
                 if idx_o is None
                 else idx_o.reshape(original_num_tokens, -1).contiguous()
             ),
-            o.reshape(original_num_tokens, -1).contiguous(),
+            o,
         )
 
     def _dense_sparse_main_decode(
@@ -1716,6 +1733,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_q: torch.Tensor,
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
+        out_quant: str = "",  # o_proj's fp8_input_quant_format: O may come back as (fp8, scale)
         **kwargs,
     ):
         assert len(kwargs) == 0
@@ -1739,6 +1757,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_cache = None
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
+        if self.kv_is_nvfp4:
+            k_cache, v_cache, idx_k_cache = _hip.nvfp4_layer_caches(
+                self.kv_pool, layer.layer_id, k_cache, v_cache, idx_k_cache
+            )
 
         attn_fn = None
         if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
@@ -1849,10 +1871,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     if forward_batch.forward_mode.is_target_verify()
                     else 1
                 ),
+                verify_num_draft=(
+                    _hip.verify_num_draft(self, forward_batch) if self.is_hip else None
+                ),
+                out_quant=out_quant,
             )
+        if not isinstance(o, tuple):
+            o = o.reshape(q.shape[0], -1).contiguous()
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
-            o.reshape(q.shape[0], -1).contiguous(),
+            o,
         )
 
 
@@ -1871,6 +1899,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
+        self._builds_dense_metadata = not (
+            is_hip() and _hip.dense_metadata_unused(sparse_backend)
+        )
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
@@ -1878,13 +1909,15 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.
         self.sparse.init_forward_metadata(forward_batch)
-        self.dense.init_forward_metadata(forward_batch)
+        if self._builds_dense_metadata:
+            self.dense.init_forward_metadata(forward_batch)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         self.sparse.init_forward_metadata_out_graph(forward_batch, in_capture)
-        self.dense.init_forward_metadata_out_graph(forward_batch, in_capture)
+        if self._builds_dense_metadata:
+            self.dense.init_forward_metadata_out_graph(forward_batch, in_capture)
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
@@ -1893,10 +1926,12 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
-        self.dense.init_forward_metadata_in_graph(forward_batch)
+        if self._builds_dense_metadata:
+            self.dense.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
+        if self._builds_dense_metadata:
+            self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
         self.sparse.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):

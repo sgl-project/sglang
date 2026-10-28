@@ -9,7 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_hip_runtime,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -18,11 +23,13 @@ if TYPE_CHECKING:
 # rows: ~51 GB/s H2D and ~52 GB/s D2H, vs 46 / 35 GB/s with 8 / 32 per lane.
 _VECS_PER_LANE = 16
 _BLOCK_SIZE = 512
+# Two CTAs saturate B300 PCIe; MI350X needs 16+ (32: 55 / 52 GB/s D2H / H2D vs 26 / 18).
+_BLOCK_QUOTA = 32 if is_hip_runtime() else 2
 
 
 @cache_once
 def _jit_page_row_module(*, load: bool) -> Module:
-    args = make_cpp_args(load, _VECS_PER_LANE, _BLOCK_SIZE)
+    args = make_cpp_args(load, _VECS_PER_LANE, _BLOCK_SIZE, _BLOCK_QUOTA)
     return load_jit(
         "page_row",
         *args,

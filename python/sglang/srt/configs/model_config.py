@@ -434,13 +434,26 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     """Whether an NVFP4 checkpoint runs its native Blackwell stack.
 
-    The attention backend, the KV pool class and the KV cell-size budget must
-    all agree on this answer; sizing the pool for one layout while allocating
-    the other runs out of memory at startup.
+    The attention backend keys on this; the KV pool class and its cell-size budget
+    key on `uses_minimax_m3_packed_nvfp4_kv`, which also covers gfx950.
     """
     from sglang.srt.runtime_context import get_platform
 
     return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
+
+
+def uses_minimax_m3_packed_nvfp4_kv(
+    quantization: Optional[str], *, speculative_algorithm: Optional[str]
+) -> bool:
+    """Whether the KV pool is `MiniMaxM3Nvfp4KVPool`; the pool class and the
+    cell-size budget must agree on it."""
+    if not get_platform().is_hip:
+        return uses_minimax_m3_nvfp4_native_stack(quantization)
+    from sglang.srt.arg_groups.model_overrides import minimax_m3_hip
+
+    return minimax_m3_hip.uses_nvfp4_kv(
+        quantization, speculative_algorithm=speculative_algorithm
+    )
 
 
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
@@ -2031,6 +2044,7 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "minimax_m3_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
