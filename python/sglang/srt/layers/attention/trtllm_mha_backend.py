@@ -1773,6 +1773,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         )
+        causal = self._extend_is_causal(layer, forward_batch)
+        # These kernels have no right window either, so a bidirectional
+        # sliding-window layer attends over the whole sequence.
+        prefill_window_left = (
+            -1
+            if not causal and layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+            else layer.sliding_window_size
+        )
 
         q_scale = 1.0
         if uses_native_fp4:
@@ -1932,12 +1940,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 block_tables=fmha_v2_block_tables,
                 out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
-                mask_mode=(
-                    "padding"
-                    if layer.attn_type == AttentionType.ENCODER_ONLY
-                    else "causal"
-                ),
-                window_left=layer.sliding_window_size,
+                mask_mode="causal" if causal else "padding",
+                window_left=prefill_window_left,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
                 or 0.0,
@@ -1978,13 +1982,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     batch_size=cu_seqlens_q.shape[0] - 1,
                     cum_seq_lens_q=cu_seqlens_q,
                     cum_seq_lens_kv=cu_seqlens_kv,
-                    window_left=layer.sliding_window_size,
+                    window_left=prefill_window_left,
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                     out=out,
                     out_dtype=(None if uses_native_fp4 else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
-                    causal=layer.attn_type != AttentionType.ENCODER_ONLY,
+                    causal=causal,
                 )
 
             if cp_active:
