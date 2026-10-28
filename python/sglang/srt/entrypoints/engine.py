@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -1282,7 +1283,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         get_serving().port,
                         get_observability().enable_metrics,
                     )
-                scheduler_init_result.block_until_scheduler_exits()
+                with rust_server_sidecar(rust_server_owns_base_port):
+                    scheduler_init_result.block_until_scheduler_exits()
             finally:
                 scheduler_init_result.stop_grpc_server()
             return (
