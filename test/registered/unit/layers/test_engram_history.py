@@ -78,8 +78,8 @@ class TestEngramHistoryMultimodalPads(CustomTestCase):
             output_ids=[7],
             kv=SimpleNamespace(req_pool_idx=1),
         )
-        batch = SimpleNamespace(forward_mode=ForwardMode.PREBUILT, reqs=[req])
-        manager._prepare_engram_history(batch)
+        # The PD decode admission writes the row its first decode reads.
+        manager.write_decode_history([req])
         self.assertEqual(
             manager.engram_hasher.history[1].tolist(), [MM_PAD_SHIFT_VALUE] * 2
         )
