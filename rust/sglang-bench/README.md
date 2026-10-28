@@ -100,6 +100,10 @@ cp target/release/libsglang_bench.so \
   peak-concurrency windows, with NumPy's percentile interpolation and
   population standard deviation so the numbers line up with the Python
   script's.
+- `--cache-report`: the prefix-cache hits the server attributes to each
+  request (`meta_info.cached_tokens` on `/generate`, `sglext` on the OpenAI
+  routes), the `Cache Hit Details` block, the `cache_report` result key and
+  the per-request columns under `--output-details`, as in the Python client.
 
 ### Token ids on both ends
 
@@ -152,6 +156,8 @@ python -m sglang.benchmark.rust_client \
 The Python client's `mooncake` dataset reads the same files but builds text
 prompts from the hash ids through the chat template, so its token counts are
 the tokenizer's, not the trace's; `timed-trace` is the token-exact replay.
+With `--cache-report` the per-request hits the engine attributes line up
+against the trace's prefix structure request by request.
 
 ### gRPC
 
@@ -179,7 +185,7 @@ silently dropped flag would report a benchmark nobody ran.
   `timed-trace` covers the same files token-exactly), `agentic-trace`,
   `generated-shared-prefix`, `custom`, `openai`, `longbench-v2`, and
   `speed-bench`.
-- Multi-turn replay, LoRA request distributions, `--cache-report`,
+- Multi-turn replay, LoRA request distributions,
   `--plot-throughput`, PD-separated profiling, and the per-stage profiler
   options.
 
