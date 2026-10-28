@@ -111,7 +111,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.poll_timer import PollTimer
@@ -616,11 +621,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        return self._finalize_match_result(params, result)
+
+    def _finalize_match_result(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if self.linker is not None and params.req is not None:
+        # PD decode has no linker load-back path, so it only offloads.
+        if (
+            self.linker is not None
+            and params.req is not None
+            and get_disagg().disaggregation_mode != "decode"
+        ):
             result = self.linker.match(params.key, params.req, result)
         return result
 
@@ -3450,7 +3465,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing(wait_for_forward=True)
+            cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()

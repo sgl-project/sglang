@@ -1,7 +1,44 @@
 import asyncio
 import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+
+
+def test_worker_error_with_output_cannot_complete_video_job(monkeypatch, tmp_path):
+    output = tmp_path / "partial.mp4"
+    output.write_bytes(b"partial")
+    monkeypatch.setattr(
+        async_scheduler_client,
+        "forward",
+        AsyncMock(
+            return_value=OutputBatch(
+                output_file_paths=[str(output)], error="save failed"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        openai_utils,
+        "get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
+    )
+
+    async def run():
+        await video_api.VIDEO_STORE.upsert("failed-output", {"id": "failed-output"})
+        await video_api._dispatch_job_async(
+            "failed-output", Req(sampling_params=SamplingParams(prompt="test"))
+        )
+        return await video_api.VIDEO_STORE.pop("failed-output")
+
+    job = asyncio.run(run())
+    assert job["status"] == "failed"
+    assert "save failed" in job["error"]["message"]
+    assert job["file_paths"] is None and job["url"] is None
 
 
 def test_video_job_registry_holds_task_until_completion():

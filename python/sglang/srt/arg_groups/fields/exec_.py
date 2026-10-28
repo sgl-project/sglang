@@ -196,10 +196,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
-    monokernel_backend: A[
-        Optional[str],
-        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
-    ] = None
+    enable_amd_monokernel: A[
+        bool,
+        "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(
@@ -965,9 +965,10 @@ class ExecMoe(msgspec.Struct):
     enable_paged_experts: A[
         bool,
         "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
-        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
-        "prefill graphs must be breakable or disabled.",
+        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
+        "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],

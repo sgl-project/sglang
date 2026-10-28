@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -492,6 +493,34 @@ class TestUnifiedCacheLinkerPythonBackend(
         _, transfers = consumer_linker.lookup_calls[0]
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
+
+    def test_decode_match_skips_linker_lookup(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        tokens = list(range(1, 9))
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        key = RadixKey(array("q", tokens))
+        with get_disagg().override(disaggregation_mode="decode"):
+            req = self._make_req(consumer_req_pool)
+            match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertEqual(consumer_linker.lookup_calls, [])
+        self.assertFalse(consumer.linker.has_hit(req.rid))
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, len(tokens))
+        consumer.linker.release_request(req.rid)
 
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)

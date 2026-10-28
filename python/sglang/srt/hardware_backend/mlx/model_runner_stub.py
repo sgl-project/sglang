@@ -337,7 +337,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"zero GPU KV cache allocation)"
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None):
+    def alloc_memory_pool(self, memory_pool_config=None, *, draft_parallel_layout=None):
         """No-op: MLX manages its own KV cache."""
         pass
 

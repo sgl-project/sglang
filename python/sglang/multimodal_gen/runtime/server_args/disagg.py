@@ -18,6 +18,8 @@ class DisaggServerArgsMixin:
         RoleType.ENCODER: 1,
         RoleType.DENOISER: 2,
         RoleType.DECODER: 3,
+        RoleType.PROMPT_ENCODER: 4,
+        RoleType.IMAGE_ENCODER: 5,
     }
 
     def get_role_parallelism(self, role_type: RoleType) -> dict[str, int | None]:
@@ -27,7 +29,7 @@ class DisaggServerArgsMixin:
             "ulysses_degree": None,
             "ring_degree": None,
         }
-        if role_type == RoleType.ENCODER:
+        if role_type.is_input_encoder or role_type == RoleType.IMAGE_ENCODER:
             return {**_none, "tp_size": self.encoder_tp}
         if role_type == RoleType.DENOISER:
             return {
@@ -53,8 +55,7 @@ class DisaggServerArgsMixin:
             offset = self.DISAGG_RESULT_PORT_OFFSETS[role]
         except KeyError as exc:
             raise ValueError(
-                "pool result endpoints are only defined for encoder, denoiser, "
-                f"and decoder roles, got {role.value!r}"
+                f"pool result endpoints are only defined for worker roles, got {role.value!r}"
             ) from exc
         return format_tcp_endpoint(host, base_port + offset, "pool_result_endpoint")
 
@@ -167,6 +168,18 @@ class DisaggServerArgsMixin:
             type=str,
             default=cls.encoder_urls,
             help="Encoder instance work endpoints for DiffusionServer head mode.",
+        )
+        parser.add_argument(
+            "--prompt-encoder-urls",
+            type=str,
+            default=cls.prompt_encoder_urls,
+            help="Semicolon-separated prompt encoder endpoints; use with --image-encoder-urls instead of --encoder-urls.",
+        )
+        parser.add_argument(
+            "--image-encoder-urls",
+            type=str,
+            default=cls.image_encoder_urls,
+            help="Semicolon-separated image encoder endpoints for split encoding.",
         )
         parser.add_argument(
             "--denoiser-urls",

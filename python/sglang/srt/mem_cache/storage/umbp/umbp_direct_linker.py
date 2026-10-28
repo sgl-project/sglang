@@ -26,7 +26,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -131,19 +130,6 @@ def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
     return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
 
 
-def _parse_storage_extra_config(raw_config):
-    # Keep the linker module importable in CPU-only unit tests. The hybrid
-    # controller imports device-specific memory-pool modules transitively.
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        HybridCacheController,
-    )
-
-    extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-        raw_config
-    )
-    return extra_config
-
-
 class UMBPDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -151,6 +137,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         _storage=None,
         forward_stream=None,
     ):
@@ -207,10 +194,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
-        extra_config = dict(extra_config)
+        extra_config = dict(extra_config or {})
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")

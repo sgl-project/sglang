@@ -286,6 +286,11 @@ struct FusedKNormRopeFlashMLAParams {
   uint32_t num_q_heads = 0;
 };
 
+// The V4.1 K RoPE with its fma pinned, so the two K kernels below round it the same way.
+SGL_DEVICE fp32x2_t v41_rope_pair(float x_real, float x_imag, float freq_real, float freq_imag) {
+  return {fmaf(x_real, freq_real, -(x_imag * freq_imag)), fmaf(x_real, freq_imag, x_imag * freq_real)};
+}
+
 template <
     typename DType,
     int64_t kHeadDim,
@@ -335,7 +340,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
       const auto x = cast<float>(input_vec[i]);
-      sum_of_squares += x * x;
+      sum_of_squares = fmaf(x, x, sum_of_squares);
     }
     const auto warp_sum = warp::reduce_sum(sum_of_squares);
     if (lane_id == 0) partial_sums[warp_id] = warp_sum;
@@ -398,8 +403,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
       const auto x_imag = rounded.y;
       const auto freq_real = freq[0];
       const auto freq_imag = freq[1];
-      rounded = cast<fp32x2_t>(
-          cast<Packed>(fp32x2_t{x_real * freq_real - x_imag * freq_imag, x_real * freq_imag + x_imag * freq_real}));
+      rounded = cast<fp32x2_t>(cast<Packed>(v41_rope_pair(x_real, x_imag, freq_real, freq_imag)));
     }
     const float v[2] = {rounded.x, rounded.y};
     return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
@@ -434,6 +438,121 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   }
 }
 
+// The sum of squares is added in the order of `fused_k_norm_rope_flashmla` (its thread t is
+// pair t % 8 of lane t / 8 here), so both kernels write bitwise-equal rows.
+constexpr uint32_t kFusedKV41WarpsPerCTA = 4;
+// Below this many tokens the block-per-token kernel is as fast (decode, short prefill).
+constexpr uint32_t kFusedKV41MinTokens = 2048;
+
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
+__global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void fused_k_norm_rope_flashmla_v41(
+    const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+  using namespace device;
+
+  constexpr uint32_t kPerLane = kHeadDim / kWarpThreads;
+  constexpr uint32_t kPairs = kPerLane / 2;
+  constexpr uint32_t kRopeLane = (kHeadDim - kRopeDim) / kPerLane;
+  static_assert(kLayout != deepseek_v4::KVLayout::V4);
+  static_assert(kHeadDim == 512 && kRopeDim == 64 && kFusedKBlockSize == kWarpThreads * kPairs);
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  using Packed = packed_t<DType>;
+  using Half = AlignedVector<DType, kPerLane / 2>;
+  using Freq = AlignedVector<float, 4>;
+
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kFusedKV41WarpsPerCTA + threadIdx.x / kWarpThreads;
+  if (work_id >= params.batch_size) return;
+
+  const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto out_loc = params.out_loc[work_id];
+
+  Half input_vec[2], weight_vec[2];
+  Freq freq[kPerLane / 4];
+#pragma unroll
+  for (uint32_t h = 0; h < 2; ++h) {
+    input_vec[h].load(input_ptr, 2 * lane_id + h);
+    weight_vec[h].load(params.kv_weight, 2 * lane_id + h);
+  }
+  if (lane_id >= kRopeLane) {
+    const auto freqs_cis = params.freqs_cis + position * kRopeDim + (lane_id - kRopeLane) * kPerLane;
+#pragma unroll
+    for (uint32_t f = 0; f < kPerLane / 4; ++f)
+      freq[f].load(freqs_cis, f);
+  }
+
+  float x[kPerLane], sums[kPairs];
+#pragma unroll
+  for (uint32_t i = 0; i < kPerLane; ++i)
+    x[i] = cast<float>(input_vec[i / (kPerLane / 2)][i % (kPerLane / 2)]);
+#pragma unroll
+  for (uint32_t p = 0; p < kPairs; ++p) {
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto v = x[2 * p + i];
+      sum_of_squares = fmaf(v, v, sum_of_squares);
+    }
+    sums[p] = sum_of_squares;
+  }
+  // The reference tree: in-warp masks 16, 8 (lane bits 1, 0 here), then 4, 2, 1 (the pair),
+  // then across its warps masks 4, 2, 1 (lane bits 4, 3, 2).
+#pragma unroll
+  for (uint32_t mask = 2; mask >= 1; mask >>= 1) {
+#pragma unroll
+    for (uint32_t p = 0; p < kPairs; ++p)
+      sums[p] += __shfl_xor_sync(0xffffffffu, sums[p], mask);
+  }
+#pragma unroll
+  for (uint32_t half = kPairs / 2; half >= 1; half >>= 1) {
+#pragma unroll
+    for (uint32_t p = 0; p < half; ++p)
+      sums[p] += sums[p + half];
+  }
+  float sum_of_squares = sums[0];
+#pragma unroll
+  for (uint32_t mask = 16; mask >= 4; mask >>= 1)
+    sum_of_squares += __shfl_xor_sync(0xffffffffu, sum_of_squares, mask);
+  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+  // As in the reference: round the normed values, rotate the RoPE tail, round again.
+  float v[kPerLane];
+#pragma unroll
+  for (uint32_t p = 0; p < kPairs; ++p) {
+    float data[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto w = cast<float>(weight_vec[(2 * p + i) / (kPerLane / 2)][(2 * p + i) % (kPerLane / 2)]);
+      data[i] = x[2 * p + i] * norm_factor * w;
+    }
+    auto rounded = cast<fp32x2_t>(cast<Packed>(fp32x2_t{data[0], data[1]}));
+    if (lane_id >= kRopeLane) {
+      const auto x_real = rounded.x;
+      const auto x_imag = rounded.y;
+      const auto freq_real = freq[p / 2][2 * (p % 2)];
+      const auto freq_imag = freq[p / 2][2 * (p % 2) + 1];
+      rounded = cast<fp32x2_t>(cast<Packed>(v41_rope_pair(x_real, x_imag, freq_real, freq_imag)));
+    }
+    v[2 * p] = rounded.x;
+    v[2 * p + 1] = rounded.y;
+  }
+
+  // Warp-uniform: one token per warp, so the store's lane reductions see a full warp.
+  if (out_loc < 0) return;
+  PDLTriggerSecondary<kUsePDL>();
+  const auto row = Paged::row(params.kvcache, out_loc);
+  deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, lane_id, v);
+}
+
 template <
     typename DType,
     int64_t kHeadDim,
@@ -452,6 +571,9 @@ struct FusedKNormRopeFlashMLAKernel {
   template <typename PosT, bool kRopeQ>
   static constexpr auto kernel =
       fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
+  template <typename PosT>
+  static constexpr auto kernel_v41 =
+      fused_k_norm_rope_flashmla_v41<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -549,6 +671,15 @@ struct FusedKNormRopeFlashMLAKernel {
       params.q_stride_batch = q->stride(0);
       params.q_stride_head = q->stride(1);
       params.num_q_heads = static_cast<uint32_t>(H.unwrap());
+    }
+    if constexpr (kLayout != deepseek_v4::KVLayout::V4 && !kRopeQ) {
+      if (batch_size >= kFusedKV41MinTokens) {
+        const auto k = pos_dtype.is_type<int32_t>() ? kernel_v41<int32_t> : kernel_v41<int64_t>;
+        LaunchKernel(
+            div_ceil(batch_size, kFusedKV41WarpsPerCTA), kFusedKV41WarpsPerCTA * device::kWarpThreads, device_.unwrap())
+            .enable_pdl(kUsePDL)(k, params);
+        return;
+      }
     }
     const auto k_int32 = kernel<int32_t, kRopeQ>;
     const auto k_int64 = kernel<int64_t, kRopeQ>;

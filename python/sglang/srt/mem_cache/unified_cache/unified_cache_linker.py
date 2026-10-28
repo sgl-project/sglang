@@ -131,7 +131,14 @@ class LayerWiseLoadCounter:
 
 
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree linkers are constructed per worker as
+    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    Store ``forward_stream`` and use ``record_offload_ready()`` to gate offloads.
+    ``layer_done_counter`` provides ``set_consumer(index)`` and
+    ``wait_until(layer)``. Report completion only after device copies finish.
+    """
 
     layer_done_counter: object
     pools: dict[PoolName, object]
