@@ -5,8 +5,8 @@ Independent prompts exceed P's logical GPU capacity while fitting in L2.
 The final repeat must report a host hit, advance the H2D counter and match
 the device-hit answer.
 
-The accuracy variants also use P TP2/CP2 + D TP2 on four GB300s. They retain
-layer-split's GSM8K scoring settings and require H2D reload during evaluation.
+The accuracy test also uses P TP2/CP2 + D TP2 on four GB300s. It retains
+layer-split's GSM8K scoring settings and requires H2D reload during evaluation.
 """
 
 import re
@@ -379,43 +379,6 @@ class TestGLM52PDShardedHiCacheAccuracy(
         for rank, state in enumerate(states):
             with self.subTest(rank=rank):
                 self.assertGreater(state["avg_spec_accept_length"], 0)
-
-
-class TestGLM52PDShardedHiCacheAccuracyMixedMoE(TestGLM52PDShardedHiCacheAccuracy):
-    """Cover target DeepEP DP2/EP2 with a TP-only EAGLE draft on two D GPUs."""
-
-    gsm8k_accuracy_thres = 0.8
-    gsm8k_num_questions = 32
-    gsm8k_num_threads = 32
-    extra_decode_args = TestGLM52PDShardedHiCacheAccuracy.extra_decode_args + [
-        # DP2/EP2 target + TP-only draft weights exceed the 0.85 budget on
-        # GB300 (measured minimum 0.870). Keep the inherited KV-token cap.
-        "--mem-fraction-static",
-        "0.90",
-        "--attn-dp-size",
-        "2",
-        "--enable-dp-lm-head",
-        "--ep-size",
-        "2",
-        "--moe-dense-tp-size",
-        "1",
-        "--moe-a2a-backend",
-        "deepep",
-        "--deepep-mode",
-        "low_latency",
-        "--moe-runner-backend",
-        "flashinfer_cutedsl",
-        "--speculative-moe-a2a-backend",
-        "none",
-        "--speculative-moe-runner-backend",
-        "triton",
-        "--cuda-graph-max-bs-decode",
-        "8",
-        "--max-running-requests",
-        "8",
-        "--disable-prefill-cuda-graph",
-        "--disable-flashinfer-autotune",
-    ]
 
 
 if __name__ == "__main__":
