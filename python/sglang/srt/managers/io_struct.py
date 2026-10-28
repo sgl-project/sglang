@@ -64,7 +64,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, validate_n
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
@@ -528,26 +528,19 @@ class GenerateReqInput:
             return 1
         return self.parallel_sample_num
 
-    @staticmethod
-    def _validated_n(sampling_params: Dict[str, Any]) -> int:
-        # Must run before inputs are multiplied by n; SamplingParams.verify is too late.
-        n = sampling_params.get("n", 1)
-        if type(n) is not int or not 1 <= n <= MAX_N:
-            raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
-        return n
-
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
+        # n is validated here because inputs are multiplied by n before SamplingParams.verify runs.
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self._validated_n(self.sampling_params)
+            self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self._validated_n(self.sampling_params[0])
+            self.parallel_sample_num = validate_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != self._validated_n(sampling_params):
+                if self.parallel_sample_num != validate_n(sampling_params.get("n", 1)):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )

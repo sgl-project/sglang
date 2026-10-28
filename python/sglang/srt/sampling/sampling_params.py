@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
@@ -116,6 +116,12 @@ def set_request_reasoning_end_token_ids(
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
     sampling_params["custom_params"] = custom_params
+
+
+def validate_n(n: Any) -> int:
+    if type(n) is not int or not 1 <= n <= MAX_N:
+        raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
+    return n
 
 
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
@@ -231,8 +237,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if type(self.n) is not int or not 1 <= self.n <= MAX_N:
-            raise ValueError(f"n must be an integer in [1, {MAX_N}], got {self.n}.")
+        validate_n(self.n)
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
