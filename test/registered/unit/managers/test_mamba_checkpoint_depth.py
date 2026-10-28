@@ -20,7 +20,9 @@ from sglang.srt.managers.schedule_batch import (
     _MambaRadixCacheV2TrackEntry,
 )
 from sglang.srt.managers.schedule_policy import PrefillAdder, mamba_prefill_chunk_grid
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.prefill_chunking import (
+    with_mamba_chunk_align,
+)
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -189,28 +191,22 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
 
     def test_non_dcp_does_not_change_truncation_alignment(self):
         # The old gate would write the chunk size into a still-empty alignment.
-        scheduler = object.__new__(Scheduler)
-        scheduler.truncation_align_size = None
         with get_context().override_server_args(
             disable_radix_cache=False,
             mamba_radix_cache_strategy="extra_buffer",
             dcp_size=1,
             _mamba_cache_chunk_size=CHUNK,
         ):
-            scheduler.init_mamba_truncation_align()
-        self.assertIsNone(scheduler.truncation_align_size)
+            self.assertIsNone(with_mamba_chunk_align(None))
 
     def test_dcp_folds_the_chunk_into_truncation_alignment(self):
-        scheduler = object.__new__(Scheduler)
-        scheduler.truncation_align_size = 48
         with get_context().override_server_args(
             disable_radix_cache=False,
             mamba_radix_cache_strategy="extra_buffer",
             dcp_size=2,
             _mamba_cache_chunk_size=CHUNK,
         ):
-            scheduler.init_mamba_truncation_align()
-        self.assertEqual(scheduler.truncation_align_size, 192)
+            self.assertEqual(with_mamba_chunk_align(48), 192)
 
     def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
         # Walk a 100k prompt through chunks the scheduler cut to whatever the

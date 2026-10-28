@@ -9,6 +9,7 @@ from typing import Optional
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_policy import mamba_prefill_chunk_grid
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -52,6 +53,7 @@ def resolve_truncation_align_size(
     """The alignment of chunk starts, or None; raises when a chunk is shorter."""
     truncation_align_size = deterministic_truncation_align_size()
     truncation_align_size = with_dsa_kpool_align(truncation_align_size, hf_config)
+    truncation_align_size = with_mamba_chunk_align(truncation_align_size)
     check_truncation_align_fits_chunk(
         truncation_align_size, chunked_prefill_size, disaggregation_mode
     )
@@ -95,6 +97,24 @@ def with_dsa_kpool_align(
         truncation_align_size = dsa_index_kpool
     else:
         truncation_align_size = math.lcm(truncation_align_size, dsa_index_kpool)
+    return truncation_align_size
+
+
+def with_mamba_chunk_align(truncation_align_size: Optional[int]) -> Optional[int]:
+    """Under DCP a mamba checkpoint may only be donated where the cached
+    prefix sits on the kernel chunk grid, so a chunk that stops anywhere
+    else costs the request every donation it would have made after that.
+    Without DCP the prefix-relative rule already donates, so leave the
+    existing alignment alone. Use the LCM to preserve any alignment that
+    is already set."""
+    chunk_size = mamba_prefill_chunk_grid()
+    if chunk_size <= 1:
+        return truncation_align_size
+
+    if truncation_align_size is None:
+        truncation_align_size = chunk_size
+    else:
+        truncation_align_size = math.lcm(truncation_align_size, chunk_size)
     return truncation_align_size
 
 
