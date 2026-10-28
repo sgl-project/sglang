@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -31,14 +32,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import (
-    add_prefix,
-    ceil_align,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_npu_a5,
-)
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -46,7 +40,7 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-if is_npu() and not is_npu_a5():
+if is_npu() and not is_npu_arch35():
     try:
         import custom_ops  # noqa: F401
     except ImportError:
@@ -2027,7 +2021,7 @@ class IndexerKPool(MultiPlatformOp):
         return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
 
     def _fix_short_sequence_topk_a5(self, topk_result, metadata, mode):
-        if not is_npu_a5() or self.index_topk < 2048:
+        if not is_npu_arch35() or self.index_topk < 2048:
             return topk_result
         causal_lens = (
             metadata.get_seqlens_int32()

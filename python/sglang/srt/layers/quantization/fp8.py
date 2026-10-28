@@ -109,7 +109,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_npu_a5,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -2753,7 +2752,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if (
-            is_npu_a5()
+            is_npu_arch35()
             and self._owns_moe_runner
             and self.runner.runner_backend.is_ascend()
         ):
@@ -2977,12 +2976,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
-            elif is_npu_a5():
+            elif is_npu_arch35():
                 moe_runner_backend = MoeRunnerBackend.ASCEND
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
-        if is_npu_a5() and moe_runner_backend.is_ascend():
+        if is_npu_arch35() and moe_runner_backend.is_ascend():
             if (
                 not self.block_quant
                 or self.use_mxfp8
@@ -3019,7 +3018,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
             or moe_runner_backend.is_flashinfer_megamoe()
-            or (is_npu_a5() and moe_runner_backend.is_ascend())
+            or (is_npu_arch35() and moe_runner_backend.is_ascend())
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -3380,7 +3379,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
-        elif is_npu_a5() and self.runner.runner_backend.is_ascend():
+        elif is_npu_arch35() and self.runner.runner_backend.is_ascend():
             from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
             quant_info = AscendQuantInfo(

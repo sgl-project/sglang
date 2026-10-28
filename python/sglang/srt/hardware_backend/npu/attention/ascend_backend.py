@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -45,11 +46,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_npu_a5,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1501,7 +1498,7 @@ class AscendAttnBackend(AttentionBackend):
         # SFA's MLA interface requires a fixed 64-dimensional query_rope even
         # for models without RoPE. Keep the model/cache contract at dimension 0
         # and materialize an operator-only zero tensor here.
-        if self.qk_rope_head_dim == 0 and is_npu_a5():
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
             k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
             q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
         elif self.qk_rope_head_dim == 0:
