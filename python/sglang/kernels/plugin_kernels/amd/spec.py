@@ -48,6 +48,10 @@ class StepMetadata(enum.Enum):
     """Per-step attention metadata a backend can skip building."""
 
     LOW_RATIO_DECODE_SCHEDULE = "the aiter decode schedule of each low-ratio indexer"
+    ATTENTION_GRAPH_VARIANT = (
+        "the decode graph's attention variant (DSA dense or sparse), chosen on the "
+        "host from the batch's longest request"
+    )
 
 
 class DeviceLimits(msgspec.Struct, frozen=True):

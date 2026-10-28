@@ -305,6 +305,55 @@ class TestMonokernelFramework(CustomTestCase):
                 binding.is_metadata_unread(model, batch("decode", 2, 2), schedule)
             )
 
+    def test_routed_graphs_are_captured_without_attention_variants(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner as Runner,
+        )
+
+        class Variants:
+            capture_labels = ("dense", "sparse")
+
+            def select(self, forward_batch):
+                # stands for the host read of the batch's longest request
+                return "selected"
+
+        variant = StepMetadata.ATTENTION_GRAPH_VARIANT
+        unread = replace(SPEC, unread_metadata=frozenset({variant}))
+
+        def runner(model, *, mode="decode", tokens=1, sizes=None):
+            r = SimpleNamespace(
+                attention_graph_variants=Variants(),
+                attention_variant_sizes=sizes,
+                model_runner=SimpleNamespace(model=model),
+                capture_forward_mode=ForwardMode[mode.upper()],
+                capture_bs=[1, 2, 3, 4, 8],
+                captured_req_width=tokens,
+            )
+            r._attention_varies_at = partial(Runner._attention_varies_at, r)
+            Runner._capture_monokernel_steps_once(r)
+            return r
+
+        def resolve(r, bs):
+            step = batch(r.capture_forward_mode.name.lower(), bs, bs)
+            return Runner._resolve_attention_variant(r, step, bs)
+
+        # the widths built (1, 2, 4) are captured once and replay without the read;
+        # every other size captures and selects a variant
+        routed = runner(switched(spec=unread)[0])
+        self.assertEqual(routed.attention_variant_sizes, frozenset({3, 8}))
+        self.assertEqual([resolve(routed, bs) for bs in (2, 3)], [None, "selected"])
+        for r in (
+            runner(switched()[0]),  # a spec that reads the variant
+            runner(Lm()),  # no monokernels
+            # a verify graph, while the forward routes decode steps
+            runner(switched(spec=unread)[0], mode="target_verify", tokens=1),
+        ):
+            self.assertIsNone(r.attention_variant_sizes)
+            self.assertEqual(resolve(r, 2), "selected")
+        # the sizes another plugin set are kept
+        kept = runner(switched(spec=unread)[0], sizes=frozenset({8}))
+        self.assertEqual(kept.attention_variant_sizes, frozenset({8}))
+
     def test_the_weights_iterator_passes_weights_through_and_keeps_copies(self):
         iterator = binding.monokernel_weights_iterator
         model, other = torch.nn.Module(), torch.nn.Module()

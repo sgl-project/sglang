@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -297,14 +297,20 @@ def monokernel_weights_iterator(
 
 def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
     """The graph key of a DECODE or TARGET_VERIFY step, else None."""
-    mode = forward_batch.forward_mode
+    return _shape_key(
+        forward_batch.forward_mode,
+        int(forward_batch.batch_size),
+        int(forward_batch.input_ids.shape[0]),
+    )
+
+
+def _shape_key(mode: ForwardMode, bs: int, rows: int) -> Optional[ShapeKey]:
     if mode.is_decode():
         name = "decode"
     elif mode.is_target_verify():
         name = "target_verify"
     else:
         return None
-    bs, rows = int(forward_batch.batch_size), int(forward_batch.input_ids.shape[0])
     if bs <= 0 or rows % bs:
         return None
     return ShapeKey(forward_mode=name, batch_size=bs, tokens_per_request=rows // bs)
@@ -316,6 +322,26 @@ def is_metadata_unread(
     """Whether the monokernel forward that runs this step never reads the metadata."""
     served, unread = model.__dict__.get("_monokernel_unread_metadata", ((), ()))
     return metadata in unread and shape_key(forward_batch) in served
+
+
+def unread_capture_sizes(
+    model: torch.nn.Module,
+    metadata: StepMetadata,
+    *,
+    forward_mode: ForwardMode,
+    capture_bs: Iterable[int],
+    tokens_per_request: int,
+) -> frozenset[int]:
+    """The captured batch sizes whose graphs run the monokernel forward, which never
+    reads the metadata."""
+    served, unread = model.__dict__.get("_monokernel_unread_metadata", ((), ()))
+    if metadata not in unread:
+        return frozenset()
+    return frozenset(
+        bs
+        for bs in capture_bs
+        if _shape_key(forward_mode, bs, bs * tokens_per_request) in served
+    )
 
 
 def install_monokernel_forward(
