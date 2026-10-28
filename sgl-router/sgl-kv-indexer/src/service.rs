@@ -262,50 +262,22 @@ where
 }
 
 fn validate_owner(request: &ApplyExternalKvBatchRequest) -> Result<(), Status> {
-    let pool = !request.dram_pool_id.is_empty();
-    if request.dram_pool_id.is_empty() == request.worker_id.is_empty()
-        || (pool && !request.worker_address.is_empty())
-    {
+    if !request.worker_id.is_empty() {
+        return Ok(());
+    }
+    if request.dram_pool_id.is_empty() || !request.worker_address.is_empty() {
         return Err(Status::invalid_argument(
             "set a worker identity or a DRAM pool id",
         ));
     }
-    let spec = match request.cache_spec.as_ref() {
-        Some(spec) if pool || !spec.dram_pool_id.is_empty() => spec,
-        _ if pool => return Err(Status::invalid_argument("a DRAM pool requires cache_spec")),
-        _ => return Ok(()),
-    };
-    if (pool && !spec.dram_pool_id.is_empty())
-        || spec.version > SUPPORTED_SPEC_VERSION
-        || spec.components & COMPONENT_FULL == 0
-        || spec.components & !(COMPONENT_FULL | COMPONENT_SWA | COMPONENT_MAMBA) != 0
-        || (spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0)
-    {
-        return Err(Status::invalid_argument("invalid shared DRAM cache spec"));
-    }
-    let tier = if pool {
-        TierType::TierDram
-    } else {
-        TierType::TierHbm
-    };
     for action in &request.actions {
-        if action.tier != tier as i32 {
-            return Err(Status::invalid_argument(
-                "pool owners mutate DRAM; members mutate HBM",
-            ));
-        }
-        if pool
-            && action.r#type == ExternalKvActionType::ActionReport as i32
-            && (action.component_masks.len() != action.hashes.len()
-                || action.block_sizes.len() != action.hashes.len()
-                || action
-                    .component_masks
-                    .iter()
-                    .any(|m| *m == 0 || m & !spec.components != 0)
-                || action.block_sizes.contains(&0))
+        let n = action.hashes.len();
+        if action.tier != TierType::TierDram as i32
+            || (action.r#type == ExternalKvActionType::ActionReport as i32
+                && (action.component_masks.len() != n || action.block_sizes.len() != n))
         {
             return Err(Status::invalid_argument(
-                "pool reports require components and token counts",
+                "pool owners report DRAM with component masks and token counts",
             ));
         }
     }
@@ -578,7 +550,7 @@ impl WorkerPrefixScanner {
             Some(spec) => PrefixScanState::ComponentAware {
                 active: true,
                 best: 0,
-                spec: spec.clone(),
+                spec: *spec,
                 swa_run: 0,
                 swa_head_broken: false,
             },
@@ -985,7 +957,6 @@ mod tests {
             full_tier_mask: tmask(full_tiers),
             swa_tier_mask: tmask(swa_tiers),
             mamba_tier_mask: tmask(mamba_tiers),
-            ..Default::default()
         }
     }
 

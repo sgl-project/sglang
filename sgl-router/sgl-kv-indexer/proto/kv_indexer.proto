@@ -20,8 +20,7 @@ enum TierType {
 //                             `swa_window_tokens` tokens ending at the boundary,
 //                             or in an unbroken run from the head.
 //   MAMBA (bit 2, value 4) -- resident on the boundary block only.
-// Carried as a bitmask; FULL is required by a cache spec, but individual tier
-// placements may contain only some of the configured components.
+// Carried as a bitmask; FULL is always present on a stored block.
 
 // A worker's versioned cache spec: which components its cache holds and the
 // parameters the fixed rules need. Absent means legacy / full-only behaviour.
@@ -37,10 +36,6 @@ message WorkerCacheSpec {
   uint32 full_tier_mask = 4;
   uint32 swa_tier_mask = 5;
   uint32 mamba_tier_mask = 6;
-  // Shared DRAM this worker can read. Empty preserves private-tier behavior.
-  // With a pool, queries combine this worker's HBM with the pool's DRAM.
-  // Members must use the same model, key layout and component/window spec.
-  string dram_pool_id = 7;
 }
 
 message MatchExternalKvRequest {
@@ -99,11 +94,10 @@ message ApplyExternalKvBatchRequest {
   // The worker's component cache spec, carried on every batch so it self-heals
   // across reconnects and indexer restarts. Absent means legacy / full-only.
   WorkerCacheSpec cache_spec = 6;
-  // Pool-owner mutation, mutually exclusive with worker_id/worker_address.
-  // Only DRAM actions are accepted. cache_spec describes the pool's immutable
-  // component/window spec, with its own dram_pool_id empty. REPORT requires
-  // explicit component masks and token counts. Pool ids and worker ids occupy
-  // separate namespaces; a pool is never returned as a routing candidate.
+  // Shared DRAM pool. With worker_id, the worker reads the pool's DRAM in
+  // place of its own DRAM/SSD, under its own cache_spec. Without worker_id or
+  // worker_address, the batch is the pool owner's DRAM residency. Pool and
+  // worker ids are separate namespaces.
   string dram_pool_id = 7;
 }
 

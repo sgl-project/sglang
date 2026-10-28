@@ -58,7 +58,7 @@ The server stores:
 - block hash → token count and `(worker, tier) → component mask`
 - worker → router-facing address, `WorkerCacheSpec`, and reverse holdings by tier
 - block hash → `dram_pool_id → component mask`, stored once per shared pool
-- DRAM pool → component/window spec, reverse holdings and member worker ids
+- DRAM pool → reverse holdings and member worker ids
 - block hash → cumulative hit count
 
 Component masks are `FULL=1`, `SWA=2`, `MAMBA=4`, and `0` for legacy
@@ -66,14 +66,9 @@ whole-block events. `REPORT` replaces the component snapshot for one
 `(worker, tier, block)` placement. `REVOKE` removes that placement, and
 `CLEAR_ALL_AT_TIER` removes every placement for the worker at that tier.
 
-For shared DRAM, set `KV_INDEXER_DRAM_POOL_ID` and a matching component/window
-spec on each bridge. The owner reports DRAM once using the request's pool id,
-empty worker identity and explicit component masks/token counts. Members must
-share the model, page size and key layout. Queries combine worker HBM with pool
-DRAM; clear/revoke remain scoped to the named owner. An empty binding restores
-private-tier mode. Pool members publish HBM only and refresh bindings every 30s,
-including at startup; the owner must refresh residency after Indexer restart.
-No HBM replay, TTL or fencing is added.
+For shared DRAM, members set `KV_INDEXER_DRAM_POOL_ID` and a cache spec; the
+owner reports DRAM once with that pool id and no worker identity. A member's
+prefix combines its HBM with the pool's DRAM under its own spec.
 
 ## Build
 
