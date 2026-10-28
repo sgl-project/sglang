@@ -1039,11 +1039,6 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        if self.dense_mla_dcp_target and seq_lens_cpu is None:
-            # Adapt device prefixes to the existing DFlash Host convention.
-            seq_lens_cpu = seq_lens[:bs].cpu()
-            if forward_mode.is_target_verify() and _is_dflash_verify(spec_info):
-                seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
         if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
             # verify adds the draft block except for DFlash, whose seq_lens_cpu already
@@ -1136,6 +1131,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[:bs, total_pages:].fill_(0)
 
         if self.dense_mla_dcp_target:
+            assert seq_lens_cpu is not None, "MLA DCP requires seq_lens_cpu"
             # Replay uses the same local Host bounds as its page table.
             local_host_kv_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
                 attention_kv_lens_cpu,
