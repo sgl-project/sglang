@@ -170,12 +170,13 @@ class TestIsFiaNz(unittest.TestCase):
         ):
             self.assertTrue(is_fia_nz())
 
-    def test_fia_nz_without_mlapo_raises(self):
+    def test_fia_nz_without_mlapo_returns_true(self):
+        # FIA NZ is a cache-layout choice, not an MLAPO-only optimization:
+        # models such as Kimi-K3 select it while MLAPO stays off.
         with patch.dict(os.environ):
             os.environ.pop("SGLANG_NPU_USE_MLAPO", None)
             os.environ["SGLANG_USE_FIA_NZ"] = "1"
-            with self.assertRaises(AssertionError):
-                is_fia_nz()
+            self.assertTrue(is_fia_nz())
 
 
 if __name__ == "__main__":
