@@ -770,6 +770,9 @@ class Envs:
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
     )
+    # Skip-topk layers never touch index-K, so they get a 0-row buffer. Set
+    # True to allocate every layer instead.
+    SGLANG_DISABLE_DSA_INDEXK_ELISION = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime

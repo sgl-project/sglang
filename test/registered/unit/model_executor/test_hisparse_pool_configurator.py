@@ -19,20 +19,24 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         *,
         enable_hisparse: bool,
         host_to_device_ratio: int = 1,
+        num_layers: int = 2,
+        disaggregation_mode: str = "null",
+        index_topk_pattern: list[str] | None = None,
     ) -> int:
-        num_layers = 2
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
             index_topk=2048,
             index_head_dim=128,
         )
+        if index_topk_pattern is not None:
+            hf_config.index_topk_pattern = index_topk_pattern
         hf_config.get_text_config = lambda: hf_config
 
         override = get_context().override_server_args(
             enable_hisparse=enable_hisparse,
             hisparse_config=f'{{"host_to_device_ratio": {host_to_device_ratio}}}',
             enable_hierarchical_cache=False,
-            disaggregation_mode="null",
+            disaggregation_mode=disaggregation_mode,
             dsa_prefill_backend="flashmla_sparse",
             dsa_decode_backend="flashmla_sparse",
         )
@@ -80,6 +84,43 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
                     host_to_device_ratio=host_to_device_ratio,
                 )
                 self.assertEqual(cell_size, expected_cell_size)
+
+    def test_hisparse_decode_prices_only_indexer_owning_layers(self):
+        # One anchor layer plus three shared-topk layers. On a HiSparse decode
+        # engine the shared layers own no index-K, so the cell must price one
+        # indexer layer, not four. The sizing path and the allocation path read
+        # the same `_should_elide_dsa_index_k`; if sizing priced all four,
+        # max_total_num_tokens would hide the memory the pool never allocates.
+        #
+        # fp8 cell = 656 B/layer latent + 132 B/token/indexer-layer * ratio:
+        #   decode  (1 priced layer)  = 4 * 656 + 132 * 1 * 2 = 2888
+        #   prefill (4 priced layers) = 4 * 656 + 132 * 4 * 2 = 3680
+        kwargs = dict(
+            enable_hisparse=True,
+            host_to_device_ratio=2,
+            num_layers=4,
+            index_topk_pattern=["A", "S", "S", "S"],
+        )
+        decode_cell = self._compute_cell_size(
+            torch.float8_e4m3fn, disaggregation_mode="decode", **kwargs
+        )
+        prefill_cell = self._compute_cell_size(
+            torch.float8_e4m3fn, disaggregation_mode="prefill", **kwargs
+        )
+        self.assertEqual(decode_cell, 2888)
+        self.assertEqual(prefill_cell, 3680)
+
+    def test_hisparse_single_engine_prices_every_layer(self):
+        # Without PD there is no prefill peer to own the shared layers' index-K,
+        # so a single HiSparse engine keeps all four indexer layers.
+        cell_size = self._compute_cell_size(
+            torch.float8_e4m3fn,
+            enable_hisparse=True,
+            host_to_device_ratio=2,
+            num_layers=4,
+            index_topk_pattern=["A", "S", "S", "S"],
+        )
+        self.assertEqual(cell_size, 3680)
 
 
 if __name__ == "__main__":
