@@ -45,7 +45,7 @@ pub struct Runtime {
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
     /// The shared core, which runs the MM pool processor's media hooks.
-    core: crate::api_server::core::CoreHandle,
+    core: crate::api_server::handlers::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -71,7 +71,10 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new(spec)?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
@@ -85,10 +88,10 @@ impl Runtime {
         workers: usize,
         feature_shm: bool,
     ) {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
-            processor,
-            feature_shm,
-        ));
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::with_processor(processor, feature_shm)
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
     }
 
@@ -314,16 +317,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // One transport-neutral entrance to the runtime. Each configured listener
     // receives a clone; no listener owns or reconstructs scheduler wiring.
-    let core = crate::api_server::core::CoreHandle::new(
+    let core = crate::api_server::handlers::CoreHandle::new(
         senders.tok_manager_tx.clone(),
         senders.abort_tx.clone(),
-        crate::api_server::core::CoreConfig {
+        crate::api_server::handlers::CoreConfig {
             response_capacity: cfg.rust_server_args.stage_channel_cap,
             response_activity: response_activity.clone(),
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
-            metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
+            peer_endpoints: crate::api_server::core::peer_endpoints(
+                &cfg.server_args.deployment_info,
+                cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+            )?,
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
         },
     );
@@ -334,7 +341,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let core = core.clone();
-        let hicache_manager = Arc::new(api_server::core::HiCacheManager::new(
+        let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
             core.clone(),
             &cfg.server_args,
         ));
@@ -395,6 +402,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
+            limits: tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
         },
         core,
         threads: Mutex::new(threads),

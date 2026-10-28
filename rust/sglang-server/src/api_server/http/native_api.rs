@@ -4,7 +4,7 @@
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
 //! tuples, cumulative vs incremental streams) lives here; submission and
-//! request lifetime belong to the shared [`crate::api_server::core::CoreHandle`].
+//! request lifetime belong to the shared [`crate::api_server::handlers::CoreHandle`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use super::app::AppState;
 use super::generate_hook::{GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys};
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{
-    CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
-};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
+use crate::api_server::handlers::{CoreCall, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]
@@ -750,16 +749,17 @@ mod tests {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -793,16 +793,17 @@ mod tests {
             ..Default::default()
         };
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: activity.clone(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -833,16 +834,17 @@ mod tests {
     async fn unary_http_generate_round_trips_through_frontend_handle() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             abort_tx,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -914,16 +916,17 @@ mod tests {
         items: usize,
     ) -> Vec<(Option<i64>, bool)> {
         let (intake_tx, intake_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             flume::unbounded().0,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -1139,16 +1142,17 @@ mod tests {
             (true, true, false),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
-            let core = crate::api_server::core::CoreHandle::new(
+            let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 flume::unbounded().0,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             );

@@ -10,6 +10,7 @@ and delegates to it.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import msgspec
 import psutil
 
+from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -41,7 +43,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
@@ -55,6 +57,25 @@ logger = logging.getLogger(__name__)
 # `hidden_poslens`). A frame without extras that sends a later column pads
 # them empty; `push_generation` asserts the count whenever it sends extras.
 _EXTRAS_HEADER_COLS = 12
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False  # a hostname; assume it resolves beyond this machine
+
+
+def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
+    """Whether every node rendezvoused on this machine (nodes emulated locally)."""
+    if not dist_init_addr:
+        return False
+    try:
+        return _is_loopback(NetworkAddress.parse(dist_init_addr).host)
+    except ValueError:
+        return False
 
 
 class RustServer:
@@ -153,6 +174,56 @@ class RustServer:
         )
 
     @classmethod
+    def _port_offset(cls) -> int:
+        """This listener's offset from the base port based on per-node DP rank."""
+        if get_exec().moe.is_ep_scale_joiner:
+            # The joining TP group is entirely local to this node.
+            tp_size_per_node = get_parallel().tp_size
+        else:
+            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
+            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
+        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
+        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+
+    @classmethod
+    def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
+        """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another
+            # node; advertise the address the interfaces answer on.
+            host = get_local_ip_auto(fallback="127.0.0.1")
+        # Nodes that rendezvous on loopback share this machine, so a loopback
+        # listener reaches them; otherwise it is a likely misconfiguration.
+        if get_parallel().nnodes > 1 and _is_loopback(host):
+            dist_init_addr = get_parallel().dist_init_addr
+            if not _rendezvous_is_loopback(dist_init_addr):
+                logger.warning(
+                    "SGLANG_RUST_SERVER: this rank listens on loopback %r but the "
+                    "%d nodes rendezvous at %r; a node on another machine cannot "
+                    "reach this rank's control endpoint",
+                    host,
+                    get_parallel().nnodes,
+                    dist_init_addr,
+                )
+        config = None
+        if hosts_listener:
+            port = get_serving().port + cls._port_offset()
+            config = {
+                "dp_rank": select_kv_publisher_dp_rank(
+                    get_parallel().attn_dp_size,
+                    get_parallel().attn_dp_rank,
+                    get_parallel().dp_rank,
+                ),
+                "endpoint": NetworkAddress(host, port).to_url(),
+            }
+        gathered = get_parallel().world_group.all_gather_object(config)
+        return sorted(
+            (entry for entry in gathered if entry is not None),
+            key=lambda entry: entry["dp_rank"],
+        )
+
+    @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
@@ -167,17 +238,8 @@ class RustServer:
         dp_rank = (
             get_parallel().attn_dp_rank if get_parallel().num_dp_ranks > 1 else None
         )
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        # Count DP leaders within this node's TP range. The first leader must
-        # use the base port even when a DP group spans multiple nodes.
-        local_dp_rank = (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
-        listen_port = get_serving().port + local_dp_rank
+        port_offset = cls._port_offset()
+        listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = cls._partition_cores(
@@ -207,7 +269,7 @@ class RustServer:
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
-            port_offset=local_dp_rank,
+            port_offset=port_offset,
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
