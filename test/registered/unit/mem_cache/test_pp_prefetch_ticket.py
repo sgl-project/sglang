@@ -5,14 +5,20 @@ import tempfile
 import threading
 import unittest
 from array import array
+from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCachePreallocMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -34,16 +40,19 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
+        c.host_memory_mode = "buffer_only"
         c.page_size = c.prefetch_threshold = 4
         c.storage_config = HiCacheStorageConfig(
             tp_rank=0,
@@ -64,8 +73,10 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.pp_prefetch_state_lock = threading.Lock()
         c.pp_prefetch_command_queue = Queue()
         c.prefetch_queue = Queue()
+        c.prefetch_hit_queue = Queue()
         c.prefetch_sync_queue = Queue()
         c.ack_prefetch_queue = Queue()
+        c.pp_prefetch_consensus = None  # Publisher-only tests; ring has a Gloo test.
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
@@ -93,6 +104,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.pp_rank = 1
+        cache.host_memory_mode = c.host_memory_mode
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
         cache._all_reduce = Mock()
@@ -105,6 +117,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.root_node_handle = Mock(return_value=0)
         cache.buffer_pipeline = Mock(spec=BufferModePipeline)
         cache._handle_prefetch_result = Mock()
+        cache.tree_components = []
+        cache._build_sidecar_transfers = Mock(return_value=[])
 
     def query_hits(self, operation, hit=8):
         hashes = get_storage_hash_str(
@@ -130,7 +144,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
     def run_commands(self, *tickets):
         commands = iter((*tickets, None))
-        self.c.pp_prefetch_command_queue.put(None)
+        if self.c.storage_config.pp_rank == 0:
+            self.c.pp_prefetch_command_queue.put(None)
 
         def broadcast(objects, *args, **kwargs):
             return [next(commands)] if self.c.storage_config.pp_rank else objects
@@ -162,6 +177,207 @@ class TestPPPrefetchTicket(unittest.TestCase):
         while not self.c.prefetch_sync_queue.empty():
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
+
+    def submit_cache_query(self, rid="hit", *, start=8, attempt=0):
+        operation = self.c.submit_prefetch(
+            CacheRequestHandle(rid, 0),
+            RadixKey(array("q", range(start, 32))),
+            "anchor",
+            None,
+            list(range(start)),
+            [],
+            assume_stored=True,
+        ).operation
+        self.cache._submit_pp_cache_query(operation, list(range(start)), attempt)
+        return operation
+
+    def test_cache_query_binding_in_either_arrival_order(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        for query_first, hit in ((False, 20), (True, 20), (True, 0)):
+            with self.subTest(query_first=query_first, hit=hit):
+                c._storage_hit_query.side_effect = lambda op: self.query_hits(op, hit)
+                rid = str((query_first, hit))
+                c.storage_config.pp_rank = 0
+                self.submit_cache_query(rid)
+                ticket = c.pp_prefetch_command_queue.get_nowait()
+                self.assertTrue(c.pp_prefetch_command_queue.empty())
+                # A peer has its own registry, including when query arrives first.
+                c.pp_prefetch_states.clear()
+                c.storage_config.pp_rank = 1
+                if query_first:
+                    self.run_commands(ticket)
+                local = self.submit_cache_query(rid)
+                if not query_first:
+                    self.run_commands(ticket)
+                result = c.prefetch_hit_queue.get_nowait()
+                self.assertIs(c.resolve_cache_query(result), local)
+                self.assertEqual(local.storage_hit_count, max(0, hit - 8))
+                self.assertEqual(
+                    local.all_hash_values,
+                    result.operation.all_hash_values[2:],
+                )
+                self.assertEqual(
+                    local.hash_value, local.all_hash_values[:3] if hit else []
+                )
+                self.assertFalse(local.assume_stored)
+                self.assertTrue(c.prefetch_hit_queue.empty())
+                self.assertTrue(c.pp_prefetch_command_queue.empty())
+        c.mem_pool_host.alloc.assert_not_called()
+
+    def test_cache_cancel_and_query_error_preserve_next_query(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        operations = []
+        for rid in ("cancelled", "failed", "next"):
+            operations.append(self.submit_cache_query(rid))
+        cancelled, failed, following = operations
+        c.terminate_prefetch(cancelled)
+        self.assertFalse(c.release_pp_prefetch("cancelled"))
+
+        def query(op):
+            if op.request_id == "failed":
+                raise RuntimeError("query failed")
+            return self.query_hits(op, 20)
+
+        c._storage_hit_query.side_effect = query
+        self.run_commands()
+        for operation, hit in ((cancelled, 0), (failed, 0), (following, 12)):
+            self.assertIs(
+                c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), operation
+            )
+            self.assertEqual(operation.storage_hit_count, hit)
+        self.assertTrue(c.prefetch_hit_queue.empty())
+        self.assertFalse(c.pp_prefetch_states)
+        self.assertEqual(c._all_reduce.call_count, 3)
+        self.assertEqual(c._storage_hit_query.call_count, 2)
+
+    def test_cache_retry_does_not_overwrite_unconsumed_peer_query(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        old = self.submit_cache_query(attempt=0)
+        first = c.pp_prefetch_command_queue.get_nowait()
+        c.storage_config.pp_rank = 1
+        hits = iter((0, 20))
+        c._storage_hit_query.side_effect = lambda op: self.query_hits(op, next(hits))
+        # PP0 can retry before the peer's scheduler consumes the first result.
+        self.run_commands(first, replace(first, cache_attempt=1))
+        new = self.submit_cache_query(attempt=1)
+        for operation, expected in ((old, 0), (new, 12)):
+            self.assertIs(
+                c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), operation
+            )
+            self.assertEqual(operation.storage_hit_count, expected)
+        self.assertFalse(c.pp_prefetch_states)
+        self.assertEqual(c._storage_hit_query.call_count, 2)
+
+    def test_cache_query_follows_prefill_and_decode_submission(self):
+        c, cache = self.c, self.cache
+        c.host_memory_mode = cache.host_memory_mode = "cache"
+        cache.buffer_pipeline = None
+        cache.tree_core.page_size = cache.prefetch_threshold = 4
+        cache.tree_core.prefetch_anchor_info.return_value = (None, None)
+        cache.hicache_storage_pass_prefix_keys = False
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache.inc_host_lock_ref = Mock()
+        # Component algorithms have native tests; check their descriptors survive
+        # the shared root query and ticket conversion, including state endpoints.
+        descriptors = {
+            ct: [
+                PoolTransfer(
+                    name, keys=["state"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+                )
+            ]
+            for ct, name in (
+                (ComponentType.SWA, PoolName.SWA),
+                (ComponentType.MAMBA, PoolName.MAMBA),
+            )
+        }
+        cache._build_prefetch_component_transfers = Mock(return_value=descriptors)
+        for bigram in (False, True):
+            cache.tree_core.is_eagle = bigram
+            for decode, length, limited in (
+                (False, 2, False),
+                (False, 8, True),
+                (False, 8, False),
+                (True, 8, False),
+            ):
+                with self.subTest(
+                    bigram=bigram, decode=decode, length=length, limited=limited
+                ):
+                    handle = CacheRequestHandle(
+                        str((bigram, decode, length, limited)), 0
+                    )
+                    c.prefetch_rate_limited = lambda: limited
+                    cache.inc_host_lock_ref.reset_mock()
+                    tokens = list(range(20 + int(bigram)))
+                    if decode:
+                        req = SimpleNamespace(
+                            rid=handle.rid,
+                            cache_request_handle=handle,
+                            origin_input_ids=tokens,
+                            storage_prefetch_retry_attempts=2,
+                            extra_key="adapter",
+                            cache_salt="tenant",
+                        )
+                        match = DecodePrefixMatch(torch.arange(4), 0, length, 0, 0)
+                        DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                            SimpleNamespace(tree_cache=cache), req, match
+                        )
+                        self.assertTrue(match.prefetch_registered)
+                    else:
+                        cache.prefetch_from_storage(
+                            handle,
+                            0,
+                            tokens[4 : 4 + length + int(bigram)],
+                            matched_prefix_tokens=tokens[:4],
+                            extra_key="adapter",
+                            cache_salt="tenant",
+                            storage_attempt=2,
+                        )
+                    if length < 4 or limited:
+                        self.assertTrue(c.pp_prefetch_command_queue.empty())
+                        cache.inc_host_lock_ref.assert_not_called()
+                        continue
+                    ticket = c.pp_prefetch_command_queue.get_nowait()
+                    operation = cache.ongoing_prefetch[handle].operation
+                    self.assertIs(
+                        c.pp_prefetch_states[ticket.key].cache_operation, operation
+                    )
+                    self.assertEqual(ticket.key, (handle, 2))
+                    self.assertEqual(len(operation.token_ids), length)
+                    self.assertEqual(operation.storage_start, 4)
+                    self.assertEqual(
+                        list(ticket.prefetch_key.raw_token_ids()),
+                        tokens[: 12 + int(bigram)],
+                    )
+                    self.assertEqual(ticket.prefetch_key.cache_salt, "tenant")
+                    cache._build_prefetch_component_transfers.assert_called_with(
+                        0, ticket.prefetch_key, last_hash=None
+                    )
+                    self.assertEqual(
+                        [(p.name, p.keys, p.hit_policy) for p in ticket.pool_specs],
+                        [
+                            (name, ["state"], PoolHitPolicy.TRAILING_PAGES)
+                            for name in (PoolName.SWA, PoolName.MAMBA)
+                        ],
+                    )
+                    cache.prefetch_from_storage(handle, 0, tokens)
+                    self.assertTrue(c.pp_prefetch_command_queue.empty())
+
+    def test_query_and_completion_sync_scopes(self):
+        c = self.c
+        c.attn_cp_group = None
+        c.attn_tp_group = c.tp_group = "tp"
+        with (
+            patch.object(torch.distributed, "get_world_size", return_value=2),
+            patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                side_effect=lambda group_ranks, backend: tuple(group_ranks),
+            ),
+        ):
+            self.assertEqual(c._create_sync_groups(), [(0, 1), (0, 2, 4, 6)])
+            self.assertEqual(c._create_sync_groups(include_pp=False), [(0, 1)])
 
     def test_hit_and_miss_are_reused_across_enqueue_retract_and_retry(self):
         c, cache = self.c, self.cache

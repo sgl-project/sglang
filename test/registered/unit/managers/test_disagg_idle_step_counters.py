@@ -592,6 +592,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = False
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False

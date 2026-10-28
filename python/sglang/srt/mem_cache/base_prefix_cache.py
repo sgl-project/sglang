@@ -645,6 +645,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Expected storage-hit span in logical tokens for a waiting request."""
         return None
 
+    def prefetch_stop_pending(self, request: CacheRequestHandle) -> bool:
+        """Whether admission should pause at a stopped prefetch awaiting PP commit."""
+        return False
+
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:

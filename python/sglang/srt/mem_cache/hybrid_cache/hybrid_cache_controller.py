@@ -89,6 +89,16 @@ class PPPrefetchTicket:
     prefix_keys: Optional[List[str]]
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
+    cache_attempt: Optional[int] = None
+
+    @property
+    def key(self):
+        # Buffer tickets live for the request; cache queries can be retried.
+        return (
+            self.handle.rid
+            if self.cache_attempt is None
+            else (self.handle, self.cache_attempt)
+        )
 
 
 class PPPrefetchDecision(Enum):
@@ -104,6 +114,7 @@ class PPPrefetchState:
     release_requested: bool = False
     ready_event: threading.Event = field(default_factory=threading.Event, repr=False)
     consumed: bool = False
+    cache_operation: Optional[PrefetchOperation] = None
 
 
 def _trailing_chain_groups(
@@ -235,7 +246,9 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_command_thread = None
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
         self.pp_prefetch_state_lock = threading.Lock()
-        self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
+        self.pp_prefetch_states: dict[
+            str | tuple[CacheRequestHandle, int], PPPrefetchState
+        ] = {}
         self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -325,8 +338,7 @@ class HybridCacheController(BaseHiCacheController):
                 "Restart with this backend selected to create compatible host pools."
             )
         enable_pp_ticket = (
-            self.host_memory_mode == "buffer_only"
-            and self.pp_group is not None
+            self.pp_group is not None
             and torch.distributed.get_world_size(group=self.pp_group) > 1
         )
         if enable_pp_ticket and self.pp_prefetch_command_group is None:
@@ -1088,7 +1100,7 @@ class HybridCacheController(BaseHiCacheController):
         return operation
 
     def get_prefetch_submission(self, rid: str) -> Optional[PrefetchSubmission]:
-        if self.pp_prefetch_command_group is None:
+        if self.pp_prefetch_command_group is None or self.host_memory_mode == "cache":
             return None
         if self.storage_config.pp_rank != 0:
             return PrefetchSubmission()
@@ -1111,6 +1123,22 @@ class HybridCacheController(BaseHiCacheController):
         pool_transfers: Optional[list[PoolTransfer]],
         assume_stored: bool = False,
     ) -> PrefetchSubmission:
+        if (
+            self.pp_prefetch_command_group is not None
+            and self.host_memory_mode == "cache"
+        ):
+            # Keep the cache's local anchor/operation. Only the root-span query
+            # is shared; host allocation and eviction stay on the scheduler.
+            operation = PrefetchOperation(
+                handle,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                pool_transfers,
+                assume_stored=False,
+            )
+            operation.storage_start = len(matched_prefix_tokens or [])
+            return PrefetchSubmission(operation=operation)
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
                 operation=self.prefetch(
@@ -1163,6 +1191,80 @@ class HybridCacheController(BaseHiCacheController):
 
         self.pp_prefetch_command_queue.put(ticket)
         return PrefetchSubmission(operation=operation, decision=True)
+
+    def register_cache_query(self, operation, key, pool_transfers, attempt):
+        """Bind the submitted operation; PP0 enqueues the shared root query."""
+        ticket = PPPrefetchTicket(
+            operation.handle,
+            key,
+            None,
+            None,
+            [],
+            tuple(PPPrefetchPoolSpec.from_transfer(t) for t in pool_transfers or []),
+            cache_attempt=attempt,
+        )
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(ticket.key)
+            if state is None:
+                state = self._new_pp_prefetch_state(ticket)
+                self.pp_prefetch_states[ticket.key] = state
+                if self.storage_config.pp_rank == 0:
+                    self.pp_prefetch_command_queue.put(ticket)
+            state.cache_operation = operation
+
+    def _new_pp_prefetch_state(self, ticket):
+        operation = PrefetchOperation(
+            ticket.handle,
+            ticket.prefetch_key,
+            ticket.last_hash,
+            prefix_keys=ticket.prefix_keys,
+            pool_transfers=[
+                PoolTransfer(
+                    name=s.name,
+                    keys=s.keys,
+                    hit_policy=s.hit_policy,
+                    indices_from_pool=s.indices_from_pool,
+                )
+                for s in ticket.pool_specs
+            ]
+            or None,
+        )
+        operation.is_pp_broadcast = self.host_memory_mode == "buffer_only"
+        return PPPrefetchState(ticket=ticket, operation=operation)
+
+    def resolve_cache_query(self, state):
+        """Bind an ordered query result to its native operation at scheduler drain.
+
+        Every submitted query contributes one queue item, even after cancellation.
+        Do not drop entries in the worker: native PP drains the same FIFO counts
+        on every stage.
+        """
+        operation = state.cache_operation
+        with self.pp_prefetch_state_lock:
+            self.pp_prefetch_states.pop(state.ticket.key, None)
+        if operation is None:
+            return None
+        query = state.operation
+        # The shared root query already agreed S_min. Subtract the local anchor
+        # only here: zero suffix work does not invalidate resident L1/L2 hits.
+        start = operation.storage_start // self.page_size
+        pages = len(operation.token_ids) // self.page_size
+        hit = max(
+            0,
+            min(
+                query.storage_hit_count - operation.storage_start,
+                pages * self.page_size,
+            ),
+        )
+        operation.all_hash_values = (query.all_hash_values or [])[start : start + pages]
+        operation.hash_value = operation.all_hash_values[: hit // self.page_size]
+        operation.storage_hit_count = hit
+        operation.query_pool_hit_pages = {
+            pool: max(0, min(count - start, pages))
+            for pool, count in query.query_pool_hit_pages.items()
+        }
+        operation.pool_storage_result.update_kv_hit_pages(hit // self.page_size)
+        return operation
 
     def _allocate_pp_prefetch_buffers(
         self, ticket: PPPrefetchTicket, operation: PrefetchOperation
@@ -1275,6 +1377,10 @@ class HybridCacheController(BaseHiCacheController):
 
     def release_pp_prefetch(self, rid: str) -> bool:
         """Retire a ticket; free only buffers not handed to buffer mode."""
+        if self.host_memory_mode == "cache":
+            # Query metadata is retired by the ordered scheduler drain. The
+            # native operation already owns cache-mode cancellation and buffers.
+            return False
         with self.pp_prefetch_state_lock:
             decision = self.pp_prefetch_decisions.pop(rid, None)
             state = self.pp_prefetch_states.get(rid)
@@ -1317,28 +1423,10 @@ class HybridCacheController(BaseHiCacheController):
 
                 rid = ticket.handle.rid
                 with self.pp_prefetch_state_lock:
-                    state = self.pp_prefetch_states.get(rid)
+                    state = self.pp_prefetch_states.get(ticket.key)
                     if state is None:
-                        operation = PrefetchOperation(
-                            ticket.handle,
-                            ticket.prefetch_key,
-                            ticket.last_hash,
-                            prefix_keys=ticket.prefix_keys,
-                            # Keep sidecar ACKs aligned even if allocation fails.
-                            pool_transfers=[
-                                PoolTransfer(
-                                    name=spec.name,
-                                    keys=spec.keys,
-                                    hit_policy=spec.hit_policy,
-                                    indices_from_pool=spec.indices_from_pool,
-                                )
-                                for spec in ticket.pool_specs
-                            ]
-                            or None,
-                        )
-                        operation.is_pp_broadcast = True
-                        state = PPPrefetchState(ticket=ticket, operation=operation)
-                        self.pp_prefetch_states[rid] = state
+                        state = self._new_pp_prefetch_state(ticket)
+                        self.pp_prefetch_states[ticket.key] = state
                     decision = self.pp_prefetch_decisions.get(rid)
                     if decision is PPPrefetchDecision.CANCELLED:
                         state.release_requested = True
@@ -1346,19 +1434,29 @@ class HybridCacheController(BaseHiCacheController):
                     operation = state.operation
 
                 try:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                    storage_hit_count = min(
-                        storage_hit_count,
-                        self.mem_pool_host.available_size(pool=PoolName.KV),
-                    )
-                    storage_hit_count -= storage_hit_count % self.page_size
-                    operation.storage_hit_count = storage_hit_count
                     if (
-                        storage_hit_count == 0
-                        or storage_hit_count < self.prefetch_threshold
-                        or not self._allocate_pp_prefetch_buffers(ticket, operation)
+                        self.host_memory_mode == "cache"
+                        and state.cache_operation is not None
+                        and state.cache_operation.is_terminated()
                     ):
-                        storage_hit_count = 0
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                    if self.host_memory_mode == "buffer_only":
+                        storage_hit_count = min(
+                            storage_hit_count,
+                            self.mem_pool_host.available_size(pool=PoolName.KV),
+                        )
+                        storage_hit_count -= storage_hit_count % self.page_size
+                        operation.storage_hit_count = storage_hit_count
+                        if (
+                            storage_hit_count == 0
+                            or storage_hit_count < self.prefetch_threshold
+                            or not self._allocate_pp_prefetch_buffers(ticket, operation)
+                        ):
+                            storage_hit_count = 0
                 except Exception:
                     logger.exception(
                         "PP HiCache query or allocation failed for req=%s.", rid
@@ -1370,6 +1468,12 @@ class HybridCacheController(BaseHiCacheController):
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
+                if self.host_memory_mode == "cache":
+                    with self.pp_prefetch_state_lock:
+                        operation.storage_hit_count = storage_hit_count
+                        state.ready_event.set()
+                        self.prefetch_hit_queue.put(state)
+                    continue
                 if operation.host_indices is not None:
                     tail = operation.host_indices[storage_hit_count:]
                     if tail.numel():
@@ -1937,40 +2041,30 @@ class HybridCacheController(BaseHiCacheController):
             for i, pool in enumerate(PoolName):
                 ack.pool_hits[pool.value] = packed[i].item()
 
-    def prefetch_sync_thread_func(self) -> None:
-        """Synchronize progressive ACKs and publish PP ticket completion."""
-        while not self.storage_stop_event.is_set():
-            try:
-                ack = self.prefetch_sync_queue.get(block=True, timeout=1)
-                if ack is None:
-                    continue
-                self._reduce_prefetch_ack(ack)
-                if not getattr(ack.operation, "is_pp_broadcast", False):
-                    self.ack_prefetch_queue.put(ack)
-                    continue
+    def _publish_prefetch_ack(self, ack: PrefetchAck) -> None:
+        """Native publication, after stage-local reduction / PP loop agreement."""
+        if not getattr(ack.operation, "is_pp_broadcast", False):
+            super()._publish_prefetch_ack(ack)
+            return
 
-                operation = ack.operation
-                if ack.completed_tokens is not None:
-                    operation.completed_tokens = ack.completed_tokens
-                if ack.pool_hits is not None:
-                    operation.pool_storage_result.update_extra_pool_hit_pages(
-                        ack.pool_hits
-                    )
-                    operation.pool_transfers_done = True
-                if not ack.completed_req:
-                    continue
+        operation = ack.operation
+        if ack.completed_tokens is not None:
+            operation.completed_tokens = ack.completed_tokens
+        if ack.pool_hits is not None:
+            operation.pool_storage_result.update_extra_pool_hit_pages(ack.pool_hits)
+            operation.pool_transfers_done = True
+        if not ack.completed_req:
+            return
 
-                with self.pp_prefetch_state_lock:
-                    state = self.pp_prefetch_states.get(operation.request_id)
-                    if state is None:
-                        continue
-                    operation.hash_value = operation.hash_value[
-                        : operation.completed_tokens // self.page_size
-                    ]
-                    operation.storage_hit_count = operation.completed_tokens
-                    state.ready_event.set()
-                    if state.release_requested:
-                        self._free_pp_prefetch_state(state)
-                        self.pp_prefetch_states.pop(operation.request_id, None)
-            except Empty:
-                continue
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(operation.request_id)
+            if state is None:
+                return
+            operation.hash_value = operation.hash_value[
+                : operation.completed_tokens // self.page_size
+            ]
+            operation.storage_hit_count = operation.completed_tokens
+            state.ready_event.set()
+            if state.release_requested:
+                self._free_pp_prefetch_state(state)
+                self.pp_prefetch_states.pop(operation.request_id, None)

@@ -2138,6 +2138,58 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def _submit_pp_cache_query(self, operation, matched_prefix_tokens, attempt):
+        # Preserve native submission order and skip decisions. Query only after
+        # a local operation exists, using the shared root span for storage MIN.
+        suffix = operation.token_ids
+        key = RadixKey(
+            array("q", matched_prefix_tokens or ())
+            + array("q", suffix.raw_token_ids()),
+            extra_key=suffix.extra_key,
+            cache_salt=suffix.cache_salt,
+            is_bigram=suffix.is_bigram,
+        )
+        comp_xfers = self._build_prefetch_component_transfers(
+            self.root_node_handle(key.extra_key), key, last_hash=None
+        )
+        transfers = [x for xfers in comp_xfers.values() for x in xfers]
+        transfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH,
+                PoolTransfer(name=PoolName.KV, host_indices=None),
+                comp_xfers,
+            )
+        )
+        self.cache_controller.register_cache_query(operation, key, transfers, attempt)
+
+    def _build_prefetch_component_transfers(self, node_id, key, last_hash):
+        """Native component query descriptors; no staging allocation or I/O.
+
+        Both the shared root query and the local suffix query need the same
+        SWA window / Mamba state requirements, not just KV-derived sidecars.
+        """
+        comp_xfers = {}
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            prep = self.components[ct].prepare_prefetch(
+                node_id, prefetch_tokens=len(key)
+            )
+            if prep.staging_tokens == 0:
+                continue
+            transfers = self.tree_core.build_hicache_transfers(
+                ct,
+                node_id,
+                CacheTransferPhase.PREFETCH,
+                token_ids=key.token_ids,
+                prefetch_tokens=len(key),
+                staging_tokens=prep.staging_tokens,
+                last_hash=last_hash,
+            )
+            if transfers:
+                comp_xfers[ct] = transfers
+        return comp_xfers
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2150,6 +2202,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        storage_attempt: int = 0,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2228,28 +2281,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
-            # Size the component's staging now; it is allocated at hit time,
-            # next to the KV staging, so the query holds no host memory.
-            prep = self.components[ct].prepare_prefetch(
-                last_host_node_id, prefetch_tokens=len(prefetch_key)
-            )
-            if prep.staging_tokens == 0:
-                continue
-            transfers = self.tree_core.build_hicache_transfers(
-                ct,
-                last_host_node_id,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                staging_tokens=prep.staging_tokens,
-                last_hash=last_hash,
-            )
-            if transfers:
-                comp_xfers[ct] = transfers
+        comp_xfers = self._build_prefetch_component_transfers(
+            last_host_node_id, prefetch_key, last_hash
+        )
         if buffer_mode and ComponentType.FULL in self.tree_components:
             transfers = self.components[ComponentType.FULL].build_hicache_transfers(
                 None,
@@ -2316,6 +2350,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+            if self.cache_controller.pp_prefetch_command_group is not None:
+                self._submit_pp_cache_query(
+                    operation, matched_prefix_tokens, storage_attempt
+                )
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
@@ -2355,7 +2393,13 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
-            return True
+            # PP must observe a common IO batch before stopping a cache fetch.
+            # Query/queued IO is not a zero-length result. A miss or failed read
+            # still retires through the native query/terminal-ACK drain.
+            return (
+                self.cache_controller.pp_prefetch_consensus is None
+                or operation.completed_tokens > 0
+            )
         if self.prefetch_stop_policy == "wait_complete":
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
@@ -2448,6 +2492,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
 
+    def prefetch_stop_pending(self, request: CacheRequestHandle) -> bool:
+        if (
+            self.cache_controller is None
+            or self.cache_controller.pp_prefetch_consensus is None
+        ):
+            return False
+        info = self.ongoing_prefetch.get(request)
+        return info is not None and info.operation.is_terminated()
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if (
@@ -2470,6 +2523,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
+        if self.cache_controller.pp_prefetch_consensus is not None:
+            # Stop permission does not make in-flight PP completion ACKs visible.
+            # Keep ownership until the native query drain (no IO) or terminal
+            # ACK finalizes the agreed prefix and releases its unused tail.
+            return False
         if operation.host_indices is None:
             if operation.deadline_expired:
                 self._finish_storage_prefetch(request, 0, reason="deadline")
@@ -3220,6 +3278,14 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                if not buffer_mode and cc.pp_prefetch_command_group is not None:
+                    operation = cc.resolve_cache_query(operation)
+                    if operation is None:
+                        continue
+                    info = self.ongoing_prefetch.get(operation.handle)
+                    if info is not None and info.operation is not operation:
+                        # A shared query can arrive after its local retry.
+                        continue
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
@@ -3285,8 +3351,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.pool_transfers_done = True
                 if ack.completed_req:
                     if is_current:
-                        # check_prefetch_progress() is not called for this rid yet.
-                        # Let us insert the prefetch result into the radix tree.
+                        # Natural completion or a PP stop awaiting its final ACK.
                         self._handle_prefetch_result(operation)
                     if operation.ack_releases_incomplete_host_indices:
                         cc.append_host_mem_release(

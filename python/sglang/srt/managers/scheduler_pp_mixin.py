@@ -12,6 +12,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -137,6 +138,7 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -271,6 +273,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -400,6 +403,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -745,7 +749,26 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_prefetch_step(self: Scheduler):
+        # All native PP loops (unified, P and D) use the same completion path.
+        # No traffic is added to L2-only deployments; runtime attach can enable
+        # it after the normal request relay has applied attach on every stage.
+        if not self.enable_hierarchical_cache or not self.tree_cache.enable_storage:
+            return
+        consensus = self.tree_cache.cache_controller.pp_prefetch_consensus
+        consensus.advance(
+            lambda: self._pp_recv_pyobj_from_prev_stage(
+                tag=P2PTag.HICACHE_PREFETCH_COMPLETION
+            )[0],
+            lambda update: self._pp_send_pyobj_to_next_stage(
+                [update], async_send=True, tag=P2PTag.HICACHE_PREFETCH_COMPLETION
+            ),
+            self.pp_loop_size,
+        )
+
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler, data, async_send: bool = False, *, tag: int = 0
+    ):
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -762,10 +785,11 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 async_send=async_send,
+                tag=tag,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, *, tag: int = 0):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
                 get_parallel().attn_dp_rank
@@ -780,6 +804,7 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                tag=tag,
             )
         else:
             data = None

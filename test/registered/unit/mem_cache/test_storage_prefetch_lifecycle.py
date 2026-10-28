@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -79,6 +80,7 @@ def _staged_fixture(full_match=2):
     )
     cc = HybridCacheController.__new__(HybridCacheController)
     cc.pp_prefetch_command_group = None
+    cc.pp_prefetch_consensus = None
     cc.page_size = 2
     cc.get_hash_str = get_hash_str
     cc.prefetch_queue = Queue()
@@ -299,6 +301,86 @@ class TestWaitingStorageSpan(unittest.TestCase):
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
+    def test_pp_stop_keeps_ownership_until_query_or_terminal_ack(self):
+        for policy in ("best_effort", "timeout"):
+            for outcome in ("query", "partial", "complete", "io_failure", "abort"):
+                with self.subTest(policy=policy, outcome=outcome):
+                    cache, operation = _timeout_fixture("cache", policy)
+                    cc = cache.cache_controller
+                    cc.pp_prefetch_consensus = object()
+                    cc.mem_pool_host.page_size = 2
+                    for name in (
+                        "prefetch_hit_queue",
+                        "ack_prefetch_queue",
+                        "ack_backup_queue",
+                        "host_mem_release_queue",
+                    ):
+                        setattr(cc, name, Queue())
+                    cache.tree_core.insert_host = Mock(
+                        return_value=SimpleNamespace(
+                            prefix_len=0, host_insert_dropped=False, cache_actions=[]
+                        )
+                    )
+                    cache.tree_core.commit_hicache_transfers = Mock()
+                    operation.hash_value = ["a", "b", "c", "d"]
+                    operation.storage_hit_count = 8
+                    if outcome != "query":
+                        operation.host_indices = torch.arange(8)
+                        cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[
+                            _REQ
+                        ]._replace(host_indices=operation.host_indices)
+                    with patch("time.perf_counter", return_value=100.0):
+                        self.assertFalse(cache.check_prefetch_progress(_REQ))
+                    with patch("time.perf_counter", return_value=103.0):
+                        self.assertFalse(cache.check_prefetch_progress(_REQ))
+                    self.assertEqual(operation.is_terminated(), policy == "timeout")
+                    self.assertEqual(operation.deadline_expired, policy == "timeout")
+                    self.assertIn(_REQ, cache.ongoing_prefetch)
+                    cache.tree_core.insert_host.assert_not_called()
+
+                    if outcome == "query":
+                        # A miss needs no progress ACK; its query drain retires it.
+                        operation.storage_hit_count = 0
+                        cc.prefetch_hit_queue.put(operation)
+                        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+                        self.assertTrue(cache.check_prefetch_progress(_REQ))
+                        self.assertEqual(cc.prefetch_tokens_occupied, 0)
+                        continue
+
+                    completed = {"complete": 8, "io_failure": 0}.get(outcome, 4)
+                    cc._publish_prefetch_ack(
+                        PrefetchAck(_REQ.rid, operation, completed_tokens=completed)
+                    )
+                    cache._drain_storage_control_queues_impl(0, 1, 0, 0, {}, False)
+                    self.assertFalse(cache.check_prefetch_progress(_REQ))
+                    stopped = policy == "timeout" or completed > 0
+                    self.assertEqual(operation.is_terminated(), stopped)
+                    self.assertEqual(cache.prefetch_stop_pending(_REQ), stopped)
+                    cache.tree_core.insert_host.assert_not_called()
+                    if outcome == "abort":
+                        cache.release_aborted_request(_REQ)
+                    cc._publish_prefetch_ack(
+                        PrefetchAck(_REQ.rid, operation, completed_req=True)
+                    )
+                    cache._drain_storage_control_queues_impl(0, 1, 0, 0, {}, False)
+                    self.assertTrue(cache.check_prefetch_progress(_REQ))
+                    self.assertFalse(cache.prefetch_stop_pending(_REQ))
+                    self.assertEqual(cc.prefetch_tokens_occupied, 0)
+                    if outcome == "abort":
+                        cache.tree_core.insert_host.assert_not_called()
+                    else:
+                        inserted = cache.tree_core.insert_host.call_args.args
+                        self.assertEqual(len(inserted[1]), completed)
+                        self.assertEqual(
+                            cache.prefetch_loaded_tokens_by_reqid[_REQ], completed
+                        )
+                    freed = []
+                    while not cc.host_mem_release_queue.empty():
+                        freed.extend(cc.host_mem_release_queue.get_nowait().tolist())
+                    self.assertEqual(
+                        freed, list(range(0 if outcome == "abort" else completed, 8))
+                    )
+
     def test_expiry_is_agreed_even_before_a_peer_starts_waiting(self):
         """A rank that has not reached its admission poll must still adopt
         the agreed expiry, or it would re-issue the prefetch alone."""

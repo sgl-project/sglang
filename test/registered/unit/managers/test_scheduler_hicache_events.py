@@ -1,7 +1,7 @@
 """HiCache progress must not depend on whether a prefill batch is admitted."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, call
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -13,6 +13,8 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from test_request_class_override_points import _recv, _scheduler
+
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -20,6 +22,48 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
+    def test_cache_prefetch_follows_grammar_admission_on_every_pp_stage(self):
+        for rank in range(3):
+            with (
+                self.subTest(rank=rank),
+                published_topology(
+                    tp_size=2,
+                    pp_size=3,
+                    ranks={"world_rank": rank * 2},
+                    hicache_host_memory_mode="cache",
+                ),
+            ):
+                s = _scheduler({}, [])
+                s.max_req_input_len = 1024
+                s.validate_dllm_request = lambda req: None
+                s.spec_algorithm = Mock()
+                s.spec_algorithm.is_dflash_family.return_value = False
+                s.spec_algorithm.is_uno.return_value = False
+                s.tree_cache = Mock()
+                s._set_or_validate_priority = lambda req: True
+                s._abort_on_queued_limit = lambda req: False
+                s.waiting_queue = []
+                s.processed_tokens_counter = 0
+                s._add_request_to_queue = MethodType(Scheduler._add_request_to_queue, s)
+                issued = []
+                s._prefetch_kvcache = lambda req: issued.append(req.rid)
+                # Grammar compilation is native; exercise only its enqueue boundary.
+                s.grammar_manager = Mock(
+                    process_req_with_grammar=Mock(side_effect=[True, False])
+                )
+                structured = _recv("r")
+                structured.sampling_params.json_schema = '{"type":"object"}'
+                s.handle_generate_request(structured)
+                s.handle_generate_request(_recv("q"))
+                self.assertEqual(issued, ["q"])
+                s.tree_cache.bind_prefetch_ticket.assert_not_called()
+                # Native grammar readiness moves r through the same enqueue path.
+                held = s.grammar_manager.process_req_with_grammar.call_args_list[
+                    0
+                ].args[0]
+                s._add_request_to_queue(held)
+                self.assertEqual(issued, ["q", "r"])
+
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
@@ -102,6 +146,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
+        s._pp_prefetch_step = self.calls.completion
         s.waiting_queue = []
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
@@ -115,7 +160,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
         self.assertEqual(
             self.calls.mock_calls,
-            [call.drain(), call.retry(), call.admit(self.running_batch)],
+            [
+                call.completion(),
+                call.drain(),
+                call.retry(),
+                call.admit(self.running_batch),
+            ],
         )
 
 

@@ -3378,8 +3378,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
-            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        if (
+            get_memory().hicache_host_memory_mode == "buffer_only"
+            and get_parallel().pp_rank == 0
+            and getattr(
+                self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+            )
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
@@ -3448,6 +3452,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    storage_attempt=req.storage_prefetch_retry_attempts,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -4308,6 +4313,11 @@ class Scheduler(
                 )
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
+                    if self.tree_cache.prefetch_stop_pending(req.cache_request_handle):
+                        # Keep this admission candidate until its PP result arrives.
+                        # Scanning farther would stop IO for later candidates before
+                        # add_one_req has charged this one's token/chunk budget.
+                        break
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute

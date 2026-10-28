@@ -185,8 +185,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        storage_attempt: int = 0,
     ) -> None:
-        del last_hash, prefix_keys, storage_hit_end
+        del last_hash, prefix_keys, storage_hit_end, storage_attempt
         req_id = request.rid
         if req_id in self._external_flows:
             return

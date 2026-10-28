@@ -351,6 +351,17 @@ class HiCacheController:
         self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
         self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
         self.ack_prefetch_queue = Queue[PrefetchAck]()
+        # Stage-agreed ACKs wait here for the PP loop, never for another PP
+        # stage in the background completion worker.
+        self.pp_prefetch_ack_queue = Queue[PrefetchAck]()
+        self.pp_prefetch_consensus = None
+        if (
+            self.pp_group is not None
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            from sglang.srt.managers.pp_prefetch_scheduler import PPPrefetchConsensus
+
+            self.pp_prefetch_consensus = PPPrefetchConsensus(self)
         self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
@@ -401,7 +412,9 @@ class HiCacheController:
             )
         return 0, 1
 
-    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+    def _create_sync_groups(
+        self, *, include_pp=True
+    ) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         groups: List[torch.distributed.ProcessGroup] = []
@@ -411,7 +424,7 @@ class HiCacheController:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
-        if self.pp_group is not None:
+        if self.pp_group is not None and include_pp:
             base_groups.append(self.pp_group)
 
         for group in base_groups:
@@ -640,7 +653,9 @@ class HiCacheController:
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
             self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups(
+                include_pp=False
+            )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -706,6 +721,8 @@ class HiCacheController:
         # previous partial detach. We attempt cleanup whenever possible.
         try:
             self._stop_storage_threads()
+            if self.pp_prefetch_consensus is not None:
+                self.pp_prefetch_consensus.reset()
         except Exception as e:
             # Do not proceed tearing down backend/process group if threads are not
             # fully stopped; otherwise still-alive threads may touch released state.
@@ -816,6 +833,8 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
+        if self.pp_prefetch_consensus is not None:
+            self.pp_prefetch_consensus.reset()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1461,16 +1480,22 @@ class HiCacheController:
                 continue
 
     def prefetch_sync_thread_func(self):
-        """Synchronize prefetch results across all PP and TP ranks."""
+        """Agree completion within the stage; PP publication belongs to its loop."""
         while not self.storage_stop_event.is_set():
             try:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
                 if ack is None:
                     continue
                 self._reduce_prefetch_ack(ack)
-                self.ack_prefetch_queue.put(ack)
+                if self.pp_prefetch_consensus is None:
+                    self._publish_prefetch_ack(ack)
+                else:
+                    self.pp_prefetch_ack_queue.put(ack)
             except Empty:
                 continue
+
+    def _publish_prefetch_ack(self, ack: PrefetchAck) -> None:
+        self.ack_prefetch_queue.put(ack)
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         """Synchronize all ranks to agree on a PrefetchAck."""
