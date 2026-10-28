@@ -397,9 +397,12 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/tag-and-rerun-ci <tier> [<tier> ...]` | Adds `run-ci` and the tier labels + reruns failed |
 | `/run-ci`, `/run-base-ci`, `/rerun-base-ci` | With no argument, aliases of `/tag-and-rerun-ci`, with the same broad retry scope and independent labeling/retry permissions. With one registered tier argument, equivalent to `/run-<tier>-ci`, including green runs and requiring both permissions. E.g. `/run-ci extra` equals `/run-extra-ci`. |
 | `/run-ci nv`, `/run-base-ci nv`, `/run-nv-ci` | Adds `run-ci` and reruns NVIDIA base/shared checks only, including green runs. No extra or other-hardware workflows. Existing hardware labels are kept; future pushes follow the existing workflow gates. |
-| `/run-full-ci` | Short form of `/tag-and-rerun-ci extra` (baseline + extra). Alias: `/rerun-full-ci` |
+| `/run-ci amd`, `/run-base-ci amd`, `/run-amd-ci` | Adds only `run-ci` and reruns existing AMD Base runs for the current commit, including green runs. Missing runs are skipped; paths and existing labels are preserved. No Extra selection or new `run-ci-amd` label; future pushes keep existing CI behavior. |
+| `/run-full-ci` | With no argument, short form of `/tag-and-rerun-ci extra`: shared Extra labels plus broad retries of completed unsuccessful runs. Alias: `/rerun-full-ci` |
+| `/run-full-ci amd`, `/rerun-full-ci amd` | Combines `amd` and `amd-extra`: adds only `run-ci` and `run-ci-amd-extra`, then selects AMD Base + AMD Extra for the current commit, including green runs. Active runs are left alone; missing base runs are skipped and missing extra runs are reported. Requires both labeling and rerun permissions. |
 | `/run-<tier>-ci` | Adds `run-ci` and any configured tier label + reruns **only** the listed workflows (green ones included). E.g. `/run-extra-ci`. Alias: `/rerun-<tier>-ci` |
 | `/run-extra-ci <hardware>`, `/rerun-extra-ci <hardware>` | Equivalent to `/run-<hardware>-extra-ci` when that tier is registered; otherwise preserves the existing ignored-suffix behavior. |
+| `/run-extra-ci amd`, `/run-amd-extra-ci`, `/run-ci amd-extra` | Adds `run-ci` and `run-ci-amd-extra`, then reruns only AMD Extra, including green runs. Base CI behavior is unchanged; existing labels are kept. |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 | `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
@@ -409,26 +412,41 @@ Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/sl
 ### Opt-in CI tiers (pr-test-extra and friends)
 
 The registry contains `extra`, including both `pr-test-extra.yml` (NVIDIA) and
-`pr-test-amd-extra.yml` (AMD), `nv`, selecting NVIDIA base/shared checks, and
-`mlu`, selecting `pr-test-mlu.yml` with `run-ci-mlu`.
-The shared extra label remains `run-ci-extra`; splitting hardware extra tiers
-is deferred. Other hardware selections such as `amd` and `ppu` are not registered.
-`/run-extra-ci amd` still runs the shared extra tier because `amd-extra` is absent.
+`pr-test-amd-extra.yml` (AMD), `amd-extra`, selecting only `pr-test-amd-extra.yml`
+with `run-ci-amd-extra`, `nv`, selecting NVIDIA base/shared checks, `amd`,
+selecting `pr-test-amd.yml`, and `mlu`, selecting `pr-test-mlu.yml` with `run-ci-mlu`.
+The shared extra label remains `run-ci-extra`; `/run-extra-ci` still selects both
+hardware extra workflows. PPU is not registered; its workflow uses `run-ci` and
+`run-ci-ppu` labels plus PPU path filters.
 
-A selection with `label: null`, such as `nv`, adds only `run-ci` and leaves existing
-workflow gates intact. It selects existing runs for the current commit, skipping workflows with no run.
+`/run-full-ci <hardware>` selects that hardware only when the exact command has
+one argument and both `<hardware>` and `<hardware>-extra` are registered. It
+combines their labels and workflows, without adding the shared `extra` tier.
+Currently only `amd` has this pair. Other full-CI forms keep their legacy shared
+Extra and broad retries, including `/run-full-ci nv` and additional arguments.
+
+`/run-extra-ci amd` and `/run-amd-extra-ci` add only `run-ci` and
+`run-ci-amd-extra` and rerun only AMD Extra. Base CI behavior is unchanged.
+Existing labels are preserved: a PR carrying `run-ci-extra` still opts into
+NVIDIA Extra on future pushes or broad reruns. Remove that shared label to stop
+opting into NVIDIA Extra; `run-ci-amd-extra` keeps AMD Extra enabled. The command
+does not cancel NVIDIA runs already queued or running.
+
+Selections with `label: null`, such as `nv` and `amd`, add only `run-ci` and leave
+existing workflow gates intact. They select existing runs for the current commit, skipping workflows with no run.
 For `pull_request_target` reruns, selection also matches the PR source repository
 and branch.
 Future pushes follow the existing workflow gates.
 These selections retain existing event/path conditions, including any limitations
-of rerunning old labeled events. Use `/run-ci nv` to select NVIDIA; legacy
-`/tag-and-rerun-ci nv` still retries broadly and adds no extra opt-in label.
+of rerunning old labeled events. Use `/run-ci nv` to select NVIDIA or `/run-ci amd`
+to select AMD Base. Legacy `/tag-and-rerun-ci nv` and `/tag-and-rerun-ci amd`
+still retry broadly and add no extra opt-in label.
 
 An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for `/tag-run-ci-label <tier>`, `/tag-and-rerun-ci <tier>` and `/run-<tier>-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
 
-1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** The gate live-fetches labels, so a missing label fails the gate job (red run) and a rerun after labeling passes.
+1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** To also accept a shared tier, set `alternative-label` to its label. For example, AMD Extra uses `require-label: run-ci-amd-extra` and `alternative-label: run-ci-extra`; either opt-in label passes, and `run-ci` remains required. The gate live-fetches labels, so a missing opt-in fails the gate job (red run) and a rerun after labeling passes. Keep this decision out of event-payload expressions, which do not refresh on rerun.
 2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).
-3. **Every workflow that gates on the label is listed in the tier**, so `/run-<tier>-ci` re-runs all of them.
+3. **Every workflow that accepts the label is listed in the tier**, including labels accepted through `alternative-label`, so `/run-<tier>-ci` re-runs all of them. A workflow accepting both a hardware label and a shared label belongs in both registry entries.
 
 Tier names `base`, `cpu`, `failed` and `full` are reserved: they collide with the
 base aliases, `/run-cpu-ci`, `/rerun-failed-ci` and `/run-full-ci`.

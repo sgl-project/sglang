@@ -6,6 +6,18 @@
       ".github/workflows/pr-test-amd-extra.yml"
     ]
   },
+  "amd-extra": {
+    "label": "run-ci-amd-extra",
+    "workflows": [
+      ".github/workflows/pr-test-amd-extra.yml"
+    ]
+  },
+  "amd": {
+    "label": null,
+    "workflows": [
+      ".github/workflows/pr-test-amd.yml"
+    ]
+  },
   "nv": {
     "label": null,
     "workflows": [

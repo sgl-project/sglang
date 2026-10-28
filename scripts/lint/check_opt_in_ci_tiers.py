@@ -24,13 +24,17 @@ _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
 def gate_labels(workflow: dict) -> set[str]:
-    """Labels a workflow requires through its pr-gate.yml calls."""
+    """Opt-in labels a workflow accepts through its pr-gate.yml calls."""
     labels = set()
     for job in (workflow.get("jobs") or {}).values():
         if job.get("uses") == PR_GATE:
-            label = (job.get("with") or {}).get("require-label")
+            inputs = job.get("with") or {}
+            label = inputs.get("require-label")
             if label:
                 labels.add(label)
+                alternative = inputs.get("alternative-label")
+                if alternative:
+                    labels.add(alternative)
     return labels
 
 
@@ -81,7 +85,7 @@ def main() -> int:
             if label not in gate_labels(workflows[path]):
                 errors.append(
                     f"tier `{name}`: {path} does not call pr-gate.yml "
-                    f"with `require-label: {label}`"
+                    f"accepting `{label}` via `require-label` or `alternative-label`"
                 )
             if refires_on_labeled(workflows[path]):
                 errors.append(

@@ -538,7 +538,9 @@ def _rerun_workflow_run(run):
     return True, f"🚀 Re-running [`{run.name}`]({run.html_url})."
 
 
-def _rerun_tier_workflows(gh_repo, pr, workflow_files, *, skip_missing=False):
+def _rerun_tier_workflows(
+    gh_repo, pr, workflow_files, *, skip_missing=False, optional_workflows=()
+):
     """
     Re-run a registered selection's workflows for the current head SHA.
 
@@ -550,7 +552,8 @@ def _rerun_tier_workflows(gh_repo, pr, workflow_files, *, skip_missing=False):
     workflows' dispatch inputs carry no `pr_head_sha`, so a fork PR could only
     be dispatched against `main`, testing the wrong tree. Opt-in tiers report
     missing runs. Selection-only entries can skip missing runs because existing
-    workflows may use trigger-level path filters.
+    workflows may use trigger-level path filters. Combined selections can name
+    those files in optional_workflows while still reporting missing opt-in runs.
 
     Returns (acted, message); acted is True if any workflow was re-run or is
     already in flight.
@@ -570,7 +573,7 @@ def _rerun_tier_workflows(gh_repo, pr, workflow_files, *, skip_missing=False):
     for workflow_file in workflow_files:
         run = latest_by_file.get(workflow_file)
         if run is None:
-            if skip_missing:
+            if skip_missing or workflow_file in optional_workflows:
                 continue
             results.append(
                 (
@@ -600,10 +603,11 @@ def _rerun_tier_workflows(gh_repo, pr, workflow_files, *, skip_missing=False):
     return acted, "\n".join(message for _, message in results)
 
 
-def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier):
+def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tiers=()):
     """
     Handles /run-<tier>-ci: add run-ci and any configured opt-in label,
     then re-run only the selection's workflows, including successful runs.
+    Hardware full CI combines its base and extra tiers through additional_tiers.
 
     Gated on the same two permissions as the steps it performs (the label add
     needs can_tag_run_ci_label, the re-run can_rerun_failed_ci) rather than a
@@ -614,13 +618,27 @@ def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
+    selected_tiers = [tier, *additional_tiers]
+    tier_labels = list(
+        dict.fromkeys(t["label"] for t in selected_tiers if t["label"] is not None)
+    )
+    workflow_files = list(
+        dict.fromkeys(path for t in selected_tiers for path in t["workflows"])
+    )
+    required_workflows = {
+        path
+        for t in selected_tiers
+        if t["label"] is not None
+        for path in t["workflows"]
+    }
+
     tagged = handle_tag_run_ci(
         gh_repo,
         pr,
         comment,
         user_perms,
         react_on_success=False,
-        tier_labels=[tier["label"]] if tier["label"] is not None else [],
+        tier_labels=tier_labels,
     )
     if not tagged:
         return False
@@ -629,7 +647,11 @@ def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier):
     time.sleep(5)
 
     acted, message = _rerun_tier_workflows(
-        gh_repo, pr, tier["workflows"], skip_missing=tier["label"] is None
+        gh_repo,
+        pr,
+        workflow_files,
+        skip_missing=not tier_labels,
+        optional_workflows=set(workflow_files) - required_workflows,
     )
     pr.create_issue_comment(message)
     comment.create_reaction("+1" if acted else "confused")
@@ -1887,6 +1909,24 @@ def main():
     command = tokens[0] if tokens else ""
     tiers = _load_opt_in_tiers()
 
+    # A registered hardware pair selects base + extra without the shared extra
+    # label or broad retry scope. Other full-CI forms retain their legacy path.
+    if (
+        command in ("/run-full-ci", "/rerun-full-ci")
+        and len(tokens) == 2
+        and tokens[1] in tiers
+        and f"{tokens[1]}-extra" in tiers
+    ):
+        handle_run_tier_ci(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            tiers[tokens[1]],
+            additional_tiers=[tiers[f"{tokens[1]}-extra"]],
+        )
+        return
+
     # Normalize new spellings before entering the existing command paths.
     # A registered tier retains precedence over an alias with the same name.
     tier_match = RUN_TIER_COMMAND.match(command)
@@ -1921,7 +1961,7 @@ def main():
 
     is_tag = first_line.startswith("/tag-run-ci-label")
     is_tag_and_rerun = first_line.startswith("/tag-and-rerun-ci")
-    # /run-full-ci is the short, spelled-out form of `/tag-and-rerun-ci extra`
+    # Bare /run-full-ci is the short form of `/tag-and-rerun-ci extra`
     # and shares its branch below. /rerun-* spellings are accepted silently as
     # aliases: they sit one keystroke from the documented name and from the
     # neighbouring /rerun-* commands, and failing them closed would just look
