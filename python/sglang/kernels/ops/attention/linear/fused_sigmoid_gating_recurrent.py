@@ -761,7 +761,9 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
-        ring_indices=ring_indices if ring_indices is not None else initial_state_indices,
+        ring_indices=ring_indices
+        if ring_indices is not None
+        else initial_state_indices,
         SEPARATE_RING_INDEX=ring_indices is not None,
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,

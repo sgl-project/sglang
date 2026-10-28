@@ -89,7 +89,7 @@ impl MambaComponent {
         node_id: NodeIdx_,
         host_value: &Tensor,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if tree_core.arena.has_device_value(node_id, MAMBA)
             || tree_core.arena.has_host_value(node_id, MAMBA)
