@@ -21,8 +21,7 @@ TokenSpaceProcessor.process(media, IDs)
   worker_thread_device d -> IO and processor threads start on device d
 
 get_mm_processor -> TokenSpaceSGLangProcessor
-  each strategy keeps its legacy processor's loader and worker defaults,
-    except the departures listed in _LEGACY_DEFAULT_DEPARTURES
+  each strategy and serving spec keep the legacy processor's loader and worker defaults
   registered serving spec -> mm_tokens and IO threads; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
@@ -60,6 +59,7 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
+    serving_spec_for,
 )
 from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
     TokenSpaceServingSpec,
@@ -347,21 +347,15 @@ def _legacy_defaults(processor_cls, hf_config):
     return defaults
 
 
-def _token_space_defaults(strategy_class):
+def _token_space_defaults(strategy_class, hf_config):
     core_cls = TokenSpaceProcessor.for_strategy(strategy_class)
     defaults = {name: getattr(core_cls, name) for name in _LOADER_ATTRIBUTES}
     # The wrapper's auto count when preprocessing does not compete with the scheduler.
     defaults["auto_mm_processor_worker_num"] = 2
-    defaults["auto_mm_io_worker_num"] = core_cls.auto_mm_io_worker_num
+    # Serving takes the IO thread default from the serving spec, not the core.
+    serving_spec = serving_spec_for(hf_config)(hf_config)
+    defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
     return defaults
-
-
-# Deliberate departures from the legacy defaults: (model type, attribute) -> value.
-_LEGACY_DEFAULT_DEPARTURES = {
-    # Legacy Omni kept the base's 4 I/O workers only because it sits outside
-    # the Qwen tuning branch; one strategy serves every Qwen model type.
-    ("qwen3_omni_moe", "auto_mm_io_worker_num"): 16,
-}
 
 
 # The model types each registered architecture is served with.
@@ -389,14 +383,13 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             if arch not in legacy:
                 continue
             for model_type in _MODEL_TYPES_BY_ARCH[arch]:
-                hf_config = SimpleNamespace(model_type=model_type)
+                hf_config = SimpleNamespace(model_type=model_type, architectures=[arch])
                 hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
-                for (departed_type, name), value in _LEGACY_DEFAULT_DEPARTURES.items():
-                    if departed_type == model_type:
-                        expected[name] = value
                 with self.subTest(arch=arch, model_type=model_type):
-                    self.assertEqual(_token_space_defaults(strategy_class), expected)
+                    self.assertEqual(
+                        _token_space_defaults(strategy_class, hf_config), expected
+                    )
 
     def test_strategy_alone_serves_a_model_without_an_hf_processor(self):
         """A strategy plus a tokenizer is enough to register, build, and serve."""

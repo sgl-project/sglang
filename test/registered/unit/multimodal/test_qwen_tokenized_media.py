@@ -80,6 +80,7 @@ from sglang.srt.multimodal.token_space_mm_process.expansion import (
 )
 from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import (
     QwenTokenSpaceProcessStrategy,
+    QwenTokenSpaceServingSpec,
     _frame_timestamps,
 )
 from sglang.srt.multimodal.token_space_mm_process.processor import (
@@ -87,9 +88,6 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
 )
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_STRATEGY_MAPPING,
-)
-from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
-    TokenSpaceServingSpec,
 )
 from sglang.srt.multimodal.token_space_mm_process.sglang import (
     TokenSpaceSGLangProcessor,
@@ -118,7 +116,7 @@ TOKEN_TEXT = {
 
 QwenTokenSpaceCore = TokenSpaceProcessor.for_strategy(QwenTokenSpaceProcessStrategy)
 QwenVLTokenSpaceProcessor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-    QwenTokenSpaceProcessStrategy, TokenSpaceServingSpec
+    QwenTokenSpaceProcessStrategy, QwenTokenSpaceServingSpec
 )
 
 
@@ -488,6 +486,8 @@ class TestQwenTokenizedMedia(CustomTestCase):
             (native._core.mm_processor_worker_num, native._core.mm_io_worker_num),
             (legacy.mm_processor_worker_num, legacy.mm_io_worker_num),
         )
+        # /v1/decisions validates image markers through mm_tokens (#5).
+        self.assertEqual(vars(native.mm_tokens), vars(legacy.mm_tokens))
         # An architecture without a registered strategy keeps its legacy processor.
         with (
             patch.dict(
