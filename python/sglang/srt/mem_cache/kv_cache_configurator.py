@@ -3151,8 +3151,7 @@ class KVCacheConfigurator:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
         request_scoped = replayssm_active and (
-            self.hybrid_kda_config is None
-            or host_only_mamba_checkpoint()
+            self.hybrid_kda_config is None or host_only_mamba_checkpoint()
         )
         replayssm_fixed_bytes, replayssm_ring_per_slot = replayssm_ring_memory_charge(
             replayssm_ring_per_req,
