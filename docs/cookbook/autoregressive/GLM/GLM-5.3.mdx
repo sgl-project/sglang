@@ -344,7 +344,7 @@ Agentic replay is a different workload: long-context prompts, multi-turn session
 
 - `--enable-amd-monokernel` runs the target model's verify step on the gfx950 monokernel when one or two requests are running (4 or 8 tokens a step). Larger steps take the normal forward, so the kernel serves fewer steps as concurrency grows.
 - Keep `--kv-cache-dtype fp8_e4m3`. The monokernel also accepts the BF16 cache, but BF16 KV slows the DSA prefill and raises TTFT on long agentic prompts.
-- The command needs an image whose SGLang pins sgl-amd-mono at or after [`0a107f1`](https://github.com/sgl-project/sgl-amd-mono/pull/60). With an older pin, the monokernel does not accept the FP8 KV cache and the server exits at startup.
+- Use `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028` or a later MI35x image. Its SGLang pins sgl-amd-mono [`90c2355`](https://github.com/sgl-project/sgl-amd-mono/commit/90c23551a323d5badd5b86c1e92151e319072d87), which contains the FP8 KV support of [sgl-amd-mono#60](https://github.com/sgl-project/sgl-amd-mono/pull/60). With an older pin, the monokernel does not accept the FP8 KV cache, and the server exits at startup.
 
 The braced value `{max-running-requests}` follows concurrency and sets both `--max-running-requests` and `--cuda-graph-max-bs-decode`:
 
