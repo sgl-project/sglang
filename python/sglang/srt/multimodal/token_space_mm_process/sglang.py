@@ -242,7 +242,8 @@ class TokenSpaceSGLangProcessor:
     def compute_mrope_positions(self, input_ids, mm_items):
         """M-RoPE from bound items, for requests that arrive already processed.
 
-        Rebuilds the processor output's media fields from each item's strategy fields.
+        Only the scheduler's fallback calls this. It rebuilds the processor output's
+        media fields from each item's strategy fields.
         """
         # TODO(rockdu): Corner case: requests that arrive without M-RoPE positions.
         # Check whether every frontend can send positions, so this fallback can be removed.
