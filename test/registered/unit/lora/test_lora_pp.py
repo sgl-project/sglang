@@ -171,8 +171,7 @@ class TestFetchKeepsLiveAdapters(CustomTestCase):
 
     def test_still_loads_the_batch_when_live_adapters_do_not_fit(self):
         manager = _lora_manager(slots=2)
-        manager.fetch_new_loras({"a"})
-        manager.fetch_new_loras({"b"})
+        manager.fetch_new_loras({"a", "b"})
 
         manager.fetch_new_loras({"c", "d"}, pp_loras={"a", "b"})
 
@@ -242,12 +241,12 @@ def _full_adapter():
     )
 
 
-def _load_into_mem_pool(pool, uid, adapter, layers):
+def _load_into_mem_pool(pool, uid, adapter):
     no_slicing = SimpleNamespace(
         slice_lora_a_weights=lambda w: w, slice_lora_b_weights=lambda w: w
     )
     lora_modules = [{} for _ in range(NUM_LAYERS)]
-    for i in layers:
+    for i in pool.lora_layer_ids:
         lora_modules[i][f"model.layers.{i}.self_attn.o_proj"] = no_slicing
     pool.load_lora_weight_to_buffer(uid, 0, adapter, lora_modules, None, None)
 
@@ -265,14 +264,14 @@ class TestStagePool(CustomTestCase):
         )
 
         # The last stage must skip the adapter's layers 0-1 and embed_tokens weights.
-        _load_into_mem_pool(last, "adapter", _full_adapter(), layers=[2, 3])
+        _load_into_mem_pool(last, "adapter", _full_adapter())
         for i in (2, 3):
             self.assertTrue(
                 torch.equal(last.A_buffer["o_proj"][i][0], _o_proj_weight(i))
             )
 
         # Handing the slot to the base model zeroes it.
-        _load_into_mem_pool(last, None, None, layers=[2, 3])
+        _load_into_mem_pool(last, None, None)
         for i in (2, 3):
             self.assertFalse(last.A_buffer["o_proj"][i][0].any())
 
