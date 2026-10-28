@@ -281,6 +281,51 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+def validate_flashinfer_megamoe_sm120(server_args: Any) -> None:
+    """SM120 runs FP4-expert checkpoints on FlashInfer's cake MegaMOE kernel."""
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if get_platform().device_capability != (12, 0):
+        raise ValueError(
+            "FlashInfer MegaMOE on SM12x requires an SM120 (compute capability "
+            f"12.0) device, got {get_platform().device_capability}."
+        )
+    if (
+        resolved_view(server_args).quantization in ("mxfp8", "modelopt_fp4")
+        or not model_config.is_fp4_experts
+    ):
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 supports only FP4-expert (MXFP4) "
+            "checkpoints such as DeepSeek-V4-Flash."
+        )
+    if cfg.tp_size < 2:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 requires an expert-parallel size of at "
+            "least 2."
+        )
+    if cfg.enable_eplb:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 does not support --enable-eplb; static "
+            "expert placement (--init-expert-location, "
+            "--ep-num-redundant-experts) is supported."
+        )
+    if cfg.speculative_algorithm and cfg.speculative_moe_runner_backend is None:
+        raise ValueError(
+            "Speculative decoding is not validated with FlashInfer MegaMOE on "
+            "SM120: the default draft MoE runner (flashinfer_trtllm) is "
+            "SM100-only. Set --speculative-moe-runner-backend explicitly."
+        )
+    try:
+        from flashinfer.moe_ep import (  # noqa: F401
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
+        )
+    except ImportError as e:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 requires a FlashInfer build with the "
+            "sm120_mxfp4_mxfp8_bf16_cake backend (flashinfer-ai/flashinfer#6346)."
+        ) from e
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -332,10 +377,22 @@ def handle_a2a_moe(server_args: Any):
         assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
             "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
         )
-        if not is_sm100_supported():
+        if get_platform().is_sm120:
+            validate_flashinfer_megamoe_sm120(server_args)
+            # The cake kernel joins the EP group's ncclComm through NCCL's
+            # Device API, which needs cuMem-backed NCCL buffers.
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            if cfg.disaggregation_mode != "prefill":
+                logger.info(
+                    "FlashInfer MegaMOE on SM120 targets prefill; decode batches "
+                    "of a few requests per rank run slower than "
+                    "--moe-runner-backend flashinfer_mxfp4. Consider it for the "
+                    "prefill server of a PD-disaggregated deployment."
+                )
+        elif not is_sm100_supported():
             raise ValueError(
                 "FlashInfer MegaMOE currently requires an SM100-family "
-                "CUDA device for all supported quantization formats."
+                "CUDA device, or an SM120 device with an FP4-expert checkpoint."
             )
         if cfg.nnodes == 1 and (
             cfg.speculative_algorithm is None

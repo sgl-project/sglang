@@ -1248,6 +1248,9 @@ class Envs:
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
     # kernel.
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    # Peer transport table of the SM120 MegaMOE kernel (FlashInfer cake config);
+    # the default needs a GIN-capable NIC only between GPUs without a peer path.
+    SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE = EnvStr("lsa_where_reachable")
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)

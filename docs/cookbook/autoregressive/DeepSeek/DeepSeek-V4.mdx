@@ -403,7 +403,7 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 
 RTX PRO 6000 (96 GB) runs **Flash only** with the FlashInfer MXFP4 MoE runner.
 V4-Pro doesn't fit on 8× 96 GB; the Deploy panel greys out unsupported recipes.
-HiCache and MegaMoE are **not** supported on RTX PRO 6000.
+HiCache and the DeepGEMM MegaMoE (`--moe-a2a-backend megamoe`) are **not** supported on RTX PRO 6000. For prefill on SM120, see [FlashInfer MegaMoE on SM120](#sm120-flashinfer-megamoe).
 
 **AMD (MI300X / MI355X) note**
 
@@ -478,6 +478,51 @@ sglang serve \
 the MegaMoE path processes per rank (i.e. per GPU); the MegaMoE path is only used
 for batches at or below this cap. The right value depends on your parallelism /
 token-split scheme, and larger values reserve more HBM.
+
+<a id="sm120-flashinfer-megamoe" />
+
+**FlashInfer MegaMoE on SM120 for prefill (Experimental)**
+
+On SM120 (RTX PRO Blackwell), DeepSeek-V4-Flash (FP4 experts) can run its routed
+experts through FlashInfer's fused EP all-to-all + expert-compute kernel
+(`sm120_mxfp4_mxfp8_bf16_cake`, [flashinfer-ai/flashinfer#6346](https://github.com/flashinfer-ai/flashinfer/pull/6346)).
+It is meant for **prefill**, e.g. the prefill server of a PD-disaggregated deployment:
+decode batches of a few requests per rank run slower than with
+`--moe-runner-backend flashinfer_mxfp4`, so serve decode with the regular SM120 recipe.
+
+This backend needs a FlashInfer build that contains #6346. The released FlashInfer
+`0.7.2` does not, and selecting the backend with it fails at startup with an explicit
+error. Until a release includes it, build FlashInfer from source at commit `399b6c1d`
+or later ([installation guide](https://docs.flashinfer.ai/installation.html)).
+
+```bash Command
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash \
+  --trust-remote-code \
+  --tp 4 --attn-dp-size 4 \
+  --moe-a2a-backend flashinfer_megamoe \
+  --chunked-prefill-size 16384 --max-prefill-tokens 4096 \
+  --mem-fraction-static 0.8 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl
+```
+
+- `--max-prefill-tokens` (per rank) sizes the kernel's per-rank workspace; larger
+  values reserve more memory. `--chunked-prefill-size` is divided by the attention-DP
+  size, so 16384 gives 4096 tokens per rank; keep that per-rank chunk at or below
+  `--max-prefill-tokens`. With `--tp 8 --attn-dp-size 8` on 72 GB
+  GPUs, lower `--mem-fraction-static` to 0.70 to leave room for the kernel.
+- The PD pairing validated so far is a decode server with
+  `--moe-runner-backend flashinfer_mxfp4 --disaggregation-mode decode
+  --disaggregation-transfer-backend nixl` behind `sglang_router.launch_router --pd-disaggregation`,
+  with NIXL's UCX backend over RoCE (UCX device settings are site-specific).
+- Static expert placement (`--init-expert-location`, `--ep-num-redundant-experts`,
+  `--ep-dispatch-algorithm static`) is supported; `--enable-eplb` is not, and
+  speculative decoding is not validated (it needs an explicit
+  `--speculative-moe-runner-backend`).
+- `SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE` picks the peer transport
+  (default `lsa_where_reachable`: PCIe/NVLink peer access where available, NCCL GIN
+  elsewhere).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
