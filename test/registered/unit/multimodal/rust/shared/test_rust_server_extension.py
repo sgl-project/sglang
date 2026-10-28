@@ -81,6 +81,7 @@ class TestRustServerExtension(CustomTestCase):
             processor=None,
             tokenizer_path="tokenizer",
             max_total_num_tokens=1024,
+            load_snapshot_writer=None,
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(**launch_config)
@@ -90,7 +91,9 @@ class TestRustServerExtension(CustomTestCase):
             model_config=launch_config["model_config"],
             tokenizer_path="tokenizer",
             max_total_num_tokens=1024,
+            load_snapshot_writer=None,
             extension=extension,
+            health_generate_headers={},
         )
         extension.Server.assert_called_once_with(
             sentinel.args, cores=None, port_offset=1
@@ -121,6 +124,7 @@ class TestRustServerExtension(CustomTestCase):
             processor=sentinel.processor,
             tokenizer_path="tokenizer",
             max_total_num_tokens=1024,
+            load_snapshot_writer=None,
         )
         with (
             launch_context(BuiltinServer),

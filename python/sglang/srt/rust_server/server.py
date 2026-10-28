@@ -70,7 +70,9 @@ class RustServer:
         self._max_per_poll = max_per_poll
 
     @classmethod
-    def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
+    def _health_generate_headers(
+        cls, *, server_args: ServerArgs, model_config: ModelConfig
+    ) -> Dict[str, str]:
         """Headers a healthy ``/health_generate`` carries; a deployment's
         router may read its metadata off the deep health probe."""
         return {}
@@ -140,6 +142,7 @@ class RustServer:
         processor,
         tokenizer_path: str,
         max_total_num_tokens: int,
+        load_snapshot_writer: Any,
     ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
@@ -193,7 +196,11 @@ class RustServer:
                 model_config=model_config,
                 tokenizer_path=tokenizer_path,
                 max_total_num_tokens=max_total_num_tokens,
+                load_snapshot_writer=load_snapshot_writer,
                 extension=extension,
+                health_generate_headers=cls._health_generate_headers(
+                    server_args=server_args, model_config=model_config
+                ),
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,

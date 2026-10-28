@@ -595,6 +595,7 @@ def assemble_scheduler(
             processor=processor,
             tokenizer_path=get_serving().tokenizer_path,
             max_total_num_tokens=max_total_num_tokens,
+            load_snapshot_writer=load_snapshot_writer,
         )
         # Park the idle loop on the request ring within the rank-0 rust-server
         idle_sleeper = RustServerIdleSleeper(rust_server, flags=flags)

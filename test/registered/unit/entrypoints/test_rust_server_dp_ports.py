@@ -129,6 +129,7 @@ def test_dp_leaders_reuse_node_local_ports(
                         processor=None,
                         tokenizer_path="tokenizer",
                         max_total_num_tokens=1024,
+                        load_snapshot_writer=None,
                     ).http_port
                 )
 

@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.entrypoints.v1_loads import (
@@ -40,7 +40,9 @@ def _build_server_args(
     model_config: ModelConfig,
     tokenizer_path: str,
     max_total_num_tokens: int,
+    load_snapshot_writer: Any,
     extension: Optional[ModuleType] = None,
+    health_generate_headers: Optional[Dict[str, str]] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -67,7 +69,7 @@ def _build_server_args(
     )
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
-    shm_writer = scheduler.load_snapshot_writer
+    shm_writer = load_snapshot_writer
     if not isinstance(shm_writer, ShmLoadSnapshotWriter):
         shm_writer = None
     return ext.ServerArgs(
@@ -131,6 +133,11 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=max_total_num_tokens,
+        load_snapshot_path=shm_writer.path if shm_writer else None,
+        load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
+        load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
+        accelerator=_accelerator_name(),
+        num_accelerators=_num_accelerators_per_dp_rank(),
         # Every process writes its prometheus_client samples under this
         # directory (set before the schedulers start); `/metrics` merges them.
         metrics=(
