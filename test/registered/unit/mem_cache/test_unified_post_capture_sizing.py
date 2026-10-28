@@ -16,7 +16,7 @@
 With post-capture sizing the shared arena is reserved as CUDA virtual memory
 before graph capture: only the slot-0 sink is physically backed, the graphs
 capture the final tensor address, and ``finalize_backing`` backs the measured
-byte budget in place. ``UnifiedSWATokenToKVPoolAllocator.resize`` then
+byte budget in place. ``ChainAllocator.resize`` then
 re-derives every capacity the sub-allocators and sub-pools expose.
 
 The oracle is the eagerly-allocated pool of the same final size: a resized pool

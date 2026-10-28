@@ -40,9 +40,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache import kv_index_translator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, TokenSpan
@@ -171,7 +169,8 @@ class TestKVLocPlan(CustomTestCase):
             ),
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        self.allocator = UnifiedSWATokenToKVPoolAllocator(
+        self.allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
             device=_DEV,

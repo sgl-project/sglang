@@ -36,9 +36,9 @@ from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFix
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc import chain
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -115,7 +115,7 @@ _TOMBSTONE_METHODS = [
 _NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
 
 
-_UNIFIED_MODULES = (mea, unified_mamba, unified_hybrid_swa)
+_UNIFIED_MODULES = (mea, chain)
 
 
 def _allocators_in_module():
@@ -335,9 +335,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
     def test_all_overridden(self):
         for cls in (
             mea.MultiEndedAllocator,
-            unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
-            unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
-            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
+            chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
@@ -355,9 +353,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
         buffer, or `free_segment` raises inside a group."""
         for cls in (
             mea.MultiEndedAllocator,
-            unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
-            unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
-            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
+            chain.ChainAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 alloc = object.__new__(cls)
@@ -446,7 +442,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
             def attach_allocators(self, **kwargs):
                 pass
 
-        return unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator(
+        return chain.ChainAllocator(
+            roles=chain.ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=_KV(pool),
             device="cpu",
@@ -608,7 +605,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
         """A fixture that patches `sys.modules` drops the modules first imported
         under the patch, so the next test imports them again; the invariant
         registry refuses a name it already holds."""
-        spec = importlib.util.find_spec(unified_hybrid_swa.__name__)
+        spec = importlib.util.find_spec(chain.__name__)
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 

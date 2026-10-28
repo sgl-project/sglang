@@ -65,7 +65,7 @@ class TestHostGateCapacity(unittest.TestCase):
         self.assertEqual(full._chain_capacity_epoch(), epoch)
         self.assertEqual(full.schedulable_available_size(), full.available_size())
         self.assertGreater(before, full.schedulable_available_size())
-        self.assertFalse(allocator._compaction_allowed())
+        self.assertFalse(allocator._policy._compaction_allowed(allocator))
         self.assertEqual(allocator.verify_byte_accounting(), [])
         state["open"] = True
         self.assertEqual(full.schedulable_available_size(), before)

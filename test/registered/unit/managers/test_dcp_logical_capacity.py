@@ -8,9 +8,7 @@ import torch
 
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -64,8 +62,13 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
         full_kv_pool=NS(buf=torch.empty(pool.max_slots("full"))),
         mamba_pool=NS(buf=torch.empty(pool.max_slots("mamba"))),
     )
-    return UnifiedMambaTokenToKVPoolAllocator(
-        unified_buffer=pool, kvcache=kvcache, device="cpu", page_size=1
+    return ChainAllocator(
+        roles=ChainRoles(owner="full", state="mamba"),
+        state_kvcache=kvcache.mamba_pool,
+        unified_buffer=pool,
+        kvcache=kvcache,
+        device="cpu",
+        page_size=1,
     )
 
 

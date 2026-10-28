@@ -11,8 +11,10 @@ corruption with no crash.
 """
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import List, Optional, Set
+from unittest import mock
 
 import torch
 
@@ -21,9 +23,15 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -192,168 +200,133 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
 
 
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
-    """Unified composites must translate virtual IDs before PD transfer.
+    """The unified allocator must translate virtual IDs before PD transfer.
 
-    The implementation may be inherited from a shared unified allocator base,
-    but inheriting the static allocator's identity would put virtual IDs on the
-    wire and silently corrupt KV. Gate installation must reach every member, and
-    so must every event that orders a member's page moves.
+    Inheriting the static allocator's identity would put virtual IDs on the
+    wire and silently corrupt KV. Gate installation must reach every sub-pool
+    of every chain, and so must every event that orders a sub-pool's page
+    moves.
     """
 
-    @staticmethod
-    def _allocator_class(name):
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedMambaSWATokenToKVPoolAllocator,
-            UnifiedSWATokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
+    # The layers of each chain shape: full + window, full + state, all three.
+    _CHAINS = {
+        "swa": dict(swa_layer_ids=(1,)),
+        "mamba": dict(state_layer_ids=(1,)),
+        "tri": dict(swa_layer_ids=(1,), state_layer_ids=(2,)),
+    }
 
-        classes = (
-            UnifiedMambaTokenToKVPoolAllocator,
-            UnifiedSWATokenToKVPoolAllocator,
-            UnifiedMambaSWATokenToKVPoolAllocator,
+    @classmethod
+    def _chain(cls, chain: str) -> ChainAllocator:
+        setup_allocator_context()
+        bundle = build_unified_bundle(
+            UnifiedGeometry(
+                chain=chain,
+                full_layer_ids=(0,),
+                lazy=True,
+                device="cpu",
+                **cls._CHAINS[chain],
+            )
         )
-        return {cls.__name__: cls for cls in classes}[name]
+        return bundle.token_to_kv_pool_allocator
+
+    @staticmethod
+    def _sub_pools(alloc: ChainAllocator) -> Set[str]:
+        return {spec.name for spec in alloc.unified_buffer.sub_pool_specs}
 
     def test_transfer_translate_is_not_inherited_identity(self):
         virtual = torch.tensor([1, 3], dtype=torch.int32)
-        for name in self._EXPECTED_COVERAGE:
-            with self.subTest(composite=name), get_parallel().override(attn_dcp_size=1):
-                alloc = object.__new__(self._allocator_class(name))
-                alloc.full_attn_allocator = SimpleNamespace(
-                    translate_kv_loc=lambda ids: ids + 16
-                )
-                physical = alloc.translate_kv_indices_for_transfer(virtual)
-                self.assertEqual(physical.dtype, torch.int64)
-                self.assertEqual(physical.tolist(), [17, 19])
+        with get_parallel().override(attn_dcp_size=1):
+            alloc = object.__new__(ChainAllocator)
+            alloc.full_attn_allocator = SimpleNamespace(
+                translate_kv_loc=lambda ids: ids + 16, shards_under_dcp=True
+            )
+            physical = alloc.translate_kv_indices_for_transfer(virtual)
+        self.assertEqual(physical.dtype, torch.int64)
+        self.assertEqual(physical.tolist(), [17, 19])
 
-    # Every sub-allocator attribute a composite can hold. The stub carries all
-    # of them regardless of composite, so the assertion is on what installation
-    # REACHES rather than on what the stub was given.
-    _MEMBER_ATTRS = ("full_attn_allocator", "swa_attn_allocator", "mamba_allocator")
-
-    # Inherited gate setters must cover every member, including tri-pool Mamba.
-    _EXPECTED_COVERAGE = {
-        "UnifiedMambaTokenToKVPoolAllocator": {
-            "full_attn_allocator",
-            "mamba_allocator",
-        },
-        "UnifiedSWATokenToKVPoolAllocator": {
-            "full_attn_allocator",
-            "swa_attn_allocator",
-        },
-        "UnifiedMambaSWATokenToKVPoolAllocator": {
-            "full_attn_allocator",
-            "swa_attn_allocator",
-            "mamba_allocator",
-        },
-    }
-
-    def _members_reached(self, cls_name: str, slot: str) -> Set[str]:
-        """Install one gate on a stub composite and report which members got it.
-
-        `object.__new__` skips `__init__` (which needs a GPU); the setter reads
-        only `lazy_compaction` and the member attributes.
-        """
-        cls = self._allocator_class(cls_name)
-        alloc = object.__new__(cls)
-        alloc.lazy_compaction = True
-        for attr in self._MEMBER_ATTRS:
-            member = type("_Member", (), {})()
-            member.disagg_move_gate = None
-            member.host_transfer_move_gate = None
-            setattr(alloc, attr, member)
+    def test_every_gate_reaches_every_member(self):
+        """Both transfer gates must protect every sub-pool from relocation."""
 
         def gate() -> bool:
             return True
 
-        if slot == "disagg_move_gate":
-            alloc.set_disagg_move_gate(gate)
-        else:
-            alloc.set_host_transfer_move_gate(gate)
-        return {
-            attr
-            for attr in self._MEMBER_ATTRS
-            if getattr(getattr(alloc, attr), slot) is gate
-        }
-
-    def test_every_gate_reaches_every_member(self):
-        """Both transfer gates must protect every sub-pool from relocation."""
-        for name, expected in self._EXPECTED_COVERAGE.items():
+        for chain in self._CHAINS:
             for slot in ("disagg_move_gate", "host_transfer_move_gate"):
-                with self.subTest(composite=name, slot=slot):
+                with self.subTest(chain=chain, slot=slot):
+                    alloc = self._chain(chain)
+                    if slot == "disagg_move_gate":
+                        alloc.set_disagg_move_gate(gate)
+                    else:
+                        alloc.set_host_transfer_move_gate(gate)
                     self.assertEqual(
-                        self._members_reached(name, slot),
-                        expected,
-                        f"{name}.{slot} does not cover every member",
+                        {
+                            m.sub_pool_name
+                            for m in alloc.members
+                            if getattr(m, slot) is gate
+                        },
+                        self._sub_pools(alloc),
+                        f"{chain}.{slot} does not cover every sub-pool",
                     )
-
-    def _ordering_events_received(self, cls_name: str) -> dict:
-        """Send each move-ordering event once to a stub composite and report, per
-        member, what it received."""
-        alloc = object.__new__(self._allocator_class(cls_name))
-        received = {attr: {} for attr in self._MEMBER_ATTRS}
-        for attr, got in received.items():
-            member = type("_Member", (), {})()
-            member.set_hicache_transfer_done_event = lambda key, event, got=got: (
-                got.__setitem__("hicache", event)
-            )
-            member.set_latest_forward_done_event = lambda event, got=got: (
-                got.__setitem__("forward_done", event)
-            )
-            member.set_inflight_forward = lambda event, ids, got=got: got.__setitem__(
-                "inflight", ids
-            )
-            setattr(alloc, attr, member)
-        event, ids = object(), torch.tensor([5, 6])
-        alloc.set_hicache_transfer_done_event("load", event)
-        alloc.set_latest_forward_done_event(event)
-        alloc.set_inflight_forward(event, ids)
-        return {attr: got for attr, got in received.items() if got}
 
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves
         wait on: a member that misses a HiCache copy's event may move a page the
         copy still reads or writes. Recurrent state is written by its own
         kernels, so its member gets no in-flight token ids."""
-        for name, expected in self._EXPECTED_COVERAGE.items():
-            received = self._ordering_events_received(name)
+        for chain in self._CHAINS:
+            alloc = self._chain(chain)
+            received = {m.sub_pool_name: {} for m in alloc.members}
+            with ExitStack() as stack:
+                for member in alloc.members:
+                    got = received[member.sub_pool_name]
+                    for name, hook in (
+                        ("set_hicache_transfer_done_event", "hicache"),
+                        ("set_latest_forward_done_event", "forward_done"),
+                        ("set_inflight_forward", "inflight"),
+                    ):
+                        stack.enter_context(
+                            mock.patch.object(
+                                member,
+                                name,
+                                side_effect=lambda *args, got=got, hook=hook: (
+                                    got.__setitem__(hook, args[-1])
+                                ),
+                            )
+                        )
+                event, ids = object(), torch.tensor([5, 6])
+                alloc.set_hicache_transfer_done_event("load", event)
+                alloc.set_latest_forward_done_event(event)
+                alloc.set_inflight_forward(event, ids)
             for hook in ("hicache", "forward_done", "inflight"):
-                with self.subTest(composite=name, hook=hook):
+                with self.subTest(chain=chain, hook=hook):
                     self.assertEqual(
-                        {attr for attr, got in received.items() if hook in got},
-                        expected,
-                        f"{name} does not send {hook} to every member",
+                        {name for name, got in received.items() if hook in got},
+                        self._sub_pools(alloc),
+                        f"{chain} does not send {hook} to every member",
                     )
-            with self.subTest(composite=name, hook="inflight ids"):
-                for attr, got in received.items():
-                    if attr == "mamba_allocator":
+            with self.subTest(chain=chain, hook="inflight ids"):
+                for name, got in received.items():
+                    if name == "mamba":
                         self.assertIsNone(got["inflight"])
                     else:
                         self.assertEqual(got["inflight"].tolist(), [5, 6])
 
-    def test_swa_composite_translates_the_swa_side_separately(self):
+    def test_swa_chain_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id
         does not name the SWA page holding the same virtual token: the transfer
         translate must go through the SWA sub-pool's own table."""
         virtual = torch.tensor([1, 3], dtype=torch.int32)
-        for name in (
-            "UnifiedSWATokenToKVPoolAllocator",
-            "UnifiedMambaSWATokenToKVPoolAllocator",
-        ):
-            with self.subTest(composite=name), get_parallel().override(attn_dcp_size=1):
-                alloc = object.__new__(self._allocator_class(name))
-                alloc.full_attn_allocator = SimpleNamespace(
-                    translate_kv_loc=lambda ids: ids + 16
-                )
-                alloc.swa_attn_allocator = SimpleNamespace(
-                    translate_kv_loc=lambda ids: ids + 32,
-                )
-                physical = alloc.translate_swa_indices_for_transfer(virtual)
-                self.assertEqual(physical.dtype, torch.int64)
-                self.assertEqual(physical.tolist(), [33, 35])
+        with get_parallel().override(attn_dcp_size=1):
+            alloc = object.__new__(ChainAllocator)
+            alloc.full_attn_allocator = SimpleNamespace(
+                translate_kv_loc=lambda ids: ids + 16
+            )
+            alloc.swa_attn_allocator = SimpleNamespace(
+                translate_kv_loc=lambda ids: ids + 32,
+            )
+            physical = alloc.translate_swa_indices_for_transfer(virtual)
+        self.assertEqual(physical.dtype, torch.int64)
+        self.assertEqual(physical.tolist(), [33, 35])
 
 
 class TestEverySwaAllocatorAnswersTheTransferTranslate(CustomTestCase):
@@ -377,20 +350,20 @@ class TestEverySwaAllocatorAnswersTheTransferTranslate(CustomTestCase):
         import inspect
         import pkgutil
 
-        import sglang.srt.mem_cache.allocator as pkg
+        import sglang.srt.mem_cache.allocator as allocator_pkg
+        import sglang.srt.mem_cache.kv.alloc as chain_pkg
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
         found = {}
-        for mod_info in pkgutil.iter_modules(pkg.__path__):
-            try:
-                mod = importlib.import_module(
-                    f"sglang.srt.mem_cache.allocator.{mod_info.name}"
-                )
-            except Exception:
-                continue  # optional backends need hardware this runner may lack
-            for _, cls in inspect.getmembers(mod, inspect.isclass):
-                if issubclass(cls, BaseTokenToKVPoolAllocator):
-                    found[cls.__name__] = cls
+        for pkg in (allocator_pkg, chain_pkg):
+            for mod_info in pkgutil.iter_modules(pkg.__path__):
+                try:
+                    mod = importlib.import_module(f"{pkg.__name__}.{mod_info.name}")
+                except Exception:
+                    continue  # optional backends need hardware this runner may lack
+                for _, cls in inspect.getmembers(mod, inspect.isclass):
+                    if issubclass(cls, BaseTokenToKVPoolAllocator):
+                        found[cls.__name__] = cls
         return found
 
     def test_read_translate_implies_transfer_translate(self):
@@ -398,6 +371,7 @@ class TestEverySwaAllocatorAnswersTheTransferTranslate(CustomTestCase):
         # Guard the guard: an import failure that empties this set would make
         # the assertion below vacuous.
         self.assertIn("SWATokenToKVPoolAllocator", classes)
+        self.assertIn("ChainAllocator", classes)
         for name, cls in sorted(classes.items()):
             if not hasattr(cls, "translate_loc_from_full_to_swa"):
                 continue

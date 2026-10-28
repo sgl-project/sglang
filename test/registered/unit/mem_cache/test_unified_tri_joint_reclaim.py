@@ -261,7 +261,8 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     )
                 self.assertGreater(
-                    a._token_allocation_byte_shortfall(
+                    a._policy._token_allocation_byte_shortfall(
+                        a,
                         400,
                         full_reclaim=c.full_evictable_size(),
                         swa_reclaim=c.swa_evictable_size(),
@@ -446,7 +447,7 @@ class TestTriJointReclaim(CustomTestCase):
                 b, a, c = self.build(state_cache=False)
                 demand = a.available_size()
                 self.assertGreater(demand, a.conserve_full_available_size())
-                self.assertTrue(a._token_reclaim_satisfied(demand))
+                self.assertTrue(a._policy._token_reclaim_satisfied(a, demand))
                 if entry == "direct":
                     self.assertTrue(a.ensure_capacity(demand, demand))
                 elif entry == "helper":
@@ -537,7 +538,12 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 6)
                     self.assertGreaterEqual(allocator.swa_available_size(), 6)
                     self.assertLess(allocator.available_size(), 6)
-                    self.assertEqual(allocator._token_allocation_byte_shortfall(6), 0)
+                    self.assertEqual(
+                        allocator._policy._token_allocation_byte_shortfall(
+                            allocator, 6
+                        ),
+                        0,
+                    )
                     if recovery == "prepare":
                         self.assertTrue(allocator.ensure_capacity(6, 6))
                     elif recovery == "decode":
@@ -684,12 +690,12 @@ class TestTriJointReclaim(CustomTestCase):
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
-                query = a._token_reclaim_satisfied
+                query = a._policy._token_reclaim_satisfied
                 checkpoints, results = [], []
 
-                def checked_query(n):
+                def checked_query(chain, n):
                     before = snapshot(a)
-                    ready = query(n)
+                    ready = query(chain, n)
                     self.assertEqual(snapshot(a), before)
                     if ready:
                         checkpoints.append(c.full_evictable_size())
@@ -716,19 +722,20 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertEqual(side, "high")
                     self.assertEqual(min_bytes, 256)
                     self.assertEqual(
-                        min_bytes, a._token_float_high_target(4, flush_ends=False)
+                        min_bytes,
+                        a._policy._token_float_high_target(a, 4, flush_ends=False),
                     )
                     targets.append(min_bytes)
                     return move(side=side, min_bytes=min_bytes)
 
                 with (
                     patch.object(
-                        a, "_token_reclaim_satisfied", side_effect=checked_query
+                        a._policy, "_token_reclaim_satisfied", side_effect=checked_query
                     ),
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
                     patch.object(sa, "make_room", side_effect=checked_move),
                     patch(
-                        "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
                         side_effect=AssertionError(
                             "certified allocation used fallback"
                         ),
@@ -766,7 +773,7 @@ class TestTriJointReclaim(CustomTestCase):
                 self.insert_parts(c, slots, states)
                 c.evict(EvictParams(num_tokens=1))
                 self.assertEqual(c.full_evictable_size(), 95)
-                self.assertEqual(a._token_float_high_target(4), 256)
+                self.assertEqual(a._policy._token_float_high_target(a, 4), 256)
                 members = {
                     "full": a.full_attn_allocator,
                     "mamba": a.mamba_allocator,
@@ -788,7 +795,7 @@ class TestTriJointReclaim(CustomTestCase):
                     ),
                     patch.object(sa, "make_room", wraps=sa.make_room) as movement,
                     patch(
-                        "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
                         side_effect=AssertionError("stale plan used fallback"),
                     ),
                 ):
@@ -800,7 +807,9 @@ class TestTriJointReclaim(CustomTestCase):
                     )
                 else:
                     self.assertEqual(movement.call_count, 0)
-                    self.assertIsNone(a._token_float_high_target(4, flush_ends=False))
+                    self.assertIsNone(
+                        a._policy._token_float_high_target(a, 4, flush_ends=False)
+                    )
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 setattr(member, gate_attr, None)
                 self.assertTrue(a.ensure_capacity(4, 4))
@@ -822,9 +831,9 @@ class TestTriJointReclaim(CustomTestCase):
                     ids = fa.translate_kv_loc(extra)
                     b.token_to_kv_pool.get_key_buffer(layer)[ids] = 701 + layer
                     b.token_to_kv_pool.get_value_buffer(layer)[ids] = 801 + layer
-                target = a._token_float_high_target(12)
+                target = a._policy._token_float_high_target(a, 12)
                 self.assertIsNotNone(target)
-                self.assertFalse(a._token_end_reclaim_satisfied(12))
+                self.assertFalse(a._policy._token_end_reclaim_satisfied(a, 12))
                 gap = sa._gap_pages()[1]
                 retreat = target // sa.entry_bytes_per_page - gap
                 self.assertGreaterEqual(retreat, sa._live_pages())
@@ -833,7 +842,7 @@ class TestTriJointReclaim(CustomTestCase):
                         sa, "_relocate_to_positions", wraps=sa._relocate_to_positions
                     ) as whole,
                     patch(
-                        "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                        "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
                         side_effect=AssertionError(
                             "positive certificate used fallback"
                         ),
@@ -922,20 +931,20 @@ class TestTriGeometry(CustomTestCase):
                     extra = fa.alloc(extra_pages * ps)
                     self.assertIsNotNone(extra)
                     demand = 2 * ps
-                    target = a._token_float_high_target(demand)
+                    target = a._policy._token_float_high_target(a, demand)
                     self.assertIsNotNone(target)
                     lo, hi = sa._region_bounds_pages()
                     retreat = target // sa.entry_bytes_per_page - (hi - sa.high_wm_page)
                     self.assertEqual(sa.low_wm_page - lo, retreat)
                     self.assertLess(retreat, sa._live_pages())
-                    self.assertFalse(a._token_end_reclaim_satisfied(demand))
+                    self.assertFalse(a._policy._token_end_reclaim_satisfied(a, demand))
                     if one_short:
                         # Bind an existing FULL-only ID into the roomier LOW gap.
                         low_before = sa.low_wm_page
                         sa.alloc_with_virtual(extra[:1] // ps)
                         self.assertEqual(sa.low_wm_page, low_before - 1)
                         before = snapshot(a)
-                        self.assertIsNone(a._token_float_high_target(demand))
+                        self.assertIsNone(a._policy._token_float_high_target(a, demand))
                         self.assertEqual(snapshot(a), before)
                         self.assertFalse(a.verify_byte_accounting())
                         continue
@@ -947,7 +956,7 @@ class TestTriGeometry(CustomTestCase):
                             wraps=sa._relocate_to_positions,
                         ) as whole,
                         patch(
-                            "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                            "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
                             side_effect=AssertionError(
                                 "positive certificate used fallback"
                             ),
@@ -970,11 +979,11 @@ class TestTriGeometry(CustomTestCase):
         ):
             a, kv, mk = build_geometry(ps, ratio, lazy, pattern, gated)
             prior = snapshot(a)
-            target = a._token_float_high_target(npage * ps)
+            target = a._policy._token_float_high_target(a, npage * ps)
             self.assertEqual(snapshot(a), prior)
             if gated or pattern == "empty":
                 self.assertIsNone(target)
-            if target is None or a._token_end_reclaim_satisfied(npage * ps):
+            if target is None or a._policy._token_end_reclaim_satisfied(a, npage * ps):
                 continue
             with self.subTest(
                 ps=ps, ratio=ratio, lazy=lazy, pattern=pattern, npage=npage
@@ -982,7 +991,7 @@ class TestTriGeometry(CustomTestCase):
                 recognized.add(ps)
                 saved = payload(a, kv, mk)
                 with patch(
-                    "sglang.srt.mem_cache.allocator.unified_hybrid_swa._relieve_for_alloc",
+                    "sglang.srt.mem_cache.kv.alloc.interim._relieve_for_alloc",
                     side_effect=AssertionError("FLOAT certificate used fallback"),
                 ):
                     self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
@@ -1003,8 +1012,9 @@ class TestTriGeometry(CustomTestCase):
             vp = vp[vp >= ma.min_page_index]
             mk.buf[ma.virtual_to_physical[vp]] = vp + 1000
             ma.free(vp[1:-1:cut])
-            if npage * ps <= a.available_size() or not a._token_end_reclaim_satisfied(
-                npage * ps
+            if (
+                npage * ps <= a.available_size()
+                or not a._policy._token_end_reclaim_satisfied(a, npage * ps)
             ):
                 continue
             with self.subTest(page_size=ps, ratio=ratio, cut=cut, demand=npage):
@@ -1012,7 +1022,9 @@ class TestTriGeometry(CustomTestCase):
                 saved = payload(a, kv, mk)
                 prior = snapshot(a)
                 for _ in range(20):
-                    self.assertTrue(a._token_end_reclaim_satisfied(npage * ps))
+                    self.assertTrue(
+                        a._policy._token_end_reclaim_satisfied(a, npage * ps)
+                    )
                 self.assertEqual(snapshot(a), prior)
                 sa = a.swa_attn_allocator
                 with (
@@ -1033,13 +1045,13 @@ class TestTriGeometry(CustomTestCase):
             with self.subTest(pd_open=pd_open, host_open=host_open):
                 a, kv, mk = build_geometry(1, (1, 4), True, "swa_edges", False)
                 self.assertLess(a.available_size(), 5)
-                self.assertTrue(a._token_reclaim_satisfied(5))
+                self.assertTrue(a._policy._token_reclaim_satisfied(a, 5))
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
                     member.disagg_move_gate = lambda: pd_open
                     member.host_transfer_move_gate = lambda: host_open
                 before = snapshot(a)
-                self.assertFalse(a._token_reclaim_satisfied(5))
+                self.assertFalse(a._policy._token_reclaim_satisfied(a, 5))
                 with patch.object(
                     kv.swa_kv_pool,
                     "move_physical_pages",
@@ -1087,11 +1099,16 @@ class TestTriGeometry(CustomTestCase):
                 for member in a._flush_targets():
                     member.disagg_move_gate = lambda: False
                 before = snapshot(a)
-                predictions = [a._token_reclaim_satisfied(n * ps) for n in range(1, 10)]
+                predictions = [
+                    a._policy._token_reclaim_satisfied(a, n * ps) for n in range(1, 10)
+                ]
                 for _ in range(20):
                     self.assertEqual(
                         predictions,
-                        [a._token_reclaim_satisfied(n * ps) for n in range(1, 10)],
+                        [
+                            a._policy._token_reclaim_satisfied(a, n * ps)
+                            for n in range(1, 10)
+                        ],
                     )
                 self.assertEqual(snapshot(a), before)
                 for member in a._flush_targets():
@@ -1103,7 +1120,9 @@ class TestTriGeometry(CustomTestCase):
                     fa.flush_for_allocation()
                     self.assertFalse(fa._pending_reuse)
                     n = max(
-                        n for n in range(1, 10) if a._token_reclaim_satisfied(n * ps)
+                        n
+                        for n in range(1, 10)
+                        if a._policy._token_reclaim_satisfied(a, n * ps)
                     )
                     self.assertTrue(a.ensure_capacity(n * ps, n * ps))
                     self.assertIsNotNone(a.alloc(n * ps))

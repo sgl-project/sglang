@@ -421,7 +421,11 @@ class MockDSV4ModelRunner:
         # Register identity full->swa mapping over swa_size full locs.
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
         self.token_to_kv_pool.register_mapping(identity)
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+        )
         self.kv_index_translator = KVIndexTranslator(
             req_to_token=self.req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

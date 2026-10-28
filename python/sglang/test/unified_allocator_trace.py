@@ -105,10 +105,10 @@ class HostModel(msgspec.Struct, kw_only=True):
     cached: int = 0
 
 
-class CompositeAdapter:
-    """The adapter for the composite allocators the unified pool builder builds."""
+class BuilderAdapter:
+    """The adapter for the allocator the unified pool builder builds."""
 
-    name = "composite"
+    name = "builder"
 
     def __init__(self, config: TraceConfig):
         setup_allocator_context()
@@ -300,7 +300,7 @@ class CompositeAdapter:
 
 
 ADAPTERS: Dict[str, Callable[[TraceConfig], object]] = {
-    CompositeAdapter.name: CompositeAdapter
+    BuilderAdapter.name: BuilderAdapter
 }
 
 
@@ -508,7 +508,7 @@ def record_run(
     seed: Optional[int] = None,
     ops: Optional[List[dict]] = None,
     steps: int = 200,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
     coverage: Optional[collections.Counter] = None,
 ) -> List[dict]:
@@ -561,7 +561,7 @@ def replay_run(
     config: TraceConfig,
     records: List[dict],
     *,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
 ) -> Optional[Divergence]:
     """Replay recorded operations on an adapter; the first step whose outcome

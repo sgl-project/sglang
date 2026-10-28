@@ -1,8 +1,8 @@
 """Build the unified KV pool stack from declarations: plan, size, then construct.
 
-`build_unified_pools` is the one entry point. Which KV facade and which
-composite allocator a plan gets still depends on its set of lifetimes; that
-choice is the `_BUILDERS` table below, until one allocator serves every chain.
+`build_unified_pools` is the one entry point. Every plan gets one
+`ChainAllocator` over its sub-pools; which KV facade it gets still depends on
+its set of lifetimes, the `_BUILDERS` table below.
 """
 
 import logging
@@ -10,6 +10,7 @@ from typing import Any, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.decl import (
     FullLifetime,
     KVLayerDecl,
@@ -86,10 +87,6 @@ def _build_full_window(
 ) -> UnifiedSWAPoolBundle:
     """Full + window: both sub-allocators are page-aware, one virtual id space
     at page granularity, two physical sub-pools compacting independently."""
-    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-        UnifiedSWATokenToKVPoolAllocator,
-    )
-
     full = plan.of_lifetime(FullLifetime)
     window = plan.of_lifetime(WindowLifetime)
     legacy_allocator_capacities = {}
@@ -117,8 +114,9 @@ def _build_full_window(
         end_layer=ctx.end_layer,
         enable_memory_saver=ctx.enable_memory_saver,
     )
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
         unified_buffer=shared_pool,
+        roles=ChainRoles(owner=full.name, window=window.name),
         kvcache=token_to_kv_pool,
         device=ctx.device,
         page_size=plan.page_size,
@@ -180,10 +178,6 @@ def _build_full_state(
 ) -> UnifiedPoolBundle:
     """Full + state: the full sub-pool is page-aware, the state sub-pool is
     one slot per request."""
-    from sglang.srt.mem_cache.allocator.unified_mamba import (
-        UnifiedMambaTokenToKVPoolAllocator,
-    )
-
     full = plan.of_lifetime(FullLifetime)
     state = plan.of_lifetime(StateLifetime)
     use_mla = isinstance(full.spec, MLASubPoolSpec)
@@ -233,9 +227,11 @@ def _build_full_state(
         start_layer=ctx.start_layer,
         full_kv_pool=unified_full_kv_pool,
     )
-    allocator = UnifiedMambaTokenToKVPoolAllocator(
+    allocator = ChainAllocator(
         unified_buffer=shared_pool,
+        roles=ChainRoles(owner=full.name, state=state.name),
         kvcache=token_to_kv_pool,
+        state_kvcache=req_to_token_pool.mamba_pool,
         device=ctx.device,
         page_size=plan.page_size,
         need_sort=ctx.need_sort,
@@ -300,10 +296,6 @@ def _build_full_window_state(
     ctx: UnifiedBuildContext,
 ) -> UnifiedPoolBundle:
     """Full + window + state: the window sub-pool floats between the two ends."""
-    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-        UnifiedMambaSWATokenToKVPoolAllocator,
-    )
-
     full = plan.of_lifetime(FullLifetime)
     window = plan.of_lifetime(WindowLifetime)
     state = plan.of_lifetime(StateLifetime)
@@ -325,10 +317,11 @@ def _build_full_window_state(
         enable_memory_saver=ctx.enable_memory_saver,
     )
     req_to_token_pool = _build_state_request_table(plan, shared_pool, ctx)
-    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
         unified_buffer=shared_pool,
+        roles=ChainRoles(owner=full.name, window=window.name, state=state.name),
         kvcache=token_to_kv_pool,
-        mamba_kvcache=req_to_token_pool.mamba_pool,
+        state_kvcache=req_to_token_pool.mamba_pool,
         device=ctx.device,
         full_max_total_num_tokens=sizing.full_tokens,
         swa_max_total_num_tokens=sizing.window_tokens,
@@ -371,7 +364,7 @@ def _build_full_window_state(
     )
 
 
-# Which facade and composite allocator a plan gets, by its set of lifetimes.
+# Which facade a plan gets, by its set of lifetimes.
 _BUILDERS = {
     frozenset({FullLifetime, WindowLifetime}): _build_full_window,
     frozenset({FullLifetime, StateLifetime}): _build_full_state,

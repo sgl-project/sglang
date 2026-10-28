@@ -2370,20 +2370,18 @@ def _swa_transfer_core(
     has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-        UnifiedSWAAllocatorBase,
-    )
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
     from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
-    allocator = Mock(
-        spec=UnifiedSWAAllocatorBase if unified else SWATokenToKVPoolAllocator
-    )
+    allocator = Mock(spec=ChainAllocator if unified else SWATokenToKVPoolAllocator)
     allocator.device = torch.device("cpu")
     allocator.swa_req_ring = False
+    allocator.hands_out_virtual_ids = unified
+    allocator.has_window_pool = True
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,

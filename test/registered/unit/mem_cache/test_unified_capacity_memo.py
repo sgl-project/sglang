@@ -36,9 +36,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 def _build(lazy: bool):
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
-    from test_multi_ended_allocator import (
-        TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
-    )
+    from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
 
     inst = _SwaFixture([m for m in dir(_SwaFixture) if m.startswith("test_")][0])
     pool, allocator, kvcache = inst._build()
@@ -52,7 +50,8 @@ class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator._policy._compute_available_size(allocator),
         )
         for band in (
             allocator.full_attn_allocator,
@@ -201,7 +200,8 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
 
     def _assert_memos_fresh(self, allocator):
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator._policy._compute_available_size(allocator),
         )
         for band in (
             allocator.full_attn_allocator,

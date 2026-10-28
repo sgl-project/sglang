@@ -70,7 +70,7 @@ def _make_prefill_aware_swa_runner(
         enable_prefill_cp=False,
     )
     token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
-    token_to_kv_pool_allocator = object()
+    token_to_kv_pool_allocator = SimpleNamespace(hands_out_virtual_ids=False)
     return SimpleNamespace(
         sliding_window_size=None,
         model_config=model_config,

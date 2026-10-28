@@ -31,7 +31,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # the static-pool view the assertions below are written against.
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(),
             page_size=backend.page_size,
             device="cpu",
@@ -63,7 +63,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # backend the strict passthrough view it now reads its tables from.
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token_pool.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
             device="cpu",

@@ -6,9 +6,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,10 +37,11 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
     )
     kv = FakeUnifiedSWAKVPool(pool)
     mk = FakeKVCache(pool.max_slots("mamba"))
-    a = UnifiedMambaSWATokenToKVPoolAllocator(
+    a = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=pool,
         kvcache=kv,
-        mamba_kvcache=mk,
+        state_kvcache=mk,
         device="cpu",
         full_max_total_num_tokens=ps * 1000,
         swa_max_total_num_tokens=ps * 1000,

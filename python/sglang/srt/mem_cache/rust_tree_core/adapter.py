@@ -435,11 +435,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         ] = None
         allocator = params.token_to_kv_pool_allocator
         if allocator is not None and ComponentType.SWA in self.tree_components:
-            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-                UnifiedSWAAllocatorBase,
-            )
-
-            if isinstance(allocator, UnifiedSWAAllocatorBase):
+            if allocator.hands_out_virtual_ids:
                 self._swa_backup_index_mapper = (
                     allocator.translate_swa_indices_for_transfer
                 )

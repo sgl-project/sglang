@@ -18,10 +18,9 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.interim import _FloatChainPolicy
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_parallel
@@ -327,7 +326,11 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(budget.remaining_swa, 64)
 
     def test_tri_pool_keeps_fixed_admission_and_clipping(self):
-        allocator = self._allocator(UnifiedMambaSWATokenToKVPoolAllocator)
+        allocator = self._allocator(ChainAllocator)
+        # A full + window + state chain's capacity policy, sized like the rest.
+        allocator._policy = object.__new__(_FloatChainPolicy)
+        allocator._policy._size_full = 128
+        allocator._policy._size_swa = 64
         allocator.can_reserve = MagicMock(
             side_effect=AssertionError("two-pool reservation")
         )

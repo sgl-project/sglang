@@ -308,7 +308,11 @@ class MockMLAModelRunner(ModelRunner):
             device=device,
             enable_memory_saver=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+        )
         self.is_draft_worker = False
         self.init_kv_index_translator()
         self.attention_chunk_size = None

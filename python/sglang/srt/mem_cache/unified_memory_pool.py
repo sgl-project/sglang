@@ -1239,7 +1239,7 @@ class UnifiedHybridLinearKVPool(HybridLinearKVPool):
 class UnifiedPoolBundle(NamedTuple):
     unified_memory_pool: UnifiedKVPool
     token_to_kv_pool: object  # HybridLinearKVPool
-    token_to_kv_pool_allocator: object  # UnifiedMambaTokenToKVPoolAllocator
+    token_to_kv_pool_allocator: object  # ChainAllocator
     req_to_token_pool: object  # UnifiedHybridReqToTokenPool
 
 
@@ -1569,4 +1569,4 @@ class UnifiedSWAKVPool(SWAKVPool):
 class UnifiedSWAPoolBundle(NamedTuple):
     unified_memory_pool: UnifiedKVPool
     token_to_kv_pool: object  # UnifiedSWAKVPool
-    token_to_kv_pool_allocator: object  # UnifiedSWATokenToKVPoolAllocator
+    token_to_kv_pool_allocator: object  # ChainAllocator
