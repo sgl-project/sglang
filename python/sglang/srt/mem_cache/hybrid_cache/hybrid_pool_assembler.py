@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv import HostPoolOptions
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1346,6 +1347,27 @@ def build_unified_host_stack(
             owner_id_drafts,
         )
 
+    parallel = get_parallel()
+
+    def build_host(name, drafts):
+        layout = storage.host_layout(name)
+        options = HostPoolOptions(
+            ratio=memory.hicache_ratio,
+            size=memory.hicache_size if host_sizes[name] is None else host_sizes[name],
+            page_size=page_size,
+            layout=memory.hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label=name,
+            dcp_size=parallel.attn_dcp_size if parallel.dcp_enabled else 1,
+            dcp_rank=parallel.attn_dcp_rank if parallel.dcp_enabled else 0,
+        )
+        return layout.build(
+            options,
+            draft_buffer_infos=tuple(
+                draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+            ),
+        )
+
     host_pools = {}
     if envelope is not None:
         pair = UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
@@ -1370,13 +1392,7 @@ def build_unified_host_stack(
         packed_draft_device_pools=token_drafts[owner],
     )
     if owner not in host_pools:
-        host_pools[owner] = build_kv_host_pool(
-            kv_pool=owner_config.root,
-            page_size=page_size,
-            host_size=host_sizes[owner],
-            mtp_draft_device_pools=owner_config.packed_draft_device_pools,
-            pool_label=owner,
-        )
+        host_pools[owner] = build_host(owner, owner_config.packed_draft_device_pools)
     entries = _build_pool_entries(
         config=owner_config,
         root_host_pool=host_pools[owner],
@@ -1390,28 +1406,10 @@ def build_unified_host_stack(
             continue
         view = storage.view(s.name)
         component = ComponentType[s.external.tree_component]
-        if s.holds_state:
-            info = _mamba_info(view)
-            drafts = params.mtp_draft_mamba_pools
-            host_pools[s.name] = build_mamba_host_pool(
-                view,
-                info,
-                host_size=host_sizes[s.name],
-                layout=_state_host_layout(),
-                mtp_draft_device_pools=drafts,
-            )
-            device_layer_num = len(info.layer_ids)
-        else:
-            drafts = token_drafts[s.name]
-            if s.name not in host_pools:
-                host_pools[s.name] = build_kv_host_pool(
-                    kv_pool=view,
-                    page_size=page_size,
-                    host_size=host_sizes[s.name],
-                    mtp_draft_device_pools=drafts,
-                    pool_label=s.name,
-                )
-            device_layer_num = view.layer_num
+        drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
+        if s.name not in host_pools:
+            host_pools[s.name] = build_host(s.name, drafts)
+        device_layer_num = storage.host_layout(s.name).device_layer_num
         alloc = storage.host_load_alloc(s.name)
         entries.append(
             build_pool_entry(

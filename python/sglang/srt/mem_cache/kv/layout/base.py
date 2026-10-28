@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.layout.fused_draft import DraftRegion
@@ -91,3 +92,17 @@ class SubPoolSpec(ABC):
     def get_dtype(self) -> torch.dtype:
         """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
         raise NotImplementedError
+
+
+class HostPoolOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """Host allocation policy, separate from a layout's device buffer facts."""
+
+    ratio: float
+    size: float
+    page_size: int
+    layout: str
+    allocator_type: str
+    pool_label: str
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    pin_memory: bool = True

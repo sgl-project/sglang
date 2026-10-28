@@ -109,6 +109,10 @@ class KVStorage:
             )
         self._sub_pools = tuple(sub_pools)
 
+    def host_layout(self, name: str):
+        """The sub-pool's host layout and persistent device buffers."""
+        return self.view(name).host_layout()
+
     @property
     def allocator(self):
         """The chain allocator, for what does not go through this storage yet:
