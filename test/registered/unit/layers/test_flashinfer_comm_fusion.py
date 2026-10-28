@@ -561,6 +561,87 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
         self.assertIsNone(moe_tp._fi_workspace_hint)
 
 
+class TestWorkspacePreflightVote(CustomTestCase):
+    """No rank may enter FlashInfer's workspace exchange unless all ranks can.
+
+    FlashInfer allocates the workspace locally and then exchanges handles across
+    ranks; a rank that fails alone leaves its peers waiting in the exchange.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved = fusion._flashinfer_allreduce_unavailable
+        fusion._flashinfer_allreduce_unavailable = False
+
+    def tearDown(self):
+        fusion._flashinfer_allreduce_unavailable = self._saved
+        super().tearDown()
+
+    def _initialize(self, *, cc, free_bytes, peers_ok=True):
+        fake_comm = _FakeFlashInferComm()
+        create = MagicMock(side_effect=fake_comm.create_allreduce_fusion_workspace)
+        vmm_probe = MagicMock(return_value=True)
+
+        def vote(flag, op=None, group=None):
+            if not peers_ok:
+                flag.zero_()
+
+        manager = fusion.FlashInferWorkspaceManager()
+        with (
+            _confidential_compute(cc),
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(fusion, "_create_allreduce_fusion_workspace", create),
+            patch.object(fusion, "in_the_same_node_as", return_value=[True] * 4),
+            patch.object(fusion, "get_cuda_driver_bindings"),
+            patch.object(fusion, "_make_flashinfer_workspace_allocation_prop"),
+            patch.object(
+                fusion,
+                "_flashinfer_trtllm_workspace_allocation_sizes",
+                return_value=[1 << 21],
+            ),
+            patch.object(fusion, "_probe_cumem_create_sequence", vmm_probe),
+            patch.object(torch.cuda, "mem_get_info", return_value=(free_bytes, 0)),
+            patch.object(torch.distributed, "all_reduce", side_effect=vote),
+            patch.object(torch.distributed, "get_rank", return_value=0),
+        ):
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="trtllm",
+                cpu_group=MagicMock(),
+            )
+        return manager, create, vmm_probe
+
+    def test_cc_rank_without_memory_stops_every_rank(self):
+        manager, create, vmm_probe = self._initialize(cc=True, free_bytes=0)
+        create.assert_not_called()
+        # CC blocks the VMM probe, so it must not run there.
+        vmm_probe.assert_not_called()
+        self.assertFalse(manager.initialized)
+        self.assertTrue(fusion.is_flashinfer_allreduce_unavailable())
+
+    def test_cc_peer_without_memory_stops_this_rank(self):
+        manager, create, _ = self._initialize(
+            cc=True, free_bytes=1 << 40, peers_ok=False
+        )
+        create.assert_not_called()
+        self.assertFalse(manager.initialized)
+
+    def test_cc_proceeds_when_every_rank_fits(self):
+        manager, create, _ = self._initialize(cc=True, free_bytes=1 << 40)
+        create.assert_called_once()
+        self.assertTrue(manager.initialized)
+
+    def test_vmm_probe_runs_off_cc(self):
+        # Off CC FlashInfer allocates its VMM workspace: the cuMemCreate probe
+        # decides, and free memory is not consulted.
+        _, create, vmm_probe = self._initialize(cc=False, free_bytes=0)
+        vmm_probe.assert_called_once()
+        create.assert_called_once()
+
+
 class TestMnnvlCliqueGate(CustomTestCase):
     """MNNVL fusion must be declined when a cross-node group is not one clique."""
 
