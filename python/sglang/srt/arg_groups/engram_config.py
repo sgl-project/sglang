@@ -2,7 +2,7 @@
 server-argument resolution imports it without torch."""
 
 import dataclasses
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 class EngramPlacement:
@@ -24,8 +24,13 @@ class EngramLookup:
     ALL_TO_ALL = "all_to_all"
     PEER_READ = "peer_read"
     ALL = (AUTO, ALL_REDUCE, REDUCE_SCATTER, ALL_TO_ALL, PEER_READ)
-    # AUTO's name before the collectives could be chosen, still accepted.
+    # Read as AUTO.
     COLLECTIVE = "collective"
+
+
+def cols_per_rank(columns: int, tp_size: int) -> Optional[int]:
+    """Hash columns each TP rank owns when they divide evenly, else None."""
+    return columns // tp_size if columns % tp_size == 0 else None
 
 
 def _choice(default: str, choices: tuple):

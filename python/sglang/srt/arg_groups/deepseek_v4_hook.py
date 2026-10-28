@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.engram_config import (
     EngramLookup,
     EngramPlacement,
     EngramReplication,
+    cols_per_rank,
 )
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -125,7 +126,7 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
     if config.lookup == EngramLookup.ALL_TO_ALL:
         text_config = model_config_of(server_args).hf_text_config
         columns = text_config.engram_n_heads * (text_config.engram_max_ngram_size - 1)
-        if columns % cfg.tp_size:
+        if cols_per_rank(columns, cfg.tp_size) is None:
             raise ValueError(
                 f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
                 f"columns to divide over --tp-size {cfg.tp_size}."
