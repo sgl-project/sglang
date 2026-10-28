@@ -7,8 +7,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     SymmetricMemoryContext,
     describe_registration_in_progress,
 )
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    create_scheduler_watchdog,
+    SchedulerWatchdog,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,8 +48,10 @@ class TestSymmMemRegistrationWatchdog(CustomTestCase):
     def test_dump_names_registration_during_init(self):
         # A stall in NCCL's window registration has no error of its own; the
         # watchdog dump must name it, also while CUDA graphs are captured.
-        scheduler = SimpleNamespace(is_initializing=True, forward_ct=0)
-        watchdog = create_scheduler_watchdog(scheduler, watchdog_timeout=3600)
+        # A fresh engine is initializing.
+        watchdog = SchedulerWatchdog(
+            counters=LaunchCounters(), flags=EngineFlags(), watchdog_timeout=3600
+        ).raw
         self.assertEqual(watchdog.dump_info(), "")
 
         with mock.patch.object(pynccl_allocator, "_registering_context", FAKE_CTX):
