@@ -40,6 +40,19 @@ def get_mori_fabric_mem_pool() -> Any:
     return _MORI_FABRIC_MEM_POOL
 
 
+def _is_mori_pd() -> bool:
+    from sglang.srt.runtime_context import get_disagg
+
+    try:
+        config = get_disagg()
+    except ValueError:
+        return False
+    return (
+        config.disaggregation_mode in ("prefill", "decode")
+        and config.disaggregation_transfer_backend == "mori"
+    )
+
+
 def init_mori_custom_mem_pool(
     device: str,
 ) -> Tuple[bool, Optional[Any], Optional[str]]:
@@ -48,7 +61,8 @@ def init_mori_custom_mem_pool(
     With staging on, only the staging slots need Fabric memory.
     """
     if (
-        envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric"
+        not _is_mori_pd()
+        or envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric"
         or envs.SGLANG_MORI_FABRIC_STAGING.get()
     ):
         return False, None, None

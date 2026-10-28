@@ -14,7 +14,7 @@
 """Common utilities."""
 
 import hashlib
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
@@ -43,7 +43,6 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
@@ -84,41 +83,25 @@ def get_eviction_strategy(
     return factory(**config) if config else factory()
 
 
-_MemPoolResult = Tuple[bool, Optional[Any], Optional[str]]
-
-
-def _mori_custom_mem_pool(device: str) -> _MemPoolResult:
+def _custom_mem_pool_providers() -> List[Callable[[str], Tuple]]:
+    from sglang.srt.disaggregation.mooncake.utils import (
+        init_mooncake_custom_mem_pool,
+    )
     from sglang.srt.disaggregation.mori.custom_mem_pool import (
         init_mori_custom_mem_pool,
     )
 
-    return init_mori_custom_mem_pool(device)
+    return [init_mooncake_custom_mem_pool, init_mori_custom_mem_pool]
 
 
-# PD transfer backends that may choose the KV pool allocator themselves. A
-# resolver returning (False, None, None) falls back to the env-driven pool below.
-_PD_BACKEND_MEM_POOLS: Dict[str, Callable[[str], _MemPoolResult]] = {
-    "mori": _mori_custom_mem_pool,
-}
-
-
-def _pd_transfer_backend() -> Optional[str]:
-    from sglang.srt.runtime_context import get_disagg
-
-    try:
-        config = get_disagg()
-    except ValueError:
-        return None
-    if config.disaggregation_mode not in ("prefill", "decode"):
-        return None
-    return config.disaggregation_transfer_backend
-
-
-def maybe_init_custom_mem_pool(device: str) -> _MemPoolResult:
+def maybe_init_custom_mem_pool(
+    device: str,
+) -> Tuple[bool, Optional[Any], Optional[str]]:
     """
     Initialize custom memory pool based on environment variable.
 
-    This function can be modified to support more features that require a custom memory pool.
+    Each provider decides from its own configuration whether it applies; the
+    first one that does owns the pool.
 
     Args:
         device: The device to allocate memory on
@@ -126,25 +109,11 @@ def maybe_init_custom_mem_pool(device: str) -> _MemPoolResult:
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    resolve = _PD_BACKEND_MEM_POOLS.get(_pd_transfer_backend())
-    if resolve is not None:
-        result = resolve(device)
+    for provider in _custom_mem_pool_providers():
+        result = provider(device)
         if result[0]:
             return result
-
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
-
-    if enable_custom_mem_pool:
-        # Mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
-        )
-
-        return init_mooncake_custom_mem_pool(device)
-    else:
-        return False, None, None
+    return False, None, None
 
 
 def get_hash_str(
