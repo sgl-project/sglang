@@ -127,6 +127,7 @@ def packed_batch():
         input_ids=ids,
         extend_seq_lens=torch.tensor([4, 3]),
         forward_mode=ForwardMode.EXTEND,
+        global_num_token_non_padded_cpu=None,
         extend_seq_lens_cpu=[4, 3],
         token_type_ids=torch.tensor([0, 0, 1, 1, 0, 1, 1]),
         dimensions=None,

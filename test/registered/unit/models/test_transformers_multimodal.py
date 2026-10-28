@@ -167,6 +167,7 @@ class ReferencePagedAttention:
 def batch_for(mm_inputs, length, prefix=0):
     return SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
+        global_num_token_non_padded_cpu=None,
         mm_inputs=[mm_inputs],
         extend_prefix_lens_cpu=[prefix],
         extend_seq_lens_cpu=[length],

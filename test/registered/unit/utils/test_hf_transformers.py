@@ -975,7 +975,7 @@ class TestNormalizeTpStyle(CustomTestCase):
         from sglang.srt.models.transformers import _normalize_tp_style
 
         with self.assertRaises(ValueError):
-            _normalize_tp_style("mla_kv_a_proj")
+            _normalize_tp_style("not_a_tp_style")
 
 
 class TestLayerTypesValidationPatch(CustomTestCase):

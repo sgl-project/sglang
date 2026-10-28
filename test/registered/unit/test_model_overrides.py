@@ -202,6 +202,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
                     "enable_fused_qk_norm_rope",
+                    "flashinfer_mla_disable_ragged",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",

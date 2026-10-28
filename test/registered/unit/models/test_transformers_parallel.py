@@ -114,6 +114,7 @@ def test_hf_parallel_plans_allow_complete_tp1_backbone(runtime, name):
         extend_seq_lens=torch.tensor([4, 3]),
         extend_seq_lens_cpu=[4, 3],
         forward_mode=ForwardMode.EXTEND,
+        global_num_token_non_padded_cpu=None,
         token_type_ids=None,
     )
     with torch.no_grad():
