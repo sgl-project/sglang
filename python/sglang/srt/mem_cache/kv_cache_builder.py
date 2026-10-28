@@ -264,6 +264,32 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def swa_gates_tree_prefix_match(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    # SWA the tree does not own must not gate prefix matching: a per-request ring,
+    # paged SWA beside the target's encoder-replay request window (only the draft
+    # uses it), or a PD decode that re-transfers the whole SWA tail.
+    return not (
+        is_swa_req_ring(token_to_kv_pool_allocator)
+        or (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is not None
+        )
+        or (
+            get_disagg().disaggregation_mode == "decode"
+            and uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator)
+        )
+    )
+
+
+def uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    """Whether PD decode allocates a fresh SWA tail that prefill always transfers."""
+    return (
+        isinstance(token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+        and token_to_kv_pool_allocator.page_size > 1
+        and hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+    )
+
+
 def validate_decode_radix_cache(
     *,
     model_config: ModelConfig,
@@ -286,17 +312,6 @@ def validate_decode_radix_cache(
             "window attention (SWA) models currently supports only "
             "device-resident cache and is incompatible with "
             "--enable-hierarchical-cache."
-        )
-    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
-    # SWA ring and c128 state are request-scoped and always transferred whole, so
-    # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
-        token_to_kv_pool, "_unified_kv", False
-    ):
-        raise ValueError(
-            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
-            "requires the unified KV layout "
-            "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
         )
     if getattr(model_config, "is_hybrid_swa_compress", False):
         raise ValueError(
@@ -349,15 +364,8 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
-    # SWA the tree does not own must not gate prefix matching: a per-request ring,
-    # or paged SWA beside the target's encoder-replay request window, which then
-    # only the draft uses.
-    swa_gates_prefix_match = not (
-        is_swa_req_ring(token_to_kv_pool_allocator)
-        or (
-            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-            and token_to_kv_pool.request_window is not None
-        )
+    swa_gates_prefix_match = swa_gates_tree_prefix_match(
+        token_to_kv_pool, token_to_kv_pool_allocator
     )
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)

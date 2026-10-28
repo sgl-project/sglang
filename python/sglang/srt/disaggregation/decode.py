@@ -113,13 +113,15 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
+from sglang.srt.mem_cache.kv_cache_builder import (
+    decode_retraction_max_tokens,
+    uses_swa_tail_prealloc,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -496,10 +498,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.kv_checksum_computer = None
 
     def _uses_swa_tail_prealloc(self) -> bool:
-        return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
-            and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        return uses_swa_tail_prealloc(
+            self.token_to_kv_pool, self.token_to_kv_pool_allocator
         )
 
     def _uses_swa_reservation(self) -> bool:
@@ -1611,6 +1611,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            decode_req.req.pd_prefill_fill_len = self._pre_alloc_fill_len(
+                decode_req.req
+            )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -3533,6 +3536,11 @@ class SchedulerDisaggregationDecodeMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
+            self.tree_cache.check_hicache_events()
+        elif (
+            getattr(self.tree_cache, "linker", None) is not None
+            and self.tree_cache.linker.pending_offloads
+        ):
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

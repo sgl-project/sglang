@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -653,6 +654,12 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def _prefill_stored_prefix(self, length: int):
+        # PD prefill already stored these pages, so decode must not write them.
+        if self.linker is None or get_disagg().disaggregation_mode != "decode":
+            return nullcontext()
+        return self.linker.prefill_stored_prefix(length)
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
@@ -1253,7 +1260,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        prefill_key = RadixKey(
+            token_ids[: req.pd_prefill_fill_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        with self._prefill_stored_prefix(len(prefill_key)):
+            result = self.insert(insert_params)
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
