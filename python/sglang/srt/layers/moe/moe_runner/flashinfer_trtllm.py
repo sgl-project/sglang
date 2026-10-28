@@ -1521,11 +1521,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     defer_finalize = _deferred_finalize_enabled.get() and hidden_pad == 0
     if defer_finalize:
         valid_deferred_input = (
-            use_routed_topk and TopKOutputChecker.format_is_standard(topk_output)
+            use_routed_topk
+            and (
+                TopKOutputChecker.format_is_standard(topk_output)
+                or TopKOutputChecker.format_is_packed(topk_output)
+            )
         ) or (not use_routed_topk and TopKOutputChecker.format_is_bypassed(topk_output))
         if not valid_deferred_input:
             raise RuntimeError(
-                "FP4 deferred finalize requires either materialized routed TopK "
+                "FP4 deferred finalize requires materialized or packed routed TopK "
                 "or the logits-based bypassed TopK input"
             )
 

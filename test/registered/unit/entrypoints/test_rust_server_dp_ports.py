@@ -18,7 +18,7 @@ from sglang.srt.rust_server import server as rust_server
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _scheduler_for_typed_config():
@@ -44,6 +44,7 @@ def _scheduler_for_typed_config():
         tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
+        rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )
 
 
@@ -77,6 +78,10 @@ def _scheduler_for_typed_config():
             "limit_mm_data_per_request",
             [("video", 1), ("image", 2)],
         ),
+        # The server loads the scheduler's tokenizer copy and reports the
+        # launched path.
+        ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
+        ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
     ],
     ids=[
         "native-grpc",
@@ -90,6 +95,8 @@ def _scheduler_for_typed_config():
         "priority-on",
         "mm-limits-unset",
         "mm-limits-keep-order",
+        "loaded-tokenizer",
+        "public-tokenizer",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -122,6 +129,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    assert deployment_info["rust_server_endpoints"] == [
+        {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -160,10 +170,17 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
-def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+def test_typed_config_carries_tokenizer_metrics(enable_metrics):
     extension = MagicMock()
     with (
-        get_context().override_server_args(enable_metrics=enable_metrics),
+        get_context().override_server_args(
+            enable_metrics=enable_metrics,
+            served_model_name="m",
+            enable_priority_scheduling=True,
+            extra_metric_labels={"cluster": "c"},
+            bucket_inter_token_latency=[0.001, 0.01],
+            generation_tokens_buckets=["custom", "10", "1"],
+        ),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
@@ -175,11 +192,26 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         )
 
     metrics = extension.ServerArgs.call_args.kwargs["metrics"]
-    if enable_metrics:
-        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
-        assert metrics is extension.MetricsConfig.return_value
-    else:
+    if not enable_metrics:
         assert metrics is None
+        return
+    assert metrics is extension.MetricsConfig.return_value
+    extension.MetricsConfig.assert_called_once_with(
+        multiproc_dir="/tmp/prom",
+        labels={
+            "model_name": "m",
+            "engine_type": "unified",
+            "priority": "",
+            "cluster": "c",
+        },
+        priority_label=True,
+        bucket_time_to_first_token=None,
+        bucket_inter_token_latency=[0.001, 0.01],
+        bucket_e2e_request_latency=None,
+        # The default rule keeps the Rust side's defaults; others resolve here.
+        bucket_prompt_tokens=None,
+        bucket_generation_tokens=[1.0, 10.0],
+    )
 
 
 @pytest.mark.parametrize(
