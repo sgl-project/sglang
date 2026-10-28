@@ -35,6 +35,8 @@ struct QuickAllReduce {
   static int64_t init(int64_t world_size, int64_t rank, int64_t max_problem_size) {
     host::RuntimeCheck(world_size == 4, "the JIT quick all-reduce is built for TP4");
     host::RuntimeCheck(0 <= rank && rank < world_size, "invalid rank");
+    // the kernel addresses each phase of the buffer with 32-bit offsets
+    host::RuntimeCheck(max_problem_size <= (int64_t{1} << 31), "quick all-reduce max size is 2 GiB");
     auto* comms = new quickreduce::DeviceComms();
     comms->init(
         static_cast<int>(world_size),
@@ -94,7 +96,10 @@ struct QuickAllReduce {
   }
 
   static void destroy(int64_t comm) {
-    delete reinterpret_cast<quickreduce::DeviceComms*>(comm);
+    auto* comms = reinterpret_cast<quickreduce::DeviceComms*>(comm);
+    // a HIP error raises here; from the noexcept destructor it would terminate
+    comms->destroy();
+    delete comms;
   }
 
   static int64_t handle_bytes() {
