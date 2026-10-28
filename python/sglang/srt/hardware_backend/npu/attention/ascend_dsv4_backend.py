@@ -1530,22 +1530,15 @@ class LowRatioCompressAscendBackendMixin:
         )
         scored = indices.view(t, topk).to(torch.int32)
         if os.environ.get("SGLANG_DSV41_DEBUG_QSLI"):
-            # What MQSMLA will be told: cmp_topk_length = min(visible, index_topk)
-            # (the position-derived upper bound).  Any -1 of `scored` inside that
-            # prefix is the exact wild-address violation -- the CPU golden raises
-            # on it (mqsmla_golden.py L215) and the kernel does not skip it --
-            # so print every occurrence, not just the first call per layer.
-            # Per-row lengths: extend rows outnumber batches (cu bucketing).
-            cu = fm.actual_seq_lengths_q_pa
-            if cu is not None and t == int(cu[-1]) and t != cu.numel() - 1:
-                row_b = torch.repeat_interleave(
-                    torch.arange(cu.numel() - 1, device=scored.device),
-                    (cu[1:] - cu[:-1]).to(torch.long),
-                )
-            else:
-                row_b = torch.arange(t, device=scored.device)
-            lens = (forward_batch.seq_lens.to(torch.long) // ratio)[row_b].clamp_max(
-                int(topk)
+            # What MQSMLA will be told: exactly the helper's buffer (position
+            # derived, dead rows zeroed).  Any -1 of `scored` inside that prefix
+            # is the wild-address violation -- the CPU golden raises on it
+            # (mqsmla_golden.py L215) and the kernel does not skip it -- so print
+            # every occurrence, not just the first call per layer.
+            lens = (
+                self._dsv41_cmp_topk_length(forward_batch, ratio)
+                .reshape(-1)
+                .to(torch.long)
             )
             in_prefix = torch.arange(topk, device=scored.device) < lens.unsqueeze(1)
             neg_in = int(((scored < 0) & in_prefix).sum())
@@ -1558,7 +1551,8 @@ class LowRatioCompressAscendBackendMixin:
             if neg_in or short or key not in self._dsv41_debugged:
                 self._dsv41_debugged.add(key)
                 print(
-                    f"[dsv41] qsli layer={layer.layer_id} ratio={ratio} rows={t} "
+                    f"[dsv41][{self._dsv41_rank_tag()}] qsli layer={layer.layer_id} "
+                    f"ratio={ratio} rows={t} "
                     f"neg_in_prefix={neg_in} len_max={int(lens.max())} "
                     f"vis_max={int((forward_batch.seq_lens // ratio).max())} "
                     f"cov_max={int(cov.max())} "
@@ -1728,6 +1722,19 @@ class LowRatioCompressAscendBackendMixin:
             setattr(fm, "dsv41_win_topk_length", lengths)
         offsets = torch.arange(topk, dtype=positions.dtype, device=positions.device)
         valid_len = torch.clamp(positions + 1, max=topk)
+        # Dead rows (batch padding / idle slots: seq_lens == 0, positions == 0)
+        # have no KV at all, but (positions + 1) claims one window token.  The
+        # indexer scores nothing for them and fills the row with -1, so the
+        # claimed prefix would feed MQSMLA an in-prefix -1 (contract violation,
+        # mqsmla_golden.py L215).  Zero the length instead: README L211 makes a
+        # zero length skip the side and emit 0.
+        seq_lens = forward_batch.seq_lens
+        if seq_lens is not None:
+            seq_lens = seq_lens.reshape(-1)
+            if seq_lens.numel() == t:
+                valid_len = torch.where(
+                    seq_lens > 0, valid_len, torch.zeros_like(valid_len)
+                )
         window_start = positions - valid_len + 1
         ids = window_start.unsqueeze(1) + offsets.unsqueeze(0)
         valid = offsets.unsqueeze(0) < valid_len.unsqueeze(1)
@@ -1748,12 +1755,15 @@ class LowRatioCompressAscendBackendMixin:
         if buf is None or buf.shape[0] != t:
             buf = torch.empty((t, 1), dtype=torch.int32, device=positions.device)
             setattr(fm, f"dsv41_cmp_topk_length_c{ratio}", buf)
-        buf.copy_(
-            ((positions + 1) // ratio)
-            .clamp_max(int(self._dsv4_index_topk))
-            .to(torch.int32)
-            .view(-1, 1)
-        )
+        lens = ((positions + 1) // ratio).clamp_max(int(self._dsv4_index_topk))
+        # Same dead-row rule as _dsv41_window_indices: a seq_lens == 0 row has
+        # no compressed tokens, so its length must be 0, not (0 + 1) // ratio.
+        seq_lens = forward_batch.seq_lens
+        if seq_lens is not None:
+            seq_lens = seq_lens.reshape(-1)
+            if seq_lens.numel() == t:
+                lens = torch.where(seq_lens > 0, lens, torch.zeros_like(lens))
+        buf.copy_(lens.to(torch.int32).view(-1, 1))
         return buf
 
     def _dsv41_attention_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
@@ -1812,6 +1822,25 @@ class LowRatioCompressAscendBackendMixin:
             return cached
         return attn_sink.reshape(-1).to(torch.float32)
 
+    def _dsv41_rank_tag(self) -> str:
+        """Per-rank tag for every [dsv41] debug line.
+
+        Multi-rank logs interleave, so each line carries its origin; without it
+        the same step number from two DP ranks looks like time travel.
+        """
+        cached = getattr(self, "_dsv41_rank_tag_cache", None)
+        if cached is None:
+            try:
+                p = get_parallel()
+                cached = (
+                    f"dp{getattr(p, 'attn_dp_rank', '?')}"
+                    f".tp{getattr(p, 'tp_rank', '?')}"
+                )
+            except Exception:
+                cached = "dp?.tp?"
+            self._dsv41_rank_tag_cache = cached
+        return cached
+
     def _dsv41_regenerate_smla_metadata(self, kw: dict):
         """Re-run the metadata op on the exact tensors this SMLA call receives.
 
@@ -1838,7 +1867,11 @@ class LowRatioCompressAscendBackendMixin:
                 has_cmp_kv=has_cmp,
             )
         except Exception as err:
-            print(f"[dsv41] metadata regeneration failed: {err}", flush=True)
+            print(
+                f"[dsv41][{self._dsv41_rank_tag()}] metadata regeneration "
+                f"failed: {err}",
+                flush=True,
+            )
             return None
 
     def _dsv41_audit_smla(self, layer, q, forward_batch, kw, ratio: int) -> None:
@@ -1863,7 +1896,8 @@ class LowRatioCompressAscendBackendMixin:
         if ("cfg",) not in self._dsv41_debugged:
             self._dsv41_debugged.add(("cfg",))
             print(
-                f"[dsv41] cfg index_topk={self._dsv4_index_topk} "
+                f"[dsv41][{self._dsv41_rank_tag()}] cfg "
+                f"index_topk={self._dsv4_index_topk} "
                 f"sliding_window={self._dsv4_sliding_window_size} "
                 f"candidate_topk_blocks={self._dsv41_candidate_topk_blocks} "
                 f"candidate_block_size={self._dsv41_candidate_block_size} "
@@ -1888,41 +1922,39 @@ class LowRatioCompressAscendBackendMixin:
             )
         else:
             row_b = torch.arange(rows, device=device)
-        # The dispatch table must tile [0, rows) exactly (README L214); a stale
-        # or mismatched metadata shows up here as a row-count disagreement.
-        # Small-T1 runs passing this check pin the layout as [starts | counts]
-        # with per-core ROW counts, so a mismatch is a real broken table, not a
-        # reading error.  The regeneration cross-check separates "we passed a
-        # stale buffer" from "the operator produced this broken table".
+        # The dispatch table's padded tail is NOT a valid check target: healthy
+        # single-curl runs show the same garbage there, so the wheel pads the
+        # (2*blocks,) table to a fixed 1024 and leaves the padding
+        # uninitialized while the kernel only consumes the head region
+        # (blockDim=32 in the fault dumps).  Compare only the head against a
+        # fresh regeneration, and dump the layout once so the real format is
+        # on record.
         md = kw.get("metadata")
         if md is not None and md.numel() % 2 == 0:
             half = md.shape[0] // 2
-            counts = md[half:]
-            total = int(counts.sum())
-            if total != rows:
-                problems.append(
-                    f"metadata tiles {total} rows != q rows {rows} "
-                    f"blocks={half} "
-                    f"starts_head={md[:4].tolist()} "
-                    f"counts_head={counts[:4].tolist()} "
-                    f"counts_tail={counts[-4:].tolist()} "
-                    f"(broken dispatch table)"
-                )
-            if rows > half:
-                problems.append(
-                    f"rows {rows} > core blocks {half} "
-                    f"(multi-row-per-core dispatch path)"
-                )
             fresh = self._dsv41_regenerate_smla_metadata(kw)
-            if (
-                fresh is not None
-                and fresh.shape == md.shape
-                and not bool(torch.equal(fresh, md))
-            ):
-                problems.append(
-                    "metadata differs from a fresh regeneration "
-                    "(stale buffer, sglang-side)"
-                )
+            if fresh is not None and fresh.shape == md.shape:
+                if not bool(torch.equal(md[:64], fresh[:64])):
+                    problems.append(
+                        "metadata head differs from a fresh regeneration: "
+                        f"buf={md[:8].tolist()} fresh={fresh[:8].tolist()}"
+                    )
+                if ("md_layout",) not in self._dsv41_debugged:
+                    self._dsv41_debugged.add(("md_layout",))
+                    diff = (md != fresh).nonzero().flatten()
+                    rt = self._dsv41_rank_tag()
+                    print(
+                        f"[dsv41][{rt}] md_layout rows={rows} blocks={half} "
+                        f"buf[:8]={md[:8].tolist()} "
+                        f"fresh[:8]={fresh[:8].tolist()}\n"
+                        f"[dsv41][{rt}]   buf_half_head={md[half : half + 8].tolist()} "
+                        f"fresh_half_head={fresh[half : half + 8].tolist()} "
+                        f"buf_tail_sum={int(md[half:].sum())} "
+                        f"fresh_tail_sum={int(fresh[half:].sum())} "
+                        f"first_diff={int(diff[0]) if diff.numel() else -1} "
+                        f"n_diff={int(diff.numel())}",
+                        flush=True,
+                    )
         for prefix in ("ori", "cmp"):
             kv = kw.get(f"{prefix}_kv")
             bt = kw.get(f"{prefix}_block_table")
@@ -1956,18 +1988,16 @@ class LowRatioCompressAscendBackendMixin:
                 # outside the prefix only the -1 filler is allowed
                 ("garbage_tail", idx < -1),
             )
-            side_bad = False
             for name, mask in checks:
                 n = int(mask.sum())
                 if not n:
                     continue
-                side_bad = True
                 r0 = int(mask.any(dim=1).nonzero()[0, 0])
                 j = mask[r0].nonzero()[:4, 0].tolist()
                 problems.append(
                     f"{prefix}.{name} n={n} first_row={r0} "
                     f"(b={int(row_b[r0])} pos={int(positions[r0])} "
-                    f"seq={int(seq_lens[r0])} len={int(lens[r0])} "
+                    f"seq={int(seq_lens[row_b[r0]])} len={int(lens[r0])} "
                     f"bt={width}x pages={pages} block={block}) "
                     + " ".join(
                         f"[j={a} idx={int(idx[r0, a])} col={int(idx[r0, a]) // block} "
@@ -1975,11 +2005,13 @@ class LowRatioCompressAscendBackendMixin:
                         for a in j
                     )
                 )
-            # window-side staleness: the prefix must end at the row position
+            # window-side staleness: the prefix must end at the row position.
+            # Dead rows (length 0) are skipped; their gathered tail is filler.
             if prefix == "ori" and rows == int(positions.numel()):
                 last = idx.gather(1, (lens - 1).clamp_min(0).unsqueeze(1)).squeeze(1)
-                if not bool((last == positions).all()):
-                    bad = (last != positions).nonzero()[:8, 0].tolist()
+                stale = (lens > 0) & (last != positions)
+                if bool(stale.any()):
+                    bad = stale.nonzero()[:8, 0].tolist()
                     problems.append(
                         f"ori.window_stale rows={bad} last={last[bad].tolist()} "
                         f"pos={positions[bad].tolist()}"
@@ -2003,7 +2035,8 @@ class LowRatioCompressAscendBackendMixin:
                         )
         if problems:
             print(
-                f"[dsv41] VIOLATION step={step} layer={layer.layer_id} ratio={ratio} "
+                f"[dsv41][{self._dsv41_rank_tag()}] VIOLATION step={step} "
+                f"layer={layer.layer_id} ratio={ratio} "
                 f"phase={phase} bs={forward_batch.batch_size} rows={rows}: "
                 + " | ".join(problems),
                 flush=True,
@@ -2012,29 +2045,26 @@ class LowRatioCompressAscendBackendMixin:
         if key not in self._dsv41_debugged:
             self._dsv41_debugged.add(key)
             shapes = {n: tuple(v.shape) for n, v in kw.items() if torch.is_tensor(v)}
+            rt = self._dsv41_rank_tag()
             print(
-                f"[dsv41] AUDIT snapshot step={step} layer={layer.layer_id} "
+                f"[dsv41][{rt}] AUDIT snapshot step={step} layer={layer.layer_id} "
                 f"ratio={ratio} phase={phase} bs={forward_batch.batch_size} "
                 f"q={tuple(q.shape)}\n"
-                f"[dsv41]   {shapes}\n"
-                f"[dsv41]   pos=[{int(positions.min())},{int(positions.max())}] "
-                f"seq=[{int(seq_lens.min())},{int(seq_lens.max())}]\n"
-                f"[dsv41]   ori_len_max={int(kw['ori_topk_length'].max())} "
+                f"[dsv41][{rt}]   {shapes}\n"
+                f"[dsv41][{rt}]   pos=[{int(positions.min())},{int(positions.max())}] "
+                f"seq=[{int(seq_lens.min())},{int(seq_lens.max())}] "
+                f"dead={int((seq_lens <= 0).sum())}\n"
+                f"[dsv41][{rt}]   ori_len_max={int(kw['ori_topk_length'].max())} "
                 f"ori_idx_max={int(kw['ori_sparse_indices'].max())} "
                 f"ori_bt={tuple(kw['ori_block_table'].shape)} "
                 f"ori_bt_max={int(kw['ori_block_table'].max())} "
                 f"ori_pages={kw['ori_kv'].shape[0]}"
                 + (
-                    f"\n[dsv41]   cmp_len_max={int(kw['cmp_topk_length'].max())} "
+                    f"\n[dsv41][{rt}]   cmp_len_max={int(kw['cmp_topk_length'].max())} "
                     f"cmp_idx_max={int(kw['cmp_sparse_indices'].max())} "
                     f"cmp_bt={tuple(kw['cmp_block_table'].shape)} "
                     f"cmp_bt_max={int(kw['cmp_block_table'].max())} "
-                    f"cmp_pages={kw['cmp_kv'].shape[0]} "
-                    f"md=(2x{md.shape[0] // 2},)"
-                    f"{' rows>blocks!' if rows > md.shape[0] // 2 else ''} "
-                    f"md_head={md[:4].tolist()} "
-                    f"md_counts_head={md[md.shape[0] // 2 :][:4].tolist()} "
-                    f"md_counts_sum={int(md[md.shape[0] // 2 :].sum())}"
+                    f"cmp_pages={kw['cmp_kv'].shape[0]}"
                     if "cmp_kv" in kw
                     else ""
                 ),
@@ -2116,17 +2146,18 @@ class LowRatioCompressAscendBackendMixin:
                 # kernel turns into a wild address, and a -1 is the sentinel
                 # leaking out of the write path.
                 row_max = cmp_bt.max(dim=1).values[:16].tolist()
+                rt = self._dsv41_rank_tag()
                 print(
-                    f"[dsv41] smla layer={layer.layer_id} ratio={compress_ratio}\n"
-                    f"[dsv41]   cmp_kv={tuple(cmp_kv.shape)} rows_per_page={rows_per_page}\n"
-                    f"[dsv41]   bt={tuple(cmp_bt.shape)} bt_max={int(cmp_bt.max())} "
+                    f"[dsv41][{rt}] smla layer={layer.layer_id} ratio={compress_ratio}\n"
+                    f"[dsv41][{rt}]   cmp_kv={tuple(cmp_kv.shape)} rows_per_page={rows_per_page}\n"
+                    f"[dsv41][{rt}]   bt={tuple(cmp_bt.shape)} bt_max={int(cmp_bt.max())} "
                     f"need_cols={need_cols} bt_cols_ok="
                     f"{cmp_bt.shape[1] >= need_cols}\n"
-                    f"[dsv41]   page_max_ok={int(cmp_bt.max()) < cmp_kv.shape[0]} "
+                    f"[dsv41][{rt}]   page_max_ok={int(cmp_bt.max()) < cmp_kv.shape[0]} "
                     f"negs={int((cmp_bt < 0).sum())}\n"
-                    f"[dsv41]   row_max={row_max}\n"
-                    f"[dsv41]   visible={compressed_lens[:16].tolist()}\n"
-                    f"[dsv41]   cmp_topk={tuple(topk.shape)} "
+                    f"[dsv41][{rt}]   row_max={row_max}\n"
+                    f"[dsv41][{rt}]   visible={compressed_lens[:16].tolist()}\n"
+                    f"[dsv41][{rt}]   cmp_topk={tuple(topk.shape)} "
                     f"topk_max={int(topk.max())} topk_neg={int((topk < 0).sum())}",
                     flush=True,
                 )
