@@ -549,5 +549,13 @@ POSITIONAL_FIELD_ORDER = (
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
     "unified_cache_external_linker_config",
+    "enable_return_aux_hidden_states",
+    "aux_hidden_state_capture",
+    "return_aux_hidden_state_layer_ids",
+    "hicache_storage_key_scheme",
+    "hicache_storage_head_partition",
+    "hicache_storage_layer_partition",
+    "engram_config",
+    "moe_ascend_ops_config",
 )
 # fmt: on
