@@ -171,13 +171,7 @@ class ExpertDistributionRecorder(ABC):
         yield
 
     @contextmanager
-    def with_forward_pass(
-        self,
-        forward_pass_id: int,
-        forward_batch: ForwardBatch,
-        *,
-        is_draft_worker: bool = False,
-    ):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -263,13 +257,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
-    def with_forward_pass(
-        self,
-        forward_pass_id: int,
-        forward_batch: ForwardBatch,
-        *,
-        is_draft_worker: bool = False,
-    ):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)

@@ -261,6 +261,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb import isolate_npu_draft_recording
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
@@ -1852,7 +1853,6 @@ class ModelRunner:
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
-                is_draft_worker=self.is_draft_worker,
             ) as recorder_outputs,
         ):
             output = self._forward_raw(
@@ -1909,6 +1909,10 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    # Select the NPU-only entry guard once at class creation.
+    if _is_npu:
+        forward = isolate_npu_draft_recording(forward)
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch

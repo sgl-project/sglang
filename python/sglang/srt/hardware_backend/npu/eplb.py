@@ -27,34 +27,21 @@ import torch
 import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
-_group_world = None
-_device_group = None
 _warmed_device_group = None
 
 
 def get_eplb_device_group() -> dist.ProcessGroup:
-    """Return the NPU EPLB group after distributed initialization.
+    """Reuse TP's device group and its existing communication configuration."""
+    from sglang.srt.runtime_context import get_parallel
 
-    Creation is collective: all WORLD ranks must reach the first call in the
-    same order. Cache against WORLD identity to handle distributed reinit.
-    """
-    global _group_world, _device_group
-    world = dist.group.WORLD
-    if _group_world is not world:
-        import torch_npu
-
-        options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        # Bound EPLB buffers without changing inference communicators.
-        options.hccl_config = {
-            "hccl_buffer_size": 64,
-            "hccl_op_expansion_mode": 1,  # HOST expansion
-        }
-        _device_group = dist.new_group(backend="hccl", pg_options=options)
-        _group_world = world
-        logger.info(
-            "[NPU EPLB host group] world=%d buffer=64MiB", dist.get_world_size()
+    tp_group = get_parallel().tp_group
+    # Shared statistics and migration use WORLD ranks, including root rank 0.
+    if tp_group.ranks != list(range(dist.get_world_size())):
+        raise ValueError(
+            "NPU EPLB requires a TP group covering WORLD in rank order; "
+            "TP subgroups are not supported."
         )
-    return _device_group
+    return tp_group.device_group
 
 
 def warmup_eplb_communication() -> None:
@@ -201,9 +188,7 @@ class ExpertWeightStaging:
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
             torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
-            if needed
-            else torch.empty_like(weight)
-            for weight, needed in zip(weights, self._needs_staging)
+            for weight in weights
         ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -229,7 +214,7 @@ class ExpertWeightStaging:
 
 
 def isolate_npu_draft_recording(forward):
-    """Keep target EPLB statistics untouched during NPU draft graph capture."""
+    """Keep target EPLB statistics untouched during NPU draft execution."""
 
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):

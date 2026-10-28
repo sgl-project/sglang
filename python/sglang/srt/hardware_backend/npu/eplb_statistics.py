@@ -26,9 +26,9 @@ from sglang.srt.hardware_backend.npu.eplb import (
 
 
 class _NpuAccumulatorMixin:
-    """Use the dedicated EPLB group for all NPU statistics modes."""
+    """Share the TP device group across NPU statistics modes and migration."""
 
-    # Resolve lazily so distributed initialization and WORLD replacement remain valid.
+    # Resolve lazily so a replaced TP group is used by subsequent dumps.
     @property
     def _communication_group(self) -> torch.distributed.ProcessGroup:
         return get_eplb_device_group()
@@ -60,7 +60,7 @@ class NpuExpertDistributionAccumulator(
 
 
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
-    """Reuse upstream recording while isolating NPU draft forward lifecycles."""
+    """Reuse upstream recording with Ascend counters and communication."""
 
     def _create_accumulator(self, expert_location_metadata, rank):
         moe = distribution.get_exec().moe
@@ -88,15 +88,9 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
         return super()._create_gatherer(expert_location_metadata, rank)
 
     @contextmanager
-    def with_forward_pass(
-        self, forward_pass_id, forward_batch, *, is_draft_worker=False
-    ):
-        # Draft runners share target statistics. Disabling hooks alone still
-        # lets the base lifecycle reset counts and append an empty draft pass.
-        if is_draft_worker:
-            with self.disable_this_region():
-                yield {}
-        elif self._disable_all:
+    def with_forward_pass(self, forward_pass_id, forward_batch):
+        # The NPU entry-point guard disables the whole draft lifecycle.
+        if self._disable_all:
             yield {}
         else:
             with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
