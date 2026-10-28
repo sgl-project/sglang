@@ -7,10 +7,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement, PageShardSpec
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
@@ -40,6 +42,7 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     free = Mock()
     controller = object.__new__(HybridCacheController)
     controller.device = "cpu"
+    controller.is_kv_sharded = False
     controller.mem_pool_device_allocator = SimpleNamespace()
     controller.load_queue = []
     controller.mem_pool_host = SimpleNamespace(
@@ -75,6 +78,41 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     assert controller._transfer_num_bytes(controller.load_queue[0]) == (
         2 if active_request else 1
     ) * (8 + 4)
+
+
+@pytest.mark.parametrize("shard_rank, expected_bytes", [(0, 44), (1, 36)])
+def test_repeated_source_bytes_count_only_local_slots(shard_rank, expected_bytes):
+    controller = object.__new__(HybridCacheController)
+    controller.is_kv_sharded = True
+    controller.mem_pool_host = SimpleNamespace(
+        anchor_entry=SimpleNamespace(
+            name=PoolName.KV,
+            host_pool=SimpleNamespace(
+                size_per_token=16,
+                shard_rank=shard_rank,
+                placement=PageInterleavePlacement(
+                    PageShardSpec(shard_rank, 2, 2, 8, 2)
+                ),
+            ),
+        ),
+        entry_map={
+            PoolName.SWA: SimpleNamespace(host_pool=SimpleNamespace(size_per_token=8)),
+            PoolName.DRAFT_SWA: SimpleNamespace(
+                host_pool=SimpleNamespace(size_per_token=4)
+            ),
+        },
+    )
+    op = CacheOperation(
+        host_indices=torch.tensor([0, 1]),
+        device_indices=torch.tensor([4, 5]),
+        node_id=0,
+        pool_transfers=[
+            PoolTransfer(PoolName.SWA, host_indices=torch.tensor([0, 2])),
+            PoolTransfer(PoolName.SWA, host_indices=torch.tensor([2, 3])),
+            PoolTransfer(PoolName.DRAFT_SWA, indices_from_pool=PoolName.SWA),
+        ],
+    )
+    assert controller._transfer_num_bytes(op) == expected_bytes
 
 
 if __name__ == "__main__":
