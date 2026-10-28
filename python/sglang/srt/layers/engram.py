@@ -1218,18 +1218,27 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
-        sizes = self._eager_dp_sizes(indices, forward_batch)
+        sizes = self._dp_sizes(indices, forward_batch)
         exchange = self._dp_exchange(sizes)
         if exchange is None:
             return self._dp_global_buffer_lookup(indices, forward_batch)
         if sum(sizes) == 0:
             return self.new_rows(indices)
         group = get_parallel().tp_group
+        # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collectives.
+        equal = len(set(sizes)) == 1
         ids = indices.new_empty((sum(sizes), *indices.shape[1:]))
-        group.all_gatherv(indices.contiguous(), sizes=sizes, output=ids)
+        if equal:
+            group.all_gather_into_tensor(ids, indices.contiguous())
+        else:
+            group.all_gatherv(indices.contiguous(), sizes=sizes, output=ids)
         if exchange == EngramLookup.REDUCE_SCATTER:
             values = self._owned_rows(ids).view(ids.shape[0], -1)
-            local = group.reduce_scatterv(values, sizes=sizes)
+            if equal:
+                local = values.new_empty((indices.shape[0], values.shape[1]))
+                group.reduce_scatter_tensor(local, values)
+            else:
+                local = group.reduce_scatterv(values, sizes=sizes)
             return local.view(*indices.shape, self.dim)
         # all_to_all: look up this rank's own hash columns for every token, then send
         # each rank its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are
@@ -1239,47 +1248,57 @@ class EngramEmbedding(nn.Module):
         own = ids.flatten(1)[:, start : start + k].contiguous()
         values = self._owned_rows(own).view(own.shape[0], -1)
         recv = values.new_empty((self.tp_size * n, values.shape[1]))
-        torch.distributed.all_to_all_single(
-            recv,
-            values,
-            output_split_sizes=[n] * self.tp_size,
-            input_split_sizes=sizes,
-            group=group.device_group,
-        )
+        if equal:
+            group.all_to_all_single(recv.view(-1), values.view(-1))
+        else:
+            torch.distributed.all_to_all_single(
+                recv,
+                values,
+                output_split_sizes=[n] * self.tp_size,
+                input_split_sizes=sizes,
+                group=group.device_group,
+            )
         # [source rank, token, its columns] -> [token, columns in rank order]
         out = engram_rows_to_token_major(recv, self.tp_size)
         return out.view(*indices.shape, self.dim)
 
     def _dp_exchange(self, sizes: Optional[list[int]]) -> Optional[str]:
-        """The exchange for an eager lookup, or None for the global-buffer path."""
+        """The exchange for a lookup with per-rank `sizes`, or None for the
+        global-buffer path."""
         if sizes is None or self.lookup == EngramLookup.ALL_REDUCE:
             return None
         if self.lookup == EngramLookup.REDUCE_SCATTER:
             return EngramLookup.REDUCE_SCATTER
-        # Measured fastest at DP 2-8 on GB300, B300 and H200 from 8K tokens per rank up.
+        # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
+        # per rank and for decode from DP 4; elsewhere within tens of microseconds.
         return EngramLookup.ALL_TO_ALL if self._cols_per_rank is not None else None
 
-    def _eager_dp_sizes(
+    def _dp_sizes(
         self, indices: torch.Tensor, forward_batch: ForwardBatch
     ) -> Optional[list[int]]:
-        """Per-rank token counts if the lookup may exchange only the real rows, else None."""
+        """Per-rank row counts for an exchange, or None for the global-buffer path."""
         parallel = get_parallel()
         padding = forward_batch.dp_padding_mode
         if (
             _is_hip
             or padding is None
-            or padding.is_max_len()
             or parallel.attn_cp_size > 1
             or self.tp_size != parallel.attn_dp_size
             or world_dp_gather_enabled()
-            or torch.cuda.is_current_stream_capturing()
         ):
+            return None
+        n = indices.shape[0]
+        if padding.is_max_len():
+            # Every rank holds n padded rows, so the counts survive a graph capture.
+            full = get_global_dp_buffer_len() == self.tp_size * n
+            return [n] * self.tp_size if full else None
+        if torch.cuda.is_current_stream_capturing():
             return None
         sizes = get_dp_global_num_tokens()
         if (
             sizes is None
             or len(sizes) != self.tp_size
-            or sizes[parallel.attn_dp_rank] != indices.shape[0]
+            or sizes[parallel.attn_dp_rank] != n
         ):
             return None
         return list(sizes)
