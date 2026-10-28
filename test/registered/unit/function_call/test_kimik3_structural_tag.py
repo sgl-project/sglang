@@ -899,6 +899,68 @@ class TestAdditionalPropertyNames(CustomTestCase):
                 self._check(tool, required + _argument("abc", "string", "ok"), True)
                 self._check(tool, required + _argument("a", "string", "invalid"), False)
 
+    def test_escaped_declared_names_keep_their_round_trip(self):
+        """Tightening extras must preserve escaped names without double unescaping."""
+        for key in ["a&b", 'a"b', "a&amp;quot;b"]:
+            with self.subTest(key=key):
+                tool = Tool(
+                    type="function",
+                    function=Function(
+                        name="probe",
+                        strict=True,
+                        parameters={
+                            "type": "object",
+                            "properties": {key: {"type": "integer"}},
+                            "required": [key],
+                            "additionalProperties": True,
+                        },
+                    ),
+                )
+                escaped = key.replace("&", "&amp;").replace('"', "&quot;")
+                first = _argument(escaped, "number", "1")
+                self._check(tool, first, True)
+                self._check(tool, first + _argument("extra", "string", "ok"), True)
+                self._check(
+                    tool, first + _argument(escaped, "string", "invalid"), False
+                )
+                wire = _tools_section(_call("probe", 1, first))
+                result = KimiK3Detector().detect_and_parse(wire, [])
+                assert json.loads(result.calls[0].parameters) == {key: 1}
+
+    def test_nested_schema_cannot_be_bypassed_by_an_extra(self):
+        """An additional argument must not replace a validated nested object."""
+        nested = {
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+            "additionalProperties": False,
+        }
+        for extra in [True, {"type": "object"}]:
+            with self.subTest(extra=extra):
+                tool = Tool(
+                    type="function",
+                    function=Function(
+                        name="probe",
+                        strict=True,
+                        parameters={
+                            "type": "object",
+                            "properties": {"config": nested},
+                            "required": ["config"],
+                            "additionalProperties": extra,
+                        },
+                    ),
+                )
+                first = _argument("config", "object", '{"count":1}')
+                self._check(tool, first, True)
+                self._check(tool, first + _argument("extra", "object", '{"x":1}'), True)
+                for invalid in ['{"count":"bad"}', "{}", '{"count":1,"extra":1}']:
+                    self._check(tool, _argument("config", "object", invalid), False)
+                self._check(
+                    tool,
+                    first + _argument("config", "object", '{"count":"bad"}'),
+                    False,
+                )
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
