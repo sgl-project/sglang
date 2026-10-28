@@ -1483,9 +1483,9 @@ class ServerArgs(DisaggServerArgsMixin):
             if role is None:
                 normalized[component_name] = backend_name
             else:
-                normalized_roles.setdefault(component_name, {})[
-                    role.value
-                ] = backend_name
+                normalized_roles.setdefault(component_name, {})[role.value] = (
+                    backend_name
+                )
         return normalized, normalized_roles
 
     @staticmethod
