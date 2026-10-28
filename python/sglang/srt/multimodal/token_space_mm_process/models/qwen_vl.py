@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from types import MappingProxyType
 
@@ -28,7 +29,51 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
+)
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+
+# Adapted from the serving defaults in sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.__init__.
+class QwenTokenSpaceServingSpec(TokenSpaceServingSpec):
+    models = (
+        "Qwen2VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLMMTP",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
+    )
+    auto_mm_io_worker_num = 16
+
+    def __init__(self, hf_config):
+        super().__init__(hf_config)
+        if hf_config.model_type == "qwen3_omni_moe":
+            # Legacy Omni sits outside the Qwen tuning branch and keeps the default.
+            self.auto_mm_io_worker_num = TokenSpaceServingSpec.auto_mm_io_worker_num
+
+    def build_mm_tokens(self, processor):
+        # Serving-only: the trainer imports this module without the serving base.
+        from sglang.srt.multimodal.processors.base_processor import (
+            MultimodalSpecialTokens,
+        )
+
+        hf_config = self.hf_config
+        if hf_config.model_type == "qwen3_omni_moe":
+            hf_config = hf_config.thinker_config
+        return MultimodalSpecialTokens(
+            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_id=hf_config.image_token_id,
+            image_token_regex=re.compile(
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+            ),
+            video_token_id=hf_config.video_token_id,
+            audio_token_id=getattr(hf_config, "audio_token_id", None),
+        ).build(processor)
 
 
 class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
@@ -57,7 +102,6 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     mm_feature_fields = frozenset(
         {"pixel_values", "pixel_values_videos", "input_features"}
     )
-    processor_class_attributes = MappingProxyType({"auto_mm_io_worker_num": 16})
     media_processor_kwargs_type = None
 
     # Adapted from sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.__init__;
