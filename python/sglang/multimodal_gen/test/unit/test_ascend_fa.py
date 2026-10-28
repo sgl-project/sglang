@@ -322,29 +322,28 @@ def test_host_bounds_avoid_device_read(adapter, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "bounds", [(1, 5), (0, 4), (0, 6, 5), (0,), (0, 5.0), (False, 5)]
+    "bounds,host_bounds,message",
+    [
+        *[
+            (torch.zeros(len(bounds), dtype=torch.int32), bounds, "monotonically")
+            for bounds in [(1, 5), (0, 4), (0, 6, 5), (0,), (0, 5.0), (False, 5)]
+        ],
+        (torch.tensor([[0, 5]]), None, "1D int32"),
+        (torch.tensor([0.0, 5.0]), None, "1D int32"),
+    ],
 )
-def test_bad_packed_bounds(adapter, bounds):
+def test_bad_packed_bounds(adapter, bounds, host_bounds, message):
     _, provider, build = adapter
     query = torch.randn(5, 4, 64)
-    with pytest.raises(ValueError, match="monotonically"):
+    with pytest.raises(ValueError, match=message):
         build().forward_varlen(
             query,
             query,
             query,
-            cu_seqlens=torch.zeros(len(bounds), dtype=torch.int32),
-            cu_seqlens_host=bounds,
+            cu_seqlens=bounds,
+            cu_seqlens_host=host_bounds,
             max_seqlen=5,
         )
-    provider.assert_not_called()
-
-
-@pytest.mark.parametrize("bounds", [torch.tensor([[0, 5]]), torch.tensor([0.0, 5.0])])
-def test_bad_boundary_tensor(adapter, bounds):
-    _, provider, build = adapter
-    query = torch.randn(5, 4, 64)
-    with pytest.raises(ValueError, match="1D int32"):
-        build().forward_varlen(query, query, query, cu_seqlens=bounds, max_seqlen=5)
     provider.assert_not_called()
 
 
@@ -599,15 +598,25 @@ def test_precision_only_selects_sd_without_weight_or_environment_setup(
         native.assert_not_called()
 
 
-@pytest.mark.parametrize("precision", ["none", "int8"])
-def test_invalid_sd_precision_never_falls_back_to_native(legacy_native, precision):
+@pytest.mark.parametrize(
+    "precision,error",
+    [
+        ("none", ValueError("Unsupported SD precision")),
+        ("int8", ValueError("Unsupported SD precision")),
+        ("fp8", RuntimeError("operator execution failed")),
+        ("mxfp8", RuntimeError("operator execution failed")),
+        ("mxfp4", RuntimeError("operator execution failed")),
+    ],
+)
+def test_sd_execution_failure_never_retries_native(legacy_native, precision, error):
     config, sd, build, quant, native_mx, native_float = legacy_native
     config.update(precision=precision)
-    sd.side_effect = ValueError("Unsupported SD precision")
+    sd.side_effect = error
     impl = build(quant_config=type("MXFP8Config", (), {})())
     query = torch.randn(1, 64, 4, 64)
-    with pytest.raises(ValueError, match="Unsupported SD precision"):
+    with pytest.raises(type(error)) as caught:
         impl.forward(query, query, query, None)
+    assert caught.value is error
     sd.assert_called_once()
     assert sd.call_args.kwargs["precision"] == precision
     for native in (quant, native_mx, native_float):
@@ -658,21 +667,6 @@ def test_sd_dependency_failure_never_falls_back(
     loader.assert_called_once()
     for operator in (sd, quant, native_mx, native_float):
         operator.assert_not_called()
-
-
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-def test_sd_execution_failure_never_retries_native(legacy_native, precision):
-    config, sd, build, quant, native_mx, native_float = legacy_native
-    config.update(precision=precision)
-    impl = build()
-    sd.side_effect = RuntimeError("operator execution failed")
-    query = torch.randn(1, 64, 4, 64)
-    with pytest.raises(RuntimeError, match="operator execution failed"):
-        impl.forward(query, query, query, None)
-    sd.assert_called_once()
-    quant.assert_not_called()
-    native_mx.assert_not_called()
-    native_float.assert_not_called()
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])

@@ -9,8 +9,8 @@ Pre-quantized checkpoints require their own loader and are not used here.
 VAE tiles run locally to avoid depending on an unrelated NPU gather workaround.
 The existing FA baseline uses BF16 attention: arbitrary H3 packed boundaries
 need a separate fix before the existing backend can serve as an MXFP8 baseline.
-No quality/performance acceptance
-threshold is fabricated for these new cases; collect outputs and measurements.
+These cases enable baseline-generation mode for collection without existing
+performance thresholds. The environment is restored after this test class.
 """
 
 import json
@@ -109,6 +109,14 @@ def _cases():
 
 class TestAscendQuantFAH3(DiffusionServerBase):
     case = diffusion_case_fixture(_cases())
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _collect_baselines(cls):
+        # Keep collection enabled through each server fixture's final summary.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("SGLANG_GEN_BASELINE", "1")
+            yield
 
     def run_and_collect(self, *args, **kwargs):
         record, content = super().run_and_collect(*args, **kwargs)
