@@ -81,7 +81,6 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
-from sglang.srt.layers.dcp.layout import dcp_extend_gathers_kv
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -261,6 +260,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        prepare_dcp_extend_metadata_npu,
     )
 else:
     pass
@@ -3500,31 +3500,21 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         create_chunked_prefix_cache_kv_indices_fn,
     ):
         if _is_npu:
-            # NPU decode and short-tail extends gather the query (#37787) and
-            # read rank-local metadata off the attention backend. A DSA extend
-            # whose prefix is cheaper to move than its queries gathers the KV
-            # instead, which needs this; its presence is what selects that path.
-            # The gathered-KV operator path is bf16/fp16 only; any other KV
-            # dtype keeps the query gather rather than raising there.
-            if not self.use_dsa or kv_cache_dtype not in (
-                torch.bfloat16,
-                torch.float16,
-            ):
-                return None
-            prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
-            parallel = get_parallel()
-            if not dcp_extend_gathers_kv(
-                [prefix_sum],
-                [seq_lens_sum - prefix_sum],
-                self.config.num_attention_heads
-                * parallel.attn_dcp_size
-                // parallel.attn_tp_size,
-                self.config.kv_lora_rank,
-                self.config.qk_rope_head_dim,
-                kv_cache_dtype.itemsize,
-            ):
-                return None
-        elif is_deepseek_dsa(self.config):
+            return prepare_dcp_extend_metadata_npu(
+                self,
+                seq_lens=seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens_sum=seq_lens_sum,
+                kv_buffer_shape=kv_buffer_shape,
+                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_device=kv_cache_device,
+                create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            )
+        if is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

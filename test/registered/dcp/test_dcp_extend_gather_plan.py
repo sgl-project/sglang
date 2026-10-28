@@ -1,6 +1,6 @@
 """CPU unit test for the NPU DCP extend-gather plan.
 
-Pins ``plan_dcp_extend_gather`` (``layers/dcp/layout.py``). Under DCP each rank
+Pins ``plan_dcp_extend_gather`` (``hardware_backend/npu/dcp_extend_gather.py``). Under DCP each rank
 holds a 1/dcp_size share of every request's prefix KV, in runs of
 ``interleave`` positions. At extend the NPU path all-gathers those shares piece
 by piece -- a piece's scratch is its gathered rows, then this chunk's own KV for
@@ -24,15 +24,19 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp import layout as dcp_layout
-from sglang.srt.layers.dcp.layout import (
+from sglang.srt import runtime_context as rc
+from sglang.srt.hardware_backend.npu import dcp_extend_gather
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
-    dcp_local_prefix_rows,
-    dcp_owned_prefix_positions,
-    localize_dcp_indices,
     plan_dcp_extend_gather,
+)
+from sglang.srt.layers.dcp import layout as dcp_layout
+from sglang.srt.layers.dcp.layout import (
+    dcp_local_row,
+    filter_dcp_local_chunk_kv_indices,
+    localize_dcp_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -159,39 +163,39 @@ class TestDcpExtendGatherPlan(CustomTestCase):
             )
 
 
-class TestDcpOwnedPrefixPositions(CustomTestCase):
-    """The planner selects this rank's prefix rows with these offsets, and the
-    gather lays them out as the plan's per-request shards. Both must be every
-    owned position of each request, in order -- including a prefix that ends
-    mid-cycle, which a stride over the concatenation gets wrong."""
+class TestDcpLocalChunkOffsetsAtInterleaveOne(CustomTestCase):
+    """The interleaved filter's offsets, run at interleave 1, must select what
+    the round-robin slice selects -- including chunks that start mid-cycle."""
 
-    def test_matches_a_walk_of_every_position(self):
-        for prefix_lens, _ in CASES:
-            for dcp_size in DCP_SIZES:
-                for interleave in INTERLEAVES:
-                    for rank in range(dcp_size):
-                        expected, offset = [], 0
-                        for p in prefix_lens:
-                            expected += [
-                                offset + x
-                                for x in _owned(p, dcp_size, rank, interleave)
-                            ]
-                            offset += p
-                        got = dcp_owned_prefix_positions(
-                            prefix_lens, dcp_size, rank, interleave
+    def test_matches_the_round_robin_slice(self):
+        starts_cases = [[0], [5], [0, 3, 17], [1, 1, 1, 1], [33, 0, 48, 7]]
+        for (prefix_lens, _), starts in zip(CASES * 2, starts_cases * 4):
+            starts = (starts * len(prefix_lens))[: len(prefix_lens)]
+            kv = torch.arange(sum(prefix_lens), dtype=torch.int64)
+            for dcp_size in DCP_SIZES[1:]:
+                for rank in range(dcp_size):
+                    with rc.get_parallel().override(
+                        dcp_enabled=True, dcp_size=dcp_size, dcp_rank=rank
+                    ):
+                        expected = filter_dcp_local_chunk_kv_indices(
+                            kv, torch.tensor(starts), torch.tensor(prefix_lens)
                         )
-                        self.assertEqual(
-                            got.tolist(),
-                            expected,
-                            (prefix_lens, dcp_size, interleave, rank),
-                        )
+                    offsets = dcp_layout._dcp_local_chunk_offsets(
+                        starts, prefix_lens, dcp_size, rank, 1
+                    )
+                    self.assertEqual(
+                        kv[offsets].tolist(),
+                        expected.tolist(),
+                        (prefix_lens, starts, dcp_size, rank),
+                    )
 
 
 class TestDcpLocalPrefixRows(CustomTestCase):
-    """The planner's read of this rank's prefix rows must land on the rows the
-    pool's write put them in (``localize_dcp_indices``). Selection is by
-    position and mapping by slot, so an off-by-one reads real KV of the wrong
-    position: right shapes, fluent output that stops following the prompt.
+    """The planner's read of this rank's prefix rows -- the chunk filter, then
+    ``dcp_local_row`` -- must land on the rows the pool's write put them in
+    (``localize_dcp_indices``), in the order the gather plan expects. Selection
+    is by position and mapping by slot, so an off-by-one reads real KV of the
+    wrong position: right shapes, fluent output that stops following the prompt.
 
     Each rank's pool is written through the write mapping, slots come from
     widened allocator pages handed out in shuffled order, and every row read
@@ -231,12 +235,25 @@ class TestDcpLocalPrefixRows(CustomTestCase):
                                 slots, dcp_size, rank, interleave
                             )
                             pool[loc[loc >= 0]] = tags[loc >= 0]
-                            rows = dcp_local_prefix_rows(
-                                slots, prefix_lens, dcp_size, rank, interleave
-                            )
-                            owned = dcp_owned_prefix_positions(
-                                prefix_lens, dcp_size, rank, interleave
-                            )
+                            with rc.get_parallel().override(
+                                dcp_enabled=dcp_size > 1,
+                                dcp_size=dcp_size,
+                                dcp_rank=rank,
+                            ):
+                                owned_slots = filter_dcp_local_chunk_kv_indices(
+                                    slots,
+                                    torch.zeros(len(prefix_lens), dtype=torch.int64),
+                                    torch.tensor(prefix_lens),
+                                    interleave_size=interleave,
+                                )
+                            rows = dcp_local_row(owned_slots, dcp_size, interleave)
+                            owned, offset = [], 0
+                            for p in prefix_lens:
+                                owned += [
+                                    offset + x
+                                    for x in _owned(p, dcp_size, rank, interleave)
+                                ]
+                                offset += p
                             self.assertTrue(torch.equal(pool[rows], tags[owned]))
 
 
@@ -276,8 +293,8 @@ class TestDcpExtendGatherBuffer(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        dcp_layout._dcp_extend_gather_buffers.clear()
-        self.addCleanup(dcp_layout._dcp_extend_gather_buffers.clear)
+        dcp_extend_gather._dcp_extend_gather_buffers.clear()
+        self.addCleanup(dcp_extend_gather._dcp_extend_gather_buffers.clear)
         # Only dtype, device and the trailing shape are read off the reference.
         self.ref = torch.empty((0, 4), dtype=torch.float32)
 

@@ -1,3 +1,4 @@
+from dataclasses import fields
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -14,11 +15,17 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+    dcp_extend_gather_buffer,
+    dcp_extend_gathers_kv,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
@@ -30,11 +37,6 @@ if TYPE_CHECKING:
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
-
-
-_dcp_extend_gather_piece_rows = envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.get()
-if _dcp_extend_gather_piece_rows <= 0:
-    _dcp_extend_gather_piece_rows = 1 << 62
 
 
 def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
@@ -50,11 +52,11 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 def _dsa_dcp_extend_gathers_kv(forward_batch: "ForwardBatch") -> bool:
     """This DCP extend gathers the prefix KV rather than the query.
 
-    The model builds ``attn_dcp_metadata`` on NPU only for such an extend
-    (``prepare_context_parallel_metadata_for_dcp``), so its presence decides.
+    ``prepare_dcp_extend_metadata_npu`` builds ``attn_dcp_metadata`` only for
+    such an extend, so its presence decides.
     """
     return (
-        forward_batch.attn_dcp_metadata is not None
+        isinstance(forward_batch.attn_dcp_metadata, NPUDecodeContextParallelMetadata)
         and runtime_context.get_parallel().dcp_enabled
         and not forward_context.get_attn_backend().is_draft_worker
         and not dsa_use_prefill_cp(forward_batch)
@@ -555,6 +557,47 @@ def forward_dsa_prepare_npu(
     )
 
 
+def prepare_dcp_extend_metadata_npu(
+    m, kv_cache_dtype, seq_lens_sum, extend_prefix_lens_cpu, **planner_kwargs
+) -> Optional[NPUDecodeContextParallelMetadata]:
+    """DCP metadata for a DSA extend that gathers the prefix KV, else None.
+
+    NPU decode and short-tail extends gather the query and read rank-local
+    metadata off the attention backend instead.
+    """
+    # The gathered-KV operator path is bf16/fp16 only; any other KV dtype keeps
+    # the query gather rather than raising there.
+    if not m.use_dsa or kv_cache_dtype not in (torch.bfloat16, torch.float16):
+        return None
+    parallel = runtime_context.get_parallel()
+    prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
+    if not dcp_extend_gathers_kv(
+        [prefix_sum],
+        [seq_lens_sum - prefix_sum],
+        m.config.num_attention_heads * parallel.attn_dcp_size // parallel.attn_tp_size,
+        m.config.kv_lora_rank,
+        m.config.qk_rope_head_dim,
+        kv_cache_dtype.itemsize,
+    ):
+        return None
+    metadata = prepare_decode_context_parallel_metadata(
+        kv_cache_dtype=kv_cache_dtype,
+        seq_lens_sum=seq_lens_sum,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        **planner_kwargs,
+        # NPU pools shard in page_size runs, and the gather reuses its own
+        # buffers rather than a context-sized dcp_kv_buffer per forward.
+        interleave_size=forward_context.get_attn_backend().page_size,
+        allocate_kv_buffer=False,
+    )
+    if metadata is None:
+        return None
+    # The gather plan needs extend_seq_lens_cpu, so the backend fills it in.
+    return NPUDecodeContextParallelMetadata(
+        **{f.name: getattr(metadata, f.name) for f in fields(metadata)}
+    )
+
+
 def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     """Lay this rank's per-request shards out at their padded send offsets."""
     # Zeroed: no rank reads the pad rows, but they still cross the collective.
@@ -569,7 +612,7 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
 
 def _dcp_gather_extend_kv_npu(
     m: "DeepseekV2AttentionMLA",
-    forward_batch: "ForwardBatch",
+    metadata: NPUDecodeContextParallelMetadata,
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -585,38 +628,17 @@ def _dcp_gather_extend_kv_npu(
     minutes. The keys travel separately because the operator takes them apart.
     """
     parallel = runtime_context.get_parallel()
-    plan = forward_batch.npu_dcp_extend_gather
-    if plan is None:
-        plan = dcp_layout.plan_dcp_extend_gather(
-            forward_batch.extend_prefix_lens_cpu,
-            forward_batch.extend_seq_lens_cpu,
-            parallel.dcp_size,
-            parallel.dcp_rank,
-            _dcp_extend_gather_piece_rows,
-            forward_context.get_attn_backend().page_size,
-        )
-        plan = plan._replace(
-            pieces=[
-                piece._replace(index=piece.index.to(k_nope.device))
-                for piece in plan.pieces
-            ]
-        )
-        forward_batch.npu_dcp_extend_gather = plan
-
+    plan = metadata.extend_gather_plan
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
-    out_nope = dcp_layout.dcp_extend_gather_buffer("latent", k_nope, total_rows)
-    out_rope = dcp_layout.dcp_extend_gather_buffer("rope", k_pe, total_rows)
+    out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
+    out_rope = dcp_extend_gather_buffer("rope", k_pe, total_rows)
     scratches = [
         (
-            dcp_layout.dcp_extend_gather_buffer(
-                "latent_scratch", k_nope, plan.scratch_rows
-            ),
+            dcp_extend_gather_buffer("latent_scratch", k_nope, plan.scratch_rows),
             k_nope,
         ),
         (
-            dcp_layout.dcp_extend_gather_buffer(
-                "rope_scratch", k_pe, plan.scratch_rows
-            ),
+            dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows),
             k_pe,
         ),
     ]
@@ -626,7 +648,7 @@ def _dcp_gather_extend_kv_npu(
     if plan.send_rows:
         sends = list(
             get_token_to_kv_pool().get_mla_kv_buffer(
-                m.attn_mqa, forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices
+                m.attn_mqa, metadata.dcp_local_prefix_kv_indices
             )
         )
         if plan.local_lens != plan.padded_lens:
@@ -674,8 +696,9 @@ def forward_dsa_core_npu(
     # The backend's sparse operator reads this in place of the paged pool.
     dcp_gathers_kv = _dsa_dcp_extend_gathers_kv(forward_batch)
     if dcp_gathers_kv:
-        forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
-            m, forward_batch, k_nope, k_pe
+        dcp_metadata = forward_batch.attn_dcp_metadata
+        dcp_metadata.extend_kv = _dcp_gather_extend_kv_npu(
+            m, dcp_metadata, k_nope, k_pe
         )
     attn_output = attn(
         q_nope_out.contiguous(),
@@ -689,7 +712,7 @@ def forward_dsa_core_npu(
     )
     if dcp_gathers_kv:
         # So no later layer or forward reads a stale gather.
-        forward_batch.npu_dcp_extend_kv = None
+        dcp_metadata.extend_kv = None
     if use_dcp:
         attn_output, lse = attn_output
         attn_output = attn_output.view(

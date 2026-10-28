@@ -24,6 +24,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+    build_dcp_extend_gather_plan,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -700,6 +704,15 @@ class AscendAttnBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            # Here, not in the model's prepare: the plan needs extend_seq_lens_cpu.
+            if isinstance(dcp_metadata, NPUDecodeContextParallelMetadata):
+                dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
+                    prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    interleave_size=self.page_size,
+                    device=self.device,
+                )
 
         if (
             self.use_mla
@@ -1112,11 +1125,10 @@ class AscendAttnBackend(AttentionBackend):
         self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        gathered: tuple[torch.Tensor, torch.Tensor],
         topk_indices: Optional[torch.Tensor],
         layer: RadixAttention,
         actual_seq_qlen: torch.Tensor,
-        forward_batch: ForwardBatch,
+        dcp_metadata: NPUDecodeContextParallelMetadata,
     ) -> torch.Tensor:
         """DCP extend over the context the model gathered, one contiguous run
         per request: TND keys, cumulative lengths, no block table.
@@ -1130,10 +1142,10 @@ class AscendAttnBackend(AttentionBackend):
                 "parallelism is not supported: the gathered extend path is "
                 "bf16/fp16 only."
             )
-        key_nope, key_rope = gathered
+        key_nope, key_rope = dcp_metadata.extend_kv
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-        seq_lengths_kv = forward_batch.attn_dcp_metadata.dcp_kv_indptr[1:]
+        seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=key_nope,
@@ -1590,17 +1602,19 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            # Set by the model only for a DCP extend that gathered the KV.
-            gathered = forward_batch.npu_dcp_extend_kv
-            if gathered is not None:
+            # extend_kv is set by the model only for a DCP extend that gathered the KV.
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_kv is not None
+            ):
                 return self._forward_sparse_dcp_gathered(
                     q_nope,
                     q_pe,
-                    gathered,
                     topk_indices,
                     layer,
                     actual_seq_qlen,
-                    forward_batch,
+                    dcp_metadata,
                 )
 
             if topk_indices is not None:

@@ -25,13 +25,13 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     update_kv_lens_and_indices,
 )
 from sglang.srt.layers.dcp.layout import (
-    dcp_local_prefix_rows,
+    dcp_local_row,
+    filter_dcp_local_chunk_kv_indices,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
-from sglang.srt.utils import is_npu
 
 
 def prepare_decode_context_parallel_metadata(
@@ -46,6 +46,8 @@ def prepare_decode_context_parallel_metadata(
     kv_cache_dtype,
     kv_cache_device,
     create_chunked_prefix_cache_kv_indices_fn,
+    interleave_size: int = 1,
+    allocate_kv_buffer: bool = True,
 ) -> Optional[DecodeContextParallelMetadata]:
     parallel = get_parallel()
     if not parallel.dcp_enabled:
@@ -114,27 +116,27 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
-    if is_npu():
-        # NPU pools shard in page_size runs (the translator's rank-local write),
-        # not round-robin, so this rank's prefix rows are not the stride below.
-        # A rank-local NPU pool is never a translating one: rows are physical.
-        dcp_local_prefix_kv_indices = dcp_local_prefix_rows(
-            dcp_prefix_kv_indices,
-            extend_prefix_lens_cpu,
-            parallel.dcp_size,
-            parallel.dcp_rank,
-            get_attn_backend().page_size,
-        )
-        # NPU gathers into its own reused buffers and never reads this one,
-        # which is context-sized: 1.15 GB per extend forward at a 1M prefix.
-        dcp_kv_buffer = None
-    else:
+    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    translator = get_attn_backend().kv_index_translator
+    if interleave_size == 1:
         # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-        # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-        translator = get_attn_backend().kv_index_translator
         dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
             dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
         )
+    else:
+        # Interleaved pools are written rank-local, never through a translator.
+        assert translator is None or not translator.is_translating
+        owned_kv_indices = filter_dcp_local_chunk_kv_indices(
+            dcp_prefix_kv_indices,
+            torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),
+            torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64),
+            interleave_size=interleave_size,
+        )
+        dcp_local_prefix_kv_indices = dcp_local_row(
+            owned_kv_indices, parallel.dcp_size, interleave_size
+        )
+    dcp_kv_buffer = None
+    if allocate_kv_buffer:
         dcp_kv_buffer = torch.empty(
             (
                 seq_lens_sum,
