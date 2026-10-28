@@ -25,6 +25,7 @@ from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +129,21 @@ def dflash_draft_cell_size_per_token(
     """Exact bytes/token of the DFLASH draft KV pool."""
     if draft_num_layers <= 0:
         return 0
+    from sglang.srt.configs.model_config import AttentionArch
+
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    if getattr(draft_model_config, "attention_arch", None) == AttentionArch.MLA:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        # One latent row per token, replicated across TP ranks.
+        kv_dim = calculate_mla_kv_cache_dim(
+            model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
+        )
+        return int(kv_dim * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
     kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
-    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
@@ -516,6 +529,67 @@ def _parse_optional_int(
     return parsed
 
 
+def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
+    # SpecForge exports attention_mode; forks that mix modes list attention_modes.
+    if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
+        raise ValueError(
+            "DFLASH dflash_config sets both attention_mode and attention_modes; "
+            "set only one."
+        )
+    raw_modes = dflash_cfg.get("attention_modes")
+    if raw_modes is None:
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")]
+    elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
+        num_hidden_layers
+    ):
+        raise ValueError(
+            "DFLASH dflash_config.attention_modes must list one mode per draft "
+            f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
+        )
+
+    modes = {str(mode).lower() for mode in raw_modes}
+    unsupported = modes - _DFLASH_ATTENTION_MODES
+    if unsupported:
+        raise ValueError(
+            f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
+            f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
+        )
+    if "mla" not in modes:
+        return False
+    # The draft KV pool has a single per-layer row layout.
+    if modes != {"mla"}:
+        raise ValueError(
+            "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
+            f"got attention modes {list(raw_modes)}."
+        )
+    return True
+
+
+# The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
+_DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
+
+
+def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
+    text_config = _get_text_config(draft_hf_config)
+    required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    missing = [name for name in required if _cfg_get(text_config, name) is None]
+    if missing:
+        raise ValueError(f"DFLASH mla draft config is missing {missing}.")
+    if _cfg_get(text_config, "attention_bias", False):
+        raise ValueError("DFLASH mla drafts do not support attention_bias.")
+    rope = (
+        _cfg_get(text_config, "rope_parameters")
+        or _cfg_get(text_config, "rope_scaling")
+        or {}
+    )
+    rope_type = rope.get("rope_type", rope.get("type", "default"))
+    if rope_type not in _DFLASH_MLA_ROPE_TYPES:
+        raise ValueError(
+            f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
+            f"got {rope_type!r}."
+        )
+
+
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
@@ -537,6 +611,7 @@ class DFlashDraftConfig:
     emb_dim: Optional[int]
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
+    is_mla: bool = False
 
     @property
     def is_domino(self) -> bool:
@@ -724,6 +799,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             )
         attention_value_scale = float(raw_attention_value_scale)
 
+    is_mla = _parse_dflash_is_mla(dflash_cfg, num_hidden_layers)
+    if is_mla and (attention_sink_bias or attention_value_scale is not None):
+        raise ValueError(
+            "DFLASH mla drafts support neither attention_sink_bias nor "
+            "attention_value_scale."
+        )
+
     projector_type = dflash_cfg.get(
         "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
     )
@@ -810,6 +892,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
+        is_mla=is_mla,
     )
 
 

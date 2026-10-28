@@ -159,6 +159,7 @@ class Spec(msgspec.Struct):
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            resolvable=True,
         ),
     ] = None
     speculative_draft_window_size: A[

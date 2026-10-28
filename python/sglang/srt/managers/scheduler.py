@@ -117,6 +117,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -147,6 +148,8 @@ from sglang.srt.managers.io_struct import (
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -459,6 +462,8 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Allocate per instance only when a consumer first defers a response.
+    _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
 
     def __init__(
         self,
@@ -1906,6 +1911,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1943,6 +1949,8 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+
+        result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
         if get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
@@ -2641,6 +2649,63 @@ class Scheduler(
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
+
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        """Hold a finished response until completion; see deferred_output."""
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            raise ValueError("deferred responses do not support PD disaggregation")
+        if not req.finished() or req.finished_output:
+            raise ValueError("only finished, unstreamed responses can be deferred")
+        if self._deferred_responses is None:
+            self._deferred_responses = {}
+        if req.rid in self._deferred_responses:
+            raise ValueError(f"response {req.rid!r} is already deferred")
+        self._deferred_responses[req.rid] = (req, completion)
+        req.defer_output = True
+        self.output_streamer.defer_outputs = True
+
+    def stream_released_deferred_outputs(self) -> None:
+        ready = []
+        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
+            if not completion.done():
+                continue
+            del self._deferred_responses[rid]
+            req.defer_output = False
+            try:
+                completion.result()
+            except Exception as exc:
+                logger.exception("Deferred response failed for %s", rid)
+                self._abort_deferred_response(
+                    req, FINISH_ABORT(str(exc), status_code=500).to_json()
+                )
+            else:
+                ready.append(req)
+        if ready:
+            self.output_streamer.stream_output(
+                ready, any(req.return_logprob for req in ready)
+            )
+
+    def has_pending_deferred_outputs(self) -> bool:
+        return bool(self._deferred_responses)
+
+    def _abort_deferred_response(
+        self, req: Req, finished_reason: Optional[FinishReasonDict]
+    ) -> None:
+        req.defer_output = False
+        req.finished_output = True
+        self.send_abort_output(
+            _make_abort_req(req, finished_reason=finished_reason), req
+        )
+
+    def _abort_deferred_responses(self, recv_req: AbortReq) -> None:
+        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
+            if recv_req.abort_all or rid.startswith(recv_req.rid):
+                del self._deferred_responses[rid]
+                try:
+                    completion.cancel()
+                except Exception:
+                    logger.exception("Failed to cancel deferred work for %s", rid)
+                self._abort_deferred_response(req, recv_req.finished_reason)
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -4657,8 +4722,11 @@ class Scheduler(
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # A load-back submitted in this build may still be writing pages that a
+            # later request matched as device prefix; don't early-send them (#44070).
+            load_pending = batch.hicache_consumer_index >= 0
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
         if self.is_generation:
@@ -5004,7 +5072,10 @@ class Scheduler(
         logits_output = result.logits_output
         if (
             logits_output is None
-            or logits_output.auxiliary_device_output is None
+            or (
+                logits_output.auxiliary_device_output is None
+                and result.forward_auxiliary_output is None
+            )
             or result.auxiliary_host_output is not None
         ):
             return
@@ -5083,6 +5154,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5248,6 +5321,8 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5272,9 +5347,11 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
+                or self._deferred_responses
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage, transfer, and deferred-output workers need the GIL
+                # between I/O calls. Singleton PD polls no longer yield through
+                # a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
@@ -5331,11 +5408,19 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if self.has_pending_deferred_outputs():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the completion's worker.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self._deferred_responses:
+            self.stream_released_deferred_outputs()
+            time.sleep(0)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
@@ -5556,6 +5641,53 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)
 
+    def _hicache_l3_layout(self) -> dict:
+        from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
+
+        if not self.enable_hierarchical_cache:
+            return disabled_l3_layout(
+                "Hierarchical cache is disabled", page_size=self.page_size
+            )
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree_cache = self.tree_cache
+        controller = tree_cache.cache_controller
+        if controller is None:
+            return disabled_l3_layout(
+                "HiCache controller is not attached", page_size=self.page_size
+            )
+        storage_backend = controller.storage_backend
+        if not isinstance(storage_backend, MooncakeStore):
+            return disabled_l3_layout(
+                "Mooncake storage is not attached",
+                backend=controller.storage_backend_type,
+                page_size=self.page_size,
+            )
+
+        sidecar_pool_specs = ()
+        swa = None
+        if isinstance(tree_cache, UnifiedRadixCache):
+            sidecar_pool_specs = tree_cache.sidecar_pool_specs
+            swa = tree_cache.components.get(ComponentType.SWA)
+        return storage_backend.describe_l3_object_layout(
+            sidecar_pool_specs=sidecar_pool_specs,
+            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            page_size=self.page_size,
+        )
+
+    def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+        """Reply with the same external L3 layout used by the startup handshake."""
+        from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+
+        return GetHiCacheL3LayoutReqOutput(
+            layout=msgspec_to_builtins(self._hicache_l3_layout())
+        )
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
 
@@ -5604,6 +5736,7 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
+            *(req for req, _ in (self._deferred_responses or {}).values()),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5633,6 +5766,8 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
+        if self._deferred_responses:
+            self._abort_deferred_responses(recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

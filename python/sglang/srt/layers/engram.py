@@ -37,6 +37,12 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -64,7 +70,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -316,6 +322,14 @@ class EngramHasher(nn.Module):
         result.image_token_id = image_token_id
         return result
 
+    def new_hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for ``input_ids``' hash ids."""
+        return torch.empty(
+            (input_ids.shape[0], self.primes.shape[0], self.offsets.shape[1]),
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -325,11 +339,7 @@ class EngramHasher(nn.Module):
         mode = forward_batch.forward_mode
         if num_tokens == 0 or mode.is_idle():
             # A DP-attention idle batch carries pad rows; nothing reads its hashes.
-            return torch.zeros(
-                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
-                dtype=torch.int64,
-                device=input_ids.device,
-            )
+            return self.new_hash_ids(input_ids).zero_()
         if (
             mode.is_extend()
             and not mode.is_target_verify()
@@ -678,23 +688,20 @@ def _registered_device_ptr(host_ptr: int) -> int:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
+    """Host-memory backing for one engram table: one shard per rank, or with
+    replication per_node one whole table shared by the TP group.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group):
-        if layout not in ("shared", "per_rank"):
-            raise ValueError(
-                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
-                "'shared' or 'per_rank'"
-            )
-        self.layout = layout
+    def __init__(self, replication: str, nbytes: int, name: str, group):
+        self.replication = replication
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
+        per_node = replication == EngramReplication.PER_NODE
+        if per_node:
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
                 self.fd,
@@ -713,12 +720,12 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "per_rank":
+        if not per_node:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == "shared":
+        if per_node:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
@@ -770,10 +777,11 @@ class _HostTable:
         if not self.dirty:
             return
         self.dirty = False
-        if self.layout == "shared":
+        per_node = self.replication == EngramReplication.PER_NODE
+        if per_node:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if not per_node and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -781,12 +789,12 @@ class _HostTable:
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
-            f"engram host table {label}: layout={self.layout}, "
+            f"engram host table {label}: replication={self.replication}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+            knob = "shmem_enabled" if per_node else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -796,14 +804,6 @@ class _HostTable:
             )
         else:
             logger.info(msg)
-
-
-@functools.cache
-def _warn_host_table_ignored() -> None:
-    logger.warning(
-        "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS takes precedence: the engram tables "
-        "stay in device memory and SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE is ignored"
-    )
 
 
 class _PeerShards:
@@ -982,9 +982,9 @@ class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
     Rows are sharded over the TP group in device memory, aligned to the hash
-    columns where they divide evenly (`shard_range`); with
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
-    one shared copy or one shard per rank (see _HostTable). Loading is sharded
+    columns where they divide evenly (`shard_range`); --engram-config can read
+    the peers' shards in place or keep the rows in host memory instead, as one
+    shard per rank or one copy per node (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
 
@@ -1007,19 +1007,15 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        if (
-            envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
-            and self.tp_size > 1
-            and is_cuda()
-        ):
-            if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get() and tp_rank == 0:
-                _warn_host_table_ignored()
+        # Resolved by server args (_resolve_engram_config); None before that.
+        config = get_exec().offload.engram_config or EngramConfig()
+        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
-        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
-            self._init_host_table(num_embeddings, dim, layer_id)
+        elif config.placement == EngramPlacement.CPU:
+            self._init_host_table(num_embeddings, dim, layer_id, config.replication)
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -1034,13 +1030,15 @@ class EngramEmbedding(nn.Module):
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
-    def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        n = num_embeddings if layout == "shared" else self.rows
+    def _init_host_table(
+        self, num_embeddings: int, dim: int, layer_id: int, replication: str
+    ):
+        per_node = replication == EngramReplication.PER_NODE
+        n = num_embeddings if per_node else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         self.host_table = _HostTable(
-            layout,
+            replication,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
@@ -1056,7 +1054,10 @@ class EngramEmbedding(nn.Module):
 
     @property
     def _shared(self) -> bool:
-        return self.host_table is not None and self.host_table.layout == "shared"
+        return (
+            self.host_table is not None
+            and self.host_table.replication == EngramReplication.PER_NODE
+        )
 
     @property
     def shared_host_table_without_ats(self) -> bool:
@@ -1105,8 +1106,8 @@ class EngramEmbedding(nn.Module):
             return self.peer.lookup(indices)
         if self._shared:
             if indices.shape[0] == 0:
-                return self._empty(indices)
-            out = self._empty(indices)
+                return self.new_rows(indices)
+            out = self.new_rows(indices)
             engram_gather(
                 *self._table_ptrs(),
                 indices.reshape(-1),
@@ -1164,7 +1165,7 @@ class EngramEmbedding(nn.Module):
         """Lookup when every TP rank holds the same indices: the device and
         per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(indices)
         if self.tp_size > 1:
             values = self._reduce_owned_rows(values)
@@ -1179,7 +1180,8 @@ class EngramEmbedding(nn.Module):
             return values
         return tensor_model_parallel_all_reduce(values)
 
-    def _empty(self, indices: torch.Tensor) -> torch.Tensor:
+    def new_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for the rows of ``indices``."""
         return torch.empty(
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
@@ -1187,7 +1189,7 @@ class EngramEmbedding(nn.Module):
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
-            return self._empty(indices).zero_()
+            return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
@@ -1195,7 +1197,7 @@ class EngramEmbedding(nn.Module):
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
+        out = self.new_rows(indices)
         engram_gather(
             *self._table_ptrs(),
             indices.reshape(-1),
@@ -1220,7 +1222,7 @@ class EngramEmbedding(nn.Module):
         # The MAX_LEN gather may zero its local input in place, hence the clone.
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
         local = torch.empty(
             (indices.shape[0], values.shape[1]),
@@ -1344,7 +1346,8 @@ class Engram(nn.Module):
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
-            emb = _bcg_engram_embed(self, hash_ids, cp_all_tokens)
+            emb = self.embed.new_rows(hash_ids)
+            _bcg_engram_embed(self, hash_ids, cp_all_tokens, emb)
         else:
             emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
         if x.shape[0] == 0:
@@ -1381,8 +1384,8 @@ class Engram(nn.Module):
 
 @eager_on_graph
 def _bcg_engram_embed(
-    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool
-) -> torch.Tensor:
+    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool, out: torch.Tensor
+) -> None:
     # A replay builds a fresh batch; the capture-time one stages no rows.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return engram.embed_rows(hash_ids, forward_batch, cp_all_tokens)
+    out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))

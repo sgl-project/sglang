@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import (
+    Any,
+    Dict,
     List,
     Literal,
     Optional,
@@ -122,6 +125,38 @@ class ExecFeatures(msgspec.Struct):
             "`last`; `full` also allows return_hidden_states=True.",
             choices=["last", "full"],
         ),
+    ] = None
+    # Changes what --speculative-algorithm means: with this flag it only names
+    # the capture convention (EAGLE3, DFLASH or DSPARK) and
+    # handle_aux_hidden_state_capture resets it to None, so no draft is loaded,
+    # nothing is reserved for one, and the speculative stack stays off.
+    enable_return_aux_hidden_states: A[
+        bool,
+        "Capture auxiliary hidden states on the target model without running a "
+        "speculative draft. --speculative-algorithm then only names the capture "
+        "convention (EAGLE3, DFLASH or DSPARK) and is reset to None. Requests "
+        "with return_hidden_states receive the concatenated aux hidden states in "
+        "place of the last-layer hidden states. Sets --return-hidden-states-mode "
+        "to full when unset. Requires pp_size == 1.",
+    ] = False
+    # The capture convention behind --enable-return-aux-hidden-states, taken from
+    # --speculative-algorithm. It stays an enum because the models' capture hooks
+    # still differ by draft family (layer-id conventions, mHC contraction).
+    # TODO: unify the per-family capture hooks, then collapse this to the bool.
+    aux_hidden_state_capture: A[
+        Optional[str],
+        Arg(
+            help="Resolved from --enable-return-aux-hidden-states and "
+            "--speculative-algorithm.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = None
+    return_aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target-model layer ids for the selected capture convention. These may "
+        "differ from draft-checkpoint layer ids. Required for DFLASH and DSPARK; "
+        "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
@@ -330,7 +365,9 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
@@ -956,7 +993,7 @@ class ExecMoe(msgspec.Struct):
     ] = False
     enforce_shared_experts_fusion: A[
         bool,
-        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
+        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -1080,6 +1117,16 @@ class ExecOffload(msgspec.Struct):
             "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
             "The file is sparse and reused across restarts; put it on fast "
             "local storage (NVMe).",
+        ),
+    ] = None
+    engram_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
+            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "collective|peer_read; an omitted key takes the first value. "
+            "See docs/advanced_features/engram.",
+            type_parser=json.loads,
         ),
     ] = None
 

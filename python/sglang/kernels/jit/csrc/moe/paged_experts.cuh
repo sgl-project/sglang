@@ -3,7 +3,9 @@
 //
 // decide: for a step whose routed (token, expert) entries fit the K slots, keep every resident
 // expert the step uses, give each missing expert the least recently used slot the step does not
-// need, and write the page-in plan (src expert -> dst slot, count) to device buffers.
+// need, and write the page-in plan (src expert -> dst slot, count) to device buffers. It also
+// writes the runner's inputs: each routed entry's slot and router weight, slot 0 and weight 0 for
+// padding, so no further kernel is needed to build them.
 // gather: copy the planned experts from the pinned host store into their slots, for every paged
 // tensor of a layer in one launch. The count is read on the device, so a replayed graph moves
 // exactly the experts its decide chose.
@@ -24,7 +26,8 @@ namespace {
 // One warp. The evictions depend on each other and are committed one at a time by lane 0; each
 // victim search and the per-entry bookkeeping are spread over the warp.
 __global__ void paged_experts_decide_kernel(
-    const int32_t* topk,  // [T] routed expert ids of the step (negative: padding)
+    const int32_t* topk,   // [T] routed expert ids of the step (negative: padding)
+    const float* weights,  // [T] their router weights
     int T,
     int E,
     int K,
@@ -34,7 +37,9 @@ __global__ void paged_experts_decide_kernel(
     int32_t* slot_lastuse,  // [K] step each slot was last used
     int32_t* src,           // [K] out: experts to page in
     int32_t* dst,           // [K] out: their slots
-    int32_t* count) {       // [1] out: number of page-ins
+    int32_t* count,         // [1] out: number of page-ins
+    int32_t* run_ids,       // [T] out: slot of each entry (0 for padding)
+    float* run_w) {         // [T] out: weight of each entry (0 for padding)
   const int lane = threadIdx.x;
   int now = 0;
   if (lane == 0) now = ++(*step);
@@ -83,6 +88,13 @@ __global__ void paged_experts_decide_kernel(
     __syncwarp();  // the next search reads this eviction
   }
   if (lane == 0) *count = n;
+  __syncwarp();  // the slots of the experts paged in above
+  for (int i = lane; i < T; i += 32) {
+    const int e = topk[i];
+    const int s = (e < 0 || e >= E) ? -1 : expert_slot[e];
+    run_ids[i] = s >= 0 ? s : 0;
+    run_w[i] = s >= 0 ? weights[i] : 0.f;
+  }
 }
 
 template <typename T>
@@ -143,13 +155,16 @@ __global__ void paged_experts_gather_kernel(
 
 void paged_experts_decide(
     tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView weights,
     tvm::ffi::TensorView step,
     tvm::ffi::TensorView slot_expert,
     tvm::ffi::TensorView expert_slot,
     tvm::ffi::TensorView slot_lastuse,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
-    tvm::ffi::TensorView count) {
+    tvm::ffi::TensorView count,
+    tvm::ffi::TensorView run_ids,
+    tvm::ffi::TensorView run_w) {
   using namespace sglang::host;
 
   SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"num_entries"}, One = {"one"};
@@ -163,13 +178,15 @@ void paged_experts_decide(
       .verify(slot_lastuse)
       .verify(src)
       .verify(dst);
-  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk).verify(run_ids);
+  TensorMatcher({T}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(weights).verify(run_w);
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(step).verify(count);
   RuntimeCheck(T.unwrap() <= K.unwrap(), "paged_experts_decide needs at most K routed entries, got ", T.unwrap());
 
   LaunchKernel(1, 32, device_.unwrap())(
       paged_experts_decide_kernel,
       static_cast<const int32_t*>(topk.data_ptr()),
+      static_cast<const float*>(weights.data_ptr()),
       static_cast<int>(T.unwrap()),
       static_cast<int>(E.unwrap()),
       static_cast<int>(K.unwrap()),
@@ -179,7 +196,9 @@ void paged_experts_decide(
       static_cast<int32_t*>(slot_lastuse.data_ptr()),
       static_cast<int32_t*>(src.data_ptr()),
       static_cast<int32_t*>(dst.data_ptr()),
-      static_cast<int32_t*>(count.data_ptr()));
+      static_cast<int32_t*>(count.data_ptr()),
+      static_cast<int32_t*>(run_ids.data_ptr()),
+      static_cast<float*>(run_w.data_ptr()));
 }
 
 void paged_experts_gather(
