@@ -1755,7 +1755,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         # Request-scoped rings are indexed by req_pool_idx. This kernel still
         # writes the ring through the mamba slot, so keep the Triton path.
-        if self.req_to_token_pool.mamba_pool.replayssm_request_ring:
+        pool = self.state_pool
+        if pool is not None and pool.replayssm_request_ring:
             return False
         if importlib.util.find_spec("cutlass") is None:
             return False

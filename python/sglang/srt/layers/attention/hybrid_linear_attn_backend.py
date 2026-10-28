@@ -619,7 +619,12 @@ class MambaAttnBackendBase(AttentionBackend):
         return bool(mamba_pool.enable_linear_replayssm)
 
     def _replayssm_request_ring(self) -> bool:
-        return self.req_to_token_pool.mamba_pool.replayssm_request_ring
+        # The flag lives on the state view the router binds. A unified
+        # RequestTable has no mamba_pool attribute.
+        pool = self.state_pool
+        if pool is None:
+            return False
+        return pool.replayssm_request_ring
 
     def _fill_replayssm_ring_indices(
         self,

@@ -1254,6 +1254,7 @@ class TestInflightAnchorStillLoads(CustomTestCase):
         cache = SimpleNamespace(
             buffer_pipeline=None,
             linker=None,
+            _mamba_host_only_checkpoint=lambda: False,
             ongoing_load_back={7: object()},
             tree_core=SimpleNamespace(
                 is_full_device_evicted=lambda _node_id: True,

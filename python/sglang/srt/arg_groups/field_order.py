@@ -348,7 +348,6 @@ POSITIONAL_FIELD_ORDER = (
     "uses_mamba_radix_cache",
     "mamba_track_interval",
     "enable_int8_mamba_checkpoint",
-    "enable_mamba_host_only_checkpoint",
     "int8_mamba_ckpt_size",
     "linear_attn_backend",
     "linear_attn_decode_backend",
@@ -558,5 +557,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "enable_mamba_host_only_checkpoint",
 )
 # fmt: on

@@ -3734,8 +3734,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """None means admission retries without committing a load. Only
-        buffer mode returns None."""
+        """None means admission retries without committing a load: buffer
+        mode, or a host-only anchor whose previous load-back is still in flight."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3754,6 +3754,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            # ongoing_load_back is keyed by anchor. A host-only mamba
+            # checkpoint stays off the device after its load, so another
+            # request can reach this anchor before the first H->D is acked.
+            if (
+                self._mamba_host_only_checkpoint()
+                and best_match_node_id in self.ongoing_load_back
+            ):
+                return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
