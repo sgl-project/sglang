@@ -150,7 +150,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -882,6 +882,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_megamoe()
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -979,6 +980,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -1002,6 +1004,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -2036,6 +2039,8 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
+        attn_type: AttentionType = AttentionType.DECODER,
+        sliding_window_size: int = -1,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -2187,7 +2192,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
@@ -2199,7 +2206,9 @@ class DeepseekV2AttentionMLA(
                 num_kv_heads=1,
                 layer_id=layer_id,
                 v_head_dim=self.kv_lora_rank,
+                sliding_window_size=sliding_window_size,
                 quant_config=quant_config,
+                attn_type=attn_type,
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
@@ -2210,7 +2219,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
 

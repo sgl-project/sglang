@@ -330,6 +330,18 @@ def _case_expand_prefill_causally(tc):
         num_tokens=bs2 * block,
         padded_num_tokens=None,
     )
+    # Device lengths only: the DSpark draft block without host lens.
+    tc._parity(
+        attn_metadata_kernels.ExpandPrefillCausally,
+        req_pool_indices=req_pool_indices[:bs2],
+        seq_lens=seq_lens[:bs2],
+        extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
+        extend_start_loc=None,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=[block] * bs2,
+        num_tokens=bs2 * block,
+        padded_num_tokens=None,
+    )
 
 
 def _case_finalize_accept_lens(tc):
