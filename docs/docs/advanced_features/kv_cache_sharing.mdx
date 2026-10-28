@@ -1,73 +1,57 @@
 ---
-title: "KV cache sharing with prefill CP and HiCache"
-description: "Page-based KV sharding with GLM DSA/MTP, CPU HiCache, and a TP4/CP4 prefill plus TP4/EP4 decode example."
+title: "KV Cache Sharing"
+metatags:
+    description: "Page-based KV cache sharding for prefill context parallelism, CPU HiCache, and P/D serving."
 ---
 
-KV cache sharing (KVShard) removes persistent KV replicas across a group of
-GPUs. Each rank stores only the pages it owns, while the prefix tree and
-scheduler keep a shared logical view. Enable it with
-`--enable-kv-cache-sharding` on a supported P/D prefill worker.
+KV cache sharing reduces duplicate KV storage across GPUs in a prefill worker. It keeps one persistent copy of each cache page within the shard group, allowing the same GPU memory budget to retain more unique tokens.
 
-[Prefill CP](/docs/advanced_features/prefill_cp) distributes query computation;
-KV sharing distributes stored pages. With a fixed pool size per rank, `N`
-shard ranks can retain up to `N` times the unique cached tokens, subject to
-scratch space and owner imbalance. Cache hits still require communication.
+[Prefill context parallelism (CP)](/docs/advanced_features/prefill_cp) distributes prompt computation, but can still leave the cached history replicated across ranks. KV cache sharing distributes those stored pages as well. This is useful for long-context and multi-turn workloads that reuse large prefixes.
 
 ## How it works
 
-### Page ownership and layer gathering
+### Shared logical tree, distributed pages
 
-The tree and scheduler use logical token slots. For slot `s`, page size `B`
-and shard-group size `N`, the pool maps to owner `(s // B) % N` and local row
-`((s // B) // N) * B + s % B`.
+Every rank keeps the same logical radix tree and request-to-token mapping. A prefix match therefore identifies the same cached tokens on all ranks, while each GPU stores only the pages it owns.
 
-```mermaid
-flowchart TB
-    L["Logical prefix: P0 P1 P2 P3 P4 P5 P6 P7"]
-    L --> R0["Rank 0: P0, P4"]
-    L --> R1["Rank 1: P1, P5"]
-    L --> R2["Rank 2: P2, P6"]
-    L --> R3["Rank 3: P3, P7"]
+For example, a CP4 group can distribute eight logical pages as follows:
+
+| Rank | Stored pages |
+| --- | --- |
+| 0 | A, E |
+| 1 | B, F |
+| 2 | C, G |
+| 3 | D, H |
+
+A request that reuses A–D matches the same logical prefix on every rank. New pages continue the cached path's ownership sequence, and prefixes remain reusable at the original page size.
+
+### Gather one layer at a time
+
+Before attention reads a cached prefix, each rank contributes its owned pages to an all-gather. Attention reads the assembled prefix from a temporary layer buffer, using a page-table mapping to preserve the logical token order.
+
+Two buffers alternate across layers so the next gather can overlap with current-layer computation. Their memory is included in the cache budget. A prefix hit saves recomputation, but still incurs the cost of gathering the distributed KV.
+
+### HiCache and MTP integration
+
+[HiCache](/docs/advanced_features/hicache) preserves page ownership during GPU-to-host backup and host-to-GPU reload. Each rank backs up and restores its own pages. For each layer, execution follows this order:
+
+```text Read order
+Restore local pages → Gather the prefix → Run attention
 ```
 
-This CP4 example starts at owner zero. New paths start on the owner with the
-most free pages; extensions inherit the cached path's rotation. Prefix reuse
-stays at page granularity `B`. Admission accounts for the most constrained owner.
+With GLM MTP, the target and draft KV/indexer state follow the same ownership plan and are restored together. During [P/D transfer](/docs/advanced_features/pd_disaggregation), each prefill rank sends the pages it owns; decode receives complete, unsharded cache entries.
 
-For each batch, the pool deduplicates cached prefix pages and all-gathers them
-into temporary, owner-ordered scratch. Attention and the DSA indexer translate
-logical IDs through this mapping. Only owner-selected pages enter persistent
-storage. Two scratch slots alternate across layers to overlap the next gather
-with current-layer computation.
+## Usage example
 
-### HiCache, MTP and P/D
+Enable KV cache sharing with `--enable-kv-cache-sharding` on the prefill worker only.
 
-- **HiCache:** Host pages preserve device ownership. Each rank copies only its
-  own pages. The gather waits for that layer's H2D completion; attention waits
-  for gather completion. Ranks with no local pages still signal completion.
-- **MTP:** GLM target and draft KV/indexer state use the same ownership plan
-  with separate scratch. Host hits restore both before use. This path supports
-  a single NextN layer with EAGLE and top-k one.
-- **P/D:** Only P enables sharding. Each owner sends its target/draft KV and
-  indexer pages through Mooncake; D receives complete, unsharded cache entries.
+The following example uses Linux with NVIDIA CUDA on two GB300 nodes, with four GPUs per worker. Prefill uses TP4/CP4 and CPU HiCache; decode uses TP4/EP4 with attention DP4. Both workers use the same GLM-5.3 NVFP4 checkpoint and model revision.
 
-The example uses one instance per node:
+### Environment variables
 
-| Worker | Parallelism | Cache |
-| --- | --- | --- |
-| Prefill | TP4/CP4, attention TP1 | Sharded GPU cache + CPU HiCache |
-| Decode | TP4/EP4, attention DP4/TP1 | Ordinary GPU cache |
+Create `kv-shard.env` on both nodes. Replace the example IP addresses and RDMA NIC names with values for your environment. This example uses Mooncake RDMA for P/D transfer.
 
-Attention DP4 is selected with `--attn-dp-size 4` within the TP4 group.
-P/D transport must support both target and draft layouts.
-
-## Deployment example
-
-The following commands launch P TP4/CP4 and D TP4/EP4 on two GB300 nodes,
-using four GPUs per node. Replace the example IP addresses and RDMA NIC names
-in `kv-shard.env` on both nodes.
-
-```bash
+```bash Environment variables
 cat > kv-shard.env <<'EOF'
 export MODEL_PATH=RadixArk/GLM-5.3-NVFP4
 export MODEL_REVISION=6e389189d564d9d3e4ea7fa284fe91f136d8ae2a
@@ -82,11 +66,11 @@ unset MC_FORCE_MNNVL SGLANG_MOONCAKE_CUSTOM_MEM_POOL
 EOF
 ```
 
-### Prefill node: TP4/CP4
+### Prefill worker: TP4/CP4
 
-Run this in its own terminal on the P node.
+Run this command on the prefill node. It enables interleave CP, page-based KV sharding, CPU HiCache, and EAGLE MTP.
 
-```bash
+```bash Prefill worker
 source ./kv-shard.env
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 python -m sglang.launch_server \
@@ -132,13 +116,11 @@ python -m sglang.launch_server \
   --enable-cache-report
 ```
 
-### Decode node: TP4/EP4
+### Decode worker: TP4/EP4
 
-Run this in a separate terminal on the D node. The target uses attention DP4,
-FlashInfer A2A and the routed TRTLLM MoE runner with EP4. The EAGLE draft uses
-the TP-only path.
+Run this command on the decode node. The target uses attention DP4 and FlashInfer A2A with EP4; the EAGLE draft uses the TP-only path. Decode does not enable KV cache sharding.
 
-```bash
+```bash Decode worker
 source ./kv-shard.env
 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -181,12 +163,9 @@ python -m sglang.launch_server \
 
 ### Router
 
-After all workers return HTTP 200 from `/health`, run the router on the D
-node or another host that can reach both workers. Install the same router
-version there. The HTTP endpoints, P bootstrap ports and transport-selected
-RDMA ports must be reachable between the nodes.
+After both workers are healthy, start the router on a host that can reach them. The worker HTTP endpoints, prefill bootstrap port, and RDMA transport must be reachable between nodes.
 
-```bash
+```bash Router
 source ./kv-shard.env
 curl --fail "http://${PREFILL_HOST}:30001/health"
 curl --fail "http://${DECODE_HOST}:30003/health"
@@ -200,51 +179,19 @@ python -m sglang_router.launch_router \
   --port 30000
 ```
 
-## Validation
+### Send a request
 
-Send a request from the router host:
+From the router host, send a request using the shared served model name:
 
-```bash
+```bash Request
 curl --fail http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"glm-kv-shard","messages":[{"role":"user","content":"What is 17 + 25?"}],"temperature":0,"max_tokens":128}'
 ```
 
-For accuracy, run the completion-style GSM8K evaluator:
-
-```bash
-set -o pipefail
-python -m sglang.test.run_eval \
-  --base-url http://127.0.0.1:30000 \
-  --model glm-kv-shard \
-  --eval-name gsm8k \
-  --api completion \
-  --num-examples 1319 \
-  --num-threads 48 \
-  --num-shots 20 \
-  --max-tokens 512 \
-  --temperature 0 \
-  2>&1 | tee gsm8k-sharded-hicache.log
-```
-
-The evaluator excludes the 20 demonstrations, leaving 1299 held-out questions.
-It does not force GPU eviction or assert host reload. To check L2, reuse a
-prefix after unrelated requests evict it from GPU memory, then check
-`cached_tokens_details.host` on native `/generate` responses and growth in
-`sglang:load_back_tokens_total`. Read one `pool="kv"` / `tp_rank="0"` series
-per P instance; logical counters repeat across ranks.
-
-This deployment recipe has not been hardware-validated as part of this change.
-The [registered hardware tests](https://github.com/sgl-project/sglang/blob/0f214cb6de059713a44d05055ed9a5e849f12ecd/test/registered/e2e/models/test_dsa_glm52_pd_kv_shard_hicache.py)
-run on four GB300 GPUs with P2/D2 and CP2, including the full GSM8K accuracy
-case. They use GLM-5.2 and different cache/MTP settings; the accuracy floor
-is not a validated GLM-5.3 baseline.
-Keep the source SHA, model revision, dependency
-manifest, GPU/RDMA topology, resolved arguments, logs and scores for each run.
-
-## References
+## Related documentation
 
 - [Prefill context parallelism](/docs/advanced_features/prefill_cp)
 - [HiCache design](/docs/advanced_features/hicache_design)
+- [P/D disaggregation](/docs/advanced_features/pd_disaggregation)
 - [GLM-5.3 cookbook](/cookbook/autoregressive/GLM/GLM-5.3)
-- [KVShard GLM DSA/MTP integration](https://github.com/sgl-project/sglang/pull/42973)
