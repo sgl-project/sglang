@@ -76,7 +76,23 @@ def fused_sigmoid_mul(
 
     ``round_sigmoid`` rounds the sigmoid to the gate dtype before the multiply,
     matching the two-op torch spelling bit for bit.
+
+    On XPU the non-quant, unrounded path uses the SYCL kernel from sgl_kernel.
     """
+    if (
+        attn_output.is_xpu
+        and not quant
+        and not round_sigmoid
+        and attn_output.ndim == 2
+        and attn_output.is_contiguous()
+        and attn_output.dtype in (torch.bfloat16, torch.float16)
+        and gate.dtype == attn_output.dtype
+        and gate.ndim in (2, 3)
+        and gate.stride(-1) == 1
+    ):
+        from sgl_kernel import fused_sigmoid_mul as xpu_fused_sigmoid_mul
+
+        return xpu_fused_sigmoid_mul(attn_output, gate, inplace=inplace)
     if gate.ndim == 3 and attn_output.ndim == 2:
         # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
         num_tokens, num_heads, head_dim = gate.shape
