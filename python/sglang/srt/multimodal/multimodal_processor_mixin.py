@@ -45,7 +45,8 @@ class MultimodalProcessorMixin:
     precompute_hash_before_cpu_transfer = False
     keep_mm_features_on_device = False
 
-    def _io_thread_initializer(self):
+    def _worker_thread_initializer(self):
+        """Runs first on every IO and processor worker thread; None runs nothing."""
         return None
 
     def _initialize_processor(self, hf_config, _processor, *, processor_config):
@@ -95,7 +96,7 @@ class MultimodalProcessorMixin:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
-            initializer=self._io_thread_initializer(),
+            initializer=self._worker_thread_initializer(),
         )
         if self.mm_io_worker_num > 4:
             logger.info(
@@ -125,7 +126,9 @@ class MultimodalProcessorMixin:
                 # `_processor` after this returns, and the workers must clone it
                 # as the subclass left it.
                 self.mm_processor_executor = MultimodalProcessorExecutor(
-                    lambda: self._processor, self.mm_processor_worker_num
+                    lambda: self._processor,
+                    self.mm_processor_worker_num,
+                    initializer=self._worker_thread_initializer(),
                 )
             except Exception:
                 logger.warning(

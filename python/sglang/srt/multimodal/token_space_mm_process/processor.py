@@ -48,10 +48,10 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         processor,
         *,
         processor_config=None,
-        pin_io_threads_to_current_device=True,
+        worker_thread_device=None,
     ):
         strategy_class = self.strategy_class
-        self._pin_io_threads_to_current_device = pin_io_threads_to_current_device
+        self._worker_thread_device = worker_thread_device
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -63,15 +63,12 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             hf_config, processor, mm_process_config=self.mm_process_config
         )
 
-    def _io_thread_initializer(self):
-        # Loaders decode on device "cuda", which a new thread resolves to cuda:0
-        # whatever device this trainer rank selected.
-        if (
-            not self._pin_io_threads_to_current_device
-            or not torch.cuda.is_initialized()
-        ):
+    def _worker_thread_initializer(self):
+        # Media decodes and preprocesses on device "cuda", which a new thread
+        # resolves to cuda:0 whatever device the caller's rank selected.
+        if self._worker_thread_device is None:
             return None
-        return functools.partial(torch.cuda.set_device, torch.cuda.current_device())
+        return functools.partial(torch.cuda.set_device, self._worker_thread_device)
 
     async def process(
         self,
