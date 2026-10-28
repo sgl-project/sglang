@@ -124,6 +124,14 @@ def test_normal_routes_remain_open_when_no_key_is_configured():
         ("/v1/unmerge_lora_weights", {}),
         ("/update_weights_from_disk", {"model_path": "/fake"}),
         ("/update_weights_from_tensor", {"serialized_named_tensors": ["fake"]}),
+        (
+            "/update_weights_from_tensor_checker",
+            {
+                "target_module": "transformer",
+                "expected_named_tensors_sha256": {"fake.weight": "0" * 64},
+            },
+        ),
+        ("/get_weights_checksum", {"module_names": ["transformer"]}),
         ("/release_memory_occupation", {}),
         ("/resume_memory_occupation", {}),
     ],
@@ -208,34 +216,3 @@ def test_cors_preflight_does_not_require_authentication():
     )
 
     assert response.status_code == 200
-
-
-def test_sensitive_management_routes_require_admin_auth():
-    app = create_app(_server_args(api_key="user-secret", admin_api_key="admin-secret"))
-    client = TestClient(app)
-
-    assert (
-        client.post(
-            "/v1/set_lora", headers={"Authorization": "Bearer user-secret"}
-        ).status_code
-        == 401
-    )
-    assert (
-        client.post(
-            "/v1/set_lora", headers={"Authorization": "Bearer admin-secret"}
-        ).status_code
-        == 422
-    )
-
-    for path in (
-        "/v1/set_lora",
-        "/v1/merge_lora_weights",
-        "/v1/unmerge_lora_weights",
-        "/update_weights_from_disk",
-        "/update_weights_from_tensor",
-        "/release_memory_occupation",
-        "/resume_memory_occupation",
-        "/update_weights_from_tensor_checker",
-        "/get_weights_checksum",
-    ):
-        assert _route_auth_level(app, path) == AuthLevel.ADMIN_OPTIONAL
