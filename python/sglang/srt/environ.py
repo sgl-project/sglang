@@ -1054,6 +1054,17 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Cap on the "waves per EU" budget requested for the hand-tuned absorb-BMM
+    # Triton kernel. Triton turns this into the AMDGPU "amdgpu-waves-per-eu"
+    # function attribute, so it is a compile-time register-budget constraint
+    # rather than a runtime scheduling hint. On gfx950 the LLVM backend cannot
+    # satisfy a 4-wave budget for the aiter fp8 batched GEMM and aborts while
+    # compiling. 2 is the largest value known to compile; 0 removes the cap.
+    SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU = EnvInt(2)
+    # Escape hatch: ignore the hand-tuned absorb-BMM config and let AITER pick
+    # its own tuning. Slower, but it keeps decode alive if a future ROCm
+    # toolkit revokes one of the tuned kernels.
+    SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

@@ -158,9 +158,14 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     global _absorb_bmm_num_cu
     if m <= 0 or m > _ABSORB_BMM_DECODE_MAX_M:
         return None
+    if envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.get():
+        return None
     if not _absorb_bmm_num_cu:
         _absorb_bmm_num_cu = get_device_core_count()
     num_cu = _absorb_bmm_num_cu
+    if num_cu <= 0:
+        # No device to tune for; let AITER pick its own config.
+        return None
     m_tiles_16 = cdiv(m, 16)
     block_n = 128
     while block_n > 32 and 4 * heads * m_tiles_16 * cdiv(n, block_n) < 3 * num_cu:
@@ -170,13 +175,28 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
         block_m *= 2
     workgroups = heads * cdiv(m, block_m) * n_tiles
+    waves_per_eu = max(1, cdiv(workgroups, num_cu))
+    # ``waves_per_eu`` is not a soft occupancy hint: the Triton AMD backend
+    # bakes it into the kernel as the ``amdgpu-waves-per-eu`` function
+    # attribute, which pins LLVM's register budget to that many waves per SIMD
+    # for the whole kernel. On gfx950 the AMDGPU backend cannot satisfy a
+    # 4-wave budget for the aiter fp8 batched GEMM and aborts while compiling:
+    #   llvm/ADT/Sequence.h: llvm::iota_range<unsigned int>::iota_range(...):
+    #   Assertion `Begin <= End && "Begin must be less or equal to End."' failed.
+    # Every decode shape that compiled before (M=2/16/64/128) asked for at most
+    # 2 waves per EU, and M=128 already selects BLOCK_SIZE_M=64/BLOCK_SIZE_N=128,
+    # so the capped M=256 config compiles the very same kernel as the M=128 one
+    # that is known to build.
+    max_waves = envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.get()
+    if max_waves > 0:
+        waves_per_eu = min(waves_per_eu, max_waves)
     return {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": max(1, cdiv(workgroups, num_cu)),
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
     }
