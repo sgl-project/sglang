@@ -13,6 +13,7 @@
 # ==============================================================================
 """Outputs that carry work their consumer still owes."""
 
+import dataclasses
 from typing import Callable, Optional, Union
 
 import msgspec
@@ -37,7 +38,8 @@ class OutputTransform(msgspec.Struct, frozen=True):
     before_reduce_scatter: bool = False
 
 
-class UnreducedOutput(msgspec.Struct, frozen=True):
+@dataclasses.dataclass(frozen=True)
+class UnreducedOutput:
     """Internal adapter value describing an unfinished reduction.
 
     Fields:
@@ -58,7 +60,7 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
-class HandoffOutput(msgspec.Struct, frozen=True):
+class HandoffOutput:
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
     norm that accepts it (residual_batch.norm(handoff_norm=...)). A fused kernel

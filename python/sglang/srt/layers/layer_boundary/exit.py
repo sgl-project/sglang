@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 from functools import partial
 from typing import Callable, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -380,7 +380,8 @@ def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool
     )
 
 
-class FfnCompletion(msgspec.Struct, frozen=True):
+@dataclasses.dataclass(frozen=True)
+class FfnCompletion:
     """One decision shared by compute flags and the matching output completion.
 
     Fields:

@@ -3506,6 +3506,11 @@ def _warn_if_called_from_outside(name: str, replacement: str):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            # Dynamo cannot trace the sys._getframe caller check below; skip the
+            # deprecation warning inside compiled regions (e.g. tc_piecewise
+            # prefill capture). Eager callers are still warned once.
+            if torch.compiler.is_compiling():
+                return fn(*args, **kwargs)
             if name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
