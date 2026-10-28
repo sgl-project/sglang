@@ -22,9 +22,7 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.sample import (
-        chain_speculative_sampling_triton,
-    )
+    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
