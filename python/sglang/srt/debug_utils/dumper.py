@@ -224,6 +224,11 @@ class _DumperState:
     global_ctx: dict = field(default_factory=dict)
     captured_output_data: Optional[dict] = None
     cleanup_previous_handled: bool = False
+    step_scope_depth: int = 0
+    step_scope_pending: bool = False
+    suspend_depth: int = 0
+    speculative_forwards: dict[tuple[str, str], int] = field(default_factory=dict)
+    speculative_ctx: dict[str, Any] = field(default_factory=dict)
 
 
 class _Dumper:
@@ -232,6 +237,10 @@ class _Dumper:
     Example usage:
     dumper.dump("layer_start__hidden_states", hidden_states, layer_id=self.layer_id)
     dumper.step()
+
+    EAGLE groups its target and draft forwards into one step per worker call.
+    Those dumps carry spec_role, spec_phase, and a phase-local
+    spec_forward_index to distinguish repeated draft forwards.
 
     Import from non-SGLang system:
     ```
@@ -271,9 +280,15 @@ class _Dumper:
     def step(self):
         """This should be called on all ranks at the end of each iteration."""
 
+        if self._state.suspend_depth:
+            return
         self._http_manager  # noqa: B018
 
         if not self._config.enable:
+            return
+
+        if self._state.step_scope_depth:
+            self._state.step_scope_pending = True
             return
 
         # Users may want to `dump` only on some ranks, thus determine name here
@@ -281,6 +296,66 @@ class _Dumper:
 
         self._state.step += 1
         _log(f"step={self._state.step}")
+
+    @contextmanager
+    def suspend(self):
+        """Ignore synthetic forwards while a model graph is being captured."""
+        state = self._state
+        state.suspend_depth += 1
+        try:
+            yield
+        finally:
+            state.suspend_depth -= 1
+
+    def grouped_step(self, func: Callable) -> Callable:
+        """Group the forwards in a speculative worker call into one dump step."""
+
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            if not self.may_enable:
+                return func(*args, **kwargs)
+
+            state = self._state
+            outermost = state.step_scope_depth == 0
+            if outermost:
+                state.step_scope_pending = False
+                state.speculative_forwards.clear()
+            state.step_scope_depth += 1
+            try:
+                return func(*args, **kwargs)
+            finally:
+                state.step_scope_depth -= 1
+                if outermost:
+                    pending = state.step_scope_pending
+                    state.step_scope_pending = False
+                    state.speculative_forwards.clear()
+                    if pending and self._state is state:
+                        self.step()
+
+        return wrapped
+
+    @property
+    def in_grouped_step(self) -> bool:
+        return self._state.step_scope_depth > 0
+
+    @contextmanager
+    def speculative_forward(self, *, is_draft: bool, phase: str):
+        """Keep same-named tensors from different speculative forwards distinct."""
+        state = self._state
+        role = "draft" if is_draft else "target"
+        key = (role, phase)
+        index = state.speculative_forwards.get(key, 0)
+        state.speculative_forwards[key] = index + 1
+        previous = state.speculative_ctx
+        state.speculative_ctx = {
+            "spec_role": role,
+            "spec_phase": phase,
+            "spec_forward_index": index,
+        }
+        try:
+            yield
+        finally:
+            state.speculative_ctx = previous
 
     def dump(
         self,
@@ -482,6 +557,9 @@ class _Dumper:
         get_grad: Optional[Callable] = None,
         step: Optional[int] = None,
     ) -> None:
+        if self._state.suspend_depth:
+            return
+
         self._http_manager  # noqa: B018
 
         if not self._config.enable:
@@ -494,6 +572,8 @@ class _Dumper:
             **extra_kwargs,
             **self._state.global_ctx,
         )
+        for key, tag_value in self._state.speculative_ctx.items():
+            tags.setdefault(key, tag_value)
 
         if (f := self._config.filter) is not None and not _evaluate_filter(f, tags):
             return

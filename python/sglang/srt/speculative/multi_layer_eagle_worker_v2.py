@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -1131,6 +1132,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return 0
         return max(windows) + draft.draft_extend_num_front_tokens
 
+    @dumper.grouped_step
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
