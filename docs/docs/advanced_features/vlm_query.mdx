@@ -59,9 +59,10 @@ that collisions are impossible.
   replacing weights or processor implementations in place; a configuration
   fingerprint is not a checksum of all model weights.
 
-Custom processors must finalize identity after changing model-facing features or
-metadata, and before exporting CUDA transport handles. Use the shared processor
-finalization path; composite processors must delegate it to their inner processor.
+Custom processors must hash the final model-facing features and metadata before
+exporting CUDA transport handles. The shared frontend finalization path then binds
+the processor namespace and updates any prebuilt padding together; composite
+processors must delegate this step to their inner processor.
 Keep server-created full identities intact across transport and never use a
 truncated scalar hash as an embedding or KV-cache identity.
 
