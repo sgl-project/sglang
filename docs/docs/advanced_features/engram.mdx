@@ -64,8 +64,8 @@ On CUDA, with one DP rank per TP rank and no context parallelism, `auto` uses `a
 eager prefill batches whenever the columns divide, and elsewhere keeps the collective it used
 before (a reduce-scatter for decode batches, an all-reduce otherwise). Measured on GB300, B300 and
 H200 at DP 2-8 with host tables, from 512 to 65,536 tokens per rank, `all_to_all` was the fastest
-in 121 of 144 shapes and never more than 8 us slower than the all-reduce; at 8,192 tokens per rank and
-up it was 6-60% faster. The exception is GB300 at DP 2, where `reduce_scatter` is faster. Every
+of the three in 134 of 144 shapes, and in all 96 from 8,192 tokens per rank up, where it was 8-62%
+faster than the all-reduce. Below that, another choice was ahead by at most 85 us. Every
 choice returns the same rows.
 
 An explicit `all_reduce`, `reduce_scatter` or `all_to_all` applies to the same eager prefill

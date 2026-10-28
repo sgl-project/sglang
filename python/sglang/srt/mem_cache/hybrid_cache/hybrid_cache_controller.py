@@ -853,7 +853,10 @@ class HybridCacheController(BaseHiCacheController):
         host_group = self.mem_pool_host
         if self.is_kv_sharded:
             return self.move_hybrid_indices(op, write_back_jit=True)
-        if self.io_backend != "kernel" or host_group.layout != "page_first":
+        if self.io_backend != "kernel" or host_group.layout not in (
+            "page_first",
+            "page_unified",
+        ):
             return self.move_hybrid_indices(op)
         if not host_group.supports_per_pool_backup_indices:
             if not host_group.can_use_write_back_jit:
