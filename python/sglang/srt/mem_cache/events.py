@@ -133,9 +133,10 @@ class MmRoutingLabels:
     Entries can expire while blocks stay cached; their later events then carry
     no span and the router treats those tokens as unmapped (fail closed).
 
-    Only a process that records KV events reads labels, so registration is a
-    no-op until an enabled event recorder turns it on. Tensor-parallel ranks
-    that do not publish events never fill it.
+    Only the "dynamo" KV event format reports labels, so registration is a
+    no-op until an enabled recorder using that format turns it on.
+    Tensor-parallel ranks that do not publish events, and the default format,
+    never fill it.
     """
 
     def __init__(self, capacity: int = 1 << 20):
@@ -163,7 +164,7 @@ MM_ROUTING_LABELS = MmRoutingLabels()
 
 
 def enable_mm_routing_labels() -> None:
-    """Record routing labels in this process: it records KV events."""
+    """Record routing labels: this process records dynamo-format KV events."""
     MM_ROUTING_LABELS.enabled = True
 
 
@@ -259,7 +260,7 @@ class KVCacheEventRecorder:
         lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
-        if enabled:
+        if enabled and dynamo_format:
             enable_mm_routing_labels()
         self.page_size = page_size
         self.dynamo_format = dynamo_format
@@ -402,9 +403,9 @@ class KVCacheEventRecorder:
                     session_id=session_id,
                     lora_name=lora_name,
                     mm_routing_spans=(
-                        None
-                        if is_bigram
-                        else mm_routing_spans(page_tokens, len(page_tokens), 1)
+                        mm_routing_spans(page_tokens, len(page_tokens), 1)
+                        if self.dynamo_format and not is_bigram
+                        else None
                     ),
                 )
             )

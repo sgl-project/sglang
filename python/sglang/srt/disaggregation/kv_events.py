@@ -293,9 +293,9 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
-    # Per block (aligned with block_hashes): [start, length, label] runs of
-    # multimodal tokens whose item carried a caller routing label. Labels are
-    # routing metadata only and never affect hashes or reuse.
+    # Dynamo format only. Per block (aligned with block_hashes): [start, length,
+    # label] runs of multimodal tokens whose item carried a caller routing
+    # label. Labels are routing metadata only and never affect hashes or reuse.
     mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
 
 
@@ -727,7 +727,8 @@ class KVEventsConfig(BaseModel):
     format: Literal["default", "dynamo"] = "default"
     """The event format. "default" is the SGLang format. "dynamo" is the format
     the Dynamo KV router reads: block hashes also depend on extra_key and
-    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name.
+    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name
+    and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
     @classmethod

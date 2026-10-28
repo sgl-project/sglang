@@ -256,8 +256,9 @@ class GenerateReqInput:
     # unlabeled. Each label is at most
     # MAX_MM_ROUTING_LABEL_BYTES in UTF-8. Batch request: one list per request,
     # or one string for a request with one input. Routing metadata only: they
-    # never affect identity, caching or reuse, and are reported back as
-    # `mm_routing_spans` on BlockStored KV events.
+    # never affect identity, caching or reuse. KV events in the "dynamo"
+    # format report them back as `mm_routing_spans` on BlockStored; other
+    # formats ignore them.
     mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None
     # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
     # mm_hashes, these identify processor inputs and never replace the

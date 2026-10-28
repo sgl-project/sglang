@@ -2,10 +2,11 @@
 
 `mm_routing_labels` gives one opaque label to each media input, matched to the
 processed items within each media type. SGLang keeps its own item identity: a
-label never changes hashes, pad values or reuse. The KV event recorder maps each labeled item's pad values to the first
-label seen and reports per-block `[start, length, label]` runs on BlockStored
+label never changes hashes, pad values or reuse. In the "dynamo" KV event
+format, the recorder maps each labeled item's pad values to the first label
+seen and reports per-block `[start, length, label]` runs on BlockStored
 (`mm_routing_spans`), so an external router can translate those blocks into
-its own routing representation.
+its own routing representation. The default format ignores labels.
 """
 
 import functools
@@ -124,18 +125,19 @@ class TestMmRoutingLabels(CustomTestCase):
         for value in unlabeled.padding_values():
             self.assertIsNone(self.registry.get(value))
 
-    def test_registration_waits_for_an_enabled_event_recorder(self):
-        # Only the rank that records KV events reads labels; the other
-        # tensor-parallel ranks build disabled recorders and register nothing.
+    def test_registration_waits_for_a_dynamo_format_event_recorder(self):
+        # Only the dynamo format reports labels. Tensor-parallel ranks that do
+        # not record KV events, and the default format, register nothing.
         labeled = MultimodalDataItem(
             modality=Modality.IMAGE, hash=0xDEADBEEF, routing_label=LABEL_U
         )
         labeled.set_pad_value()
-        events.KVCacheEventRecorder(enabled=False, page_size=16)
+        events.KVCacheEventRecorder(enabled=False, page_size=16, dynamo_format=True)
+        events.KVCacheEventRecorder(enabled=True, page_size=16)
         events.register_mm_routing_labels([labeled])
         self.assertFalse(self.registry)
 
-        events.KVCacheEventRecorder(enabled=True, page_size=16)
+        events.KVCacheEventRecorder(enabled=True, page_size=16, dynamo_format=True)
         events.register_mm_routing_labels([labeled])
         for value in labeled.padding_values():
             self.assertEqual(self.registry.get(value), LABEL_U)
@@ -376,22 +378,32 @@ class TestMmRoutingLabels(CustomTestCase):
         waiting._finish_assemble(None)
         self.assertEqual([item.routing_label for item in items], [LABEL_V, LABEL_U])
 
-    def test_radix_cache_insert_reports_spans(self):
+    def test_radix_cache_insert_reports_spans_in_the_dynamo_format(self):
         # The real producer path: insert -> record_store -> BlockStored spans.
-        cache = RadixCache.create_simulated(page_size=16, enable_kv_cache_events=True)
-        cache.take_events()
+        # The default format reports none, even for a labeled item.
         self.registry.register(X, LABEL_U)
         tokens = list(range(100, 110)) + item_tokens(X, 22)
-        cache.insert(InsertParams(key=RadixKey(tokens), value=None))
-        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
-        spans = [
-            block_spans
-            for event in stored
-            for block_spans in (
-                event.mm_routing_spans or [[]] * len(event.block_hashes)
-            )
-        ]
-        self.assertEqual(spans, [[(10, 6, LABEL_U)], [(0, 16, LABEL_U)]])
+        for dynamo_format, expected in (
+            (True, [[(10, 6, LABEL_U)], [(0, 16, LABEL_U)]]),
+            (False, [[], []]),
+        ):
+            with self.subTest(dynamo_format=dynamo_format):
+                cache = RadixCache.create_simulated(
+                    page_size=16,
+                    enable_kv_cache_events=True,
+                    dynamo_kv_event_format=dynamo_format,
+                )
+                cache.take_events()
+                cache.insert(InsertParams(key=RadixKey(tokens), value=None))
+                stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+                spans = [
+                    block_spans
+                    for event in stored
+                    for block_spans in (
+                        event.mm_routing_spans or [[]] * len(event.block_hashes)
+                    )
+                ]
+                self.assertEqual(spans, expected)
 
     def test_coalescing_long_chains_keeps_spans_aligned(self):
         recorder = events.KVCacheEventRecorder(enabled=True, page_size=1)
