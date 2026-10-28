@@ -701,6 +701,14 @@ if get_platform().is_sm90 and is_flashinfer_available():
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
 
+def _block32_ue8m0_deepgemm_platform() -> bool:
+    """Whether this platform's DeepGEMM serves [32, 32] blocks through the UE8M0
+    (power-of-two) scale-factor recipe. SM90 has a separate block32 kernel that
+    consumes fp32 scales, so it is deliberately not in this set.
+    """
+    return get_platform().is_sm100 or get_platform().is_sm120
+
+
 def dispatch_w8a8_block_fp8_linear(
     weight_block_size: Optional[List[int]] = None,
     act_scale_ue8m0: bool = False,
@@ -713,14 +721,18 @@ def dispatch_w8a8_block_fp8_linear(
     2. Auto-detection based on hardware capabilities
     """
     backend = get_fp8_gemm_runner_backend()
-    # Native block32 DeepGEMM is the default on SM90. SM100 DeepGEMM casts the
-    # weight scales to UE8M0, so it takes only UE8M0 checkpoints, on request.
+    # Native block32 DeepGEMM is the default on SM90. The UE8M0 platforms cast the
+    # weight scales to UE8M0, so they take only UE8M0 checkpoints, on request.
     if (
         weight_block_size == [32, 32]
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and (
             (get_platform().is_sm90 and (backend.is_auto() or backend.is_deep_gemm()))
-            or (get_platform().is_sm100 and backend.is_deep_gemm() and act_scale_ue8m0)
+            or (
+                _block32_ue8m0_deepgemm_platform()
+                and backend.is_deep_gemm()
+                and act_scale_ue8m0
+            )
         )
     ):
         return partial(
@@ -734,7 +746,7 @@ def dispatch_w8a8_block_fp8_linear(
             print_warning_once(
                 f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
                 "block FP8 weights on this setup; using Triton. DeepGEMM takes "
-                "[32, 32] blocks on SM90, and on SM100 with UE8M0 scales."
+                "[32, 32] blocks on SM90, and on SM100/SM120 with UE8M0 scales."
             )
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
@@ -1439,11 +1451,12 @@ def _ue8m0_deepgemm_skips_block32(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor],
 ) -> bool:
-    # UE8M0 DeepGEMM casts block32 fp32 scales itself: it takes only weights the
-    # load found power-of-two scaled, and no pre-quantized input, which nothing checks.
     if list(block_size) != [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return False
-    return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
+    scale_is_ue8m0 = weight_scale.dtype == torch.int32 or getattr(
+        weight_scale, "power_of_two", False
+    )
+    return input_scale is not None or not scale_is_ue8m0
 
 
 def _deepgemm_block_fp8_supported(
@@ -1453,7 +1466,7 @@ def _deepgemm_block_fp8_supported(
         return False
     n, k = weight_shape
     if list(block_size) == [32, 32] and (
-        get_platform().is_sm90 or get_platform().is_sm100
+        get_platform().is_sm90 or _block32_ue8m0_deepgemm_platform()
     ):
         return n % 8 == 0 and k % 32 == 0
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
@@ -1618,9 +1631,10 @@ def _unpack_ue8m0_scale_for_triton(
     mn_repeat, k_div_4 = sf_packed.shape
     k_packed = k_div_4 * 4
 
-    # Unpack int32 -> 4x uint8 -> float32
-    # Each uint8 represents an exponent in UE8M0 format
-    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    # Singleton dimensions can be contiguous without a unit last stride.
+    sf_u8 = (
+        sf_packed.contiguous().reshape(-1).view(torch.uint8).view(mn_repeat, k_packed)
+    )
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
     # Handle row dimension - may have 128x replication or direct mapping
@@ -2142,6 +2156,34 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
 
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
+
+
+def pack_block32_scale_ue8m0_for_deepgemm(
+    weight: torch.nn.Parameter,
+    weight_scale: torch.nn.Parameter,
+    weight_block_size: Optional[List[int]],
+    use_deepgemm_runner: bool,
+    output_dtype: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    """Return DeepGEMM's packed UE8M0 view of qualifying block32 scales."""
+    if (
+        not use_deepgemm_runner
+        or list(weight_block_size or []) != [32, 32]
+        or not get_platform().is_sm120
+        or not _deepgemm_block_fp8_supported(
+            weight.shape, [32, 32], output_dtype or torch.bfloat16
+        )
+        or getattr(weight_scale, "format_ue8m0", False)
+        or not getattr(weight_scale, "power_of_two", False)
+    ):
+        return None
+
+    from deep_gemm import transform_sf_into_required_layout
+
+    n, k = weight.shape
+    return transform_sf_into_required_layout(
+        weight_scale.data.contiguous(), mn=n, k=k, recipe=(1, 32, 32), is_sfa=False
+    )
 
 
 def requant_block_scale_ue8m0_for_deepgemm(
