@@ -60,7 +60,12 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    "--attn-dp-size",
+    # The canonical "--attn-dp-size" is missing from the B-series snapshot
+    # images; the legacy pair below resolves to the same layout
+    # (attn_dp_size=4, dp_size=1) on every build. Switch back to
+    # "--attn-dp-size", 4, before merge.
+    "--enable-dp-attention",
+    "--dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
