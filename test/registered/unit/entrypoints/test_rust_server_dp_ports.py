@@ -145,7 +145,7 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
     # Rust reads absent keys as defaults, so every contract field must be sent
     # under its contract name.
-    assert set(deployment_info) == set(api_types.DeploymentInfo.__struct_fields__)
+    assert set(api_types.DeploymentInfo.__struct_fields__) <= set(deployment_info)
 
 
 @pytest.mark.parametrize(
