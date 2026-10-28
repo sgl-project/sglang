@@ -1903,14 +1903,12 @@ class Scheduler(
         if cache_controller is not None:
             result_dict["kv_hint_sources"] = cache_controller.get_kv_hint_sources()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
-            result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
+        result_dict["kv_event_sources"] = (
+            self.kv_events_publisher.local_kv_event_sources(
+                self.page_size * get_parallel().dcp_size,
+                hint_sources=result_dict.get("kv_hint_sources"),
             )
+        )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -2830,8 +2828,8 @@ class Scheduler(
         # Only a cache whose events are taken prunes the table.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            and self.tree_cache.supports_prefix_sharing()
-        ):
+            or getattr(self.tree_cache, "storage_kv_events_enabled", False) is True
+        ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:

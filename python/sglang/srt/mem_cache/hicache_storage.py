@@ -203,6 +203,15 @@ class HiCacheStorage(ABC):
     # before admission and retain the resulting claim until storage delivery.
     requires_lookup_confirmation = False
 
+    # Optional actual-backend inventory, distinct from framework host residency.
+    publishes_kv_events = False
+
+    def pending_kv_events(self) -> int:
+        return 0
+
+    def take_kv_events(self) -> list:
+        return []
+
     def get_kv_hint_source(self) -> Optional[dict]:
         """Return resolved control coordinates for this rank, without starting IO.
 

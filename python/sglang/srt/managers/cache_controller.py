@@ -241,6 +241,7 @@ class StorageOperation:
         prefix_keys: Optional[List[str]] = None,
         kv_hints=None,
         storage_key_to_event_hash: Optional[dict[str, int]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -250,6 +251,7 @@ class StorageOperation:
         self.prefix_keys = prefix_keys
         self.kv_hints = kv_hints
         self.storage_key_to_event_hash = storage_key_to_event_hash
+        self.kv_event_metadata = kv_event_metadata
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -1455,12 +1457,17 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            kv_event_metadata=kv_event_metadata,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1489,7 +1496,10 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=storage_operation_extra_info(operation),
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

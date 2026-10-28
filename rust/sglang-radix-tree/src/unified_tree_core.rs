@@ -3516,6 +3516,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         std::mem::take(&mut self.kv_event_queue)
     }
 
+    /// Reuse the event hasher without mixing a prospective storage claim into
+    /// the framework queue. Native backend inventory decides residency later.
+    pub fn storage_event_metadata(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(Vec<String>, Vec<KvCacheEvent<K::Atom>>), NodeAccessError> {
+        let node = self.arena.resolve(node_id)?;
+        let pending = self.take_events();
+        let enabled = std::mem::replace(&mut self.enable_kv_cache_events, true);
+        self.record_store_event_(node, StorageMedium::Cpu, None);
+        self.enable_kv_cache_events = enabled;
+        let metadata = std::mem::replace(&mut self.kv_event_queue, pending);
+        let keys = self.arena.node(node).hash_value.clone().unwrap_or_default();
+        Ok((keys, metadata))
+    }
+
     /// Mark the SWA host pool as wired; pools attach after tree construction.
     pub fn set_has_swa_host_pool(&mut self) {
         self.has_swa_host_pool = true;

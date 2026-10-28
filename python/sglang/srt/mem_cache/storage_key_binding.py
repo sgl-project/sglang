@@ -68,4 +68,7 @@ def storage_operation_extra_info(operation: Any, **fields: Any) -> dict[str, Any
     mapping = getattr(operation, "storage_key_to_event_hash", None)
     if mapping is not None:
         fields["storage_key_to_event_hash"] = mapping
+    metadata = getattr(operation, "kv_event_metadata", None)
+    if metadata is not None:
+        fields["kv_event_metadata"] = metadata
     return fields

@@ -20,6 +20,8 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+from array import array
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
@@ -42,6 +44,14 @@ if TYPE_CHECKING:
 # Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
 # end of extra_key, so the last 32 characters of extra_key are the id.
 _LORA_ID_LEN = 32
+
+
+@dataclass
+class _StorageEventSpan:
+    key: Any
+    parent: Any = None
+    hash_value: Any = None
+    event_hash_value: Any = None
 
 
 class LoRANameTable:
@@ -148,13 +158,14 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and tail.ownership == event.ownership:
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
                 if (
                     tail.medium == event.medium
+                    and tail.ownership == event.ownership
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
@@ -301,6 +312,68 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+
+    def storage_metadata(self, node: Any) -> dict:
+        """Snapshot exact wire identities without publishing a storage claim."""
+        recorder = KVCacheEventRecorder(
+            # Non-publisher TP ranks still describe their physical storage.
+            enabled=True,
+            page_size=self.page_size,
+            dynamo_format=self.dynamo_format,
+            lora_names=self.lora_names,
+        )
+        recorder.record_store(node, medium=StorageMedium.CPU)
+        keys = (
+            node.hash_value
+            if node.hash_value is not None
+            else compute_node_hash_values(node, self.page_size)
+        )
+        return self.metadata_for_events(keys, recorder.take())
+
+    @staticmethod
+    def metadata_for_events(keys, events) -> dict:
+        keys = iter(keys)
+        metadata = {}
+        for event in events:
+            parent = event.parent_block_hash
+            for index, block_hash in enumerate(event.block_hashes):
+                metadata[next(keys)] = BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent,
+                    token_ids=event.token_ids[
+                        index * event.block_size : (index + 1) * event.block_size
+                    ],
+                    block_size=event.block_size,
+                    lora_id=event.lora_id,
+                    medium=event.medium,
+                    cache_salt=event.cache_salt,
+                    session_id=event.session_id,
+                    lora_name=event.lora_name,
+                )
+                parent = block_hash
+        return metadata
+
+    def prefetch_storage_metadata(self, key, matched_prefix_tokens, last_hash) -> dict:
+        """Describe a requested span; the backend still proves actual residency."""
+        prefix = matched_prefix_tokens or []
+        if len(prefix) % self.page_size or (last_hash is not None and not prefix):
+            return {}
+        tokens = array("q", prefix)
+        tokens.extend(key.raw_token_ids())
+        span = _StorageEventSpan(
+            type(key)(
+                tokens,
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+                is_bigram=key.is_bigram,
+            )
+        )
+        span.hash_value = compute_node_hash_values(span, self.page_size)
+        metadata = self.storage_metadata(span)
+        skipped = len(prefix) // self.page_size
+        if skipped and span.hash_value[skipped - 1] != last_hash:
+            return {}
+        return {page: metadata[page] for page in span.hash_value[skipped:]}
 
     def record_all_cleared(self) -> None:
         if not self.enabled:

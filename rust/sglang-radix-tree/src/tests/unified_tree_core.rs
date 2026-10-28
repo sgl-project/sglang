@@ -3267,6 +3267,30 @@ fn insert_coalesces_parent_linked_block_stores() {
 }
 
 #[test]
+fn storage_metadata_does_not_publish_a_framework_or_backend_store() {
+    let mut tc = events_core(2);
+    tc.insert(&insert_params(&vec![1, 2, 7, 8], &[10, 11, 12, 13]));
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 7, 8]))
+        .best_match_node_id;
+    let pending = tc.kv_event_queue.clone();
+    tc.enable_kv_cache_events = false;
+    let (keys, metadata) = tc.storage_event_metadata(leaf).unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(metadata.len(), 1);
+    assert!(matches!(
+        &metadata[0],
+        KvCacheEvent::BlockStored {
+            medium: StorageMedium::Cpu,
+            ..
+        }
+    ));
+    assert_eq!(tc.take_events(), pending);
+    assert!(!tc.enable_kv_cache_events);
+    assert!(tc.take_events().is_empty());
+}
+
+#[test]
 fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];

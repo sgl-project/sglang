@@ -293,15 +293,18 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
+    # An absent owner denotes framework GPU/host memory, not backend storage.
+    ownership: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    ownership: Optional[str] = None
 
 
 # The dynamo format publishes namespaced hashes as block hashes. If you change
@@ -370,7 +373,9 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
-    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+    def describe_local_source(
+        self, block_size: int, advertise_host: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
         """Describe a source accessible to a separate local process, if any."""
         return None
 
@@ -467,7 +472,9 @@ class ZmqEventPublisher(EventPublisher):
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
 
-    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+    def describe_local_source(
+        self, block_size: int, advertise_host: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
         """Report the bound socket, not a port reconstructed from global DP size.
 
         Connect-style publishers and inproc sockets have no subscribable local
@@ -485,9 +492,9 @@ class ZmqEventPublisher(EventPublisher):
             address = NetworkAddress.parse(endpoint[len("tcp://") :])
             host = address.host
             if host in ("*", "0.0.0.0"):
-                host = "127.0.0.1"
+                host = advertise_host or "127.0.0.1"
             elif host == "::":
-                host = "::1"
+                host = advertise_host or "::1"
             return NetworkAddress(host, address.port).to_tcp()
 
         endpoint = local_endpoint(self._local_pub_endpoint)

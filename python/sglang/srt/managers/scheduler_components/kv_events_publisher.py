@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import (
@@ -8,6 +9,7 @@ from typing import (
     Callable,
     Optional,
 )
+from urllib.parse import urlsplit
 
 import msgspec
 import zmq
@@ -15,6 +17,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -61,6 +64,17 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             parallel = get_parallel()
+            controller = getattr(self.tree_cache, "cache_controller", None)
+            for source in controller.get_kv_hint_sources() if controller else ():
+                if "kvcr_inventory" in source.get("capabilities", ()):
+                    config = KVEventsConfig.from_cli(kv_events_config)
+                    owner = hashlib.sha256(
+                        source["cache_owner_id"].encode()
+                    ).hexdigest()
+                    # Reused TCP ports must not mix a replacement engine's raw
+                    # stream into an older owner's still-attached subscriber.
+                    config.topic = f"{config.topic}/kvcr/{owner}"
+                    kv_events_config = config.model_dump_json()
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(
@@ -89,10 +103,30 @@ class SchedulerKvEventsPublisher:
         if not self.send_metrics_from_scheduler.closed:
             sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
-    def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
+    def local_kv_event_sources(
+        self, block_size: int, hint_sources: Optional[list[dict]] = None
+    ) -> list[dict[str, Any]]:
         if self.kv_event_publisher is None:
             return []
-        source = self.kv_event_publisher.describe_local_source(block_size)
+        inventory_source = next(
+            (
+                source
+                for source in hint_sources or ()
+                if "kvcr_inventory" in source.get("capabilities", ())
+            ),
+            None,
+        )
+        if inventory_source is None:
+            source = self.kv_event_publisher.describe_local_source(block_size)
+        else:
+            source = self.kv_event_publisher.describe_local_source(
+                block_size,
+                advertise_host=urlsplit(
+                    inventory_source["source_control_endpoint"]
+                ).hostname,
+            )
+            if source is not None:
+                source["format"] = KVEventsConfig.from_cli(self.kv_events_config).format
         return [source] if source is not None else []
 
     def publish_kv_events(self):

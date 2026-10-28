@@ -2168,6 +2168,49 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.detach(|| self.core().record_all_cleared_event());
     }
 
+    fn storage_event_metadata(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<(Vec<String>, Py<PyList>)>
+    where
+        for<'py> Vec<K::Atom>: IntoPyObject<'py>,
+    {
+        let (keys, events) = py
+            .detach(|| self.core().storage_event_metadata(node_id))
+            .map_err(node_access_error)?;
+        let list = PyList::empty(py);
+        for event in events {
+            if let KvCacheEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium,
+                cache_salt,
+                session_id,
+                extra_key,
+            } = event
+            {
+                list.append(
+                    (
+                        "block_stored",
+                        block_hashes,
+                        parent_block_hash,
+                        token_ids,
+                        block_size,
+                        medium.as_str(),
+                        cache_salt.map(|value| value.to_string()),
+                        session_id.map(|value| value.to_string()),
+                        extra_key.map(|value| value.to_string()),
+                    )
+                        .into_py_any(py)?,
+                )?;
+            }
+        }
+        Ok((keys, list.unbind()))
+    }
+
     /// Drain the queued placement events as tagged tuples.
     fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>>
     where
@@ -3504,6 +3547,10 @@ macro_rules! tree_core_binding {
             }
 
             /// Drain the queued placement events as tagged tuples.
+            fn storage_event_metadata(&self, py: Python<'_>, node_id: NodeId) -> PyResult<(Vec<String>, Py<PyList>)> {
+                catch_native_panic(|| self.inner.storage_event_metadata(py, node_id))
+            }
+
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
                 catch_native_panic(|| self.inner.take_events(py))
             }

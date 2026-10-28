@@ -134,6 +134,11 @@ class StorageAttachment:
             cache.write_through_threshold,
             cache.is_write_back,
         )
+        if extra_config.get("publish_inventory") is True:
+            return False, (
+                "Inventory publication requires startup source metadata; "
+                "configure the storage backend when launching the worker."
+            )
         try:
             prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             if cache.host_memory_mode == "buffer_only":
@@ -179,7 +184,7 @@ class StorageAttachment:
         )
         return True, "Attached HiCache storage backend successfully."
 
-    def detach(self) -> tuple[bool, str]:
+    def detach(self, *, shutdown: bool = False) -> tuple[bool, str]:
         """Disable the storage backend at runtime.
 
         The caller must ensure there are no running or queued requests. Ordering
@@ -198,6 +203,19 @@ class StorageAttachment:
         controller = cache.cache_controller
         if controller is None:
             return False, "HiCache storage backend is not initialized."
+        if (
+            not shutdown
+            and getattr(
+                getattr(controller, "storage_backend", None),
+                "publishes_kv_events",
+                False,
+            )
+            is True
+        ):
+            return False, (
+                "An inventory-publishing backend is an engine-lifetime source. "
+                "Restart the worker to change or detach it."
+            )
 
         try:
             cache.drain_storage_control_queues_local()
@@ -230,7 +248,7 @@ class StorageAttachment:
         """
         try:
             if self._cache.enable_storage:
-                self.detach()
+                self.detach(shutdown=True)
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 

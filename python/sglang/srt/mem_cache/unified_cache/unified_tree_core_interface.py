@@ -185,6 +185,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Hand the queued KV placement events to the Controller."""
         return self.kv_events.take()
 
+    def storage_event_metadata(self, node_id: NodeId) -> dict:
+        """Snapshot prefix identity without publishing a residency claim."""
+        return self.kv_events.storage_metadata(self.node_by_id(node_id))
+
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""
