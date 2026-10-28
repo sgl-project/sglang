@@ -175,19 +175,19 @@ class TestServerInfoTransportParity(CustomTestCase):
 
                 # The embedded Rust server's launch-time fields, which stamp
                 # the init info the scheduler handshake carries for Python.
-                scheduler = SimpleNamespace(
+                launch = dict(
                     server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
                 )
-                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                rust_launch = json.loads(rust_config._launch_server_info(**launch))
                 self.assertEqual(rust_launch.pop("status"), "ready")
                 self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
                 self.assertEqual(rust_launch, json.loads(leader_json))
 
                 # The Rust listener is HTTP/1 only, so it never advertises h2.
-                scheduler.server_args = ServerArgs(
+                launch["server_args"] = ServerArgs(
                     model_path="dummy", page_size=64, enable_http2=True
                 )
-                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                rust_launch = json.loads(rust_config._launch_server_info(**launch))
                 self.assertIs(rust_launch["enable_http2"], False)
 
                 with (
