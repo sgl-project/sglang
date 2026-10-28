@@ -455,13 +455,15 @@ def test_pair_prefill_across_requests_matches_triton(monkeypatch):
 def test_pair_prefill_fp8_out_equals_o_proj_quant(monkeypatch, kv_scale):
     """The pair kernel's FP8 O must be the bytes and column-major scales the o_proj's
     separate per 1 x 128 quant writes for its bf16 O, which the block GEMM reads."""
+    import aiter
     from aiter import dtypes
 
     from sglang.srt.layers.quantization.fp8_utils import (
-        aiter_per1x128_quant,
         view_aiter_fused_rms_transposed_fp8_scale,
     )
 
+    # fp8_utils binds its aiter quant only under SGLANG_USE_AITER=1
+    per1x128_quant = aiter.get_hip_quant(aiter.QuantType.per_1x128)
     monkeypatch.setattr(gluon_prefill_pair_gfx950, "PAIR_MIN_TOKENS_FP8", 1)
     prefix, q_len = 9000, 1501
     seq, b = _extend(prefix, q_len)
@@ -478,7 +480,7 @@ def test_pair_prefill_fp8_out_equals_o_proj_quant(monkeypatch, kv_scale):
         )  # fmt: skip
 
     q8, scale = run("fp8")
-    ref_q8, ref_scale = aiter_per1x128_quant(
+    ref_q8, ref_scale = per1x128_quant(
         run("").view(q_len, -1), quant_dtype=dtypes.fp8, transpose_scale=True
     )
     ref_scale = view_aiter_fused_rms_transposed_fp8_scale(ref_scale)
