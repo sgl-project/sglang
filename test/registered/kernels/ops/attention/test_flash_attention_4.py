@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.flash_attn.cute import (
     clear_shear_bias_workspace,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+    _flash_attn_fwd,
     _shear_bias_empty,
     _shear_bias_workspace,
 )
@@ -39,7 +40,7 @@ from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=420, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # Existing tests below target SM100+; the SM90 regression class has its own guard.
@@ -1575,11 +1576,135 @@ def test_flash_attn_hd256_noncontiguous_inputs(strided_input):
     assert torch.equal(lse, lse_dense)
 
 
+def _gemma4_fp8_kv_inputs(lengths, q_len, page_size, seed):
+    """Gemma-4 full-attention shapes (32 q heads, 4 kv heads, hd 512) on an fp8 cache."""
+    torch.manual_seed(seed)
+    batch, q_heads, kv_heads, dim = len(lengths), 32, 4, 512
+    pages_per_seq = (max(lengths) + page_size - 1) // page_size
+    table = torch.randperm(batch * pages_per_seq, device="cuda")
+    cache_shape = (batch * pages_per_seq, page_size, kv_heads, dim)
+    return dict(
+        q=torch.randn(batch * q_len, q_heads, dim, device="cuda").bfloat16() * 0.3,
+        k=torch.randn(cache_shape, device="cuda").to(torch.float8_e4m3fn),
+        v=torch.randn(cache_shape, device="cuda").to(torch.float8_e4m3fn),
+        page_table=table.reshape(batch, -1).int(),
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.arange(0, (batch + 1) * q_len, q_len, device="cuda").int(),
+        # Distinct per (request, kv head), so a wrong descale index fails.
+        k_descale=torch.rand(batch, kv_heads, device="cuda") * 0.25 + 0.25,
+        v_descale=torch.rand(batch, kv_heads, device="cuda") * 1.5 + 0.5,
+    )
+
+
+def _fp8_kv_reference(inputs, q_len):
+    """fp32 causal attention over the dequantized cache, chunked over queries."""
+    q, k, v, table = (inputs[name] for name in ("q", "k", "v", "page_table"))
+    kv_heads, dim = k.shape[-2:]
+    group = q.shape[1] // kv_heads
+    outs = []
+    for b, length in enumerate(inputs["cache_seqlens"].tolist()):
+        # Gather as bytes: advanced indexing has no fp8 kernel.
+        kb, vb = [
+            x.view(torch.uint8)[table[b].long()]
+            .view(x.dtype)
+            .reshape(-1, kv_heads, dim)[:length]
+            .float()
+            * inputs[name][b][None, :, None]
+            for x, name in ((k, "k_descale"), (v, "v_descale"))
+        ]
+        kb = kb.repeat_interleave(group, dim=1)
+        vb = vb.repeat_interleave(group, dim=1)
+        qb = q[b * q_len : (b + 1) * q_len].float()
+        pos = torch.arange(q_len, device="cuda") + length - q_len
+        keys = torch.arange(length, device="cuda")
+        for start in range(0, q_len, 512):
+            scores = torch.einsum("qhd,khd->hqk", qb[start : start + 512], kb)
+            mask = keys[None, :] <= pos[start : start + 512, None]
+            scores.masked_fill_(~mask[None], -torch.inf)
+            outs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb))
+    return torch.cat(outs)
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
     "Requires Hopper",
 )
 class TestFlashAttention4SM90(CustomTestCase):
+    def test_fp8_kv_cache_matches_dequantized_reference(self):
+        """bf16 Q against an fp8 e4m3 cache matches fp32 attention on the dequantized cache.
+
+        Covers both K/V producers (TMA at page 64, cp.async at page 1), both
+        consumer schedules, split-KV with empty splits, decode, MTP verify and
+        chunked prefill over a cached prefix.
+        """
+        cases = (
+            # page_size, q_len, cache lengths, num_splits, intra_wg_overlap
+            (1, 1, (7, 1103), 1, True),
+            (64, 1, (7, 1103), 3, True),
+            (64, 5, (9, 1103), 1, False),
+            (1, 5, (9, 1103), 3, False),
+            (64, 2048, (2100, 3000), 1, True),
+            (1, 2048, (2100, 3000), 1, False),
+            (64, 8192, (9000,), 1, True),
+        )
+        for page_size, q_len, lengths, splits, overlap in cases:
+            with self.subTest(
+                page=page_size, q_len=q_len, splits=splits, overlap=overlap
+            ):
+                inputs = _gemma4_fp8_kv_inputs(lengths, q_len, page_size, seed=q_len)
+                out, _ = _flash_attn_fwd(
+                    inputs["q"],
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=q_len,
+                    page_table=inputs["page_table"],
+                    softmax_scale=1.0,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                    num_splits=splits,
+                    intra_wg_overlap=overlap,
+                )
+                self.assertEqual(out.dtype, torch.bfloat16)
+                torch.testing.assert_close(
+                    out.float(), _fp8_kv_reference(inputs, q_len), atol=0.01, rtol=0.01
+                )
+
+    def test_fp8_kv_cache_decode_replays_in_cuda_graph(self):
+        """A captured FP8-KV decode reads the cache and descales afresh on replay."""
+        inputs = _gemma4_fp8_kv_inputs((1103, 4100, 17), q_len=1, page_size=64, seed=0)
+
+        def run():
+            return flash_attn_with_kvcache(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                page_table=inputs["page_table"],
+                cache_seqlens=inputs["cache_seqlens"],
+                cu_seqlens_q=inputs["cu_seqlens_q"],
+                max_seqlen_q=1,
+                softmax_scale=1.0,
+                causal=True,
+                k_descale=inputs["k_descale"],
+                v_descale=inputs["v_descale"],
+                num_splits=0,
+                ver=4,
+            )
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run()
+        fresh = _gemma4_fp8_kv_inputs((1103, 4100, 17), q_len=1, page_size=64, seed=1)
+        for name in ("q", "k", "v", "k_descale", "v_descale"):
+            inputs[name].copy_(fresh[name])
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), _fp8_kv_reference(inputs, 1), atol=0.01, rtol=0.01
+        )
+
     def test_paged_attention(self):
         cases = (
             (1, 1, 0, True),

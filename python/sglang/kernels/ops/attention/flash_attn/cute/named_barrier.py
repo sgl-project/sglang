@@ -10,6 +10,13 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    # SM90 FP8-KV dequant: both MMA warpgroups read all of sK and sQ, so their
+    # rewrites sync 256 threads; each warpgroup reads only its own half of sV.
+    DequantKEmpty = enum.auto()
+    DequantKFull = enum.auto()
+    DequantV0 = enum.auto()
+    DequantV1 = enum.auto()
+    NarrowQ = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

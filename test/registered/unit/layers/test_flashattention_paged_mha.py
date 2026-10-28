@@ -37,6 +37,7 @@ def _backend():
     backend.kv_cache_dtype = torch.float16
     backend.kv_cache_dtype_str = "float8_e4m3fn"
     backend.kv_cache_is_mxfp8 = False
+    backend.fa4_casts_fp8_kv = False
     backend.fa_impl_ver = 3
     backend.num_splits = 4
     return backend
@@ -169,6 +170,33 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertEqual(q.dtype, torch.float16)
         self.assertEqual(k_descale.shape, (2, 1))
         self.assertEqual(v_descale.shape, (2, 1))
+
+    def test_prepare_paged_mha_query_leaves_q_unquantized_for_fa4_fp8_kv(self):
+        # On SM90 FA4 casts the fp8 cache in-kernel and takes bf16 Q, while FA3
+        # layers of the same model still need Q in the cache dtype.
+        backend = _backend()
+        backend.kv_cache_dtype = torch.float8_e4m3fn
+        backend.fa4_casts_fp8_kv = True
+        scales = dict(k_scale=torch.tensor(2.0), v_scale=torch.tensor(4.0))
+        cases = (
+            (SimpleNamespace(head_dim=512, **scales), 4, True, torch.bfloat16),
+            (SimpleNamespace(head_dim=512, **scales), 4, False, torch.bfloat16),
+            (SimpleNamespace(head_dim=256, **scales), 3, False, torch.float8_e4m3fn),
+        )
+        for layer, ver, is_prefill, q_dtype in cases:
+            q, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
+                torch.ones(2, 16, dtype=torch.bfloat16),
+                None,
+                None,
+                layer,
+                logical_batch_size=2,
+                kv_head_num=1,
+                is_prefill=is_prefill,
+                ver=ver,
+            )
+            self.assertEqual(q.dtype, q_dtype, (ver, is_prefill))
+            self.assertTrue(torch.equal(k_descale, torch.full((2, 1), 2.0)))
+            self.assertTrue(torch.equal(v_descale, torch.full((2, 1), 4.0)))
 
 
 def _fa3_backend():
