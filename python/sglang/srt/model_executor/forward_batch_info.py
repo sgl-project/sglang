@@ -634,6 +634,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # A one-request batch's committed KV length, which can lag one verify: a host-side
+    # lower bound attention graph variants select on; None for several requests
+    attention_kv_len_lower_bound: Optional[int] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
@@ -1100,6 +1103,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            attention_kv_len_lower_bound=(
+                batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
+            ),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
                 if watermark_state is not None
@@ -2084,16 +2090,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_prefix_lens = self._pad_tensor_to_size(
                 self.extend_prefix_lens, bs
             )
+        # Rebind, never extend in place: pre-pad attention plans hold these lists,
+        # and extend_logprob_start_lens_cpu aliases the ScheduleBatch's list.
         if self.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu.extend(
-                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            self.extend_seq_lens_cpu = self.extend_seq_lens_cpu + [dummy_extend_len] * (
+                bs - len(self.extend_seq_lens_cpu)
             )
         if self.extend_prefix_lens_cpu is not None:
-            self.extend_prefix_lens_cpu.extend(
-                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            self.extend_prefix_lens_cpu = self.extend_prefix_lens_cpu + [0] * (
+                bs - len(self.extend_prefix_lens_cpu)
             )
         if self.extend_logprob_start_lens_cpu is not None:
-            self.extend_logprob_start_lens_cpu.extend(
+            self.extend_logprob_start_lens_cpu = self.extend_logprob_start_lens_cpu + (
                 [0] * (bs - len(self.extend_logprob_start_lens_cpu))
             )
 
@@ -2251,6 +2259,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        # Full aux capture keeps both outputs on the same token rows.
+        if (
+            logits_output.hidden_states is not None
+            and logits_output.last_hidden_states is not None
+        ):
+            logits_output.last_hidden_states = logits_output.last_hidden_states[
+                : logits_output.hidden_states.shape[0]
+            ]
 
     @property
     def can_run_tbo(self):

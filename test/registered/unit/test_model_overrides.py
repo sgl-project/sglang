@@ -217,6 +217,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
+                    "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
                     "watermark_enforce_all",
@@ -3643,7 +3644,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend=None,
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
+            ),
+            {},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend="ascend_ops",
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
             ),
             {},
         )

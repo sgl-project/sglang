@@ -168,7 +168,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             positions=None,
             forward_batch=batch,
         )
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         x = torch.full((8, 2), 3, dtype=torch.int32)
         with (
             patch.object(
@@ -202,7 +202,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
@@ -226,9 +226,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         ngram_eos_token_id=None,
                         holder=holder,
                     )
-                else:
-                    for replay in capture.cuda_graph._break_fns:
-                        replay()
+                    self.assertIsNone(holder.batch)
+                for replay in capture.cuda_graph._break_fns:
+                    replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
