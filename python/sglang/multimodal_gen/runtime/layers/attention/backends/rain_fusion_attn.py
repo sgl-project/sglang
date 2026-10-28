@@ -130,7 +130,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
+        from sglang.multimodal_gen.runtime.platforms.npu import NPUGenerationEnum
 
         if causal:
             raise ValueError("Rain Fusion Attention does not support causal masks")
@@ -143,7 +143,9 @@ class RainFusionAttentionImpl(AttentionImpl):
         )
         self.block_size = 128
         self.tile_size = RAIN_FUSION_TILE_SIZE
-        self._is_a5 = current_platform.return_platform() == NPUPlatformEnum.ASCEND_950
+        self._is_a5 = (
+            current_platform.platform_generation() == NPUGenerationEnum.ASCEND_950
+        )
         # CANN: 4 selects mixed precision on A5; 0 selects high precision,
         # which is required for BF16 on A2/A3. Keep the established A5 mode.
         self.inner_precise = 4 if self._is_a5 else 0

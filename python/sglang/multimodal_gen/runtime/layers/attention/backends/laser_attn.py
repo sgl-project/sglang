@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
+from sglang.multimodal_gen.runtime.platforms.npu import NPUGenerationEnum
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
 _BF16_LASER_SCALE = 256.0
@@ -46,7 +46,7 @@ class LaserAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        if current_platform.return_platform() == NPUPlatformEnum.ASCEND_950:
+        if current_platform.platform_generation() == NPUGenerationEnum.ASCEND_950:
             raise ValueError(
                 "Laser Attention is unavailable on Ascend 950 (A5). "
                 "Use --attention-backend fa or rain_fusion_attn."
