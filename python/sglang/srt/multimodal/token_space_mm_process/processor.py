@@ -48,7 +48,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         processor,
         *,
         processor_config=None,
-        compute_mrope_positions=False,
         pin_io_threads_to_current_device=True,
     ):
         strategy_class = self.strategy_class
@@ -63,8 +62,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         self.strategy = strategy_class(
             hf_config, processor, mm_process_config=self.mm_process_config
         )
-        # Off by default: Megatron Bridge and similar trainers compute positions themselves.
-        self._compute_mrope_positions = compute_mrope_positions
 
     def _io_thread_initializer(self):
         # Loaders decode on device "cuda", which a new thread resolves to cuda:0
@@ -87,6 +84,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         video_metadata=None,
         image_device=None,
         video_device=None,
+        compute_mrope_positions=False,
         package_output=None,
         **kwargs,
     ):
@@ -98,6 +96,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             mm_token_expansion_start_len: Length of an already expanded prefix.
             video_metadata: Per-video frame metadata, in video order.
             image_device, video_device: Preprocessing devices; None keeps defaults.
+            compute_mrope_positions: Also return M-RoPE positions; off for trainers
+                such as Megatron Bridge that compute them themselves.
             package_output: Runs on the BatchFeature in the same worker task.
             **kwargs: Request kwargs for the strategy and its output builder.
 
@@ -128,6 +128,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             input_ids=input_ids,
             mm_token_expansion_start_len=mm_token_expansion_start_len,
             request_kwargs=kwargs,
+            compute_mrope_positions=compute_mrope_positions,
             package_output=package_output,
         )
 
@@ -234,6 +235,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         input_ids,
         mm_token_expansion_start_len,
         request_kwargs,
+        compute_mrope_positions,
         processor,
         package_output=None,
     ):
@@ -258,7 +260,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         # Where each media's tower output goes, aligned with media_items.
         output["mm_modalities"] = [modality for modality, *_ in media_items]
         output["mm_spans"] = mm_spans
-        if self._compute_mrope_positions:
+        if compute_mrope_positions:
             mrope_positions, mrope_position_delta = (
                 self.strategy.compute_mrope_positions(
                     expanded_input_ids, media_features
