@@ -77,10 +77,12 @@ try:
 except:
     StructuralTag = Any
 
-from sglang.srt.sampling.sampling_params import MAX_N
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
+
+# OpenAI's limit on n; SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ still applies after it.
+OPENAI_MAX_N = 128
 
 DEFAULT_MODEL_NAME = "default"
 
@@ -377,7 +379,7 @@ class CompletionRequest(PDRoutingFields):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     max_tokens: int = 16
-    n: int = Field(default=1, ge=1, le=MAX_N)
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
@@ -941,7 +943,7 @@ class ChatCompletionRequest(PDRoutingFields):
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
-    n: int = Field(default=1, ge=1, le=MAX_N)
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None

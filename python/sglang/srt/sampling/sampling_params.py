@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
     normalize_watermark_request,
@@ -41,7 +42,6 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
-MAX_N = 128
 # The float32 bias is divided by a temperature of at least _SAMPLING_EPS; larger
 # values overflow to inf and NaN the softmax.
 LOGIT_BIAS_ABS_MAX = 1e30
@@ -142,8 +142,11 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
 
 
 def validate_n(n: Any) -> int:
-    if type(n) is not int or not 1 <= n <= MAX_N:
-        raise ValueError(f"n must be an integer in [1, {MAX_N}], got {n}.")
+    # A negative limit disables the cap, matching the Rust server.
+    max_n = envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.get()
+    if type(n) is not int or n < 1 or 0 <= max_n < n:
+        bound = f"in [1, {max_n}]" if max_n >= 0 else ">= 1"
+        raise ValueError(f"n must be an integer {bound}, got {n!r}.")
     return n
 
 

@@ -14,10 +14,11 @@ from unittest.mock import MagicMock
 
 import msgspec
 
+from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
+from sglang.srt.environ import envs
 from sglang.srt.sampling.sampling_params import (
     LOGIT_BIAS_ABS_MAX,
     MAX_LEN,
-    MAX_N,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
@@ -113,14 +114,25 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_n_bounds(self):
-        """n outside [1, MAX_N] must be rejected at admission, not fail later."""
-        for value in (-1, 0, MAX_N + 1, "2"):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "n must be"):
-                    self._make(n=value).verify(self.VOCAB_SIZE)
+        """Native n is bounded by SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ, not OpenAI's."""
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
+            for value in (-1, 0, 4097, "2"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "n must be"):
+                        self._make(n=value).verify(self.VOCAB_SIZE)
 
-        self._make(n=1).verify(self.VOCAB_SIZE)
-        self._make(n=MAX_N).verify(self.VOCAB_SIZE)
+            for value in (1, OPENAI_MAX_N + 1, 4096):
+                self._make(n=value).verify(self.VOCAB_SIZE)
+
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(8192):
+            self._make(n=8192).verify(self.VOCAB_SIZE)
+
+        # A negative limit disables the cap, matching the Rust server.
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(-1):
+            for value in (1, 10**6):
+                self._make(n=value).verify(self.VOCAB_SIZE)
+            with self.assertRaisesRegex(ValueError, "n must be an integer >= 1"):
+                self._make(n=0).verify(self.VOCAB_SIZE)
 
     def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
         self._make(

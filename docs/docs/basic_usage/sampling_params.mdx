@@ -291,7 +291,7 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>n</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int = 1`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.) Must be an integer in `[1, 128]`; larger, zero, negative, non-integer, or boolean values fail with HTTP 400 before the request is expanded.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.) Must be an integer from 1 to 4096; `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ` sets the upper bound, and a negative value removes it. Larger, zero, negative, non-integer, or boolean values are rejected before the request is expanded (see [Validation](#validation)). The OpenAI-compatible APIs keep OpenAI's limit of 128, which a setting below 128 lowers further.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>logit_bias</td>

@@ -531,10 +531,10 @@ class GenerateReqInput:
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
-        # n is validated here because inputs are multiplied by n before SamplingParams.verify runs.
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
+        # Validate before inputs are expanded n times; verify() runs too late.
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):

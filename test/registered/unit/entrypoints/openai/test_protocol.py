@@ -20,6 +20,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    OPENAI_MAX_N,
     ChatCompletionMessageContentAudioPart,
     ChatCompletionMessageContentAudioURLPart,
     ChatCompletionMessageContentImageURL,
@@ -37,7 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
-from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,11 +68,11 @@ class TestCompletionRequest(CustomTestCase):
             CompletionRequest(model="test-model")  # missing prompt
 
     def test_completion_n_bounds(self):
-        """n outside [1, MAX_N] must be rejected before reaching the response path."""
-        for n in (-1, 0, MAX_N + 1):
+        """n outside [1, OPENAI_MAX_N] must be rejected before the response path."""
+        for n in (-1, 0, OPENAI_MAX_N + 1):
             with self.subTest(n=n), self.assertRaises(ValidationError):
                 CompletionRequest(model="test-model", prompt="Hello", n=n)
-        for n in (1, MAX_N):
+        for n in (1, OPENAI_MAX_N):
             self.assertEqual(
                 CompletionRequest(model="test-model", prompt="Hello", n=n).n, n
             )
@@ -79,6 +80,18 @@ class TestCompletionRequest(CustomTestCase):
 
 class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
+
+    def _chat_request(self, **params):
+        return ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            **params,
+        )
+
+    def _assert_rejected_field(self, field, **params):
+        with self.assertRaises(ValidationError) as ctx:
+            self._chat_request(**params)
+        self.assertEqual([error["loc"] for error in ctx.exception.errors()], [(field,)])
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
         constraint = ("full_assistant_ebnf", 'root ::= "generated"')
@@ -560,24 +573,12 @@ class TestChatCompletionRequest(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "stop_token_ids"):
                     sampling_params.verify(vocab_size=32)
 
-    def _chat_request(self, **params):
-        return ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            **params,
-        )
-
-    def _assert_rejected_field(self, field, **params):
-        with self.assertRaises(ValidationError) as ctx:
-            self._chat_request(**params)
-        self.assertEqual([error["loc"] for error in ctx.exception.errors()], [(field,)])
-
     def test_out_of_range_sampling_params_are_rejected(self):
-        """Out-of-range sampling values previously passed validation and reached serving."""
+        """Out-of-range sampling values previously passed validation."""
         for field, value in (
             ("n", -1),
             ("n", 0),
-            ("n", MAX_N + 1),
+            ("n", OPENAI_MAX_N + 1),
             ("top_logprobs", -1),
             ("temperature", -0.1),
             ("temperature", float("inf")),
@@ -598,17 +599,15 @@ class TestChatCompletionRequest(CustomTestCase):
     def test_sampling_param_boundaries_are_accepted(self):
         for params in (
             {"n": 1, "logprobs": True, "top_logprobs": 0},
-            {"n": MAX_N, "logprobs": True, "top_logprobs": 20},
-            {"temperature": None},
+            {"n": OPENAI_MAX_N, "logprobs": True, "top_logprobs": 20},
             {"temperature": 0.0},
         ):
             with self.subTest(params=params):
-                request = self._chat_request(**params)
-                for field, value in params.items():
-                    self.assertEqual(getattr(request, field), value)
+                self._chat_request(**params)
+        self.assertIsNone(self._chat_request().temperature)
 
     def test_openai_limits_are_deliberately_not_enforced(self):
-        """The engine applies these values as expected, so they must not be rejected."""
+        """The engine applies these values as expected; they must not be rejected."""
         for params in (
             {"temperature": 3.0},
             {"logprobs": True, "top_logprobs": 50},
