@@ -68,6 +68,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.dllm.manager import DllmManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1118,6 +1119,7 @@ class Scheduler:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.parts.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -1225,6 +1227,7 @@ class Scheduler:
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.parts.dp_attn_adapter.drop_sync_wait_carry()
+        self.parts.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
         self.parts.output_streamer.maybe_reply_health_check()
 
@@ -1249,6 +1252,7 @@ class Scheduler:
                 hicache_storage_enabled()
                 or self.mode.disaggregation_mode != DisaggregationMode.NULL
                 or get_memory().enable_lmcache
+                or self.parts.deferred_responses.has_pending()
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -1307,11 +1311,19 @@ class Scheduler:
             self.hub.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if self.parts.deferred_responses.has_pending():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the completion's worker.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.parts.metrics_sink.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.parts.deferred_responses.has_pending():
+            self.parts.deferred_responses.stream_released()
+            time.sleep(0)
         if self.hub.request_registry.is_fully_idle():
             self.parts.metrics_sink.record_scheduler_idle()
         else:
@@ -1513,7 +1525,18 @@ class Scheduler:
 
     # The abort RPC handler.
     def abort_request(self, recv_req: AbortReq):
+        self.parts.deferred_responses.abort(recv_req)
         self.hub.request_registry.abort_request(recv_req)
+
+    # The plugin API of deferred responses; see deferred_output.
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        self.parts.deferred_responses.defer(req, completion)
+
+    def stream_released_deferred_outputs(self) -> None:
+        self.parts.deferred_responses.stream_released()
+
+    def has_pending_deferred_outputs(self) -> bool:
+        return self.parts.deferred_responses.has_pending()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

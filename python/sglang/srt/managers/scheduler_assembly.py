@@ -71,6 +71,9 @@ from sglang.srt.managers.scheduler_components.bundles import (
     Streams,
     Workers,
 )
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -274,6 +277,7 @@ class SchedulerParts:
     beam_coordinator: BeamCoordinator
     batch_result_processor: SchedulerBatchResultProcessor
     request_retirer: RequestRetirer
+    deferred_responses: DeferredResponses
     step_counters: StepCounters
 
 
@@ -792,6 +796,11 @@ def assemble_scheduler(
         output_streamer=output_streamer,
         ipc_channels=ipc_channels,
     )
+    deferred_responses = DeferredResponses(
+        disaggregation_mode=disaggregation_mode,
+        output_streamer=output_streamer,
+        request_retirer=request_retirer,
+    )
     batch_result_processor = SchedulerBatchResultProcessor(
         is_generation=is_generation,
         model_config=model_config,
@@ -896,6 +905,7 @@ def assemble_scheduler(
         beam_coordinator=beam_coordinator,
         batch_result_processor=batch_result_processor,
         request_retirer=request_retirer,
+        deferred_responses=deferred_responses,
         step_counters=step_counters,
     )
 

@@ -326,7 +326,10 @@ class StepLauncher:
         logits_output = result.logits_output
         if (
             logits_output is None
-            or logits_output.auxiliary_device_output is None
+            or (
+                logits_output.auxiliary_device_output is None
+                and result.forward_auxiliary_output is None
+            )
             or result.auxiliary_host_output is not None
         ):
             return
