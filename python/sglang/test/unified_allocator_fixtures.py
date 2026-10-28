@@ -319,6 +319,7 @@ def build_swa_cache(
         device="cpu",
         enable_memory_saver=False,
     )
+    allocator.storage.requests = req_pool
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,

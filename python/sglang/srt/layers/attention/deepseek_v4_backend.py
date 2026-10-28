@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
+    decoder_replay_tail_len,
     late_layer_tail_layout,
     late_layer_tail_lens,
 )
@@ -1018,16 +1019,16 @@ def late_layer_whole_extend(
     )
 
 
-def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
+def late_layer_num_tokens(
+    forward_batch: ForwardBatch, *, dspark: bool, tail_len: int
+) -> int:
     """Rows a rank runs from late_layer_start on: an extend's tail rows, as
     late_layer_tail_layout picks them, and every row otherwise."""
     if not forward_batch.forward_mode.is_extend_without_speculative():
         return forward_batch.input_ids.shape[0]
     whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
     return sum(
-        late_layer_tail_lens(
-            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
-        )
+        late_layer_tail_lens(forward_batch.extend_seq_lens_cpu, tail_len, whole_extend)
     )
 
 
@@ -1306,6 +1307,17 @@ class DeepseekV4AttnBackend(
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
+        )
+        self.decoder_replay_tail_len = (
+            decoder_replay_tail_len(
+                SWA_WINDOW,
+                cfg.num_hidden_layers,
+                max(cfg.kv_source_layer_ids),
+                page_size=self.page_size,
+            )
+            if self.enable_decoder_swa_bounded_replay
+            and not model_runner.is_draft_worker
+            else SWA_WINDOW
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
@@ -1746,7 +1758,9 @@ class DeepseekV4AttnBackend(
         if not self.enable_decoder_swa_bounded_replay:
             return None
         return late_layer_num_tokens(
-            forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+            forward_batch,
+            dspark=self.model_runner.spec_algorithm.is_dspark(),
+            tail_len=self.decoder_replay_tail_len,
         )
 
     def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
@@ -1775,18 +1789,17 @@ class DeepseekV4AttnBackend(
         self, extend_lens: List[int], whole_extend: Optional[List[bool]]
     ) -> bool:
         tail_lens = late_layer_tail_lens(
-            [int(n) for n in extend_lens], SWA_WINDOW, whole_extend
+            [int(n) for n in extend_lens], self.decoder_replay_tail_len, whole_extend
         )
         return sum(tail_lens) <= self._prefill_graph_tail_capacity()
 
     def _prefill_graph_tail_capacity(self) -> int:
-        """Rows the late layers run over inside the prefill CUDA graph: every
-        request's SWA_WINDOW tail at the request cap, so one capture fits any batch."""
+        """Capacity for every request's replay dependency rows at the request cap."""
         if self._bcg_tail_capacity is None:
             max_reqs = self.model_runner.server_args.max_running_requests
             if not max_reqs:
                 max_reqs = int(self.model_runner.req_to_token_pool.size)
-            self._bcg_tail_capacity = int(max_reqs) * SWA_WINDOW
+            self._bcg_tail_capacity = int(max_reqs) * self.decoder_replay_tail_len
         return self._bcg_tail_capacity
 
     def _prefill_graph_tail_block_rows(self, forward_batch: ForwardBatch) -> int:
@@ -1832,7 +1845,7 @@ class DeepseekV4AttnBackend(
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
+            tail_len=self.decoder_replay_tail_len,
             device=device,
             whole_extend=late_layer_whole_extend(
                 forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()

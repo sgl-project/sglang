@@ -3857,7 +3857,7 @@ class DeepseekV4Model(nn.Module):
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
         # Decoder SWA bounded replay: layers from late_layer_start on run over each
-        # request's last SWA_WINDOW extend tokens only.
+        # request's final window plus its dependencies through the late layers.
         self.late_layer_start: Optional[int] = None
         # The tail starts at the last kv_source layer, whose compressed KV is first
         # written for every row (DeepseekV4AttnBackend.write_tail_source_kv).
@@ -4092,7 +4092,7 @@ class DeepseekV4Model(nn.Module):
                             positions=positions,
                             forward_batch=forward_batch,
                         )
-                # Decode reaches back at most SWA_WINDOW positions.
+                # The tail includes the final window's transitive SWA dependencies.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
                     # live batch's tail metadata; the gathers below are captured

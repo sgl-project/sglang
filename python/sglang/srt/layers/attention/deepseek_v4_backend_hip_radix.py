@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
 )
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
+    decoder_replay_tail_len,
     late_layer_tail_layout,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
@@ -971,6 +972,17 @@ class DeepseekV4HipRadixBackend(
         )
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
+        )
+        self.decoder_replay_tail_len = (
+            decoder_replay_tail_len(
+                SWA_WINDOW,
+                hf_text_config.num_hidden_layers,
+                max(hf_text_config.kv_source_layer_ids),
+                page_size=self.page_size,
+            )
+            if self.enable_decoder_swa_bounded_replay
+            and not getattr(model_runner, "is_draft_worker", False)
+            else SWA_WINDOW
         )
         if self.enable_decoder_swa_bounded_replay:
             # both read the store target off the full batch, not the tail metadata
@@ -2195,7 +2207,9 @@ class DeepseekV4HipRadixBackend(
     def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
         if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
             return None
-        return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
+        return late_layer_num_tokens(
+            forward_batch, dspark=self.is_dspark, tail_len=self.decoder_replay_tail_len
+        )
 
     def _init_forward_metadata_prefill_from_batch(
         self,
@@ -2240,7 +2254,7 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens, or its whole extend
+        replay: each request's dependency-complete tail, or its whole extend
         when it reads prompt rows (late_layer_whole_extend)."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -2249,7 +2263,7 @@ class DeepseekV4HipRadixBackend(
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
+            tail_len=self.decoder_replay_tail_len,
             device=device,
             whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )

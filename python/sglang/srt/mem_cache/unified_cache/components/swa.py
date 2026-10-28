@@ -948,7 +948,7 @@ class SWAComponent(TreeComponent):
 
         # Record the logical SWA branch boundary for insertion.
         insert_params.swa_branching_seqlen = branching_seqlen
-        return effective_cache_len
+        return None if self.cache.decoder_swa_bounded_replay else effective_cache_len
 
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:

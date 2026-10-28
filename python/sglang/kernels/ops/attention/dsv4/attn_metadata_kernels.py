@@ -444,6 +444,18 @@ class BuildCausalSwaPageIndices:
         )
 
 
+def decoder_replay_tail_len(
+    window_size: int, num_layers: int, last_kv_source: int, *, page_size: int = 1
+) -> int:
+    assert window_size > 0
+    assert 0 <= last_kv_source < num_layers
+    assert page_size > 0
+    # Cache insertion can retain a page before the final window. Each replayed
+    # layer also needs the preceding layer's window of activations.
+    retained_rows = max(window_size, page_size) + page_size
+    return retained_rows + (num_layers - last_kv_source) * (window_size - 1)
+
+
 def late_layer_tail_lens(
     extend_lens_cpu: list[int],
     tail_len: int,

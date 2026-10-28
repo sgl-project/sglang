@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    decoder_replay_tail_len,
     late_layer_tail_layout,
 )
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
@@ -38,6 +39,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
+REPLAY_TAIL = decoder_replay_tail_len(128, 40, 20, page_size=256)
 
 
 def _batch(extend_lens, starts=None, capture=CaptureHiddenMode.NULL):
@@ -128,6 +130,7 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
     def _backend(self, capacity):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.enable_decoder_swa_bounded_replay = True
+        backend.decoder_replay_tail_len = REPLAY_TAIL
         backend._prefill_graph_tail_capacity = lambda: capacity
         backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
         return backend
@@ -135,7 +138,7 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
     def _both(self, extend_lens, capacity, starts=None, full=False):
         hidden = CaptureHiddenMode.FULL if full else CaptureHiddenMode.NULL
         forward_batch = _batch(extend_lens, starts, capture=hidden)
-        forward_batch.seq_lens_cpu = torch.tensor([400] * len(extend_lens))
+        forward_batch.seq_lens_cpu = torch.tensor([max(400, n) for n in extend_lens])
         schedule_batch = SimpleNamespace(
             extend_lens=extend_lens,
             extend_logprob_start_lens=starts,
@@ -159,11 +162,12 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
         return vote
 
     def test_whole_extend_counts_against_the_tail_block(self):
-        self.assertTrue(self._both([300, 300], capacity=256))
+        self.assertFalse(self._both([4096], capacity=REPLAY_TAIL - 1))
+        self.assertTrue(self._both([4096, 4096], capacity=2 * REPLAY_TAIL))
         # A prompt-logprob request's tail no longer fits: run the step eagerly.
-        self.assertFalse(self._both([300, 300], 256, starts=[0, 300]))
-        self.assertTrue(self._both([300, 300], 428, starts=[0, 300]))
-        self.assertFalse(self._both([300], 256, full=True))
+        self.assertFalse(self._both([4096, 4096], 2 * REPLAY_TAIL, starts=[0, 4096]))
+        self.assertTrue(self._both([4096, 4096], 4096 + REPLAY_TAIL, starts=[0, 4096]))
+        self.assertFalse(self._both([4096], REPLAY_TAIL, full=True))
 
 
 class TestTailReadersCheck(CustomTestCase):
@@ -209,8 +213,8 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         )
 
     def test_rows_are_exchanged_before_the_forward(self):
-        # Rank 0 prefills 300 rows; rank 1 is idle.
-        n = 300
+        # Rank 0 prefills beyond the replay bound; rank 1 is idle.
+        n = 4096
         fb = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
@@ -240,6 +244,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.enable_decoder_swa_bounded_replay = True
+        backend.decoder_replay_tail_len = REPLAY_TAIL
         backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
         backend.get_cpu_graph_seq_len_fill_value = lambda: 1
         runner = MagicMock(attn_backend=backend, is_draft_worker=False)
@@ -257,9 +262,9 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             ),
         ):
             fb.prepare_mlp_sync_batch(runner)
-        self.assertEqual(fb.global_late_layer_num_tokens_cpu, [SWA_WINDOW, 0])
+        self.assertEqual(fb.global_late_layer_num_tokens_cpu, [REPLAY_TAIL, 0])
 
-        for rank, local_rows in ((0, SWA_WINDOW), (1, 0)):
+        for rank, local_rows in ((0, REPLAY_TAIL), (1, 0)):
             with (
                 self.subTest(rank=rank),
                 self._dp_rank(rank),
@@ -270,7 +275,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
                 ),
             ):
                 counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
-            self.assertEqual(counts, [SWA_WINDOW, 0])
+            self.assertEqual(counts, [REPLAY_TAIL, 0])
 
 
 def _prefill_graph_replay(*, ratios, seq_len):

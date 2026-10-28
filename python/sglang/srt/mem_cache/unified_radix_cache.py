@@ -1240,7 +1240,7 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
 
-        if (
+        if self.decoder_swa_bounded_replay or (
             not is_finished
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
@@ -1393,7 +1393,10 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         )
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        if (
+            self.decoder_swa_bounded_replay
+            or envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
@@ -3857,9 +3860,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
         stores, so a reused window would read another request's stale slots; a
-        host pool restores exact contents instead. Decoder SWA bounded replay
-        writes late-layer window KV only for an extend's tail rows, so a matched
-        prefix may lack it; a streaming turn borrowing its own record has it.
+        host pool restores exact contents instead.
         """
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
@@ -3868,8 +3869,6 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.component_of(TREE_WINDOW)
         if swa is None or not swa.sliding_window_size:
             return 0
-        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
-            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
