@@ -1140,7 +1140,9 @@ The multi-node router presets retain the default request timeout. The standalone
 
 The panel keeps its c16 / c48 / c256 strategy presets. Apply the following overrides to the **Multi-Nodes** commands to reproduce the optimized recipe's endpoints. Here `cN` means a target concurrency of N.
 
-**c1 (replaces c4):** start from Low-Latency. Keep prefill TP4, set decode to `--tp 4`, and set `--max-running-requests 8` on both roles. Replace decode's graph list with `--cuda-graph-bs-decode 1 2 3 4 5 6 7 8`. Keep DSpark block size 6 (7 draft tokens), `MORI_MAX_DISPATCH_TOKENS_DECODE=448`, and both kernel switches on both roles. The source also sets `SGLANG_MLA_HCA_KV_SPLITS=8` on both roles; the FP8 KV path does not read this setting. Keep these 8 server slots and graph sizes when benchmarking with client concurrency 1; do not reduce them to 2 using the strategy presets' `N*2` rule.
+**c1 (replaces c4):** start from Low-Latency. Keep prefill TP4 and decode TP8, and set `--max-running-requests 8` on both roles. Replace decode's graph list with `--cuda-graph-bs-decode 1 2 3 4 5 6 7 8`. Keep DSpark block size 6 (7 draft tokens), `MORI_MAX_DISPATCH_TOKENS_DECODE=448`, and both kernel switches on both roles. The source also sets `SGLANG_MLA_HCA_KV_SPLITS=8` on both roles; the FP8 KV path does not read this setting. Keep these 8 server slots and graph sizes when benchmarking with client concurrency 1; do not reduce them to 2 using the strategy presets' `N*2` rule.
+
+For c1, use `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261028` for the serving roles and add `--enable-amd-monokernel` to the **decode** command.
 
 **c32:** start from Low-Latency, keep TP4 → TP8 and block size 6, set both admission limits to 64, and capture decode graph sizes 1–64. Both roles use FP8 KV and mxscale, as at c16 and c48.
 
