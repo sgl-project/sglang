@@ -50,6 +50,7 @@ class DllmPrefillAdder(PrefillAdder):
         extend_input_len: int,
         total_tokens: int,
         swa_host_hit_length: int,
+        chunk_limit: Optional[int],
     ) -> tuple[bool, Optional[int]]:
         # No chunk cap: the block is the extend.
         can_admit, _ = super()._check_prefill_budget(
@@ -57,6 +58,7 @@ class DllmPrefillAdder(PrefillAdder):
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             swa_host_hit_length=swa_host_hit_length,
+            chunk_limit=chunk_limit,
         )
         return can_admit, None
 
@@ -86,7 +88,9 @@ class DllmPrefillAdder(PrefillAdder):
         extend_len = self._get_dllm_extend_len(req, admission.prefix_len)
         if extend_len <= 0:
             return AddReqResult.OTHER
-        return _PrefillAdmission(admission.prefix_len, extend_len, 0, False)
+        return _PrefillAdmission(
+            admission.prefix_len, extend_len, 0, False, admission.replay_len
+        )
 
     def _admit_ignore_eos(
         self, req: Req, cand_extend_input_len: int
