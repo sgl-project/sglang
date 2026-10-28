@@ -106,13 +106,13 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
 
     # Adapted from sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.__init__;
     # token IDs go to mm_token_expansion_params instead of MultimodalSpecialTokens.
-    def __init__(self, hf_config, processor, **kwargs):
+    def __init__(self, hf_config, processor, *, mm_process_config=None):
         self.model_type = hf_config.model_type
         if self.model_type == "qwen3_omni_moe":
             self.media_processor_kwargs_type = Qwen3OmniMoeProcessorKwargs
             hf_config = hf_config.thinker_config
 
-        super().__init__(hf_config, processor, **kwargs)
+        super().__init__(hf_config, processor, mm_process_config=mm_process_config)
 
         vision_config = hf_config.vision_config
         self._tokens_per_second = getattr(vision_config, "tokens_per_second", None)
@@ -140,18 +140,17 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         }
 
     def resolve_media_options(
-        self, processor, *, image_device=None, video_device=None, **kwargs
+        self, processor, *, image_device=None, video_device=None
     ) -> dict:
-        """Split the request kwargs per modality as the HF processor call does."""
-        kwargs.setdefault("return_tensors", "pt")
-        kwargs.setdefault("padding", True)
+        """Per-modality options as the HF processor call merges them, plus the config."""
         kwargs_type = (
             self.media_processor_kwargs_type or processor.valid_processor_kwargs
         )
         processor_kwargs = processor._merge_kwargs(
             kwargs_type,
             tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-            **kwargs,
+            return_tensors="pt",
+            padding=True,
         )
         image_kwargs = processor_kwargs["images_kwargs"]
         video_kwargs = processor_kwargs["videos_kwargs"]
@@ -366,22 +365,18 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         input_ids: list[int],
         *,
         processor,
-        **kwargs,
     ) -> BatchFeature:
         """Return what processor(text, media) returns, from expanded input_ids.
 
-        Text keys follow the processor defaults and the call kwargs, as in
-        ProcessorMixin.__call__: mm_token_type_ids only when requested, and
-        video_metadata only with return_metadata. A single unpadded request needs
-        no attention_mask.
+        Text keys follow the processor defaults, as in ProcessorMixin.__call__:
+        mm_token_type_ids only when the processor returns them, and no
+        video_metadata. A single unpadded request needs no attention_mask.
         """
         kwargs_type = (
             self.media_processor_kwargs_type or processor.valid_processor_kwargs
         )
         text_kwargs = processor._merge_kwargs(
-            kwargs_type,
-            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-            **kwargs,
+            kwargs_type, tokenizer_init_kwargs=processor.tokenizer.init_kwargs
         )["text_kwargs"]
         output = {"input_ids": torch.tensor([input_ids], dtype=torch.long)}
         if text_kwargs.get("return_mm_token_type_ids", False):
@@ -389,8 +384,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 processor.create_mm_token_type_ids([input_ids]), dtype=torch.long
             )
         output.update(media_features)
-        if not kwargs.get("return_metadata"):
-            output.pop("video_metadata", None)
+        output.pop("video_metadata", None)
         return BatchFeature(output)
 
     # Adapted from sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.build_input_ids_with_timestamps;
