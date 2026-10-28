@@ -69,7 +69,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    async_h2d_stack,
+    ceil_align,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1544,9 +1548,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = _stack_mrope_deltas_to_device(
-                deltas=mrope_deltas, device=device
-            )
+            mrope_delta_tensor = async_h2d_stack(mrope_deltas, device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -2411,31 +2413,6 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
-
-
-def _stack_mrope_deltas_to_device(
-    *, deltas: List[torch.Tensor], device: torch.device
-) -> torch.Tensor:
-    """Stack per-request CPU MRoPE deltas into one device tensor.
-
-    A plain `.to(device)` on pageable memory appends a cudaStreamSynchronize to
-    the copy, so the spec decode loop (target verify / draft extend run every
-    step) waits for every kernel already queued on the stream. Staging through
-    pinned memory keeps the copy async; the caching host allocator holds each
-    block until its copy event completes, so a fresh pinned tensor per call is
-    safe to let go of here.
-
-    `stack` allocates its output through the regular CPU allocator, so the
-    result is never already pinned; don't probe it (is_pinned costs a
-    cudaPointerGetAttributes on the decode hot path).
-    """
-    stacked = torch.stack(deltas, dim=0)
-    if stacked.device.type != "cpu" or not is_pin_memory_available(device):
-        return stacked.to(device=device)
-
-    staging = torch.empty(stacked.shape, dtype=stacked.dtype, pin_memory=True)
-    staging.copy_(stacked)
-    return staging.to(device=device, non_blocking=True)
 
 
 def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
