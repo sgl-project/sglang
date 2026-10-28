@@ -1,5 +1,5 @@
 {
- "source": "test/manual/mem_cache/gen_unified_layout_golden.py at 60d941293e",
+ "source": "test/manual/mem_cache/gen_unified_layout_golden.py at 404f59412d",
  "layouts": {
   "swa_p1": {
    "chain": [["swa", "up"], ["full", "down"]],
@@ -1766,7 +1766,7 @@
      "draft_offset": null,
      "max_slots": 380,
      "min_slot_index": 3,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 1],
      "views": {
       "conv": [[0, [2, 380, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
       "temporal": [96, [2, 380, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]

@@ -167,7 +167,6 @@ _CONFIGS = {
         full_tokens=64 * 16,
         swa_tokens=64 * 16,
     ),
-    # The source carries a conv slice axis that this chain does not read today.
     "tri_p16_slice_axis": _tri(
         page_size=16,
         conv_slice_axis=1,

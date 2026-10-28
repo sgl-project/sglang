@@ -2405,6 +2405,7 @@ def init_unified_mamba_swa_pools(
         conv_dtype=cp.dtype.conv,
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
+        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
         draft_region=None if fused_draft is None else fused_draft.region("mamba"),
     )
