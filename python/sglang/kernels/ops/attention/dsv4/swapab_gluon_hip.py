@@ -294,11 +294,14 @@ def combine_gfx950(
 ):
     b, h, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t, d = tl.arange(0, ST), tile * BD + tl.arange(0, BD)
+    ROPE_TILES: tl.constexpr = (512 - ROPE_DIM) % BD == 0
     # issued before the tl.max reduce: Triton does not hoist loads across it
     sink = tl.load(SINK + h)
     if ROPE_DIM > 0:
         pos = tl.load(POSITIONS + b)
         cos, sin = rope_tables(d, FREQS, pos, FREQ_STRIDE, 512, ROPE_DIM)
+        if ROPE_TILES:
+            signed_sin = tl.where(d % 2 == 0, -sin, sin)
     den = tl.load(SUM + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.load(MAX + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.where(den > 0, mx, -float("inf"))
@@ -315,7 +318,15 @@ def combine_gfx950(
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
     out = out.to(OUT.dtype.element_ty)
     if ROPE_DIM > 0:
-        out = inverse_rope_apply(out, d, cos, sin, 512, ROPE_DIM)
+        if ROPE_TILES:
+            if tile * BD >= 512 - ROPE_DIM:
+                x = out.to(tl.float32)
+                swapped = tl.reshape(
+                    tl.flip(tl.reshape(x * signed_sin, (BD // 2, 2)), 1), d.shape
+                )
+                out = tl.fma(x, cos, swapped).to(out.dtype)
+        else:
+            out = inverse_rope_apply(out, d, cos, sin, 512, ROPE_DIM)
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 
