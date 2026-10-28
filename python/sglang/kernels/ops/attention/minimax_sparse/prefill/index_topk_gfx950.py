@@ -456,6 +456,7 @@ def can_fuse_index_topk(
         # Candidates are whole causal blocks; the partial self block is always forced.
         and local_blocks >= 1
         and q.shape[-1] == 128
+        and q.stride(-1) == 1
         and block_size_k == 128
         and topk <= _KP
         and k_ok
