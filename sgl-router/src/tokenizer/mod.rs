@@ -506,7 +506,12 @@ mod tests {
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
-        std::fs::write(&tok, "{}").unwrap();
+        // DeepSeek-V4 loads the checkpoint tokenizer, so it must parse.
+        std::fs::write(
+            &tok,
+            include_str!("../../tests/fixtures/tiny_tokenizer.json"),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "T").unwrap();
         let resolve = |model_type: &str| {
             let cfg = serde_json::json!({ "model_type": model_type }).to_string();
