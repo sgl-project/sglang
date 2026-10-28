@@ -1331,6 +1331,36 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         mark = self.swa_valid_from
         return [mark.data_ptr()], [mark.nbytes], [mark[0].nbytes]
 
+    def cpu_buffer_transfer_tensors(self) -> List[torch.Tensor]:
+        """Owners of the regions described by the PD buffer-info methods.
+
+        Keep the descriptor methods authoritative for offsets and lengths: the
+        unified layout puts SWA and compressed KV in disjoint parts of one tensor.
+        """
+        buffers = []
+        if self._unified_kv:
+            buffers.extend(self.unified_kv_pool.kv_buffer)
+            if self._unified_kv_fp8:
+                buffers.extend(self.unified_kv_pool.kv_buffer_rope)
+        else:
+            for pool in self.kv_pools.values():
+                if pool is not None:
+                    buffers.extend(pool.kv_buffer)
+        for pool in self.index_pools.values():
+            if pool is not None:
+                buffers.extend(pool.contiguous_page_row_buffers())
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        if swa_pool is not None:
+            buffers.extend(swa_pool.kv_buffer)
+        for pool in self.compress_state_pools + self.indexer_compress_state_pools:
+            if pool is not None:
+                buffers.append(pool.kv_score_buffer.kv_score)
+        return buffers
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
+    state_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -43,6 +44,71 @@ def _make_buf(size=4, *, kv_checksum_enabled=True, output_dsa_topk_indices_dim=0
         output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
         kv_checksum_enabled=kv_checksum_enabled,
     )
+
+
+class TestDeepSeekStateIndices(unittest.TestCase):
+    def test_swa_and_pending_pair_use_independent_indices(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.sliding_window = 4
+        pool.request_window = None
+        pool.get_state_buf_infos = Mock(return_value=([11, 12], [], []))
+        pool.get_unified_swa_ring_buf_infos = Mock(return_value=([], [], []))
+        pool.get_request_state_buf_infos = Mock(return_value=([13], [], []))
+        pool.request_state_transfer_indices = Mock(return_value=[5, 6])
+        allocator = SimpleNamespace(
+            page_size=2,
+            get_kvcache=lambda: pool,
+            translate_swa_indices_for_transfer=lambda ids: ids + 20,
+        )
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(4, 8)),
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+        result = state_indices_for_request(scheduler, req, 7)
+        self.assertEqual(
+            [v.tolist() for v in result], [[15, 16, 17], [15, 16, 17], [5, 6]]
+        )
+        pool.request_state_transfer_indices.assert_called_once_with(1, 7)
+        # Decode retains cached prefix pages; only transferred SWA pages are hashed.
+        result = state_indices_for_request(scheduler, req, 7, start_idx=6)
+        self.assertEqual([v.tolist() for v in result], [[17], [17], [5, 6]])
+        pool.request_window = SimpleNamespace(page_indices=Mock(return_value=[4, 7, 9]))
+        result = state_indices_for_request(scheduler, req, 7)
+        self.assertEqual([v.tolist() for v in result], [[4, 7, 9], [4, 7, 9], [5, 6]])
+        pool.request_window.page_indices.assert_called_once_with(1, 2, 7)
+        pool.request_window.page_indices.reset_mock()
+        state_indices_for_request(scheduler, req, 7, start_idx=6)
+        pool.request_window.page_indices.assert_called_once_with(1, 6, 7)
+
+    def test_unified_ring_wrap_and_empty_pending_state(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.get_state_buf_infos = Mock(return_value=([], [], []))
+        pool.get_unified_swa_ring_buf_infos = Mock(return_value=([11, 12], [], []))
+        pool.get_request_state_buf_infos = Mock(return_value=([13], [], []))
+        pool.request_state_transfer_indices = Mock(return_value=[])
+        pool.unified_swa_window = 3
+        pool.unified_swa_ring_size = 4
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=2, get_kvcache=lambda: pool
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(4, 8)),
+        )
+        result = state_indices_for_request(
+            scheduler,
+            SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2)),
+            6,
+            start_idx=4,
+        )
+        self.assertEqual([v.tolist() for v in result], [[11, 8, 9], [11, 8, 9], []])
+        self.assertTrue(
+            all(v.dtype == torch.int64 and v.is_contiguous() for v in result)
+        )
 
 
 class TestMetadataBuffers(unittest.TestCase):
@@ -169,6 +235,43 @@ class TestKvChecksumComputer(unittest.TestCase):
         value = _make_computer(kv, item_len).compute(idx)
         expected = _ref_strided_adler32(kv, [idx] * len(kv), [item_len] * len(kv))
         self.assertEqual(value, expected)
+
+    def test_qsa_components_use_independent_indices(self):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.get_state_buf_infos = lambda: ([1, 2], [], [])
+        pool.get_qsa_pending_state_buf_infos = lambda: ([3, 4], [], [])
+        pool.get_qsa_compressed_state_buf_infos = lambda: ([5], [], [])
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: pool, page_size=4
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_index_to_mamba_index_mapping=torch.tensor(
+                    [0, 0, 5], device=self.device
+                ),
+                req_to_token=torch.tensor(
+                    [[0] * 8, [0] * 8, [12, 13, 14, 15, 4, 5, 6, 7]], device=self.device
+                ),
+            ),
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2))
+        ids = state_indices_for_request(scheduler, req, 8)
+        self.assertEqual([v.tolist() for v in ids], [[5], [5], [2], [2], [3, 1]])
+        suffix_ids = state_indices_for_request(scheduler, req, 8, start_idx=4)
+        self.assertEqual([v.tolist() for v in suffix_ids], [[5], [5], [2], [2], [1]])
+        tensors = [torch.randn(8, 16, device=self.device) for _ in ids]
+        widths = [t[0].nbytes for t in tensors]
+        computer = _make_computer([], 0, tensors, widths)
+        empty = torch.empty(0, dtype=torch.int64, device=self.device)
+        value = computer.compute(empty, ids)
+        self.assertEqual(value, _ref_strided_adler32(tensors, ids, widths))
+        for tensor, selected in zip(tensors, ids):
+            tensor[selected[0], 0] += 1
+            updated = computer.compute(empty, ids)
+            self.assertNotEqual(value, updated)
+            value = updated
 
     def test_kv_corruption_detected(self):
         kv = _make_kv(num_layers=2, num_pages=16, page_elems=64)
