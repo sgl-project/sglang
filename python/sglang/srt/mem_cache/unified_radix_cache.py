@@ -146,6 +146,10 @@ T = TypeVar("T")
 
 # Arbitrary; one reminder a minute while L3 is degraded.
 _STORAGE_UNAVAILABLE_WARN_S = 60.0
+# Shared-memory row of the HiCache ready-count exchange: the two L2 ack counts,
+# the four storage queue sizes, the storage health bit and the folded digest's
+# two words. Extra host pools widen the row past it and take the gloo reduce.
+_HICACHE_SHM_ROW_WIDTH = 9
 
 
 def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
@@ -3673,7 +3677,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        return get_shm_exchange(group, "hicache", multihost=True)
+        return get_shm_exchange(
+            group, "hicache", multihost=True, width=_HICACHE_SHM_ROW_WIDTH
+        )
 
     def _apply_storage_health(self, storage_healthy: bool) -> None:
         """Act on the rank-agreed health bit of this drain round, once."""
