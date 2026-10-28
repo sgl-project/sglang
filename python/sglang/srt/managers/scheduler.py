@@ -631,6 +631,7 @@ class Scheduler(
                     self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
+        self.maybe_init_mla_dedup_stream()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -741,6 +742,17 @@ class Scheduler(
 
         self.is_initializing = False
         self.init_startup_timing_summary()
+
+    def maybe_init_mla_dedup_stream(self):
+        if self.enable_hierarchical_cache:
+            controller = self.tree_cache.cache_controller
+            if controller is not None and controller.mla_dedup_enabled:
+                producer_stream = (
+                    self.forward_stream
+                    if self.enable_overlap or get_parallel().pp_size > 1
+                    else self.schedule_stream
+                )
+                controller.set_mla_producer_stream(producer_stream)
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -4718,6 +4730,12 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
+        # A later forward may reuse device rows still being read by D2H.
+        if self.enable_hierarchical_cache and not self.enable_overlap:
+            controller = self.tree_cache.cache_controller
+            if controller is not None and controller.mla_dedup_enabled:
+                controller.wait_mla_write_on_stream(self.device_module.current_stream())
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -4739,6 +4757,10 @@ class Scheduler(
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
                         self.future_map.resolve_seq_lens_cpu(batch, stream_ordered=True)
+                    if self.enable_hierarchical_cache:
+                        controller = self.tree_cache.cache_controller
+                        if controller is not None and controller.mla_dedup_enabled:
+                            controller.wait_mla_write_on_stream(self.forward_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring

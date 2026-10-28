@@ -225,6 +225,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_context=None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
@@ -254,6 +255,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            mla_dedup_context=mla_dedup_context,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -987,7 +989,11 @@ class HybridCacheController(BaseHiCacheController):
             if self.is_kv_sharded
             else len(op.device_indices)
         )
-        num_bytes = kv_tokens * anchor.host_pool.size_per_token
+        num_bytes = (
+            0
+            if getattr(anchor.host_pool, "_is_dummy", False)
+            else kv_tokens * anchor.host_pool.size_per_token
+        )
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -995,7 +1001,7 @@ class HybridCacheController(BaseHiCacheController):
                 source_len[t.name] = transferred_tokens(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None:
+            if entry is None or getattr(entry.host_pool, "_is_dummy", False):
                 continue
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)
@@ -1748,9 +1754,13 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
-        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
-        # MLA/DeepSeek-V4 draft pools remain TP0-only.
-        if self.storage_backend_type == "mooncake" and transfer.name in (
+        # Mooncake and the file backend both give MHA draft and draft-SWA
+        # objects rank-specific keys, so every TP rank must back up its own
+        # shard. Otherwise a nonzero rank's draft file is never written and,
+        # because storage hits are combined with a cross-rank MIN, the missing
+        # shard collapses the whole prefix hit to zero.
+        # MLA/DeepSeek-V4 draft pools (non-MHA host) remain TP0-only.
+        if self.storage_backend_type in ("mooncake", "file") and transfer.name in (
             PoolName.DRAFT,
             PoolName.DRAFT_SWA,
         ):

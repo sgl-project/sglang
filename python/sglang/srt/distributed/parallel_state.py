@@ -3021,7 +3021,11 @@ def initialize_model_parallel(
 
 
 def create_custom_parallel_group(
-    group_ranks: List[int], backend: str = "gloo"
+    group_ranks: List[int],
+    backend: str = "gloo",
+    *,
+    metadata_group: Optional[torch.distributed.ProcessGroup] = None,
+    timeout: Optional[timedelta] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """
     Create a custom parallel group based on the provided ranks.
@@ -3030,6 +3034,12 @@ def create_custom_parallel_group(
         group_ranks: The list of ranks that the CURRENT process wants to join.
                      (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
         backend: The communication backend (default: "gloo").
+        metadata_group: Optional world-sized group for exchanging rank lists.
+                        A CPU group avoids initializing the default NCCL group
+                        just to exchange Python objects.
+        timeout: Optional timeout for each new group. When omitted, PyTorch's
+                 default applies. With a Gloo metadata group, also bound the
+                 preceding rank-list exchange.
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
@@ -3046,6 +3056,12 @@ def create_custom_parallel_group(
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
+    if (
+        metadata_group is not None
+        and torch.distributed.get_world_size(group=metadata_group) != world_size
+    ):
+        raise ValueError("Custom-group metadata must be exchanged across the world.")
+
     local_config = sorted(list(set(group_ranks)))
     group_size = len(local_config)
 
@@ -3058,8 +3074,20 @@ def create_custom_parallel_group(
 
     if not (_is_npu and is_standard_partition):
         # General path: collect every rank's group via all_gather_object.
+        # The metadata group's own timeout may be much longer than the new
+        # group's timeout. Detect a rank that never enters this exchange first.
+        if (
+            metadata_group is not None
+            and timeout is not None
+            and torch.distributed.get_backend(metadata_group) == "gloo"
+        ):
+            torch.distributed.monitored_barrier(
+                group=metadata_group, timeout=timeout, wait_all_ranks=True
+            )
         gathered_configs = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(gathered_configs, local_config)
+        torch.distributed.all_gather_object(
+            gathered_configs, local_config, group=metadata_group
+        )
     else:
         # NPU fast path: all_gather_object on the default HCCL PG allocates
         # an HCCL buffer; instead derive the standard TP/DP groups locally.
@@ -3082,7 +3110,10 @@ def create_custom_parallel_group(
     my_new_group = None
 
     for g_ranks in unique_groups:
-        group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
+        kwargs = {"ranks": g_ranks, "backend": backend}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        group = torch.distributed.new_group(**kwargs)
 
         if set(g_ranks) == set(local_config):
             my_new_group = group
