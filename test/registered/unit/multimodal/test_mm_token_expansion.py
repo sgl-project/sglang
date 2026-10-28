@@ -17,7 +17,7 @@ TokenSpaceProcessor.process(media, IDs)
   image ok + video fails -> request fails, loaded decoder still closed
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
-  strategy loading options -> loader class attributes and load kwargs
+  strategy loading options -> load kwargs
 """
 
 import asyncio
@@ -252,18 +252,11 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             asyncio.run(self._processor().process("image.png", input_ids=[1, IMAGE]))
 
     def test_strategy_loading_options_reach_the_loader(self):
-        class CpuDecodedStrategy(_ImageWidthStrategy):
-            processor_class_attributes = {"gpu_image_decode": False}
+        class LoaderOptionsStrategy(_ImageWidthStrategy):
             audio_sample_rate = 24000
             discard_alpha_channel = False
 
-        self.assertIs(
-            TokenSpaceProcessor.for_strategy(CpuDecodedStrategy).gpu_image_decode,
-            False,
-        )
-        self.assertIs(TokenSpaceProcessor.gpu_image_decode, True)
-
-        processor = self._processor(CpuDecodedStrategy)
+        processor = self._processor(LoaderOptionsStrategy)
         load = AsyncMock(return_value=([Image.new("RGB", (1, 1))], [], []))
         with patch.object(processor, "_load_media_lists", load):
             asyncio.run(processor.process(["image"], input_ids=[1, IMAGE]))
