@@ -288,6 +288,9 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                # The L3 cleaner deletes the oldest files once the disk holding
+                # test_dir passes its watermark, which races these round trips.
+                "l3_cleaner_enabled": False,
             },
         )
 
@@ -837,7 +840,10 @@ class TestNixlDirectIO(CustomTestCase):
             is_page_first_layout=False,
             model_name="test_model",
             enable_storage_metrics=False,
-            extra_config={"plugin": {"posix": {"active": True}}},
+            extra_config={
+                "plugin": {"posix": {"active": True}},
+                "l3_cleaner_enabled": False,
+            },
             # use_direct_io defaults to True (env var)
         )
         try:
