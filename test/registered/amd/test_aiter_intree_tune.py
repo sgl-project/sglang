@@ -4,14 +4,16 @@ Guards: the in-tree rows / JSON / mHC policy apply only while aiter ships the pr
 config; once aiter has the PR (simulated by handing aiter a table that already has the
 PR rows) nothing is installed, aiter's merge does not see duplicate keys, and the
 effective table is the PR's either way. The mHC tile_m=16 policy is bit-identical.
-Rows without a base kernel only add shapes aiter lacks; on the pinned aiter every M3.1
-row applies or adds.
+Rows without a base kernel only add shapes aiter lacks, once; on the pinned aiter every
+M3.1 row applies or adds.
 """
 
 import collections
 import glob
+import importlib.metadata
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -220,10 +222,24 @@ class TestIntreeAdditions(CustomTestCase):
         self.assertFalse(out.duplicated(subset=it._KEY_COLS).any())
 
 
+def _aiter_commit() -> str:
+    try:
+        version = importlib.metadata.version("amd-aiter")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+    match = re.search(r"\+g([0-9a-f]+)", version)
+    return match.group(1) if match else ""
+
+
+# the aiter the M3.1 rows were tuned against
+_M31_TABLES_AITER = "acf8fdf93"
+
+
 @unittest.skipUnless(_HAS_AITER, "aiter not installed")
 class TestMiniMaxM31Tables(CustomTestCase):
-    """On the pinned aiter every M3.1 shape resolves to its row's kernel; a re-tuned aiter
-    shape (superseded) or one it dropped (missing) means the rows need updating."""
+    """An in-tree M3.1 key never repeats, which aiter refuses. On the pinned aiter every
+    shape resolves to its row's kernel; there, a re-tuned aiter shape (superseded) or one
+    it dropped (missing) means the rows need updating."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sglang_m31_tables_test_")
@@ -241,13 +257,15 @@ class TestMiniMaxM31Tables(CustomTestCase):
         type(AITER_CONFIGS).get_config_file.cache_clear()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_install_on_pinned_aiter(self):
+    def test_install(self):
+        pinned = _aiter_commit().startswith(_M31_TABLES_AITER)
         for spec in m31.M31_TABLES:
             with self.subTest(spec.stem):
                 stats, path = it.install_intree_table(
                     spec, out_dir=os.path.join(self.tmp, "out")
                 )
-                self.assertEqual(stats[it.SUPERSEDED] + stats[it.MISSING], 0, stats)
+                if pinned:
+                    self.assertEqual(stats[it.SUPERSEDED] + stats[it.MISSING], 0, stats)
                 self.assertEqual(path, getattr(AITER_CONFIGS, spec.attr))
                 keys, kernels = list(spec.key_cols), list(spec.kernel_cols)
                 table = pd.read_csv(path)
@@ -263,7 +281,10 @@ class TestMiniMaxM31Tables(CustomTestCase):
                     zip(*(rows[c].map(it._norm) for c in keys)), rows.iterrows()
                 ):
                     self.assertEqual(counts[key], 1, key)
-                    self.assertEqual(effective[key], it._norm_kernel(row, kernels), key)
+                    if pinned:
+                        self.assertEqual(
+                            effective[key], it._norm_kernel(row, kernels), key
+                        )
 
 
 class TestTritonJson(CustomTestCase):
