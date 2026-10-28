@@ -599,7 +599,9 @@ def generate_simulated_accept_index(
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
     generator: Optional[torch.Generator] = None,
+    accept_lens: Optional[torch.Tensor] = None,
 ):
+    """accept_lens: also written by the fused kernel (num_correct_drafts + 1)."""
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
@@ -617,7 +619,10 @@ def generate_simulated_accept_index(
             width=spec_steps + 1,
             num_accept_tokens=simulate_acc_len,
             real_tokens=use_real_draft_tokens,
+            accept_lens=accept_lens,
         )
+    if accept_lens is not None:
+        accept_lens.fill_(simulate_acc_len)
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(

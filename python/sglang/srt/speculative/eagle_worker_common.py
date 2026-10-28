@@ -123,9 +123,12 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
-    writes again (the verify window); a widened window plans its own."""
+    writes again (the verify window); a widened window plans its own.
+    ``prepared_layout``: prepare_draft_extend_layout's outputs, built with the
+    verify tree."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -170,7 +173,9 @@ def prepare_for_draft_extend(
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
         batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
+            prepared_layout
+            if prepared_layout is not None
+            else prepare_draft_extend_layout(
                 batch.seq_lens,
                 num_draft_tokens,
                 draft_model_runner.model_config.model_is_mrope
@@ -428,6 +433,7 @@ def build_eagle_verify_input(
 
     prepared_out_cache_loc = None
     prepared_mrope_positions = None
+    prepared_extend_layout = None
     if (
         batch.seq_lens.is_cuda
         and topk == 1
@@ -444,8 +450,11 @@ def build_eagle_verify_input(
             req_to_token=batch.req_to_token_pool.req_to_token,
             with_mrope=target_worker.model_runner.model_config.model_is_mrope
             and all(x is None for x in batch.multimodal_inputs),
+            with_extend_layout=True,
         )
-        prepared_out_cache_loc, prepared_mrope_positions = tree_outputs[6:]
+        prepared_out_cache_loc, prepared_mrope_positions, prepared_extend_layout = (
+            tree_outputs[6:]
+        )
         tree_outputs = tree_outputs[:6]
     else:
         tree_outputs = build_tree_kernel_efficient(
@@ -488,6 +497,7 @@ def build_eagle_verify_input(
         draft_probs=draft_probs,
         prepared_out_cache_loc=prepared_out_cache_loc,
         prepared_mrope_positions=prepared_mrope_positions,
+        prepared_draft_extend_layout=prepared_extend_layout,
     )
 
 
@@ -565,6 +575,7 @@ def run_eagle_verify(
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    future_relay: Optional[Any] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -741,6 +752,12 @@ def run_eagle_verify(
             if batch.mamba_track_indices is not None
             else 0
         )
+        # the overlap scheduler's relay takes the new lengths from this launch
+        relay = (
+            (future_relay.new_seq_lens, batch.req_pool_indices)
+            if future_relay is not None and future_relay.adopted
+            else None
+        )
         new_seq_lens, bonus_tokens, prepared_commit_steps, prepared_draft_inputs = (
             prepare_verify_commit_outputs(
                 predict,
@@ -749,8 +766,11 @@ def run_eagle_verify(
                 batch.seq_lens,
                 num_draft_tokens=num_draft_tokens,
                 mamba_track_interval=track_interval,
+                relay=relay,
             )
         )
+        if relay is not None:
+            future_relay.published_seq_lens = new_seq_lens
     elif fused_commit_outputs:
         new_seq_lens, bonus_tokens = prepare_verify_commit_outputs(
             predict, accept_index, accept_lens, batch.seq_lens

@@ -423,6 +423,67 @@ def test_dynamic_batch_reuses_kernel(operation, monkeypatch):
         assert len(cache) == 1, (operation, bs, token_count, len(cache))
 
 
+@pytest.mark.parametrize("bs", [0, 1, 7, 128])
+@pytest.mark.parametrize("width", [1, 4])
+def test_commit_scatters_relay_lengths(bs, width):
+    """The commit launch's relay scatter equals FutureMap.publish's index_put."""
+    g = torch.Generator(device="cuda").manual_seed(bs * 10 + width)
+    seq = torch.randint(100, 9000, (bs,), generator=g, device="cuda")
+    accepted = torch.randint(1, width + 1, (bs,), generator=g, device="cuda").int()
+    predict = torch.arange(bs * width, device="cuda", dtype=torch.int32)
+    accept = torch.arange(bs * width, device="cuda", dtype=torch.int64).reshape(
+        bs, width
+    )
+    pool = 2 * bs + 1
+    rows = torch.randperm(pool, generator=g, device="cuda")[:bs]
+    start = torch.randint(0, 1 << 20, (pool,), generator=g, device="cuda")
+    relay = start.clone()
+    outputs = prepare_verify_commit_outputs(
+        predict, accept, accepted, seq, width, relay=(relay, rows)
+    )
+    expected = start.clone()
+    expected[rows] = outputs[0]
+    torch.testing.assert_close(relay, expected, rtol=0, atol=0)
+    plain = prepare_verify_commit_outputs(predict, accept, accepted, seq, width)
+    torch.testing.assert_close(outputs[0], plain[0], rtol=0, atol=0)
+    torch.testing.assert_close(outputs[1], plain[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_chain_tree_extend_layout(bs, depth, mrope):
+    """The draft extend layout build_chain_tree writes equals
+    prepare_draft_extend_layout's over the same window."""
+    from sglang.kernels.ops.speculative.eagle import (
+        build_chain_tree,
+        prepare_draft_extend_layout,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(bs + depth)
+    width = depth + 1
+    bonus = torch.randint(0, 1000, (bs,), generator=g, device="cuda")
+    drafts = torch.randint(0, 1000, (bs, depth), generator=g, device="cuda")
+    seq = torch.randint(100, 9000, (bs,), generator=g, device="cuda")
+    outputs = build_chain_tree(
+        bonus, drafts, seq, None, with_mrope=mrope, with_extend_layout=True
+    )
+    prefix, extend, post, (positions, starts, rope) = outputs[-1]
+    want = prepare_draft_extend_layout(seq, width, mrope)
+    for actual, expected in zip(
+        (prefix, extend, post, positions, starts),
+        (want[0], want[1], want[2], want[3][0], want[3][1]),
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if mrope:
+        torch.testing.assert_close(rope, want[3][2], rtol=0, atol=0)
+    for actual, expected in zip(
+        outputs[:-1], build_chain_tree(bonus, drafts, seq, None, with_mrope=mrope)
+    ):
+        if expected is not None:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 

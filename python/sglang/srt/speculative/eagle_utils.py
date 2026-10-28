@@ -706,7 +706,11 @@ def eagle_sample(
         and next_token_logits.stride(-1) == 1
     )
     target_predict = None
+    # accept_lens written by the verify launch (and a simulated acceptance after it),
+    # else num_correct_drafts + 1 below
+    accept_lens = None
     if chain:
+        accept_lens = torch.empty((bs,), dtype=torch.int32, device=device)
         predict, accept_index, num_correct_drafts, target_predict, verify_out = (
             greedy_chain_verify(
                 next_token_logits,
@@ -714,6 +718,7 @@ def eagle_sample(
                 verify_input.retrieve_index,
                 verify_input.retrieve_next_token,
                 verify_input.max_tree_depth,
+                accept_lens=accept_lens,
             )
         )
     else:
@@ -760,6 +765,7 @@ def eagle_sample(
                     tp_group.broadcast(predict, src=0)
                     tp_group.broadcast(accept_index, src=0)
                     tp_group.broadcast(num_correct_drafts, src=0)
+            accept_lens = None
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
@@ -921,6 +927,7 @@ def eagle_sample(
                     bs, verify_input.draft_token_num
                 )
         if simulated_acc_len is not None:
+            accept_lens = None
             accept_index = generate_simulated_accept_index_device(
                 accept_index=accept_index,
                 predict=predict,  # mutable
@@ -944,12 +951,14 @@ def eagle_sample(
                 bs=bs,
                 spec_steps=verify_input.max_tree_depth - 1,
                 generator=simulated_acc_len_rng,
+                accept_lens=accept_lens,
             )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    accept_lens = num_correct_drafts + 1
+    if accept_lens is None:
+        accept_lens = num_correct_drafts + 1
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,

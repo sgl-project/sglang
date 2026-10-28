@@ -36,6 +36,9 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The draft extend's layout over the verify window, built with the verify tree
+    # (prepare_draft_extend_layout's outputs).
+    prepared_draft_extend_layout: Optional[tuple] = None
     # The iteration's plan when the draft planned the verify window
     # (`prepared_out_cache_loc`); verify and draft extend take it.
     iteration_ids: Optional[IterationIds] = None

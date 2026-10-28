@@ -9,6 +9,8 @@ vocabulary split of a row and folds its (value, lowest index) into the row's
 target tokens and walks every request's chain.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -30,6 +32,7 @@ def _greedy_chain_verify_kernel(
     predicts,
     accept_index,
     accept_token_num,
+    accept_lens,
     bs,
     n_programs,
     vocab_size: tl.constexpr,
@@ -38,6 +41,7 @@ def _greedy_chain_verify_kernel(
     BLOCK: tl.constexpr,
     ROWS_BLOCK: tl.constexpr,
     BS_BLOCK: tl.constexpr,
+    WITH_ACCEPT_LENS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
@@ -90,7 +94,11 @@ def _greedy_chain_verify_kernel(
                     )
             else:
                 walk = req
-                tl.store(accept_index + b * S, pos.to(accept_index.dtype.element_ty), mask=req)
+                tl.store(
+                    accept_index + b * S,
+                    pos.to(accept_index.dtype.element_ty),
+                    mask=req,
+                )
             k = tl.atomic_add(best + pos, 0, mask=walk, sem="relaxed")
             target = 0x7FFFFFFF - (k & 0x7FFFFFFF)
             tl.store(
@@ -98,7 +106,13 @@ def _greedy_chain_verify_kernel(
                 tl.where(on, target, 0).to(predicts.dtype.element_ty),
                 mask=walk,
             )
-        tl.store(accept_token_num + b, n.to(accept_token_num.dtype.element_ty), mask=req)
+        tl.store(
+            accept_token_num + b, n.to(accept_token_num.dtype.element_ty), mask=req
+        )
+        if WITH_ACCEPT_LENS:
+            tl.store(
+                accept_lens + b, (n + 1).to(accept_lens.dtype.element_ty), mask=req
+            )
         # every read above has returned; now read the keys out once more and reset
         tl.debug_barrier()
         r = tl.arange(0, ROWS_BLOCK)
@@ -136,6 +150,7 @@ def greedy_chain_verify(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     num_speculative_tokens: int,
+    accept_lens: Optional[torch.Tensor] = None,
 ):
     """Greedy verify of top-1 draft chains from f32 logits [bs * W, vocab], in one
     launch: (predicts int32 [bs * W], accept_index int32 [bs, S], accept_token_num
@@ -143,7 +158,8 @@ def greedy_chain_verify(
     buffer), as ``row_argmax`` (ties to the
     lowest index) then ``verify_tree_greedy`` on zeroed predicts and an accept
     index filled with -1 give them. ``retrieve_next_token`` holds each request's
-    chain (no siblings); NaN reads as -1e30."""
+    chain (no siblings); NaN reads as -1e30. accept_lens (optional, [bs]): also
+    written, accept_token_num + 1."""
     assert logits.dim() == 2 and logits.dtype == torch.float32
     assert logits.stride(1) == 1
     bs, W = candidates.shape
@@ -175,6 +191,7 @@ def greedy_chain_verify(
         predicts,
         accept_index,
         accept_token_num,
+        accept_token_num if accept_lens is None else accept_lens,
         bs,
         rows * splits,
         vocab_size=vocab,
@@ -183,6 +200,7 @@ def greedy_chain_verify(
         BLOCK=_BLOCK,
         ROWS_BLOCK=triton.next_power_of_2(rows),
         BS_BLOCK=triton.next_power_of_2(bs),
+        WITH_ACCEPT_LENS=accept_lens is not None,
         num_warps=8,
     )
     return predicts, accept_index, accept_token_num, target_predict, out
