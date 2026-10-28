@@ -11,6 +11,7 @@ import struct
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
+from operator import attrgetter
 
 import blake3
 import numpy as np
@@ -26,13 +27,21 @@ def _frame(tag: bytes, *parts: bytes) -> bytes:
     return tag + b"".join(len(part).to_bytes(8, "big") + part for part in parts)
 
 
+def dataclass_items(value):
+    """Read declared fields without deep-copying tensor storage, including slots."""
+    return (
+        (field.name, attrgetter(field.name)(value))
+        for field in dataclasses.fields(value)
+    )
+
+
 def _children(value):
     if isinstance(value, Mapping):
         return value.values()
     if isinstance(value, (list, tuple)):
         return value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return [value.__dict__[field.name] for field in dataclasses.fields(value)]
+        return (child for _, child in dataclass_items(value))
     return ()
 
 
@@ -125,12 +134,10 @@ def _encode(value, gpu_digests) -> bytes:
         )
         return _frame(b"dict", *(_frame(b"pair", key, child) for key, child in pairs))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = {
-            field.name: value.__dict__[field.name]
-            for field in dataclasses.fields(value)
-        }
         return _frame(
-            b"dataclass", str(type(value)).encode(), _encode(fields, gpu_digests)
+            b"dataclass",
+            str(type(value)).encode(),
+            _encode(dict(dataclass_items(value)), gpu_digests),
         )
     raise TypeError(f"Unsupported multimodal identity input: {type(value).__name__}")
 

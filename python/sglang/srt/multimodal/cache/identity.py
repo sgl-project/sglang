@@ -19,7 +19,7 @@ import transformers
 from PIL import Image
 
 from sglang.srt.environ import envs
-from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.cache.digest import dataclass_items, structured_digest
 from sglang.srt.runtime_context import get_mm, get_model
 
 CONTENT_HASH_PREFIX = "sha256:"
@@ -187,11 +187,9 @@ def media_preprocess_kwargs(
     defaults = defaults or {}
     if dataclasses.is_dataclass(source):
         values = {
-            field.name: value
-            for field, value in zip(
-                dataclasses.fields(source), dataclasses.astuple(source)
-            )
-            if field.name not in _MEDIA_ENVELOPE_FIELDS
+            name: value
+            for name, value in dataclass_items(source)
+            if name not in _MEDIA_ENVELOPE_FIELDS
         }
     elif isinstance(source, Mapping):
         values = {
@@ -228,10 +226,8 @@ def _canonicalize(value: Any) -> Any:
             "type": "dataclass",
             "class": _qualified_type_name(value),
             "fields": [
-                [field.name, _canonicalize(field_value)]
-                for field, field_value in zip(
-                    dataclasses.fields(value), dataclasses.astuple(value)
-                )
+                [name, _canonicalize(field_value)]
+                for name, field_value in dataclass_items(value)
             ],
         }
     if isinstance(value, Enum):

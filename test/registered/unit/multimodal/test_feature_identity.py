@@ -4,6 +4,7 @@ import itertools
 import pickle
 import unittest
 from array import array
+from dataclasses import dataclass
 from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
     _insert,
     _key,
@@ -30,6 +31,10 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.cache.identity import (
+    build_artifact_key,
+    media_preprocess_kwargs,
+)
 from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,6 +50,36 @@ def _item(value, **kwargs):
 
 
 class TestFeatureIdentity(CustomTestCase):
+    def test_dataclass_metadata_keeps_tensor_storage_and_nested_types(self):
+        @dataclass(slots=True)
+        class Settings:
+            crop: torch.Tensor
+            output_size: tuple[int, int]
+
+        value = Settings(torch.arange(8), (224, 224))
+        with patch.object(torch.Tensor, "__deepcopy__", side_effect=AssertionError):
+            digest = structured_digest(value)
+            kwargs = media_preprocess_kwargs(value)
+            self.assertIs(kwargs["crop"], value.crop)
+            artifact = build_artifact_key(
+                "sha256:" + "00" * 32,
+                modality="image",
+                processor_fingerprint="sha256:" + "11" * 32,
+                preprocess_kwargs={"settings": value},
+            )
+        self.assertEqual(digest, structured_digest(value))
+        value.output_size = (448, 224)
+        self.assertNotEqual(digest, structured_digest(value))
+        self.assertNotEqual(
+            artifact,
+            build_artifact_key(
+                "sha256:" + "00" * 32,
+                modality="image",
+                processor_fingerprint="sha256:" + "11" * 32,
+                preprocess_kwargs={"settings": value},
+            ),
+        )
+
     def test_request_namespace_prevents_partial_media_prefix_reuse(self):
         for backend, page_size, text_len, media_len in itertools.product(
             ("python", "rust"), (1, 16), (15, 16), (1, 32)

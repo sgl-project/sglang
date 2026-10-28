@@ -205,17 +205,12 @@ class GenerateReqInput:
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
     # request when each request has one image, or one list of hashes per request.
-    # When supplied, each MultimodalDataItem's
-    # `hash` is initialised from this list and `set_pad_value` skips the
-    # internal `hash_feature()` recompute, so the resulting `pad_value` is
-    # deterministic from the caller's hash. Intended for external KV routers
-    # that compute their own per-image hash for routing decisions and need
-    # sglang's prefix-cache key to align. When unset, behavior is unchanged
-    # (sglang hashes the processor feature tensor).
+    # Routing hints only: they supplement, never replace, the server-computed
+    # identity of actual content, shape, dtype, and processor configuration.
+    # Identical caller hashes cannot authorize sharing between different media.
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
-    # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
-    # mm_hashes, these identify processor inputs and never replace the
-    # processor-output feature hash used by the embedding/prefix cache.
+    # Optional `sha256:<64-hex>` identities verified against original media
+    # contents. They do not replace the embedding/prefix-cache identity.
     mm_content_hashes: Optional[
         Union[List[Optional[str]], List[List[Optional[str]]]]
     ] = None

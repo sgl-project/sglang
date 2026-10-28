@@ -361,7 +361,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
 
-    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
+    Each item has a full identity for embedding caching and batch deduplication.
+    KV caching additionally scopes the request by its ordered media identities.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -431,7 +432,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
 
         ``hash`` keeps a compatibility scalar, never the embedding-cache key.
-        The radix key uses the wide sentinel pattern.
+        The radix key also binds the full identity in the request namespace.
         """
         if len(identity) != _MM_IDENTITY_BYTES:
             raise ValueError(
