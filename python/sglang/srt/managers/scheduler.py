@@ -1550,12 +1550,15 @@ class Scheduler:
             # The request lists, chunked_req and the pending steps are left
             # untouched. On resume, the event loop commits the pending steps
             # and schedules from the lists through the standard code paths.
+            self.parts.step_counters.begin_pause(time.monotonic())
             return
 
         # Under PP the ring commits its pending steps once their outputs come
         # back over the relay; there is nothing to commit here.
         if self.parts.pending and get_parallel().pp_size == 1:
             self.commit_pending_steps()
+        # A first retract starts the pause once the in-flight result has drained.
+        self.parts.step_counters.begin_pause(time.monotonic())
 
         self.hub.step_planner.retract_for_pause()
 
@@ -1590,6 +1593,7 @@ class Scheduler:
         if self.disagg_decode is not None:
             self.disagg_decode.prealloc_queue.enqueue_held_rebootstrap()
         self.parts.flags._engine_paused = False
+        self.parts.step_counters.end_pause(time.monotonic())
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput

@@ -1,6 +1,5 @@
 import unittest
 from array import array
-from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
@@ -43,6 +42,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingSteps,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -163,6 +163,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.parts.metrics_sink = MagicMock()
         scheduler.parts.metrics_sink.current_scheduler_metrics_enabled = False
         scheduler.parts.kv_events_publisher = MagicMock()
+        scheduler.parts.step_counters = StepCounters()
         return scheduler
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
@@ -309,13 +310,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hub.step_planner.get_decode_step(scheduler.flat_slot)
 
     def drain_with_pause_start_seen(self, scheduler, mode, now):
-        # Records the pause start that busy accounting sees while the held result drains.
+        # Records the pause start that busy accounting sees while the pending step commits.
         seen = []
-        scheduler.enable_overlap = True
-        scheduler.last_batch = MagicMock()
-        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
-        scheduler.process_batch_result = lambda batch, result: seen.append(
-            scheduler._pause_started_at
+        step_counters = scheduler.parts.step_counters
+        scheduler.parts.pending.push(MagicMock())
+        scheduler.commit_step = lambda record: seen.append(
+            step_counters._pause_started_at
         )
         with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=now):
             scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
@@ -326,7 +326,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(
             self.drain_with_pause_start_seen(scheduler, "retract", 3.5), [None]
         )
-        self.assertEqual(scheduler._pause_started_at, 3.5)
+        self.assertEqual(scheduler.parts.step_counters._pause_started_at, 3.5)
 
     def test_retract_after_in_place_keeps_the_first_pause_start(self):
         scheduler = self._new_scheduler()
@@ -335,7 +335,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(
             self.drain_with_pause_start_seen(scheduler, "retract", 10.125), [0.125]
         )
-        self.assertEqual(scheduler._pause_started_at, 0.125)
+        self.assertEqual(scheduler.parts.step_counters._pause_started_at, 0.125)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
