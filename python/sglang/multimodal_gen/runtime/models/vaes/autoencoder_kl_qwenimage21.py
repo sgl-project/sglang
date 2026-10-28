@@ -662,7 +662,7 @@ class AutoencoderKLQwenImage21(ParallelTiledVAE):
             enable_qwen21_spatial_decode(self.decoder)
 
         # These prerequisites are fixed by the encoder/decoder constructors.
-        context_tiles_supported = (
+        self._context_tiles_supported = (
             (
                 not torch.distributed.is_initialized()
                 or torch.distributed.get_world_size() == 1
@@ -671,21 +671,12 @@ class AutoencoderKLQwenImage21(ParallelTiledVAE):
             and ac.patch_size in (None, 1)
             and self.spatial_compression_ratio == 2 ** (len(ac.dim_mult) - 1)
         )
-        self._context_encode_supported = config.load_encoder and context_tiles_supported
-        self._context_decode_supported = (
-            config.load_decoder
-            and context_tiles_supported
-            and not self.spatial_parallel
-        )
         self._context_stochastic_dropout = 0 < ac.dropout < 1
 
     def _supports_context_tiles(self, x, *, encode):
-        supported = (
-            self._context_encode_supported if encode else self._context_decode_supported
-        )
         branch = self.encoder if encode else self.decoder
         return (
-            supported
+            self._context_tiles_supported
             and not (branch.training and self._context_stochastic_dropout)
             and x.shape[2] == 1
             and all(n > 0 for n in x.shape[-2:])
