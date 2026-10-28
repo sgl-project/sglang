@@ -837,6 +837,7 @@ class TboForwardBatchPreparer:
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,
+                num_mixed_decode_reqs=None,
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
