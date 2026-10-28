@@ -49,7 +49,7 @@ class ExternalLinker(UnifiedCacheLinker):
     def noop(self, *args):
         pass
 
-    lookup = prefetch = load = start_layer_wise_loading = cancel_queued_load = noop
+    lookup = load = start_layer_wise_loading = cancel_queued_load = noop
     finish_layer_wise_loading = offload = noop
     num_completed_offloads = pop_completed_offload = reset = close = noop
 
@@ -235,10 +235,12 @@ class TestExternalLinkerFactory(unittest.TestCase):
             )
 
     def test_passes_forward_stream_to_plugin(self):
+        """Legacy layer-wise plugins remain usable without a prefetch override."""
         stream = object()
         linker = self._create(forward_stream=stream)
         self.assertIs(linker.forward_stream, stream)
         self.assertEqual(linker.load_mode, "layer_wise")
+        self.assertIsNone(linker.prefetch([]))
 
     def test_loads_unregistered_module_and_copies_extra_config(self):
         linker = self._create(load_mode="prefetch", prefetch_policy="wait_complete")

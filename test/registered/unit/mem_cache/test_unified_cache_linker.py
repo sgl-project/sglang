@@ -688,7 +688,13 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         cache, backend, req, allocator = self._fixture()
         cache.linker.load_mode = backend.load_mode = "layer_wise"
         req.init_next_round_input(cache)
+        lookup_count = backend.lookup.call_count
+        available = allocator.available_size()
         self._enqueue(cache, req)
+        assert backend.lookup.call_count == lookup_count
+        assert allocator.available_size() == available
+        assert not cache.linker.prefetches
+        assert cache.check_prefetch_progress(req.cache_request_handle)
         assert req.host_hit_length == 6
         assert not backend.queued_loads
         assert cache.linker.load_back(req)[0] == 6

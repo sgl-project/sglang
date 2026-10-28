@@ -172,9 +172,9 @@ class UnifiedCacheLinker(ABC):
             events.append(kv_written)
         return events
 
-    @abstractmethod
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
+        return None
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -381,6 +381,8 @@ class UnifiedCacheLinkerWrapper:
 
     def prefetch(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
+        if self.load_mode != "prefetch":
+            return
         request = req.cache_request_handle
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
