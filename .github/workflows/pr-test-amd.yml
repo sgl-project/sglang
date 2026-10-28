@@ -633,7 +633,9 @@ jobs:
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         runner: [linux-mi35x-gpu-1]
-        part: [0, 1]
+        part: [0]
+    # One job: the MI35x 1-GPU pool is the scarcest AMD runner pool, and
+    # each job sent there waited a median ~8 h. ~26 min of tests.
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -653,9 +655,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
