@@ -665,7 +665,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         allocator.lazy_compaction = True
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.lazy_compaction = True
-            sub_pool.disagg_move_gate = lambda: False
+            sub_pool.pin_sources = (lambda: True,)
         live = allocator.alloc(16)
         self.assertIsNotNone(live)
         allocator.free(live[4:8])
@@ -676,7 +676,7 @@ class TestWindowChainAllocator(unittest.TestCase):
                 allocator.full_attn_allocator,
                 allocator.swa_attn_allocator,
             ):
-                sub_pool.disagg_move_gate = lambda: compacted
+                sub_pool.pin_sources = (lambda: not compacted,)
             for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
                 max_full = min(12, full_evictable) // page_size
                 max_swa = min(8, swa_evictable) // page_size
@@ -3072,7 +3072,7 @@ class TestFloatMultiEndedAllocator(CustomTestCase):
         self.assertGreater(moved, 0)
         self._check_float_state(fla, kv)
 
-    def test_on_demand_movers_honor_move_gate(self):
+    def test_on_demand_movers_honor_pins(self):
         """`make_room` / `compact_holes` relocate live pages just as `_flush`
         does, so a closed move gate must stop them too: the shortfall ladder
         reaches `make_room` while a host transfer or RDMA still addresses the
@@ -3096,14 +3096,14 @@ class TestFloatMultiEndedAllocator(CustomTestCase):
                 len(fla._inverse_history),
             )
 
-        fla.host_transfer_move_gate = lambda: False
+        fla.pin_sources = (lambda: True,)
         before = snapshot()
         self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
         self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
         self.assertEqual(snapshot(), before)
         self._check_float_state(fla, kv)
 
-        fla.host_transfer_move_gate = lambda: True
+        fla.pin_sources = ()
         self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
         self._check_float_state(fla, kv)
 

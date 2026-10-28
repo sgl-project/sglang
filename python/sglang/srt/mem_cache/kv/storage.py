@@ -9,9 +9,10 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -95,6 +96,11 @@ class KVStorage:
         """Every sub-pool, owner first."""
         return self._sub_pools
 
+    def sub_pool_names(self) -> Tuple[str, ...]:
+        """Every sub-pool's name, owner first: what a transfer that reaches
+        every sub-pool pins."""
+        return tuple(s.name for s in self._sub_pools)
+
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
 
@@ -135,6 +141,29 @@ class KVStorage:
             return self._allocator.swa_available_size()
         assert sub_pool == self._allocator.roles.state, sub_pool
         return self._allocator.state_slots.schedulable_available_size()
+
+    def host_ids(
+        self, sub_pool: str
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """How a host transfer turns the controller's ids for the sub-pool into
+        the rows its view indexes, or None when they index it as they are (a
+        window's host loads bind physical pages). Called on the transfer
+        stream; pins keep the rows in place until the copy is acknowledged."""
+        roles = self._allocator.roles
+        if sub_pool == roles.owner:
+            return self._allocator.full_attn_allocator.translate_kv_loc
+        if sub_pool == roles.state:
+            return self._allocator.state.slots.translate
+        return None
+
+    def add_pin_source(
+        self, sub_pools: Sequence[str], busy: Callable[[], bool]
+    ) -> None:
+        """Keep the named sub-pools' device rows where they are whenever
+        ``busy()`` holds: a DMA engine (a PD transfer, a HiCache copy) reads
+        or writes the addresses it was handed. Register each initiator once,
+        over the queues that live across iterations; tree locks are not pins."""
+        self._allocator.add_pin_source(sub_pools, busy)
 
     def host_load_alloc(
         self, sub_pool: str

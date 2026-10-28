@@ -266,6 +266,38 @@ class TestHostStack(CustomTestCase):
         self.assertGreater(params.swa_num_tokens, 0)
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
+    def test_host_transfers_translate_through_the_storage(self):
+        """A host copy maps the controller's ids to rows through the storage's
+        id spaces, carried on its entry: the owner's and the state's ids are
+        virtual, a window's host loads bind physical pages. The views hold no
+        allocator callable."""
+        for name in ("swa", "mamba", "tri"):
+            with self.subTest(chain=name):
+                result, _, cache = self._build(name, backend=None)
+                allocator = cache.token_to_kv_pool_allocator
+                storage = allocator.storage
+                expected = {
+                    storage.owner: allocator.full_attn_allocator.translate_kv_loc,
+                    "swa": None,
+                    "mamba": None
+                    if allocator.state is None
+                    else allocator.state.slots.translate,
+                }
+                by_view = {
+                    id(storage.view(s.name)): s.name for s in storage.sub_pools()
+                }
+                seen = set()
+                for entry in result.host_pool_group.entry_map.values():
+                    sub_pool = by_view[id(entry.device_pool)]
+                    seen.add(sub_pool)
+                    self.assertEqual(entry.device_translate, expected[sub_pool])
+                    self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
+                self.assertEqual(seen, set(storage.sub_pool_names()))
+                for sub_pool in storage.sub_pool_names():
+                    self.assertNotIn(
+                        "host_transfer_translate", vars(storage.view(sub_pool))
+                    )
+
     def test_owner_host_pool_is_named_by_its_sub_pool(self):
         result, _, _ = self._build("swa", backend="file")
         self.assertEqual(

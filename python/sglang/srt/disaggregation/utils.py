@@ -162,10 +162,10 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
-def unified_memory_disagg_move_gate(scheduler):
-    """Compaction move gate for a PD node running the unified memory pool.
+def disagg_transfers_in_flight(scheduler):
+    """A PD node's pin source over the unified memory pool.
 
-    Returns a predicate that is True only when no transfer can be in flight, so
+    Returns a predicate that is True while a transfer may be in flight, so
     compaction never relocates a page the RDMA engine is reading or writing.
     Safe to read this state from here: every mover runs on the scheduler thread.
 
@@ -180,21 +180,17 @@ def unified_memory_disagg_move_gate(scheduler):
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
     """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
 
-        def prefill_gate() -> bool:
-            return not (
+    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
+    def busy() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            return bool(
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
             )
-
-        return prefill_gate
-
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-
-        def decode_gate() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
-            return not (
+            return bool(
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
@@ -202,13 +198,12 @@ def unified_memory_disagg_move_gate(scheduler):
                     and decode_offload_manager.has_inflight_device_transfer()
                 )
             )
+        raise ValueError(
+            "disagg_transfers_in_flight: scheduler is not a PD node "
+            f"(mode={scheduler.disaggregation_mode})"
+        )
 
-        return decode_gate
-
-    raise ValueError(
-        "unified_memory_disagg_move_gate: scheduler is not a PD node "
-        f"(mode={scheduler.disaggregation_mode})"
-    )
+    return busy
 
 
 #########################

@@ -15,7 +15,11 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
+from sglang.test.unified_allocator_fixtures import (
+    chain_snapshot,
+    pin_every_band,
+    token_ends,
+)
 
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
@@ -32,9 +36,10 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(dcp_size=dcp_size),
-            SimpleNamespace(host_transfer_translate=translate),
+            SimpleNamespace(),
             logical.clone(),
             logical,
+            device_translate=translate,
         )
         resolved = L2TransferEngine._resolve_device_indices(transfer)
         for rank in range(dcp_size):
@@ -60,7 +65,7 @@ class TestHostGateCapacity(unittest.TestCase):
         allocator.free_swa(ids[2:6])
         full = allocator.full_attn_allocator
         state = {"open": True}
-        allocator.set_host_transfer_move_gate(lambda: state["open"])
+        pin_every_band(allocator, lambda: not state["open"])
         epoch = full._chain_capacity_epoch()
         before = full.schedulable_available_size()
         state["open"] = False
@@ -164,10 +169,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
             ),
         )
         transfer = L2Transfer(
-            host,
-            SimpleNamespace(host_transfer_translate=translate),
-            torch.arange(3),
-            ids,
+            host, SimpleNamespace(), torch.arange(3), ids, device_translate=translate
         )
         completion = engine.submit_host_to_device(
             [transfer], transfer_layer_id_max=1, start_event=start
@@ -217,9 +219,10 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(),
-            SimpleNamespace(device="cuda", host_transfer_translate=translate),
+            SimpleNamespace(device="cuda"),
             torch.tensor([0, 1]),
             torch.tensor([2, 1]),
+            device_translate=translate,
         )
         result = L2TransferEngine._resolve_device_indices(transfer)
         self.assertEqual(result.device.type, "cpu")

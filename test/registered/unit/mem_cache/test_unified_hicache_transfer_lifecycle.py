@@ -59,6 +59,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
+    pin_every_band,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -423,10 +424,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)
         controller = cache.cache_controller
-        # The scheduler's gate: rows stay put until host copies are acknowledged.
-        self.allocator.set_host_transfer_move_gate(
-            lambda: not controller.has_inflight_device_transfers()
-        )
+        # The scheduler's pin source: rows stay put until host copies are
+        # acknowledged.
+        pin_every_band(self.allocator, controller.has_inflight_device_transfers)
         self.cache = cache
         self.controller = controller
         # Compaction and frees wait through this stand-in stream.

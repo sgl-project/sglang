@@ -98,9 +98,9 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
-    unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
@@ -628,8 +628,10 @@ class Scheduler(
                 if self.enable_unified_memory:
                     # Keep device rows stable until host transfers are acknowledged.
                     # Queue reads and relocation both run on the scheduler thread.
-                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
-                        lambda c=cache_controller: not c.has_inflight_device_transfers()
+                    storage = self.token_to_kv_pool_allocator.storage
+                    storage.add_pin_source(
+                        storage.sub_pool_names(),
+                        cache_controller.has_inflight_device_transfers,
                     )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
@@ -690,6 +692,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_disaggregation_pin_source()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1644,14 +1647,6 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
-        if (
-            self.enable_unified_memory
-            and self.disaggregation_mode != DisaggregationMode.NULL
-        ):
-            self.token_to_kv_pool_allocator.set_disagg_move_gate(
-                unified_memory_disagg_move_gate(self)
-            )
-
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
             "zmq_to_scheduler",
@@ -1662,6 +1657,17 @@ class Scheduler(
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
+            )
+
+    def maybe_init_disaggregation_pin_source(self):
+        # A role switch rebuilds PD queues, but the allocator keeps its pins.
+        if (
+            self.enable_unified_memory
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            storage = self.token_to_kv_pool_allocator.storage
+            storage.add_pin_source(
+                storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
 
     def init_overlap(self):
