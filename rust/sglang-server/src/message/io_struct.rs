@@ -99,6 +99,7 @@ control_messages! {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     }
 
     /// Clear the HiCache storage backend.
@@ -225,6 +226,7 @@ impl CheckWeightsReqInput {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     ) -> Self {
         Self {
             rid,
@@ -232,6 +234,7 @@ impl CheckWeightsReqInput {
             allow_quant_error,
             skip_tensor_list,
             selector,
+            names,
         }
     }
 }
@@ -295,6 +298,7 @@ mod tests {
             true,
             Some(vec!["lm_head".into()]),
             "target".into(),
+            Some(vec!["model.weight".into()]),
         )
         .encode()
         .unwrap();
@@ -302,9 +306,9 @@ mod tests {
         let arr = val.as_array().expect("array");
         assert_eq!(
             arr.len(),
-            7,
+            8,
             "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
-             allow_quant_error, skip_tensor_list, selector]"
+             allow_quant_error, skip_tensor_list, selector, names]"
         );
         assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
         assert_eq!(arr[1].as_str(), Some("7"));
@@ -313,6 +317,7 @@ mod tests {
         assert_eq!(arr[4].as_bool(), Some(true));
         assert_eq!(arr[5][0].as_str(), Some("lm_head"));
         assert_eq!(arr[6].as_str(), Some("target"));
+        assert_eq!(arr[7][0].as_str(), Some("model.weight"));
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /

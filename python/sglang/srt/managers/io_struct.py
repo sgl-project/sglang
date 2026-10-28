@@ -2218,6 +2218,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     skip_tensor_list: Optional[List[str]] = None
     # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
+    names: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in

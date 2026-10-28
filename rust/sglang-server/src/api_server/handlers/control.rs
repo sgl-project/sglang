@@ -38,6 +38,7 @@ impl CoreHandle {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     ) -> Result<CheckWeightsOutcome, CoreError> {
         let outcomes = self
             .control(&|| {
@@ -47,6 +48,7 @@ impl CoreHandle {
                     allow_quant_error,
                     skip_tensor_list.clone(),
                     selector.clone(),
+                    names.clone(),
                 ))
             })
             .await

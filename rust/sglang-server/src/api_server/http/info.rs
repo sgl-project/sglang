@@ -188,6 +188,7 @@ struct CheckWeightsBody {
     allow_quant_error: bool,
     skip_tensor_list: Option<Vec<String>>,
     selector: CheckWeightsSelector,
+    names: Option<Vec<String>>,
 }
 
 impl Default for CheckWeightsBody {
@@ -197,6 +198,7 @@ impl Default for CheckWeightsBody {
             allow_quant_error: false,
             skip_tensor_list: None,
             selector: CheckWeightsSelector::All,
+            names: None,
         }
     }
 }
@@ -244,6 +246,7 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
             body.allow_quant_error,
             body.skip_tensor_list,
             body.selector.as_str().to_owned(),
+            body.names,
         )
         .await
     {
@@ -755,8 +758,15 @@ mod tests {
             (
                 "POST",
                 r#"{"action": "fingerprint", "allow_quant_error": true,
-                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x"}"#,
-                ("fingerprint", true, Some("lm_head"), "target"),
+                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x",
+                    "names": ["model.weight"]}"#,
+                (
+                    "fingerprint",
+                    true,
+                    Some("lm_head"),
+                    "target",
+                    Some("model.weight"),
+                ),
                 (true, "Success.", ranks.clone()),
                 StatusCode::OK,
                 serde_json::json!({
@@ -770,7 +780,7 @@ mod tests {
             (
                 "GET",
                 "",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (false, "rank 1 failed", rmpv::Value::Nil),
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"success": false, "message": "rank 1 failed"}),
@@ -778,7 +788,7 @@ mod tests {
             (
                 "POST",
                 "null",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (true, "Success.", rmpv::Value::Array(vec![])),
                 StatusCode::OK,
                 serde_json::json!({
@@ -818,6 +828,8 @@ mod tests {
             assert_eq!(header[4].as_bool(), Some(request.1), "{body}");
             assert_eq!(header[5][0].as_str(), request.2, "{body}");
             assert_eq!(header[6].as_str(), Some(request.3), "{body}");
+            assert_eq!(header.as_array().unwrap().len(), 8);
+            assert_eq!(header[7][0].as_str(), request.4, "{body}");
 
             let mut payload = Vec::new();
             rmpv::encode::write_value(

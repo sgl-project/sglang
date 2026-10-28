@@ -2279,6 +2279,7 @@ class ModelRunner:
         action: str,
         allow_quant_error: bool = False,
         skip_tensor_list: Optional[List[str]] = None,
+        names: Optional[List[str]] = None,
         *,
         role: str,
     ):
@@ -2287,6 +2288,7 @@ class ModelRunner:
             allow_quant_error=allow_quant_error,
             skip_tensor_list=skip_tensor_list,
             role=role,
+            names=names,
         )
 
     def _expand_eplb_metadata_for_scale(
