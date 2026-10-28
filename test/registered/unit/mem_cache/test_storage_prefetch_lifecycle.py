@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+from sglang.srt.managers.schedule_batch import ReqKvInfo, split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -125,7 +125,7 @@ def _staged_fixture(full_match=2):
         cache_request_handle=_REQ,
         prefix_len=2,
         last_node=1,
-        kv=SimpleNamespace(cache_protected_len=2),
+        kv=ReqKvInfo(cache_protected_len=2),
         extra_key=None,
         cache_salt=None,
         host_hit_length=0,

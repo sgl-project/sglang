@@ -1034,6 +1034,80 @@ class ReqKvInfo:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
 
+    def allocate_extend(self, seq_len: int) -> None:
+        """An extend holds [0, seq_len) of the row, all of it committed."""
+        self.kv_allocated_len = seq_len
+        self.kv_committed_len = seq_len
+
+    def allocate_decode(self, num_tokens: int) -> None:
+        """A decode step holds num_tokens more slots and commits them at
+        allocation, before the step runs."""
+        self.kv_allocated_len += num_tokens
+        self.kv_committed_len += num_tokens
+
+    def allocate_spec_decode(self, end: int) -> None:
+        """A speculative step holds at least [0, end) and commits nothing; a
+        reservation an earlier step left past end stays."""
+        self.kv_allocated_len = max(self.kv_allocated_len, end)
+
+    def allocate_prealloc(self, fill_len: int) -> None:
+        """PD decode: the preallocated row holds [0, fill_len)."""
+        self.kv_allocated_len = fill_len
+
+    def commit_prealloc(self, fill_len: int) -> None:
+        """PD decode: [0, fill_len) counts as committed, since the prefill
+        node computes it and the transfer writes its KV."""
+        self.kv_committed_len = fill_len
+
+    def commit_decode(self, num_tokens: int) -> None:
+        """num_tokens more decode tokens (a verify's accepted run) are committed."""
+        self.kv_committed_len += num_tokens
+
+    def commit_finished(self, end: int) -> None:
+        """A finished turn kept by a streaming session commits up to end,
+        capped at what the row holds."""
+        self.kv_committed_len = min(end, self.kv_allocated_len)
+
+    def truncate_committed(self, end: int) -> None:
+        """Committed drops to end if it is past it; nothing else changes."""
+        self.kv_committed_len = min(self.kv_committed_len, end)
+
+    def truncate(self, end: int) -> None:
+        """The row keeps at most [0, end): every length past end drops to it."""
+        self.kv_allocated_len = min(self.kv_allocated_len, end)
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def free_tail(self, end: int) -> None:
+        """The tail past end was freed: allocated becomes end exactly, and the
+        committed and evicted lengths past end drop to it."""
+        self.kv_allocated_len = end
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def rewind(self, end: int) -> None:
+        """The row goes back to [0, end), all of it committed."""
+        self.kv_committed_len = end
+        self.kv_allocated_len = end
+
+    def protect_prefix(self, length: int) -> None:
+        """The tree owns [0, length) of the row; the request frees only past it."""
+        self.cache_protected_len = length
+
+    def record_insert(self, length: int) -> None:
+        """The request inserted [0, length) into the tree; a shorter insert
+        than an earlier one leaves the record as it is."""
+        self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+    def clear_tree_prefix(self) -> None:
+        """The tree owns none of the row and the request inserted none of it."""
+        self.cache_protected_len = 0
+        self.cache_inserted_len = 0
+
+    def shield_swa_prefill(self, extend_end: int) -> None:
+        """Prefill-aware SWA: the window never evicts [0, extend_end)."""
+        self.swa_evict_floor = extend_end
+
 
 class Req(ReqDllmMixin):
     """The input and output status of a request."""

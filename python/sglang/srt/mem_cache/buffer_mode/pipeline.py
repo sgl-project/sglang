@@ -1523,7 +1523,7 @@ class BufferModePipeline:
     ) -> None:
         req.prefix_len = matched_len
         req.last_node = node_id
-        req.kv.cache_protected_len = matched_len
+        req.kv.protect_prefix(matched_len)
 
     def _build_staged_prefetch_plan(
         self, f: _StagedPrefetch, key: RadixKey, matched_len: int

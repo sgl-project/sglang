@@ -481,8 +481,7 @@ def alloc_for_extend(
         )
 
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-        req.kv.kv_allocated_len = seq_len
-        req.kv.kv_committed_len = seq_len
+        req.kv.allocate_extend(seq_len)
         batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
@@ -682,8 +681,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         raise
 
     for req in batch.reqs:
-        req.kv.kv_allocated_len += token_per_req
-        req.kv.kv_committed_len += token_per_req
+        req.kv.allocate_decode(token_per_req)
 
     return out_cache_loc
 
@@ -845,4 +843,4 @@ def alloc_for_spec_decode(
 
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)
+        req.kv.allocate_spec_decode(nxt_kv_len)
