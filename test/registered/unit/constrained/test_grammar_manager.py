@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    REQUEST_REASONING_IN_GRAMMAR_KEY,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -424,6 +425,28 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         for token_id in (8, 9):
             req.grammar.accept_token(token_id)
         self.assertTrue(req.grammar._is_generation())
+
+    def test_cache_hit_applies_only_a_request_reasoning_in_grammar(self):
+        for value, expected in ((True, True), ("true", False)):
+            with self.subTest(value=value):
+                mgr = self._make_mgr()
+                grammar_obj = ReasonerGrammarObject(
+                    grammar=MagicMock(), think_end_ids=[7]
+                )
+                grammar_obj.maybe_init_reasoning(True)
+                mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                    grammar_obj,
+                    True,
+                )
+
+                req = _make_req(
+                    structural_tag="tag",
+                    custom_params={REQUEST_REASONING_IN_GRAMMAR_KEY: value},
+                )
+                req.require_reasoning = True
+                mgr.process_req_with_grammar(req)
+
+                self.assertIs(req.grammar.reasoning_in_grammar, expected)
 
     def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
         mgr = self._make_mgr()

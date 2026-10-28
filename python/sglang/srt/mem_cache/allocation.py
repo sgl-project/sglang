@@ -355,7 +355,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu or _is_npu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -668,6 +668,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     if _is_npu:
         maybe_write_dsv4_decode(
             batch,
+            batch.req_pool_indices_cpu,
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )

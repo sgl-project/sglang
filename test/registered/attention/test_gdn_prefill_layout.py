@@ -15,10 +15,11 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=6, stage="stage-b", runner_config="1-gpu-large-amd")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=13, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -28,6 +29,7 @@ class TestGdnPrefillLayout(unittest.TestCase):
     NUM_V_HEADS = 4
     HEAD_DIM = 128
 
+    @unittest.skipIf(not is_cuda(), "conv_block_table is CUDA-only")
     def test_compact_prefill_conv_matches_rectangular_output_and_cache(self):
         torch.manual_seed(0)
         for seq_lens in ([65, 1, 0, 1, 1, 1, 1, 1], [8065] + [1] * 127):

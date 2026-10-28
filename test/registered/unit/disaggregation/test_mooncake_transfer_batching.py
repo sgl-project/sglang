@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
@@ -16,7 +17,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
@@ -411,17 +412,20 @@ class TestDcpPackLifetime(CustomTestCase):
         self.assertEqual(observed, [11])
 
 
-class TestMooncakeEarlySend(unittest.TestCase):
+class TestMooncakeEarlySend(CustomTestCase):
     def test_sender_queues_event_once_without_waiting_on_scheduler(self):
         for last in (False, True):
             with self.subTest(last=last):
                 ready = MagicMock()
                 manager = MagicMock()
-                sender = SimpleNamespace(
+                sender = object.__new__(MooncakeKVSender)
+                vars(sender).update(
                     kv_mgr=manager,
                     bootstrap_room=1,
                     aux_index=0,
                     trace_ctx=MagicMock(),
+                    conclude_state=None,
+                    _transfer_start_time=None,
                     _early_send_wait_event=ready,
                     _prepare_send_indices=lambda ids, state: (
                         ids,
@@ -431,15 +435,17 @@ class TestMooncakeEarlySend(unittest.TestCase):
                     ),
                     _record_transfer_indices=MagicMock(),
                 )
-                MooncakeKVSender.send(sender, [0])
-                self.assertIs(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"], ready
-                )
+                indices_ready = MagicMock()
+                sender.send([0], indices_event=indices_ready)
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIs(kwargs["wait_event"], ready)
+                self.assertIs(kwargs["indices_event"], indices_ready)
                 ready.synchronize.assert_not_called()
-                MooncakeKVSender.send(sender, [1])
-                self.assertIsNone(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"]
-                )
+                indices_ready.synchronize.assert_not_called()
+                sender.send([1])
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIsNone(kwargs["wait_event"])
+                self.assertIsNone(kwargs["indices_event"])
 
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
@@ -451,11 +457,21 @@ class TestMooncakeEarlySend(unittest.TestCase):
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
         )
+        indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
-            manager, 1, [0], slice(0, 1), False, wait_event=ready
+            manager,
+            1,
+            [0],
+            slice(0, 1),
+            False,
+            wait_event=ready,
+            indices_event=indices_ready,
         )
-        self.assertIs(queue.get_nowait().wait_event, ready)
+        chunk = queue.get_nowait()
+        self.assertIs(chunk.wait_event, ready)
+        self.assertIs(chunk.indices_event, indices_ready)
         ready.synchronize.assert_not_called()
+        indices_ready.synchronize.assert_not_called()
 
     def _worker(self, event):
         chunk = TransferKVChunk(
@@ -513,6 +529,28 @@ class TestMooncakeEarlySend(unittest.TestCase):
         manager.send_kvcache.side_effect = transfer
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+
+    def test_worker_sends_indices_after_copy_completes(self):
+        manager, queue = self._worker(None)
+        chunk = queue.get_nowait()
+        host_indices = torch.full((1,), -1, dtype=torch.int32)
+        chunk.prefill_kv_indices = host_indices
+        chunk.indices_event = MagicMock()
+        chunk.indices_event.synchronize.side_effect = lambda: host_indices.fill_(7)
+        queue.get_nowait()  # Replace the stop sentinel after the updated chunk.
+        queue.put(chunk)
+        queue.put(None)
+        sent_indices = []
+
+        def transfer(session, indices, *args, **kwargs):
+            self.assertIsInstance(indices, np.ndarray)
+            sent_indices.extend(indices.tolist())
+            return 0
+
+        manager.send_kvcache.side_effect = transfer
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+
+        self.assertEqual(sent_indices, [7])
 
     def test_abort_during_wait_prevents_transfer_and_releases_ack(self):
         ready = MagicMock()
