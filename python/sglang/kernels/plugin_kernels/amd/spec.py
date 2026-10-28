@@ -52,6 +52,11 @@ class StepMetadata(enum.Enum):
         "the decode graph's attention variant (DSA dense or sparse), chosen on the "
         "host from the batch's longest request"
     )
+    DSA_REPLAY_PLAN = (
+        "the DSA backend's per-replay lengths, indexer schedule and kpool write plan"
+    )
+    # skipped only together with DSA_REPLAY_PLAN
+    DSA_REPLAY_PAGE_TABLE = "the DSA backend's per-replay page table"
 
 
 class DeviceLimits(msgspec.Struct, frozen=True):
@@ -60,6 +65,9 @@ class DeviceLimits(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # step rows, ascending
     tp_sizes: tuple[int, ...]
     resident_blocks: int  # the launch grid: one workgroup a CU
+    # tp_size -> the most rows a step is routed with at that TP size, when below
+    # widths; wider steps run the model's forward
+    max_rows: Mapping[int, int] = {}
 
 
 class Requirements(msgspec.Struct, frozen=True):
@@ -111,7 +119,7 @@ class Numerics(msgspec.Struct, frozen=True):
 class ShapeKey(msgspec.Struct, frozen=True):
     """The graph key a step is routed by; every rank holds it alike."""
 
-    forward_mode: str  # "decode" or "target_verify"
+    forward_mode: str  # "decode", "target_verify" or "draft_extend"
     batch_size: int  # requests, padded to the graph's batch size
     tokens_per_request: int
 
@@ -125,6 +133,7 @@ class BuildContext(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # the rows the capture plan routes
     deadline_s: float  # every wait's deadline, below --watchdog-timeout
     copies: dict  # (kind, ...) -> tensor: the load hook's copies; build adds its own
+    served: frozenset[ShapeKey] = frozenset()  # the steps routed to the forward
 
 
 class Plan(msgspec.Struct, frozen=True):
@@ -167,8 +176,13 @@ class MonoSpec(msgspec.Struct, frozen=True):
     ] = None
     # (model) -> tokens per request when different from the target, e.g. draft blocks
     tokens_per_request: Optional[Callable[[torch.nn.Module], int]] = None
-    # per-step metadata the forward never reads; backends skip it on routed steps
+    # per-step metadata the forward never reads; backends skip it on routed steps,
+    # so a served step must run the monokernels whenever it is graph-replayed
     unread_metadata: frozenset[StepMetadata] = frozenset()
+    # (model) -> the (forward_mode, tokens_per_request) steps a draft spec serves in
+    # place of the target's verify step, e.g. an EAGLE draft's draft decode
+    # ("decode", 1) and draft extend ("draft_extend", N)
+    step_modes: Optional[Callable[[torch.nn.Module], Sequence[tuple[str, int]]]] = None
 
     def widths(self, isa: str) -> tuple[int, ...]:
         return self.devices[isa].widths

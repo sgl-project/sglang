@@ -87,6 +87,26 @@ SPEC = MonoSpec(
 OLD_SPEC = replace(SPEC, api_version=registry.MONOKERNEL_API_VERSION - 1)
 # a DSpark draft at 2 draft tokens with anchor sampling: 1-token blocks
 ONE_TOKEN_DRAFT = replace(SPEC, tokens_per_request=lambda model: 1)
+# an EAGLE draft that serves its own draft decode and draft extend steps
+EAGLE_DRAFT = replace(
+    SPEC,
+    step_modes=lambda model: [("decode", 1), ("draft_extend", 4)],
+    unread_metadata=frozenset(
+        {StepMetadata.DSA_REPLAY_PLAN, StepMetadata.DSA_REPLAY_PAGE_TABLE}
+    ),
+)
+# one whose kernels cannot serve this draft
+IDLE_DRAFT = replace(SPEC, step_modes=lambda model: [])
+# one capped at 4 rows at TP4, whose wider steps run the model's forward
+CAPPED = replace(
+    SPEC,
+    devices={
+        "gfx950": DeviceLimits(
+            widths=WIDTHS, tp_sizes=(2, 4), resident_blocks=256, max_rows={4: 4}
+        )
+    },
+    unread_metadata=frozenset({StepMetadata.DSA_REPLAY_PLAN}),
+)
 
 
 def server_args(**kw):
@@ -111,7 +131,7 @@ def batch(mode, bs, rows):
     return SimpleNamespace(
         forward_mode=ForwardMode[mode.upper()],
         batch_size=bs,
-        input_ids=torch.zeros(rows, dtype=torch.int64),
+        input_ids=None if rows is None else torch.zeros(rows, dtype=torch.int64),
     )
 
 
@@ -142,6 +162,14 @@ def install(*, archs, lookups=None, is_load_observed=False):
 def runner(*, capture_bs):
     """A decode CUDA graph runner, as the capture tail hook sees it."""
     return SimpleNamespace(capture_bs=capture_bs)
+
+
+class DraftDecodeRunner(SimpleNamespace):
+    pass
+
+
+class DraftExtendRunner(SimpleNamespace):
+    pass
 
 
 class Lm(torch.nn.Module):
@@ -472,17 +500,186 @@ class TestMonokernelFramework(CustomTestCase):
             is_capturing.return_value = False  # a warmup run is not a capture
             check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
             is_capturing.return_value = True
-            with self.assertRaisesRegex(ValueError, "none of the 1 captured decode"):
+            with self.assertRaisesRegex(ValueError, "none of the 1 graphs"):
                 check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
         check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
         with capturing:
             for bs in (2, 4):  # the check waits for every captured size
                 check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
-        self.assertTrue(check.is_done)
+        self.assertEqual(check.done, {"SimpleNamespace"})
         # a step pads up to a captured graph that holds it: only a served key past
         # the largest graph of its mode runs eagerly
-        eager = binding._eager_keys(served=served, captured=check.captured.values())
+        captured = check.captured["SimpleNamespace"].values()
+        eager = binding._eager_keys(served=served, captured=captured)
         self.assertEqual([k.batch_size for k in eager], [8])
+
+    def test_each_graph_runner_of_a_draft_is_checked(self):
+        # a draft model's draft decode and draft extend runners share its hooks;
+        # each is checked once all of its own graphs are in
+        served = frozenset(
+            {
+                ShapeKey(forward_mode="decode", batch_size=1, tokens_per_request=1),
+                ShapeKey(
+                    forward_mode="draft_extend", batch_size=1, tokens_per_request=4
+                ),
+            }
+        )
+        check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        decode, extend = (
+            DraftDecodeRunner(capture_bs=[1, 2]),
+            DraftExtendRunner(capture_bs=[1]),
+        )
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            check(decode, None, batch("decode", 1, 1), 1)
+            check(extend, None, batch("draft_extend_v2", 1, 4), 4)
+            self.assertEqual(check.done, {"DraftExtendRunner"})
+            check(decode, None, batch("decode", 2, 2), 2)
+        self.assertEqual(check.done, {"DraftDecodeRunner", "DraftExtendRunner"})
+
+    def test_a_draft_spec_serves_its_own_step_modes(self):
+        registry.register(
+            backend=BACKEND, architecture="Draft", path=f"{__name__}:EAGLE_DRAFT"
+        )
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                enable_amd_monokernel=True,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_num_draft_tokens=4,
+                disable_cuda_graph=True,
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        lm = install(archs=["Draft"], is_load_observed=True)
+        x = torch.zeros(1)
+        self.assertEqual(lm(x, None, batch("draft_extend_v2", 1, 4)), "mono")
+        self.assertEqual(lm(x, None, batch("decode", 2, 2)), "mono")
+        # the target's verify step, which a draft never runs, is not its key
+        self.assertEqual(lm(x, None, batch("target_verify", 1, 4)), "normal")
+        # a draft decode plans its metadata before its steps set input_ids
+        replay = batch("decode", 2, None)
+        plan = StepMetadata.DSA_REPLAY_PLAN
+        self.assertTrue(binding.is_metadata_unread(lm, replay, plan))
+        self.assertTrue(
+            binding.is_metadata_unread(lm, batch("draft_extend_v2", 3, 12), plan)
+        )
+        self.assertFalse(
+            binding.is_metadata_unread(lm, batch("target_verify", 1, 4), plan)
+        )
+
+    def test_a_draft_spec_with_no_step_keeps_the_normal_forward(self):
+        registry.register(
+            backend=BACKEND, architecture="Draft", path=f"{__name__}:IDLE_DRAFT"
+        )
+        publish(
+            ServerArgs(
+                model_path="dummy", enable_amd_monokernel=True, disable_cuda_graph=True
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        lm = install(archs=["Draft"], is_load_observed=True)
+        self.assertNotIn("forward", vars(lm))
+
+    def test_a_spec_caps_its_rows_at_a_tp_size(self):
+        registry.register(
+            backend=BACKEND, architecture="Capped", path=f"{__name__}:CAPPED"
+        )
+        self.addCleanup(reset_context)
+        plan, x = StepMetadata.DSA_REPLAY_PLAN, torch.zeros(1)
+        for tp_size, wide in ((4, "normal"), (2, "mono")):
+            with self.subTest(tp_size=tp_size):
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        tp_size=tp_size,
+                        enable_amd_monokernel=True,
+                        disable_cuda_graph=True,
+                    ),
+                    role="test",
+                )
+                lm = install(archs=["Capped"], is_load_observed=True)
+                self.assertEqual(lm(x, None, batch("decode", 4, 4)), "mono")
+                self.assertTrue(
+                    binding.is_metadata_unread(lm, batch("decode", 4, 4), plan)
+                )
+                # past the cap the step runs the model's forward, which reads the
+                # backend's metadata, so the backend builds it
+                self.assertEqual(lm(x, None, batch("decode", 6, 6)), wide)
+                self.assertEqual(
+                    binding.is_metadata_unread(lm, batch("decode", 6, 6), plan),
+                    wide == "mono",
+                )
+
+    def test_the_dsa_replay_builds_only_the_metadata_its_forward_reads(self):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        page, bs = 4, 2
+        req_to_token = torch.randperm(8 * 64).reshape(8, 64)
+        requests = torch.tensor([5, 2])
+
+        def replay(*, unread, mode="decode", rows=bs, page_size=page):
+            tokens = rows // bs
+            spec = replace(SPEC, unread_metadata=frozenset(unread))
+            lm, _ = switched(mode=mode, tokens=tokens, spec=spec)
+            if mode == "decode" and tokens > 1:
+                lm, _ = switched(spec=spec)  # serves 1-token decode steps only
+            backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+            captured = SimpleNamespace(
+                page_table_1=torch.zeros(4, 64, dtype=torch.int64),
+                real_page_table=torch.zeros(4, 64 // page_size, dtype=torch.int64),
+            )
+            if page_size == 1:
+                captured.real_page_table = captured.page_table_1
+            backend.__dict__.update(
+                model_runner=SimpleNamespace(model=lm),
+                decode_cuda_graph_metadata={bs: captured},
+                req_to_token=req_to_token,
+                physical_page_size=page_size,
+                forward_metadata=None,
+            )
+            step = SimpleNamespace(
+                forward_mode=ForwardMode[mode.upper()],
+                batch_size=bs,
+                input_ids=torch.zeros(rows, dtype=torch.int64),
+                req_pool_indices=requests,
+                seq_lens=torch.full((bs,), 64),
+                seq_lens_cpu=torch.full((bs,), 64),
+                spec_info=None,
+            )
+            with patch.object(backend, "_apply_cuda_graph_metadata") as full:
+                backend.init_forward_metadata_out_graph(step)
+            return backend, captured, full.called
+
+        plan = StepMetadata.DSA_REPLAY_PLAN
+        table = StepMetadata.DSA_REPLAY_PAGE_TABLE
+        # nothing read: the captured metadata as is
+        backend, captured, full = replay(unread={plan, table})
+        self.assertFalse(full)
+        self.assertIs(backend.forward_metadata, captured)
+        self.assertFalse(captured.real_page_table.any())
+        # only the page table read: SGLang's real page table, req_to_token at each
+        # page's first token, divided by the page size
+        for page_size in (page, 1):
+            backend, captured, full = replay(unread={plan}, page_size=page_size)
+            self.assertFalse(full)
+            self.assertIs(backend.forward_metadata, captured)
+            want = req_to_token[requests][:, ::page_size] // page_size
+            self.assertTrue(torch.equal(captured.real_page_table[:bs], want))
+            # negative control: the requests in another order
+            other = req_to_token[requests.flip(0)][:, ::page_size] // page_size
+            self.assertFalse(torch.equal(captured.real_page_table[:bs], other))
+        # every other step builds it all: the plan read, a width the forward does not
+        # serve, or a page-table-only replay outside decode
+        for unread, mode, rows in (
+            ({table}, "decode", bs),
+            ({plan, table}, "decode", 2 * bs),
+            ({plan}, "target_verify", 2 * bs),
+        ):
+            with self.subTest(unread=unread, mode=mode, rows=rows):
+                self.assertTrue(replay(unread=unread, mode=mode, rows=rows)[2])
 
     def test_the_runtime_reads_the_published_config(self):
         graphs = with_phase(default_cuda_graph_config(), Phase.DECODE, bs=[1, 2, 8])

@@ -504,6 +504,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch,
             )
 
+            for capture_hook in self.model_runner.capture_tail_hooks:
+                capture_hook(self, ret, forward_batch, num_tokens)
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
