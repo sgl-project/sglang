@@ -812,7 +812,9 @@ class MiMoV2Attention(nn.Module):
             qkv,
             positions,
             get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
-            value_scale=1.0 if self.v_scale is None else self.v_scale,
+            value_scale=(
+                1.0 if self.v_scale is None or self.v_scale_folded else self.v_scale
+            ),
         )
         if query is None:
             return None
