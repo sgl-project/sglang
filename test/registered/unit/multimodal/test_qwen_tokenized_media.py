@@ -175,9 +175,7 @@ def _post_process(processor, input_ids, media):
     )
     ret["mm_modalities"] = [modality for (modality,) in media_items]
     ret["mm_spans"] = strategy.locate_media(input_ids, media_items, spec)
-    mrope_positions, mrope_position_delta = strategy.compute_mrope_positions(
-        input_ids, ret
-    )
+    mrope_positions, mrope_position_delta = strategy.compute_mrope_positions(ret)
     if mrope_positions is not None:
         ret["mrope_positions"] = mrope_positions
         ret["mrope_position_delta"] = mrope_position_delta
@@ -203,7 +201,6 @@ def _attach_core(processor, strategy):
     core.mm_processor_executor = None
     core.FEATURE_NAMES = sorted(strategy.mm_feature_fields)
     core.keep_mm_features_on_device = False
-    core._compute_mrope_positions = True
     processor._core = core
 
 
@@ -424,9 +421,9 @@ class TestQwenTokenizedMedia(CustomTestCase):
             processor = get_mm_processor(config, args, fixture._processor, None)
         self.addCleanup(processor.shutdown)
         audio = np.zeros(16000, dtype=np.float32)
-        options = dict(return_attention_mask=True, truncation=False)
-        actual = _process_media(processor, audios=[audio], **options)
-        expected = _process_media(fixture, audios=[audio], **options)
+        options = {"audios": [dict(return_attention_mask=True, truncation=False)]}
+        actual = _process_media(processor, audios=[audio], preprocess_kwargs=options)
+        expected = _process_media(fixture, audios=[audio], preprocess_kwargs=options)
         self.assertEqual(actual.keys(), expected.keys())
         for name in actual:
             self.assert_tensor_bytes_equal(actual[name], expected[name])
@@ -548,7 +545,10 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 )
                 with _ban_text_processing(processor):
                     batch = _process_loaded(
-                        processor, images=images, input_ids=[START, IMAGE, END] * 2
+                        processor,
+                        images=images,
+                        input_ids=[START, IMAGE, END] * 2,
+                        compute_mrope_positions=True,
                     )
                 # Serving also asks the core for M-RoPE, and every core output locates
                 # its media, neither of which HF returns; HF's all-ones attention_mask
@@ -639,7 +639,10 @@ class TestQwenTokenizedMedia(CustomTestCase):
                     16 if hf_class is Qwen3VLProcessor else 14,
                     model_type=model_type,
                 )
-                processor._core.strategy.video_config = {"do_sample_frames": False}
+                processor._core.strategy.video_config = {
+                    "do_sample_frames": False,
+                    "fps": 2.0,
+                }
                 videos = [
                     torch.arange(4 * 3 * 112 * 168)
                     .remainder(251)
@@ -665,7 +668,9 @@ class TestQwenTokenizedMedia(CustomTestCase):
                     **kwargs,
                 )
                 with _ban_text_processing(processor):
-                    media = _process_media(processor, videos=videos, **kwargs)
+                    media = _process_media(
+                        processor, videos=videos, video_metadata=metadata
+                    )
                     expanded = expand_token_placeholders(
                         [VIDEO, EOS, VIDEO],
                         _expansion_spec(processor, media),
@@ -714,7 +719,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             lambda: processor._processor, max_workers=2
         )
         self.addCleanup(processor._core.mm_processor_executor.shutdown)
-        processor._core.strategy.video_config = {"do_sample_frames": False}
+        processor._core.strategy.video_config = {"do_sample_frames": False, "fps": 2.0}
         videos = [
             torch.arange(4 * 3 * 112 * 168)
             .remainder(251)
@@ -760,7 +765,10 @@ class TestQwenTokenizedMedia(CustomTestCase):
             ),
         ):
             output = _process_loaded(
-                processor, videos=videos, input_ids=[VIDEO, EOS, VIDEO], **kwargs
+                processor,
+                videos=videos,
+                input_ids=[VIDEO, EOS, VIDEO],
+                video_metadata=kwargs["video_metadata"],
             )
         self.assertEqual(
             output["input_ids"][0].tolist(), reference["input_ids"][0].tolist()
@@ -788,14 +796,13 @@ class TestQwenTokenizedMedia(CustomTestCase):
             )
             for video, normalize in zip(videos, (True, False, True))
         ]
+        strategy.video_config = {"do_resize": False, "do_sample_frames": False}
         media_features = _process_media(
             processor,
             videos=videos,
             preprocess_kwargs={
                 "videos": [{"do_normalize": value} for value in (True, False, True)]
             },
-            do_resize=False,
-            do_sample_frames=False,
         )
         for name in ("pixel_values_videos", "video_grid_thw"):
             self.assert_tensor_bytes_equal(
@@ -928,8 +935,9 @@ class TestQwenTokenizedMedia(CustomTestCase):
         processor = _make_hf_processor(
             Qwen3OmniMoeProcessor, 16, model_type="qwen3_omni_moe"
         )
+        processor._core.strategy.video_config = {"use_audio_in_video": True}
         with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
-            _process_media(processor, videos=[object()], use_audio_in_video=True)
+            _process_media(processor, videos=[object()])
 
     def test_video_preprocess_kwargs_cannot_raise_configured_limits(self):
         strategy = _make_hf_processor(Qwen3VLProcessor, 16)._core.strategy
@@ -998,9 +1006,16 @@ class TestQwenTokenizedMedia(CustomTestCase):
         )
         audio = np.zeros(3200, dtype=np.float32)
         audio_options = {"truncation": True, "max_length": 1600}
-        first = _process_media(processor, audios=[audio], **audio_options)
+        first = _process_media(
+            processor, audios=[audio], preprocess_kwargs={"audios": [audio_options]}
+        )
         third_audio = np.full(4800, 0.25, dtype=np.float32)
-        third = _process_media(processor, audios=[third_audio], **audio_options)
+        third = _process_media(
+            processor,
+            audios=[third_audio],
+            preprocess_kwargs={"audios": [audio_options]},
+        )
+        processor._core.strategy.audio_config = {"truncation": False}
         with patch.object(
             processor._core.strategy,
             "process_audio",
@@ -1010,7 +1025,6 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 processor,
                 audios=[audio, audio, third_audio],
                 preprocess_kwargs={"audios": [audio_options, {}, audio_options]},
-                truncation=False,
             )
         self.assertEqual(
             [call.args[2] for call in process_audio.call_args_list],
