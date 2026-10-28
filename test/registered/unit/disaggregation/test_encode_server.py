@@ -1,6 +1,8 @@
 import asyncio
 import pickle
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -28,11 +30,12 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestEncoderDPErrorHandling(CustomTestCase):
@@ -243,6 +246,77 @@ class TestEncoderMetaRegistry(CustomTestCase):
             note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
 
         asyncio.run(run())
+
+
+class TestEncoderPreprocessorOffEventLoop(CustomTestCase):
+    @staticmethod
+    def _make_preprocessor():
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = "minimax_m3_vl"
+        preprocessor.image_processor = None
+        preprocessor.use_image_processor_gpu = False
+        preprocessor.vision_config = {"image": {}, "video": {}}
+        preprocessor.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preserve_media_metadata=True, preprocess_off_event_loop=True
+        )
+        preprocessor.io_executor = ThreadPoolExecutor(max_workers=2)
+        preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
+        return preprocessor
+
+    @staticmethod
+    def _run_with_loop_handshake(make_awaitable):
+        """The hook blocks until a coroutine on the event loop answers it, so a hook
+        that holds the loop thread starves that coroutine and times out."""
+        started, answered = threading.Event(), threading.Event()
+
+        def wait_for_loop():
+            started.set()
+            if not answered.wait(timeout=5):
+                raise TimeoutError("the preprocess hook blocked the event loop")
+
+        async def answer():
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            answered.set()
+
+        async def run():
+            responder = asyncio.create_task(answer())
+            result = await make_awaitable(wait_for_loop)
+            await asyncio.wait_for(responder, timeout=5)
+            return result
+
+        return asyncio.run(run())
+
+    def test_video_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._load_single_item = lambda data, modality: "decoded"
+
+        def process(wait_for_loop):
+            def hook(videos, modality, config):
+                wait_for_loop()
+                return {"videos": videos}
+
+            return preprocessor._process_video_items([{"url": "a.mp4"}], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertEqual(output, {"videos": ["decoded"]})
+
+    def test_image_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._flatten_and_load_images = AsyncMock(
+            return_value=[torch.zeros(3, 4, 4)]
+        )
+        grid = torch.tensor([[1, 2, 2]])
+
+        def process(wait_for_loop):
+            def hook(images, modality, config):
+                wait_for_loop()
+                return {"image_grid_thw": grid}
+
+            return preprocessor._process_image_items(["img"], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertIs(output["image_grid_thw"], grid)
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):

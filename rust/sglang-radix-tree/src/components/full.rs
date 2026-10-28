@@ -7,13 +7,13 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, Family};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
-    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
+    CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
 
@@ -30,6 +30,10 @@ impl FullComponent {
 impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn component_type(&self) -> ComponentType {
         FULL
+    }
+
+    fn family(&self) -> Family {
+        Family::Token
     }
 
     fn create_match_validator(
@@ -104,7 +108,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let node = tree_core.arena.node(node_id);
@@ -156,7 +160,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _cache_actions: &mut Vec<CacheAction>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = FULL;
         assert!(
@@ -205,7 +209,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         for spare_imminent_demotes in [true, false] {
             if tracker[&FULL] >= num_tokens {
@@ -248,7 +252,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
         let arena = &tree_core.arena;
@@ -491,7 +495,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
