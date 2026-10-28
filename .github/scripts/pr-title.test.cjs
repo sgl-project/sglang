@@ -188,10 +188,10 @@ test('kernel sync helper title', async () => {
   assert.deepEqual(await validate(title), []);
 });
 test('sgl-amd-mono pin helper title', async () => {
-  const source = loadSource('scripts/release/commit_and_pr_sgl_amd_mono.sh');
-  const match = /PR_TITLE="([^"\n]+)"/.exec(source);
-  assert.ok(match, 'Missing PR_TITLE in commit_and_pr_sgl_amd_mono.sh');
-  assert.deepEqual(await validate(expand(match[1], {NEW_SHORT_SHA: 'abcdef12'})), []);
+  const title = expand(titleTemplate('scripts/release/commit_and_pr_sgl_amd_mono.sh'), {
+    NEW_SHORT_SHA: 'abcdef12',
+  });
+  assert.deepEqual(await validate(title), []);
 });
 for (const path of ['.github/workflows/sync-lmsys-sglang-blogs.yml',
                     '.github/workflows/weekly-update-est-time.yml']) {

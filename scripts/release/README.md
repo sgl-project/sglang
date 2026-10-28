@@ -101,7 +101,7 @@ python scripts/release/bump_docs_install_version.py 0.5.13
 - `docs/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
 
 ### `bump_sgl_amd_mono_version.py`
-Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) (the `monokernels_hip` extra, which the gfx950 ROCm image also checks out) at a branch head or a full commit SHA, `main` by default. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which force-pushes `bot/bump-sgl-amd-mono` when sgl-amd-mono's `main` has moved and opens one PR from it, labeled `run-ci`, or updates the open one. A run whose target the open PR already pins does nothing.
+Pins [`sgl-amd-mono`](https://github.com/sgl-project/sgl-amd-mono) (the `monokernels_hip` extra, which the gfx950 ROCm image also checks out) at a branch head or a full commit SHA, `main` by default. Driven daily by [`.github/workflows/bot-bump-sgl-amd-mono-version.yml`](../../.github/workflows/bot-bump-sgl-amd-mono-version.yml), which opens a PR from `bot/bump-sgl-amd-mono-<sha8>` when sgl-amd-mono's `main` has moved and closes the bump PR it supersedes; closing it cancels that PR's runs through `cancel-pr-workflows-on-close.yml`. Closing a bump PR without merging it keeps the bot from reopening one for that commit. Comment `/tag-and-rerun-ci` on a bump PR to run its CI.
 
 **Usage:**
 ```bash
