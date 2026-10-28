@@ -52,6 +52,7 @@ def native_batch(lengths):
     batch = SimpleNamespace(
         input_ids=torch.arange(count) + 3,
         forward_mode=ForwardMode.EXTEND,
+        global_num_token_non_padded_cpu=None,
         seq_lens=torch.tensor(lengths),
         extend_seq_lens=torch.tensor(lengths),
         extend_seq_lens_cpu=lengths,
