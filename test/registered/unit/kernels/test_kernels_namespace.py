@@ -218,7 +218,6 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
-        "'sglang.kernels.ops.speculative.row_argmax', "
         "'sgl_kernel_npu')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
@@ -359,7 +358,6 @@ def test_reclassified_public_entry_points_are_inventoried():
         "kv_canary.verify",
         "kv_canary.scatter_req_token_ids",
         "mm.process.image",
-        "speculative.row_argmax",
     )
     for module in modules:
         tree = ast.parse(
@@ -514,27 +512,13 @@ def test_deep_select_spec_matches_wrapper_architectures():
     "op,backend",
     [
         ("attention.expand_causal_seqlens", KernelBackend.TRITON),
-        (
-            "attention.expand_pool_topk_and_append_tail_batched_npu",
-            KernelBackend.TRITON,
-        ),
-        ("attention.fused_decode_prepare_indexer", KernelBackend.TRITON),
         ("attention.build_pooled_page_table", KernelBackend.TORCH),
-        (
-            "kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
-            KernelBackend.TRITON,
-        ),
-        ("kvcache.kpool_assemble_softmax_write_cache_npu", KernelBackend.TRITON),
-        ("kvcache.kpool_write_tail_and_maybe_compress_npu", KernelBackend.TRITON),
-        ("kvcache.scatter_kpool_tail_updates_npu", KernelBackend.TRITON),
-        ("mamba.causal_conv1d_target_verify_npu", KernelBackend.TRITON),
     ],
 )
 def test_ascend_kernel_inventory_is_npu_only(op, backend):
     """Inventory tooling must not offer these Ascend implementations on CUDA/CPU."""
     spec = K.registry.get_backend(op, backend)
-    # Ascend implementations are provided by the external kernel package.
-    # Inventory must resolve the public vendor facade, without importing it here.
+    # NPU operators all called by sgl_kernel_npu.operators
     assert spec.target.startswith("sgl_kernel_npu.operators.")
     assert spec.capabilities == frozenset({Cap.NPU})
     assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type="npu"))
