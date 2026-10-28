@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+import weakref
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -33,6 +35,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.factory import dead_rope_buffer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -59,6 +62,28 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+# get_rope() caches modules by their arguments, so a draft whose RoPE config
+# matches the target's (e.g. partial/M-RoPE fields copied from the target
+# config) would share the target's module. The draft forward may then replace
+# cos_sin_cache with a dtype-cast tensor, freeing the buffer that the target's
+# already-captured CUDA graphs read on replay (illegal memory access). Give
+# the draft its own copy, shared by its layers. The copy is only weakly
+# referenced here so it is released with the draft, and a copy killed by a
+# teardown is rebuilt, mirroring get_rope()'s own cache.
+_DRAFT_PRIVATE_ROPES: weakref.WeakKeyDictionary[nn.Module, weakref.ref] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _draft_private_rope(shared_rope: nn.Module) -> nn.Module:
+    ref = _DRAFT_PRIVATE_ROPES.get(shared_rope)
+    rope = ref() if ref is not None else None
+    if rope is None or dead_rope_buffer(rope) is not None:
+        rope = copy.deepcopy(shared_rope)
+        _DRAFT_PRIVATE_ROPES[shared_rope] = weakref.ref(rope)
+    return rope
+
 
 try:
     from flashinfer import top_k as _flashinfer_top_k
@@ -271,14 +296,16 @@ class DFlashAttention(nn.Module):
             )
         )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
-        self.rotary_emb = get_rope(
-            head_dim,
-            rotary_dim=rotary_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=rope_is_neox_style,
-            partial_rotary_factor=partial_rotary_factor,
+        self.rotary_emb = _draft_private_rope(
+            get_rope(
+                head_dim,
+                rotary_dim=rotary_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=rope_is_neox_style,
+                partial_rotary_factor=partial_rotary_factor,
+            )
         )
 
         self.scaling = head_dim**-0.5
