@@ -1738,7 +1738,6 @@ class TestTransferReadyEvents(CustomTestCase):
         ):
             linker._broadcast_loaded_layers(3, 0)
             linker._broadcast_loaded_layers(3, 1)
-        # The peers' copies are queued behind every event, and only once.
         self.assertEqual(
             order.mock_calls,
             [

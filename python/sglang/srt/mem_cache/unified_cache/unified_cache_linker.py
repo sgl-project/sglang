@@ -131,8 +131,6 @@ class LayerWiseLoadCounter:
 
 
 class TransferReady(NamedTuple):
-    """The events a transfer waits on before it touches device pages."""
-
     events: list[torch.cuda.Event]
 
     def synchronize(self) -> None:
@@ -156,18 +154,14 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
     pools: dict[PoolName, object]
-    # The stream the forward uses the device pools on; None when the current
-    # stream is the only one using the pages.
+    # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
     def record_transfer_ready(self) -> TransferReady:
         """Record what a transfer waits on before it touches device pages.
 
-        The current stream has computed which pages to transfer, and the forward
-        stream may still use them: read-done lets the scheduler's stream run
-        ahead of the forward in flight. An offload reads pages that forward
-        writes; a load may write pages that the forward in flight still uses
-        after they were freed, such as a stashed chunk's duplicates.
+        The current stream computed the page indices; under read-done the
+        forward in flight may still use those pages, including freed ones.
         """
         indices_ready = device_module.Event()
         indices_ready.record()
