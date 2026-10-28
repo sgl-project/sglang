@@ -511,6 +511,15 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
 
+    if model_runner.is_draft_worker and get_parallel().enable_prefill_cp:
+        from sglang.srt.layers.cp.base import is_interleave
+
+        if is_interleave():
+            # EagleWorkerV2 requests capture again with force_for_draft_worker=True
+            # after init_lm_head, bypassing the guard above. The interleave adapter
+            # supports only target prefill; draft CP must stay eager on that call too.
+            return result(None)
+
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
     # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
