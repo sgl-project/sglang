@@ -45,7 +45,9 @@ CANARY_TEXT = " ".join(
 )
 CANARY_TOL = 0.5
 # Default breakable prefill buckets reach well beyond every length above.
-CAPTURE_CAP = 4096
+# Default prefill capture cap on main for MLA/DSA models:
+# min(8192, chunked_prefill_size) (arg_groups/memory_hook.py).
+CAPTURE_CAP = 8192
 RESULTS_PATH = os.environ.get("SGLANG_TEST_CP_BCG_RESULTS")
 
 
@@ -90,6 +92,8 @@ def _common_args(attn_cp_size: int):
 
 class TestDsaCpBcgBoundaryCP4(CustomTestCase):
     attn_cp_size = 4
+    # Whether main is expected to keep breakable graphs on for this shape.
+    expect_prefill_graphs = True
 
     @classmethod
     def setUpClass(cls):
@@ -200,11 +204,11 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
             probe = self._generate(self._prompt(length), MAX_NEW_TOKENS)
             graph_passes = self._prefill_graph_passes() - before
             self.assertEqual(probe["meta_info"]["prompt_tokens"], length)
-            if prefill_graphs and length <= CAPTURE_CAP:
+            if prefill_graphs and self.expect_prefill_graphs and length <= CAPTURE_CAP:
                 self.assertGreater(
                     graph_passes, 0, f"length={length}: eager fallback, no graph pass"
                 )
-            elif not prefill_graphs:
+            elif not prefill_graphs or not self.expect_prefill_graphs:
                 self.assertEqual(graph_passes, 0, f"length={length}")
             # Replay the canary from the radix cache: every cached KV row is
             # read again, so a pad-row write into its slots changes the result.
@@ -287,7 +291,15 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
 
 
 class TestDsaCpBcgBoundaryCP2(TestDsaCpBcgBoundaryCP4):
+    """CP2 inside TP4: main gates CP BCG on attn_cp_size == tp_size
+    (supports_prefill_cp_bcg), so even an explicit
+    --cuda-graph-backend-prefill breakable resolves to eager prefill. This
+    class pins that gate (no graph pass may be taken) and checks eager-CP
+    parity for the same lengths.
+    """
+
     attn_cp_size = 2
+    expect_prefill_graphs = False
 
 
 if __name__ == "__main__":
