@@ -1716,6 +1716,8 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Opt-in CPU tail reuse and exact prefix pruning for streaming literal stops.
+    SGLANG_ENABLE_STOP_STR_OPTIMIZATION = EnvBool(False)
     # Group replies by tokenizer worker; disable for per-request delivery.
     SGLANG_BATCH_TOKENIZER_OUTPUTS = EnvBool(True)
     # Encode long rendered chat prompts as chunks on the tokenizers thread pool.

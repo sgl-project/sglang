@@ -179,6 +179,8 @@ _MM_WIDE_PAD_MASK = (1 << 62) - 1
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+# Resolve once at import; do not read the environment on the per-token path.
+_ENABLE_STOP_STR_OPTIMIZATION = envs.SGLANG_ENABLE_STOP_STR_OPTIMIZATION.get()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -1837,7 +1839,24 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        tail_ids = self.output_ids[-tail_len:]
+        # Only streaming literal stops reuse this decode in the prefix check.
+        # Regex windows can cover the whole output; do not retain a copy of them.
+        if (
+            not _ENABLE_STOP_STR_OPTIMIZATION
+            or self.stream is not True
+            or self.sampling_params.stop_regex_strs
+        ):
+            return self.tokenizer.decode(tail_ids)
+
+        key = (tail_len, len(self.output_ids), tuple(tail_ids))
+        cached = getattr(self, "_stop_tail_cache", None)
+        if cached is not None and cached[0] == key and cached[1] is self.tokenizer:
+            return cached[2]
+
+        tail_str = self.tokenizer.decode(tail_ids)
+        self._stop_tail_cache = (key, self.tokenizer, tail_str)
+        return tail_str
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
@@ -1855,6 +1874,10 @@ class Req(ReqDllmMixin):
             # Check if stop_str is contained in tail_str (fastest check first)
             if stop_str in tail_str:
                 return True
+
+            # A matching nonempty suffix must end in a character from stop_str.
+            if _ENABLE_STOP_STR_OPTIMIZATION and tail_str[-1] not in stop_str:
+                continue
 
             # Check if tail_str suffix matches stop_str prefix
             # Only check if stop_str is not empty, it's for stream output
