@@ -9,6 +9,7 @@ shape helpers are called directly. The parallelism rejections live in ``test_wan
 import math
 from collections import OrderedDict
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     _make_score_mod,
     _pad_reference_video_kv,
     _quantize_fp8_per_token_head,
+    _split_attention_is_exact,
     _sp_scatter_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
@@ -399,6 +401,72 @@ def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
     start = layout.padded_generation_video_len
     for t in (captured["k"], captured["v"]):
         torch.testing.assert_close(t.transpose(1, 2)[:, start:], dequant)
+
+
+@pytest.mark.parametrize(
+    "layout,batch,expected",
+    [
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 1, True),  # full clip
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (4, 1, 2)), 1, True),  # short last clip
+        (_SHORT_CLIP_LAYOUT, 1, False),  # zero slots inside each frame
+        (_InContextLayout((2, 2, 2), (1, 1, 5), (2, 2, 2)), 1, False),  # wider reference frame
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 2, False),
+    ],
+)
+def test_split_attention_only_where_it_matches_flex(layout, batch, expected):
+    q = SimpleNamespace(is_cuda=True, shape=(batch, 4, 2, 8))
+    with patch(f"{_BLOCK}.current_platform.is_hopper", return_value=True):
+        assert _split_attention_is_exact(q, layout) is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="FA3 split runs on Hopper only",
+)
+@pytest.mark.parametrize("log_scale", [0.0, -1.3])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("full_clip_f", [3, 5])  # full clip, short last clip
+def test_split_attention_matches_flex(log_scale, fp8, full_clip_f):
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    layout = _InContextLayout((3, 8, 16), (2, 8, 16), (full_clip_f, 8, 16))
+    mask = create_block_mask(
+        layout.block_mask_fn(),
+        B=None,
+        H=None,
+        Q_LEN=layout.padded_generation_video_len,
+        KV_LEN=layout.padded_kv_len,
+        device="cuda",
+    )
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 384, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        for _ in range(3)
+    )
+    ref_k, ref_v = (
+        _pad_reference_video_kv(
+            torch.randn(1, 256, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g),
+            layout,
+        )
+        for _ in range(2)
+    )
+    scales = (None, None)
+    if fp8:
+        (ref_k, k_scale), (ref_v, v_scale) = (
+            _quantize_fp8_per_token_head(ref_k),
+            _quantize_fp8_per_token_head(ref_v),
+        )
+        scales = (k_scale, v_scale)
+    stub = SimpleNamespace(log_scale=log_scale)
+    args = (q, k, v, ref_k, ref_v, mask, layout, *scales)
+    with patch(f"{_BLOCK}._split_attention_is_exact", return_value=False):
+        flex_out = WanAnimate2TransformerBlock._in_context_attention(stub, *args)
+    stub._split_in_context_attention = partial(
+        WanAnimate2TransformerBlock._split_in_context_attention, stub
+    )
+    split_out = WanAnimate2TransformerBlock._in_context_attention(stub, *args)
+    assert split_out.shape == flex_out.shape == q.shape
+    torch.testing.assert_close(split_out, flex_out, rtol=2e-2, atol=2e-2)
 
 
 def test_make_score_mod_is_cached_by_key():

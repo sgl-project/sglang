@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 # Eager flex_attention materializes the full [Q, KV] scores over the padded [gen | reference-video]
 # sequence (tens of GiB at video resolution); compiled, it is one fused kernel.
@@ -116,6 +117,22 @@ def _quantize_fp8_per_token_head(
     scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
     q = (x / scale).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
     return q, scale
+
+
+def _split_attention_is_exact(q: torch.Tensor, layout: _InContextLayout) -> bool:
+    """Whether _split_in_context_attention reproduces the flex path exactly: generation and
+    reference frames both fill the slot, so the only zero-padded keys flex attends are the
+    missing frames of a short clip, which the split adds back as a softmax term. Grids that
+    differ by a row keep the flex path."""
+    return (
+        q.is_cuda
+        and q.shape[0] == 1
+        and current_platform.is_hopper()
+        and layout.generation_video_f >= 2
+        and layout.generation_video_tokens_per_frame == layout.max_tokens_per_frame
+        and layout.reference_video_tokens_per_frame == layout.max_tokens_per_frame
+        and layout.reference_video_f == layout.generation_video_f - 1
+    )
 
 
 class WanAnimate2TransformerBlock(WanTransformerBlock):
@@ -366,6 +383,20 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         padded_kv_len = layout.padded_kv_len
 
         q_padding = q[:, layout.generation_video_num_tokens :]
+        if _split_attention_is_exact(q, layout):
+            attn_output_valid = self._split_in_context_attention(
+                q,
+                k,
+                v,
+                reference_video_k,
+                reference_video_v,
+                layout,
+                reference_video_k_scale,
+                reference_video_v_scale,
+            )
+            if q_padding.shape[1] == 0:
+                return attn_output_valid
+            return torch.cat([attn_output_valid, q_padding], dim=1)
 
         q_padded = torch.zeros(
             batch_size,
@@ -445,6 +476,98 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         if q_padding.shape[1] == 0:
             return attn_output_valid
         return torch.cat([attn_output_valid, q_padding], dim=1)  # [B, seq_len, N, C]
+
+    def _split_in_context_attention(
+        self,
+        q: torch.Tensor,  # [1, seq_len, H, D] (gen-RoPE'd)
+        k: torch.Tensor,
+        v: torch.Tensor,
+        reference_video_k: torch.Tensor,  # [1, padded_reference_video_len, H, D]
+        reference_video_v: torch.Tensor,
+        layout: _InContextLayout,
+        reference_video_k_scale: torch.Tensor | None,
+        reference_video_v_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The flex in-context attention as FA3 calls merged by log-sum-exp: dense over the
+        generation keys, then generation frame j >= 1 over reference frame j - 1. Only valid
+        when _split_attention_is_exact; returns ``[1, generation_video_num_tokens, H, D]``."""
+        from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+        from sglang.srt.layers.attention.merge_state import merge_state
+
+        num_generation_tokens = layout.generation_video_num_tokens
+        num_reference_tokens = layout.reference_video_num_tokens
+        tokens_per_frame = layout.max_tokens_per_frame
+        q, k, v = (t[0, :num_generation_tokens] for t in (q, k, v))
+        reference_k = reference_video_k[0, :num_reference_tokens]
+        reference_v = reference_video_v[0, :num_reference_tokens]
+        if reference_video_k_scale is not None:
+            reference_k = reference_k.to(q.dtype).mul_(
+                reference_video_k_scale[0, :num_reference_tokens]
+            )
+            reference_v = reference_v.to(q.dtype).mul_(
+                reference_video_v_scale[0, :num_reference_tokens]
+            )
+
+        def attend(query, key, value, cu_seqlens_q, cu_seqlens_k, max_q, max_k):
+            out, lse = flash_attn_varlen_func(
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_q,
+                max_k,
+                return_softmax_lse=True,
+                ver=3,
+            )[:2]
+            return out, lse.transpose(0, 1).contiguous()  # lse [H, N] -> [N, H]
+
+        def whole(n: int) -> torch.Tensor:
+            return torch.tensor([0, n], dtype=torch.int32, device=q.device)
+
+        n = num_generation_tokens
+        log_scale = float(self.log_scale)
+        if log_scale == 0.0:
+            out, lse = attend(q, k, v, whole(n), whole(n), n, n)
+        else:
+            # The score bias on generation frame 1's keys (_score_mod_impl) is a constant added to
+            # every score of that key chunk, i.e. the same constant added to the chunk's LSE.
+            frame_1 = slice(tokens_per_frame, 2 * tokens_per_frame)
+            other_k = torch.cat([k[: frame_1.start], k[frame_1.stop :]])
+            other_v = torch.cat([v[: frame_1.start], v[frame_1.stop :]])
+            out, lse = attend(
+                q, other_k, other_v, whole(n), whole(n - tokens_per_frame), n, n - tokens_per_frame
+            )
+            out_1, lse_1 = attend(
+                q, k[frame_1], v[frame_1], whole(n), whole(tokens_per_frame), n, tokens_per_frame
+            )
+            out, lse = merge_state(out, lse, out_1, lse_1 + log_scale)
+
+        # Generation frame j >= 1 also attends reference frame j - 1; frame 0 attends none.
+        frame_starts = (
+            torch.arange(
+                layout.reference_video_f + 1, dtype=torch.int32, device=q.device
+            )
+            * tokens_per_frame
+        )
+        reference_out, reference_lse = attend(
+            q[tokens_per_frame:],
+            reference_k,
+            reference_v,
+            frame_starts,
+            frame_starts,
+            tokens_per_frame,
+            tokens_per_frame,
+        )
+        out[tokens_per_frame:], lse[tokens_per_frame:] = merge_state(
+            out[tokens_per_frame:], lse[tokens_per_frame:], reference_out, reference_lse
+        )
+        # A short clip's missing generation frames are zero keys under the full-clip mask: score 0
+        # and value 0, so they only add num_zero_keys to the softmax denominator.
+        num_zero_keys = layout.max_generation_video_num_tokens - n
+        if num_zero_keys:
+            out = (out * torch.sigmoid(lse - math.log(num_zero_keys)).unsqueeze(-1)).to(q.dtype)
+        return out.unsqueeze(0)
 
 
 class _InContextLayout:
