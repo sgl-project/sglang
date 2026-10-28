@@ -54,10 +54,12 @@ renders the model:
   `PromptFormatter`, replace that branch.
 - **Python calls `apply_chat_template`** (Jinja, spec `None`): give the model a
   variant holding Dynamo's Jinja `PromptFormatter`, picked in
-  `ChatFormatter::from_tokenizer_config` from the template text as
-  `parser/template_detection.py` picks it, and build the template context that
-  `_process_messages` and `_apply_jinja_template` build, like GLM-5.3
-  (`models/glm53.rs`).
+  `ChatFormatter::from_tokenizer_config` from the template text (as
+  `parser/template_detection.py` picks it, where it has a detector), and build the
+  template context that `_process_messages` and `_apply_jinja_template` build, like
+  GLM-5.3 (`models/glm53.rs`) and Qwen3.8 (`models/qwen38.rs`). Dynamo's formatter
+  rewrites shapes its load-time probes find the template rejects (a later system
+  turn, for one); SGLang raises on them, so check those before rendering.
 
 ## Method
 
@@ -76,13 +78,12 @@ renders the model:
      It also reads the server's `--tool-call-parser` and whether the tokenizer has
      a chat template. If the deployment depends on the parser, set
      `tool_call_parser` in the fixture, and add it to `ChatFormatterOptions` in the
-     same PR. Note any per-checkpoint state the server resolves once (DeepSeek-V4's
-     effort profile reads `encoding/encoding_dsv4.py`).
+     same PR. Note any per-checkpoint state the server resolves once.
    - That spec's branch in `serving_chat._apply_jinja_template` / `_encode_messages`:
      message dumping, content flattening, `_handle_last_assistant_message`, system
      insertion, tools, model-specific fields, the encoder or `apply_chat_template`
      call, and how the prompt is tokenized.
-   - The encoder itself (for example `encoding_dsv4.py`), line by line. History
+   - The encoder itself (for example deepseek-recipe), line by line. History
      rules live there: dropped turns, `</think>` on empty reasoning, argument
      formatting, and the errors it raises.
 
@@ -137,7 +138,7 @@ renders the model:
   split (it is for DeepSeek-V4). Run each check where Python runs it: a final
   assistant turn's tool calls are discarded, so object checks on their arguments
   belong after the split. Hosts reach the model through `render_prompt` too, so
-  check the renderer's continuation handling (`sglang-renderer` `render()`) as well.
+  check their continuation handling as well.
   (`final_assistant`, `continuation_parts`, `continuation_bos`, `continuation_only`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
@@ -182,7 +183,7 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
-  example `_dsv41_default_reasoning_effort`.
+  example the chat encoding adapter (`_encoding_adapter`).
 
 A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
 recorded by the template's text output. Its `render_request` returns the
@@ -203,8 +204,8 @@ cargo check -p sglang-processor --no-default-features --features render,tokenize
 The token check loads the pinned commit's snapshot from the cache. When the
 snapshot is missing, the test prints `token ids not checked` (visible with
 `-- --nocapture`), so confirm that line is absent before claiming token parity.
-With the snapshot cached, the test also checks that the checkpoint resolves the
-fixture's recorded DeepSeek-V4 profile.
+A formatter that encodes its own prompts (DeepSeek-V4 and V4.1, through
+`encode_request`) is checked with the checkpoint's own tokenizer.
 
 ## OpenAI layer
 

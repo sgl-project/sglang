@@ -21,7 +21,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
-    forward_hc_pre_from_prev_fused_boundary,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
@@ -150,7 +149,7 @@ def attention_inv_rope(
 
 
 def init_decoder_layer(layer, quant_config) -> None:
-    """The ROCm state of DeepseekV4DecoderLayer.__init__. input_layernorm also emits the
+    """The ROCm state of DeepseekV4DecoderLayerBase.__init__. input_layernorm also emits the
     pre-quantized operand of the dense projections (whether wqkv_a consumes native MXFP8
     resolves on first use), and on gfx950 one launch runs hc_post, the pre-collapse and
     the mixing stats; the kernel only supports hc_mult 4."""
@@ -181,6 +180,26 @@ def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
     return mhc_post_split_h(x, residual, post, comb, block_size=2048)
 
 
+def _x_quant_e8m0(layer) -> bool:
+    """Whether input_layernorm's fp8 operand goes out with ue8m0 scales: only when
+    every dense projection reading it (wqkv_a, or wq_a + wkv) runs the e8m0 mxscale
+    GEMM (SGLANG_DSV4_DENSE_MXSCALE). Resolved on first use, after weight load."""
+    cached = layer.__dict__.get("_x_quant_e8m0")
+    if cached is None:
+        from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+        attn = layer.self_attn
+        if getattr(attn, "fuse_wqa_wkv", False):
+            consumers = (getattr(attn, "wqkv_a", None),)
+        else:
+            consumers = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+        cached = all(c is not None for c in consumers) and dense_mxscale_ready(
+            *consumers
+        )
+        layer.__dict__["_x_quant_e8m0"] = cached
+    return cached
+
+
 def input_norm(
     layer,
     hidden_states: torch.Tensor,
@@ -195,7 +214,10 @@ def input_norm(
         if coefficients is not None:
             coefficients.materialize()
         x_quant, hidden_states = fused_rmsnorm_fp8_quant(
-            hidden_states, layer.input_layernorm.weight, layer.rms_norm_eps
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.rms_norm_eps,
+            e8m0=_x_quant_e8m0(layer),
         )
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:
@@ -203,48 +225,3 @@ def input_norm(
     if coefficients is not None:
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None
-
-
-# ---- DeepseekV4Model layer loop ----
-
-
-def forward_layer_fused_boundary(
-    model,
-    i: int,
-    state,
-    *,
-    positions: torch.Tensor,
-    input_ids: torch.Tensor,
-    forward_batch,
-    input_ids_global: torch.Tensor,
-    capture_dspark: bool,
-):
-    """Layer i through the fused mHC boundary. Its FFN hc_post stays pending for the next
-    layer's boundary launch unless that layer reads the residual stream first (Engram gate,
-    DSpark capture) or there is none; hidden_states is None while a post is pending."""
-    nxt = i + 1
-    defer_post = (
-        nxt < model.end_layer
-        and model.layers[nxt].engram is None
-        and not (capture_dspark and nxt in model.dspark_layers_to_capture)
-    )
-    # The boundary speaks its own (hidden_states, prev_pre, pending_post) triple;
-    # the loop speaks HcState. This is the only place the two meet.
-    from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
-
-    pending = isinstance(state.streams, HcPending)
-    hidden_states, prev_pre, pending_post = forward_hc_pre_from_prev_fused_boundary(
-        model.layers[i],
-        positions=positions,
-        hidden_states=None if pending else state.streams,
-        input_ids=input_ids,
-        forward_batch=forward_batch,
-        input_ids_global=input_ids_global,
-        prev_pre=state.pre,
-        pending_post=tuple(state.streams) if pending else None,
-        defer_post=defer_post,
-    )
-    return HcState(
-        hidden_states if pending_post is None else HcPending(*pending_post),
-        prev_pre,
-    )

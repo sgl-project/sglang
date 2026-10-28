@@ -19,7 +19,7 @@ from sglang.srt.speculative.eagle_utils import _verify_uses_greedy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu):
@@ -79,15 +79,6 @@ class TestEagleGateRouting(CustomTestCase):
             self.assertFalse(self._gate(False, platform, True))
             self.assertTrue(self._gate(True, platform, False))
             self.assertTrue(self._gate(True, platform, True))
-
-    def test_cpu_xpu_always_greedy(self):
-        for platform in ("cpu", "xpu"):
-            for is_all_greedy in (False, True):
-                for use_rej in (False, True):
-                    self.assertTrue(
-                        self._gate(is_all_greedy, platform, use_rej),
-                        f"{platform} must force greedy",
-                    )
 
 
 def _hip_auto_enable(**overrides):

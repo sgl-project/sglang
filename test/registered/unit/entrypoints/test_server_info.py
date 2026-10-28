@@ -32,15 +32,17 @@ import msgspec.structs
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _CustomModelLoader:
@@ -109,6 +111,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    scheduler_info: dict | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -129,9 +132,11 @@ def _call_server_info_with(
         return internal_states or [{"max_req_input_len": 1024}]
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
+    if scheduler_info is None:
+        scheduler_info = {"max_req_input_len": 1024}
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
-        scheduler_info={"max_req_input_len": 1024},
+        scheduler_info=scheduler_info,
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
@@ -171,6 +176,23 @@ class TestServerInfoTransportParity(CustomTestCase):
                     json.loads(leader_json), json.loads(json.dumps(http_info))
                 )
 
+                # The embedded Rust server's launch-time fields, which stamp
+                # the init info the scheduler handshake carries for Python.
+                scheduler = SimpleNamespace(
+                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertEqual(rust_launch.pop("status"), "ready")
+                self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
+                self.assertEqual(rust_launch, json.loads(leader_json))
+
+                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                scheduler.server_args = ServerArgs(
+                    model_path="dummy", page_size=64, enable_http2=True
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertIs(rust_launch["enable_http2"], False)
+
                 with (
                     patch.object(
                         common,
@@ -188,6 +210,28 @@ class TestServerInfoTransportParity(CustomTestCase):
                 load.return_value.start_metadata_server.assert_called_once_with(
                     host="127.0.0.1", port=50051, server_info_json=leader_json
                 )
+
+    def test_rust_server_followers_skip_runtime_metadata_server(self):
+        """A follower node hosting a Rust listener must not bind grpc_port a
+        second time; that node's KV publishers are served by the listener."""
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            patch.object(
+                common,
+                "get_serving",
+                return_value=SimpleNamespace(
+                    host="127.0.0.1",
+                    grpc_port=50051,
+                    smg_grpc_mode=False,
+                    grpc_mode=False,
+                ),
+            ),
+            patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+        ):
+            self.assertIsNone(
+                common.start_follower_grpc_server(ServerArgs(model_path="dummy"), {})
+            )
+        load.return_value.start_metadata_server.assert_not_called()
 
 
 class TestServerInfoKvEventsField(CustomTestCase):
@@ -674,6 +718,40 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
                     load_publish_endpoint=endpoint,
                 )
                 check_load_publish_args(args)  # must not raise
+
+
+class TestServerInfoHicacheLayoutField(CustomTestCase):
+    """The scheduler-reported L3 layout surfaces in `/server_info`."""
+
+    def test_layout_from_scheduler_info_is_surfaced(self):
+        args = ServerArgs(model_path="dummy")
+        layout = {
+            "enabled": True,
+            "backend": "mooncake",
+            "page_size": 256,
+            "hicache_object_layout": {
+                "pools": [],
+                "key_prefix": "deepseek-ai-DeepSeek-V4",
+            },
+        }
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "hicache_object_layout": layout,
+            },
+        )
+
+        self.assertEqual(info["hicache_object_layout"], layout)
+        json.dumps(info)
+
+    def test_legacy_scheduler_without_layout_keeps_field_absent(self):
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        self.assertNotIn("hicache_object_layout", info)
 
 
 if __name__ == "__main__":
