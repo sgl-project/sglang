@@ -531,11 +531,6 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
-        # Capture reads the graph's device prefix once. Replay uses the live
-        # Host input: DFlash/DSPARK already include verify KV, other inputs do not.
-        host_seq_lens_cpu = (
-            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
-        )
         if in_capture:
             self._init_cuda_graph_metadata(
                 bs,
@@ -547,7 +542,11 @@ class AscendAttnBackend(AttentionBackend):
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            seq_lens_cpu=host_seq_lens_cpu,
+            seq_lens_cpu=(
+                forward_batch.seq_lens.cpu()
+                if in_capture
+                else forward_batch.seq_lens_cpu
+            ),
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
