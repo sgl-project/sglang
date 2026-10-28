@@ -144,6 +144,8 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Queued for its demote by the running write-back eviction walk.
+        self.write_back_queued = False
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
@@ -496,6 +498,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
         self._tracked_unbacked_tokens = 0
         self._is_tracking_unbacked_tokens = False
+        self._write_back_queued_count = 0
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -1617,8 +1620,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node is not self.root_node
             and cd.value is not None
             and cd.host_value is not None
-            and node.write_through_pending_id is None
+            and self._is_full_host_value_settled(node)
             and node.load_back_pending_id is None
+        )
+
+    def _is_full_host_value_settled(self, node: UnifiedTreeNode) -> bool:
+        """No in-flight copy writes the node's Full host value (a queued SWA
+        window backup marks ancestors but writes only their SWA slots)."""
+        return not node.write_back_queued and (
+            node.write_through_pending_id is None or self._is_round_write_pending(node)
         )
 
     def _for_each_component_lru(
@@ -1782,8 +1792,28 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def evict_device_end(self, component_type: ComponentType) -> None:
         """Finish a component's device-eviction walk."""
+        assert self._write_back_queued_count == 0, (
+            "a device-eviction walk ended with queued write-back victims not demoted"
+        )
         self.components_by_type[component_type].evict_device_end()
         self._pending_internal_evictions.pop(component_type, None)
+
+    def mark_write_back_queued(
+        self, node_id: NodeId, copied: Sequence[NodeId] = ()
+    ) -> int:
+        node = self.node_by_id(node_id)
+        covered = [self.node_by_id(covered_id) for covered_id in copied]
+        assert not node.write_back_queued and not node.evicted, (
+            f"node {node.id} is not a device-resident victim to queue"
+        )
+        node.write_back_queued = True
+        self._write_back_queued_count += 1
+        if covered:
+            for covered_node in covered:
+                if covered_node is not node:
+                    self._update_duplicate_tracking(covered_node)
+            self.full_host_duplicates.setdefault(node.id, node)
+        return self.components_by_type[BASE_COMPONENT_TYPE].reclaimable_value_len(node)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
@@ -1793,7 +1823,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         the cache to execute and then demote."""
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
-        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        evictable = self._is_device_leaf(
+            node
+        ) or self._is_evictable_after_queued_children(node)
+        assert evictable, f"node {node.id} is not a D-leaf"
+        # Only the running walk's own copies may be in flight; a covered node
+        # joins with a copy of its own, since demoting it would free slots the
+        # pending copy reads.
+        assert node.write_through_pending_id is None or (
+            self._is_round_write_pending(node) and not node.backuped
+        ), f"D-leaf {node.id} has write {node.write_through_pending_id} in flight"
         self._begin_tracking_unbacked_tokens()
         try:
             if not node.backuped:
@@ -1990,10 +2029,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                     break
                 cd = node.component_data[BASE_COMPONENT_TYPE]
-                if cd.value is None or cd.host_value is None:
+                # Queued victims count as demoted.
+                if cd.value is None or cd.host_value is None or node.write_back_queued:
                     swept_ids.append(node.id)  # stale entry
                     continue
-                if spare_imminent_demotes and node in self.evictable_device_leaves:
+                if spare_imminent_demotes and self._is_device_walk_candidate(node):
                     continue
                 if not self._can_reclaim_full_host_duplicate(node):
                     continue
@@ -2012,7 +2052,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node is self.root_node or cd.value is None or cd.host_value is None:
             return False
         if (
-            node.write_through_pending_id is not None
+            not self._is_full_host_value_settled(node)
             or node.load_back_pending_id is not None
         ):
             return False
@@ -2096,6 +2136,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert not node.evicted and node.backuped
+        assert node.write_through_pending_id is None, (
+            f"demoting node {node.id} while write "
+            f"{node.write_through_pending_id} still reads its device slots"
+        )
+        if node.write_back_queued:
+            node.write_back_queued = False
+            self._write_back_queued_count -= 1
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,
@@ -2210,6 +2257,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        assert not node.write_back_queued, (
+            f"deleting node {node.id} while it is queued for a write-back demote"
+        )
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
@@ -2362,6 +2412,39 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ):
             return False
         return True
+
+    def _is_round_write_pending(self, node: UnifiedTreeNode) -> bool:
+        """The node's pending write belongs to the running walk's batch."""
+        if node.write_through_pending_id is None:
+            return False
+        ack_node = self._node_arena.get(node.write_through_pending_id)
+        return ack_node is not None and ack_node.write_back_queued
+
+    def _is_evictable_after_queued_children(self, node: UnifiedTreeNode) -> bool:
+        """D-leaf once the queued victims below it are demoted."""
+        ct = BASE_COMPONENT_TYPE
+        if (
+            node is self.root_node
+            or node.evicted
+            or node.write_back_queued
+            or any(cd.lock_ref > 0 for cd in node.component_data)
+            or (
+                node.write_through_pending_id is not None
+                and not self._is_round_write_pending(node)
+            )
+        ):
+            return False
+        return all(
+            child.component_data[ct].value is None or child.write_back_queued
+            for child in node.children.values()
+        )
+
+    def _is_device_walk_candidate(self, node: UnifiedTreeNode) -> bool:
+        """The Full device walk may take the node: an unqueued D-leaf, or
+        under write_back a parent whose device children are all queued."""
+        if node in self.evictable_device_leaves:
+            return not node.write_back_queued
+        return self.is_write_back and self._is_evictable_after_queued_children(node)
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
         """H-leaf: evicted, Full host value present, no children, unlocked on
@@ -2757,11 +2840,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         marked: list[tuple[int, NodeId]] = []
         for node_id in node_ids:
             node = self.node_by_id(node_id)
-            assert node.write_through_pending_id in (
-                None,
-                ack_id,
-            ), f"node {node.id} is already pending under a different write-through ack"
-            node.write_through_pending_id = ack_id
+            if node.write_through_pending_id is None:
+                node.write_through_pending_id = ack_id
+            elif node.write_through_pending_id != ack_id:
+                # An earlier copy in the same batch covers the node.
+                assert self._is_round_write_pending(node), (
+                    f"node {node.id} is already pending under a different "
+                    "write-through ack"
+                )
             marked.append((self._depth_from_root(node), node_id))
         marked.sort()
         return [node_id for _, node_id in marked]
@@ -2840,12 +2926,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        # mark_write_back_queued already registered a batch's copies.
+        ack_node = self._node_arena.get(ack_id)
+        queued_copy = ack_node is not None and ack_node.write_back_queued
         for node_id in node_ids:
             node = self.node_by_id(node_id)
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
-                # The backed-up copy becomes a tracked duplicate only now.
-                self._update_duplicate_tracking(node)
+                if not queued_copy:
+                    # The backed-up copy becomes a tracked duplicate only now.
+                    self._update_duplicate_tracking(node)
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def _walk_span(self, key: RadixKey, end: int):

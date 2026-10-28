@@ -132,7 +132,12 @@ class SWAComponent(TreeComponent):
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
         ):
-            if cur.write_through_pending_id is not None:
+            # A copy in the same write-back batch already committed this SWA
+            # host value.
+            if (
+                cur.write_through_pending_id is not None
+                and not self.tree_core._is_round_write_pending(cur)
+            ):
                 break
 
             cd = cur.component_data[ct]

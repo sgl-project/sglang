@@ -5052,6 +5052,46 @@ fn demote_rejects_unbackuped_and_evicted_nodes() {
     ));
 }
 
+// A write-back victim [1] whose D->H copy is queued but not acknowledged:
+// its host value is committed and it stays an unlocked D-leaf.
+fn leaf_with_write_in_flight(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeId {
+    tc.insert(&insert_params(&vec![1], &[10]));
+    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new())
+        .expect("live test node");
+    tc.mark_write_through_pending(vec![leaf], leaf)
+        .expect("live test node");
+    assert!(tc.inspect_is_device_evictable_leaf(leaf));
+    leaf
+}
+
+#[test]
+#[should_panic(expected = "while write Some(")]
+fn demote_panics_while_the_backup_still_reads_the_device_slots() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    let _ = tc.demote(leaf);
+}
+
+#[test]
+#[should_panic(expected = "in flight")]
+fn evicting_a_device_leaf_panics_while_its_write_is_in_flight() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    let _ = tc.evict_device_leaf(leaf, /* is_write_back = */ true);
+}
+
+#[test]
+fn demote_after_the_ack_frees_the_device_slots() {
+    let mut tc = write_back_core();
+    let leaf = leaf_with_write_in_flight(&mut tc);
+    tc.finish_write_through(vec![leaf], leaf)
+        .expect("live test node");
+    let step = tc.demote(leaf).expect("acked backup");
+    assert_eq!(step.tracker[&FULL], 1);
+    tc.sanity_check(&[], &[]);
+}
+
 #[test]
 fn fallible_node_boundaries_reject_stale_handles() {
     let mut tc = core();

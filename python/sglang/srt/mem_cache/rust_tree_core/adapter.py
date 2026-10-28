@@ -686,6 +686,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, result)
 
+    def mark_write_back_queued(
+        self, node_id: NodeId, copied: Sequence[NodeId] = ()
+    ) -> int:
+        return self._binding.mark_write_back_queued(node_id, list(copied))
+
     def demote(self, node_id: NodeId) -> DemoteResult:
         binding_result = self._binding.demote(node_id)
         return self._fill_evict_result(binding_result, DemoteResult())

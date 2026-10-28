@@ -1991,6 +1991,17 @@ macro_rules! tree_core_methods {
                 cache_actions_to_py(py, actions)
             }
 
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                py.detach(|| self.core().mark_write_back_queued(node_id, copied))
+                    .map_err(node_access_error)
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3359,6 +3370,16 @@ macro_rules! tree_core_binding {
                     self.inner
                         .commit_load_back(py, node_id, device_indices, kv_xfer, comp_xfers)
                 })
+            }
+
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
             }
 
             /// Release a node's device KV once its host copy exists.

@@ -617,6 +617,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
+    write_back_queued_count: usize,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
@@ -963,6 +964,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
+            write_back_queued_count: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
@@ -1006,6 +1008,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
+        self.write_back_queued_count = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
@@ -2529,8 +2532,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         !node.is_root()
             && node.has_device_value(FULL)
             && node.has_host_value(FULL)
-            && node.write_through_pending_id.is_none()
+            && self.is_full_host_value_settled_(node)
             && !node.is_load_back_pending()
+    }
+
+    /// No in-flight copy writes the node's Full host value (a queued SWA
+    /// window backup marks ancestors but writes only their SWA slots).
+    fn is_full_host_value_settled_(&self, node: &Node<K>) -> bool {
+        !node.write_back_queued
+            && (node.write_through_pending_id.is_none() || self.is_round_write_pending_(node))
     }
 
     /// Apply lru_op to each aux component's LRU that has data on this node.
@@ -2751,8 +2761,40 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Finish a component's device-eviction walk.
     pub fn evict_device_end(&mut self, component_type: ComponentType) {
+        assert_eq!(
+            self.write_back_queued_count, 0,
+            "a device-eviction walk ended with queued write-back victims not demoted"
+        );
         self.component_by_type_(component_type)
             .evict_device_end(self);
+    }
+
+    /// See `UnifiedTreeCoreInterface.mark_write_back_queued`.
+    pub fn mark_write_back_queued(
+        &mut self,
+        node_id: NodeId,
+        copied: Vec<NodeId>,
+    ) -> Result<usize, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let copied = copied
+            .into_iter()
+            .map(|copied_id| self.arena.resolve(copied_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let node = self.arena.node_mut(node_idx);
+        assert!(
+            !node.write_back_queued && node.has_device_value(FULL),
+            "node {node_id} is not a device-resident victim to queue"
+        );
+        node.write_back_queued = true;
+        self.write_back_queued_count += 1;
+        let device_len = node.device_reclaimable_value_len(FULL);
+        if !copied.is_empty() {
+            for covered in copied.into_iter().filter(|&covered| covered != node_idx) {
+                self.update_full_coexisting_host_tracking_(covered);
+            }
+            self.full_coexisting_host_nodes.add(node_idx);
+        }
+        Ok(device_len)
     }
 
     /// Evict one device leaf (demote if backuped, delete if write-through);
@@ -2768,8 +2810,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             let node = self.arena.node(node_id);
             assert!(
-                self.is_evictable_device_leaf_(node),
+                self.is_evictable_device_leaf_(node)
+                    || self.is_evictable_after_queued_children_(node),
                 "node {node_id} is not a D-leaf"
+            );
+            // Only the running walk's own copies may be in flight; a covered
+            // node joins with a copy of its own, since demoting it would free
+            // slots the pending copy reads.
+            assert!(
+                node.write_through_pending_id.is_none()
+                    || (self.is_round_write_pending_(node) && !node.backuped()),
+                "D-leaf {} has write {:?} in flight",
+                node.id,
+                node.write_through_pending_id
             );
         }
         assert!(self.tracked_unbacked_tokens.is_none());
@@ -2989,7 +3042,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         !node.is_root()
             && node.has_device_value(component_type)
             && node.has_host_value(component_type)
-            && node.write_through_pending_id.is_none()
+            && if component_type == FULL {
+                self.is_full_host_value_settled_(node)
+            } else {
+                node.write_through_pending_id.is_none()
+            }
             && !node.is_load_back_pending()
             && node.host_lock_ref(component_type) == 0
     }
@@ -3111,6 +3168,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             let node = self.arena.node(node_id);
             assert!(!node.evicted() && node.backuped());
+            assert!(
+                node.write_through_pending_id.is_none(),
+                "demoting node {} while write {:?} still reads its device slots",
+                node.id,
+                node.write_through_pending_id
+            );
+        }
+        if self.arena.node(node_id).write_back_queued {
+            self.arena.node_mut(node_id).write_back_queued = false;
+            self.write_back_queued_count -= 1;
         }
         self.evict_component_and_detach_lru_(
             node_id,
@@ -3262,6 +3329,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Unlink a leaf from its parent.
     pub fn remove_leaf_from_parent_(&mut self, node_id: NodeIdx_) {
+        assert!(
+            !self.arena.node(node_id).write_back_queued,
+            "deleting node {node_id} while it is queued for a write-back demote"
+        );
         let node_handle = self.arena.node(node_id).id;
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
@@ -3424,6 +3495,44 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         true
+    }
+
+    /// The node's pending write belongs to the running walk's batch.
+    pub(crate) fn is_round_write_pending_(&self, node: &Node<K>) -> bool {
+        node.write_through_pending_id.is_some_and(|ack_id| {
+            self.arena
+                .resolve(ack_id)
+                .is_ok_and(|ack_idx| self.arena.node(ack_idx).write_back_queued)
+        })
+    }
+
+    /// D-leaf once the queued victims below it are demoted.
+    pub(crate) fn is_evictable_after_queued_children_(&self, node: &Node<K>) -> bool {
+        if node.is_root()
+            || node.evicted()
+            || node.is_device_locked()
+            || node.is_load_back_pending()
+            || node.write_back_queued
+            || (node.write_through_pending_id.is_some() && !self.is_round_write_pending_(node))
+        {
+            return false;
+        }
+        node.children.values().all(|&child_id| {
+            let child = self.arena.node(child_id);
+            !child.has_device_value(FULL) || child.write_back_queued
+        })
+    }
+
+    /// The Full device walk may take the node: an unqueued D-leaf, or under
+    /// write_back a parent whose device children are all queued. The walk's
+    /// heap may hold a node freed since it was pushed.
+    pub(crate) fn is_device_walk_candidate_(&self, node_id: NodeIdx_) -> bool {
+        if self.evictable_device_leaves.contains(node_id) {
+            return !self.arena.node(node_id).write_back_queued;
+        }
+        self.is_write_back
+            && self.arena.is_allocated(node_id)
+            && self.is_evictable_after_queued_children_(self.arena.node(node_id))
     }
 
     /// Whether the node is an evictable Full host leaf.
@@ -4594,14 +4703,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut marked: Vec<(usize, NodeId)> = Vec::with_capacity(node_indices.len());
         for (node_id, node_idx) in node_indices {
             let depth = self.depth_from_root_(node_idx);
-            let node = self.arena.node_mut(node_idx);
-            assert!(
-                node.write_through_pending_id.is_none()
-                    || node.write_through_pending_id == Some(ack_id),
-                "node {} is already pending under a different write-through ack",
-                node.id
-            );
-            node.write_through_pending_id = Some(ack_id);
+            let node = self.arena.node(node_idx);
+            match node.write_through_pending_id {
+                None => self.arena.node_mut(node_idx).write_through_pending_id = Some(ack_id),
+                Some(pending_id) if pending_id == ack_id => {}
+                // An earlier copy in the same batch covers the node.
+                Some(_) => assert!(
+                    self.is_round_write_pending_(node),
+                    "node {} is already pending under a different write-through ack",
+                    node.id
+                ),
+            }
             marked.push((depth, node_id));
         }
         marked.sort_unstable();
@@ -4726,11 +4838,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .into_iter()
             .map(|node_id| self.arena.resolve(node_id))
             .collect::<Result<Vec<_>, _>>()?;
+        // mark_write_back_queued already registered a batch's copies.
+        let queued_copy = self
+            .arena
+            .resolve(ack_id)
+            .is_ok_and(|ack_idx| self.arena.node(ack_idx).write_back_queued);
         for node_idx in node_indices {
             let node = self.arena.node_mut(node_idx);
             if node.write_through_pending_id == Some(ack_id) {
                 node.write_through_pending_id = None;
-                self.update_full_coexisting_host_tracking_(node_idx);
+                if !queued_copy {
+                    self.update_full_coexisting_host_tracking_(node_idx);
+                }
             }
             self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
         }

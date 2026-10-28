@@ -3377,6 +3377,58 @@ fn internal_swa_backup_counts_the_collected_window_including_page_overshoot() {
 }
 
 #[test]
+fn a_backup_window_reads_past_nodes_a_queued_eviction_copy_covers() {
+    // a -> b -> {c1 -> c2, d}, one token each, window 3. A queued write-back
+    // copy of c2 covers c2, c1 and b; d's window then reaches a through b, as
+    // it does once that copy's ack has landed.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            swa_sliding_window_size: Some(3),
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let keys = [
+        vec![1],
+        vec![1, 2],
+        vec![1, 2, 3],
+        vec![1, 2, 3, 4],
+        vec![1, 2, 5],
+    ];
+    let mut ids = Vec::new();
+    for key in &keys {
+        let values: Vec<i64> = key.iter().map(|t| t + 10).collect();
+        let id = tc
+            .insert(&insert_params_swa(key, &values, 0, 0))
+            .last_device_node_id
+            .unwrap();
+        let idx = tc.arena.resolve(id).unwrap();
+        store_swa_device(&mut tc, idx);
+        ids.push(id);
+    }
+    let (a, b, c1, c2, d) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+    let (full, mut transfers) = tc.build_backup_spec(c2).unwrap();
+    let mut covered = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    covered.sort_unstable();
+    assert_eq!(covered, vec![b, c1, c2]);
+    for transfer in transfers.values_mut().flatten() {
+        transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+    }
+    tc.commit_backup(c2, full + 1000, transfers).unwrap();
+    let covered = tc.mark_write_through_pending(covered, c2).unwrap();
+    tc.mark_write_back_queued(c2, covered).unwrap();
+
+    let (_, transfers) = tc.build_backup_spec(d).unwrap();
+    let mut window = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    window.sort_unstable();
+    assert_eq!(window, vec![a, d]);
+}
+
+#[test]
 fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
     for guard in [
         "no_hicache",

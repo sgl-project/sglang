@@ -1033,23 +1033,106 @@ class UnifiedRadixCache(BasePrefixCache):
                 walk_quota = max(
                     request_cnt, tracker[ct] + self.tree_core.full_evictable_size()
                 )
-            self.tree_core.evict_device_start(ct, walk_quota)
-            try:
-                while True:
-                    node_id, made_progress = self._evict_device_next_node(ct, tracker)
-                    if node_id is None:
-                        if not made_progress:
-                            break
-                    else:
-                        backup_kv = self._evict_device_leaf(node_id, tracker)
-                    if node_id is not None and backup_kv is not None:
-                        # Deferred demote: run the D->H backup, demote only on success.
+            self._evict_device_walk(
+                ct,
+                walk_quota,
+                request_cnt,
+                tracker,
+                target_reached,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+    def _write_back_batch_tokens(
+        self,
+        ct: ComponentType,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> int:
+        """Full tokens the walk may leave queued before demoting; 0 (demote
+        per victim) when its target is only observable after each demote."""
+        if ct != BASE_COMPONENT_TYPE or allocation_reclaim_satisfied is not None:
+            return 0
+        need = request_cnt - tracker[ct]
+        target = (available_size_targets or {}).get(ct)
+        if target is not None:
+            target_component, target_size = target
+            if target_component != ct:
+                return 0
+            need = min(need, target_size - self._component_available_size(ct))
+        return max(need, 0)
+
+    def _evict_device_walk(
+        self,
+        ct: ComponentType,
+        walk_quota: int,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        target_reached: Callable[[ComponentType], bool],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> None:
+        """One device-eviction walk: write-back victims queue their copies and
+        demotes, then one wait lands the batch. Queued victims count as
+        evicted, so the walk takes the per-victim walk's victims in its order.
+        One decision can differ: a queued victim's fresh host copy is not
+        host-evictable until its demote, so a later victim's host eviction
+        takes another entry."""
+        pending: list[NodeId] = []
+        pending_tokens = 0
+
+        def batch_need() -> int:
+            return self._write_back_batch_tokens(
+                ct,
+                request_cnt,
+                tracker,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+        def demote_queued() -> None:
+            nonlocal pending_tokens
+            self._demote_backed_up(pending, tracker)
+            pending_tokens = 0
+
+        self.tree_core.evict_device_start(ct, walk_quota)
+        try:
+            while True:
+                # Queued victims count as evicted toward the walk's quota.
+                tracker[ct] += pending_tokens
+                node_id, made_progress = self._evict_device_next_node(ct, tracker)
+                tracker[ct] -= pending_tokens
+                if node_id is None:
+                    if not made_progress:
+                        break
+                elif pending and self.tree_core.is_backuped(node_id):
+                    pending.append(node_id)
+                    pending_tokens += self.tree_core.mark_write_back_queued(node_id)
+                else:
+                    backup_kv = self._evict_device_leaf(node_id, tracker)
+                    if backup_kv is not None:
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        if written == 0 and pending:
+                            # Make the queued victims host-evictable, as the
+                            # per-victim walk would have by now, and retry once.
+                            demote_queued()
+                            written = self._execute_and_commit_kv_backup(
+                                backup_kv, write_back=True
+                            )
                         if written > 0:
-                            self.writing_check(write_back=True)
-                            self._demote(node_id, tracker)
+                            pending.append(node_id)
+                            pending_tokens += self.tree_core.mark_write_back_queued(
+                                node_id,
+                                self.ongoing_write_through[node_id].publish_node_ids,
+                            )
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
@@ -1064,10 +1147,26 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
-                    if target_reached(ct):
-                        break
+                if pending and pending_tokens >= batch_need():
+                    demote_queued()
+                if not pending and target_reached(ct):
+                    break
+        finally:
+            try:
+                self._demote_backed_up(pending, tracker)
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _demote_backed_up(
+        self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
+    ) -> None:
+        """Wait once for the queued copies, then demote the nodes in order."""
+        if not node_ids:
+            return
+        self.writing_check(write_back=True)
+        for node_id in node_ids:
+            self._demote(node_id, tracker)
+        node_ids.clear()
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
