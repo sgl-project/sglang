@@ -36,9 +36,8 @@ class EmbeddingNemotron3Model(Ministral3ForCausalLM):
         # only an alias of embed_tokens and adds no parameters.
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.pooler = _FP32Pooler(pooling_type=PoolingType.MEAN, normalize=True)
-        for layer in self.model.layers:
-            if hasattr(layer, "self_attn"):  # Skip pipeline-parallel placeholders.
-                layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
+        for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
+            layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
 
     @torch.no_grad()
     def forward(
