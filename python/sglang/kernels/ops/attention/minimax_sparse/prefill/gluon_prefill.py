@@ -158,8 +158,8 @@ def _get_scratch(
 
 
 def _gather_context_to_shuffle(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -409,8 +409,8 @@ def _kv_scale_tensor(scale: Optional[float], device: torch.device) -> torch.Tens
 
 def can_use_gluon_prefill(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     sink: Optional[torch.Tensor],
     block_size_k: int,
     seq_lens_cpu: Optional[torch.Tensor],
@@ -475,8 +475,8 @@ def _pair_prefill_module(
 @torch.no_grad()
 def _gluon_sparse_prefill_group(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     topk_idx: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
