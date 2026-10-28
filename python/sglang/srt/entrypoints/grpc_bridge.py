@@ -12,11 +12,13 @@ import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -427,22 +429,17 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         return json.dumps(
             msgspec_to_builtins(
-                build_server_info(
-                    self.tokenizer_manager.server_args, self.scheduler_info
+                redact_watermark_secrets(
+                    build_server_info(
+                        self.tokenizer_manager.server_args, self.scheduler_info
+                    )
                 )
             ),
             default=str,
         )
 
     def health_check(self) -> bool:
-        from sglang.srt.managers.tokenizer_manager import ServerStatus
-
-        if self.tokenizer_manager.gracefully_exit:
-            return False
-        return self.tokenizer_manager.server_status not in (
-            ServerStatus.Starting,
-            ServerStatus.UnHealthy,
-        )
+        return self.tokenizer_manager.is_healthy()
 
     def is_pause(self) -> bool:
         """Return the tokenizer manager's authoritative generation pause state."""
@@ -795,7 +792,8 @@ class RuntimeHandle:
                 elif hasattr(result, "body"):
                     resp_bytes = result.body
                 elif isinstance(result, (dict, list)):
-                    resp_bytes = json.dumps(result).encode("utf-8")
+                    # As FastAPI encodes it over HTTP; rerank returns a list of models.
+                    resp_bytes = json.dumps(jsonable_encoder(result)).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
                 status_code = int(

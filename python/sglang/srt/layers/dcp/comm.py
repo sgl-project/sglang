@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     correct_attn_out,
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
+    dcp_pack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -258,12 +259,28 @@ def all_gather_kv_cache_for_mha_extend(
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
 ):
+    """All-gather the DCP group's query heads; ``dtype`` casts q before the wire."""
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
+    if dtype is None or dtype == q_pe.dtype:
+        with use_symmetric_memory(group):
+            # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+            combined = torch.cat(
+                [q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1
+            )
+        gathered = group.all_gather(combined, dim=0)
+    else:
+        B, H, d_nope = q_nope_out.shape
+        with use_symmetric_memory(group):
+            combined = torch.empty(
+                (H, B, q_pe.shape[-1] + d_nope), dtype=dtype, device=q_pe.device
+            )
+        dcp_pack_q(q_nope_out, q_pe, combined)
+        # The aiter custom all-gather only takes 16/32-bit floats and pynccl has
+        # no FP8 dtype: pair the bytes into fp16 when the row allows, an exact copy.
+        wire = torch.float16 if combined.shape[-1] % 2 == 0 else torch.uint8
+        gathered = group.all_gather(combined.view(wire), dim=0).view(dtype)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
@@ -299,17 +316,19 @@ def all_gather_kv_cache_for_mla_extend(
         )
         dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # Attention TP may append dummy tokens to align an extend batch to its
+    # group width. The DCP buffer tracks only real sequence tokens.
+    extend_num_tokens = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         :kv_lora_rank,
-    ] = k_nope
+    ] = k_nope[:extend_num_tokens]
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         kv_lora_rank:,
-    ] = k_pe
+    ] = k_pe[:extend_num_tokens]
 
 
 # all gather kv cache and re-org to query orders

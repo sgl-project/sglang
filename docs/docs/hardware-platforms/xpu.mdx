@@ -63,7 +63,7 @@ The [XPU image tags](https://hub.docker.com/r/lmsysorg/sglang/tags?name=xpu) end
 The image pulling command is like:
 
 ```bash Command
-docker pull lmsysorg/sglang:v0.5.20-xpu
+docker pull lmsysorg/sglang:v0.5.22-xpu
 ```
 
 #### Build from Dockerfile
@@ -283,7 +283,7 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Feature | Status |
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Not yet implemented |
+| Speculative decoding | Supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
 
@@ -302,6 +302,9 @@ It needs the `intel_xpu` attention backend and ranks that share their DCP group'
 KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
 Unsupported features are refused at startup. If startup fails with
 `UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
+
+With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
+kernel runs only on CUDA, so KV is transferred per token instead.
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
