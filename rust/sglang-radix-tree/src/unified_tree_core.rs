@@ -5299,11 +5299,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // Host-only mamba keeps Full on device and the checkpoint on host.
                 let host_only_ok =
                     full_dev && self.components[i].host_only_checkpoint_counts_as_device();
-                if node.has_host_value(ct)
-                    && !full_hst
-                    && !(self.is_write_back && full_dev)
-                    && !host_only_ok
-                {
+                let excused = host_only_ok || (self.is_write_back && full_dev);
+                if node.has_host_value(ct) && !full_hst && !excused {
                     errors.push(format!(
                         "node {node_id} {ct:?} host present but Full.host_value=None"
                     ));
