@@ -5,8 +5,6 @@ Scored by sgl-eval with the GLM-4.7-Flash cookbook sampling settings.
 
 import unittest
 
-import torch
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -19,10 +17,6 @@ from sglang.test.test_utils import (
 register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
-@unittest.skipUnless(
-    torch.xpu.is_available(),
-    "Intel XPU not available (torch.xpu.is_available() returned False)",
-)
 class TestGLM4_7FlashXPU(GSM8KMixin, CustomTestCase):
     model = "zai-org/GLM-4.7-Flash"
     base_url = DEFAULT_URL_FOR_TEST
