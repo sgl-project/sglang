@@ -20,7 +20,7 @@ NUM_HEADS = 64
 TILES = (64, 32, 16)
 
 
-def _pick(seq, num_heads, n_groups, cu=CU, block_per_cu=BLOCK_PER_CU):
+def _pick(seq, num_heads, n_groups, cu=CU, block_per_cu=BLOCK_PER_CU, d_tail=0):
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_h_per_block
 
     return _pick_h_per_block(
@@ -29,6 +29,7 @@ def _pick(seq, num_heads, n_groups, cu=CU, block_per_cu=BLOCK_PER_CU):
         n_groups=n_groups,
         cu=cu,
         block_per_cu=block_per_cu,
+        d_tail=d_tail,
     )
 
 
@@ -86,6 +87,13 @@ class TestPickHPerBlock(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_a_tail_pins_the_tile_to_16(self):
+        """Only h=16 builds when d_tail is 64; a wider tile fails layout inference."""
+        for seq in (1, 12, 80, 512, 14472):
+            for num_heads in (32, 64, 128):
+                with self.subTest(seq=seq, num_heads=num_heads):
+                    self.assertEqual(_pick(seq, num_heads, 8, d_tail=64), 16)
 
     def test_empty_grid_falls_back_to_16(self):
         self.assertEqual(_pick(seq=1, num_heads=NUM_HEADS, n_groups=1), 16)

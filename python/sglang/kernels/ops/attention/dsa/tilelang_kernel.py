@@ -80,7 +80,12 @@ def _pick_h_per_block(
     n_groups: int,
     cu: int,
     block_per_cu: int,
+    d_tail: int,
 ) -> int:
+    # A tail makes TileLang infer two layouts for acc_s and refuse to build any
+    # tile but 16; d_tail=0 accepts all three.
+    if d_tail:
+        return 16
     # Largest tile that still fills the grid. A tile wider than num_heads pads
     # rows without shrinking the grid, so candidates stop at num_heads.
     exact = [h for h in (64, 32, 16) if h <= num_heads and num_heads % h == 0]
@@ -1236,6 +1241,7 @@ def tilelang_sparse_fwd(
                     n_groups=ni // inner_iter,
                     cu=cu,
                     block_per_cu=block_per_cu,
+                    d_tail=tail_dim,
                 )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
