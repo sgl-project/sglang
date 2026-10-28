@@ -20,10 +20,12 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
+    state = None  # no recurrent state
+
     def __init__(self, base=1000, page_size=1):
         self.base = base
         self.page_size = page_size

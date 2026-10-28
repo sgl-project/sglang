@@ -30,17 +30,17 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
     UnifiedKVPool,
     _check_bs1_feasibility_floor,
     _reserved_floor_bytes,
-    init_unified_swa_pools,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -66,7 +66,7 @@ def _swa_factory(**over):
         need_sort=False,
     )
     kw.update(over)
-    return init_unified_swa_pools(**kw)
+    return build_test_unified_pools(**kw)
 
 
 def _entry_bytes():

@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
@@ -41,7 +42,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -428,6 +429,8 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             kvcache=pool,
             need_sort=False,
         )
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
         tree = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,
@@ -451,7 +454,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             origin_input_ids=array("q", self.PROMPT),
             sampling_params=SamplingParams(max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         kv_indices = allocator.alloc(len(self.PROMPT))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices

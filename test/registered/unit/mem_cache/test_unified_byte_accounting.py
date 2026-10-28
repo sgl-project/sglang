@@ -27,16 +27,14 @@ live + holes + pending pages at EVERY point of a lifecycle, not just at rest.
 import unittest
 
 from test_multi_ended_allocator import TestPagedMultiEndedAllocator as _PagedFixture
-from test_multi_ended_allocator import (
-    TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
-)
+from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
 
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _swa_composite():

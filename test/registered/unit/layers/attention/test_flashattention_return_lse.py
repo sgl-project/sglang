@@ -14,7 +14,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestFlashAttentionReturnLse(CustomTestCase):
@@ -57,7 +57,9 @@ class TestFlashAttentionReturnLse(CustomTestCase):
                 is_draft_worker=False,
                 kv_index_translator=KVIndexTranslator(
                     req_to_token=req_pool.req_to_token,
-                    token_to_kv_pool_allocator=object(),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        hands_out_virtual_ids=False
+                    ),
                     token_to_kv_pool=pool,
                     page_size=1,
                     device="cuda",

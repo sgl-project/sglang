@@ -24,11 +24,13 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
@@ -46,7 +48,9 @@ def make_xqa_backend(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
-    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "resolve_window_kv_pool", lambda *args: None
+    )
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -83,6 +87,7 @@ def make_xqa_backend(monkeypatch):
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
+            is_draft_worker=False,
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -308,8 +313,9 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
     page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
     for row, pages in enumerate(row_pages):
         page_table[row, : len(pages)] = torch.tensor(pages)
-    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
-    v = torch.randn_like(k)
+    # V before K in one buffer: never the fused-halves layout fmha_v2 reads
+    # without a copy, so the prefill takes the copy path.
+    v, k = torch.randn(2, pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
     backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
 
     backend.kv_index_translator = SimpleNamespace(
@@ -512,8 +518,10 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     # matching the real __init__'s parent binding.
     backend.kv_index_translator = KVIndexTranslator(
         req_to_token=backend.req_to_token,
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=PAGE_SIZE,
         device="cpu",
     )
@@ -1062,10 +1070,11 @@ def test_swa_cache_write_uses_metadata_slot_snapshot():
         raise AssertionError("cache writes must not read the live SWA mapping")
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend._swa_kv_pool = SimpleNamespace(
-        layers_mapping={1: (0, True)},
-        translate_loc_from_full_to_swa=translate_live_mapping,
+    swa_pool = SimpleNamespace(translate_loc_from_full_to_swa=translate_live_mapping)
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(IdSpaceKind.SLIDING_WINDOW, None, {1: 0})]
     )
+    backend._swa_kv_pool = swa_pool
     backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
     forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
 

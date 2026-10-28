@@ -32,19 +32,20 @@ import unittest
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _SWA = ComponentType.SWA
@@ -75,9 +76,11 @@ def _build_swa_composite(n_full=64, n_swa=64):
         enable_memory_saver=False,
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
+        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -116,6 +119,8 @@ class _StaticAllocRecorder:
     tensor and a real `set_full_to_swa_mapping`, so the handler must keep
     routing static pools through the original recipe."""
 
+    hands_out_virtual_ids = False
+
     def __init__(self, n=16):
         self.full_to_swa_index_mapping = torch.arange(n, dtype=torch.int64)
         self.mapping_calls = []
@@ -152,7 +157,7 @@ class _StaticAllocRecorder:
 class _RecoverTestBase(unittest.TestCase):
     def _probe(self):
         allocator = _build_swa_composite()
-        self.assertIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        self.assertIsInstance(allocator, ChainAllocator)
         return _Probe(allocator), allocator
 
     def _two_ranges(self, allocator, n=4):
@@ -227,7 +232,9 @@ class TestRecoverActionHandler(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
         self.assertTrue(
-            bool((allocator.translate_loc_from_full_to_swa(kept) == 0).all()),
+            bool(
+                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) == 0).all()
+            ),
             "precondition: a tombstoned range translates to the sink",
         )
         # Snapshot AFTER the setup traffic: the invariant under test is that
@@ -257,7 +264,9 @@ class TestRecoverActionHandler(_RecoverTestBase):
             "the incoming ids' FULL side must come back",
         )
         self.assertTrue(
-            bool((allocator.translate_loc_from_full_to_swa(kept) > 0).all()),
+            bool(
+                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
+            ),
             "after recovery the node's ids must address live swa pages",
         )
 
@@ -316,7 +325,9 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
         )
 
         self.assertTrue(
-            bool((allocator.translate_loc_from_full_to_swa(kept) > 0).all()),
+            bool(
+                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
+            ),
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(

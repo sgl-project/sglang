@@ -31,7 +31,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -48,11 +48,9 @@ def _make_pool(
 ):
     """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MHASubPoolSpec,
-        UnifiedKVPool,
-    )
+    from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 
     mamba_spec = MambaSubPoolSpec(
         name="mamba",

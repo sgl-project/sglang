@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -60,8 +61,8 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -672,7 +673,9 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(set(load_by_pool), {PoolName.KV, PoolName.SWA})
         for transfer in load_by_pool.values():
             self.assertEqual(transfer.keys, all_keys[2:4])
-        translated = consumer_allocator.translate_loc_from_full_to_swa(loaded)
+        translated = consumer_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            loaded
+        )
         self.assertTrue(
             torch.equal(translated, load_by_pool[PoolName.SWA].device_indices)
         )

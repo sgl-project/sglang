@@ -23,7 +23,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class RecordingAllocator(BaseTokenToKVPoolAllocator):
@@ -211,8 +211,11 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
 
 def test_hybrid_pool_stats_exclude_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
-    pool.mamba_allocator = SimpleNamespace(available_size=lambda: 1)
-    pool.mamba_pool = SimpleNamespace(size=1)
+    allocator.state = SimpleNamespace(
+        slots=SimpleNamespace(available_size=lambda: 1),
+        pool=SimpleNamespace(size=1),
+        ckpt_pool=None,
+    )
     observer = SchedulerPoolStatsObserver(
         tree_cache=SimpleNamespace(
             supports_mamba=lambda: True, supports_prefix_sharing=lambda: False
@@ -264,10 +267,10 @@ def test_streaming_session_release_frees_compressed_slots():
 def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     allocator.free_pages = torch.arange(6, 70, dtype=torch.int64)
-    pool.mamba_pool = SimpleNamespace(size=1)
-    pool.mamba_allocator = SimpleNamespace(
-        size=1,
-        free_slots=torch.empty(0, dtype=torch.int64),
+    allocator.state = SimpleNamespace(
+        slots=SimpleNamespace(size=1, free_slots=torch.empty(0, dtype=torch.int64)),
+        pool=SimpleNamespace(size=1),
+        ckpt_pool=None,
     )
     checker = SchedulerInvariantChecker(
         is_hybrid_swa=False,

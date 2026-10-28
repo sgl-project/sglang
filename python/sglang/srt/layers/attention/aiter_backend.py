@@ -26,7 +26,11 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    resolve_window_id_space,
+    resolve_window_kv_pool,
+)
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -91,8 +95,8 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -201,6 +205,8 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # (capturing, seq_lens + max_q_len) for target-verify attention
+    verify_seqused_k: Optional[tuple] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
     asm_ctx_ready: bool = False
@@ -504,11 +510,13 @@ class AiterAttnBackend(AttentionBackend):
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
         # pool is its own draft pool, but its draft path reads target KV, so the
-        # SWA mapping must still come from the target allocator. Mirrors
-        # TRTLLMHAAttnBackend._resolve_swa_kv_pool.
-        self.swa_kv_pool = self._resolve_swa_kv_pool(model_runner)
+        # SWA mapping must still come from the target allocator.
+        self.swa_kv_pool = resolve_window_kv_pool(model_runner)
+        # The window id space of that pool, which these reads map through.
+        self.swa_space = resolve_window_id_space(model_runner, self.swa_kv_pool)
         self.use_sliding_window_kv_pool = (
-            self.swa_kv_pool is not None and self.swa_kv_pool.swa_layer_nums > 0
+            self.swa_kv_pool is not None
+            and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
@@ -518,10 +526,10 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
-            if isinstance(pool, SWAKVPool):
-                return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
-                    "vectorized_5d"
-                )
+            # A pool with a window sub-pool reports its owner view's layout.
+            router = pool.layer_router
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                pool = router.view(IdSpaceKind.FULL)
             return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
@@ -569,9 +577,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
-        )
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32
+        ).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -744,6 +752,21 @@ class AiterAttnBackend(AttentionBackend):
         if self.kv_cache_dtype != fp8_dtype:
             return "auto"
         return "fp8_e4m3"
+
+    def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``q`` to fp8 with the static q scale.
+
+        Returns ``(q_fp8, q_descale)``; ``q_descale`` must be passed as the
+        attention kernel's ``q_descale``. The KV cache ``k_scale`` is calibrated
+        for K, not q, so it cannot stand in for q's scale. The quant kernel
+        saturates, whereas ``.to(fp8)`` turns out-of-range values into NaN on
+        e4m3fnuz. ``q`` is often a strided view into the fused qkv output, and
+        the quant kernel reads its input as contiguous rows.
+        """
+        q_fp8, _ = scaled_fp8_quant(
+            q.reshape(q.shape[0], -1).contiguous(), self.q_scale
+        )
+        return q_fp8.view(q.shape), self.q_scale
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -2002,9 +2025,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.swa_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                    self.swa_space.ids(forward_batch.out_cache_loc)
                 )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
@@ -2033,9 +2054,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.swa_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
+            swa_out_cache_loc = self.swa_space.ids(forward_batch.out_cache_loc)
         # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
         # verify sizes from its page table instead.
         if forward_batch.seq_lens_cpu is not None:
@@ -2103,11 +2122,7 @@ class AiterAttnBackend(AttentionBackend):
                     if self.use_sliding_window_kv_pool:
                         # AITER attention kernels require int32 page indices;
                         # full_to_swa_index_mapping is stored as int64.
-                        swa_page_table = (
-                            self.swa_kv_pool.translate_loc_from_full_to_swa(
-                                kv_indices
-                            ).to(torch.int32)
-                        )
+                        swa_page_table = self.swa_space.ids(kv_indices).to(torch.int32)
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
@@ -2564,7 +2579,7 @@ class AiterAttnBackend(AttentionBackend):
                     # AITER attention kernels (e.g. mha_batch_prefill_func)
                     # require int32 page indices; full_to_swa_index_mapping is
                     # stored as int64.
-                    swa_page_table = self.swa_kv_pool.translate_loc_from_full_to_swa(
+                    swa_page_table = self.swa_space.ids(
                         self.indices_updater_prefill.kv_indices
                     ).to(torch.int32)
 
@@ -3019,10 +3034,8 @@ class AiterAttnBackend(AttentionBackend):
                         if self.use_sliding_window_kv_pool:
                             # AITER attention kernels require int32 page indices;
                             # full_to_swa_index_mapping is stored as int64.
-                            swa_page_indices = (
-                                self.swa_kv_pool.translate_loc_from_full_to_swa(
-                                    page_indices
-                                ).to(torch.int32)
+                            swa_page_indices = self.swa_space.ids(page_indices).to(
+                                torch.int32
                             )
 
                             page_indices = self._transform_table_1_to_real(page_indices)
@@ -3637,26 +3650,6 @@ class AiterAttnBackend(AttentionBackend):
             )
 
     @staticmethod
-    def _resolve_swa_kv_pool(model_runner):
-        """Return the SWAKVPool to translate against, or None for non-SWA models.
-
-        EAGLE draft workers share the target allocator for token bookkeeping but
-        own a separate draft KV pool, so the target allocator's SWA mapping must
-        not be used for them. FROZEN_KV MTP is the exception: its draft path reads
-        target KV directly, so it still needs the allocator pool when the active
-        pool is not itself an SWAKVPool. Mirrors
-        ``TRTLLMHAAttnBackend._resolve_swa_kv_pool``.
-        """
-        active_pool = model_runner.token_to_kv_pool
-        if isinstance(active_pool, SWAKVPool):
-            return active_pool
-        if getattr(model_runner, "is_draft_worker", False):
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
-        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
-        return kvcache if isinstance(kvcache, SWAKVPool) else None
-
-    @staticmethod
     def _reject_paged_decode_sliding_window(layer):
         """Reject sliding-window layers on the aiter paged-decode path.
 
@@ -4178,6 +4171,17 @@ class AiterAttnBackend(AttentionBackend):
                         and not layer.logit_cap
                         and sinks is None
                     )
+                    # One add per forward, shared by every layer, so the asm kernel's
+                    # per-forward seg-plan cache (keyed on this tensor) hits after layer 0.
+                    md = self.forward_metadata
+                    cap = torch.cuda.is_current_stream_capturing()
+                    hit = md.verify_seqused_k
+                    if hit is None or hit[0] != cap:
+                        hit = md.verify_seqused_k = (
+                            cap,
+                            forward_batch.seq_lens + md.max_q_len,
+                        )
+                    seqused_k = hit[1]
                     if use_unified_attention_3d_mtp:
                         unified_attention_3d_mtp_func(
                             q=q_unified,
@@ -4185,9 +4189,7 @@ class AiterAttnBackend(AttentionBackend):
                             v=v_unified,
                             out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                             cu_seqlens_q=self.forward_metadata.qo_indptr,
-                            seqused_k=(
-                                forward_batch.seq_lens + self.forward_metadata.max_q_len
-                            ),
+                            seqused_k=seqused_k,
                             max_seqlen_q=self.forward_metadata.max_q_len,
                             max_seqlen_k=max_kv_len,
                             softmax_scale=layer.scaling,
@@ -4216,9 +4218,7 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -4572,8 +4572,7 @@ class AiterAttnBackend(AttentionBackend):
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                q, q_descale = self._quantize_q_fp8(q)
 
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -4814,10 +4813,7 @@ class AiterAttnBackend(AttentionBackend):
                     return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q, _ = scaled_fp8_quant(q, q_descale)
+                    q, q_descale = self._quantize_q_fp8(q)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -4836,7 +4832,7 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
-                    softcap=0,
+                    softcap=layer.logit_cap,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -4865,8 +4861,8 @@ class AiterAttnBackend(AttentionBackend):
                     aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    k_descale if k_descale is not None else self.k_scale,
+                    v_descale if v_descale is not None else self.v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )

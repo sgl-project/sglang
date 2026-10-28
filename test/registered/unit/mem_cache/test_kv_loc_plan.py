@@ -40,22 +40,23 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache import kv_index_translator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, TokenSpan
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind, TokenSpan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -115,6 +116,9 @@ class _FakeKVCache:
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
         self.allocator = None
 
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
     def attach_allocator(self, allocator):
         self.allocator = allocator
 
@@ -170,9 +174,11 @@ class TestKVLocPlan(CustomTestCase):
             ),
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        self.allocator = UnifiedSWATokenToKVPoolAllocator(
+        self.allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -298,7 +304,7 @@ class TestKVLocPlan(CustomTestCase):
         real_build = kv_index_translator.build_kv_read_table
 
         swa_writes = []
-        real_swa_write = self.allocator.translate_loc_from_full_to_swa
+        real_swa_write = self.allocator.id_spaces()[_SWA].write
 
         def counting_write(ids, *a, **kw):
             writes.append(ids)
@@ -727,6 +733,41 @@ class TestKVLocPlan(CustomTestCase):
             self.assertTrue(torch.equal(target_batch.out_cache_loc, local_ids))
             self.assertTrue(torch.equal(draft_batch.out_cache_loc, global_ids))
             self.assertIs(plan.write_virtual, global_ids)
+
+    def test_an_npu_dcp_target_maps_per_call_ids_as_its_pool_does(self):
+        """Only the plan's write window is rank-local on an NPU DCP target. A
+        consumer outside the plan (a backend mapping its page table, a model
+        writing its window) passes allocator-global ids, so it must get the
+        pool's own full -> window map, not the localized one the plan writes
+        through."""
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=2, dcp_rank=1, attn_dcp_size=1
+        )
+        pool = SWAKVPool.__new__(SWAKVPool)
+        pool.full_to_swa_index_mapping = torch.arange(100, 132)
+        with (
+            patch.object(kv_index_translator, "_is_npu", True),
+            patch.object(kv_index_translator, "get_parallel", return_value=parallel),
+        ):
+            target = KVIndexTranslator(
+                req_to_token=self.req_to_token,
+                token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+                token_to_kv_pool=pool,
+                page_size=4,
+                device=_DEV,
+            )
+        global_ids = torch.arange(8, 16)
+        self.assertTrue(
+            torch.equal(target.ids_in(_SWA, global_ids), torch.arange(108, 116))
+        )
+        self.assertTrue(torch.equal(target.ids_in(_FULL, global_ids), global_ids))
+        # The plan's writes, by contrast, are this rank's slots.
+        self.assertTrue(
+            torch.equal(
+                target.space(_FULL).write(global_ids),
+                torch.tensor([-1, -1, -1, -1, 4, 5, 6, 7]),
+            )
+        )
 
     def test_runner_slots_are_used_as_they_are(self):
         for translator, writes_swa in (

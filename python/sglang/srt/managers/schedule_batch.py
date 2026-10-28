@@ -59,9 +59,9 @@ import hashlib
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
-from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from typing import (
@@ -126,6 +126,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -342,31 +343,6 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
-
-
-class Modality(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    AUDIO = auto()
-
-    @staticmethod
-    def from_str(modality_str: str):
-        try:
-            return Modality[modality_str.upper()]
-        except KeyError:
-            raise ValueError(
-                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
-            )
-
-    @staticmethod
-    def all():
-        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
-
-
-class MultimodalInputFormat(Enum):
-    NORMAL = auto()
-    PROCESSOR_OUTPUT = auto()
-    PRECOMPUTED_EMBEDDING = auto()
 
 
 # Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
@@ -994,6 +970,11 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -1169,13 +1150,14 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
         self._think_start_match_len = 0
 
-        # Only custom logit processors need the "__req__" reference cycle.
+        # Only custom logit processors read "__req__", and the reference is weak
+        # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
-                "__req__": self
+                "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
@@ -1206,6 +1188,8 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Owned by Scheduler.defer_response until its completion is retired.
+        self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
@@ -2123,11 +2107,11 @@ class Req(ReqDllmMixin):
             )
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
-        if allocator.get_kvcache().cpu_copy_carries_mamba:
+        if allocator.cpu_copy_carries_mamba:
             return None
         if not isinstance(req_to_token_pool, HybridReqToTokenPool):
             return None
-        return req_to_token_pool.mamba_pool
+        return allocator.state.pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2158,7 +2142,7 @@ class Req(ReqDllmMixin):
         # Loads both the kv cache and mamba state if exists
         mamba_cpu = self.kv.retraction_backup.mamba_cpu
         if mamba_cpu is not None and self.kv.holds_mamba:
-            req_to_token_pool.mamba_pool.load_cpu_copy(
+            token_to_kv_pool_allocator.state.pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
         token_to_kv_pool_allocator.load_cpu_copy(
@@ -2353,7 +2337,7 @@ def set_mamba_track_indices_from_reqs(
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
-        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+        # been given a ping-pong buffer yet (e.g., spec v2 verify path).
         # Keep the gather in bounds for those requests. Freed rows are
         # invalidated below so they cannot scatter into a recycled slot.
         track_positions = [
@@ -3664,7 +3648,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No evict-retry: a transient slot is not worth evicting a
                 # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = pool.mamba_allocator.alloc(1)
+                new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
@@ -3688,7 +3672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            pool.mamba_allocator.free(buf[next_idx].unsqueeze(0))
+            self.token_to_kv_pool_allocator.state_slots.free(buf[next_idx].unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, next_idx, -1)
             req.kv.mamba_next_track_idx = 1 - next_idx
 
@@ -3723,7 +3707,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     # No evict-retry: a transient slot is not worth
                     # evicting a cached checkpoint for.
-                    new_slot = pool.mamba_allocator.alloc(1)
+                    new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
                 if new_slot is not None:
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True
@@ -4023,6 +4007,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_pool_indices=self.req_pool_indices,
             req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,

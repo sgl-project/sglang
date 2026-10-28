@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
@@ -17,8 +18,47 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def resolve_window_kv_pool(model_runner: ModelRunner) -> Optional[KVCache]:
+    """The pool whose window sub-pool this runner's window layers address, or
+    None when there is none.
+
+    A draft runner shares the target's allocator for token bookkeeping but owns
+    a separate KV pool, so the allocator's pool is not its pool. A frozen-KV MTP
+    draft is the exception: it reads the target's KV directly.
+    """
+    active_pool = model_runner.token_to_kv_pool
+    if active_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return active_pool
+    if (
+        model_runner.is_draft_worker
+        and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+    ):
+        return None
+    kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+    if kvcache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return kvcache
+    return None
+
+
+def resolve_window_id_space(
+    model_runner: ModelRunner, window_pool: Optional[KVCache]
+) -> Optional[IdSpace]:
+    """How ``window_pool``'s window sub-pool names the iteration's slots: by
+    its allocator's tables when the allocator hands out virtual ids for that
+    pool (the unified pool's tables are its allocator's), else as the pool
+    maps them itself."""
+    if window_pool is None:
+        return None
+    allocator = model_runner.token_to_kv_pool_allocator
+    if allocator.hands_out_virtual_ids and allocator.get_kvcache() is window_pool:
+        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+    return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 
 class SharedReadEnds(Enum):
@@ -63,6 +103,10 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Whether target verify runs correctly under decode context parallelism:
+    # each rank reads its shard of the DCP-widened pages with the global causal
+    # bound and returns its LSE for the cross-rank merge.
+    supports_dcp_target_verify: bool = False
     # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
     # skips cached-row compression for replay rows folded into the extend.
     folds_encoder_swa_replay: bool = False

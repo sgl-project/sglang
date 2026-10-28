@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _BonusTokenVerifyInput(SpecInput):
@@ -168,6 +168,7 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     backend.use_dense_fp8_chunked_prefill = False
     backend.allow_bidirectional_attention_in_extend = False
     backend.page_size = 1
+    backend.use_sliding_window_kv_pool = False
     backend.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=lambda _layer_id: torch.zeros((1, 1, 4)),
         get_value_buffer=lambda _layer_id: torch.zeros((1, 1, 4)),

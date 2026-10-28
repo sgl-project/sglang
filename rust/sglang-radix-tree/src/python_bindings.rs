@@ -1000,6 +1000,13 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Lock the core for an O(1) read, releasing the GIL only to wait for a busy core.
+            fn core_attached(&self, py: Python<'_>) -> std::sync::MutexGuard<'_, $core<K>> {
+                pyo3::sync::MutexExt::lock_py_attached(&self.core, py).unwrap_or_else(|_| {
+                    panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
+                })
+            }
+
             /// Reject an insert value whose dtype, device, or length cannot cover the key.
             fn validate_insert_value(&self, value: &Tensor, key_atom_len: usize) -> PyResult<()> {
                 if value.kind() != Kind::Int64 {
@@ -1198,7 +1205,7 @@ macro_rules! tree_core_methods {
 
             /// Whether an insert walk is suspended at a barrier.
             fn has_ongoing_insert(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().has_ongoing_insert())
+                self.core_attached(py).has_ongoing_insert()
             }
 
             /// Finish the insert (idempotent); returns still-pending actions to drain.
@@ -1596,34 +1603,34 @@ macro_rules! tree_core_methods {
 
             /// Evictable token count of the FULL (base) component.
             fn evictable_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().evictable_size())
+                self.core_attached(py).evictable_size()
             }
 
             /// Protected (locked) token count of the FULL (base) component.
             fn protected_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().protected_size())
+                self.core_attached(py).protected_size()
             }
 
             /// FULL component evictable token count.
             fn full_evictable_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().full_evictable_size())
+                self.core_attached(py).full_evictable_size()
             }
 
             /// FULL component protected token count.
             fn full_protected_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().full_protected_size())
+                self.core_attached(py).full_protected_size()
             }
 
             /// Evictable token count for one component (0 if the component is absent).
             fn component_evictable_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
                 let ct = parse_component_type(component_type)?;
-                Ok(py.detach(|| self.core().component_evictable_size(ct)))
+                Ok(self.core_attached(py).component_evictable_size(ct))
             }
 
             /// Protected token count for one component (0 if the component is absent).
             fn component_protected_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
                 let ct = parse_component_type(component_type)?;
-                Ok(py.detach(|| self.core().component_protected_size(ct)))
+                Ok(self.core_attached(py).component_protected_size(ct))
             }
 
             /// (full_tokens, aux_tokens) summed across the whole tree.
@@ -1644,7 +1651,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the host tier runs as a storage staging buffer, not a cache.
             fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().is_host_memory_buffer_only())
+                self.core_attached(py).is_host_memory_buffer_only()
             }
 
             /// Mark the host tier (HiCache) as wired.
@@ -1654,7 +1661,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the host tier (HiCache) is wired.
             fn enable_hicache(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_hicache())
+                self.core_attached(py).enable_hicache()
             }
 
             /// Mark the SWA host pool as wired (HiCache).
@@ -1664,7 +1671,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the SWA host pool is wired.
             fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().has_swa_host_pool())
+                self.core_attached(py).has_swa_host_pool()
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
@@ -2075,7 +2082,7 @@ macro_rules! tree_core_methods {
 
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().is_write_back())
+                self.core_attached(py).is_write_back()
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.
@@ -2085,7 +2092,7 @@ macro_rules! tree_core_methods {
 
             /// The current write-through backup hit threshold.
             fn write_through_threshold(&self, py: Python<'_>) -> i64 {
-                py.detach(|| self.core().write_through_threshold())
+                self.core_attached(py).write_through_threshold()
             }
 
             /// Mark the storage tier (L3) wired; storage attaches after tree construction.
@@ -2095,7 +2102,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the storage tier (L3) is wired.
             fn enable_storage(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_storage())
+                self.core_attached(py).enable_storage()
             }
 
             /// Enable or disable the direct external-cache linker.
@@ -2106,7 +2113,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the direct external-cache linker is wired.
             fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_external_cache_linker())
+                self.core_attached(py).enable_external_cache_linker()
             }
 
             /// Queue the all-cleared placement event.
@@ -2277,7 +2284,7 @@ macro_rules! tree_core_methods {
 
             /// Order-sensitive digest of reclaimed coexisting host values.
             fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
-                py.detach(|| self.core().write_back_coexist_reclaim_digest())
+                self.core_attached(py).write_back_coexist_reclaim_digest()
             }
 
             /// Whether the component's data is device-evicted but host-backed.

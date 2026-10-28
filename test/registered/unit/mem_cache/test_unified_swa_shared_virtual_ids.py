@@ -30,13 +30,13 @@ import unittest
 import torch
 from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
@@ -65,9 +65,13 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
         device=_DEV,
         enable_memory_saver=False,
     )
-    return UnifiedSWATokenToKVPoolAllocator(
+    return ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=_FakeUnifiedSWAKVPool(pool),
+        views=stand_in_views(
+            ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
+        ),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,

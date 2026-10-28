@@ -42,12 +42,12 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import unified_draft_pool
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -60,11 +60,7 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftSWAKVPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    _store_dtype_for,
-)
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -73,6 +69,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=35, stage="weekly", runner_config="cpu")
 maybe_stub_sgl_kernel()
@@ -211,9 +208,13 @@ class TestDraftBindingDispatch(CustomTestCase):
                 else None
             ),
         )
-        return UnifiedSWATokenToKVPoolAllocator(
+        return ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
+            ),
             device="cpu",
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -232,7 +233,8 @@ class TestDraftBindingDispatch(CustomTestCase):
         req_to_token_pool="shared",
     ):
         if req_to_token_pool == "shared":
-            req_to_token_pool = object()
+            # The target's table: slot ids only, no recurrent state.
+            req_to_token_pool = SimpleNamespace(state=None)
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -240,7 +242,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         cfg.spec_algorithm = algorithm
         cfg.page_size = _PS
         cfg.is_hybrid_swa = False
-        cfg.is_hybrid_swa_mtp_draft = False
+        cfg.draft_owns_its_depth = False
         cfg.model = object()
         cfg.model_config = SimpleNamespace(hf_config=None, is_hybrid_swa=False)
         sizes = kcc._PoolSizes(
@@ -259,7 +261,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         def _capture(self, *, sizes, **kw):
             raise _CapturedSizes(sizes)
 
-        built_req_pool = SimpleNamespace(kind="private-compact")
+        built_req_pool = SimpleNamespace(kind="private-compact", state=None)
 
         with (
             patch.object(

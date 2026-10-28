@@ -16,7 +16,7 @@
 With post-capture sizing the shared arena is reserved as CUDA virtual memory
 before graph capture: only the slot-0 sink is physically backed, the graphs
 capture the final tensor address, and ``finalize_backing`` backs the measured
-byte budget in place. ``UnifiedSWATokenToKVPoolAllocator.resize`` then
+byte budget in place. ``ChainAllocator.resize`` then
 re-derives every capacity the sub-allocators and sub-pools expose.
 
 The oracle is the eagerly-allocated pool of the same final size: a resized pool
@@ -29,10 +29,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 _RESERVED_BYTES = 64 << 20
 _FINAL_BYTES = 16 << 20
@@ -40,7 +40,7 @@ _PAGE_SIZE = 4
 
 
 def _bundle(*, total_bytes: int, post_capture_active: bool):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cuda",
         kv_cache_dtype=torch.float16,
         head_num=2,
@@ -73,15 +73,14 @@ def _capacities(bundle) -> dict:
         "active_allocation_bytes": shared.active_allocation_bytes,
         "buf_lens": kvcache.get_contiguous_buf_infos()[1],
         "kvcache.size": kvcache.size,
-        "kvcache.size_swa": kvcache.size_swa,
         "allocator.size": allocator.size,
         "allocator.available_size": allocator.available_size(),
         "allocator.full_available_size": allocator.full_available_size(),
         "allocator.swa_available_size": allocator.swa_available_size(),
     }
     for name, sub, pool in (
-        ("full", allocator.full_attn_allocator, kvcache.full_kv_pool),
-        ("swa", allocator.swa_attn_allocator, kvcache.swa_kv_pool),
+        ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
+        ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
         out[f"{name}.max_slots"] = shared.max_slots(name)
         out[f"{name}.sub.max_slots"] = sub.max_slots

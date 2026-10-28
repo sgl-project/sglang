@@ -18,7 +18,7 @@ from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _ReadStream:
@@ -27,6 +27,10 @@ class _ReadStream:
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
+
+    def space(self, kind):
+        # A pool without a window sub-pool has no window id space.
+        return None
 
     def pack_read_stream(
         self,

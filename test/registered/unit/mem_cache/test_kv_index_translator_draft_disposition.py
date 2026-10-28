@@ -30,11 +30,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -43,12 +42,13 @@ from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftSWAKVPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
@@ -58,6 +58,9 @@ class _FakeKVCache:
     def __init__(self, max_slots):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
         self.allocator = None
+
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
     def attach_allocator(self, allocator):
         self.allocator = allocator
@@ -113,9 +116,11 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         fused_draft=FusedDraftPlacement.from_counts(counts=counts, regions=regions),
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
+        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -218,7 +223,9 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             )
         (draft_write, draft_read), (target_write, target_read) = views
         self.assertTrue(
-            torch.equal(draft_write, allocator.translate_loc_from_full_to_swa(v))
+            torch.equal(
+                draft_write, allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
+            )
         )
         self.assertTrue(torch.equal(draft_write, target_write))
         self.assertTrue(torch.equal(draft_read, target_read))
@@ -279,7 +286,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         dense_fb, target_fb = batch(), batch()
         dense.bind_own_plan(dense_fb)
         target.bind_own_plan(target_fb)
-        expected = allocator.translate_loc_from_full_to_swa(v)
+        expected = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertTrue(torch.equal(window_ids(window, dense_fb.kv_loc_plan), expected))
         self.assertTrue(
             torch.equal(window_ids(target, target_fb.kv_loc_plan), expected)

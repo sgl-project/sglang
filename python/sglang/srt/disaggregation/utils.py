@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.storage import KVStorage
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -161,10 +162,10 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
-def unified_memory_disagg_move_gate(scheduler):
-    """Compaction move gate for a PD node running the unified memory pool.
+def disagg_transfers_in_flight(scheduler):
+    """A PD node's pin source over the unified memory pool.
 
-    Returns a predicate that is True only when no transfer can be in flight, so
+    Returns a predicate that is True while a transfer may be in flight, so
     compaction never relocates a page the RDMA engine is reading or writing.
     Safe to read this state from here: every mover runs on the scheduler thread.
 
@@ -179,21 +180,17 @@ def unified_memory_disagg_move_gate(scheduler):
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
     """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
 
-        def prefill_gate() -> bool:
-            return not (
+    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
+    def busy() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            return bool(
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
             )
-
-        return prefill_gate
-
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-
-        def decode_gate() -> bool:
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
-            return not (
+            return bool(
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
@@ -201,13 +198,12 @@ def unified_memory_disagg_move_gate(scheduler):
                     and decode_offload_manager.has_inflight_device_transfer()
                 )
             )
+        raise ValueError(
+            "disagg_transfers_in_flight: scheduler is not a PD node "
+            f"(mode={scheduler.disaggregation_mode})"
+        )
 
-        return decode_gate
-
-    raise ValueError(
-        "unified_memory_disagg_move_gate: scheduler is not a PD node "
-        f"(mode={scheduler.disaggregation_mode})"
-    )
+    return busy
 
 
 #########################
@@ -1117,6 +1113,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
+    storage: Optional[KVStorage] = None,
 ) -> List[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
@@ -1128,13 +1125,19 @@ def build_kv_layer_ids(
     against the same draft config and so agree on the band.
 
     Returns [] for pools that cannot report ids, leaving the peers on positional
-    pairing.
+    pairing: only a pool wrapping one token KV view (its other layers hold
+    state), or one whose main page rows pair by layer id, reports them.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if (
+        not isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        and token_to_kv_pool.layer_router.wrapped_view() is None
+    ):
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    # A unified pool (``storage``) registers its owner sub-pool as one
+    # whole-envelope entry: no per-layer entries to pair by id.
+    layer_ids = [] if storage is not None else token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1150,9 +1153,7 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if isinstance(pool, HybridLinearKVPool):
+    if pool.layer_router.wrapped_view() is not None:
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1212,14 +1213,17 @@ def build_staging_slot_metadata(
     Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
     no contiguous K/V tensors to stage.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
     # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
     # pool, and the draft pool is wrapped the same way.
-    if isinstance(kv_pool, HybridLinearKVPool):
-        kv_pool = kv_pool.full_kv_pool
-    if isinstance(draft_kv_pool, HybridLinearKVPool):
-        draft_kv_pool = draft_kv_pool.full_kv_pool
+    inner = kv_pool.layer_router.wrapped_view()
+    if inner is not None:
+        kv_pool = inner
+    if draft_kv_pool is not None:
+        inner = draft_kv_pool.layer_router.wrapped_view()
+        if inner is not None:
+            draft_kv_pool = inner
     if not isinstance(kv_pool, MHATokenToKVPool):
         return None
 
@@ -1450,12 +1454,41 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(pool):
+def get_kv_transfer_buf_infos(pool, storage: Optional[KVStorage] = None):
+    """The KV entries a PD peer registers: a unified pool's owner sub-pool
+    region, else the pool's own buffers."""
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
+    if storage is not None:
+        region = storage.regions(storage.owner)
+        return list(region.ptrs), list(region.lens), list(region.item_lens)
     if isinstance(pool, MiniMaxSparseKVPool):
         return pool.get_sparse_kv_buf_infos()
     return pool.get_contiguous_buf_infos()
+
+
+def _setup_unified_state_kv_args(kv_args: KVArgs, storage: KVStorage) -> None:
+    """A unified pool's state entries: one per wire entry of its plan, each
+    the region of the sub-pool it carries."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    kv_args.is_hybrid_mla_backend = is_mla_backend(storage.view(storage.owner))
+    for entry in storage.wire_entries():
+        region = storage.regions(entry.sub_pool)
+        state_type = StateType(entry.state_type)
+        append_state_component(
+            kv_args,
+            state_type,
+            list(region.ptrs),
+            list(region.lens),
+            list(region.item_lens),
+            list(region.dim_per_tensor),
+            list(region.conv_shard_groups),
+            list(region.slice_outer_counts),
+            list(region.layer_ids),
+        )
+        if state_type == StateType.SWA:
+            kv_args.swa_kv_cache_layout = region.kv_layout
 
 
 def setup_state_kv_args(
@@ -1463,21 +1496,20 @@ def setup_state_kv_args(
     token_to_kv_pool,
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
-    req_to_token_pool=None,
+    state_pool=None,
+    storage: Optional[KVStorage] = None,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
-        HybridLinearKVPool,
         MHATokenToKVPool,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -1495,6 +1527,10 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    if storage is not None:
+        _setup_unified_state_kv_args(kv_args, storage)
+        return
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1525,31 +1561,41 @@ def setup_state_kv_args(
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
             append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
-        append_state_component(
-            kv_args,
-            StateType.MINIMAX_DENSE_KV,
-            *token_to_kv_pool.get_dense_kv_state_buf_infos(),
+        dense_ptrs, dense_lens, dense_item_lens = (
+            token_to_kv_pool.get_dense_kv_state_buf_infos()
         )
+        # An all-sparse pool has no dense layers; registering an empty component
+        # would make every transfer carry a state with nothing to move.
+        if dense_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.MINIMAX_DENSE_KV,
+                dense_ptrs,
+                dense_lens,
+                dense_item_lens,
+            )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
-        # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
-        # state list is described per-entry via get_state_buf_infos.
-        if isinstance(token_to_kv_pool, BaseSWAKVPool):
+        router = token_to_kv_pool.layer_router
+        has_window_sub_pool = router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        # A pool with a sliding-window sub-pool describes its window state here,
+        # and so does DeepSeek-V4's, its heterogeneous state list per entry.
+        if has_window_sub_pool or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
-            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
-                token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
+            if has_window_sub_pool and isinstance(
+                router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
-                kv_args.swa_kv_cache_layout = (
-                    token_to_kv_pool.swa_kv_pool.kv_cache_layout
-                )
+                kv_args.swa_kv_cache_layout = router.view(
+                    IdSpaceKind.SLIDING_WINDOW
+                ).kv_cache_layout
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
-            # Only the concrete SWAKVPool owns a full sub-pool; other
-            # BaseSWAKVPool implementations describe their state per entry.
-            if isinstance(token_to_kv_pool, SWAKVPool):
+            # Only a pool with a window sub-pool owns a full sub-pool here;
+            # DeepSeek-V4 describes its state per entry.
+            if has_window_sub_pool:
                 # Global and SWA caches may use different dtypes.
                 for pool, state_type in (
                     (token_to_kv_pool.full_kv_pool, StateType.BLOCK_SCALE),
@@ -1587,7 +1633,7 @@ def setup_state_kv_args(
                         c128_lens,
                         c128_item_lens,
                     )
-        elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+        elif router.wrapped_view() is not None:
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
@@ -1848,28 +1894,14 @@ def setup_state_kv_args(
                 kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
             )
 
-    if (
-        StateType.MAMBA not in kv_args.state_types
-        and req_to_token_pool is not None
-        and hasattr(req_to_token_pool, "get_state_buf_infos")
-    ):
-        data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
+    # The recurrent state pool, when the KV pool does not describe it (a
+    # window KV pool beside a state sub-pool).
+    if StateType.MAMBA not in kv_args.state_types and state_pool is not None:
+        data_ptrs, data_lens, item_lens = state_pool.get_contiguous_buf_infos()
         if data_ptrs:
-            dim = (
-                req_to_token_pool.get_state_dim_per_tensor()
-                if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
-                else None
-            )
-            conv_shard_groups = (
-                req_to_token_pool.get_state_conv_shard_groups()
-                if hasattr(req_to_token_pool, "get_state_conv_shard_groups")
-                else None
-            )
-            slice_outer_counts = (
-                req_to_token_pool.get_state_slice_outer_counts()
-                if hasattr(req_to_token_pool, "get_state_slice_outer_counts")
-                else None
-            )
+            dim = state_pool.get_state_dim_per_tensor()
+            conv_shard_groups = state_pool.get_state_conv_shard_groups()
+            slice_outer_counts = state_pool.get_state_slice_outer_counts()
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

@@ -14,19 +14,20 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Deserialize;
+use sglang_processor::dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
-use futures::StreamExt;
-use serde::Deserialize;
 
 use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
@@ -720,10 +721,10 @@ mod tests {
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{
+    use futures::StreamExt;
+    use sglang_processor::dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
-    use futures::StreamExt;
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {

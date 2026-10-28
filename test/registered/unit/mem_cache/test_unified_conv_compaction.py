@@ -5,12 +5,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
@@ -23,7 +23,7 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
         dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.bfloat16),
         layers=[1, 3],
     )
-    return init_unified_mamba_swa_pools(
+    return build_test_unified_pools(
         device=device,
         kv_cache_dtype=torch.bfloat16,
         head_num=1,
@@ -60,7 +60,7 @@ class TestConvCompaction(CustomTestCase):
         bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
         pool = bundle.unified_memory_pool
         composite = bundle.token_to_kv_pool_allocator
-        state = bundle.req_to_token_pool.mamba_pool
+        state = composite.state.pool
         alloc = composite.mamba_allocator
         self.assertEqual(state.mamba_cache.temporal.numel(), 0)
         self.assertFalse(state._should_fuse_slot_ops())

@@ -1,15 +1,11 @@
 # CUDA 13.4 only args
-# Torch nighly args
-ARG TORCH_NIGHTLY_INDEX=https://download.pytorch.org/whl/nightly/cu134
-ARG TORCH_NIGHTLY_VERSION=2.15.0.dev20261005+cu134
-ARG TORCHVISION_NIGHTLY_VERSION=0.30.0.dev20261005+cu134
-ARG TORCHAUDIO_NIGHTLY_VERSION=2.11.0.dev20261004+cu134
+# Torch 2.15.0 RC1 from the PyTorch test channel; move to whl/cu134 once 2.15.0 is released.
 # Torch wheels may differ from the CUDA 13.4 toolkit used for JIT (e.g. cu130 stable
-# wheels on Blackwell). The nightly arguments stay as defaults for existing invocations.
-ARG TORCH_INDEX_URL=${TORCH_NIGHTLY_INDEX}
-ARG TORCH_VERSION=${TORCH_NIGHTLY_VERSION}
-ARG TORCHVISION_VERSION=${TORCHVISION_NIGHTLY_VERSION}
-ARG TORCHAUDIO_VERSION=${TORCHAUDIO_NIGHTLY_VERSION}
+# wheels on Blackwell); override these four arguments to select other wheels.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/test/cu134
+ARG TORCH_VERSION=2.15.0+cu134
+ARG TORCHVISION_VERSION=0.29.2+cu134
+ARG TORCHAUDIO_VERSION=2.11.1+cu134
 # source: build sglang-kernel / sgl-deep-gemm / sgl-deep-ep from source; pypi: download released wheels.
 ARG SGL_WHEELS_SOURCE=source
 ARG SGL_KERNEL_VERSION=0.4.10
@@ -19,6 +15,9 @@ ARG DEEPGEMM_REF=v0.2.3.post2
 ARG SGL_DEEP_GEMM_VERSION=0.2.3.post2
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
+# MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
+# strided cache views, and the SGLang monokernel plugin.
+ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
 
 ARG CUDA_VERSION=13.4.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
@@ -48,7 +47,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
 
-# Turn off torch.distributed's NCCL2 path in the torch nightly.
+# Turn off torch.distributed's NCCL2 path in torch 2.15.
 ENV TORCH_DIST_USE_NCCL2=0
 
 # Add GKE default lib and bin locations
@@ -528,8 +527,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "peft==0.18.1" \
     && python3 -c "import importlib.util as u; missing = [m for m in ('cosmos_guardrail', 'retinaface', 'better_profanity', 'nltk', 'cv2', 'peft', 'sentencepiece') if u.find_spec(m) is None]; assert not missing, f'guardrail deps missing: {missing}'"
 
-# constraints.txt pins the cu134 nightly torch, which does not exist on PyPI;
-# later stages cannot satisfy it without the nightly index in scope.
+# constraints.txt pins the cu134 torch, which does not exist on PyPI;
+# later stages cannot satisfy it without the cu134 torch index in scope.
 RUN if [ "$CUDA_VERSION" = "13.4.1" ]; then \
         python3 -m pip config set global.extra-index-url "${TORCH_INDEX_URL}"; \
     fi
@@ -777,8 +776,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install essential Python packages (use constraints to prevent conflicts)
 #
 # pip only considers pre-release candidates when the requirement itself names
-# one, so the constraints-pinned cu134 nightly must be restated here; otherwise
-# runai-model-streamer's "torch<3.0.0,>=2.0.0" backtracks the whole resolve.
+# one, so the constraints-pinned cu134 torch is restated here in case it is a
+# nightly; otherwise runai-model-streamer's "torch<3.0.0,>=2.0.0" backtracks the
+# whole resolve.
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$CUDA_VERSION" = "13.4.1" ]; then TORCH_SPEC="torch==${TORCH_VERSION}"; else TORCH_SPEC=""; fi \
     && python3 -m pip install -c /sgl-workspace/constraints.txt \
@@ -862,7 +862,7 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
 # TODO(Jialin): Set SGLANG_RUST_BUILD_MODE=never after Rust TreeCore supports
-# the PyTorch 2.15 nightly used by this preview image.
+# the PyTorch 2.15 used by this preview image.
 
 WORKDIR /sgl-workspace
 
@@ -938,6 +938,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         && python3 -c "from importlib.metadata import entry_points; assert any(e.name == 'nvidia_megakernel' for e in entry_points(group='sglang.srt.plugins')), 'sgl-nvidia-mega plugin not registered'"; \
     fi
 
+# MiniMax MSA (https://github.com/MiniMax-AI/MSA, MIT), editable because prefill compiles
+# against its CUTLASS submodule; installed last so nothing overwrites its top-level packages.
+# Its MSA-v1 monokernel plugin (integrations/sglang) registers --monokernel-backend msa, inert
+# unless a server passes the flag; commits that predate the plugin skip it.
+ARG MSA_COMMIT
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ -z "${MSA_COMMIT}" ]; then \
+        echo 'WARNING: MSA_COMMIT is empty; the MSA kernels are not installed' >&2; \
+    else \
+        printf '%s\n' "${MSA_COMMIT}" | grep -Eq '^[0-9a-f]{40}$'; \
+        git init /sgl-workspace/minimax-msa; \
+        git -C /sgl-workspace/minimax-msa remote add origin https://github.com/MiniMax-AI/MSA.git; \
+        git -C /sgl-workspace/minimax-msa fetch --depth 1 origin "${MSA_COMMIT}"; \
+        git -C /sgl-workspace/minimax-msa checkout --detach FETCH_HEAD; \
+        git -C /sgl-workspace/minimax-msa submodule update --init --recursive; \
+        python3 -m pip install --no-deps -e /sgl-workspace/minimax-msa; \
+        test -f /sgl-workspace/minimax-msa/third_party/cutlass/include/cutlass/cutlass.h; \
+        python3 -c "import importlib.metadata as m; d = m.packages_distributions(); \
+bad = {k: d.get(k) for k in ('inference', 'datas', 'msa_v1') if d.get(k) != ['minimax-msa']}; \
+assert not bad, f'MSA top-level packages are shadowed or missing: {bad}'"; \
+        if [ -f /sgl-workspace/minimax-msa/integrations/sglang/pyproject.toml ]; then \
+            python3 -m pip install --no-deps -e /sgl-workspace/minimax-msa/integrations/sglang; \
+            python3 -c "from importlib.metadata import entry_points; \
+assert any(e.name == 'msa' for e in entry_points(group='sglang.srt.plugins')), 'MSA monokernel plugin not registered'"; \
+        else \
+            echo "MSA ${MSA_COMMIT} has no SGLang monokernel plugin; --monokernel-backend msa is unavailable" >&2; \
+        fi; \
+    fi
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -988,7 +1018,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
 
-# Turn off torch.distributed's NCCL2 path in the torch nightly.
+# Turn off torch.distributed's NCCL2 path in torch 2.15.
 ENV TORCH_DIST_USE_NCCL2=0
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT

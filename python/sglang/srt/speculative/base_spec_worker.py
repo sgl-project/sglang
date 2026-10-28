@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -302,11 +303,11 @@ class BaseSpecWorker(ABC):
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
-            target_mamba_pool = getattr(
-                target_model_runner.req_to_token_pool, "mamba_pool", None
+            target_mamba_pool = (
+                target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
             )
             draft_mamba_pools = tuple(
-                getattr(runner.req_to_token_pool, "mamba_pool", None)
+                runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
                 for runner in draft_runners
             )
             # Shared state is already backed up with the target. Separate

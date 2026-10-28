@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
@@ -54,10 +54,10 @@ def _marked(loc: torch.Tensor):
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):
+    from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MLASubPoolSpec,
         UnifiedKVPool,
         UnifiedMLATokenToKVPool,
     )

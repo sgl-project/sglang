@@ -10,7 +10,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
@@ -31,8 +36,8 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # the static-pool view the assertions below are written against.
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=backend.page_size,
             device="cpu",
         )
@@ -63,8 +68,8 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # backend the strict passthrough view it now reads its tables from.
         backend.kv_index_translator = KVIndexTranslator(
             req_to_token=backend.req_to_token_pool.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device="cpu",
         )
