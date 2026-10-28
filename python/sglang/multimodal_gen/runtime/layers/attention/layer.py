@@ -172,7 +172,7 @@ def _count_active_replicated_modes(
     )
 
 
-def _prepare_sdpa_mask(
+def prepare_sdpa_mask(
     mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     mask = mask.to(device=device)
@@ -590,6 +590,21 @@ class UlyssesAttention(nn.Module):
             output = _usp_output_all_to_all_varlen(output, seq_lens, head_dim=2)
         return output, replicated_output
 
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+        seq_lens: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        output = _new_attention_output(q, v)
+        if replicated_q is None:
+            return output, None
+        return output, _new_attention_output(replicated_q, replicated_v)
+
 
 class UlyssesAttention_VSA(UlyssesAttention):
     """Distributed attention layer with VSA support."""
@@ -657,6 +672,18 @@ class UlyssesAttention_VSA(UlyssesAttention):
         )
 
         return output
+
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+        gate_compress: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _new_attention_output(q, v)
 
 
 class LocalAttention(nn.Module):
@@ -757,20 +784,7 @@ class LocalAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-
-            if torch.is_floating_point(attn_mask):
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
+            mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
 
             if q_.shape[1] != k_.shape[1]:
                 repeat_factor = q_.shape[1] // k_.shape[1]
@@ -799,14 +813,14 @@ class LocalAttention(nn.Module):
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
 
-
-@functools.lru_cache(maxsize=64)
-def _cu_seqlens_on_device(
-    bounds: tuple[int, ...], device: torch.device
-) -> torch.Tensor:
-    # Bounds repeat for every block and step; a fresh pageable H2D copy per call
-    # blocks the host until the stream drains. Callers must not mutate the result.
-    return torch.tensor(bounds, dtype=torch.int32, device=device)
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _new_attention_output(q, v)
 
 
 class USPAttention(nn.Module):
@@ -1003,7 +1017,7 @@ class USPAttention(nn.Module):
                 bounds = [0]
                 for length in seq_lens:
                     bounds.append(bounds[-1] + int(length))
-                cu_seqlens = _cu_seqlens_on_device(tuple(bounds), q.device)
+                cu_seqlens = _fa_backend.cu_seqlens_on_device(tuple(bounds), q.device)
                 out = self.attn_impl.forward_varlen(
                     q[0],
                     k[0],
@@ -1269,7 +1283,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+                mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -1448,7 +1462,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
+                mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
                 sdpa_context = (
@@ -1537,7 +1551,19 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(qs, ks, vs, ctx_attn_metadata)
                 return _usp_output_all_to_all(out, head_dim=2)
 
-            out = self._pipelined_ulysses(q, k, v, attend, sequential, layout="dense")
+            out = self._pipelined_ulysses(
+                q,
+                k,
+                v,
+                attend,
+                sequential,
+                layout="dense",
+                attend_into=lambda q_group, k_group, v_group, out: (
+                    self.attn_impl.forward_into(
+                        q_group, k_group, v_group, out, ctx_attn_metadata
+                    )
+                ),
+            )
             if out is not None:
                 return out
 
@@ -1585,6 +1611,34 @@ class USPAttention(nn.Module):
 
         return out
 
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        num_replicated_prefix: int = 0,
+        num_replicated_suffix: int = 0,
+        num_replicated_kv_prefix: int = 0,
+        skip_sequence_parallel_override: bool = False,
+        attn_mask_meta: dict | None = None,
+        qkv_pre_all_to_all: bool = False,
+        seq_lens: list[int] | None = None,
+        q_prefix: torch.Tensor | None = None,
+        k_prefix: torch.Tensor | None = None,
+        v_prefix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, rows, heads = q.shape[:3]
+        ulysses = get_ulysses_parallel_world_size()
+        skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
+        if qkv_pre_all_to_all and not skip_sp and ulysses > 1:
+            # q arrives head-sharded; the output all-to-all shards it by rows.
+            rows, heads = rows // ulysses, heads * ulysses
+        if q_prefix is not None and attn_mask is not None:
+            # The masked local path attends over the segmented prefix rows too.
+            rows += q_prefix.shape[1]
+        return q.new_empty((batch, rows, heads, v.shape[-1]))
+
     def _pipelined_ulysses(
         self,
         q: torch.Tensor,
@@ -1596,6 +1650,8 @@ class USPAttention(nn.Module):
         layout: str,
         replicated=(None, None, None),
         replicated_first: bool = True,
+        attend_into=None,
+        fill_all=None,
     ) -> torch.Tensor | None:
         """Ulysses attention with the exchange pipelined over head groups.
 
@@ -1656,7 +1712,7 @@ class USPAttention(nn.Module):
             v,
             attend,
             groups,
-            sequential=reference,
+            sequential=None if sequential is None else reference,
             signature=(
                 type(self.attn_impl).__name__,
                 self.causal,
@@ -1665,10 +1721,51 @@ class USPAttention(nn.Module):
             ),
             replicated=replicated,
             replicated_first=replicated_first,
+            attend_into=attend_into,
+            fill_all=fill_all,
         )
         if out is None:
             self._pipeline_declined.add(key)
         return out
+
+    def forward_qk_filled(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fill_all
+    ) -> torch.Tensor | None:
+        """Dense Ulysses attention whose q/k exchange blocks ``fill_all`` writes.
+
+        ``q``/``k`` are the caller's raw projections: ``fill_all`` (see
+        ``ulysses_pipelined_attention``) writes what ``forward`` would read into
+        every exchange block, this rank's own slot rows included, so no own-row
+        copy runs. Returns None, having written nothing, when the call would not
+        take the pipelined dense path; the caller then runs ``forward`` itself.
+        """
+        if (
+            self.skip_sequence_parallel
+            or get_sequence_parallel_world_size() == 1
+            or get_ring_parallel_world_size() > 1
+            or self.enable_packed_qkv_input_a2a
+            or get_request_skip_softmax_params() is not None
+        ):
+            return None
+        ctx_attn_metadata = get_forward_context().attn_metadata
+        return self._pipelined_ulysses(
+            q,
+            k,
+            v,
+            lambda q_group, k_group, v_group: self.attn_impl.forward(
+                q_group, k_group, v_group, ctx_attn_metadata
+            ),
+            # no first-sight reference: the pipelined backends attend a head group
+            # exactly as inside the full call (PIPELINED_ATTENTION_BACKENDS)
+            None,
+            layout="dense-filled",
+            attend_into=lambda q_group, k_group, v_group, out: (
+                self.attn_impl.forward_into(
+                    q_group, k_group, v_group, out, ctx_attn_metadata
+                )
+            ),
+            fill_all=fill_all,
+        )
 
     def _forward_ring_tail_pad(
         self,
@@ -2114,7 +2211,7 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
-        mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+        mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -2336,40 +2433,38 @@ class USPAttention(nn.Module):
         return out if out is not None else sequential()
 
 
-class _BCGBoxedTupleOutput:
-    """Box a tuple-returning break-point output as tensor attributes.
-
-    ``_copy_output`` copies tensors and objects-with-tensor-attributes in
-    place across replays but ignores tuples, so tuple-returning attention
-    forwards (``UlyssesAttention``) are boxed for the break point and
-    unboxed after.
-    """
-
-    def __init__(self, values: tuple) -> None:
-        self.num_values = len(values)
-        for i, value in enumerate(values):
-            setattr(self, f"value_{i}", value)
-
-    def astuple(self) -> tuple:
-        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
+def _new_attention_output(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
 
 def _make_breakable_attention_forward(forward_method):
     """Wrap a DiT attention module's ``forward`` so it becomes a breakable
     CUDA graph (BCG) break point.
 
-    During BCG capture the whole attention forward runs eagerly between
+    At every BCG replay the whole attention forward runs eagerly between
     captured graph segments -- the sequence-parallel all-to-all collectives,
     varlen packing, and dynamic/sparse attention kernels that live here
-    cannot (or should not) be captured into a static CUDA graph. When BCG is
-    disabled this is a transparent pass-through to the original method.
+    cannot (or should not) be captured into a static CUDA graph. The outputs
+    are allocated by the module's ``_new_bcg_output`` before the break, and
+    the break writes them. When BCG is disabled this is a transparent
+    pass-through to the original method.
     """
 
-    def _forward_boxing_tuples(*args, **kwargs):
-        out = forward_method(*args, **kwargs)
-        return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
-
-    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+    @eager_on_graph
+    def bcg_forward(self, *args, out, **kwargs):
+        result = forward_method(self, *args, **kwargs)
+        outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
+        for dst, src in zip(outs, results, strict=True):
+            if dst is None and src is None:
+                continue
+            # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+            assert (
+                dst is not None
+                and src is not None
+                and dst.shape == src.shape
+                and dst.dtype == src.dtype
+            ), "BCG attention output mispredicted"
+            dst.copy_(src)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
@@ -2388,8 +2483,9 @@ def _make_breakable_attention_forward(forward_method):
                 )
             )
             if not capture_dense:
-                out = bcg_forward(self, *args, **kwargs)
-                return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+                out = self._new_bcg_output(*args, **kwargs)
+                bcg_forward(self, *args, **kwargs, out=out)
+                return out
         return forward_method(self, *args, **kwargs)
 
     return forward
