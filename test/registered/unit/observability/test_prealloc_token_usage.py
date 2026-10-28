@@ -10,9 +10,6 @@ import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    SchedulerMetricsReporter,
-)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
@@ -20,6 +17,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import decode_owner_shell
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -60,19 +58,15 @@ class TestPreAllocatedTokenCounts(CustomTestCase):
         self.assertEqual(_queue([]).pre_allocated_token_counts(), (0, 0))
 
 
-def _reporter(*, counts, pool_stats):
-    reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
-    reporter.stats = SchedulerStats()
-    reporter.scheduler = SimpleNamespace(
-        disagg_decode_prealloc_queue=SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: counts
-        ),
-        disagg_decode_transfer_queue=SimpleNamespace(
+def _owner(*, counts, pool_stats):
+    owner = decode_owner_shell(
+        transfer_queue=SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
         ),
         pool_stats_observer=SimpleNamespace(get_pool_stats=lambda: pool_stats),
     )
-    return reporter
+    owner.prealloc_queue.pre_allocated_token_counts = lambda: counts
+    return owner
 
 
 def _swa_pool_stats(full_capacity, swa_capacity):
@@ -88,20 +82,22 @@ def _swa_pool_stats(full_capacity, swa_capacity):
 
 
 class TestDecodeQueueStats(CustomTestCase):
-    def _update(self, reporter):
+    def _update(self, owner):
+        stats = SchedulerStats()
         with mock.patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
+            "sglang.srt.disaggregation.decode.get_disagg",
             return_value=SimpleNamespace(
                 disaggregation_decode_host_receive_threshold=1
             ),
         ):
-            reporter._update_decode_queue_stats(False)
+            owner.report_queue_stats(stats, False)
+        return stats
 
     def test_hybrid_swa_ratios_use_each_pool_capacity(self):
-        reporter = _reporter(counts=(250, 40), pool_stats=_swa_pool_stats(1000, 200))
-        self._update(reporter)
-        self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.25)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.2)
+        owner = _owner(counts=(250, 40), pool_stats=_swa_pool_stats(1000, 200))
+        stats = self._update(owner)
+        self.assertEqual(stats.prealloc_full_token_usage, 0.25)
+        self.assertEqual(stats.prealloc_swa_token_usage, 0.2)
 
     def test_plain_pool_reports_no_swa_share(self):
         pool_stats = PoolStats(
@@ -111,16 +107,14 @@ class TestDecodeQueueStats(CustomTestCase):
             full_evictable_size=200,
             full_capacity=1000,
         )
-        reporter = _reporter(counts=(100, 100), pool_stats=pool_stats)
-        self._update(reporter)
-        self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.1)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.0)
+        stats = self._update(_owner(counts=(100, 100), pool_stats=pool_stats))
+        self.assertEqual(stats.prealloc_full_token_usage, 0.1)
+        self.assertEqual(stats.prealloc_swa_token_usage, 0.0)
 
     def test_zero_capacity_reports_zero_like_token_usage(self):
-        reporter = _reporter(counts=(0, 0), pool_stats=_swa_pool_stats(0, 0))
-        self._update(reporter)
-        self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.0)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.0)
+        stats = self._update(_owner(counts=(0, 0), pool_stats=_swa_pool_stats(0, 0)))
+        self.assertEqual(stats.prealloc_full_token_usage, 0.0)
+        self.assertEqual(stats.prealloc_swa_token_usage, 0.0)
 
 
 class TestCollectorExport(CustomTestCase):

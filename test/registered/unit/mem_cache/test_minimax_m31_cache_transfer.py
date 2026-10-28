@@ -13,7 +13,8 @@ from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import DisaggPrefill
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     get_kv_transfer_buf_infos,
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import prefill_owner_shell
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -231,7 +233,7 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
     sender = Mock(supports_host_tensor_indices=False)
     sender.should_send_kv_chunk.return_value = True
     sender.get_max_transfer_tokens.return_value = None
-    scheduler = SimpleNamespace(
+    owner = prefill_owner_shell(
         token_to_kv_pool_allocator=SimpleNamespace(
             page_size=128, translate_kv_indices_for_transfer=lambda x: x
         ),
@@ -239,38 +241,33 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
             req_to_token=token_mapping([2, 4, 1, 3], length).unsqueeze(0)
         ),
         enable_staging=False,
-        disagg_metadata_buffers=Mock(),
-        disagg_prefill_bootstrap_queue=SimpleNamespace(
-            kv_manager=SimpleNamespace(
-                kv_args=SimpleNamespace(state_types=[StateType.MINIMAX_INDEX_K])
-            )
-        ),
-        disagg_prefill_pending_chunk_rids=set(),
+        metadata_buffers=Mock(),
     )
+    owner.bootstrap_queue.kv_manager = SimpleNamespace(
+        kv_args=SimpleNamespace(state_types=[StateType.MINIMAX_INDEX_K])
+    )
+    owner.kv_senders["prefix-hit"] = sender
     req = SimpleNamespace(
         kv=SimpleNamespace(req_pool_idx=0),
         origin_input_ids=list(range(length)),
         rid="prefix-hit",
-        start_send_idx=prefix,
-        disagg_decode_prefix_len=prefix,
         extend_end=length,
-        disagg_kv_sender=sender,
+        disagg=DisaggReqState(start_send_idx=prefix, decode_prefix_len=prefix),
     )
-    send_chunk = SchedulerDisaggregationPrefillMixin._send_kv_chunk
     if length == 385:
-        send_chunk(scheduler, req, last_chunk=False, end_idx=384)
+        DisaggPrefill._send_kv_chunk(owner, req, last_chunk=False, end_idx=384)
         early_pages, early_state = sender.send.call_args.args
         np.testing.assert_array_equal(early_pages, [4, 1])
         assert early_state is None
-        scheduler.disagg_metadata_buffers.set_buf.assert_not_called()
-    send_chunk(scheduler, req, last_chunk=True)
+        owner.metadata_buffers.set_buf.assert_not_called()
+    DisaggPrefill._send_kv_chunk(owner, req, last_chunk=True)
     main_pages, state_pages = sender.send.call_args.args
     if length == 385:
         np.testing.assert_array_equal(main_pages, [3])
         np.testing.assert_array_equal(state_pages[0], [4, 1, 3])
     else:
         assert len(main_pages) == 0 and len(state_pages[0]) == 0
-    scheduler.disagg_metadata_buffers.set_buf.assert_called_once()
+    owner.metadata_buffers.set_buf.assert_called_once()
 
 
 @pytest.mark.parametrize("start_layer", [0, 4])

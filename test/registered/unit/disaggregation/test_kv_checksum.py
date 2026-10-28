@@ -13,10 +13,10 @@ from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
 )
-from sglang.srt.disaggregation.decode import DisaggDecode
+from sglang.srt.disaggregation.decode import DecodeTransferQueue, DisaggDecode
 from sglang.srt.disaggregation.prefill import DisaggPrefill
 from sglang.srt.disaggregation.req_state import DisaggReqState
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
@@ -77,11 +77,54 @@ class TestMetadataBuffers(unittest.TestCase):
 
     def test_set_get_kv_checksum_roundtrip(self):
         buf = _make_buf()
-        buf.set_kv_checksum(
-            SimpleNamespace(disagg=DisaggReqState(metadata_buffer_index=1)), 0xDEADBEEF
-        )
-        self.assertEqual(buf.get_kv_checksum(1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(0), 0)
+        buf.set_kv_checksum(_slot_owner(1), 0xDEADBEEF, 0xAB)
+        self.assertEqual(buf.get_kv_checksum(1), (0xDEADBEEF, 0xAB))
+        # An untouched row reads as "no digest".
+        self.assertEqual(buf.get_kv_checksum(0), (0, 0))
+
+    def test_clear_slot_resets_what_the_next_owner_reads(self):
+        buf = _make_buf()
+        buf.set_kv_checksum(_slot_owner(1), 0xDEADBEEF, 0xAB)
+        buf.bootstrap_room[1, 0] = 42
+        buf.clear_slot(1)
+        self.assertEqual(buf.get_kv_checksum(1), (0, 0))
+        self.assertEqual(int(buf.bootstrap_room[1, 0]), 0)
+        _make_buf(kv_checksum_enabled=False).clear_slot(1)
+
+
+def _slot_owner(idx):
+    return SimpleNamespace(disagg=DisaggReqState(metadata_buffer_index=idx))
+
+
+class TestKvLayoutSignature(unittest.TestCase):
+    def test_tracks_layout_and_is_never_zero(self):
+        def make(**kw):
+            base = dict(
+                page_size=1,
+                kv_cache_dtype_str="bf16",
+                kv_layout=None,
+                swa_kv_cache_layout=None,
+                state_types=[StateType.SWA],
+                kv_item_lens=[64, 64],
+                state_item_lens=[[32]],
+            )
+            base.update(kw)
+            return kv_layout_signature(SimpleNamespace(**base))
+
+        same = make()
+        self.assertNotEqual(same, 0)
+        self.assertEqual(same, make())
+        # A different TP width shows up as different per-page item lengths.
+        self.assertNotEqual(same, make(kv_item_lens=[32, 32]))
+        # A layer-sharded or PP prefill owns fewer buffers.
+        self.assertNotEqual(same, make(kv_item_lens=[64]))
+        self.assertNotEqual(same, make(page_size=16))
+        self.assertNotEqual(same, make(state_item_lens=[[16]]))
+        # Same byte sizes, other bytes: another dtype of the same width, or
+        # another page layout of the same pool.
+        self.assertNotEqual(same, make(kv_cache_dtype_str="fp16"))
+        self.assertNotEqual(same, make(kv_layout="bucketed"))
+        self.assertNotEqual(same, make(state_types=[StateType.DSA]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -206,11 +249,12 @@ class TestKvChecksumComputer(unittest.TestCase):
 class _FakeOwner(DisaggDecode):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
-        self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
-        )
-        self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        self.attn_tp_cpu_group = None
         self.prealloc_queue = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=1, get_kvcache=lambda: SimpleNamespace()
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             kv_manager=SimpleNamespace(
                 should_verify_kv_checksum=lambda bootstrap_addr: True
             ),
@@ -227,29 +271,55 @@ class _FakeOwner(DisaggDecode):
         self.streamed_aborts.extend(reqs)
 
 
-def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0.0.1"):
+def _make_req(
+    expected_chksum,
+    num_input_tokens,
+    rid="r0",
+    bootstrap_host="127.0.0.1",
+    start_idx=0,
+):
     return SimpleNamespace(
         rid=rid,
         bootstrap_host=bootstrap_host,
         bootstrap_port=8998,
         bootstrap_room=12345,
-        kv=SimpleNamespace(req_pool_idx=0, holds_kv=True),
+        # start_idx: the decode-cached prefix, as each role records it.
+        kv=SimpleNamespace(
+            req_pool_idx=0, holds_kv=True, cache_protected_len=start_idx
+        ),
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
-        disagg=DisaggReqState(expected_kv_checksum=expected_chksum),
+        extend_end=num_input_tokens,
+        disagg=DisaggReqState(
+            expected_kv_checksum=expected_chksum, decode_prefix_len=start_idx
+        ),
         return_logprob=False,
     )
 
 
+def _verify(owner, reqs, reduce=None):
+    """Run the admission check on one rank, unless a test stands in for the
+    peers with its own reduce."""
+    with patch(
+        "sglang.srt.disaggregation.decode.all_reduce_flags",
+        reduce or (lambda flags, group, op: flags),
+    ):
+        return owner._verify_kv_checksums(reqs)
+
+
 class TestPrefillChecksum(unittest.TestCase):
-    def _send_last_chunk(self, sched, req):
+    def _owner(self, computer=None):
+        owner = prefill_owner_shell(
+            kv_checksum_computer=computer or object(),
+            metadata_buffers=SimpleNamespace(set_kv_checksum=Mock()),
+        )
+        owner.bootstrap_queue.kv_checksum_signature = 0x1234
+        return owner
+
+    def _send_last_chunk(self, owner, req):
         page_indices = Mock(return_value=None)
         with (
-            patch.object(
-                SchedulerDisaggregationPrefillMixin,
-                "_send_kv_chunk",
-                lambda *args, **kwargs: None,
-            ),
+            patch.object(DisaggPrefill, "_send_kv_chunk", lambda *args, **kwargs: None),
             patch(
                 "sglang.srt.disaggregation.prefill.page_indices_for_request",
                 page_indices,
@@ -259,22 +329,59 @@ class TestPrefillChecksum(unittest.TestCase):
                 lambda *args, **kwargs: None,
             ),
         ):
-            sched.send_kv_chunk(req, last_chunk=True)
+            owner.send_kv_chunk(req, last_chunk=True)
         return page_indices
 
     def test_health_check_clears_metadata_checksum(self):
-        owner = prefill_owner_shell(
-            kv_checksum_computer=object(),
-            metadata_buffers=SimpleNamespace(set_kv_checksum=Mock()),
-        )
+        owner = self._owner()
         req = _make_req(0xDEADBEEF, 1, rid="HEALTH_CHECK_1")
-        with patch.object(
-            DisaggPrefill,
-            "_send_kv_chunk",
-            lambda *args, **kwargs: None,
-        ):
-            owner.send_kv_chunk(req, last_chunk=True)
-        owner.metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0)
+        self._send_last_chunk(owner, req)
+        owner.metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0, 0)
+
+    def test_last_chunk_ships_digest_with_layout_signature(self):
+        owner = self._owner(SimpleNamespace(compute=lambda *args: 0x55))
+        req = _make_req(0, 7)
+        self._send_last_chunk(owner, req)
+        owner.metadata_buffers.set_kv_checksum.assert_called_once_with(
+            req, 0x55, 0x1234
+        )
+
+    def test_digest_starts_where_the_decode_cached_prefix_ends(self):
+        """A decode-side radix hit makes prefill send only the suffix; the
+        digest must cover that suffix, not the whole prompt."""
+        owner = self._owner(SimpleNamespace(compute=lambda *args: 0x55))
+        req = _make_req(0, 7, start_idx=4)
+        page_indices = self._send_last_chunk(owner, req)
+        page_indices.assert_called_once_with(owner, req, 7, start_idx=4)
+
+
+class TestKvChecksumComparable(unittest.TestCase):
+    def _queue(self, signature=0x77):
+        return SimpleNamespace(
+            prealloc_queue=SimpleNamespace(kv_checksum_signature=signature),
+            _skipped_checksum_signatures=set(),
+        )
+
+    def test_same_layout_compares(self):
+        self.assertTrue(
+            DecodeTransferQueue._kv_checksum_comparable(self._queue(), 0x77)
+        )
+
+    def test_no_digest_skips_quietly(self):
+        queue = self._queue()
+        self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0))
+        self.assertEqual(queue._skipped_checksum_signatures, set())
+
+    def test_other_layout_skips_and_logs_once(self):
+        queue = self._queue()
+        with self.assertLogs(
+            "sglang.srt.disaggregation.decode", level="WARNING"
+        ) as logs:
+            self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0x99))
+        self.assertEqual(len(logs.output), 1)
+        with patch("sglang.srt.disaggregation.decode.logger.warning") as warning:
+            self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0x99))
+        warning.assert_not_called()
 
 
 class TestChecksumMismatchRelease(unittest.TestCase):
@@ -321,7 +428,7 @@ class TestChecksumMismatchRelease(unittest.TestCase):
                 side_effect=release_kv_cache,
             ),
         ):
-            self.assertEqual(owner._verify_kv_checksums([req]), [])
+            self.assertEqual(_verify(owner, [req]), [])
         self.assertEqual(events, [("hisparse", "r0"), ("tree", "r0", False)])
 
 
@@ -351,7 +458,7 @@ class TestAdmissionChecksum(unittest.TestCase):
     def test_match_keeps_req(self):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
-        self.assertEqual(sched._verify_kv_checksums([req]), [req])
+        self.assertEqual(_verify(sched, [req]), [req])
         self.assertEqual(sched.streamed_aborts, [])
 
     def test_mismatch_aborts(self):
@@ -365,7 +472,7 @@ class TestAdmissionChecksum(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as mock_release,
         ):
-            verified = sched._verify_kv_checksums([req, valid])
+            verified = _verify(sched, [req, valid])
         self.assertEqual(verified, [valid])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
@@ -380,7 +487,7 @@ class TestAdmissionChecksum(unittest.TestCase):
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
             self.assertRaisesRegex(RuntimeError, "KV checksum mismatch"),
         ):
-            sched._verify_kv_checksums([req])
+            _verify(sched, [req])
         mock_abort.assert_not_called()
         sched.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
 
@@ -393,7 +500,7 @@ class TestAdmissionChecksum(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as mock_release,
         ):
-            verified = sched._verify_kv_checksums([req])
+            verified = _verify(sched, [req])
         self.assertEqual(verified, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
@@ -403,14 +510,15 @@ class TestAdmissionChecksum(unittest.TestCase):
         """The injector must not trip the in-CI raise it exists to exercise."""
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
-        sched.waiting_queue = [req]
         with (
             envs.SGLANG_IS_IN_CI.override(True),
             envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ),
         ):
-            self.assertIsNone(self._run_once(sched))
+            self.assertEqual(_verify(sched, [req]), [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
 
@@ -418,16 +526,17 @@ class TestAdmissionChecksum(unittest.TestCase):
         """Every rank drops the same requests, even if only a peer saw the fault."""
         sched = self._make_sched(_SENTINEL)
         clean = _make_req(self.true_chksum, self.num_pages, rid="clean")
-        sched.waiting_queue = [clean]
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ),
         ):
-            batch = self._run_once(
-                sched, reduce=lambda flags, group, op: [1] * len(flags)
+            verified = _verify(
+                sched, [clean], reduce=lambda flags, group, op: [1] * len(flags)
             )
-        self.assertIsNone(batch)
+        self.assertEqual(verified, [])
         self.assertEqual(sched.streamed_aborts, [clean])
 
     def test_verified_once(self):
@@ -435,9 +544,26 @@ class TestAdmissionChecksum(unittest.TestCase):
         a retraction, by which time decode has written into its last page."""
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
-        # A retracted request is verified again when it is admitted again.
-        self.assertEqual(sched._verify_kv_checksums([req]), [req])
-        self.assertEqual(sched._verify_kv_checksums([req]), [req])
+        self.assertEqual(_verify(sched, [req]), [req])
+        self.assertEqual(req.disagg.expected_kv_checksum, 0)
+        self.kv[0][0, 0] += 1
+        self.assertEqual(_verify(sched, [req]), [req])
+        self.assertEqual(sched.streamed_aborts, [])
+
+    def test_suffix_digest_skips_decode_cached_prefix(self):
+        """After a decode-side radix hit the digest covers only the pages
+        prefill sent; the prefix decode cached itself is not corruption."""
+        start = self.num_pages // 2
+        suffix = torch.arange(
+            start, self.num_pages, dtype=torch.int64, device=self.device
+        )
+        expected = _ref_strided_adler32(
+            self.kv, [suffix] * len(self.kv), [self.item_len] * len(self.kv)
+        )
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(expected, self.num_pages, start_idx=start)
+        self.kv[0][0, 0] += 1
+        self.assertEqual(_verify(sched, [req]), [req])
         self.assertEqual(sched.streamed_aborts, [])
 
     def test_disabled_keeps_every_req(self):
@@ -448,7 +574,7 @@ class TestAdmissionChecksum(unittest.TestCase):
     def test_zero_expected_skips_checksum(self):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0, self.num_pages)
-        self.assertEqual(sched._verify_kv_checksums([req]), [req])
+        self.assertEqual(_verify(sched, [req]), [req])
 
     def test_backend_can_skip_incomparable_checksum(self):
         """A request whose sender the backend declares incomparable is admitted
@@ -469,7 +595,7 @@ class TestAdmissionChecksum(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ),
         ):
-            verified = sched._verify_kv_checksums([aborted, skipped])
+            verified = _verify(sched, [aborted, skipped])
         self.assertEqual(verified, [skipped])
         self.assertEqual(sched.streamed_aborts, [aborted])
         mock_abort.assert_called_once()

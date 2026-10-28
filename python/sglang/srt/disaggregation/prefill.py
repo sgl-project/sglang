@@ -292,6 +292,7 @@ class PrefillBootstrapQueue:
         self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
+            self.kv_checksum_signature = kv_layout_signature(kv_args)
             self.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -839,8 +840,11 @@ class DisaggPrefill:
         if self.enable_staging:
             # Decode allocates its staging while this forward runs.
             self.maybe_prefetch_staging_for_batch(batch)
+        # A load-back submitted in this build may still be writing pages that a
+        # later request matched as device prefix; don't early-send them.
+        load_pending = batch.hicache_consumer_index >= 0
         for req in batch.reqs:
-            self.maybe_send_cached_prefix_chunk(req)
+            self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
     def on_launch(self, reqs: List[Req]) -> None:
         """The launched requests prefill until their commit hands the KV over."""
@@ -1270,7 +1274,7 @@ class DisaggPrefill:
             self.send_kv_chunk(req)
         return chunked_req, waiting
 
-    def maybe_send_cached_prefix_chunk(self, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(self, req: Req, allow_send: bool) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1282,7 +1286,9 @@ class DisaggPrefill:
                 0, req.prefix_len - req.host_hit_length
             )
 
-        if req.disagg.pending_bootstrap:
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them.
+        if req.disagg.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
@@ -1322,10 +1328,18 @@ class DisaggPrefill:
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
-                value = computer.compute(page_indices_gpu, state_indices)
-            self.metadata_buffers.set_kv_checksum(req, value)
+                # Only the pages this prefill sends; decode digests the same
+                # range of its row, past the prefix it promised at bootstrap.
+                start_idx = req.disagg.decode_prefix_len
+                page_indices_gpu = page_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                digest = computer.compute(page_indices_gpu, state_indices)
+                signature = self.bootstrap_queue.kv_checksum_signature
+            self.metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(
@@ -1424,7 +1438,7 @@ class DisaggPrefill:
                 return minimax_index_transfer_pages(
                     self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
                     page_size=page_size,
-                    prefix_len=req.disagg_decode_prefix_len,
+                    prefix_len=req.disagg.decode_prefix_len,
                 )
 
             def _dsa_pages_payload():

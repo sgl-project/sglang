@@ -115,7 +115,7 @@ def _match_state(req):
 class _Queue(DecodeHiCachePreallocMixin, DecodeHiCacheTransferMixin):
     def __init__(self, cache):
         self.tree_cache = cache
-        self.scheduler = SimpleNamespace(enable_decode_hicache=True)
+        self.enable_decode_hicache = True
 
 
 class TestDecodeHiCacheL2(CustomTestCase):
