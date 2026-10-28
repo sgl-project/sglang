@@ -157,7 +157,7 @@ class DSATopKBackend(Enum):
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
         # Prefill CP (interleave) stays on legacy on CUDA: its rows are the rank's
         # token shard, a layout no CUDA packed-kernel test covers. ROCm keeps
-        # main's packed path.
+        # the packed path it already had.
         if batch_idx_list is None:
             row_to_batch = attn_metadata.token_to_batch_idx
         elif isinstance(batch_idx_list, torch.Tensor):

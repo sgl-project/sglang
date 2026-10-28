@@ -816,7 +816,7 @@ class TestShardedDSAMetadata(unittest.TestCase):
 
     def test_prefill_cp_shard_keeps_the_legacy_topk(self):
         """On CUDA the packed prefill top-k takes an unsharded batch, never a CP
-        shard. ROCm sends a CP shard to the packed kernel, as on main."""
+        shard. ROCm takes the packed kernel for both, as it already did."""
         import sys
         import types
         from unittest.mock import MagicMock
@@ -838,11 +838,12 @@ class TestShardedDSAMetadata(unittest.TestCase):
                 torch.tensor([0, 1]),
             ),
         )
-        # (is_hip, cp_sharded, (packed, legacy) calls). On main the packed branch
-        # was ROCm-only and had no CP check, so ROCm sends the CP shard there.
+        # (is_hip, cp_sharded, (packed, legacy) calls). ROCm's packed branch
+        # predates the CP check and ignores it, so ROCm sends both batches there.
         cases = (
             (False, False, (1, 0)),
             (False, True, (0, 1)),
+            (True, False, (1, 0)),
             (True, True, (1, 0)),
         )
         for is_hip, cp_sharded, want_calls in cases:
