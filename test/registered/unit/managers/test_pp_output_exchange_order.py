@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
@@ -32,10 +33,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
-    """Stream ops one PP2 rank enqueues for one output exchange, in order.
+    """Device p2p ops one PP2 rank posts for one output exchange, in stream order.
 
-    Device p2p ops are ("send" | "recv", msg); a fence on this rank's own
-    just-launched forward is ("wait", "own-forward").
+    Fences on this rank's own forward show up as ("wait", "own-forward").
     """
     ops = []
     scheduler = SchedulerPPMixin()
@@ -87,19 +87,9 @@ class TestPPOutputExchangeOrder(CustomTestCase):
             with self.subTest(spec_relay=spec_relay):
                 # Rank 1 (last) returns output A to rank 0 while rank 0 relays
                 # output B (received last iteration) on to rank 1.
-                # A fence on a rank's own forward never waits on its peer.
                 streams = [
-                    deque(
-                        op
-                        for op in _posted_output_ops(
-                            pp_rank, spec_relay, send_msg, recv_msg
-                        )
-                        if op[0] != "wait"
-                    )
-                    for pp_rank, send_msg, recv_msg in (
-                        (0, "relay-B", "output-A"),
-                        (1, "output-A", "relay-B"),
-                    )
+                    deque(_posted_output_ops(0, spec_relay, "relay-B", "output-A")),
+                    deque(_posted_output_ops(1, spec_relay, "output-A", "relay-B")),
                 ]
                 self.assertEqual([len(s) for s in streams], [2, 2])
                 while streams[0] or streams[1]:
@@ -114,24 +104,28 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                     streams[1].popleft()
 
     def test_only_first_rank_fences_output_recv_on_its_forward(self):
-        """Rank 0 must not post its output recv before its own forward finishes:
-        an early recv holds an SM through the forward and hangs flashinfer MLA."""
-        self.assertEqual(
-            _posted_output_ops(0, False, "relay", "output"),
-            [("send", "relay"), ("wait", "own-forward"), ("recv", "output")],
-        )
-        # Later ranks receive relays that already exist, the spec relay
-        # exchanges before its forward, and depth > 0 receives before launch.
-        for pp_rank, spec_relay, server_args in (
-            (1, False, {}),
-            (0, True, {}),
-            (0, False, {"pp_async_batch_depth": 1}),
-        ):
-            with self.subTest(pp_rank=pp_rank, spec_relay=spec_relay, **server_args):
-                ops = _posted_output_ops(
-                    pp_rank, spec_relay, "relay", "output", **server_args
-                )
-                self.assertNotIn(("wait", "own-forward"), ops)
+        """With the fence on, rank 0 must not post its output recv before its own
+        forward finishes: an early recv holds an SM through the forward and hangs
+        flashinfer MLA."""
+        with envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.override(True):
+            self.assertEqual(
+                _posted_output_ops(0, False, "relay", "output"),
+                [("send", "relay"), ("wait", "own-forward"), ("recv", "output")],
+            )
+            # Later ranks receive relays that already exist, the spec relay
+            # exchanges before its forward, and depth > 0 receives before launch.
+            for pp_rank, spec_relay, server_args in (
+                (1, False, {}),
+                (0, True, {}),
+                (0, False, {"pp_async_batch_depth": 1}),
+            ):
+                with self.subTest(
+                    pp_rank=pp_rank, spec_relay=spec_relay, **server_args
+                ):
+                    ops = _posted_output_ops(
+                        pp_rank, spec_relay, "relay", "output", **server_args
+                    )
+                    self.assertNotIn(("wait", "own-forward"), ops)
 
 
 if __name__ == "__main__":

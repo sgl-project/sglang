@@ -1491,10 +1491,11 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                # Gate the recv on our forward: the last stage sends only after its own,
-                # and an early recv spins on an SM, stalling kernels that need every SM.
+                # An early recv spins on an SM and can stall or hang kernels that need every SM
+                # (e.g. flashinfer MLA); set SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD=1 then.
                 if (
-                    get_parallel().pp_async_batch_depth == 0
+                    envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.get()
+                    and get_parallel().pp_async_batch_depth == 0
                     and self.pp_group.is_first_rank
                     and not self._pp_spec_relay
                     and self.launch_event is not None
