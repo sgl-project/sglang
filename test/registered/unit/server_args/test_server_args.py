@@ -2335,6 +2335,97 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_mla_host_dedup_rejects_page_unified(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            hicache_mem_layout="page_unified",
+            hicache_io_backend="kernel",
+        )
+        with self.assertRaisesRegex(ValueError, "dedup does not support.*page_unified"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_checks_resolved_layout(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            hicache_mem_layout="page_first",
+            hicache_io_backend="kernel",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.hicache_hook.resolve_unified_memory_layout_io",
+                side_effect=lambda target: declare_resolution(
+                    target,
+                    "test_page_unified_resolution",
+                    hicache_mem_layout="page_unified",
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "dedup does not support.*page_unified"),
+        ):
+            handle_hicache(args)
+        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+
+    def test_page_unified_key_resolution_without_mla_host_dedup(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=False,
+            hicache_storage_backend="file",
+            hicache_storage_key_scheme="unified",
+            hicache_mem_layout="page_first",
+            hicache_io_backend="direct",
+        )
+        handle_hicache(args)
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+        self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
+
+    def test_mla_host_dedup_rejects_sharded_dcp(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            dcp_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "distinct KV shards"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_rejects_page_interleave_sharding(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            enable_kv_cache_sharding=True,
+        )
+        with self.assertRaisesRegex(ValueError, "distinct KV pages"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_accepts_replicated_l2(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            dcp_size=1,
+        )
+        handle_hicache(args)
+        self.assertTrue(resolution_result(args, "enable_mla_hicache_host_dedup"))
+
+    def test_mla_host_dedup_storage_backend_boundary(self):
+        for backend in (None, "file", "mooncake"):
+            with self.subTest(backend=backend):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_host_dedup=True,
+                    hicache_storage_backend=backend,
+                )
+                if backend is not None:
+                    with self.assertRaisesRegex(
+                        ValueError, "requires the file L3 integration"
+                    ):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+                    self.assertEqual(
+                        resolution_result(args, "hicache_storage_backend"), backend
+                    )
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (
