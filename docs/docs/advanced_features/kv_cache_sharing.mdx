@@ -235,9 +235,11 @@ prefix after unrelated requests evict it from GPU memory, then check
 per P instance; logical counters repeat across ranks.
 
 This deployment recipe has not been hardware-validated as part of this change.
-The [registered hardware tests](https://github.com/sgl-project/sglang/blob/065adbfa003138b99972fc3acbcd491828654241/test/registered/e2e/models/test_dsa_glm52_pd_kv_shard_hicache.py)
-use GLM-5.2 and different cache/MTP settings; their accuracy floors are not a
-validated GLM-5.3 baseline. Keep the source SHA, model revision, dependency
+The [registered hardware tests](https://github.com/sgl-project/sglang/blob/0f214cb6de059713a44d05055ed9a5e849f12ecd/test/registered/e2e/models/test_dsa_glm52_pd_kv_shard_hicache.py)
+run on four GB300 GPUs with P2/D2 and CP2, including the full GSM8K accuracy
+case and a DP2/EP2 Mixed-MoE smoke. They use GLM-5.2 and different cache/MTP
+settings; their accuracy floors are not a validated GLM-5.3 baseline.
+Keep the source SHA, model revision, dependency
 manifest, GPU/RDMA topology, resolved arguments, logs and scores for each run.
 
 ## References
