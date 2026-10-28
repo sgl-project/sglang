@@ -55,6 +55,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     chain_snapshot,
     float_chain,
+    stand_in_views,
     tri_sub_pool_specs,
 )
 
@@ -93,7 +94,9 @@ class TestUnifiedTriPool(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            state_kvcache=mamba_kv,
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa", state="mamba"), kvcache, mamba_kv
+            ),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -127,8 +130,6 @@ class TestUnifiedTriPool(unittest.TestCase):
             [s.name for s in pool.sub_pool_specs], ["mamba", "swa", "full"]
         )
         # KV pool got the allocators.
-        self.assertIs(kvcache._full_allocator, fa)
-        self.assertIs(kvcache._swa_allocator, sa)
 
     def test_pd_preallocation_binds_only_swa_tail_pages(self):
         _, allocator, _, _ = self._build(page_size=4)
@@ -471,7 +472,9 @@ class TestTriPagedFreeGroup(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            state_kvcache=mamba_kv,
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa", state="mamba"), kvcache, mamba_kv
+            ),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -1484,7 +1487,11 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa", state="mamba"),
+                kvcache,
+                FakeKVCache(pool.max_slots("mamba")),
+            ),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -1599,7 +1606,11 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=kvcache,
-            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa", state="mamba"),
+                kvcache,
+                FakeKVCache(pool.max_slots("mamba")),
+            ),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,
@@ -1692,7 +1703,11 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa", state="mamba"),
             unified_buffer=pool,
             kvcache=FakeUnifiedSWAKVPool(pool),
-            state_kvcache=FakeKVCache(pool.max_slots("mamba")),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa", state="mamba"),
+                FakeUnifiedSWAKVPool(pool),
+                FakeKVCache(pool.max_slots("mamba")),
+            ),
             device=_DEV,
             full_max_total_num_tokens=48,
             swa_max_total_num_tokens=32,

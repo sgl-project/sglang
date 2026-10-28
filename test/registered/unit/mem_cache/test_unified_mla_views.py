@@ -376,48 +376,39 @@ class TestTranslateKvLoc(unittest.TestCase):
             self.assertTrue(torch.equal(got.reshape(-1), want))
 
 
-class _RecordingHybridPool:
-    """Stands in for `UnifiedHybridLinearKVPool`, recording the ids it is handed."""
+class _RecordingView(_FakeKVCache):
+    """Stands in for the owner sub-pool's view, recording the ids it is handed."""
 
-    def __init__(self, full_kv_pool, mamba_pool):
-        self.full_kv_pool = full_kv_pool
-        self.mamba_pool = mamba_pool
-        self.seen = None
+    seen = None
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(self, indices, req_pool_index=None):
         self.seen = indices.clone()
-        return {"full": None}
+        return None
 
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
+    def load_cpu_copy(self, kv_cache_cpu, indices, req_pool_index=None):
         self.seen = indices.clone()
 
 
 class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
     """REGRESSION: decode retraction calls the allocator's `get_cpu_copy` with
-    `req_to_token` rows, which hold VIRTUAL ids. This composite inherited the
-    raising base, and a plain delegate would have been just as wrong -- the
-    unified pools read those ids as PHYSICAL."""
+    `req_to_token` rows, which hold VIRTUAL ids; the owner's view reads ids
+    as PHYSICAL, so a plain delegate would read and restore other rows."""
 
     def _build(self, ps=1):
         pool, _, _ = _make_unified(page_size=ps)
-        kvcache = _RecordingHybridPool(
-            _FakeKVCache(pool.max_slots("full")),
-            _FakeKVCache(pool.max_slots("mamba")),
-        )
+        owner = _RecordingView(pool.max_slots("full"))
         with get_parallel().override(
             dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
         ):
             allocator = ChainAllocator(
                 roles=ChainRoles(owner="full", state="mamba"),
-                state_kvcache=kvcache.mamba_pool,
                 unified_buffer=pool,
-                kvcache=kvcache,
+                kvcache=owner,
+                views={"full": owner, "mamba": _FakeKVCache(pool.max_slots("mamba"))},
                 device=_DEV,
                 page_size=ps,
             )
-        return allocator, kvcache
+        return allocator, owner
 
     def test_pool_is_handed_physical_token_ids(self):
         alloc, kvcache = self._build()
@@ -432,7 +423,7 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         alloc.get_cpu_copy(virtual, req_pool_index=0)
         self.assertTrue(torch.equal(kvcache.seen, physical))
 
-        alloc.load_cpu_copy({"full": None}, virtual, req_pool_index=0)
+        alloc.load_cpu_copy((None, None), virtual, req_pool_index=0)
         self.assertTrue(torch.equal(kvcache.seen, physical))
 
 

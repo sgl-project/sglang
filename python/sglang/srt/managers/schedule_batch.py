@@ -2107,7 +2107,7 @@ class Req(ReqDllmMixin):
             )
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
-        if allocator.get_kvcache().cpu_copy_carries_mamba:
+        if allocator.cpu_copy_carries_mamba:
             return None
         if not isinstance(req_to_token_pool, HybridReqToTokenPool):
             return None

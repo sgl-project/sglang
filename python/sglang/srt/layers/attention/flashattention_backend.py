@@ -543,10 +543,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.init_forward_metadata_in_graph(forward_batch)
 
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
-        # The in-graph SWA translation needs the raw mapping tensor; v2p-table
-        # pools (UnifiedSWAKVPool) keep it None and must stay on the eager
-        # rebuild path.
-        if not self.use_sliding_window_kv_pool:
+        # The in-graph SWA translation needs a static pool's raw mapping
+        # tensor; a translating runner's window ids go through its allocator's
+        # tables on the eager rebuild path.
+        if (
+            not self.use_sliding_window_kv_pool
+            or self.kv_index_translator.is_translating
+        ):
             return None
         return self.token_to_kv_pool.full_to_swa_index_mapping
 
@@ -2964,6 +2967,7 @@ class FlashAttentionBackend(AttentionBackend):
             full_to_swa_index_mapping=(
                 self.token_to_kv_pool.full_to_swa_index_mapping
                 if self.use_sliding_window_kv_pool
+                and not self.kv_index_translator.is_translating
                 else None
             ),
             skip_page_table=translated,

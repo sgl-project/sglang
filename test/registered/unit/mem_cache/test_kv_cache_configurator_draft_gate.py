@@ -69,6 +69,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=35, stage="weekly", runner_config="cpu")
 maybe_stub_sgl_kernel()
@@ -211,6 +212,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa"), _FakeUnifiedSWAKVPool(pool)
+            ),
             device="cpu",
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,

@@ -23,6 +23,7 @@ Triton kernel.
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -77,6 +78,7 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
         roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
+        views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
         device=_DEV,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -527,16 +529,23 @@ class TestWriteIds(CustomTestCase):
                 )
                 allocator = ChainAllocator(
                     roles=ChainRoles(owner="full", state="mamba"),
-                    state_kvcache=(
-                        SimpleNamespace(
-                            full_kv_pool=_FakeKVCache(pool.max_slots("full")),
-                            mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
-                        )
-                    ).mamba_pool,
                     unified_buffer=pool,
                     kvcache=SimpleNamespace(
                         full_kv_pool=_FakeKVCache(pool.max_slots("full")),
                         mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                    ),
+                    views=stand_in_views(
+                        ChainRoles(owner="full", state="mamba"),
+                        SimpleNamespace(
+                            full_kv_pool=_FakeKVCache(pool.max_slots("full")),
+                            mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                        ),
+                        (
+                            SimpleNamespace(
+                                full_kv_pool=_FakeKVCache(pool.max_slots("full")),
+                                mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                            )
+                        ).mamba_pool,
                     ),
                     device="cpu",
                     page_size=4,

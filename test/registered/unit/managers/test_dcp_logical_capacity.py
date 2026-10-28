@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -64,9 +65,11 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
     )
     return ChainAllocator(
         roles=ChainRoles(owner="full", state="mamba"),
-        state_kvcache=kvcache.mamba_pool,
         unified_buffer=pool,
         kvcache=kvcache,
+        views=stand_in_views(
+            ChainRoles(owner="full", state="mamba"), kvcache, kvcache.mamba_pool
+        ),
         device="cpu",
         page_size=1,
     )

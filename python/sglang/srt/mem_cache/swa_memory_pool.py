@@ -20,6 +20,36 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 
+def filter_window_cpu_copy(window_pool, *, swa_kv_cpu, row_mask: torch.Tensor):
+    """The rows of a window sub-pool's CPU copy that ``row_mask`` keeps, rechunked
+    as the sub-pool chunks its copies."""
+    if swa_kv_cpu is None:
+        return None
+    if row_mask is None or bool(torch.all(row_mask).item()):
+        return swa_kv_cpu
+
+    chunk_size = getattr(window_pool, "cpu_offloading_chunk_size", len(row_mask))
+    filtered = []
+    for layer_chunks in swa_kv_cpu:
+        if len(layer_chunks) == 0:
+            filtered.append([])
+            continue
+
+        # A chunk is whatever the sub-pool produced: k/v, plus the block
+        # scales for a quantized pool. Filter every tensor it carries.
+        num_tensors = len(layer_chunks[0])
+        tensors = [
+            torch.cat([chunk[t] for chunk in layer_chunks], dim=0)[row_mask]
+            for t in range(num_tensors)
+        ]
+
+        filtered_layer = []
+        for i in range(0, len(tensors[0]), chunk_size):
+            filtered_layer.append([t[i : i + chunk_size] for t in tensors])
+        filtered.append(filtered_layer)
+    return filtered
+
+
 class SWAKVPool(BaseSWAKVPool):
     """Hybrid full/SWA cache composed from independently configurable pools.
 
@@ -352,35 +382,6 @@ class SWAKVPool(BaseSWAKVPool):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
-    def _filter_swa_cpu_copy(self, *, swa_kv_cpu, row_mask: torch.Tensor):
-        if swa_kv_cpu is None:
-            return None
-        if row_mask is None or bool(torch.all(row_mask).item()):
-            return swa_kv_cpu
-
-        chunk_size = getattr(
-            self.swa_kv_pool, "cpu_offloading_chunk_size", len(row_mask)
-        )
-        filtered = []
-        for layer_chunks in swa_kv_cpu:
-            if len(layer_chunks) == 0:
-                filtered.append([])
-                continue
-
-            # A chunk is whatever the sub-pool produced: k/v, plus the block
-            # scales for a quantized pool. Filter every tensor it carries.
-            num_tensors = len(layer_chunks[0])
-            tensors = [
-                torch.cat([chunk[t] for chunk in layer_chunks], dim=0)[row_mask]
-                for t in range(num_tensors)
-            ]
-
-            filtered_layer = []
-            for i in range(0, len(tensors[0]), chunk_size):
-                filtered_layer.append([t[i : i + chunk_size] for t in tensors])
-            filtered.append(filtered_layer)
-        return filtered
-
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
@@ -434,7 +435,7 @@ class SWAKVPool(BaseSWAKVPool):
             if swa_indices.numel() == 0:
                 return
 
-            swa_kv_cpu = self._filter_swa_cpu_copy(
-                swa_kv_cpu=swa_kv_cpu, row_mask=row_mask
+            swa_kv_cpu = filter_window_cpu_copy(
+                self.swa_kv_pool, swa_kv_cpu=swa_kv_cpu, row_mask=row_mask
             )
             self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)

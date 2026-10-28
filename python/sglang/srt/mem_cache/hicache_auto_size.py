@@ -65,7 +65,12 @@ def _draft_bytes(target, draft) -> int:
         IdSpaceKind.SLIDING_WINDOW
     ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
         # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        target = (
+            target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+            else target.swa_kv_pool
+        )
+        draft = draft.swa_kv_pool
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
 

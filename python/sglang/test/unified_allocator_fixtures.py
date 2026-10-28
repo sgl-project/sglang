@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
     FloatChain,
@@ -33,8 +34,6 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
-    UnifiedPoolBundle,
-    UnifiedSWAKVPool,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
@@ -165,12 +164,17 @@ class FakeUnifiedSWAKVPool:
     def __init__(self, shared_pool: UnifiedKVPool):
         self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
         self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
-        self._full_allocator = None
-        self._swa_allocator = None
 
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
+
+def stand_in_views(roles: ChainRoles, kvcache, state=None) -> Dict[str, object]:
+    """The sub-pool views a test's stand-in KV pool holds, by sub-pool name:
+    what `ChainAllocator` takes as `views`."""
+    views = {roles.owner: kvcache.full_kv_pool}
+    if roles.window is not None:
+        views[roles.window] = kvcache.swa_kv_pool
+    if roles.state is not None:
+        views[roles.state] = state
+    return views
 
 
 def tri_sub_pool_specs(
@@ -657,12 +661,13 @@ def _member_summary(member) -> tuple:
 
 
 def _kv_pools(bundle) -> Dict[str, object]:
-    kv = bundle.token_to_kv_pool
-    pools = {"full": kv.full_kv_pool}
-    if isinstance(kv, UnifiedSWAKVPool):
-        pools["swa"] = kv.swa_kv_pool
-    if isinstance(bundle, UnifiedPoolBundle):
-        pools["mamba"] = bundle.token_to_kv_pool_allocator.state.pool
+    router = bundle.token_to_kv_pool.layer_router
+    pools = {
+        sub_pool.name: router.view(sub_pool.name) for sub_pool in router.sub_pools()
+    }
+    state = bundle.token_to_kv_pool_allocator.state
+    if state is not None:
+        pools[state.sub_pool] = state.pool
     return pools
 
 
@@ -681,18 +686,23 @@ def _pool_summary(pool, raw_base: int) -> dict:
 
 
 def _layer_maps(bundle) -> dict:
-    kv = bundle.token_to_kv_pool
-    if isinstance(kv, UnifiedSWAKVPool):
+    """Each token layer's index in its view; with a window, and whether it
+    is a window layer."""
+    router = bundle.token_to_kv_pool.layer_router
+    owner = router.sub_pools()[0].name
+    routes = {gid: router.route(gid) for gid in router.layer_ids()}
+    if len(router.sub_pools()) > 1:
         kv_map = tuple(
             sorted(
-                (gid, idx, is_swa) for gid, (idx, is_swa) in kv.layers_mapping.items()
+                (gid, route.index, route.sub_pool != owner)
+                for gid, route in routes.items()
             )
         )
     else:
-        kv_map = tuple(sorted(kv.full_attention_layer_id_mapping.items()))
+        kv_map = tuple(sorted((gid, route.index) for gid, route in routes.items()))
     out = {"kv": kv_map}
-    if isinstance(bundle, UnifiedPoolBundle):
-        state = bundle.token_to_kv_pool_allocator.state
+    state = bundle.token_to_kv_pool_allocator.state
+    if state is not None:
         out["state"] = tuple(sorted(state.layer_map.items()))
     return out
 
@@ -704,9 +714,9 @@ def _capacity_summary(bundle) -> dict:
         "size_full": allocator.size_full,
         "draft_virtual_id_space": allocator.draft_virtual_id_space,
     }
-    if isinstance(bundle.token_to_kv_pool, UnifiedSWAKVPool):
+    if allocator.has_window_pool:
         out["size_swa"] = allocator.size_swa
-    if isinstance(bundle, UnifiedPoolBundle):
+    if allocator.state is not None:
         out["state_slots"] = allocator.state_slots.size
     return out
 
@@ -732,8 +742,8 @@ def unified_layout_summary(bundle) -> dict:
         "layer_maps": _layer_maps(bundle),
         "capacity": _capacity_summary(bundle),
     }
-    if not isinstance(bundle, UnifiedPoolBundle):
-        # Only the window chain's stored floor has a consumer (post-capture
-        # backing re-checks it).
+    if bundle.token_to_kv_pool_allocator.state is None:
+        # Only a plan without state resizes after capture, where the backing
+        # re-checks the stored floor.
         out["bs1_floor_terms"] = tuple(pool._bs1_floor_terms)
     return out

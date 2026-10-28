@@ -574,9 +574,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_table=metadata.page_table,
             page_size=self.page_size,
             swa_page_table=metadata.swa_page_table if has_swa else None,
-            full_to_swa=(
-                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
-            ),
+            full_to_swa=self._swa_full_to_swa_mapping if has_swa else None,
         )
 
     def _is_window_layer(self, layer: RadixAttention) -> bool:

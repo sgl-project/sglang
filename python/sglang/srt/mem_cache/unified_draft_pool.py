@@ -127,8 +127,8 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
 class UnifiedDraftSWAKVPool(SWAKVPool):
     """A draft's KV pool when it has sliding-window layers: one dense draft
     pool per host sub-pool it fuses into ("full" and/or "swa"), routed per
-    layer exactly like the target's `UnifiedSWAKVPool`, so the attention
-    backends run their swa rail for it. Inherits `SWAKVPool` for `isinstance`
+    layer like the target's pool, so the attention backends run their swa
+    rail for it. Inherits `SWAKVPool` for `isinstance`
     only; never calls its `__init__` (it would allocate static pools)."""
 
     requires_physical_write_loc = True

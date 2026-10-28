@@ -469,8 +469,12 @@ class TestFactoryViews(unittest.TestCase):
     def test_factory_builds_per_layer_views(self):
         b = self._bundle()
         # Sub-pools expose stock 3-D per-layer views.
-        self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
-        self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("full").k_buffer[0].dim(), 3
+        )
+        self.assertEqual(
+            b.token_to_kv_pool.layer_router.view("swa").k_buffer[0].dim(), 3
+        )
 
     @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
     def test_swa_factory_preserves_fp8_logical_dtype(self):
@@ -497,7 +501,7 @@ class TestFactoryViews(unittest.TestCase):
         )
 
         self.assertEqual(b.token_to_kv_pool.dtype, torch.float8_e4m3fn)
-        for pool in (b.token_to_kv_pool.full_kv_pool, b.token_to_kv_pool.swa_kv_pool):
+        for pool in map(b.token_to_kv_pool.layer_router.view, ("full", "swa")):
             self.assertEqual(pool.dtype, torch.float8_e4m3fn)
             self.assertEqual(pool.store_dtype, torch.uint8)
             self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)

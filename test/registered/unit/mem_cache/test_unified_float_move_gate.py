@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
+    stand_in_views,
     tri_sub_pool_specs,
 )
 
@@ -41,7 +42,9 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=pool,
         kvcache=kv,
-        state_kvcache=mk,
+        views=stand_in_views(
+            ChainRoles(owner="full", window="swa", state="mamba"), kv, mk
+        ),
         device="cpu",
         full_max_total_num_tokens=ps * 1000,
         swa_max_total_num_tokens=ps * 1000,

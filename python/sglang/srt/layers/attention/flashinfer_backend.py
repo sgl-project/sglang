@@ -32,6 +32,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
+    resolve_window_id_space,
     resolve_window_kv_pool,
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -342,10 +343,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
         self._swa_kv_pool = resolve_window_kv_pool(model_runner)
         # The window id space of that pool, which these reads map through.
-        self._swa_space: Optional[IdSpace] = (
-            None
-            if self._swa_kv_pool is None
-            else self._swa_kv_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+        self._swa_space: Optional[IdSpace] = resolve_window_id_space(
+            model_runner, self._swa_kv_pool
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = get_exec().features.enable_mis

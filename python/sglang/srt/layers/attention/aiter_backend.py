@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
+    resolve_window_id_space,
     resolve_window_kv_pool,
 )
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
@@ -512,11 +513,7 @@ class AiterAttnBackend(AttentionBackend):
         # SWA mapping must still come from the target allocator.
         self.swa_kv_pool = resolve_window_kv_pool(model_runner)
         # The window id space of that pool, which these reads map through.
-        self.swa_space = (
-            None
-            if self.swa_kv_pool is None
-            else self.swa_kv_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
-        )
+        self.swa_space = resolve_window_id_space(model_runner, self.swa_kv_pool)
         self.use_sliding_window_kv_pool = (
             self.swa_kv_pool is not None
             and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)

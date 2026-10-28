@@ -10,7 +10,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation import utils as pd
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import is_mla_pool
@@ -110,45 +109,6 @@ class TestPlanNames(CustomTestCase):
                     self.assertEqual(s.layer_indices, expected)
 
 
-def _kv_args_fields(kv_args):
-    return {
-        name: getattr(kv_args, name)
-        for name in (
-            "state_types",
-            "state_data_ptrs",
-            "state_data_lens",
-            "state_item_lens",
-            "state_dim_per_tensor",
-            "state_conv_shard_groups",
-            "state_slice_outer_counts",
-            "state_layer_ids",
-            "is_hybrid_mla_backend",
-            "swa_kv_cache_layout",
-            "mla_compression_ratios",
-        )
-    }
-
-
-class TestPdRegistration(CustomTestCase):
-    def test_plan_wire_matches_the_pool_class_branches(self):
-        for name in CHAINS:
-            with self.subTest(chain=name):
-                bundle = _bundle(name)
-                pool = bundle.token_to_kv_pool
-                allocator = bundle.token_to_kv_pool_allocator
-                state_pool = None if allocator.state is None else allocator.state.pool
-                by_plan, by_class = SimpleNamespace(), SimpleNamespace()
-                pd.setup_state_kv_args(
-                    by_plan, pool, None, 4, state_pool, storage=allocator.storage
-                )
-                pd.setup_state_kv_args(by_class, pool, None, 4, state_pool)
-                self.assertEqual(_kv_args_fields(by_plan), _kv_args_fields(by_class))
-                self.assertEqual(
-                    pd.get_kv_transfer_buf_infos(pool, allocator.storage),
-                    pd.get_kv_transfer_buf_infos(pool),
-                )
-
-
 class TestHostSizing(CustomTestCase):
     def test_plan_sizes_match_the_pool_views(self):
         from sglang.srt.mem_cache import hicache_auto_size as sizing
@@ -231,7 +191,7 @@ def _host_pool_recorders():
 
 
 class TestHostStack(CustomTestCase):
-    def _build(self, name, *, backend, by_plan):
+    def _build(self, name, *, backend):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
         chain = CHAINS[name].chain
@@ -275,87 +235,17 @@ class TestHostStack(CustomTestCase):
             patch.object(hpa, "HostPoolGroup", _Group),
             patch.object(hpa.HybridCacheController, "__init__", record),
         ):
-            if by_plan:
-                result = hpa.build_unified_host_stack(
-                    storage=allocator.storage,
-                    params=params,
-                    cache=cache,
-                    load_cache_event=None,
-                    storage_backend=backend,
-                )
-            else:
-                kvcache = allocator.get_kvcache()
-                result = hpa._select_strategy(kvcache, _COMPONENTS[chain]).build(
-                    cache=cache,
-                    kvcache=kvcache,
-                    params=params,
-                    server_args=None,
-                    load_cache_event=None,
-                    storage_backend=backend,
-                )
+            result = hpa.build_unified_host_stack(
+                storage=allocator.storage,
+                params=params,
+                cache=cache,
+                load_cache_event=None,
+                storage_backend=backend,
+            )
         return result, controller, cache
 
-    def _summary(self, result, controller, cache):
-        limit = controller["transfer_layer_id_max"] + 4
-        entries = []
-        for entry in result.host_pool_group.entry_map.values():
-            host = dict(vars(entry.host_pool))
-            host.pop("name", None)  # the envelope side's label
-            calls = []
-            for fn, arg in ((entry.host_evict_fn, 3), (entry.device_evict_fn, 1 << 30)):
-                cache.calls.clear()
-                if fn is not None:
-                    fn(arg)
-                calls.append(list(cache.calls))
-            entries.append(
-                (
-                    entry.name,
-                    host,
-                    entry.device_pool,
-                    [entry.layer_mapper(t) for t in range(limit)],
-                    entry.is_primary_index_anchor,
-                    entry.packed_draft_device_pools,
-                    calls,
-                    entry.device_alloc_fn,
-                    entry.device_free_fn,
-                )
-            )
-        components = {
-            c: next(
-                n
-                for n, e in result.host_pool_group.entry_map.items()
-                if e.host_pool is pool
-            )
-            for c, pool in result.component_host_pools.items()
-        }
-        return entries, components, result.sidecars, result.loads_state_layer_wise
-
-    def test_matches_the_pool_class_strategies(self):
-        # The class strategies no longer build a page-envelope pair: a window
-        # chain is compared on a backend that keeps no envelopes.
-        for name in CHAINS:
-            for backend in (None, "file"):
-                if backend is None and name == "swa":
-                    continue
-                with self.subTest(chain=name, backend=backend):
-                    plan = self._build(name, backend=backend, by_plan=True)
-                    legacy = self._build(name, backend=backend, by_plan=False)
-                    self.assertEqual(
-                        {k: v for k, v in plan[1].items() if k != "args"},
-                        {k: v for k, v in legacy[1].items() if k != "args"},
-                    )
-                    self.assertEqual(plan[1]["args"][2:], legacy[1]["args"][2:])
-                    # Separate builds: compare by position, not identity.
-                    plan_entries, *plan_rest = self._summary(*plan)
-                    legacy_entries, *legacy_rest = self._summary(*legacy)
-                    self.assertEqual(plan_rest, legacy_rest)
-                    self.assertEqual(
-                        [_shape(e) for e in plan_entries],
-                        [_shape(e) for e in legacy_entries],
-                    )
-
     def test_window_ends_share_a_page_envelope_backing(self):
-        result, controller, cache = self._build("swa", backend=None, by_plan=True)
+        result, controller, cache = self._build("swa", backend=None)
         storage = cache.token_to_kv_pool_allocator.storage
         kv, swa = result.host_pool_group.entry_map.values()
         self.assertEqual((kv.name, swa.name), (PoolName.KV, PoolName.SWA))
@@ -377,32 +267,11 @@ class TestHostStack(CustomTestCase):
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
     def test_owner_host_pool_is_named_by_its_sub_pool(self):
-        result, _, _ = self._build("swa", backend="file", by_plan=True)
+        result, _, _ = self._build("swa", backend="file")
         self.assertEqual(
             [e.name for e in result.host_pool_group.entry_map.values()],
             [PoolName.KV, PoolName.SWA],
         )
-
-
-def _shape(entry):
-    """An entry with its objects replaced by what they are, so two builds over
-    two pools of one geometry compare equal."""
-    name, host, device_pool, layer_map, anchor, packed, calls, alloc, free = entry
-    host = {k: type(v).__name__ if k == "device_pool" else v for k, v in host.items()}
-    return (
-        name,
-        host,
-        type(device_pool).__name__,
-        layer_map,
-        anchor,
-        len(packed),
-        [
-            [(c[0], c[1], c[2]) if c[0] == "host" else (c[0], vars(c[1])) for c in call]
-            for call in calls
-        ],
-        None if alloc is None else alloc.__qualname__,
-        None if free is None else free.__qualname__,
-    )
 
 
 if __name__ == "__main__":
