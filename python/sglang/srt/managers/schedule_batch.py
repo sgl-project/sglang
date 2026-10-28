@@ -2655,11 +2655,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
-    # Host-side max of the page-aligned kv_allocated_len for this spec
-    # round, published by eagle_prepare_for_decode when the CPU mirror is
-    # absent; NPU sizes its graph block-table gather from it (no D2H).
-    max_seq_len_host: Optional[int] = None
-
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 

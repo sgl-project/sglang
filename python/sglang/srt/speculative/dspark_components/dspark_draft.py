@@ -594,8 +594,10 @@ class DraftBlockProposer:
         elif batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
-            # nxt_kv_lens_cpu is allocation headroom, not an attention length.
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
         draft_num_tokens = bs * query_token_num

@@ -4243,6 +4243,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        use_flash_mla: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -4330,6 +4331,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **({"use_flash_mla": True} if use_flash_mla else {}),
             )
         if isinstance(self.full_kv_pool, MHATokenToKVPool):
             # Only the hybrid root knows the model IDs of its compact child.

@@ -1123,8 +1123,7 @@ class Envs:
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
-    # Use FlashMLA and its merged MLA cache for static DSpark target verify.
-    # Non-speculative decode keeps the default attention and cache layout.
+    # FlashMLA and merged KV cache for static DSpark target verify.
     SGLANG_NPU_USE_FLASH_MLA = EnvBool(False)
     # BF16 wo_a: use F.linear for single-local-group decode (Flash TP8),
     # retaining the original weight layout. Opt-in for A/B.

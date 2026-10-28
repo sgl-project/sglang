@@ -1230,13 +1230,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
-    def requires_host_seq_lens_update(self) -> bool:
-        return (
-            getattr(self.full_attn_backend, "requires_host_seq_lens_update", True)
-            or self.linear_attn_backend.needs_cpu_seq_lens
-        )
-
-    @property
     def supports_ragged_verify_graph(self) -> bool:
         return (
             self.full_attn_backend.supports_ragged_verify_graph

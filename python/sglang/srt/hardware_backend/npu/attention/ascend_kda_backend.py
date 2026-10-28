@@ -19,7 +19,7 @@ _LOG2_E = math.log2(math.e)
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
-    # Ascend returns chunk states directly; it does not use FlashInfer checkpoints.
+    # Ascend returns chunk states directly.
     uses_state_checkpoints: bool = False
 
     def extend(

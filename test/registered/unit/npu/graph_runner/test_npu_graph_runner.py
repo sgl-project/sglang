@@ -13,9 +13,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("requires_host_seq_lens_update", [True, False])
+@pytest.mark.parametrize("needs_cpu_seq_lens", [True, False])
+@pytest.mark.parametrize("dflash", [True, False])
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
-    requires_host_seq_lens_update,
+    needs_cpu_seq_lens,
+    dflash,
 ):
     runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
     runner.require_mlp_tp_gather = False
@@ -30,18 +32,19 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
         req_pool_indices=torch.empty(2, dtype=torch.int32),
     )
     runner.model_runner = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: dflash),
         is_draft_worker=False,
         model_config=SimpleNamespace(hf_config=object()),
     )
     runner.seq_len_fill_value = 0
+    runner.raw_bs = runner.raw_num_token = runner.bs = 2
     runner.capture_forward_mode = object()
     runner.is_encoder_decoder = False
     runner._pad_to_bucket = lambda raw_bs, buckets: raw_bs
     runner._make_graph_key = lambda bs: ("graph", bs)
     attention = SimpleNamespace(
         init_forward_metadata_out_graph=mock.Mock(),
-        requires_host_seq_lens_update=requires_host_seq_lens_update,
+        needs_cpu_seq_lens=needs_cpu_seq_lens,
     )
     runner._replay_attn_backend = lambda: attention
     runner.backend = SimpleNamespace(
@@ -67,7 +70,11 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
         input_ids=torch.tensor([4, 5]),
         positions=torch.tensor([8, 9]),
         seq_lens=torch.tensor([10, 11]),
-        seq_lens_cpu=torch.tensor([10, 11], dtype=torch.int32),
+        seq_lens_cpu=(
+            torch.tensor([10, 11], dtype=torch.int32)
+            if dflash or needs_cpu_seq_lens
+            else None
+        ),
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         out_cache_loc=None,
         input_embeds=None,
@@ -86,9 +93,13 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
     ):
         output = runner.execute(forward_batch)
 
-    runner.deepep_adapter.replay.assert_called_once_with()
-    attention.init_forward_metadata_out_graph.assert_called_once_with("replay-view")
-    if requires_host_seq_lens_update:
+    if dflash:
+        runner.deepep_adapter.replay.assert_called_once_with()
+        attention.init_forward_metadata_out_graph.assert_called_once_with("replay-view")
+    else:
+        runner.deepep_adapter.replay.assert_not_called()
+        attention.init_forward_metadata_out_graph.assert_not_called()
+    if needs_cpu_seq_lens:
         runner.backend.replay_with_input_update.assert_called_once_with(
             ("graph", 2),
             seq_lens=[10, 11],

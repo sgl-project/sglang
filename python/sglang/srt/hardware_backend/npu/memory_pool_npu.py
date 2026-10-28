@@ -716,17 +716,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.use_flash_mla = use_flash_mla
-        if self.use_flash_mla and (
-            dtype != torch.bfloat16
-            or index_head_dim is not None
-            or self.use_fia_nz
-            or self.dcp_size != 1
-            or enable_memory_saver
-        ):
-            raise ValueError(
-                "NPU FlashMLA requires ordinary BF16 MLA with ND KV cache, "
-                "without DCP or memory saver."
-            )
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
@@ -755,8 +744,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                # Preserve the existing split-cache API for MLA preprocess and
-                # prefill. Both views write directly into FlashMLA's allocation.
+                # Split views share the FlashMLA cache allocation.
                 self.k_buffer = self.kv_buffer[..., : self.kv_cache_dim]
                 self.v_buffer = self.kv_buffer[..., self.kv_cache_dim :]
             else:

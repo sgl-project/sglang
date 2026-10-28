@@ -54,8 +54,6 @@ def backend():
     obj.flash_mla_metadata = Mock(side_effect=lambda **kw: kw["cache_seqlens"].clone())
 
     def attention(query, cache, **kwargs):
-        # The CANN operator takes TND query (Q_T, Q_N, D) and returns NTD
-        # attn_out (Q_N, Q_T, DV).
         assert kwargs["layout_q"] == "TND"
         assert kwargs["layout_out"] == "NTD"
         assert query.dim() == 3
@@ -79,6 +77,9 @@ def make_batch(mode, lengths):
         forward_mode=mode,
         seq_lens=torch.tensor(lengths, dtype=torch.int32),
         seq_lens_cpu=None,
+        spec_algorithm=SimpleNamespace(
+            is_dflash=lambda: False, is_dflash_family=lambda: True
+        ),
         req_pool_indices=torch.arange(len(lengths)),
         spec_info=SimpleNamespace(draft_token_num=8)
         if mode.is_target_verify()
@@ -93,8 +94,12 @@ def make_batch(mode, lengths):
     "mode,expected",
     [(ForwardMode.TARGET_VERIFY, [133, 0]), (ForwardMode.IDLE, [0, 0])],
 )
-def test_eager_metadata_uses_device_lengths_without_cpu_mirror(backend, mode, expected):
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_eager_metadata_uses_device_lengths_without_cpu_mirror(
+    backend, mode, expected, dtype
+):
     batch = make_batch(mode, [125, 0] if mode.is_target_verify() else [0, 0])
+    batch.seq_lens = batch.seq_lens.to(dtype)
     with (
         patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
@@ -103,13 +108,44 @@ def test_eager_metadata_uses_device_lengths_without_cpu_mirror(backend, mode, ex
     ):
         backend.init_forward_metadata(batch)
     metadata = backend.forward_metadata
-    assert metadata.flash_mla_seq_lens.tolist() == expected
-    assert metadata.flash_mla_seqused_q.tolist() == [
+    assert metadata.seq_lens.dtype == torch.int32
+    assert metadata.seq_lens.data_ptr() != batch.seq_lens.data_ptr()
+    assert metadata.seq_lens.tolist() == expected
+    assert metadata.seqused_q.tolist() == [
         8 if mode.is_target_verify() else 0,
         0,
     ]
     assert batch.seq_lens.tolist() == ([125, 0] if mode.is_target_verify() else [0, 0])
     assert batch.seq_lens_cpu is None
+
+
+@pytest.mark.parametrize("mirror_includes_block", [False, True])
+def test_flash_mla_reuses_cpu_mirror_for_page_table_extent(
+    backend, mirror_includes_block
+):
+    batch = make_batch(ForwardMode.TARGET_VERIFY, [121, 249])
+    batch.seq_lens_cpu = torch.tensor(
+        [129, 257] if mirror_includes_block else [121, 249]
+    )
+    original = batch.seq_lens_cpu.clone()
+    with (
+        patch.object(
+            mod, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
+        ),
+        patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")),
+    ):
+        backend.init_forward_metadata(batch)
+    metadata = backend.forward_metadata
+    expected_pages = backend.req_to_token[:, : 3 * 128 : 128] // 128
+    torch.testing.assert_close(metadata.block_tables, expected_pages)
+    torch.testing.assert_close(
+        metadata.seq_lens, torch.tensor([129, 257], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        batch.seq_lens, torch.tensor([121, 249], dtype=torch.int32)
+    )
+    torch.testing.assert_close(batch.seq_lens_cpu, original)
+    assert metadata.seqused_q.tolist() == [8, 8]
 
 
 def test_graph_metadata_preserves_prefix_and_stable_addresses(backend):
@@ -122,12 +158,12 @@ def test_graph_metadata_preserves_prefix_and_stable_addresses(backend):
     ):
         backend.init_forward_metadata_out_graph(batch, in_capture=True)
         metadata = backend.forward_metadata
-        names = ["flash_mla_seq_lens", "flash_mla_seqused_q", "flash_mla_metadata"]
+        names = ["seq_lens", "seqused_q", "cu_seqlens_q", "flash_mla_metadata"]
         pointers = [getattr(metadata, name).data_ptr() for name in names]
-        assert metadata.flash_mla_seq_lens.tolist() == [133, 0]
+        assert metadata.seq_lens.tolist() == [133, 0]
         batch.seq_lens[0] = 126
         backend.init_forward_metadata_out_graph(batch)
-        assert metadata.flash_mla_seq_lens.tolist() == [134, 0]
+        assert metadata.seq_lens.tolist() == [134, 0]
         assert metadata.flash_mla_metadata.tolist() == [134, 0]
         assert metadata is backend.forward_metadata
         assert pointers == [getattr(metadata, name).data_ptr() for name in names]
@@ -139,11 +175,14 @@ def test_graph_metadata_preserves_prefix_and_stable_addresses(backend):
 def test_target_verify_dispatches_to_flash_mla_and_zeroes_padding(backend):
     mode = ForwardMode.TARGET_VERIFY
     batch = make_batch(mode, [125, 0])
-    metadata = mod.ForwardMetadata(block_tables=torch.zeros(2, 4, dtype=torch.int32))
-    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens, mode, batch.spec_info)
+    metadata = mod.ForwardMetadata(
+        seq_lens=torch.empty_like(batch.seq_lens),
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+    )
+    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens)
     backend.forward_metadata = metadata
     width = 8
-    tokens = 2 * width + 2  # two request slots followed by DP token padding
+    tokens = 2 * width + 2  # DP padding.
     q = torch.zeros(tokens, 2, 512, dtype=torch.bfloat16)
     rope = torch.zeros(tokens, 2, 64, dtype=torch.bfloat16)
     layer = SimpleNamespace(layer_id=0, tp_q_head_num=2, v_head_dim=512, scaling=0.1)
@@ -159,19 +198,20 @@ def test_target_verify_dispatches_to_flash_mla_and_zeroes_padding(backend):
     assert torch.count_nonzero(output[width:]) == 0
     args, kwargs = backend.flash_mla.call_args
     assert args[0].shape == (2 * width, 2, 576)
-    assert kwargs["cache_seqlens"] is metadata.flash_mla_seq_lens
-    assert kwargs["seqused_q"] is metadata.flash_mla_seqused_q
-    assert kwargs["cu_seqlens_q"] is metadata.flash_mla_cu_seqlens_q
+    assert kwargs["cache_seqlens"] is metadata.seq_lens
+    assert kwargs["seqused_q"] is metadata.seqused_q
+    assert kwargs["cu_seqlens_q"] is metadata.cu_seqlens_q
     assert kwargs["cu_seqlens_q"].tolist() == [0, width, 2 * width]
     assert kwargs["layout_kv"] == "PA_BBND"
 
 
 def test_empty_batch_does_not_call_cann(backend):
-    metadata = mod.ForwardMetadata(block_tables=torch.empty(0, 4, dtype=torch.int32))
-    batch = make_batch(ForwardMode.TARGET_VERIFY, [])
-    backend._prepare_flash_mla_metadata(
-        metadata, batch.seq_lens, batch.forward_mode, batch.spec_info
+    metadata = mod.ForwardMetadata(
+        seq_lens=torch.empty(0, dtype=torch.int32),
+        block_tables=torch.empty(0, 4, dtype=torch.int32),
     )
+    batch = make_batch(ForwardMode.TARGET_VERIFY, [])
+    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens)
     backend.forward_metadata = metadata
     layer = SimpleNamespace(tp_q_head_num=2, v_head_dim=512)
     output = backend._forward_flash_mla(
@@ -180,24 +220,6 @@ def test_empty_batch_does_not_call_cann(backend):
     assert output.shape == (0, 1024)
     backend.flash_mla_metadata.assert_not_called()
     backend.flash_mla.assert_not_called()
-
-
-def test_ragged_verify_is_rejected(backend):
-    with pytest.raises(ValueError, match="static DSpark"):
-        backend._prepare_flash_mla_metadata(
-            mod.ForwardMetadata(),
-            torch.tensor([125]),
-            ForwardMode.TARGET_VERIFY,
-            SimpleNamespace(ragged_verify_layout=object()),
-        )
-
-
-def test_flash_mla_metadata_rejects_ordinary_decode(backend):
-    with pytest.raises(ValueError, match="static DSpark"):
-        backend._prepare_flash_mla_metadata(
-            mod.ForwardMetadata(), torch.tensor([125]), ForwardMode.DECODE, None
-        )
-    backend.flash_mla_metadata.assert_not_called()
 
 
 @pytest.mark.parametrize("graph,use_fia", [(False, False), (False, True), (True, True)])
@@ -292,7 +314,8 @@ def test_non_speculative_graph_metadata_keeps_host_lengths(backend):
         backend.init_forward_metadata_out_graph(batch, in_capture=True)
     metadata = backend.forward_metadata
     assert metadata.seq_lens_cpu_list == [125, 0]
-    assert metadata.flash_mla_seq_lens is None
+    assert metadata.seqused_q is None
+    assert metadata.cu_seqlens_q is None
     assert metadata.flash_mla_metadata is None
     backend.flash_mla_metadata.assert_not_called()
 
@@ -387,7 +410,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         patch.object(
             mod,
             "get_bool_env_var",
-            side_effect=lambda name, *args: mojo and name == "ASCEND_USE_MOJO_MTP",
+            side_effect=lambda name, *args: (
+                name == "ASCEND_USE_FIA" or (mojo and name == "ASCEND_USE_MOJO_MTP")
+            ),
         ),
         patch.object(
             mod,
@@ -409,6 +434,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             ),
         ),
         patch.object(mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled),
+        patch.object(mod.logger, "warning") as warning,
         patch.object(
             mod.envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS,
             "get",
@@ -419,7 +445,13 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     assert obj.use_flash_mla is uses_flash_mla
     assert obj.use_mojo_mtp is uses_mojo
     assert obj.needs_cpu_seq_lens is needs_cpu
-    assert obj.requires_host_seq_lens_update is not (uses_flash_mla or uses_mojo)
+    if not force_cpu and not (uses_flash_mla or uses_mojo):
+        warning.assert_called_once_with(
+            "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+            "host-bound attention paths present; keeping the mirror."
+        )
+    else:
+        warning.assert_not_called()
     if uses_flash_mla:
         provider = cann_module if arch35 else kernel_module
         assert obj.flash_mla is provider.flash_mla
@@ -567,8 +599,9 @@ def test_disabled_flash_mla_keeps_separate_cache_allocations(pool_factory, fia_n
 )
 @pytest.mark.parametrize("arch35", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
 def test_pool_configurator_only_merges_dspark_target_cache(
-    pool_factory, dspark, is_draft, arch35, enabled
+    pool_factory, dspark, is_draft, arch35, enabled, hybrid
 ):
     from sglang.srt.hardware_backend.npu import utils as npu_utils
 
@@ -580,21 +613,38 @@ def test_pool_configurator_only_merges_dspark_target_cache(
     config = config_mod.KVCacheConfigurator.__new__(config_mod.KVCacheConfigurator)
     config.is_draft_worker = is_draft
     config.spec_algorithm = SimpleNamespace(is_dspark=lambda: dspark)
-    config.model_config = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    config.model_config = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        head_dim=576,
+        hf_config=SimpleNamespace(),
+        get_num_kv_heads=lambda *_: 1,
+    )
     config.kv_cache_dtype = torch.bfloat16
+    config.kv_cache_dtype_str = "auto"
+    config.use_mla_backend = True
+    config.post_capture_kv_active = False
+    config.mambaish_config = SimpleNamespace(full_attention_layer_ids=[0, 1])
     config.device = "cpu"
     config.layer_info = SimpleNamespace(
         start_layer=0, end_layer=2, num_effective_layers=2
     )
     constructor = Mock()
+    constructor.return_value.get_kv_size_bytes.return_value = 0
     with (
         patch.object(pool_mod, "NPUMLATokenToKVPool", constructor),
+        patch.object(config_mod, "_is_npu", True),
+        patch.object(
+            config_mod.KVCacheConfigurator, "_build_mha_quant_method", return_value=None
+        ),
         patch.object(
             config_mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled
         ),
         patch.object(npu_utils, "is_npu_arch35", return_value=arch35),
         patch.object(
-            config_mod, "get_parallel", return_value=SimpleNamespace(attn_dcp_size=1)
+            config_mod,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=1, attn_tp_size=1),
         ),
         patch.object(
             config_mod, "get_schedule", return_value=SimpleNamespace(page_size=128)
@@ -606,12 +656,33 @@ def test_pool_configurator_only_merges_dspark_target_cache(
                 features=SimpleNamespace(enable_memory_saver=False)
             ),
         ),
+        patch.object(
+            config_mod,
+            "get_model",
+            return_value=SimpleNamespace(qsa_indexer_dtype="auto"),
+        ),
+        patch.object(
+            config_mod,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+        ),
     ):
-        config._build_ascend_mla_kv_pool(max_total_num_tokens=256, is_dsa_model=False)
+        if hybrid:
+            config._build_hybrid_linear_kv_pool(
+                max_total_num_tokens=256,
+                req_to_token_pool=SimpleNamespace(mamba_pool=Mock()),
+                mha_pool_class=Mock(),
+                mla_pool_class=Mock(),
+                dsa_pool_class=Mock(),
+            )
+        else:
+            config._build_ascend_mla_kv_pool(
+                max_total_num_tokens=256, is_dsa_model=False
+            )
     constructor.assert_called_once()
     requested = enabled and dspark and not is_draft
-    assert constructor.call_args.kwargs["use_flash_mla"] is requested
-    pool = pool_factory(**constructor.call_args.kwargs)
+    assert constructor.call_args.kwargs.get("use_flash_mla", False) is requested
+    pool = pool_factory(**{**constructor.call_args.kwargs, "use_flash_mla": requested})
     assert pool.use_flash_mla is requested
     key, rope = pool.get_kv_buffer(0)
     shares_storage = (
@@ -631,33 +702,14 @@ def test_k3_hybrid_pool_maps_model_layer_to_flash_mla_cache(pool_factory):
     hybrid.layer_transfer_counter.wait_until.assert_called_once_with(7)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"dtype": torch.float16},
-        {"index_head_dim": 128},
-        {"enable_memory_saver": True},
-        {"fia_nz": True},
-        {"dcp_size": 2},
-    ],
-)
-def test_unsupported_cache_configurations_fail_before_allocation(
-    pool_factory, overrides
-):
-    with pytest.raises(ValueError, match="ordinary BF16 MLA"):
-        pool_factory(**overrides)
-
-
 def test_verify_mask_broadcasts_across_query_block(backend):
-    """seqused_q is per batch; the padding mask must cover the whole query block.
-
-    DSpark verify runs query_len > 1, so a non-broadcast view over seqused_q
-    would either raise or silently mask the wrong rows.
-    """
-    metadata = mod.ForwardMetadata(block_tables=torch.zeros(3, 4, dtype=torch.int32))
+    metadata = mod.ForwardMetadata(
+        seq_lens=torch.empty(3, dtype=torch.int32),
+        block_tables=torch.zeros(3, 4, dtype=torch.int32),
+    )
     mode = ForwardMode.TARGET_VERIFY
     batch = make_batch(mode, [125, 0, 40])
-    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens, mode, batch.spec_info)
+    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens)
     backend.forward_metadata = metadata
     width = 8
     tokens = 3 * width

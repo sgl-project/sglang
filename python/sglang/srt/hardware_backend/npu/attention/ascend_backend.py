@@ -101,16 +101,14 @@ class ForwardMetadata:
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
-    mojo_cu_q_lens: Optional[torch.Tensor] = None
+    cu_seqlens_q: Optional[torch.Tensor] = None  # Query offsets, including leading 0.
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
     # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
-    flash_mla_seq_lens: Optional[torch.Tensor] = None
-    flash_mla_seqused_q: Optional[torch.Tensor] = None
-    flash_mla_cu_seqlens_q: Optional[torch.Tensor] = None
+    seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
     flash_mla_metadata: Optional[torch.Tensor] = None
 
     # DCP decode inputs
@@ -319,7 +317,6 @@ def _cp_allgather_and_save_kv_npu(
 class AscendAttnBackend(AttentionBackend):
     use_mojo_mtp: bool = False
     use_flash_mla: bool = False
-    requires_host_seq_lens_update: bool = True
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
@@ -395,13 +392,11 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
-        # Independent of the FIA-v2 switch: only the DSpark draft uses GQA.
         self.use_mojo_mtp = (
             get_bool_env_var("ASCEND_USE_MOJO_MTP", "False")
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
-        # Keep non-speculative decode on the default attention/cache path.
         self.use_flash_mla = (
             self.use_mla
             and not self.is_draft_worker
@@ -409,20 +404,6 @@ class AscendAttnBackend(AttentionBackend):
             and envs.SGLANG_NPU_USE_FLASH_MLA.get()
         )
         if self.use_flash_mla:
-            if (
-                self.use_dsa
-                or self.model_dtype != torch.bfloat16
-                or self.kv_cache_dtype != torch.bfloat16
-                or (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64)
-                or get_parallel().attn_cp_size > 1
-                or get_parallel().dcp_enabled
-                or model_runner.is_hybrid_swa
-                or model_runner.server_args.enable_mixed_chunk
-            ):
-                raise ValueError(
-                    "NPU FlashMLA supports ordinary BF16 MLA (latent 512, RoPE 64), "
-                    "static DSpark target verify, without CP or mixed chunks."
-                )
             if is_npu_arch35():
                 from cann_ops_transformer.ops.attention.flash_mla import (
                     flash_mla,
@@ -433,11 +414,9 @@ class AscendAttnBackend(AttentionBackend):
                     flash_mla,
                     flash_mla_metadata,
                 )
-            logger.info("NPU FlashMLA provider: %s", flash_mla.__module__)
 
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
-            self.requires_host_seq_lens_update = False
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -471,6 +450,17 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
+        if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
+            # FIA host IntArrays consume the CPU mirror; keep it on instead of
+            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
+            if self.use_fia and not (self.use_flash_mla or self.use_mojo_mtp):
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+                    "host-bound attention paths present; keeping the mirror."
+                )
+            else:
+                self.needs_cpu_seq_lens = False
+
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
@@ -492,70 +482,6 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
-
-        if self.use_mojo_mtp:
-            if (
-                self.use_mla
-                or self.use_dsa
-                or self.model_dtype not in (torch.float16, torch.bfloat16)
-                or self.kv_cache_dtype != self.model_dtype
-                or self.page_size < 16
-                or self.page_size & (self.page_size - 1)
-                or self.is_hybrid_swa
-                or self.use_sliding_window_kv_pool
-                or getattr(self, "use_alibi", False)
-                or get_parallel().dcp_enabled
-                or self.attn_cp_size > 1
-                or model_runner.server_args.enable_mixed_chunk
-                or self.enable_sparsity_driven_kv_offload
-            ):
-                raise ValueError(
-                    "Mojo MTP supports static DSpark GQA drafts with matching "
-                    "BF16/FP16 Q/K/V, power-of-two pages >= 16, without "
-                    "SWA, ALiBi, CP/DCP, mixed chunks or KV offload."
-                )
-            self.requires_host_seq_lens_update = False
-
-        # Static gate for the scheduler's per-step pinned-D2H seq_lens_cpu
-        # mirror. Device-length paths can opt out; host-bound consumers keep it.
-        _env_opt_out = not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
-        # DSA models dispatch every forward mode to forward_sparse (device
-        # lengths), so the MLA host-bound check does not apply to them.
-        self.is_dsa_model = is_deepseek_dsa(model_runner.model_config.hf_config)
-        _host_bound = bool(
-            (self.use_mla and not self.is_dsa_model and not self.use_flash_mla)
-            or (
-                (self.use_fia or self.use_fias_v2_bsnd)
-                and not self.use_flash_mla
-                and not self.use_mojo_mtp
-            )
-            or self.is_hybrid_swa  # SWA table/mask paths read host max_len
-            or getattr(self, "use_alibi", False)  # attn_alibi consumes host lengths
-            or get_parallel().dcp_enabled  # DCP local-KV metadata is host-built
-            or get_parallel().attn_cp_size > 1  # CP attention is FIA-host-only
-            or model_runner.server_args.enable_mixed_chunk  # forward_mixed = FIA TND
-            or (
-                model_runner.spec_algorithm is not None
-                and model_runner.spec_algorithm.is_dflash_family()
-                and not self.use_flash_mla
-                and not self.use_mojo_mtp
-            )  # FIA-based DFlash/DSpark paths consume host verify lengths
-        )
-        # The scheduler ORs target and draft capabilities. Only fully supported
-        # device-length paths can skip its per-round CPU mirror.
-        self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
-        logger.info(
-            "NPU attention configuration: draft=%s flash_mla=%s mojo_mtp=%s cpu_seq_lens=%s",
-            self.is_draft_worker,
-            self.use_flash_mla,
-            self.use_mojo_mtp,
-            self.needs_cpu_seq_lens,
-        )
-        if _env_opt_out and _host_bound:
-            logger.warning(
-                "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
-                "host-bound attention paths present; keeping the mirror."
-            )
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -623,23 +549,14 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.use_flash_mla or self.use_mojo_mtp:
-            seq_lens_cpu = None
-        elif in_capture:
-            seq_lens_cpu = forward_batch.seq_lens.cpu()
-        elif forward_batch.seq_lens_cpu is None and not self.needs_cpu_seq_lens:
-            if self.is_dsa_model:
-                # DSA replay has no host-mirror consumer: attention reads
-                # device lengths and the gather width comes from
-                # max_seq_len_host or the static capture width.
-                seq_lens_cpu = None
-            else:
-                # Plain MHA opt-out: publish the mirror from the device
-                # seq_lens; graph rebind paths may still bind host IntArrays.
-                seq_lens_cpu = forward_batch.seq_lens.cpu()
-                forward_batch.seq_lens_cpu = seq_lens_cpu
+        if self.needs_cpu_seq_lens:
+            seq_lens_cpu = (
+                forward_batch.seq_lens.cpu()
+                if in_capture
+                else forward_batch.seq_lens_cpu
+            )
         else:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
+            seq_lens_cpu = None
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -655,23 +572,10 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.use_mojo_mtp:
-            self.forward_metadata.block_tables = (
-                self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :: self.page_size
-                ]
-                // self.page_size
-            ).to(torch.int32)
-            self._prepare_mojo_mtp_metadata(
-                self.forward_metadata,
-                forward_batch.seq_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
-            )
-            self.graph_mode = False
-            return
-        # Use a supplied CPU mirror when present; device-only paths bypass it.
-        if forward_batch.seq_lens_cpu is not None and not self.use_flash_mla:
+        # Data-driven branch: take the CPU-mirror path whenever the mirror is
+        # present, instead of statically gating on needs_cpu_seq_lens. When the
+        # mirror is absent (true mirrorless), fall through to the else branch.
+        if forward_batch.seq_lens_cpu is not None:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -719,17 +623,6 @@ class AscendAttnBackend(AttentionBackend):
                     .contiguous()
                 )
         else:
-            if (
-                forward_batch.seq_lens is not None
-                and forward_batch.seq_lens_cpu is None
-                and not forward_batch.forward_mode.is_decode_or_idle()
-                and not self.use_flash_mla
-            ):
-                # Mirrorless opt-out (non-decode only): derive the mirror from
-                # the device seq_lens and publish it back so host consumers
-                # (FIA host arrays, block-table width) keep working; decode
-                # batches skip the D2H entirely (device lengths only).
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :: self.page_size
@@ -742,7 +635,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         if forward_batch.seq_lens is not None:
-            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
+            self.forward_metadata.seq_lens = forward_batch.seq_lens.to(
+                dtype=torch.int32, copy=self.use_flash_mla or self.use_mojo_mtp
+            )
         else:
             self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
                 self.device
@@ -750,10 +645,6 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.seq_lens_cpu is not None:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        else:
-            # Mirrorless decode: leave unset so consumers fall back to the
-            # device seq_lens (per-step draft offset applied below).
-            self.forward_metadata.seq_lens_cpu_int = None
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
         # only rebind the Host-side IntArray when captured as a Python list.
@@ -765,7 +656,7 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify() and not self.use_flash_mla:
+        if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if (
                 spec_algorithm is None or not spec_algorithm.is_dflash_family()
@@ -776,7 +667,6 @@ class AscendAttnBackend(AttentionBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
-            and not self.use_flash_mla
         ):
             if self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
@@ -891,10 +781,11 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_idle()
         ):
             self._prepare_flash_mla_metadata(
-                self.forward_metadata,
-                forward_batch.seq_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
+                self.forward_metadata, forward_batch.seq_lens
+            )
+        elif self.use_mojo_mtp:
+            self._prepare_mojo_mtp_metadata(
+                self.forward_metadata, forward_batch.seq_lens
             )
         self.graph_mode = False
 
@@ -1024,10 +915,11 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        if self.use_flash_mla or self.use_mojo_mtp:
-            metadata.seq_lens = torch.empty_like(seq_lens)
-        else:
+        if self.needs_cpu_seq_lens:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        if self.use_flash_mla or self.use_mojo_mtp:
+            metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
+        else:
             metadata.seq_lens = seq_lens
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
@@ -1101,23 +993,6 @@ class AscendAttnBackend(AttentionBackend):
         """
         metadata = self.graph_metadata[bs]
 
-        if self.use_mojo_mtp:
-            # The page table is capacity-sized; the kernel masks reads with
-            # the actual device KV end. No host max or length list is needed.
-            pages = metadata.block_tables.shape[1]
-            metadata.block_tables[:bs].copy_(
-                self.req_to_token[
-                    req_pool_indices[:bs], : pages * self.page_size : self.page_size
-                ]
-                // self.page_size
-            )
-            self._prepare_mojo_mtp_metadata(
-                metadata, seq_lens[:bs], forward_mode, spec_info
-            )
-            self.forward_metadata = metadata
-            self.graph_mode = True
-            return
-
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
@@ -1125,12 +1000,10 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        # Compute the host-side KV lengths visible to this attention step. Target
-        # verify adds the draft block except for DFlash, whose seq_lens_cpu already
-        # includes it; speculative decode adds tokens through the current draft step.
-        attention_kv_lens_cpu = None
-        max_len = None
         if seq_lens_cpu is not None:
+            # Compute the host-side KV lengths visible to this attention step. Target
+            # verify adds the draft block except for DFlash, whose seq_lens_cpu already
+            # includes it; speculative decode adds tokens through the current draft step.
             attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
             if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
                 attention_kv_lens_cpu = (
@@ -1177,43 +1050,43 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
+
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif max_seq_len_host is not None:
-            # Mirrorless DSA replay: the scheduler publishes the max of the
-            # page-aligned kv_allocated_len (>= committed + alloc reserve,
-            # so it upper-bounds every readable length). Apply the same
-            # speculative offsets as the mirror branch above.
+            # Mirrorless replay (e.g. DSA models): the scheduler publishes the
+            # host-side max of the page-aligned allocated seq lens (>= committed
+            # + alloc reserve, so it upper-bounds every readable length). Apply
+            # the same speculative offsets as the mirror branch above.
             if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
             elif forward_mode.is_decode_or_idle() and spec_info is not None:
                 max_len = max_seq_len_host + self.speculative_step_id + 1
             else:
-                # Ordinary decode has no draft block. Only speculative modes
-                # reserve the extra query width beyond the supplied host bound.
-                max_len = max_seq_len_host
-                if spec_info is not None:
-                    max_len += self.speculative_num_draft_tokens
+                # draft-extend (and any other spec mode) sees base + draft block
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-        else:
-            # No mirror and no bound: static full capture width. Device
-            # consumers bound page reads by the per-request seq_lens, so
-            # stale tail entries are never read.
-            max_seq_pages = metadata.block_tables.shape[1]
-
-        if max_len is not None:
-            # Dynamic-width gather: copy the reachable page range, zero the tail.
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
                 // self.page_size
             )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
-            # Static full-width gather: clamp the source slice to the
-            # req_to_token row width; the squeezed tail columns stay unread.
-            src = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_seq_pages * self.page_size : self.page_size,
-            ]
-            metadata.block_tables[:bs, : src.shape[1]].copy_(src // self.page_size)
+            total_pages = min(
+                metadata.block_tables.shape[1],
+                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
+            )
+            metadata.block_tables[:bs, :total_pages].copy_(
+                self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : total_pages * self.page_size : self.page_size,
+                ]
+                // self.page_size
+            )
+            metadata.block_tables[:bs, total_pages:].fill_(0)
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -1268,11 +1141,11 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_flash_mla:
-            self._prepare_flash_mla_metadata(
-                metadata, seq_lens[:bs], forward_mode, spec_info
-            )
-            metadata.seq_lens[:bs].copy_(metadata.flash_mla_seq_lens)
+        if self.use_flash_mla or self.use_mojo_mtp:
+            if self.use_flash_mla:
+                self._prepare_flash_mla_metadata(metadata, seq_lens[:bs])
+            else:
+                self._prepare_mojo_mtp_metadata(metadata, seq_lens[:bs])
             self.forward_metadata = metadata
             self.graph_mode = True
             return
@@ -1303,47 +1176,22 @@ class AscendAttnBackend(AttentionBackend):
         self,
         metadata: ForwardMetadata,
         prefix_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
     ):
-        if not (forward_mode.is_target_verify() or forward_mode.is_idle()):
-            raise ValueError("Mojo MTP requires static DSpark target-verify batches")
-        if getattr(spec_info, "ragged_verify_layout", None) is not None:
-            raise ValueError("Mojo MTP does not support ragged query blocks")
         width = self.speculative_num_draft_tokens
-        if forward_mode.is_target_verify() and int(spec_info.draft_token_num) != width:
-            raise ValueError(
-                "Mojo MTP query width differs from the captured draft width"
-            )
-        if metadata.seq_lens is None or metadata.seq_lens.dtype != torch.int32:
-            metadata.seq_lens = torch.empty_like(prefix_lens, dtype=torch.int32)
-        # Never mutate/alias the batch's prefix: replay must add the width
-        # exactly once. Zero-length graph/DP slots remain inactive.
+        # Preserve input prefixes and captured buffer addresses.
         metadata.seq_lens.copy_(torch.where(prefix_lens > 0, prefix_lens + width, 0))
-        if metadata.mojo_cu_q_lens is None:
-            metadata.mojo_cu_q_lens = torch.arange(
+        if metadata.cu_seqlens_q is None:
+            metadata.cu_seqlens_q = torch.arange(
                 0,
                 (prefix_lens.numel() + 1) * width,
                 width,
                 dtype=torch.int32,
                 device=prefix_lens.device,
             )
-        metadata.seq_lens_cpu_int = metadata.seq_lens_cpu_list = None
 
     def _forward_mojo_mtp(self, q, layer, forward_batch, sinks):
-        # The kernel ships in sgl-kernel-npu; see
-        # sgl_kernel_npu.attention.mojo_mtp.
         from sgl_kernel_npu.attention.mojo_mtp import mojo_paged_mtp_decode
 
-        if layer.sliding_window_size != -1 or sinks is not None:
-            raise ValueError(
-                "Mojo MTP does not support sliding windows or attention sinks"
-            )
-        if (
-            layer.qk_head_dim != layer.v_head_dim
-            or layer.tp_k_head_num != layer.tp_v_head_num
-        ):
-            raise ValueError("Mojo MTP requires matching K/V head shapes")
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         padded_tokens = query.shape[0]
         if not self.graph_mode:
@@ -1359,7 +1207,7 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             ),
             seq_lens=self.forward_metadata.seq_lens[:bs],
-            cu_q_lens=self.forward_metadata.mojo_cu_q_lens[: bs + 1],
+            cu_q_lens=self.forward_metadata.cu_seqlens_q[: bs + 1],
             block_tables=self.forward_metadata.block_tables[:bs],
             page_size=self.page_size,
             num_q_heads=layer.tp_q_head_num,
@@ -1383,34 +1231,20 @@ class AscendAttnBackend(AttentionBackend):
         self,
         metadata: ForwardMetadata,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
     ):
-        if not (forward_mode.is_target_verify() or forward_mode.is_idle()) or (
-            getattr(spec_info, "ragged_verify_layout", None) is not None
-        ):
-            raise ValueError("NPU FlashMLA currently requires static DSpark verify")
         query_len = self.speculative_num_draft_tokens
-        if metadata.flash_mla_seq_lens is None:
-            metadata.flash_mla_seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
-            metadata.flash_mla_seqused_q = torch.empty_like(seq_lens, dtype=torch.int32)
+        if metadata.seqused_q is None:
+            metadata.seqused_q = torch.empty_like(seq_lens, dtype=torch.int32)
         active = seq_lens > 0
-        # Own the effective lengths: never add the verify width into the input
-        # prefix tensor, and keep the addresses read by captured graphs stable.
-        metadata.flash_mla_seq_lens.copy_(
-            torch.where(active, seq_lens + query_len, 0).to(torch.int32)
-        )
-        metadata.flash_mla_seqused_q.copy_(active.to(torch.int32) * query_len)
+        # Preserve input prefixes and captured buffer addresses.
+        metadata.seq_lens.copy_(torch.where(active, seq_lens + query_len, 0))
+        metadata.seqused_q.copy_(active.to(torch.int32) * query_len)
         if seq_lens.numel() == 0:
             metadata.flash_mla_metadata = torch.empty_like(seq_lens, dtype=torch.int32)
             return
-        # TND layout requires cu_seqlens_q (cumulative query lengths).
         bs = seq_lens.shape[0]
-        if (
-            metadata.flash_mla_cu_seqlens_q is None
-            or metadata.flash_mla_cu_seqlens_q.numel() != bs + 1
-        ):
-            metadata.flash_mla_cu_seqlens_q = torch.arange(
+        if metadata.cu_seqlens_q is None:
+            metadata.cu_seqlens_q = torch.arange(
                 0,
                 (bs + 1) * query_len,
                 query_len,
@@ -1418,11 +1252,11 @@ class AscendAttnBackend(AttentionBackend):
                 device=seq_lens.device,
             )
         schedule = self.flash_mla_metadata(
-            cache_seqlens=metadata.flash_mla_seq_lens,
+            cache_seqlens=metadata.seq_lens,
             num_heads_q=self.tp_q_head_num,
             num_heads_kv=1,
-            cu_seqlens_q=metadata.flash_mla_cu_seqlens_q,
-            seqused_q=metadata.flash_mla_seqused_q,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            seqused_q=metadata.seqused_q,
             max_seqlen_q=-1,
             max_seqlen_kv=-1,
             head_dim_qk=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -1436,7 +1270,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def _forward_flash_mla(self, q, q_rope, layer, forward_batch):
         metadata = self.forward_metadata
-        batch_size = metadata.flash_mla_seq_lens.shape[0]
+        batch_size = metadata.seq_lens.shape[0]
         query_len = self.speculative_num_draft_tokens
         num_tokens = batch_size * query_len
         q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
@@ -1444,9 +1278,6 @@ class AscendAttnBackend(AttentionBackend):
             return q.new_zeros(
                 (q_nope.shape[0], layer.tp_q_head_num * layer.v_head_dim)
             )
-        if q_nope.shape[0] < num_tokens:
-            raise ValueError("NPU FlashMLA requires one fixed query block per request")
-        # FlashMLA (CANN) only accepts TND layout: [T, N, D]
         query = torch.cat(
             (
                 q_nope[:num_tokens],
@@ -1460,9 +1291,9 @@ class AscendAttnBackend(AttentionBackend):
             query,
             self.token_to_kv_pool.get_flash_mla_buffer(layer.layer_id),
             block_table=metadata.block_tables,
-            cache_seqlens=metadata.flash_mla_seq_lens,
-            cu_seqlens_q=metadata.flash_mla_cu_seqlens_q,
-            seqused_q=metadata.flash_mla_seqused_q,
+            cache_seqlens=metadata.seq_lens,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            seqused_q=metadata.seqused_q,
             attn_mask=self.flash_mla_mask,
             metadata=metadata.flash_mla_metadata,
             head_dim_v=self.kv_lora_rank,
@@ -1472,20 +1303,13 @@ class AscendAttnBackend(AttentionBackend):
             max_seqlen_kv=-1,
             layout_q="TND",
             layout_kv="PA_BBND",
-            # Doc: layout_q=TND requires layout_out=NTD, attn_out is (Q_N, Q_T, DV)
             layout_out="NTD",
             return_softmax_lse=False,
         )
-        # NTD (Q_N, Q_T, DV) -> token-major (Q_T, Q_N, DV)
-        output = output.permute(1, 0, 2).contiguous()
-        # Zero out rows of inactive (padded) requests. seqused_q has one entry
-        # per batch, so it must be broadcast across the query block width.
-        inactive = (
-            (metadata.flash_mla_seqused_q == 0)
-            .view(batch_size, 1, 1, 1)
-            .expand(batch_size, query_len, 1, 1)
-            .reshape(num_tokens, 1, 1)
-        )
+        # FlashMLA returns NTD; convert to token-major TND.
+        output = output.permute(1, 0, 2).contiguous().view(batch_size, query_len, -1)
+        # Mask every query row of padded requests.
+        inactive = (metadata.seqused_q == 0)[:, None, None]
         output = output.masked_fill(inactive, 0).reshape(num_tokens, -1)
         if q_nope.shape[0] > num_tokens:
             output = torch.cat(
@@ -3564,7 +3388,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and self.needs_cpu_seq_lens:
+                if self.use_fia:
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -3626,9 +3450,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_out
 
-            if self.use_fia and self.needs_cpu_seq_lens:
-                # Mirrorless decode falls through to _npu_paged_attention,
-                # whose context_lens reads the device seq_lens.
+            if self.use_fia:
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:

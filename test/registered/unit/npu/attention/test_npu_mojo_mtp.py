@@ -10,9 +10,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from test_npu_flash_mla import mod
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
-from test_npu_flash_mla import mod
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -45,7 +46,8 @@ def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_mojo_mtp = True
     obj.use_flash_mla = obj.use_mla = False
-    obj.needs_cpu_seq_lens = obj.requires_host_seq_lens_update = False
+    obj.is_draft_worker = True
+    obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
     obj.page_size, obj.speculative_num_draft_tokens = 128, 7
     obj.max_context_len = 512
@@ -53,14 +55,17 @@ def backend():
     obj.enable_sparsity_driven_kv_offload = False
     obj.is_hybrid_swa = obj.use_sliding_window_kv_pool = False
     obj.q_head_num_padding = None
-    obj.req_to_token = torch.arange(1024).reshape(2, 512)
+    obj.req_to_token = torch.arange(1024, dtype=torch.int32).reshape(2, 512)
     obj.req_to_token_pool = SimpleNamespace(req_to_token=obj.req_to_token)
     obj.graph_metadata = {"block_tables": torch.zeros(2, 4, dtype=torch.int32)}
     obj.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=Mock(return_value=torch.zeros(8, 128, 32)),
         get_value_buffer=Mock(return_value=torch.zeros(8, 128, 32)),
     )
-    return obj
+    with patch.object(
+        mod, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
+    ):
+        yield obj
 
 
 def batch(lengths=(127, 0)):
@@ -71,7 +76,14 @@ def batch(lengths=(127, 0)):
         seq_lens_cpu=None,
         req_pool_indices=torch.arange(len(lengths)),
         out_cache_loc=None,
-        spec_info=SimpleNamespace(draft_token_num=7),
+        extend_seq_lens=None,
+        extend_seq_lens_cpu=[],
+        spec_algorithm=SimpleNamespace(
+            is_dflash=lambda: False, is_dflash_family=lambda: True
+        ),
+        spec_info=SimpleNamespace(
+            draft_token_num=7, spec_input_type=mod.SpecInputType.DFLASH_VERIFY
+        ),
         global_num_token_non_padded_cpu=len(lengths) * 7,
     )
 
@@ -86,7 +98,7 @@ def test_eager_metadata_uses_valid_device_end_and_preserves_prefix(backend):
     ):
         backend.init_forward_metadata(fb)
     assert backend.forward_metadata.seq_lens.tolist() == [134, 0]
-    assert backend.forward_metadata.mojo_cu_q_lens.tolist() == [0, 7, 14]
+    assert backend.forward_metadata.cu_seqlens_q.tolist() == [0, 7, 14]
     assert fb.seq_lens.tolist() == [127, 0]
     assert fb.seq_lens_cpu is None
     assert backend.forward_metadata.seq_lens.data_ptr() != fb.seq_lens.data_ptr()
@@ -105,7 +117,7 @@ def test_graph_refresh_keeps_storage_and_masks_reused_padding_slots(backend):
     ):
         backend.init_forward_metadata_out_graph(fb, in_capture=True)
         metadata = backend.forward_metadata
-        pointers = (metadata.seq_lens.data_ptr(), metadata.mojo_cu_q_lens.data_ptr())
+        pointers = (metadata.seq_lens.data_ptr(), metadata.cu_seqlens_q.data_ptr())
         fb.seq_lens.copy_(torch.tensor([254, 127], dtype=torch.int32))
         backend.init_forward_metadata_out_graph(fb)
         updated = metadata.seq_lens.clone()
@@ -116,24 +128,45 @@ def test_graph_refresh_keeps_storage_and_masks_reused_padding_slots(backend):
     assert fb.seq_lens.tolist() == [255, 0]
     assert pointers == (
         metadata.seq_lens.data_ptr(),
-        metadata.mojo_cu_q_lens.data_ptr(),
+        metadata.cu_seqlens_q.data_ptr(),
     )
     assert metadata.seq_lens_cpu_list is metadata.seq_lens_cpu_int is None
 
 
-@pytest.mark.parametrize(
-    "mode,layout,width",
-    [
-        (ForwardMode.DECODE, None, 7),
-        (ForwardMode.TARGET_VERIFY, object(), 7),
-        (ForwardMode.TARGET_VERIFY, None, 8),
-    ],
-)
-def test_unsupported_query_layouts_fail_before_attention(backend, mode, layout, width):
-    info = SimpleNamespace(draft_token_num=width, ragged_verify_layout=layout)
-    with pytest.raises(ValueError):
-        backend._prepare_mojo_mtp_metadata(
-            mod.ForwardMetadata(), torch.tensor([127]), mode, info
+@pytest.mark.parametrize("needs_cpu", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
+def test_shared_metadata_respects_cpu_mirror_flag(backend, needs_cpu, graph):
+    backend.needs_cpu_seq_lens = needs_cpu
+    fb = batch((121, 249))
+    fb.seq_lens_cpu = torch.tensor([128, 256], dtype=torch.int32) if needs_cpu else None
+    if graph:
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        metadata = backend.forward_metadata
+        pointers = (metadata.seq_lens.data_ptr(), metadata.cu_seqlens_q.data_ptr())
+    with patch.object(
+        torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
+    ):
+        if graph:
+            backend.init_forward_metadata_out_graph(fb)
+        else:
+            backend.init_forward_metadata(fb)
+    metadata = backend.forward_metadata
+    assert metadata.seq_lens.tolist() == [128, 256]
+    assert metadata.cu_seqlens_q.tolist() == [0, 7, 14]
+    assert metadata.block_tables.dtype == torch.int32
+    assert fb.seq_lens.tolist() == [121, 249]
+    if needs_cpu:
+        assert fb.seq_lens_cpu.tolist() == [128, 256]
+        if graph:
+            assert metadata.seq_lens_cpu_list == [121, 249]
+        else:
+            torch.testing.assert_close(metadata.seq_lens_cpu_int, fb.seq_lens_cpu)
+    else:
+        assert metadata.seq_lens_cpu_list is metadata.seq_lens_cpu_int is None
+    if graph:
+        assert pointers == (
+            metadata.seq_lens.data_ptr(),
+            metadata.cu_seqlens_q.data_ptr(),
         )
 
 
@@ -185,9 +218,10 @@ def test_forward_uses_device_lengths_without_host_attention_and_restores_dp_padd
         (False, 127, 256),
         (True, 127, 256),
         (True, None, 256),
+        (True, None, None),
     ],
 )
-def test_draft_never_substitutes_allocation_capacity_for_valid_lengths(
+def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
     needs_cpu, mirror, allocation
 ):
     method = source_method(
@@ -259,7 +293,7 @@ def test_draft_never_substitutes_allocation_capacity_for_valid_lengths(
         device="cpu",
         embed_module=lambda x: torch.zeros(1, 7, 16),
     )
-    if needs_cpu and mirror is None:
+    if needs_cpu and mirror is None and allocation is None:
         with pytest.raises(RuntimeError, match="batch.seq_lens_cpu"):
             method(proposer, **kwargs)
         runner.forward.assert_not_called()
@@ -268,16 +302,17 @@ def test_draft_never_substitutes_allocation_capacity_for_valid_lengths(
     forwarded = runner.forward.call_args.args[0]
     assert forwarded.seq_lens.tolist() == [127]
     if needs_cpu:
-        assert forwarded.seq_lens_cpu.tolist() == [134]
-        assert forwarded.seq_lens_sum == 134
+        expected = mirror + 7 if mirror is not None else allocation
+        assert forwarded.seq_lens_cpu.tolist() == [expected]
+        assert forwarded.seq_lens_sum == expected
     else:
         assert forwarded.seq_lens_cpu is forwarded.seq_lens_sum is None
 
 
-@pytest.mark.parametrize("needs_cpu,mirror", [(False, None), (True, None), (True, 127)])
-def test_target_verify_keeps_device_lengths_and_rejects_allocation_fallback(
-    needs_cpu, mirror
-):
+@pytest.mark.parametrize(
+    "needs_cpu,mirror", [(False, None), (False, 127), (True, None), (True, 127)]
+)
+def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mirror):
     method = source_method(
         "speculative/dspark_components/dspark_verify.py",
         "TargetVerifyExecutor",
@@ -314,15 +349,17 @@ def test_target_verify_keeps_device_lengths_and_rejects_allocation_fallback(
         ),
         sampling_info=None,
     )
-    if needs_cpu and mirror is None:
-        with pytest.raises(RuntimeError, match="valid CPU lengths"):
-            method(executor, **kwargs)
-    else:
-        method(executor, **kwargs)
+    method(executor, **kwargs)
+    assert fb.seq_lens.tolist() == [127]
+    if not needs_cpu:
         if mirror is None:
             assert fb.seq_lens_cpu is fb.seq_lens_sum is None
         else:
-            assert fb.seq_lens_cpu.tolist() == [135]
+            assert fb.seq_lens_cpu.tolist() == [mirror]
+    else:
+        expected = mirror + 8 if mirror is not None else 256
+        assert fb.seq_lens_cpu.tolist() == [expected]
+        assert fb.seq_lens_sum == expected
 
 
 def test_device_length_graph_uses_plain_replay_after_loading_inputs(backend):

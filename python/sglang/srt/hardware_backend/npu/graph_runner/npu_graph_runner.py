@@ -20,7 +20,7 @@ capture/replay mechanics live in the backend. This class adds:
     torch.compile path.
   - Profile context override (NPU profiler emits to disk, not in-mem).
   - Replay override that issues an async NPUGraph.update for
-    seq_lens before replay (skipped for device-length attention backends).
+    seq_lens before replay (skipped for deepseek-nsa).
   - Smaller cache_loc dtype (int32 instead of int64).
 """
 
@@ -369,9 +369,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if getattr(
-            self._replay_attn_backend(), "requires_host_seq_lens_update", True
-        ) and not (
+        if getattr(self._replay_attn_backend(), "needs_cpu_seq_lens", True) and not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):

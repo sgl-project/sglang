@@ -2599,6 +2599,12 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            if _is_npu:
+                extra_args["use_flash_mla"] = (
+                    envs.SGLANG_NPU_USE_FLASH_MLA.get()
+                    and self.spec_algorithm.is_dspark()
+                    and not self.is_draft_worker
+                )
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
