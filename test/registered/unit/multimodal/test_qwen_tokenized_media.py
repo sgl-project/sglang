@@ -88,6 +88,9 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_STRATEGY_MAPPING,
 )
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
+)
 from sglang.srt.multimodal.token_space_mm_process.sglang import (
     TokenSpaceSGLangProcessor,
 )
@@ -114,8 +117,8 @@ TOKEN_TEXT = {
 
 
 QwenTokenSpaceCore = TokenSpaceProcessor.for_strategy(QwenTokenSpaceProcessStrategy)
-QwenVLTokenSpaceProcessor = TokenSpaceSGLangProcessor.for_strategy(
-    QwenTokenSpaceProcessStrategy
+QwenVLTokenSpaceProcessor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+    QwenTokenSpaceProcessStrategy, TokenSpaceServingSpec
 )
 
 
