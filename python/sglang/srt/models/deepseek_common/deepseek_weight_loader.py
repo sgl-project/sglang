@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -67,6 +68,36 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_INPUT_SCALE_RE = re.compile(r"(?:^|\.)experts\.\d+\.w[123]\.input_scale$")
+
+
+def has_expert_input_scale_checkpoint(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if is_wint4afp8_or_wint4a16_config(quant_config):
+        return True
+
+    from sglang.srt.layers.quantization.humming import HummingConfig
+
+    # Humming preserves the checkpoint quantization in full_config.
+    return (
+        isinstance(quant_config, HummingConfig)
+        and quant_config.full_config.get("quant_method") == "w4afp8"
+    )
+
+
+def expert_input_scale_has_destination(
+    quant_config: Optional[QuantizationConfig],
+    params_dict: Dict[str, torch.nn.Parameter],
+) -> bool:
+    """Load expert activation scales only when the quant method registered them."""
+    if not has_expert_input_scale_checkpoint(quant_config):
+        return False
+    return any(
+        name.endswith(("w13_input_scale", "w2_input_scale")) for name in params_dict
+    )
+
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -242,14 +273,6 @@ class DeepseekV2WeightLoaderMixin:
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if is_wint4afp8_or_wint4a16_config(self.quant_config):
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
-            )
-
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
@@ -265,12 +288,27 @@ class DeepseekV2WeightLoaderMixin:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
+            if expert_input_scale_has_destination(self.quant_config, params_dict):
+                expert_params_mapping += (
+                    FusedMoE.make_expert_input_scale_params_mapping(
+                        num_experts=self.config.n_routed_experts
+                    )
+                )
+                expert_input_scale_unused = False
+            else:
+                expert_input_scale_unused = has_expert_input_scale_checkpoint(
+                    self.quant_config
+                )
             indexer_present_prefixes = {
                 n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
             }
             weight_names = []
 
+            num_unused_expert_input_scale = 0
             for name, loaded_weight in weights:
+                if expert_input_scale_unused and _EXPERT_INPUT_SCALE_RE.search(name):
+                    num_unused_expert_input_scale += 1
+                    continue
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
@@ -504,6 +542,13 @@ class DeepseekV2WeightLoaderMixin:
                                 func_args=(param, loaded_weight),
                             )
 
+            if num_unused_expert_input_scale:
+                log_info_on_rank0(
+                    logger,
+                    f"Skipped {num_unused_expert_input_scale} expert input_scale "
+                    "tensors with no registered destination.",
+                )
+
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
@@ -628,9 +673,8 @@ class DeepseekV2WeightLoaderMixin:
                         if hasattr(self_attn.kv_b_proj, "weight_scale")
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
-                    is_ue8m0_uint8 = (
-                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
-                    )
+                    format_ue8m0 = getattr(weight_scale, "format_ue8m0", False)
+                    is_ue8m0_uint8 = format_ue8m0 and weight_scale.dtype == torch.uint8
                     if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
@@ -653,7 +697,7 @@ class DeepseekV2WeightLoaderMixin:
                                 else None
                             )
                         )
-                        and weight_scale.format_ue8m0
+                        and format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
