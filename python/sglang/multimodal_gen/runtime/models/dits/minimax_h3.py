@@ -66,9 +66,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
-    vsa_h3_fold_gate,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     claim_deferred_component_attn_backend,
     get_attn_backend,
@@ -858,6 +855,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
