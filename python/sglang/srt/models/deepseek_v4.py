@@ -372,6 +372,31 @@ def _flashinfer_hc_pre(
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _tbo_collective_sizes(
+    rank_sizes: List[int], attn_tp_size: int
+) -> Tuple[List[int], List[int]]:
+    # Collapse attention-TP replicas into DP counts and split each count into TP shards.
+    if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
+        raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
+
+    dp_sizes = []
+    tp_sizes = []
+    for start in range(0, len(rank_sizes), attn_tp_size):
+        replicas = rank_sizes[start : start + attn_tp_size]
+        if any(size != replicas[0] for size in replicas):
+            raise ValueError(f"TBO token counts differ within attention TP: {replicas}")
+        if replicas[0] % attn_tp_size != 0:
+            raise ValueError(
+                f"TBO token count {replicas[0]} is not divisible by "
+                f"attention TP size {attn_tp_size}"
+            )
+        dp_sizes.append(replicas[0])
+        tp_sizes.extend([replicas[0] // attn_tp_size] * attn_tp_size)
+    return dp_sizes, tp_sizes
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -885,17 +910,7 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
-    # A decoder tail graph's capture pass hands the break activations its
-    # segments never computed; the indexer would select candidate blocks from
-    # them and index pages past the live context. Its replay runs the body.
-    if not in_replay_tail_graph():
-        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
-
-
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
-    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
-)
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(deepseek_v4_low_ratio_sources)
 
 
 def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
@@ -923,13 +938,24 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     )
 
 
-bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(deepseek_v4_write_tail_source_kv)
+def _write_tail_source_kv_on_capture(layer, x, positions) -> None:
+    get_attn_backend().tail_source_kv_layer_id = layer.layer_id
 
 
-def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
+# The captured tail reads this layer id to skip the source layer's compressor,
+# so the id is also set while the graph captures.
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
+    deepseek_v4_write_tail_source_kv,
+    on_capture=_write_tail_source_kv_on_capture,
+)
+
+
+def deepseek_v4_engram_hash_ids(
+    hasher, input_ids: torch.Tensor, out: torch.Tensor
+) -> None:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return hasher(input_ids, forward_batch)
+    out.copy_(hasher(input_ids, forward_batch))
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
@@ -942,26 +968,27 @@ def _engram_image_token_id(config) -> Optional[int]:
     return None
 
 
-def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_enter_late_layer_tail() -> None:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
-    # backend onto the tail metadata of the *live* batch (the captured args hold
-    # the capture-time batch). The sentinel keeps the break in the replay sequence.
+    # backend onto the tail metadata of the *live* batch.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
-    return sentinel
 
 
-def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_exit_late_layer_tail() -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
-    return sentinel
 
 
-bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_enter_late_layer_tail
+# The captured tail segments read the metadata these swap in, so they also run
+# while the graph captures.
+bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(
+    deepseek_v4_enter_late_layer_tail,
+    on_capture=deepseek_v4_enter_late_layer_tail,
 )
-bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_exit_late_layer_tail
+bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(
+    deepseek_v4_exit_late_layer_tail,
+    on_capture=deepseek_v4_exit_late_layer_tail,
 )
 
 
@@ -3971,9 +3998,8 @@ class DeepseekV4Model(nn.Module):
             elif (
                 forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             ):
-                hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
-                )
+                hash_ids = self.engram_hasher.new_hash_ids(input_ids)
+                bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids, hash_ids)
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
@@ -4015,7 +4041,6 @@ class DeepseekV4Model(nn.Module):
                 tail_in_graph=tail_in_graph,
                 late_dp_counts=late_dp_counts,
             )
-        tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
@@ -4072,7 +4097,7 @@ class DeepseekV4Model(nn.Module):
                     # Eager break: re-run at replay so the backend swaps onto the
                     # live batch's tail metadata; the gathers below are captured
                     # against the persistent index buffers.
-                    tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
+                    bcg_deepseek_v4_enter_late_layer_tail()
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                     if (
                         self.decoder_replay_tail is not None
@@ -4098,7 +4123,7 @@ class DeepseekV4Model(nn.Module):
                         if capture_dspark:
                             dspark_aux_hidden_states.extend(aux)
                         residual_batch.clear(forward_batch)
-                        bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                        bcg_deepseek_v4_exit_late_layer_tail()
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4218,7 +4243,7 @@ class DeepseekV4Model(nn.Module):
             exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             if tail_in_graph:
-                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                bcg_deepseek_v4_exit_late_layer_tail()
             else:
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
@@ -4231,14 +4256,20 @@ class DeepseekV4Model(nn.Module):
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
         TBO). We additionally restrict to prefill (EXTEND), single PP, and
-        non-CP paths supported by the DSV4 op strategy.
+        non-CP paths supported by the DSV4 op strategy. The non-EP strategy
+        uses variable-size DP collectives and therefore requires CP1,
+        multi-rank DP, and SUM_LEN padding.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
         path_ok = not is_cp_active(forward_batch) and (
-            not _is_hip
-            or not get_moe_a2a_backend().is_none()
-            or get_parallel().attn_dp_size > 1
+            not get_moe_a2a_backend().is_none()
+            or (
+                get_parallel().attn_cp_size == 1
+                and get_parallel().attn_dp_size > 1
+                and forward_batch.dp_padding_mode is not None
+                and forward_batch.dp_padding_mode.is_sum_len()
+            )
         )
         return (
             is_tbo_enabled()
@@ -4291,6 +4322,7 @@ class DeepseekV4Model(nn.Module):
         if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
             tp_group = get_parallel().tp_group
             world = tp_group.world_size
+            attn_tp_size = get_parallel().attn_tp_size
             children = forward_batch.tbo_children
             local_lens = torch.tensor(
                 [int(c.tbo_padded_len) for c in children],
@@ -4304,19 +4336,22 @@ class DeepseekV4Model(nn.Module):
             )
             tp_group.all_gather_into_tensor(gathered, local_lens)
             gathered_cpu = gathered.tolist()
-            rank = tp_group.rank_in_group
+            dp_rank = get_parallel().attn_dp_rank
+            attn_tp_rank = get_parallel().attn_tp_rank
             for idx, child in enumerate(children):
-                sizes = [gathered_cpu[r][idx] for r in range(world)]
-                child.global_num_tokens_cpu = sizes
-                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
-                child.global_dp_buffer_len = sum(sizes)
+                rank_sizes = [gathered_cpu[r][idx] for r in range(world)]
+                dp_sizes, tp_sizes = _tbo_collective_sizes(rank_sizes, attn_tp_size)
+                child.global_num_tokens_cpu = dp_sizes
+                child.global_num_tokens_gpu = gathered[::attn_tp_size, idx].contiguous()
+                child.global_dp_buffer_len = sum(dp_sizes)
+                child._tbo_tp_sizes = tp_sizes
                 # Gather the ubatch's input_ids -> global ONCE here (cached on the
                 # child) instead of per-layer in op_gather_a. The hash MoE reads
                 # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
                 # VARYING size (-> RCCL registers a new internal buffer per size ->
                 # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
                 local_ids = child.input_ids
-                rows = sizes[rank]
+                rows = dp_sizes[dp_rank]
                 if local_ids.shape[0] < rows:
                     padded_ids = local_ids.new_zeros((rows,))
                     padded_ids[: local_ids.shape[0]] = local_ids
@@ -4324,10 +4359,15 @@ class DeepseekV4Model(nn.Module):
                     padded_ids = local_ids[:rows]
                 else:
                     padded_ids = local_ids
+                local_ids_shard = padded_ids.tensor_split(attn_tp_size)[
+                    attn_tp_rank
+                ].contiguous()
                 gids = torch.empty(
-                    (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
+                    (sum(dp_sizes),),
+                    dtype=local_ids.dtype,
+                    device=local_ids.device,
                 )
-                tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
+                tp_group.all_gatherv(local_ids_shard, sizes=tp_sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
         try:
