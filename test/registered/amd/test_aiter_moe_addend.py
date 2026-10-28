@@ -37,7 +37,7 @@ class TestAiterMoeAddend(CustomTestCase):
         )
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
-        # MiniMaxM3MoEGfx950 applies it; AiterRunnerCore applies only the sort patch
+        # the model's MoE layer applies it; AiterRunnerCore applies only the sort patch
         apply_aiter_moe_addend_patch()
         torch.manual_seed(0)
         dev = torch.device("cuda", 0)

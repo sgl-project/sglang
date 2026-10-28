@@ -23,6 +23,7 @@ from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+# the fp8 producer cases need gfx95; the MI300 kernel job runs the others
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = "cuda"
