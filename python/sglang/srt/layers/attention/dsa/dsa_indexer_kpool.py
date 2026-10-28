@@ -134,11 +134,6 @@ def _mqa_logits_row_chunks(
     )
 
 
-# ============================================================================
-# NPU Triton kernel: expand pool-level topk indices to token-level
-# ============================================================================
-
-
 def _a5_full_topk_for_short_sequences(topk_result, causal_lens):
     """Select all causal tokens below the A5 2048-token sparse threshold.
 
@@ -1975,7 +1970,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         elif forward_batch.forward_mode.is_extend_without_speculative():
             self._compress_write_extend_npu(
-                x, key, gate_score, positions, forward_batch, layer_id, metadata
+                key, gate_score, forward_batch, layer_id, metadata
             )
         else:
             raise NotImplementedError(
@@ -1995,7 +1990,6 @@ class IndexerKPool(MultiPlatformOp):
                 self._prepare_decode_indexer_inputs_npu(x, metadata)
             )
             topk_result = self._get_topk_paged_npu(
-                forward_batch,
                 layer_id,
                 query,
                 w_bf16,
@@ -2014,9 +2008,7 @@ class IndexerKPool(MultiPlatformOp):
 
         # Extend and MTP use per-query causal lengths with vendor paged-cache
         # top-k. The write phase above rejects unsupported forward modes.
-        topk_result = self._get_topk_ragged_npu(
-            forward_batch, layer_id, query, weights, metadata
-        )
+        topk_result = self._get_topk_ragged_npu(layer_id, query, weights, metadata)
 
         return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
 
@@ -2092,7 +2084,7 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     def _compress_write_extend_npu(
-        self, x, key, gate_score, positions, forward_batch, layer_id, metadata
+        self, key, gate_score, forward_batch, layer_id, metadata
     ):
         """Execute the precomputed NPU extend cache-write and tail-update plan."""
         assert (
@@ -2106,45 +2098,42 @@ class IndexerKPool(MultiPlatformOp):
 
         attn_metadata = getattr(metadata, "attn_metadata", None)
         plan = getattr(attn_metadata, "kpool_extend_plan", None)
-        if plan is not None:
-            # The NPU index cache is BF16, so tail updates cannot reuse the GPU
-            # FP8 scatter implementation.
-            from sgl_kernel_npu.operators.mem_cache import (
-                kpool_assemble_softmax_write_cache_npu,
-                scatter_kpool_tail_updates_npu,
-            )
-
-            writes, tails = plan.writes, plan.tails
-            if not writes.is_empty:
-                kpool_assemble_softmax_write_cache_npu(
-                    index_k_cache=buf,
-                    chunk_k=key,
-                    chunk_score=gate_score,
-                    tail_k=tail_k_buf,
-                    tail_score=tail_score_buf,
-                    req_pool_idx=writes.req,
-                    n_from_tail=writes.n_from_tail,
-                    chunk_src_start=writes.chunk_src,
-                    tail_logical_base=writes.tail_logical_base,
-                    ape=self.index_kpool_compress_ape,
-                    loc=writes.write_loc,
-                )
-            if not tails.is_empty:
-                scatter_kpool_tail_updates_npu(
-                    pool=pool,
-                    chunk_k=key,
-                    chunk_score=gate_score,
-                    tail_k=tail_k_buf,
-                    tail_score=tail_score_buf,
-                    req_pool_idx=tails.req,
-                    dst_logical_start=tails.dst_logical_start,
-                    chunk_src_start=tails.chunk_src,
-                    n_write=tails.n_write,
-                )
-
-            return None
-
         assert plan is not None, "NPU DSA kpool extend requires kpool_extend_plan"
+
+        # The NPU index cache is BF16, so tail updates cannot reuse the GPU
+        # FP8 scatter implementation.
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_assemble_softmax_write_cache_npu,
+            scatter_kpool_tail_updates_npu,
+        )
+
+        writes, tails = plan.writes, plan.tails
+        if not writes.is_empty:
+            kpool_assemble_softmax_write_cache_npu(
+                index_k_cache=buf,
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=writes.req,
+                n_from_tail=writes.n_from_tail,
+                chunk_src_start=writes.chunk_src,
+                tail_logical_base=writes.tail_logical_base,
+                ape=self.index_kpool_compress_ape,
+                loc=writes.write_loc,
+            )
+        if not tails.is_empty:
+            scatter_kpool_tail_updates_npu(
+                pool=pool,
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=tails.req,
+                dst_logical_start=tails.dst_logical_start,
+                chunk_src_start=tails.chunk_src,
+                n_write=tails.n_write,
+            )
 
     def _prepare_decode_indexer_inputs_npu(self, x, metadata):
         """Fused decode prep for npu_lightning_indexer inputs (2 Triton kernels).
@@ -2174,7 +2163,7 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     def _get_topk_paged_npu(
-        self, forward_batch, layer_id, query_bf16, weights, metadata, prepared
+        self, layer_id, query_bf16, weights, metadata, prepared
     ) -> torch.Tensor:
         """NPU paged topk via npu_lightning_indexer fused op on pooled cache.
 
@@ -2226,7 +2215,7 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     def _get_topk_ragged_npu(
-        self, forward_batch, layer_id, query_bf16, weights, metadata
+        self, layer_id, query_bf16, weights, metadata
     ) -> torch.Tensor:
         """NPU ragged topk via npu_lightning_indexer fused op on pooled cache.
 

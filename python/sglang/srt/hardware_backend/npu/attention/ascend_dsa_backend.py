@@ -5,10 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import (
-    get_dsa_index_kpool,
-    get_dsa_index_topk,
-)
+from sglang.srt.configs.model_config import get_dsa_index_kpool
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMultiStepDraftBackend,
@@ -89,9 +86,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # backend can run mirrorless, but this subclass does not support it yet.
         self.needs_cpu_seq_lens = True
         hf_config = model_runner.model_config.hf_config
-        self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         if self.dsa_index_kpool > 1:
             assert self.page_size % self.dsa_index_kpool == 0, (

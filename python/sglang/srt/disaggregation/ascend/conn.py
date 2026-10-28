@@ -131,33 +131,15 @@ class AscendKVManager(MooncakeKVManager):
         return super()._transfer_data(mooncake_session_id, transfer_blocks)
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
-        # Skip-topk layers retain zero-length DSA-tail entries so that PD peers
-        # agree on layer positions. Filter only the registration view, leaving
-        # kv_args intact. The inherited register/deregister paths both use it.
         # MemFabric aligns registered buffers to 2 MiB. Register everything in
         # one batch so overlapping aligned ranges from small tensors are merged
         # before they are published to the peer.
-        buffer_groups = [
-            (self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens),
-            (self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens),
-        ]
-        buffer_groups.extend(
-            zip(self.kv_args.state_data_ptrs or [], self.kv_args.state_data_lens or [])
-        )
-        regions = []
-        seen = set()
-        for ptrs, lengths in buffer_groups:
-            for ptr, length in zip(ptrs or [], lengths or []):
-                if length == 0:
-                    continue
-                if ptr <= 0 or length < 0:
-                    raise ValueError(
-                        f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
-                    )
-                region = (ptr, length)
-                if region not in seen:
-                    seen.add(region)
-                    regions.append(region)
+        regions = super()._registerable_regions()
+        for ptr, length in regions:
+            if ptr <= 0 or length < 0:
+                raise ValueError(
+                    f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
+                )
         return regions
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:

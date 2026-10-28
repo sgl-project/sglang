@@ -801,7 +801,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
-            index_kpool_compress=index_kpool_compress,
             tail_extra_slots=tail_extra_slots,
             index_head_dim=index_head_dim,
             layer_num=layer_num,
@@ -816,7 +815,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _init_kpool_compress_tail_buffers(
         self,
         index_kpool: int,
-        index_kpool_compress: bool,
         tail_extra_slots: int,
         index_head_dim: Optional[int],
         layer_num: int,
@@ -895,7 +893,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
         kpool_decode_update_and_maybe_write_cache_bf16(
-            # pool=self,
             buf=buf,
             tail_k=self._compress_tail_k[idx],
             tail_score=self._compress_tail_score[idx],

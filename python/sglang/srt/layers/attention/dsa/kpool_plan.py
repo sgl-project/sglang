@@ -973,10 +973,6 @@ def init_kpool_extend_metadata_npu(
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 
-    # pooled_seq_lens_expanded = torch.div(
-    #     local_seqlens_expanded, pool_size, rounding_mode="floor"
-    # ).to(torch.int32)
-
     empty_i32_dev = torch.empty((0,), dtype=torch.int32, device=device)
 
     plan = KPoolExtendPlan(
