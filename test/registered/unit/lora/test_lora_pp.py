@@ -27,8 +27,12 @@ from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
+from sglang.srt.lora.utils import LoRAType
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -69,12 +73,30 @@ class TestAllPPLoras(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         decoding, base, launched = _req("decoding"), _req(None), _req("launched")
         scheduler.running_mbs = [
-            _batch(decoding, _req("done", finished=True)),
+            _batch(decoding, _req("decoding", finished=True)),
             _batch(base),
         ]
         scheduler.mbs = [_batch(launched), None]
         self.assertCountEqual(
             map(id, scheduler._get_all_pp_reqs()), map(id, [decoding, base, launched])
+        )
+
+        scheduler.enable_lora = True
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(lora_manager=_lora_manager(slots=4))
+        )
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = scheduler
+        reporter.stats = SimpleNamespace()
+        with get_parallel().override(pp_size=2):
+            reporter._update_lora_metrics()
+        self.assertEqual(
+            (
+                reporter.stats.lora_pool_slots_used,
+                reporter.stats.lora_pool_slots_total,
+                reporter.stats.lora_pool_utilization,
+            ),
+            (2, 4, 0.5),
         )
 
     @mock.patch("time.monotonic", return_value=100.0)
@@ -120,7 +142,7 @@ class TestAllPPLoras(CustomTestCase):
             get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
             page_size=1,
             tree_cache=SimpleNamespace(buffer_pipeline=None),
-            token_to_kv_pool_allocator=None,
+            token_to_kv_pool_allocator=SimpleNamespace(state_slots=None),
             req_to_token_pool=SimpleNamespace(),
             new_token_ratio_tracker=SimpleNamespace(current=1),
             max_prefill_tokens=1,
@@ -183,7 +205,7 @@ class TestFetchKeepsLiveAdapters(CustomTestCase):
 NUM_LAYERS, HIDDEN, VOCAB, RANK = 4, 8, 32, 2
 
 
-def _stage_pool(layers, embed_tokens=False, lm_head=False):
+def _stage_pool(layers, embed_tokens=False, lm_head=False, added_tokens_size=0):
     config = SimpleNamespace(
         num_hidden_layers=NUM_LAYERS, hidden_size=HIDDEN, vocab_size=VOCAB
     )
@@ -200,7 +222,7 @@ def _stage_pool(layers, embed_tokens=False, lm_head=False):
             target_modules={"o_proj", "embed_tokens", "lm_head"},
             base_model=base_model,
             eviction_policy="lru",
-            lora_added_tokens_size=0,
+            lora_added_tokens_size=added_tokens_size,
             lora_layer_ids=layers,
             has_embed_tokens_lora=embed_tokens,
             has_lm_head_lora=lm_head,
@@ -254,7 +276,7 @@ def _load_into_mem_pool(pool, uid, adapter):
 class TestStagePool(CustomTestCase):
     def test_each_stage_allocates_and_loads_only_its_part(self):
         first = _stage_pool(layers=[0, 1], embed_tokens=True)
-        last = _stage_pool(layers=[2, 3], lm_head=True)
+        last = _stage_pool(layers=[2, 3], lm_head=True, added_tokens_size=1)
         self.assertEqual(
             _allocated(first),
             {"layers": [0, 1], "embed_tokens": True, "lm_head": False},
@@ -262,6 +284,7 @@ class TestStagePool(CustomTestCase):
         self.assertEqual(
             _allocated(last), {"layers": [2, 3], "embed_tokens": False, "lm_head": True}
         )
+        self.assertIsNone(last.get_embedding_tensor("added_tokens", LoRAType.LORA_A))
 
         # The last stage must skip the adapter's layers 0-1 and embed_tokens weights.
         _load_into_mem_pool(last, "adapter", _full_adapter())

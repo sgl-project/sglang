@@ -1541,7 +1541,7 @@ class LoRAMemoryPool:
                 self.lora_added_tokens_size is not None
                 and self.lora_added_tokens_size > 0
             ):
-                return self.new_embeddings_buffer["input_embeddings"]
+                return self.new_embeddings_buffer.get("input_embeddings")
             return None
         elif target_module == "embed_tokens":
             if lora_type == LoRAType.LORA_A:
