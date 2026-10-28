@@ -218,6 +218,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
+        "'sglang.kernels.ops.speculative.row_argmax', "
         "'sgl_kernel_npu')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
@@ -358,6 +359,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "kv_canary.verify",
         "kv_canary.scatter_req_token_ids",
         "mm.process.image",
+        "speculative.row_argmax",
     )
     for module in modules:
         tree = ast.parse(
