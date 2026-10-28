@@ -15,12 +15,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.mem_cache.allocation_sizing import uses_pd_decode_kv_only_mamba_cache
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_serving,
+    get_spec,
 )
 
 if TYPE_CHECKING:
@@ -167,6 +169,36 @@ def create_unified_radix_cache(
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
+        params.mamba_state_from_prefill = (
+            not ctx.disable_radix_cache and uses_pd_decode_kv_only_mamba_cache()
+        )
+        if (
+            params.mamba_state_from_prefill
+            and get_spec().speculative_algorithm is not None
+        ):
+            if (
+                get_spec().speculative_algorithm not in ("EAGLE", "DFLASH")
+                or get_spec().speculative_eagle_topk not in (None, 1)
+                or get_disagg().disaggregation_transfer_backend != "nixl"
+                or ctx.is_hybrid_swa
+            ):
+                raise ValueError(
+                    "PD decode KV-only hybrid radix cache with speculation "
+                    "currently requires linear EAGLE or DFLASH (topk=1), NIXL, and "
+                    "a model without sliding-window attention."
+                )
+        if params.mamba_state_from_prefill and (
+            ctx.enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
+            or params.enable_session_radix_cache
+            or get_serving().enable_streaming_session
+            or use_mlx()
+        ):
+            raise ValueError(
+                "PD decode KV-only hybrid radix cache currently requires a "
+                "device-resident cache without session caching, streaming "
+                "sessions, external linkers, or MLX."
+            )
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
@@ -291,11 +323,12 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     hicache_attached = cache.cache_controller is not None
     logger.info(
         "Tree cache initialized: source=%s impl=%s hybrid_swa=%s hybrid_ssm=%s "
-        "hicache_attached=%s",
+        "hicache_attached=%s mamba_state_from_prefill=%s",
         source,
         type(cache).__name__,
         ctx.is_hybrid_swa,
         ctx.is_hybrid_ssm,
         hicache_attached,
+        ctx.params.mamba_state_from_prefill,
     )
     return cache

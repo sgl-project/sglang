@@ -275,8 +275,8 @@ def validate_decode_radix_cache(
 
     SWA models go through the unified tree, whose component pools preserve the
     full-attention prefix while the SWA window is transferred fresh. Hybrid
-    SSM/KDA uses UnifiedRadixCache's Mamba component (match + lock + CoW), the
-    same path as colocated serving.
+    SSM/KDA decode keeps received state request-local while
+    the unified tree shares KV prefixes independently of state checkpoints.
     """
     if not is_hybrid_swa:
         return

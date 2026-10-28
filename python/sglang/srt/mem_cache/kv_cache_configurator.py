@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
     get_req_to_token_extra_context_len,
+    uses_pd_decode_kv_only_mamba_cache,
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -3059,7 +3060,29 @@ class KVCacheConfigurator:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
+    def _mamba_prealloc_requests(self) -> int:
+        if self.mambaish_config is not None and uses_pd_decode_kv_only_mamba_cache():
+            return get_disagg().disaggregation_decode_extra_slots or 0
+        return 0
+
+    def _mamba_running_request_capacity(self) -> int:
+        # Transfer requests share the persistent state pool with running ones.
+        return max(
+            0,
+            get_schedule().max_mamba_cache_size // self._calculate_mamba_ratio()
+            - self._mamba_prealloc_requests(),
+        )
+
     def _calculate_mamba_ratio(self) -> int:
+        if self.mambaish_config is not None and uses_pd_decode_kv_only_mamba_cache():
+            # Match HybridMambaDecodeReqToTokenPool, which allocates tracking
+            # eagerly even when lazy tracking is requested for ordinary caches.
+            # No recurrent checkpoint slots are donated to the radix tree.
+            return 1 + get_mamba_tracking_slots(
+                extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=False,
+            )
         if get_memory().disable_radix_cache:
             return 1
 
@@ -3134,18 +3157,20 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            mamba_cap = self._mamba_running_request_capacity()
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(
                     "max_running_requests is capped to %d by the mamba state "
                     "cache (max_mamba_cache_size=%d, %d state slots per "
-                    "request). To raise it: increase --mamba-full-memory-ratio "
+                    "request, %d requests reserved for PD transfer). "
+                    "To raise it: increase --mamba-full-memory-ratio "
                     "or --max-mamba-cache-size, or halve the state size with "
                     "--mamba-ssm-dtype bfloat16.",
                     mamba_cap,
                     get_schedule().max_mamba_cache_size,
                     ratio,
+                    self._mamba_prealloc_requests(),
                 )
             max_num_reqs = min(max_num_reqs, mamba_cap)
 
@@ -3153,8 +3178,10 @@ class KVCacheConfigurator:
                 raise RuntimeError(
                     f"Hybrid (mamba/linear-attention) state cache is too small to serve "
                     f"any requests. max_mamba_cache_size={get_schedule().max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
+                    f"mamba_ratio={ratio}, PD extra requests={self._mamba_prealloc_requests()}, "
+                    f"resulting max_num_reqs={max_num_reqs}. "
+                    f"Try: (1) increase --max-mamba-cache-size or reduce "
+                    f"--disaggregation-decode-extra-slots, "
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
@@ -3281,7 +3308,9 @@ class KVCacheConfigurator:
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
         if replayssm_active and self.hybrid_kda_config is None:
             replay_req_slots = (
-                max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
+                max(1, get_schedule().max_running_requests // self.attn_dp_size)
+                + self._mamba_prealloc_requests()
+                + 1
             )
             replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
             replayssm_ring_per_slot = 0
@@ -3311,10 +3340,14 @@ class KVCacheConfigurator:
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # and on PD prefill (no intermediate_ssm allocated).
             if reserves_spec_state:
-                ratio = self._calculate_mamba_ratio()
-                capped_reqs = min(
-                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
-                    get_schedule().max_mamba_cache_size // ratio,
+                capped_reqs = (
+                    min(
+                        max(
+                            1, get_schedule().max_running_requests // self.attn_dp_size
+                        ),
+                        self._mamba_running_request_capacity(),
+                    )
+                    + self._mamba_prealloc_requests()
                 )
                 intermediate_size = (
                     stage_per_req
@@ -3369,9 +3402,14 @@ class KVCacheConfigurator:
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
-                capped_reqs = min(
-                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
-                    get_schedule().max_mamba_cache_size // ratio,
+                capped_reqs = (
+                    min(
+                        max(
+                            1, get_schedule().max_running_requests // self.attn_dp_size
+                        ),
+                        self._mamba_running_request_capacity(),
+                    )
+                    + self._mamba_prealloc_requests()
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))

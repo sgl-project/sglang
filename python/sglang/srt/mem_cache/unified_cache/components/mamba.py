@@ -72,9 +72,14 @@ class MambaComponent(TreeComponent):
         assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
             f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
         )
+        self.state_from_prefill = params.mamba_state_from_prefill
         # Without the extra buffer only the sequence-end state exists, so a cached
         # state needs page 1; a disabled tree caches none.
-        if not params.enable_mamba_extra_buffer and not params.disable:
+        if (
+            not params.enable_mamba_extra_buffer
+            and not params.disable
+            and not self.state_from_prefill
+        ):
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -151,6 +156,8 @@ class MambaComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if self.state_from_prefill:
+            return lambda node: True
         ct = self.component_type
         if match_device_only:
             return lambda node: node.component_data[ct].value is not None
@@ -168,6 +175,8 @@ class MambaComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        if self.state_from_prefill:
+            return result
         last_node = result.best_match_node
 
         mamba_boundary_len = result.device_prefix_len + result.host_hit_length
@@ -196,6 +205,8 @@ class MambaComponent(TreeComponent):
     def finalize_match_result_in_cache(
         self, params: MatchPrefixParams, result: MatchResult
     ) -> MatchResult:
+        if self.state_from_prefill:
+            return result
         # Copy-on-write the matched device mamba state into a per-request slot.
         if not params.cow_mamba:
             return result
@@ -232,6 +243,9 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        if self.state_from_prefill:
+            assert params.mamba_value is None
+            return
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
@@ -608,6 +622,10 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if self.state_from_prefill:
+            # The received state is at the full prompt boundary, not necessarily
+            # the page-aligned KV boundary. Never donate it as a checkpoint.
+            return None
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -688,6 +706,10 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if self.state_from_prefill:
+            if is_finished:
+                self.cache.req_to_token_pool.free_mamba_cache(req)
+            return
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist

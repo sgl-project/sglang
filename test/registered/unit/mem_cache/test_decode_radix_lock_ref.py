@@ -20,6 +20,11 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
+from sglang.srt.mem_cache import allocation_sizing, kv_cache_configurator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -589,6 +594,114 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
+
+
+class TestPDRequestLocalMambaState(CustomTestCase):
+    def setUp(self):
+        self.comp = object.__new__(MambaComponent)
+        self.comp.state_from_prefill = True
+        self.pool = MagicMock()
+        self.comp.cache = SimpleNamespace(req_to_token_pool=self.pool)
+
+    def test_kv_hit_does_not_restore_or_publish_recurrent_state(self):
+        node = SimpleNamespace(
+            component_data={
+                ComponentType.MAMBA: SimpleNamespace(value=None, host_value=None)
+            }
+        )
+        params = SimpleNamespace(cow_mamba=True, mamba_value=None)
+        result = object()
+        self.assertTrue(self.comp.create_match_validator()(node))
+        self.assertIs(
+            self.comp.finalize_match_result_in_tree_core(result, params, [], 64), result
+        )
+        self.assertIs(self.comp.finalize_match_result_in_cache(params, result), result)
+        self.assertIsNone(
+            self.comp.prepare_for_caching_req(
+                SimpleNamespace(), params, token_ids_len=65, is_finished=True
+            )
+        )
+        self.assertIsNone(params.mamba_value)
+        self.comp.commit_insert_component_data(node, True, params, None, [])
+        self.assertIsNone(node.component_data[ComponentType.MAMBA].value)
+        self.assertEqual(self.pool.mock_calls, [])
+        # Ordinary checkpoint caches must still reject the same state-less hit.
+        self.comp.state_from_prefill = False
+        self.assertFalse(self.comp.create_match_validator()(node))
+
+    def test_request_state_retained_until_finish_or_abort(self):
+        for inserted in (False, True):
+            with self.subTest(inserted=inserted):
+                self.pool.reset_mock()
+                req = SimpleNamespace()
+                params = SimpleNamespace(mamba_value=None) if inserted else None
+                self.comp.cleanup_after_caching_req(req, False, insert_params=params)
+                self.pool.free_mamba_cache.assert_not_called()
+                self.comp.cleanup_after_caching_req(req, True, insert_params=params)
+                self.pool.free_mamba_cache.assert_called_once_with(req)
+
+    def test_mtp_key_excludes_shifted_draft_boundary(self):
+        for kv_only, expected in ((True, True), (False, False)):
+            with self.subTest(kv_only=kv_only):
+                params = CacheInitParams(
+                    False,
+                    None,
+                    None,
+                    64,
+                    is_eagle=True,
+                    mamba_state_from_prefill=kv_only,
+                )
+                components = {
+                    ComponentType.FULL: MagicMock(),
+                    ComponentType.MAMBA: MagicMock(),
+                }
+                with patch.object(UnifiedTreeCore, "reset"):
+                    core = UnifiedTreeCore(params, components)
+                self.assertEqual(core.is_eagle, expected)
+                # Same first page but different next token: shifted draft KV
+                # at the page boundary must not be shared by the KV-only tree.
+                a = RadixKey(array("q", range(66)), is_bigram=core.is_eagle)
+                b = RadixKey(array("q", [*range(64), 999, 65]), is_bigram=core.is_eagle)
+                self.assertEqual(a.match(b, page_size=64), 0 if kv_only else 64)
+
+
+class TestPDHybridStateBudget(CustomTestCase):
+    def test_transfer_slots_are_reserved_before_running_capacity(self):
+        schedule = SimpleNamespace(
+            max_mamba_cache_size=30,
+            max_running_requests=8,
+            disable_overlap_schedule=False,
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_decode_extra_slots=2,
+        )
+        memory = SimpleNamespace(disable_radix_cache=False, radix_cache_backend=None)
+        mamba = SimpleNamespace(enable_mamba_extra_buffer=True)
+        getters = dict(
+            get_schedule=lambda: schedule,
+            get_disagg=lambda: disagg,
+            get_memory=lambda: memory,
+            get_exec=lambda: SimpleNamespace(mamba=mamba),
+        )
+        for module in (allocation_sizing, kv_cache_configurator):
+            for name, value in getters.items():
+                if hasattr(module, name):
+                    patcher = patch.object(module, name, value)
+                    patcher.start()
+                    self.addCleanup(patcher.stop)
+        config = object.__new__(KVCacheConfigurator)
+        config.mambaish_config = object()
+        config.attn_dp_size = 1
+        config.model_config = SimpleNamespace(context_len=4096)
+        # Eight running + two receiving requests each need three state slots.
+        self.assertEqual(config.resolve_max_num_reqs(65536), 8)
+        schedule.max_mamba_cache_size = 24
+        self.assertEqual(config.resolve_max_num_reqs(65536), 6)
+        schedule.max_mamba_cache_size = 6
+        with self.assertRaisesRegex(RuntimeError, "state cache is too small"):
+            config.resolve_max_num_reqs(65536)
 
 
 if __name__ == "__main__":

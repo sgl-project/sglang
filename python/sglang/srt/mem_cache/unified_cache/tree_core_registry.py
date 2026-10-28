@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    if params.mamba_state_from_prefill:
+        return "request-local PD Mamba state requires the Python TreeCore"
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
@@ -128,7 +130,12 @@ def select_tree_core_backend(params: CacheInitParams) -> str:
         if params.tree_core_backend is not None
         else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
     )
-    return resolve_tree_core_backend(name, params)
+    name = resolve_tree_core_backend(name, params)
+    if params.mamba_state_from_prefill and name != "python":
+        raise ValueError(
+            "PD decode request-local Mamba state requires the Python TreeCore"
+        )
+    return name
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:
