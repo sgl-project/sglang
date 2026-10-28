@@ -110,6 +110,20 @@ class TestMoeSortQuantLarge(CustomTestCase):
             self.assertTrue(bool((out_s[addr[~real]] == 0).all()), msg)
             self.assertTrue(bool((moe_buf == 0).all()), msg)
 
+    def test_declines_batches_past_32_bit_offsets(self):
+        """x and moe_buf are addressed with int32 offsets, so a batch past them must keep
+        aiter's sort instead of faulting."""
+        from sglang.kernels.ops.moe.moe_sort_quant_large import (
+            moe_sort_quant_large_supported,
+        )
+
+        limit = (1 << 31) // 6144
+        for m, supported in ((limit, True), (limit + 1, False)):
+            ids = torch.empty(m, 4, dtype=torch.int32, device="meta")
+            w = torch.empty(m, 4, dtype=torch.float32, device="meta")
+            x = torch.empty(m, 6144, dtype=torch.bfloat16, device="meta")
+            self.assertEqual(moe_sort_quant_large_supported(ids, w, 128, x), supported)
+
     def test_patched_sort_hands_its_quant_to_aiter(self):
         """Past the one-launch sort's cap, the patched sort emits the stage1 quant that the
         patched quant call returns."""
