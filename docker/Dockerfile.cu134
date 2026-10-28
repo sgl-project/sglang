@@ -11,8 +11,8 @@ ARG SGL_WHEELS_SOURCE=source
 ARG SGL_KERNEL_VERSION=0.4.10
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
-ARG DEEPGEMM_REF=v0.2.5
-ARG SGL_DEEP_GEMM_VERSION=0.2.5
+ARG DEEPGEMM_REF=v0.2.5.post1
+ARG SGL_DEEP_GEMM_VERSION=0.2.5.post1
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
 # MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
