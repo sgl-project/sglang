@@ -99,9 +99,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
-        backend.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(mamba_cache=cache)
-        )
+        backend.state_pool = SimpleNamespace(mamba_cache=cache)
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
