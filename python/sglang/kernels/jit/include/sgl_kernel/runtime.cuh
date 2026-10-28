@@ -188,11 +188,12 @@ inline auto get_max_smem_per_block(
   const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin
                            : cudaDevAttrMaxSharedMemoryPerBlock;
 #endif
-  return smem_cache[opt_in].get_cached(device_id, use_cache, [attr](int32_t device_id) {
-    int value = 0;
-    CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
-    return value;
-  });
+  return smem_cache[opt_in].get_cached(
+      device_id, use_cache, [attr](int32_t device_id) {
+        int value = 0;
+        CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
+        return value;
+      });
 }
 
 }  // namespace host::runtime
