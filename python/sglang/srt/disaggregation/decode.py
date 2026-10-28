@@ -1611,8 +1611,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            # Prefill is responsible for storing this prefix; no persistence ACK is required.
             prefill_info = getattr(decode_req.kv_receiver, "prefill_info", None)
-            decode_req.req.pd_prefill_fill_len = (
+            decode_req.req.linker_offload_skip_prefix_len = (
                 self._pre_alloc_fill_len(decode_req.req)
                 if prefill_info is not None and prefill_info.stores_to_linker
                 else 0

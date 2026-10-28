@@ -654,17 +654,17 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
-    def _prefill_stored_prefix(self, req: Req, token_ids):
-        # PD prefill already stored these pages, so decode must not write them.
-        if self.linker is None or get_disagg().disaggregation_mode != "decode":
+    def _linker_offload_skip_prefix(self, req: Req, token_ids):
+        # Convert the raw-token skip boundary to page-aligned radix-key units.
+        if self.linker is None:
             return nullcontext()
-        prefill_key = RadixKey(
-            token_ids[: req.pd_prefill_fill_len],
+        skip_key = RadixKey(
+            token_ids[: req.linker_offload_skip_prefix_len],
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
-        return self.linker.prefill_stored_prefix(len(prefill_key))
+        return self.linker.skip_offload_prefix(len(skip_key))
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1266,7 +1266,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        with self._prefill_stored_prefix(req, token_ids):
+        with self._linker_offload_skip_prefix(req, token_ids):
             result = self.insert(insert_params)
 
         if result.rotation_tail_declined:

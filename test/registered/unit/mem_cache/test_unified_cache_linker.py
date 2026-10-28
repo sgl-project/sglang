@@ -505,9 +505,9 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.init_cache_linker(linker)
         tokens = list(range(1, 9))
 
-        with cache.linker.prefill_stored_prefix(4):
+        with cache.linker.skip_offload_prefix(4):
             inserted = self._insert(cache, allocator, req_pool, tokens)
-        self.assertEqual(cache.linker.stored_prefix_len, 0)
+        self.assertEqual(cache.linker.offload_skip_prefix_len, 0)
         (kv_offload,) = linker.offload_calls[0]
         node = inserted.last_device_node
         self.assertEqual(kv_offload.keys, cache.tree_core.get_hash_values(node)[2:])
@@ -521,7 +521,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.check_hicache_events()
         self.assertTrue(cache.tree_core.is_external_cache_stored(node))
 
-    def test_node_inside_prefill_stored_prefix_is_marked_stored(self):
+    def test_node_inside_skip_offload_prefix_is_marked_stored(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
         cache, allocator, req_pool = build_fixture(cfg)
@@ -529,7 +529,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.init_cache_linker(linker)
         tokens = list(range(1, 9))
 
-        with cache.linker.prefill_stored_prefix(4):
+        with cache.linker.skip_offload_prefix(4):
             prompt = self._insert(cache, allocator, req_pool, tokens[:4])
         self.assertEqual(linker.offload_calls, [])
         self.assertTrue(
