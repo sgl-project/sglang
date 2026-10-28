@@ -321,6 +321,7 @@ class StaticKVStorage:
                 )
             )
         return tuple(usage)
+
     # -- what a PD peer registers --
 
     def view(self, sub_pool: str) -> Any:
