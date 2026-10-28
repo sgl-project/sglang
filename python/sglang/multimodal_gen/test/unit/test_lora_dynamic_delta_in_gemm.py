@@ -216,7 +216,9 @@ class _ColumnLinear(nn.Module):
         return F.linear(x, self.weight), None
 
 
-def _column_layer(*, stacked=False, alpha=RANK, strength=1.0, output_offset=None):
+def _column_layer(
+    *, stacked=False, alpha=RANK, strength=1.0, output_offset=None, multi=False
+):
     a, b = _adapter(stacked, torch.float32)
     if stacked:
         layer = MergedColumnParallelLinearWithLoRA(
@@ -229,6 +231,12 @@ def _column_layer(*, stacked=False, alpha=RANK, strength=1.0, output_offset=None
     layer.set_lora_weights(
         a, b, strength=strength, merge_weights=False, output_offset=output_offset
     )
+    if multi:
+        a, b = _adapter(stacked, torch.float32, seed=21)
+        layer.lora_alpha = RANK // 2
+        layer.set_lora_weights(
+            a, b, strength=-0.4, merge_weights=False, output_offset=output_offset
+        )
     return layer
 
 
@@ -250,8 +258,9 @@ def _assert_fused_delta(actual, expected):
 
 
 @pytest.mark.parametrize("stacked", [False, True])
-def test_fused_delta_matches_the_forward_delta(stacked):
-    layer = _column_layer(stacked=stacked, alpha=2 * RANK, strength=0.7)
+@pytest.mark.parametrize("multi", [False, True])
+def test_fused_delta_matches_the_forward_delta(stacked, multi):
+    layer = _column_layer(stacked=stacked, alpha=2 * RANK, strength=0.7, multi=multi)
     x = _activations(TOKENS, IN_DIM, seed=7).reshape(2, TOKENS // 2, IN_DIM)
     delta = _fused_delta(layer, x)
     assert delta.shape == (TOKENS, OUT_DIM)
@@ -267,8 +276,9 @@ def test_fused_delta_follows_the_runtime_scale_and_output_offset():
         assert _fused_delta(layer, x) is None
 
 
-def test_fused_delta_interleaves_swiglu_value_and_gate_columns():
-    layer = _column_layer(output_offset=torch.randn(OUT_DIM))
+@pytest.mark.parametrize("multi", [False, True])
+def test_fused_delta_interleaves_swiglu_value_and_gate_columns(multi):
+    layer = _column_layer(output_offset=torch.randn(OUT_DIM), multi=multi)
     x = _activations(TOKENS, IN_DIM, seed=9)
     gate, value = _forward_delta(layer, x).chunk(2, dim=-1)
     interleaved = torch.stack((value, gate), dim=-1).flatten(-2)
@@ -298,3 +308,42 @@ def test_inactive_layers_have_no_fused_delta(state):
         layer.merged = True
     assert not layer.lora_active
     assert _fused_delta(layer, _activations(TOKENS, IN_DIM, seed=12)) is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("stacked", [False, True])
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+def test_multiple_dynamic_adapters_scale_deltas_and_offsets(device, stacked, quality):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    base = nn.Linear(2, 2, bias=False, device=device, dtype=torch.bfloat16)
+    base.weight.data.copy_(torch.eye(2, device=device))
+    layer = LinearWithLoRA(base)
+    for rank, alpha, strength, offset in [(1, 2, 0.5, 2.0), (2, 1, -0.5, 4.0)]:
+        layer.lora_rank, layer.lora_alpha = rank, alpha
+        a_shape, b_shape = (
+            ((2, rank, 2), (2, 1, rank)) if stacked else ((rank, 2), (2, rank))
+        )
+        layer.set_lora_weights(
+            base.weight.new_ones(a_shape),
+            base.weight.new_ones(b_shape),
+            strength=strength,
+            merge_weights=False,
+            output_offset=base.weight.new_full((2,), offset),
+        )
+    # Adapter 1: delta 2 + offset 2; adapter 2: delta -1 + offset -1.
+    for scale in (0.0, 0.5):
+        with (
+            torch.inference_mode(),
+            set_forward_context(0, None, _batch(quality, scale)),
+        ):
+            out = layer(base.weight.new_ones(1, 2))
+        torch.testing.assert_close(
+            out, torch.full_like(out, 1.0 + 2.0 * scale), rtol=0, atol=0
+        )
+    torch.testing.assert_close(
+        base.weight,
+        torch.eye(2, device=device, dtype=base.weight.dtype),
+        rtol=0,
+        atol=0,
+    )
