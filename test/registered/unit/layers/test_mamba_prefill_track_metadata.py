@@ -395,6 +395,8 @@ def make_verify_batch():
         req_to_token_pool=SimpleNamespace(
             req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
         ),
+        # The plan spec_prepare_for_decode leaves on the step, and the lazy one.
+        mamba_track_buffer_indices=[0, None, 1],
         mamba_lazy_spec_track_positions_cpu=[1, 0, 0],
     )
 
@@ -451,7 +453,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
             ),
             "mapping written": lambda b: track_mapping(b)[0, 1].fill_(19),
             "position moved": lambda b: setattr(
-                b.reqs[2].kv, "mamba_next_track_idx", 0
+                b, "mamba_track_buffer_indices", [0, None, 0]
             ),
             "request freed": lambda b: setattr(
                 b.reqs[0].kv, "mamba_next_track_idx", None
