@@ -1,6 +1,5 @@
 import itertools
 import unittest
-from pathlib import Path
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -19,7 +18,6 @@ conv1d_weight_pack = torch.ops.sgl_kernel.conv1d_weight_pack
 
 
 class TestConv1d(CustomTestCase):
-
     def _test_conv1d(self, N, IC, OC, L, kernel_size, stride, padding, dtype):
         """Test conv1d_cpu against torch.nn.Conv1d reference."""
         conv_ref = nn.Conv1d(

@@ -96,6 +96,8 @@ def _validate_conv_args(
             )
         if padding == "same" and any(s != 1 for s in stride):
             raise ValueError("padding='same' is not supported for strided convolutions")
+
+
 class Conv1dLayer(BaseFusedOp):
     """Drop-in replacement for nn.Conv1d"""
 
