@@ -11,8 +11,8 @@ class TokenSpaceServingSpec:
 
     # hf_config.architectures names this spec serves.
     models: tuple[str, ...] = ()
-    # Media IO threads when --mm-io-worker-num is unset; None keeps the processor default.
-    auto_mm_io_worker_num: Optional[int] = None
+    # Media IO threads when neither --mm-io-worker-num nor SGLANG_IO_WORKERS is set.
+    auto_mm_io_worker_num: int = 4
     # Device every medium of a video request preprocesses and decodes on, unless
     # mm_process_config sets video_preprocessing_device; None keeps the defaults.
     video_preprocessing_device: Optional[str] = None

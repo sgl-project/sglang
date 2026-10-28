@@ -444,7 +444,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         strategies = {_ImageWidthStrategy.models[0]: _ImageWidthStrategy}
         for specs, expected_tokens, expected_io in (
             ({_ImageWidthStrategy.models[0]: _MarkerSpec}, mm_tokens, 7),
-            ({}, None, TokenSpaceProcessor.auto_mm_io_worker_num),
+            ({}, None, TokenSpaceServingSpec.auto_mm_io_worker_num),
         ):
             with (
                 self.subTest(spec_registered=bool(specs)),
