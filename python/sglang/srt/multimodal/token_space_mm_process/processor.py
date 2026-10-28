@@ -88,6 +88,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             mm_token_expansion_start_len: Length of an already expanded prefix.
             video_metadata: Per-video frame metadata, in video order.
             image_device, video_device: Preprocessing devices; None keeps defaults.
+                Videos also decode on CPU when `video_device` is "cpu".
             compute_mrope_positions: Also return M-RoPE positions; off for trainers
                 such as Megatron Bridge that compute them themselves.
             package_output: Runs on the BatchFeature in the same worker task,
@@ -104,10 +105,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             *sources,
             audio_sample_rate=self.strategy.audio_sample_rate,
             discard_alpha_channel=self.strategy.discard_alpha_channel,
-        )
-        _, videos, _ = loaded
-        image_device, video_device = self._media_devices(
-            videos, image_device, video_device
+            video_decode_device=video_device,
         )
         request_options = dict(image_device=image_device, video_device=video_device)
         media_items = self._list_media_items(sources, loaded, video_metadata)
@@ -136,12 +134,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     f"{name}: token-space processing does not accept processor_output "
                     "or precomputed_embedding inputs; pass raw media instead"
                 )
-
-    def _media_devices(self, videos, image_device, video_device):
-        # A strategy may pin all media of a video request to one device.
-        if videos and self.video_preprocessing_device is not None:
-            return self.video_preprocessing_device, self.video_preprocessing_device
-        return image_device, video_device
 
     @staticmethod
     def _list_media_items(sources, loaded, video_metadata):

@@ -3418,9 +3418,15 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mm-process-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multimodal preprocessing config, a json config contains keys: <code>image</code>, <code>video</code>, <code>audio</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multimodal preprocessing config, a json config contains keys: <code>image</code>, <code>video</code>, <code>audio</code>, and <code>video_preprocessing_device</code>, the device the token-space processor decodes and preprocesses a video request on (e.g. <code>&#123;"video_preprocessing_device": "cpu"&#125;</code>).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>&#123;&#125;</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-token-space-processor`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable token-space multimodal preprocessing for supported models. Unsupported models keep their existing processor. Not supported with --encoder-only or --language-only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--allowed-media-domains`</td>
