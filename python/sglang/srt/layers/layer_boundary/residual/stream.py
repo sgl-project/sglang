@@ -13,9 +13,9 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
+import dataclasses
 from typing import Callable, Optional, Union
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -23,8 +23,15 @@ from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
 from sglang.srt.layers.layer_boundary.output import HandoffOutput, UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import StageUpdate
 
+# These carriers are constructed inside the tc_piecewise compiled region
+# (fullgraph torch.compile of the language-model forward). Dynamo cannot replay
+# msgspec.Struct construction -- its C-level __new__ is untraceable and probing
+# object.__new__(cls) raises "not safe" -- so they must stay plain dataclasses,
+# whose generated __init__ Dynamo traces directly.
 
-class CarriedSum(msgspec.Struct, frozen=True):
+
+@dataclasses.dataclass(frozen=True)
+class CarriedSum:
     """Runtime reduction left by an exit decision.
 
     Fields:
@@ -42,7 +49,8 @@ class CarriedSum(msgspec.Struct, frozen=True):
         return self.group.all_reduce(value)
 
 
-class DeclaredSum(msgspec.Struct, frozen=True):
+@dataclasses.dataclass(frozen=True)
+class DeclaredSum:
     """A sum every output of this producer owes to its declared input edge."""
 
     group: SumGroup
@@ -51,7 +59,8 @@ class DeclaredSum(msgspec.Struct, frozen=True):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+@dataclasses.dataclass
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
@@ -87,7 +96,8 @@ class Contribution(msgspec.Struct):
         return value
 
 
-class OwedOutput(msgspec.Struct, frozen=True):
+@dataclasses.dataclass(frozen=True)
+class OwedOutput:
     """Opaque model-facing handle. Only its boundary may read the contribution."""
 
     contribution: Contribution

@@ -220,13 +220,21 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+# Import torchada eagerly (at module load) so that dynamo never traces an
+# import statement when is_musa() is called from a fullgraph torch.compile
+# region: an import inside tracing is a graph break, which is fatal to
+# tc_piecewise prefill CUDA graph capture.
+try:
+    import torchada  # noqa: F401
+
+    _MUSA_VERSION = getattr(torch.version, "musa", None)
+except ImportError:
+    _MUSA_VERSION = None
+
+
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
-    try:
-        import torchada  # noqa: F401
-    except ImportError:
-        return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return _MUSA_VERSION is not None
 
 
 @lru_cache(maxsize=1)

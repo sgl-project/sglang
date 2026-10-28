@@ -37,6 +37,7 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
+import warnings
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
@@ -445,6 +446,49 @@ def test_group_desc_none_normalized_to_anonymous():
     """group_name=None keeps the existing "anonymous" normalization, so the
     emitted descs must be anonymous:device / anonymous:cpu (not None:device)."""
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
+
+
+def test_deprecated_getter_wrapper_skips_frame_check_under_fullgraph_compile(
+    monkeypatch,
+):
+    """Bug regression: the deprecation wrapper around module-level group
+    getters (get_tp_group, get_attn_tp_group, ...) inspected sys._getframe(1)
+    on every call. Dynamo cannot trace sys._getframe, so the declared-sum
+    boundary path -- which calls get_attn_tp_group().all_reduce() inside
+    tc_piecewise's fullgraph-compiled forward -- crashed MiniMax-M3 TP16
+    prefill capture with "Attempted to call function marked as skipped". The
+    wrapper must bypass the frame check when torch.compiler.is_compiling().
+    """
+    monkeypatch.setattr(parallel_state, "_ALREADY_WARNED", set())
+
+    @parallel_state._warn_if_called_from_outside("get_test_group", "test_group")
+    def get_test_group():
+        return torch.ones(2)
+
+    def caller():
+        return get_test_group(), torch.compiler.is_compiling()
+
+    # backend="eager": the regression fires at dynamo trace time, so no codegen
+    # is needed to reproduce it.
+    value, compiling = torch.compile(backend="eager", fullgraph=True)(caller)()
+    torch.testing.assert_close(value, torch.ones(2))
+    assert compiling  # fails vacuously if dynamo is disabled
+
+
+def test_deprecated_getter_wrapper_still_warns_external_caller_once(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_ALREADY_WARNED", set())
+
+    @parallel_state._warn_if_called_from_outside(
+        "get_test_group_eager", "test_group"
+    )
+    def get_test_group_eager():
+        return torch.ones(2)
+
+    with pytest.warns(DeprecationWarning, match="get_test_group_eager"):
+        get_test_group_eager()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        get_test_group_eager()  # the one-shot warning stays silent afterwards
 
 
 if __name__ == "__main__":
