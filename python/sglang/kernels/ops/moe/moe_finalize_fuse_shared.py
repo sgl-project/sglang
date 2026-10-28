@@ -24,7 +24,16 @@ def moe_finalize_fuse_shared(
     shared_output: Optional[torch.Tensor],
     top_k: int,
     enable_pdl: bool = False,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+    round_routed: bool = False,
 ) -> torch.Tensor:
+    """Finalize expert outputs and optionally add shared output.
+
+    round_routed preserves a materialized BF16 routed result before adding
+    shared_output; output_dtype controls the final store independently.
+    """
+    assert output_dtype in (torch.bfloat16, torch.float32)
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype in (torch.float32, torch.bfloat16)
     assert expanded_idx_to_permuted_idx.dtype == torch.int32
@@ -43,7 +52,7 @@ def moe_finalize_fuse_shared(
         assert hidden_dim <= gemm2_out.shape[1]
 
     out = torch.empty(
-        num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
+        num_tokens, hidden_dim, dtype=output_dtype, device=gemm2_out.device
     )
     if shared_output is None:
         shared_output = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
@@ -56,5 +65,6 @@ def moe_finalize_fuse_shared(
         shared_output,
         int(top_k),
         bool(enable_pdl),
+        bool(round_routed),
     )
     return out

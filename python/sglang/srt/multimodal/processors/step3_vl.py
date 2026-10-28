@@ -1,7 +1,12 @@
+import asyncio
+import io
+import json
+import logging
 import math
 import re
 from itertools import product
 from typing import List, Optional, Union
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -11,27 +16,40 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.configs.step5 import Step5VLConfig
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
+from sglang.srt.models.step5_vl import Step5ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_mm
+from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
+
+logger = logging.getLogger(__name__)
+
+LOW_DETAIL_MAX_SIDE = 728
+LOW_DETAIL_MAX_RATIO = 1.5
 
 Step3Image = Union[Image.Image, torch.Tensor]
 ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
 
 
-class GPUToTensor(torch.nn.Module):
+class CPUToTensor(torch.nn.Module):
     def forward(
         self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(raw_image, torch.Tensor):
-            image_tensor = raw_image
+            image_tensor = raw_image.cpu()
             if image_tensor.ndim != 3:
                 raise TypeError(
                     f"Expected CHW image tensor, got shape {tuple(image_tensor.shape)}"
@@ -48,17 +66,10 @@ class GPUToTensor(torch.nn.Module):
                 image_tensor = image_tensor.to(torch.float32)
             return image_tensor.contiguous()
         if isinstance(raw_image, Image.Image):
-            image_tensor = transforms.ToTensor()(raw_image)
-            if torch.cuda.is_available():
-                image_tensor = image_tensor.to(torch.device("cuda"))
-            return image_tensor
+            return transforms.ToTensor()(raw_image)
         if raw_image.ndim == 2:
             raw_image = raw_image[:, :, None].repeat(3, -1)
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
-        image_tensor = torch.from_numpy(raw_image).to(device)
+        image_tensor = torch.from_numpy(raw_image)
         image_tensor = torch.permute(image_tensor, (2, 0, 1)).contiguous()
         if image_tensor.dtype == torch.uint8:
             image_tensor = image_tensor.to(torch.float32).div(255)
@@ -73,7 +84,7 @@ class Step3VisionProcessor:
 
         self.transform = transforms.Compose(
             [
-                GPUToTensor(),
+                CPUToTensor(),
                 transforms.Normalize(mean, std),
                 transforms.Resize(
                     (size, size),
@@ -90,7 +101,7 @@ class Step3VisionProcessor:
         self.patch_transform = (
             transforms.Compose(
                 [
-                    GPUToTensor(),
+                    CPUToTensor(),
                     transforms.Normalize(mean, std),
                     transforms.Resize(
                         (patch_size, patch_size),
@@ -446,6 +457,7 @@ class Step3VLProcessor:
         images: Optional[Union[Image.Image, list[Image.Image]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
         *args,
+        add_special_tokens: bool = True,
         **kwargs,
     ) -> BatchFeature:
         if text is None:
@@ -459,7 +471,7 @@ class Step3VLProcessor:
 
         if len(images) == 0:
             image_inputs = {}
-            text_inputs = self.tokenizer(text)
+            text_inputs = self.tokenizer(text, add_special_tokens=add_special_tokens)
         else:
             splitted_images_data = self._split_images(images)
             pixel_values_lst = []
@@ -505,7 +517,7 @@ class Step3VLProcessor:
                 self.replace_placeholder(t, self.image_token, image_repl_str_lst)
                 for t in text
             ]
-            text_inputs = self.tokenizer(text)
+            text_inputs = self.tokenizer(text, add_special_tokens=add_special_tokens)
 
         return BatchFeature(
             {
@@ -516,6 +528,42 @@ class Step3VLProcessor:
         )
 
 
+def step3_vl_rust_spec(processor: Step3VLProcessor) -> Optional[dict]:
+    preprocessor = processor.image_preprocessor
+    resizes = (
+        preprocessor.transform.transforms[2],
+        preprocessor.patch_transform.transforms[2],
+    )
+    if any(
+        t.interpolation != InterpolationMode.BILINEAR or not t.antialias
+        for t in resizes
+    ):
+        return None
+    tokenizer = processor.tokenizer
+    names = {
+        "image_start_id": "<im_start>",
+        "image_end_id": "<im_end>",
+        "patch_start_id": "<patch_start>",
+        "patch_end_id": "<patch_end>",
+        "patch_newline_id": "<patch_newline>",
+    }
+    ids = {key: tokenizer.convert_tokens_to_ids(tok) for key, tok in names.items()}
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if any(v is None or (unk is not None and v == unk) for v in ids.values()):
+        return None
+    normalize = preprocessor.transform.transforms[1]
+    return dict(
+        image_token_id=processor.image_token_id,
+        image_size=processor.image_size,
+        patch_size=processor.patch_size,
+        image_feature_tokens=processor.num_image_feature_size,
+        patch_feature_tokens=processor.num_patch_feature_size,
+        image_mean=[float(x) for x in normalize.mean],
+        image_std=[float(x) for x in normalize.std],
+        **ids,
+    )
+
+
 ################################################
 
 
@@ -524,12 +572,30 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
         Step3VLForConditionalGeneration,
         StepVLForConditionalGeneration,
         Step3p7ForConditionalGeneration,
+        Step5ForConditionalGeneration,
     ]
+
+    # Preprocessing runs in tokenizer workers, which must not compete with TP0.
+    mm_feature_transport_override = "cpu"
+    gpu_image_decode = False
+    video_preprocessing_device = "cpu"
+    per_image_mm_items = False
+
+    def _fast_image_processor_device(self, processor):
+        return "cpu"
+
+    def _preprocessing_competes_with_the_scheduler(self):
+        return False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.
         processor = Step3VLProcessor(hf_config, _processor)
+        self._rust, self._rust_spec_json = self._load_rust(processor)
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
+        is_step5 = isinstance(hf_config, Step5VLConfig)
+        self.prefer_tokenized_input = is_step5
+        self.accepts_chat_prompt_ids = is_step5
+        self.per_image_mm_items = is_step5
         self.IM_TOKEN = "<im_patch>"
         self.IM_TOKEN_ID = self._processor.tokenizer.get_vocab()[self.IM_TOKEN]
         self.mm_tokens = MultimodalSpecialTokens(
@@ -541,11 +607,212 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
         mean = [0.48145466, 0.4578275, 0.40821073]
         std = [0.26862954, 0.26130258, 0.27577711]
 
+    @staticmethod
+    def _load_rust(processor: Step3VLProcessor):
+        mm = get_mm()
+        if mm.image_processor_backend != "auto" or mm.disable_fast_image_processor:
+            return None, None
+        fields = step3_vl_rust_spec(processor)
+        if fields is None:
+            return None, None
+        try:
+            from sglang.srt.rust_extensions import load_rust_extension
+
+            module = load_rust_extension(
+                "sglang.srt.rust_extensions._multimodal"
+            ).step3_vl
+        except (ImportError, OSError, RuntimeError, AttributeError) as error:
+            logger.warning(
+                "Step3-VL Rust image processor unavailable; using Python: %s", error
+            )
+            return None, None
+        return module, json.dumps({"family": "step3_vl", **fields})
+
+    def preprocess_fingerprint_payload(self):
+        payload = super().preprocess_fingerprint_payload()
+        payload["step3_vl_preprocess_backend"] = (
+            "rust" if self._rust is not None else "python"
+        )
+        return payload
+
+    @staticmethod
+    def _rust_image_source(item) -> Optional[Union[str, bytes, Image.Image]]:
+        if isinstance(item, (str, bytes, Image.Image)):
+            return item
+        url = getattr(item, "url", None)
+        if isinstance(url, str) and not getattr(item, "preprocess_kwargs", None):
+            return url
+        return None
+
+    @staticmethod
+    def _read_image_bytes(source: Union[str, bytes, Image.Image]) -> bytes:
+        # detail=low has already been resized/padded using PIL. Lossless encoding
+        # preserves those exact pixels for the Rust normalization/patch pipeline.
+        if isinstance(source, Image.Image):
+            buffer = io.BytesIO()
+            source.save(buffer, format="PNG")
+            return buffer.getvalue()
+        from sglang.srt.utils.common import get_image_bytes, image_extension_names
+
+        if isinstance(source, str):
+            if source.startswith("file://"):
+                source = unquote(urlparse(source).path)
+            elif not source.startswith(
+                ("http://", "https://", "data:", "/")
+            ) and source.lower().endswith(image_extension_names):
+                with open(source, "rb") as f:
+                    return f.read()
+        return get_image_bytes(source)
+
+    async def _process_mm_data_rust(self, sources, input_text):
+        loop = asyncio.get_running_loop()
+        datas = await asyncio.gather(
+            *(
+                loop.run_in_executor(self.io_executor, self._read_image_bytes, s)
+                for s in sources
+            )
+        )
+        semantics = ["pil"] * len(datas)
+        images = await asyncio.to_thread(
+            self._rust.preprocess_batch, list(datas), self._rust_spec_json, semantics
+        )
+        if isinstance(input_text, list):
+            input_ids = list(input_text)
+        else:
+            tokenizer = self._processor.tokenizer
+            input_ids = tokenizer(
+                input_text,
+                add_special_tokens=not self._template_wrote_bos(tokenizer, input_text),
+            )["input_ids"]
+        newlines = [list(nl) for _, _, nl in images]
+        input_ids, runs = self._rust.expand_input_ids(
+            input_ids, newlines, self._rust_spec_json
+        )
+        size, patch = self._processor.image_size, self._processor.patch_size
+        model_specific_data = {
+            "num_patches": torch.tensor([len(nl) for nl in newlines], dtype=torch.long)
+        }
+        patches = [ppv for _, ppv, _ in images if ppv.size]
+        if patches:
+            model_specific_data["patch_pixel_values"] = torch.from_numpy(
+                np.concatenate(patches)
+            ).view(-1, 3, patch, patch)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.from_numpy(np.concatenate([pv for pv, _, _ in images])).view(
+                -1, 3, size, size
+            ),
+            offsets=[tuple(r) for per_image in runs for r in per_image],
+            model_specific_data=model_specific_data,
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=self._split_per_image(item),
+            im_token_id=self.mm_tokens.image_token_id,
+        )
+
+    _PER_IMAGE_KEYS = frozenset(
+        {"num_patches", "patch_pixel_values", "patch_newline_mask"}
+    )
+
+    def _split_per_image(self, item: MultimodalDataItem) -> List[MultimodalDataItem]:
+        if not self.per_image_mm_items or not item.is_image():
+            return [item]
+        data = item.model_specific_data
+        num_patches = data.get("num_patches")
+        if (
+            item.feature is None
+            or item.offsets is None
+            or num_patches is None
+            or not set(data).issubset(self._PER_IMAGE_KEYS)
+        ):
+            return [item]
+        if isinstance(num_patches, torch.Tensor):
+            counts = [int(x) for x in num_patches.flatten().tolist()]
+        else:
+            counts = [int(x) for x in num_patches]
+        if (
+            len(counts) <= 1
+            or item.feature.shape[0] != len(counts)
+            or len(item.offsets) != sum(n + 1 for n in counts)
+        ):
+            return [item]
+        patch_pixel_values = data.get("patch_pixel_values")
+        patch_newline_mask = data.get("patch_newline_mask")
+        if patch_pixel_values is not None and patch_pixel_values.shape[0] != sum(
+            counts
+        ):
+            return [item]
+        items, run, patch = [], 0, 0
+        for i, n in enumerate(counts):
+            image_data = {"num_patches": torch.tensor([n], dtype=torch.long)}
+            if n and patch_pixel_values is not None:
+                image_data["patch_pixel_values"] = patch_pixel_values[patch : patch + n]
+            if n and patch_newline_mask is not None:
+                image_data["patch_newline_mask"] = patch_newline_mask[patch : patch + n]
+            items.append(
+                MultimodalDataItem(
+                    modality=item.modality,
+                    feature=item.feature[i : i + 1],
+                    offsets=list(item.offsets[run : run + n + 1]),
+                    model_specific_data=image_data,
+                )
+            )
+            run += n + 1
+            patch += n
+        return items
+
+    def _postprocess_mm_items_before_transport(self, mm_items, *, images):
+        return [split for item in mm_items for split in self._split_per_image(item)]
+
     def preprocess(self, image):
         return {"pixel_values": self.transform(image).unsqueeze(0)}
 
     def __call__(self, image):
         return self.preprocess(image)
+
+    @staticmethod
+    def _is_low_detail(item) -> bool:
+        return getattr(item, "detail", None) == "low"
+
+    @classmethod
+    def _load_low_detail_image(cls, item):
+        from sglang.srt.utils.common import load_image
+
+        img, _ = load_image(item.url, gpu_image_decode=False)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        long_side = max(img.size)
+        if long_side > LOW_DETAIL_MAX_SIDE:
+            scale = LOW_DETAIL_MAX_SIDE / long_side
+            img = img.resize(
+                (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                Image.Resampling.BILINEAR,
+            )
+        w, h = img.size
+        if max(w, h) > min(w, h) * LOW_DETAIL_MAX_RATIO:
+            need = math.ceil(max(w, h) / LOW_DETAIL_MAX_RATIO)
+            pad_w, pad_h = (w, max(h, need)) if w >= h else (max(w, need), h)
+            padded = Image.new("RGB", (pad_w, pad_h), (0, 0, 0))
+            padded.paste(img, (0, 0))
+            img = padded
+        return img
+
+    async def _resolve_low_detail(self, image_data):
+        if not image_data or not any(self._is_low_detail(i) for i in image_data):
+            return image_data
+        loop = asyncio.get_running_loop()
+        resolved = []
+        for item in image_data:
+            if self._is_low_detail(item):
+                resolved.append(
+                    await loop.run_in_executor(
+                        self.io_executor, self._load_low_detail_image, item
+                    )
+                )
+            else:
+                resolved.append(item)
+        return resolved
 
     async def process_mm_data_async(
         self,
@@ -555,6 +822,21 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        image_data = await self._resolve_low_detail(image_data)
+        if isinstance(input_text, list) and not request_obj.video_data:
+            placeholders = input_text.count(self.IM_TOKEN_ID)
+            if placeholders != len(image_data or []):
+                raise ValueError(
+                    f"prompt has {placeholders} image placeholder(s) "
+                    f"but {len(image_data or [])} image(s)"
+                )
+        if self._rust is not None and image_data and not request_obj.video_data:
+            sources = [self._rust_image_source(item) for item in image_data]
+            if all(s is not None for s in sources):
+                try:
+                    return await self._process_mm_data_rust(sources, input_text)
+                except CLIENT_MEDIA_EXCEPTIONS:
+                    pass
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,

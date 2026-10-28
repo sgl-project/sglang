@@ -48,6 +48,7 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    _fix_v5_tokenizer_components,
     _install_tokenizer_warnings_filter,
     get_tokenizer,
 )
@@ -268,11 +269,13 @@ def get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
-        return AutoTokenizer.from_pretrained(
+        return get_tokenizer(
             tokenizer_name,
             *args,
+            tokenizer_mode=tokenizer_mode,
+            tokenizer_backend=tokenizer_backend,
             trust_remote_code=trust_remote_code,
-            revision=revision,
+            tokenizer_revision=revision,
             **kwargs,
         )
 
@@ -378,6 +381,10 @@ def get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
+    # AutoProcessor may return a model-specific tokenizer whose v5 constructor
+    # overwrote the checkpoint's ByteLevel components. Apply the same repair
+    # as the text-only loader before this tokenizer encodes any chat history.
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(

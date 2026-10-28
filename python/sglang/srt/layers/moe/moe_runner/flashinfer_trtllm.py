@@ -82,6 +82,9 @@ def is_deferred_finalize_enabled() -> bool:
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: Optional[torch.Tensor],
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+    round_routed: bool = False,
 ) -> torch.Tensor:
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
@@ -92,6 +95,8 @@ def finalize_flashinfer_trtllm_deferred_output(
         shared_output,
         deferred_output.top_k,
         enable_pdl=trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
+        output_dtype=output_dtype,
+        round_routed=round_routed,
     )
 
 
@@ -134,8 +139,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        FlashinferCombineInput,
-        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -814,12 +817,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     defer_finalize = _deferred_finalize_enabled.get()
     if defer_finalize and (
         not quant_info.block_quant
-        or use_routed_topk
-        or not TopKOutputChecker.format_is_bypassed(topk_output)
+        or (
+            not use_routed_topk
+            and not TopKOutputChecker.format_is_bypassed(topk_output)
+        )
     ):
         raise RuntimeError(
-            "FP8 deferred finalize requires block quantization, the logits-based "
-            "FlashInfer TRTLLM backend, and bypassed TopK"
+            "FP8 deferred finalize requires block quantization and either routed "
+            "TopK or logits-based bypassed TopK"
         )
 
     if quant_info.block_quant:
@@ -881,7 +886,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing if isinstance(routing, tuple) else (routing, None)
             )
 
-            trtllm_fp8_block_scale_routed_moe_out_wrapper(
+            routed_kwargs = dict(
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
                 routing_bias=None,
@@ -916,8 +921,36 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
+                silu_clamp_mode=runner_config.silu_clamp_mode,
+                fc1_output_dtype=runner_config.fc1_output_dtype,
             )
-            output = cast(torch.Tensor, symm_output)
+            if defer_finalize:
+                from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
+                from flashinfer.fused_moe.core import ActivationType
+
+                routed_kwargs["topk_ids"] = (
+                    topk_ids if topk_weights is None else (topk_ids, topk_weights)
+                )
+                del routed_kwargs["topk_weights"]
+                routed_kwargs["fp8_quantization_type"] = fp8_quantization_type
+                if quant_info.activation_type is not None:
+                    routed_kwargs["activation_type"] = ActivationType(
+                        quant_info.activation_type
+                    )
+                else:
+                    del routed_kwargs["activation_type"]
+                for name in ("silu_clamp_mode", "fc1_output_dtype"):
+                    if routed_kwargs[name] is None:
+                        del routed_kwargs[name]
+                output = _make_deferred_finalize_output(
+                    trtllm_fp8_block_scale_routed_moe(
+                        **routed_kwargs, do_finalize=False
+                    ),
+                    top_k=runner_config.top_k,
+                )
+            else:
+                trtllm_fp8_block_scale_routed_moe_out_wrapper(**routed_kwargs)
+                output = cast(torch.Tensor, symm_output)
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
             common_kwargs = dict(
@@ -948,6 +981,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             )
+            if runner_config.silu_clamp_mode is not None:
+                common_kwargs["silu_clamp_mode"] = runner_config.silu_clamp_mode
+            if runner_config.fc1_output_dtype is not None:
+                common_kwargs["fc1_output_dtype"] = runner_config.fc1_output_dtype
             if defer_finalize:
                 from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
@@ -1590,6 +1627,7 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+    gemm1_clamp_limit: torch.Tensor | None = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -1638,6 +1676,16 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
+    step_post_clamp = runner_config.silu_clamp_mode == "post"
+    if step_post_clamp:
+        from flashinfer.tllm_enums import ActivationType
+
+        if not use_routed_topk or runner_config.activation != "silu":
+            raise ValueError("Step BF16 requires precomputed routing and SiLU")
+        if quant_info.gemm1_clamp_limit is None:
+            raise ValueError("Step BF16 requires an explicit clamp limit")
+        activation_type = ActivationType.SwigluStep
+
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     defer_finalize = _deferred_finalize_enabled.get()
@@ -1677,6 +1725,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 ),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1763,6 +1812,23 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
+    )
+
+
+@register_fused_func("megamoe", "flashinfer_trtllm_routed")
+def fused_experts_megamoe_to_flashinfer_trtllm_bf16(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    # MegaMoE deployments use StandardDispatcher for checkpoint-BF16 layers.
+    # These layers produce local expert contributions; Step5 owns the reduction.
+    if not isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        raise TypeError("MegaMoE's TRTLLM fallback only supports BF16 experts")
+    if runner_config.silu_clamp_mode != "post":
+        raise ValueError("MegaMoE's TRTLLM BF16 fallback requires Step post-SiLU clamp")
+    return fused_experts_none_to_flashinfer_trtllm_bf16(
+        dispatch_output, quant_info, runner_config, use_routed_topk=True
     )
 
 

@@ -383,6 +383,8 @@ def _fused_sigmoid_mul_kernel(
     gate_ptr,
     gate_stride_row,
     gate_stride_head,
+    gate_stride_dim: tl.constexpr,
+    ROUND_GATE: tl.constexpr,
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -402,10 +404,14 @@ def _fused_sigmoid_mul_kernel(
     attn_off = pid_row * hidden_dim + offsets
     attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
 
-    gate_off = pid_row * gate_stride_row + head * gate_stride_head + d
+    gate_off = pid_row * gate_stride_row + head * gate_stride_head + d * gate_stride_dim
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
-    result = attn * tl.sigmoid(g)
+    sigmoid = tl.sigmoid(g)
+    if ROUND_GATE:
+        # Match a separately materialized sigmoid in the gate storage dtype.
+        sigmoid = sigmoid.to(gate_ptr.dtype.element_ty).to(tl.float32)
+    result = attn * sigmoid
     if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
         y = tl.where(mask, result.to(output_ptr.dtype.element_ty).to(tl.float32), 0.0)
         y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
@@ -421,6 +427,8 @@ def fused_sigmoid_mul(
     gate: torch.Tensor,
     inplace: bool = False,
     quant: bool = False,
+    *,
+    round_gate: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -429,6 +437,11 @@ def fused_sigmoid_mul(
 
     The production Qwen3.5 path passes a 3D strided gate. A single hidden-block
     Triton kernel handles both that path and flat contiguous inputs.
+
+    A zero stride in the last gate dimension supports one gate per head
+    through an expanded view. round_gate=True preserves the intermediate
+    gate-dtype rounding of a separately materialized sigmoid. Existing
+    callers keep the FP32 sigmoid behavior by default.
 
     When inplace=True, writes result back to attn_output and returns it.
 
@@ -443,6 +456,7 @@ def fused_sigmoid_mul(
         assert attn_output.shape == (num_tokens, hidden_dim)
         gate_stride_row = gate.stride(0)
         gate_stride_head = gate.stride(1)
+        gate_stride_dim = gate.stride(2)
     else:
         # Flat path: both tensors have the same shape
         assert attn_output.shape == gate.shape, (
@@ -453,6 +467,7 @@ def fused_sigmoid_mul(
         head_dim = hidden_dim
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
+        gate_stride_dim = 1
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
@@ -469,7 +484,9 @@ def fused_sigmoid_mul(
         gate,
         gate_stride_row,
         gate_stride_head,
-        hidden_dim,
+        gate_stride_dim=gate_stride_dim,
+        ROUND_GATE=round_gate,
+        hidden_dim=hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
         num_warps=4,

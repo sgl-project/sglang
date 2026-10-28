@@ -1,0 +1,276 @@
+--- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
++++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+@@ -77,6 +77,19 @@
+   // FC1 GEMM's batch index. tileTokensDim is a runtime value (not always a power of two), hence
+   // the division; it is off the default path and negligible next to the global loads.
+   int32_t const localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
++
++  if (params.siluClampMode == 1 && params.gatedActClampLimitPtr != nullptr) {
++    // Post-SiLU clamp: the limit applies to the SiLU output, not to its input.
++    float const limit = params.gatedActClampLimitPtr[localExpertIdx];
++    float const alpha =
++        params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
++    float const beta =
++        params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 0.0f;
++    float act = xGlu / (1.0f + expf(-alpha * xGlu));
++    act = fminf(act, limit);
++    xLinear = fmaxf(fminf(xLinear, limit), -limit);
++    return act * (xLinear + beta);
++  }
+
+   if (params.gatedActClampLimitPtr != nullptr) {
+     float const limit = params.gatedActClampLimitPtr[localExpertIdx];
+--- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/data/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -5589,10 +5589,20 @@
+     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
+     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
++    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
++    int64_t silu_clamp_mode) {
+   auto activation_type = validateAndCastActivationType(act_type);
+   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                              quantization_type, activation_type);
++  FLASHINFER_CHECK(silu_clamp_mode == 0 || silu_clamp_mode == 1,
++                   "silu_clamp_mode must be 0 (legacy pre-SiLU clamp) or 1 (post-SiLU clamp), got ",
++                   silu_clamp_mode);
++  if (silu_clamp_mode == 1) {
++    FLASHINFER_CHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8,
++                     "post-SiLU clamp only supported for DeepSeekFp8");
++    FLASHINFER_CHECK(gemm1_clamp_limit.has_value(),
++                     "post-SiLU clamp (silu_clamp_mode=1) requires gemm1_clamp_limit");
++  }
+   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
+   // Fail for any other activation to avoid silently running incorrect activation behavior.
+   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
+@@ -5702,6 +5712,7 @@
+     args->output = output.data_ptr();
+     args->output_scale = nullptr;
+     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
++    args->silu_clamp_mode = silu_clamp_mode;
+
+     // Create and initialize launcher for this tile size
+     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
+--- a/data/csrc/trtllm_fused_moe_runner.cu
++++ b/data/csrc/trtllm_fused_moe_runner.cu
+@@ -518,6 +518,7 @@
+   activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
+   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
+   activationData.tileTokensDim = workspace.ProjUpTileN;
++  activationData.siluClampMode = args.silu_clamp_mode;
+
+   // Setup finalize data
+   if (args.do_finalize) {
+--- a/data/include/flashinfer/trtllm/fused_moe/DevKernel.h
++++ b/data/include/flashinfer/trtllm/fused_moe/DevKernel.h
+@@ -190,6 +190,8 @@
+   // Only read when one of the pointers above is set.
+   int32_t const* ctaIdxXyToBatchIdx = nullptr;
+   int32_t tileTokensDim{0};
++  // 0 = legacy pre-SiLU clamp; 1 = post-SiLU clamp (clamp the SiLU output instead).
++  int32_t siluClampMode{0};
+ };
+
+ template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
+@@ -216,6 +218,7 @@
+   float const* gatedActClampLimitPtr = nullptr;
+   int32_t const* ctaIdxXyToBatchIdx = nullptr;
+   int32_t tileTokensDim{0};
++  int32_t siluClampMode{0};
+
+   static KernelParams setKernelParams(Data const& data) {
+     KernelParams params;
+@@ -237,6 +240,7 @@
+     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
+     params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
+     params.tileTokensDim = data.tileTokensDim;
++    params.siluClampMode = data.siluClampMode;
+
+     return params;
+   }
+--- a/data/include/flashinfer/trtllm/fused_moe/runner.h
++++ b/data/include/flashinfer/trtllm/fused_moe/runner.h
+@@ -335,6 +335,8 @@
+   float* gemm1_alpha = nullptr;
+   float* gemm1_beta = nullptr;
+   float* gemm1_clamp_limit = nullptr;
++  // 0 = legacy pre-SiLU clamp, 1 = post-SiLU clamp (DeepSeekFp8 unfused activation only).
++  int64_t silu_clamp_mode{0};
+   float* gemm2_bias = nullptr;
+
+   ActivationType activation_type = ActivationType::Swiglu;
+--- a/fused_moe/backends/trtllm/sm100_runner.py
++++ b/fused_moe/backends/trtllm/sm100_runner.py
+@@ -458,6 +458,7 @@
+                     prepare_da_body,
+                     kwargs.get("valid_hidden_size"),
+                     kwargs.get("valid_intermediate_size"),
++                    kwargs.get("silu_clamp_mode", 0),
+                 )
+             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
+                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
+--- a/fused_moe/core.py
++++ b/fused_moe/core.py
+@@ -3010,6 +3010,7 @@
+         routing_replay_out: Optional[torch.Tensor] = None,
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
++        silu_clamp_mode: int = 0,
+     ) -> List[torch.Tensor]:
+         # Determine routing mode: compute from logits or use pre-computed
+         if routing_logits is None:
+@@ -3099,6 +3100,12 @@
+             activation_type,
+             gemm1_alpha,
+             gemm1_beta,
++            gemm1_clamp_limit,
++        )
++        _check_silu_clamp_mode_int(
++            silu_clamp_mode,
++            fp8_quantization_type,
++            activation_type,
+             gemm1_clamp_limit,
+         )
+
+@@ -3173,6 +3180,7 @@
+             "routing_replay_out": routing_replay_out,
+             "valid_hidden_size": valid_hidden_size,
+             "valid_intermediate_size": valid_intermediate_size,
++            "silu_clamp_mode": silu_clamp_mode,
+         }
+         _, tactic = tuner.choose_one(
+             "flashinfer::trtllm_fp8_block_scale_moe",
+@@ -3229,6 +3237,7 @@
+                 False,
+                 valid_hidden_size,
+                 valid_intermediate_size,
++                silu_clamp_mode,
+             )
+             # Reconstruct the public result without exposing dtype-specific body workspaces.
+             return _unpack_trtllm_moe_output(
+@@ -3331,6 +3340,7 @@
+         routing_replay_out: Optional[torch.Tensor] = None,
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
++        silu_clamp_mode: int = 0,
+     ) -> List[torch.Tensor]:
+         # Acknowledge mutation-only and fallback-only controls without executing the native op.
+         _ = routing_replay_out, valid_intermediate_size
+@@ -4696,6 +4706,64 @@
+             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
+             "for ActivationType.Swiglu."
+         )
++
++
++def _normalize_silu_clamp_mode(
++    silu_clamp_mode: Optional[str],
++    fp8_quantization_type: Fp8QuantizationType,
++    activation_type: int,
++    gemm1_clamp_limit: Optional[torch.Tensor],
++) -> int:
++    """Validate the public ``silu_clamp_mode`` selector and map it to the kernel mode.
++
++    ``None`` (default) and ``"pre"`` select the legacy pre-SiLU clamp
++    (``min(gate, limit)`` before the SiLU). ``"post"`` selects the post-SiLU clamp
++    (``min(silu(gate), limit)``), which is only valid for DeepSeekFp8 + Swiglu with
++    ``gemm1_clamp_limit`` set.
++    """
++    if silu_clamp_mode is None or silu_clamp_mode == "pre":
++        return 0
++    if silu_clamp_mode != "post":
++        raise ValueError(
++            f"silu_clamp_mode must be None, 'pre', or 'post'; got {silu_clamp_mode!r}."
++        )
++    if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.DeepSeekFp8:
++        raise ValueError(
++            "silu_clamp_mode='post' is only supported for "
++            f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
++        )
++    if int(activation_type) != int(ActivationType.Swiglu):
++        raise ValueError(
++            "silu_clamp_mode='post' is only supported for activation_type=Swiglu, "
++            f"got activation_type={activation_type}."
++        )
++    if gemm1_clamp_limit is None:
++        raise ValueError("silu_clamp_mode='post' requires gemm1_clamp_limit to be set.")
++    return 1
++
++
++def _check_silu_clamp_mode_int(
++    silu_clamp_mode: int,
++    fp8_quantization_type: Fp8QuantizationType,
++    activation_type: int,
++    gemm1_clamp_limit: Optional[torch.Tensor],
++) -> None:
++    """Op-level validation for the integer silu_clamp_mode (direct op callers)."""
++    if silu_clamp_mode not in (0, 1):
++        raise ValueError(f"silu_clamp_mode must be 0 or 1, got {silu_clamp_mode}.")
++    if silu_clamp_mode == 1:
++        if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.DeepSeekFp8:
++            raise ValueError(
++                "silu_clamp_mode=1 (post-SiLU clamp) is only supported for "
++                f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
++            )
++        if int(activation_type) != int(ActivationType.Swiglu):
++            raise ValueError(
++                "silu_clamp_mode=1 (post-SiLU clamp) is only supported for "
++                f"activation_type=Swiglu, got activation_type={activation_type}."
++            )
++        if gemm1_clamp_limit is None:
++            raise ValueError("silu_clamp_mode=1 (post-SiLU clamp) requires gemm1_clamp_limit.")
+
+
+ @flashinfer_api(trace=trtllm_bf16_moe_trace)
+@@ -5723,6 +5791,7 @@
+     *,
+     gemm1_bias: Optional[torch.Tensor] = None,
+     gemm2_bias: Optional[torch.Tensor] = None,
++    silu_clamp_mode: Optional[str] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""FP8 block-scaled MoE operation.
+
+@@ -5898,6 +5967,9 @@
+         gemm1_beta,
+         gemm1_clamp_limit,
+     )
++    silu_clamp_mode_int = _normalize_silu_clamp_mode(
++        silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
++    )
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+         RoutingInputMode.FromLogits,
+         routing_logits,
+@@ -5938,6 +6010,7 @@
+         routing_replay_out,
+         valid_hidden_size,
+         valid_intermediate_size,
++        silu_clamp_mode_int,
+     )
+
+     if do_finalize:
+@@ -5982,6 +6055,7 @@
+     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+     valid_hidden_size: Optional[int] = None,
+     valid_intermediate_size: Optional[int] = None,
++    silu_clamp_mode: Optional[str] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""Pre-routed FP8 block-scaled MoE operation.
+
+@@ -6142,6 +6216,9 @@
+         gemm1_beta,
+         gemm1_clamp_limit,
+     )
++    silu_clamp_mode_int = _normalize_silu_clamp_mode(
++        silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
++    )
+     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+@@ -6184,6 +6261,7 @@
+         None,  # routing_replay_out is not exposed by this routed wrapper
+         valid_hidden_size,
+         valid_intermediate_size,
++        silu_clamp_mode_int,
+     )
+
+     if do_finalize and gemm1_lora_delta is None:

@@ -1,0 +1,243 @@
+--- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
++++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+@@ -284,6 +284,20 @@
+   for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
+     for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
+          tokenCtaIdx += gridDim.y * NumTokensPerCta) {
++      // The mapping and token range are CTA-uniform. Global routing slots
++      // assigned to other EP ranks have no input loads or output stores here.
++      // Avoid SiLU, CUB reduction and barriers for a wholly nonlocal group.
++      bool hasLocalToken = false;
++#pragma unroll
++      for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; ++tokenInCtaIdx) {
++        int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
++        if (tokenIdx < params.numTokens) {
++          hasLocalToken |= params.expandedIdxToPermutedIdx[tokenIdx * params.topK + k] != -1;
++        }
++      }
++      if (!hasLocalToken) {
++        continue;
++      }
+       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
+            hiddenIdx += blockDim.x * gridDim.x) {
+ #pragma unroll
+@@ -340,7 +354,9 @@
+           // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
+           // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
+           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+-          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
++          // Both operands of an absent route are initialized to +0 above.
++          // Preserve that exact result without computing SiLU in mixed groups.
++          float out = permutedIdx == -1 ? 0.0f : gatedSilu(params, permutedIdx, x1, x2);
+           outArr[tokenInCtaIdx] = out;
+           absOutArr[tokenInCtaIdx] = fabsf(out);
+         }
+@@ -393,6 +409,72 @@
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
++// Step5 BF16 FC1: one warp owns one routed token's 128-element scale block.
++// The route predicate is warp-uniform. No CTA-wide reduction or shared scale
++// exchange is needed, so absent routes leave before all activation arithmetic.
++template <typename KernelParams>
++__global__ void activationDeepSeekWarpKernel(KernelParams params) {
++  using TypeOut = typename KernelParams::TypeOut;
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  if constexpr (KernelParams::UsePdl) {
++    cudaTriggerProgrammaticLaunchCompletion();
++    cudaGridDependencySynchronize();
++  }
++#endif
++  constexpr int WarpSize = 32;
++  constexpr int TokensPerCta = 4;
++  constexpr float E4m3MaxVal = 448.f;
++  int const lane = threadIdx.x % WarpSize;
++  int const warp = threadIdx.x / WarpSize;
++  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
++  int const outputDim = params.innerDim / 2;
++  int const hiddenBase = blockIdx.x * 128;
++
++  for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
++    for (int tokenIdx = blockIdx.y * TokensPerCta + warp; tokenIdx < params.numTokens;
++         tokenIdx += gridDim.y * TokensPerCta) {
++      int const permutedIdx = params.expandedIdxToPermutedIdx[tokenIdx * params.topK + k];
++      if (permutedIdx == -1) {
++        continue;
++      }
++      float values[4];
++      float aMax = 0.0f;
++      int const laneBase = hiddenBase + lane * 4;
++      int64_t const inputIdx = (int64_t)permutedIdx * params.innerDim + laneBase;
++      uint2 const linearBits = *reinterpret_cast<uint2 const*>(params.inPtr + inputIdx);
++      uint2 const gluBits = *reinterpret_cast<uint2 const*>(params.inPtr + inputIdx + outputDim);
++      auto const* linearVals = reinterpret_cast<cutlass::bfloat16_t const*>(&linearBits);
++      auto const* gluVals = reinterpret_cast<cutlass::bfloat16_t const*>(&gluBits);
++#pragma unroll
++      for (int element = 0; element < 4; ++element) {
++        float const xLinear = static_cast<float>(linearVals[element]);
++        float const xGlu = static_cast<float>(gluVals[element]);
++        values[element] = gatedSilu(params, permutedIdx, xLinear, xGlu);
++        aMax = fmaxf(aMax, fabsf(values[element]));
++      }
++#pragma unroll
++      for (int delta = WarpSize / 2; delta > 0; delta /= 2) {
++        aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffff, aMax, delta));
++      }
++      float const scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
++      if (lane == 0) {
++        int64_t const scaleIdx =
++            (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * blockIdx.x;
++        params.outDqSfsPtr[scaleIdx] = scaleOut;
++      }
++      uint32_t packed;
++      auto* packedVals = reinterpret_cast<TypeOut*>(&packed);
++#pragma unroll
++      for (int element = 0; element < 4; ++element) {
++        packedVals[element] = static_cast<TypeOut>(values[element] / scaleOut);
++      }
++      int64_t const outputIdx = (int64_t)permutedIdx * outputDim + laneBase;
++      *reinterpret_cast<uint32_t*>(params.outPtr + outputIdx) = packed;
++    }
++  }
++}
++
++
+ void run(Data const& data, void* stream) {
+   if (data.mDtypeElt == tg::Dtype::E2m1) {
+     // Note: this should be unreachable because the options are checked beforehand.
+@@ -430,7 +512,17 @@
+
+     const dim3 grid(gridSizeX, gridSizeY, data.topK);
+
+-    if (data.mUseBf16Input) {
++    bool const useWarpActivation =
++        data.mUseBf16Input && data.inDqSfsPtr == nullptr && (data.innerDim == 3072 || data.innerDim == 768) &&
++        data.topK == 8 && numTokensPerCta == 4 && data.siluClampMode == 1 &&
++        data.gatedActClampLimitPtr != nullptr && data.gatedActAlphaPtr == nullptr &&
++        data.gatedActBetaPtr == nullptr && reinterpret_cast<uintptr_t>(data.inPtr) % 8 == 0 &&
++        reinterpret_cast<uintptr_t>(data.outPtr) % 4 == 0;
++    if (useWarpActivation) {
++      LAUNCH_ACTIVATION_TYPED(data, cutlass::bfloat16_t, cutlass::float_e4m3_t, 4,
++                             activationDeepSeekWarpKernel, grid,
++                             DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
++    } else if (data.mUseBf16Input) {
+       // Explicit BF16 FC1 mode: BF16 in (no dequant scales) -> E4M3 out, contract unchanged.
+       LAUNCH_ACTIVATION_TYPED(data, cutlass::bfloat16_t, cutlass::float_e4m3_t, numTokensPerCta,
+                               activationDeepSeekKernel, grid,
+@@ -678,7 +770,116 @@
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
++
++template <typename KernelParams>
++__global__ void permuteVectorKernel(KernelParams params) {
++  using Type = typename KernelParams::Type;
++  using Vec = uint32_t;
++  constexpr int kElements = sizeof(Vec) / sizeof(Type);
++  static_assert(sizeof(Vec) % sizeof(Type) == 0);
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  if constexpr (KernelParams::UsePdl) {
++    cudaTriggerProgrammaticLaunchCompletion();
++    cudaGridDependencySynchronize();
++  }
++#endif
++  int const vectorsPerRow = params.hiddenDim / kElements;
++  auto const* input = reinterpret_cast<Vec const*>(params.inPtr);
++  auto* output = reinterpret_cast<Vec*>(params.outPtr);
++  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
++    for (int vectorIdx = threadIdx.x + blockDim.x * blockIdx.x;
++         vectorIdx < vectorsPerRow; vectorIdx += blockDim.x * gridDim.x) {
++      Vec const value = input[int64_t(tokenIdx) * vectorsPerRow + vectorIdx];
++#pragma unroll
++      for (int k = 0; k < 8; ++k) {
++        int const permutedIdx = params.expandedIdxToPermutedIdx[tokenIdx * 8 + k];
++        if (permutedIdx >= 0) {
++          output[int64_t(permutedIdx) * vectorsPerRow + vectorIdx] = value;
++        }
++      }
++    }
++    for (int scaleIdx = threadIdx.x + blockDim.x * blockIdx.x;
++         scaleIdx < params.hiddenDim / 128; scaleIdx += blockDim.x * gridDim.x) {
++      float const scale = params.inDqSfsPtr[tokenIdx + int64_t(params.numTokens) * scaleIdx];
++      int const padded = params.totalNumPaddedTokens[0];
++#pragma unroll
++      for (int k = 0; k < 8; ++k) {
++        int const permutedIdx = params.expandedIdxToPermutedIdx[tokenIdx * 8 + k];
++        if (permutedIdx >= 0) {
++          params.outDqSfsPtr[permutedIdx + int64_t(padded) * scaleIdx] = scale;
++        }
++      }
++    }
++  }
++}
++
++template <typename KernelParams>
++__global__ void permuteVector16Kernel(KernelParams params) {
++  using Type = typename KernelParams::Type;
++  using Vec = uint4;
++  constexpr int kElements = sizeof(Vec) / sizeof(Type);
++  static_assert(sizeof(Vec) % sizeof(Type) == 0);
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  if constexpr (KernelParams::UsePdl) {
++    cudaTriggerProgrammaticLaunchCompletion();
++    cudaGridDependencySynchronize();
++  }
++#endif
++  int const vectorsPerRow = params.hiddenDim / kElements;
++  auto const* input = reinterpret_cast<Vec const*>(params.inPtr);
++  auto* output = reinterpret_cast<Vec*>(params.outPtr);
++  int const padded = params.totalNumPaddedTokens[0];
++  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
++    int permutedIdx[8];
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++      permutedIdx[k] = params.expandedIdxToPermutedIdx[tokenIdx * 8 + k];
++    }
++    for (int vectorIdx = threadIdx.x + blockDim.x * blockIdx.x; vectorIdx < vectorsPerRow;
++         vectorIdx += blockDim.x * gridDim.x) {
++      Vec const value = input[int64_t(tokenIdx) * vectorsPerRow + vectorIdx];
++#pragma unroll
++      for (int k = 0; k < 8; ++k) {
++        if (permutedIdx[k] >= 0) {
++          output[int64_t(permutedIdx[k]) * vectorsPerRow + vectorIdx] = value;
++        }
++      }
++    }
++    for (int scaleIdx = threadIdx.x + blockDim.x * blockIdx.x; scaleIdx < params.hiddenDim / 128;
++         scaleIdx += blockDim.x * gridDim.x) {
++      float const scale = params.inDqSfsPtr[tokenIdx + int64_t(params.numTokens) * scaleIdx];
++#pragma unroll
++      for (int k = 0; k < 8; ++k) {
++        if (permutedIdx[k] >= 0) {
++          params.outDqSfsPtr[permutedIdx[k] + int64_t(padded) * scaleIdx] = scale;
++        }
++      }
++    }
++  }
++}
++
+ void run(Data const& data, void* stream) {
++  if (data.mDtypeElt == tg::Dtype::E4m3 && data.mUseDeepSeekFp8 && data.hiddenDim == 4096 &&
++      data.topK == 8 && data.numTokens > 256 && data.inDqSfsPtr != nullptr &&
++      data.outDqSfsPtr != nullptr && reinterpret_cast<uintptr_t>(data.inPtr) % 16 == 0 &&
++      reinterpret_cast<uintptr_t>(data.outPtr) % 16 == 0) {
++    constexpr int kThreads = 256;
++    dim3 blocks((data.hiddenDim / 16 + kThreads - 1) / kThreads, std::min(65535, data.numTokens));
++    LAUNCH(data, permuteVector16Kernel, blocks, kThreads, 0, stream);
++    return;
++  }
++  if (data.mDtypeElt == tg::Dtype::E4m3 && data.mUseDeepSeekFp8 &&
++      data.hiddenDim == 4096 && data.topK == 8 &&
++      data.numTokens >= 128 && data.numTokens <= 256 &&
++      data.inDqSfsPtr != nullptr && data.outDqSfsPtr != nullptr &&
++      reinterpret_cast<uintptr_t>(data.inPtr) % 4 == 0 &&
++      reinterpret_cast<uintptr_t>(data.outPtr) % 4 == 0) {
++    constexpr int kThreads = 256;
++    dim3 blocks((data.hiddenDim / 4 + kThreads - 1) / kThreads, data.numTokens);
++    LAUNCH(data, permuteVectorKernel, blocks, kThreads, 0, stream);
++    return;
++  }
++
+   int const numThreads = 256;
+   int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
+   int const numBlocksY = std::min(8192, data.numTokens);

@@ -78,8 +78,14 @@ class Step3p7Config(PretrainedConfig):
             text_config = Step3p5Config()
         elif isinstance(text_config, dict):
             from sglang.srt.configs.step3p5 import Step3p5Config
+            from sglang.srt.configs.step5 import Step5Config
 
-            text_config = Step3p5Config(**text_config)
+            text_config_cls = (
+                Step5Config
+                if text_config.get("model_type") == "step5"
+                else Step3p5Config
+            )
+            text_config = text_config_cls(**text_config)
         self.text_config = text_config
 
         self.understand_projector_stride = understand_projector_stride

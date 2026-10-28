@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1320,6 +1319,8 @@ class Req(ReqDllmMixin):
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
+        self.full_kv_hit_length = 0
+        self.prefix_swa_truncated_tokens = 0
         self.already_computed = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)
@@ -2103,6 +2104,21 @@ class Req(ReqDllmMixin):
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
+    def record_prefix_swa_metrics(self, prefix_len: int, metrics_collector) -> None:
+        """Record the match snapshot when admitting the first prefill chunk."""
+        if self.retracted_stain or self._cache_breakdown_computed:
+            return
+        # A later prefetch can materialize more than the match saw.
+        # Conversely, load-back failure must not inflate SWA loss.
+        self.prefix_swa_truncated_tokens = min(
+            self.prefix_swa_truncated_tokens,
+            max(0, self.full_kv_hit_length - prefix_len),
+        )
+        if metrics_collector is not None:
+            metrics_collector.increment_prefix_swa_truncated_tokens(
+                self.prefix_swa_truncated_tokens
+            )
+
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
         if self.has_log_time_stats:
@@ -2118,6 +2134,8 @@ class Req(ReqDllmMixin):
             f"rid={self.rid}{bootstrap_info}, "
             f"input_len={len(self.origin_input_ids)}, "
             f"cached_input_len={self.cached_tokens}, "
+            f"full_kv_hit_len={self.full_kv_hit_length}, "
+            f"swa_truncated_tokens={self.prefix_swa_truncated_tokens}, "
             f"output_len={len(self.output_ids)}, "
             f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
@@ -2868,6 +2886,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         storage_hit_len=req.storage_hit_length,
                         storage_hit_start=req.storage_hit_start,
                         host_hit_is_storage=req.host_hit_is_storage,
+                    )
+                    req.record_prefix_swa_metrics(
+                        pre_len, self.tree_cache.metrics_collector
                     )
                     req._cache_breakdown_computed = True
 

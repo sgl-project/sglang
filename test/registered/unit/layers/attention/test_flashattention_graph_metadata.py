@@ -2,8 +2,14 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from transformers import PretrainedConfig
 
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.kernels.ops.attention.swa_window_align import align_swa_cache_seqlens
+from sglang.srt.configs.step5 import Step5Config, uses_step5_swa_window_align
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMetadata,
+)
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -69,6 +75,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         )
         backend.is_prefill_aware_swa = False
         backend.has_swa = False
+        backend.swa_fa4_window_align = False
         backend.use_sliding_window_kv_pool = False
         backend.page_size = 1
         backend._compute_scheduler_metadata = lambda *_: None
@@ -139,6 +146,106 @@ class TestDraftExtendInGraph(CustomTestCase):
         self._run(translating=True)
         with self.assertRaises(KeyError):
             self._run(translating=False)
+
+
+class TestSwaWindowAlignGraphBuffers(CustomTestCase):
+    """A captured decode graph bakes the addresses of the SWA window-align
+    tensors, and replay prep refills them in place. An eager decode batch wider
+    than the captured max used to replace those tensors, so every later replay
+    read a stale window offset: sliding-window attention silently went wrong."""
+
+    WINDOW = 127
+    MAX_BS = 4
+
+    def _backend(self):
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.sliding_window_size = self.WINDOW
+        b.topk = 0
+        b.max_context_len = 16384
+        b.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((4 * self.MAX_BS, 16384), dtype=torch.int32)
+        )
+        b.kv_index_translator = KVIndexTranslator(
+            req_to_token=b.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device="cpu",
+        )
+        b.is_prefill_aware_swa = False
+        b.use_sliding_window_kv_pool = False
+        b.swa_fa4_window_align = True
+        b.page_size = 1
+        b._compute_scheduler_metadata = lambda *_: None
+        b._maybe_init_local_attn_metadata = lambda *_: None
+        # As init_cuda_graph_state allocates them for MAX_BS.
+        b._swa_align_seqlens = torch.zeros(self.MAX_BS, dtype=torch.int32)
+        b._swa_align_leftpad = torch.zeros(self.MAX_BS, dtype=torch.int32)
+        return b
+
+    def _expected(self, seqlens):
+        return align_swa_cache_seqlens(seqlens, window_left=self.WINDOW, query_len=1)
+
+    def test_replay_after_wider_eager_decode_reads_fresh_align(self):
+        b = self._backend()
+        graph_md = FlashAttentionMetadata()
+        graph_md.cache_seqlens_int32 = torch.ones(self.MAX_BS, dtype=torch.int32)
+        b._fill_swa_window_align(graph_md)
+        captured = (graph_md.swa_aligned_seqlens, graph_md.swa_cache_leftpad)
+
+        eager_bs = 3 * self.MAX_BS
+        seq_lens = torch.arange(1, eager_bs + 1, dtype=torch.int64) * 500
+        b.init_forward_metadata(
+            SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                seq_lens=seq_lens,
+                batch_size=eager_bs,
+                seq_lens_cpu=seq_lens,
+                spec_info=None,
+                req_pool_indices=torch.arange(eager_bs, dtype=torch.int64),
+                encoder_lens=None,
+            )
+        )
+        eager_md = b.forward_metadata
+        for got, want in zip(
+            (eager_md.swa_aligned_seqlens, eager_md.swa_cache_leftpad),
+            self._expected(seq_lens.to(torch.int32)),
+        ):
+            self.assertTrue(torch.equal(got, want))
+
+        replay_seqlens = torch.tensor([100, 300, 1000, 5000], dtype=torch.int32)
+        graph_md.cache_seqlens_int32.copy_(replay_seqlens)
+        b._fill_swa_window_align(graph_md)
+        for got, want in zip(captured, self._expected(replay_seqlens)):
+            self.assertTrue(torch.equal(got, want), f"{got.tolist()=}")
+
+    def test_graph_batch_wider_than_capture_raises(self):
+        b = self._backend()
+        graph_md = FlashAttentionMetadata()
+        graph_md.cache_seqlens_int32 = torch.ones(self.MAX_BS + 1, dtype=torch.int32)
+        with self.assertRaisesRegex(AssertionError, "used 5 > capacity 4"):
+            b._fill_swa_window_align(graph_md)
+
+
+class TestSwaWindowAlignScope(CustomTestCase):
+    """FA4 leftpad window alignment is Step5's decode layout. Other SWA models must
+    keep the stock KV split: FA4's dedicated head_dim-256 kernel rejects leftpad."""
+
+    def test_only_step5_aligns_its_swa_decode(self):
+        other = PretrainedConfig(sliding_window=127, head_dim=256)
+        self.assertTrue(uses_step5_swa_window_align(Step5Config()))
+        self.assertFalse(uses_step5_swa_window_align(other))
+
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.fa_impl_ver = 4
+        b.forward_metadata = None
+        b.swa_fa4_window_align = uses_step5_swa_window_align(other)
+        seqlens = torch.tensor([1000, 64], dtype=torch.int32)
+        aligned, leftpad = b._swa_window_aligned_kvcache(
+            True, seqlens, window_left=127, max_seqlen_q=1, extra_kwargs={}
+        )
+        self.assertIsNone(leftpad)
+        self.assertIs(aligned, seqlens)
 
 
 if __name__ == "__main__":

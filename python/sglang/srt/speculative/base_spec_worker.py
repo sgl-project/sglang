@@ -191,6 +191,10 @@ class BaseSpecWorker(ABC):
         return pool
 
     @property
+    def draft_kv_pools(self) -> tuple[object, ...]:
+        return tuple(runner.token_to_kv_pool for runner in self._draft_model_runners())
+
+    @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
 

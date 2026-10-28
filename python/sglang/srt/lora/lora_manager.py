@@ -44,6 +44,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    lora_adapts_routed_experts,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -140,6 +141,9 @@ class LoRAManager:
             raise ValueError(
                 f"LoRA backend {lora_backend!r} does not support DP attention"
             )
+
+        # Decided by init_lora_shapes; None while the startup adapters load.
+        self.adapts_routed_experts: Optional[bool] = None
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -725,6 +729,10 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        for lora_id, lora_adapter in self.loras.items():
+            self._reject_unserved_routed_expert_weights(
+                lora_name=self.lora_refs[lora_id].lora_name, lora_adapter=lora_adapter
+            )
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
@@ -804,6 +812,19 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
+        # Full names, before normalization folds them to leaf module names.
+        requested_targets = [
+            *(target_modules or ()),
+            *(
+                target
+                for config in self.configs.values()
+                for target in (
+                    [config.target_modules]
+                    if isinstance(config.target_modules, str)
+                    else config.target_modules or ()
+                )
+            ),
+        ]
         if target_modules and target_modules == {"all"}:
             self.target_modules = auto_detect_lora_target_modules(self.base_model)
             self.target_modules.update(EMBEDDING_NAMES)
@@ -878,6 +899,10 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        self.adapts_routed_experts = lora_adapts_routed_experts(
+            self.base_model, requested_targets
+        )
+
         unsupported_targets = self.target_modules - _KNOWN_LORA_TARGET_MODULES
         if unsupported_targets:
             raise ValueError(
@@ -938,6 +963,9 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
+        self._reject_unserved_routed_expert_weights(
+            lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+        )
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -946,6 +974,20 @@ class LoRAManager:
         )
 
         self.loras[lora_ref.lora_id] = lora_adapter
+
+    def _reject_unserved_routed_expert_weights(
+        self, *, lora_name: str, lora_adapter: LoRAAdapter
+    ) -> None:
+        # Without routed-expert buffers, these weights would load nowhere and never apply.
+        if self.adapts_routed_experts is not False:
+            return
+        names = lora_adapter.routed_expert_weight_names()
+        if names:
+            raise ValueError(
+                f"LoRA adapter {lora_name!r} has {len(names)} routed-expert weights "
+                f"(e.g. {names[0]}), but the routed experts take no LoRA in this "
+                "server; restart with a routed-expert target in --lora-target-modules."
+            )
 
     def load_lora_weights_from_tensors(
         self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
@@ -972,6 +1014,9 @@ class LoRAManager:
             keep_weights_on_device=self.lora_no_cpu_backup,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+        self._reject_unserved_routed_expert_weights(
+            lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+        )
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -1169,6 +1214,7 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            adapts_routed_experts=self.adapts_routed_experts,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
             lora_no_cpu_backup=self.lora_no_cpu_backup,
@@ -1315,7 +1361,10 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
+            if (
+                isinstance(module, (FusedMoE, InklingBatchDenseMLP))
+                and self.adapts_routed_experts
+            ):
                 expert_projections = ("gate_up_proj", "down_proj")
                 missing = [
                     x for x in expert_projections if x not in self.target_modules

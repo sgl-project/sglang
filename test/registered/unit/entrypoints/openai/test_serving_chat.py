@@ -123,6 +123,7 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.mm_processor = None
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -223,6 +224,7 @@ class TestChatTemplateCache(CustomTestCase):
             "template_kwargs": {"enable_thinking": False},
             "encode_kwargs": {"add_special_tokens": False},
             "use_cache": True,
+            "decode_prompt": True,
         }
         kwargs.update(overrides)
         return self.chat._render_and_encode_chat_template(**kwargs)
@@ -924,6 +926,110 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.cache_salt, "tenant-a")
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
+
+    def test_vlm_engine_prompt_keeps_chat_ids_for_accepting_processor(self):
+        """A processor that accepts chat prompt_ids gets them unchanged, with or
+        without media; resending the decoded text would add a second BOS."""
+
+        def engine_prompt(prompt, prompt_ids, image_data=None):
+            processed = MessageProcessingResult(
+                prompt=prompt,
+                prompt_ids=prompt_ids,
+                image_data=image_data,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+            return self.chat._engine_prompt(processed, is_multimodal=True)
+
+        self.tm.mm_processor = Mock(accepts_chat_prompt_ids=True)
+        self.assertEqual(engine_prompt("", [1, 2]), ("input_ids", [1, 2]))
+        self.assertEqual(
+            engine_prompt("", [1, 9, 2], image_data=["image"]),
+            ("input_ids", [1, 9, 2]),
+        )
+        self.assertEqual(engine_prompt("<s>Hi", []), ("text", "<s>Hi"))
+
+        self.tm.mm_processor = Mock(accepts_chat_prompt_ids=False)
+        self.assertEqual(
+            engine_prompt("<s><im>Hi", [1, 9, 2], image_data=["image"]),
+            ("text", "<s><im>Hi"),
+        )
+
+    def test_prompt_ids_request_keeps_media_for_accepting_processor(self):
+        """A request that already carries input_ids still delivers its images, in
+        order, to a processor that expands the placeholders in those ids."""
+        self.template_manager.jinja_template_content_format = "openai"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "image-a", "detail": "low"},
+                        },
+                        {"type": "text", "text": "hi"},
+                        {"type": "image_url", "image_url": {"url": "image-b"}},
+                    ],
+                }
+            ],
+            input_ids=[1, 9, 2, 9],
+        )
+
+        self.tm.mm_processor = Mock(
+            accepts_chat_prompt_ids=True, mm_tokens=Mock(image_token_id=9)
+        )
+        result = self.chat._process_messages(request, is_multimodal=True)
+        self.assertEqual(result.prompt_ids, [1, 9, 2, 9])
+        self.assertEqual(
+            [(item.url, item.detail) for item in result.image_data],
+            [("image-a", "low"), ("image-b", "auto")],
+        )
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
+
+        self.tm.mm_processor = Mock(accepts_chat_prompt_ids=False)
+        result = self.chat._process_messages(request, is_multimodal=True)
+        self.assertIsNone(result.image_data)
+
+    def test_prompt_ids_text_only_placeholder_literal_is_text(self):
+        """A text-only request whose text contains the image placeholder literal is
+        served as text, matching the engine-tokenized path."""
+        self.template_manager.jinja_template_content_format = "openai"
+        self.tm.mm_processor = Mock(
+            accepts_chat_prompt_ids=True, mm_tokens=Mock(image_token_id=9)
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            input_ids=[1, 9, 2],
+        )
+        result = self.chat._process_messages(request, is_multimodal=True)
+        self.assertEqual(result.prompt_ids, [1, 9, 2])
+        self.assertIsNone(result.image_data)
+
+    def test_prompt_ids_placeholder_count_mismatch_with_images_is_rejected(self):
+        self.template_manager.jinja_template_content_format = "openai"
+        self.tm.mm_processor = Mock(
+            accepts_chat_prompt_ids=True, mm_tokens=Mock(image_token_id=9)
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-a"}},
+                        {"type": "text", "text": "hi"},
+                    ],
+                }
+            ],
+            input_ids=[1, 9, 2, 9],
+        )
+        with self.assertRaisesRegex(ValueError, "2 image placeholder"):
+            self.chat._process_messages(request, is_multimodal=True)
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"

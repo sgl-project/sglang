@@ -1992,6 +1992,18 @@ def max_speculative_num_draft_tokens() -> int | None:
     )
 
 
+def max_decode_batch_tokens() -> int:
+    """The largest token count one decode or verify batch can carry: the
+    running-request bound times the widest draft speculative decoding may use,
+    so per-batch workspaces sized from it also cover adaptive widening."""
+    requests = (
+        get_schedule().max_running_requests
+        or get_exec().graph.cuda_graph_config.decode.max_bs
+        or 1
+    )
+    return requests * (max_speculative_num_draft_tokens() or 1)
+
+
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
     from sglang.srt.arg_groups.overrides import use_mla_backend

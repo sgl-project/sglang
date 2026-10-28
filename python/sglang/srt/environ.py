@@ -686,6 +686,9 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # Opt in to loading-time FP8 quantization of checkpoint BF16 MoE experts.
+    # Step5-Preview keeps its last three routed-expert layers in BF16.
+    SGLANG_STEP5_QUANTIZE_BF16_MOE = EnvBool(False)
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
@@ -1328,7 +1331,7 @@ class Envs:
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(16384)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)

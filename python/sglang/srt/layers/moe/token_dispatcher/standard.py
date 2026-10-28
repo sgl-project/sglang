@@ -92,10 +92,12 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, runner_backend=None):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = get_moe_runner_backend()
+        backend = (
+            runner_backend if runner_backend is not None else get_moe_runner_backend()
+        )
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
@@ -127,6 +129,7 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
+        self._local_expert_lookup = None
         self.expert_mask_gpu = None
 
     def dispatch(
@@ -188,9 +191,16 @@ class StandardDispatcher(BaseDispatcher):
         ):
             if self.local_expert_mapping is None:
                 device = get_device()
-                self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device=device
+                # The final entry preserves the upstream -1 drop sentinel in
+                # the same gather as real IDs. Keep the public expert map's E
+                # shape for AITER masks and quantization consumers. Both views
+                # are rebuilt together when the public mapping is invalidated.
+                self._local_expert_lookup = torch.full(
+                    (self.num_experts + 1,), -1, dtype=torch.int32, device=device
                 )
+                self.local_expert_mapping = self._local_expert_lookup[
+                    : self.num_experts
+                ]
                 self.local_expert_mapping[
                     self.moe_ep_rank * self.num_local_routed_experts : (
                         self.moe_ep_rank + 1
@@ -223,15 +233,15 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    topk_ids_local = self._local_expert_lookup[topk_output.topk_ids]
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
                     # wasted compute (and a masked-grouped-GEMM workspace
                     # blow-up when they collide on the same top-k).  Must
-                    # run POST-translation (a pre-translation -1 aliases to
-                    # the mapping table's last entry); -1 is the drop
-                    # sentinel both the triton and deep_gemm runners honor.
+                    # retain this length-based mask for rows whose router has
+                    # not emitted -1. Existing -1 IDs already remain dropped
+                    # through the lookup; triton and deep_gemm honor them.
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)

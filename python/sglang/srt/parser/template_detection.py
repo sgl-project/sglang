@@ -482,6 +482,14 @@ def _is_step3p5(ctx):
     )
 
 
+def _is_step5(ctx):
+    return (
+        _is_step3p5(ctx)
+        and ctx.has_text("preserve_thinking")
+        and ctx.has_pattern(r"\{%-?\s*generation\s*-?%\}")
+    )
+
+
 def _is_step3(ctx):
     return ctx.has_text("<steptml:invoke") or (
         ctx.has_text("<｜tool_calls_begin｜>") and ctx.has_text("<｜tool_sep｜>")
@@ -556,6 +564,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
+    DetectionRule(name="step5", value="step5", predicate=_is_step5),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
@@ -602,6 +611,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
+    DetectionRule(name="step5", value="step5", predicate=_is_step5),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),

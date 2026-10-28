@@ -1116,10 +1116,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 kv_loc_plan=kv_loc_plan,
             )
+
+            can_run_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
+            )
+            if not forward_batch.forward_mode.is_idle() and not can_run_graph:
+                self.draft_runner.attn_backend.init_forward_metadata(forward_batch)
+                # DSA pre-pad plans must survive DP padding. NPU instead
+                # rebuilds the padded block table in forward_extend.
+                if not _is_npu:
+                    forward_batch.mark_forward_metadata_ready()
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(

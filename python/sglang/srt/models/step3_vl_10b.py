@@ -164,14 +164,17 @@ class PerceptionEncoderMLP(nn.Module):
         act_layer: Callable[[], nn.Module],
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        replicated = dict(parallel_group="replicated") if use_data_parallel else {}
         self.fc1 = ColumnParallelLinear(
             input_dim,
             hidden_dim,
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
+            **replicated,
         )
         self.activation = act_layer
         self.fc2 = RowParallelLinear(
@@ -180,6 +183,7 @@ class PerceptionEncoderMLP(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
+            **replicated,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -203,6 +207,7 @@ class PerceptionEncoderVisionBlock(nn.Module):
         use_cls_token: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.head_dim = d_model // n_head
@@ -222,6 +227,7 @@ class PerceptionEncoderVisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             customized_position_embedding_applier=self.rope,
+            use_data_parallel=use_data_parallel,
         )
         self.ls_1 = (
             PerceptionEncoderLayerScale(d_model, ls_init_value)
@@ -242,6 +248,7 @@ class PerceptionEncoderVisionBlock(nn.Module):
             act_layer,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(self, x: torch.Tensor, grid_hw: tuple[int, int]):
@@ -265,6 +272,7 @@ class PerceptionEncoderVisionTransformer(nn.Module):
         use_cls_token: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.width = width
@@ -283,6 +291,7 @@ class PerceptionEncoderVisionTransformer(nn.Module):
                     use_cls_token=use_cls_token,
                     quant_config=quant_config,
                     prefix=f"{prefix}.resblocks.{i}",
+                    use_data_parallel=use_data_parallel,
                 )
                 for i in range(layers)
             ]
@@ -302,6 +311,7 @@ class PerceptionEncoder(nn.Module):
         norm_layer: Callable = _DEFAULT_NORM_LAYER,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.patch_size = config.patch_size
@@ -342,6 +352,7 @@ class PerceptionEncoder(nn.Module):
             use_cls_token=self.use_cls_token,
             quant_config=quant_config,
             prefix=f"{prefix}.transformer",
+            use_data_parallel=use_data_parallel,
         )
 
         self.vit_downsampler1 = nn.Conv2d(

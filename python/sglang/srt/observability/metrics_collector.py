@@ -163,6 +163,7 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_host_pool_tokens: Dict[str, tuple[int, int]] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -757,6 +758,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
+            self.hicache_host_pool_used_tokens = Gauge(
+                name="sglang:hicache_host_pool_used_tokens",
+                documentation="Used logical host cache slots by pool.",
+                labelnames=list(labels.keys()) + ["pool"],
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_total_tokens = Gauge(
+                name="sglang:hicache_host_pool_total_tokens",
+                documentation="Host cache capacity in logical slots by pool.",
+                labelnames=list(labels.keys()) + ["pool"],
                 multiprocess_mode="mostrecent",
             )
 
@@ -1699,6 +1713,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
 
+            for pool, (used, total) in stats.hicache_host_pool_tokens.items():
+                self.hicache_host_pool_used_tokens.labels(**self.labels, pool=pool).set(
+                    used
+                )
+                self.hicache_host_pool_total_tokens.labels(
+                    **self.labels, pool=pool
+                ).set(total)
+
         # Streaming session metrics
         if self.enable_streaming_session:
             self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
@@ -2545,6 +2567,30 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "eager write-through did not complete before eviction.",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
+
+        self.host_evicted_tokens = Counter(
+            name="sglang:hicache_host_evicted_tokens_total",
+            documentation="Logical host cache slots evicted by pool and requesting pool "
+            "(trigger). Read one TP rank; counts are replicated across ranks.",
+            labelnames=list(labels.keys()) + ["pool", "trigger"],
+        )
+        self.prefix_swa_truncated_tokens = Counter(
+            name="sglang:prefix_swa_truncated_tokens_total",
+            documentation="Full KV prefix tokens unavailable at the SWA-constrained "
+            "match, counted once at first prefill. Excludes intentional ring "
+            "re-prefill and mixed Mamba caches. Read one TP rank.",
+            labelnames=labels.keys(),
+        )
+
+    def increment_host_evicted_tokens(
+        self, num_tokens: int, pool: str, trigger: str
+    ) -> None:
+        self.host_evicted_tokens.labels(**self.labels, pool=pool, trigger=trigger).inc(
+            num_tokens
+        )
+
+    def increment_prefix_swa_truncated_tokens(self, num_tokens: int) -> None:
+        self.prefix_swa_truncated_tokens.labels(**self.labels).inc(num_tokens)
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)

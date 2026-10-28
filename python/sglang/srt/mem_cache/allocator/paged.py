@@ -288,14 +288,27 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
+        num_new_pages = None
+        # One token per request needs at most one new page per request.
+        if bs > len(self.free_pages):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                decode=True,
+            )
+            available_pages = len(self.free_pages) + self.num_staged_pages
+            if num_new_pages > available_pages:
+                return None
+
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
+        if num_new_pages is None:
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                decode=True,
+            )
         if num_new_pages > len(self.free_pages):
             return None
 

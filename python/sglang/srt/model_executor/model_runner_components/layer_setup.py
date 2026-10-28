@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 import msgspec
 from torch import nn
 
+from sglang.srt.configs.step5 import Step5LayerSelection, get_step5_text_config
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
@@ -135,6 +137,7 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     full_attention_layer_ids: Optional[list[int]] = None
     # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
     is_hybrid_swa_mtp_draft: bool = False
+    step5_layer_selection: Step5LayerSelection | None = None
 
 
 def resolve_layer_indices(
@@ -144,6 +147,12 @@ def resolve_layer_indices(
     is_draft_worker: bool,
     draft_model_idx: Optional[int] = None,
 ) -> ModelLayerInfo:
+    if get_step5_text_config(model_config.hf_config) is not None:
+        return _resolve_step5_model_layer_indices(
+            model=model,
+            model_config=model_config,
+            is_draft_worker=is_draft_worker,
+        )
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
     # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
     # determine the number of layers.
@@ -234,4 +243,67 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
     return _PPLayerRange(
         start_layer=getattr(model, "start_layer", 0),
         end_layer=getattr(model, "end_layer", model_num_layers),
+    )
+
+
+def _resolve_step5_model_layer_indices(
+    *, model: Any, model_config: ModelConfig, is_draft_worker: bool
+) -> ModelLayerInfo:
+    # Step5 models must publish this typed value in their constructor. There is
+    # deliberately no fallback that guesses a range from a model's dimensions.
+    selection = model.layer_selection
+    if not isinstance(selection, Step5LayerSelection):
+        raise TypeError("Step5 model must own a typed layer_selection.")
+    draft = model_config.hf_config.architectures[0] == "Step5MTP"
+    if (
+        is_draft_worker != draft
+        or model_config.is_draft_model != draft
+        or (selection.draft_model_idx is not None) != draft
+    ):
+        raise ValueError("Step5 selection and model/runner draft roles disagree.")
+    if not model_config.is_hybrid_swa:
+        raise ValueError("Step5 requires native hybrid SWA memory.")
+    full = tuple(model_config.full_attention_layer_ids)
+    swa = tuple(model_config.swa_attention_layer_ids)
+    if draft:
+        depth = selection.draft_model_idx
+        matches = (
+            type(depth) is int
+            and 0 <= depth < len(swa)
+            and len(swa) == model_config.num_nextn_predict_layers
+            and swa
+            == tuple(
+                range(
+                    model_config.num_hidden_layers,
+                    model_config.num_hidden_layers + len(swa),
+                )
+            )
+            and not full
+            and selection.full_attention_layer_ids == ()
+            and selection.swa_attention_layer_ids == (swa[depth],)
+            and (selection.start_layer, selection.end_layer)
+            == (swa[depth], swa[depth] + 1)
+        )
+    else:
+        matches = (
+            selection.full_attention_layer_ids == full
+            and selection.swa_attention_layer_ids == swa
+            and sorted(full + swa) == list(range(model_config.num_hidden_layers))
+            and (selection.start_layer, selection.end_layer)
+            == (0, model_config.num_hidden_layers)
+        )
+    if not matches:
+        raise ValueError("Step5 model selection does not match the resolved partition.")
+    if (model.start_layer, model.end_layer) != (
+        selection.start_layer,
+        selection.end_layer,
+    ):
+        raise ValueError("Loaded Step5 model does not own the selected layer range.")
+    return ModelLayerInfo(
+        start_layer=selection.start_layer,
+        end_layer=selection.end_layer,
+        num_effective_layers=selection.end_layer - selection.start_layer,
+        step5_layer_selection=selection,
+        swa_attention_layer_ids=list(selection.swa_attention_layer_ids),
+        full_attention_layer_ids=list(selection.full_attention_layer_ids),
     )

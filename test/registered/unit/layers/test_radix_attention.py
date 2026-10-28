@@ -89,6 +89,44 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             raw_num_tokens=None,
         )
 
+    def test_backend_can_own_padded_extend_rows(self):
+        layer = self._new_layer()
+        query = torch.zeros((4, 2, 3))
+        batch = self._new_impl_context([layer]).forward_batch
+        batch.forward_mode = ForwardMode.EXTEND
+        backend = _RecordingAttentionBackend(return_lse=False)
+        backend.handles_padded_extend = True
+        with (
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=None,
+            ),
+        ):
+            layer(query, query, query, batch)
+        self.assertEqual(backend.calls[0].query.shape[0], 4)
+        self.assertEqual(backend.calls[0].out_cache_loc.shape[0], 4)
+
+    def test_padded_eager_attention_narrows_head_gate(self):
+        layer = self._new_layer()
+        query = torch.zeros((4, 2, 3))
+        gate = torch.arange(8).reshape(4, 2)
+        batch = self._new_impl_context([layer]).forward_batch
+        backend = _RecordingAttentionBackend(return_lse=False)
+        with patch.object(
+            radix_attention_module, "get_attn_backend", return_value=backend
+        ):
+            output = radix_attention_module._attention_on_real_rows(
+                layer, 2, query, query, query, batch, True, head_gate=gate
+            )
+        torch.testing.assert_close(backend.calls[0].kwargs["head_gate"], gate[:2])
+        self.assertEqual(backend.calls[0].query.shape[0], 2)
+        torch.testing.assert_close(output[2:], torch.zeros_like(output[2:]))
+        self.assertEqual(batch.out_cache_loc.shape[0], 4)
+
     def test_forward_dispatches_all_graph_and_lse_variants(self):
         layer = self._new_layer()
         query = torch.zeros((4, 2, 3))

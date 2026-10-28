@@ -105,7 +105,13 @@ pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output,
             // Inputs PIL accepts but decode_rgb refuses (e.g. 16-bit PNG)
             // error here and reject the request.
             let (rgb, height, width) = common::decode_rgb(bytes)?;
-            let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
+            let jpeg = common::is_jpeg(bytes);
+            let item = family.process_item(&DecodedMedia::Image {
+                rgb,
+                height,
+                width,
+                jpeg,
+            })?;
             Ok((item, hash))
         })?;
 

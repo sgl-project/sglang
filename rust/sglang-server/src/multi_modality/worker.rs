@@ -8,7 +8,9 @@ use sglang_mm::driver::{self, Output};
 use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
 use sglang_mm::registry::build_pipeline;
 
-use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
+use super::encoded::{
+    MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality, MmTokenIds,
+};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
 use crate::message::request::{MmData, Request, RequestKind};
@@ -112,6 +114,7 @@ fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
         .zip(offsets)
         .map(|(item, span)| {
             Ok(MmEncodedItem {
+                aux: Vec::new(),
                 modality: MmModality::Image,
                 feature: item.feature,
                 hash: item.hash,
@@ -151,6 +154,55 @@ fn aux_meta(name: &str, tensor: Tensor) -> Result<MmMetaValue, String> {
     }
 }
 
+struct Step3VlMmProcessor {
+    family: sglang_mm::step3_vl::Step3VlProcessor,
+}
+
+impl MmProcessor for Step3VlMmProcessor {
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+        let input = super::payload::to_mm_input(input_ids, mm)?;
+        let output = driver::process(&self.family, input)?;
+        let image_token_id = self.family.spec().image_token_id;
+        let input_ids = output.input_ids;
+        let mut items = Vec::with_capacity(output.items.len());
+        for (item, &span) in output.items.into_iter().zip(&output.offsets) {
+            let mut model_specific_data = std::collections::BTreeMap::new();
+            let mut aux = Vec::new();
+            for (name, tensor) in item.aux {
+                match (name.as_str(), &tensor.data) {
+                    ("num_patches", sglang_mm::pipeline::TensorData::I64(v)) => {
+                        model_specific_data.insert(
+                            name.clone(),
+                            MmMetaValue::Int(v.first().copied().unwrap_or(0)),
+                        );
+                    }
+                    ("patch_newline_mask", _) => {}
+                    _ => aux.push((name, tensor)),
+                }
+            }
+            items.push(MmEncodedItem {
+                modality: MmModality::Image,
+                feature: item.feature,
+                hash: item.hash,
+                offsets: sglang_mm::step3_vl::image_token_runs(&input_ids, span, image_token_id),
+                model_specific_data,
+                aux,
+            });
+        }
+        Ok(MmProcessOutput {
+            input_ids,
+            result: MmEncodedEntry {
+                items,
+                mrope: None,
+                token_ids: Some(MmTokenIds {
+                    im_token_id: Some(image_token_id),
+                    ..Default::default()
+                }),
+            },
+        })
+    }
+}
+
 /// Shared state of the multimodal path, built once at worker startup.
 pub struct MmContext {
     pub processor: Arc<dyn MmProcessor>,
@@ -163,8 +215,19 @@ pub struct MmContext {
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
         let feature_shm = spec.feature_shm;
+        let processor: Arc<dyn MmProcessor> = match spec.pipeline {
+            sglang_mm::registry::PipelineSpec::Step3Vl(step3) => {
+                if feature_shm {
+                    return Err("step3_vl: feature shm is not supported".into());
+                }
+                Arc::new(Step3VlMmProcessor {
+                    family: sglang_mm::step3_vl::Step3VlProcessor::new(step3)?,
+                })
+            }
+            _ => Arc::new(QwenMmProcessor::new(spec)?),
+        };
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
+            processor,
             feature_shm,
         })
     }
@@ -235,10 +298,25 @@ fn place_features(
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
     let meta = MmMeta::of(&entry).encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
-    let features = items.into_iter().map(|item| item.feature).collect();
+    let mut auxiliary = Vec::new();
+    let features = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            for (name, tensor) in item.aux {
+                auxiliary.push(Buffer::inline_shaped(
+                    format!("mm.aux.{i}.{name}"),
+                    tensor.shape,
+                    tensor_data(tensor.data),
+                )?);
+            }
+            Ok(item.feature)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut buffers = place_features(features, feature_shm, |_| {
         crate::utils::shm::unique_name("mm")
     });
+    buffers.extend(auxiliary);
     if let Some(mrope) = mrope {
         let len = mrope.positions.len() / 3;
         buffers.push(Buffer::inline_shaped(
@@ -366,6 +444,7 @@ mod tests {
                 input_ids,
                 result: MmEncodedEntry {
                     items: vec![MmEncodedItem {
+                        aux: Vec::new(),
                         modality: MmModality::Image,
                         feature: Tensor {
                             shape: self.shape.clone(),
@@ -478,6 +557,7 @@ mod tests {
     /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
     fn qwen_entry() -> MmEncodedEntry {
         let item = |rows: usize, feature: Vec<f32>, grid: [i64; 3], hash, span| MmEncodedItem {
+            aux: Vec::new(),
             modality: MmModality::Image,
             feature: Tensor {
                 shape: vec![rows, 2],
@@ -847,6 +927,82 @@ mod tests {
             "{:?}",
             req.state
         );
+    }
+
+    const SOLID_800X100_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAyAAAABkCAIAAADxM8PYAAABkUlEQVR42u3WMQEAAAQAQQQRTGKxlDDeRfjpc3sCAIA/JQEAgMECADBYAAAGCwAAgwUAYLAAAAwWAAAGCwDAYAEAGCwAAAwWAIDBAgAwWAAABgsAAIMFAGCwAAAMFgAABgsAwGABABgsAAAMFgCAwQIAMFgAABgsAACDBQBgsAAADBYAAAYLAMBgAQAYLAAADBYAgMECADBYAAAYLAAAgwUAYLAAADBYAAAGCwDAYAEAGCwAAAwWAIDBAgAwWAAAGCwAAIMFAGCwAAAwWAAABgsAwGABAGCwAAAMFgCAwQIAMFgAABgsAACDBQBgsAAAMFgAAAYLAMBgAQBgsAAADBYAgMECADBYAAAYLAAAgwUAYLAAADBYAAAGCwDAYAEAYLAAAAwWAIDBAgDAYAEAGCwAAIMFAGCwAAAwWAAABgsAwGABAGCwAAAMFgCAwQIAwGABABgsAACDBQCAwQIAMFgAAAYLAMBgAQBgsAAADBYAgMECAMBgAQAYLAAAgwUAgMECADBYAAAGCwAAgwUA8O0AvDwCCMkzCdIAAAAASUVORK5CYII=";
+
+    fn step3_spec() -> MmSpec {
+        MmSpec {
+            feature_shm: false,
+            pipeline: sglang_mm::registry::PipelineSpec::Step3Vl(
+                sglang_mm::step3_vl::Step3VlSpec {
+                    image_token_id: 900,
+                    image_start_id: 901,
+                    image_end_id: 902,
+                    patch_start_id: 903,
+                    patch_end_id: 904,
+                    patch_newline_id: 905,
+                    image_size: 728,
+                    patch_size: 504,
+                    image_feature_tokens: 169,
+                    patch_feature_tokens: 81,
+                    image_mean: [0.5; 3],
+                    image_std: [0.5; 3],
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn step3_vl_processor_emits_named_buffers() {
+        let ctx = MmContext::new(step3_spec()).unwrap();
+        let work = MmData {
+            image_data: vec![crate::message::multimodal::MmItem::Source(format!(
+                "data:image/png;base64,{SOLID_800X100_PNG}"
+            ))],
+            ..Default::default()
+        };
+        let output = ctx.processor.process(vec![1, 900, 2], work).unwrap();
+        let ids = output.input_ids;
+        assert_eq!(ids.len(), 2 + 8 * 83 + 171);
+        let entry = output.result;
+        entry.validate(ids.len()).unwrap();
+        assert_eq!(entry.token_ids.as_ref().unwrap().im_token_id, Some(900));
+        let [item] = entry.items.as_slice() else {
+            panic!("one item per image")
+        };
+        assert_eq!(item.feature.shape, [1, 3, 728, 728]);
+        assert_eq!(
+            item.model_specific_data.get("num_patches"),
+            Some(&MmMetaValue::Int(8))
+        );
+        let aux: std::collections::BTreeMap<_, _> =
+            item.aux.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        assert_eq!(aux["patch_pixel_values"].shape, [8, 3, 504, 504]);
+        assert_eq!(aux.len(), 1);
+        assert_eq!(item.offsets.len(), 9);
+        for &(start, end) in &item.offsets {
+            assert!(ids[start as usize..=end as usize].iter().all(|&t| t == 900));
+        }
+        let runs: usize = item
+            .offsets
+            .iter()
+            .map(|&(s, e)| (e - s + 1) as usize)
+            .sum();
+        assert_eq!(runs, 8 * 81 + 169);
+        assert_eq!(ids.iter().filter(|&&t| t == 900).count(), runs);
+        let buffers = make_buffers(entry, false).unwrap();
+        assert_eq!(
+            find(&buffers, "mm.aux.0.patch_pixel_values").unwrap().shape,
+            [8, 3, 504, 504]
+        );
+    }
+
+    #[test]
+    fn step3_vl_rejects_feature_shm() {
+        let mut spec = step3_spec();
+        spec.feature_shm = true;
+        assert!(MmContext::new(spec).is_err());
     }
 
     /// Caller hashes override computed ones; mismatched lengths and malformed

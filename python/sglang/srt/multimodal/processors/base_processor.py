@@ -223,10 +223,13 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    mm_feature_transport_override = None
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
+    # Chat sends this processor its chat-encoded prompt_ids instead of rendered text.
+    accepts_chat_prompt_ids = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
@@ -260,7 +263,9 @@ class BaseMultimodalProcessor(ABC):
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
         )
-        configured_mm_feature_transport = get_mm().mm_feature_transport
+        configured_mm_feature_transport = (
+            self.mm_feature_transport_override or get_mm().mm_feature_transport
+        )
         self.mm_feature_transport = (
             configured_mm_feature_transport
             if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
@@ -735,6 +740,12 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _template_wrote_bos(self, tokenizer, input_text) -> bool:
+        if not self._tokenizer_auto_adds_specials or not isinstance(input_text, str):
+            return False
+        bos = getattr(tokenizer, "bos_token", None)
+        return bool(bos) and input_text.startswith(bos)
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
@@ -917,10 +928,8 @@ class BaseMultimodalProcessor(ABC):
             kwargs["device"] = self.video_preprocessing_device
 
         # Avoid double BOS when the chat template already wrote one.
-        if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
-            bos = getattr(tokenizer, "bos_token", None)
-            if bos and input_text.startswith(bos):
-                kwargs.setdefault("add_special_tokens", False)
+        if self._template_wrote_bos(tokenizer, input_text):
+            kwargs.setdefault("add_special_tokens", False)
 
         with self._temporary_fast_processor_cuda_pool(processor_device):
             result = processor.__call__(
@@ -1721,6 +1730,9 @@ class BaseMultimodalProcessor(ABC):
         """helper function to turn a tensor into a cuda-ipc tensor"""
         if not tensor.is_cuda:
             return tensor
+        if tensor.numel() == 0:
+            # A zero-byte allocation cannot own a distinct pool slice.
+            return tensor if self.keep_mm_features_on_device else tensor.cpu()
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
             tensor,
@@ -1965,7 +1977,9 @@ class BaseMultimodalProcessor(ABC):
             )
 
         # Split bundled items into per-image/video items for better cache granularity
-        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+        from sglang.srt.managers.mm_utils import (
+            get_new_expanded_mm_items,
+        )
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
         all_collected_items = self._finalize_mm_items(
@@ -2009,12 +2023,15 @@ class BaseMultimodalProcessor(ABC):
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
+        from sglang.srt.managers.mm_utils import AUXILIARY_TRANSPORT_FEATURE_NAMES
+
         if not self.use_cuda_ipc:
             return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
         updates = []
+        auxiliary_updates = []
         try:
             for item in mm_items:
                 fields = (
@@ -2027,6 +2044,19 @@ class BaseMultimodalProcessor(ABC):
                     wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
                     setattr(item, field, wrapped)
                     updates.append((item, field, tensor, wrapped))
+                original_data = item.model_specific_data
+                updated_data = None
+                for key in AUXILIARY_TRANSPORT_FEATURE_NAMES:
+                    tensor = original_data.get(key)
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    if updated_data is None:
+                        updated_data = dict(original_data)
+                        auxiliary_updates.append((item, original_data))
+                        item.model_specific_data = updated_data
+                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                    updated_data[key] = wrapped
+                    updates.append((updated_data, key, tensor, wrapped))
         except BaseException as error:
             rollback_errors = []
             for item, field, tensor, wrapped in reversed(updates):
@@ -2036,7 +2066,12 @@ class BaseMultimodalProcessor(ABC):
                 except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)
                 finally:
-                    setattr(item, field, tensor)
+                    if isinstance(item, dict):
+                        item[field] = tensor
+                    else:
+                        setattr(item, field, tensor)
+            for item, original_data in reversed(auxiliary_updates):
+                item.model_specific_data = original_data
             if rollback_errors:
                 error.add_note(
                     f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"

@@ -96,4 +96,11 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
+    if (
+        getattr(model, "kv_cache_dtype_full_attention_only", False)
+        and kv_cache_dtype != model_dtype
+    ):
+        kv_cache_dtype = model_dtype
+        resolved_kv_cache_dtype = "auto"
+
     return resolved_kv_cache_dtype, kv_cache_dtype

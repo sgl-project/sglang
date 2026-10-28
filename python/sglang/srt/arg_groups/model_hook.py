@@ -137,6 +137,17 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
         logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
 
 
+def apply_step5_running_requests_default(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.max_running_requests is not None or cfg.speculative_algorithm is None:
+        return
+    declare_resolution(
+        server_args,
+        "_apply_step5_running_requests_default",
+        max_running_requests=128,
+    )
+
+
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -263,6 +274,9 @@ def handle_model_specific_adjustments(server_args: Any):
         )
 
         apply_deepseek_v4_defaults(server_args, model_arch)
+
+    if model_arch in ("Step5ForCausalLM", "Step5ForConditionalGeneration"):
+        apply_step5_running_requests_default(server_args)
 
     if model_arch in [
         "DeepseekV3ForCausalLM",

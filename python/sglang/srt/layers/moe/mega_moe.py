@@ -614,3 +614,131 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
         recipe=(128, 32),
         disable_ue8m0_cast=False,
     )
+
+
+def build_mega_moe_fp8_block_experts_weights(experts, chunk: int = 16) -> None:
+    from deep_gemm import transform_sf_into_required_layout
+    from deep_gemm.utils import per_token_cast_to_fp8
+
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    def to_mxfp8(weight, scale_inv, block):
+        num_groups, n, k = weight.shape
+        out = torch.empty_like(weight)
+        sf = torch.empty(
+            (num_groups, n, k // 32), dtype=torch.float32, device=weight.device
+        )
+        for start in range(0, num_groups, chunk):
+            end = min(start + chunk, num_groups)
+            scale = scale_inv[start:end].repeat_interleave(block[0], dim=1)[:, :n]
+            scale = scale.repeat_interleave(block[1], dim=2)[:, :, :k]
+            dequant = weight[start:end].float() * scale
+            for g in range(end - start):
+                out[start + g], sf[start + g] = per_token_cast_to_fp8(
+                    dequant[g], use_ue8m0=True, gran_k=32
+                )
+            del dequant, scale
+        packed = transform_sf_into_required_layout(
+            sf,
+            mn=n,
+            k=k,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        return out, packed
+
+    block = experts.quant_method.quant_config.weight_block_size
+    w13, w13_sf = to_mxfp8(
+        experts.w13_weight.data, experts.w13_weight_scale_inv.data, block
+    )
+    w2, w2_sf = to_mxfp8(
+        experts.w2_weight.data, experts.w2_weight_scale_inv.data, block
+    )
+    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+        (w13, w13_sf), "fp8xfp8"
+    )
+    experts.w13_weight.data = w13_interleaved
+    experts.w2_weight.data = w2
+    experts.w13_weight_scale_inv.data = _transpose_mega_moe_sf_for_utccp(
+        w13_sf_interleaved
+    )
+    experts.w2_weight_scale_inv.data = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    experts.w13_weight_scale_inv.format_ue8m0 = True
+    experts.w2_weight_scale_inv.format_ue8m0 = True
+    experts.mega_l1_weights = (
+        experts.w13_weight.data,
+        experts.w13_weight_scale_inv.data,
+    )
+    experts.mega_l2_weights = (experts.w2_weight.data, experts.w2_weight_scale_inv.data)
+    experts.mega_moe_mma_type = "fp8xfp8"
+    experts._mega_moe_weights_built = True
+
+
+def forward_mega_moe_local_experts(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    group,
+    activation_clamp: Optional[float],
+) -> torch.Tensor:
+    import deep_gemm
+
+    num_tokens, hidden_size = hidden_states.shape
+    num_local = experts.num_local_experts
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if num_tokens > cap:
+        return torch.cat(
+            [
+                forward_mega_moe_local_experts(
+                    experts,
+                    hidden_states[start : start + cap],
+                    topk_ids[start : start + cap],
+                    topk_weights[start : start + cap],
+                    group=group,
+                    activation_clamp=activation_clamp,
+                )
+                for start in range(0, num_tokens, cap)
+            ]
+        )
+    buf = _get_mega_moe_symm_buffer(
+        group,
+        num_experts=num_local,
+        num_max_tokens_per_rank=cap,
+        num_topk=topk_ids.shape[1],
+        hidden=hidden_size,
+        intermediate_hidden=experts.intermediate_size_per_partition,
+        mma_type=experts.mega_moe_mma_type,
+    )
+    mega_moe_pre_dispatch(
+        hidden_states,
+        topk_ids.to(torch.int32),
+        topk_weights.to(torch.float32),
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        quant_group_size=32,
+        expert_offset=experts.moe_ep_rank * num_local,
+        num_local_experts=num_local,
+    )
+    y = torch.empty(
+        (max(num_tokens, 1), hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            experts.mega_l1_weights,
+            experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=activation_clamp,
+            fast_math=True,
+        )
+    return y[:num_tokens]

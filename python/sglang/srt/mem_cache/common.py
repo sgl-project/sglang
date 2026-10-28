@@ -200,6 +200,33 @@ def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     )
 
 
+def snapshot_prefix_swa_metrics(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    match_result: MatchResult,
+    max_len: int,
+    reprefill_tail: int,
+) -> None:
+    """Refresh the match snapshot until the first prefill is admitted."""
+    if getattr(req, "_cache_breakdown_computed", False) or getattr(
+        req, "retracted_stain", False
+    ):
+        return
+    req.full_kv_hit_length = min(match_result.full_kv_hit_length, max_len)
+    matched = min(
+        match_result.device_prefix_len + match_result.host_hit_length, max_len
+    )
+    req.prefix_swa_truncated_tokens = 0
+    if (
+        req.full_kv_hit_length > matched
+        and not reprefill_tail
+        and not envs.SGLANG_RADIX_FORCE_MISS.get()
+        and tree_cache.supports_swa()
+        and not tree_cache.supports_mamba()
+    ):
+        req.prefix_swa_truncated_tokens = req.full_kv_hit_length - matched
+
+
 def match_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -241,6 +268,9 @@ def match_kv_cache(
     )
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    snapshot_prefix_swa_metrics(
+        req, tree_cache, match_result, max_len, tree_cache.swa_reprefill_tail_tokens()
+    )
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:

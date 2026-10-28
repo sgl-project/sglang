@@ -83,7 +83,7 @@ def rotate_input_ids(
     if batch_size == 0 and _is_npu:
         return input_ids
 
-    BLOCK_SIZE = 4096 if select_index is not None else 8
+    BLOCK_SIZE = 4096
     grid = (batch_size,)
 
     rotate_input_ids_kernel[grid](
@@ -122,6 +122,8 @@ def stash_append_boundary_state_kernel(
     writes, ascending order)."""
     pid = tl.program_id(0)
     rpi = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    if rpi == 0:
+        return
     end = tl.load(src_row_ends_ptr + pid).to(tl.int64)
     avail = tl.load(num_available_ptr + pid).to(tl.int64)
     m = tl.minimum(avail, front)
@@ -234,7 +236,15 @@ def fill_widened_draft_extend_inputs_kernel(
 
     for j in range(0, width):
         row = pid * width + j
-        if j >= front:
+        if rpi == 0:
+            tl.store(input_ids_ptr + row, 0)
+            for hb in range(0, hidden_dim, BLOCK_H):
+                tl.store(
+                    hidden_ptr + row * hidden_dim + hb + h_off,
+                    0.0,
+                    mask=(hb + h_off) < hidden_dim,
+                )
+        elif j >= front:
             src = pid * draft_token_num + j - front
             tok = tl.load(predict_ptr + src)
             tl.store(input_ids_ptr + row, tok)
@@ -454,12 +464,14 @@ def compute_widened_draft_extend_locs_positions_kernel(
 
     pos = seq_len - front + offs64
     first_valid = tl.maximum(tl.maximum(front - valid_len, front - seq_len), 0)
-    data_valid = offs64 >= first_valid
-    write_real = offs64 >= tl.minimum(first_valid + num_warmup_tokens, front)
+    data_valid = (rpi != 0) & (offs64 >= first_valid)
+    write_real = (rpi != 0) & (
+        offs64 >= tl.minimum(first_valid + num_warmup_tokens, front)
+    )
 
     tok = tl.load(
         req_to_token_ptr + rpi * req_to_token_stride + tl.maximum(pos, 0),
-        mask=wmask,
+        mask=wmask & write_real,
         other=0,
     ).to(tl.int64)
     locs = tl.where(write_real, tok, 0)

@@ -60,6 +60,8 @@ class AttentionBackend(ABC):
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
 
+    # The backend builds metadata for aligned tail rows and handles them itself.
+    handles_padded_extend: bool = False
     supports_ragged_verify_graph: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers

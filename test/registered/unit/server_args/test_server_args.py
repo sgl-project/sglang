@@ -2968,6 +2968,11 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
                 ["Qwen3_5ForConditionalGeneration"]
             )
         )
+        self.assertTrue(
+            is_multimodal_breakable_cuda_graph_supported(
+                ["Step5ForConditionalGeneration"]
+            )
+        )
         self.assertFalse(
             is_multimodal_breakable_cuda_graph_supported(
                 ["Qwen3VLForConditionalGeneration"]

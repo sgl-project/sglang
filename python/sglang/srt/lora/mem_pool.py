@@ -155,6 +155,7 @@ class LoRAMemoryPool:
         eviction_policy: str,
         lora_added_tokens_size: int,
         experts_shared_outer_loras: bool = False,
+        adapts_routed_experts: bool = True,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
         lora_no_cpu_backup: bool = False,
@@ -175,6 +176,7 @@ class LoRAMemoryPool:
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
+        self.adapts_routed_experts: bool = adapts_routed_experts
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
         self.pin_memory_available: bool = is_pin_memory_available()
@@ -347,6 +349,8 @@ class LoRAMemoryPool:
             getattr(cfg, "num_experts", None)
             or getattr(cfg, "num_local_experts", None)
             or getattr(cfg, "n_routed_experts", None)
+            # Step3/Step5
+            or getattr(cfg, "moe_num_experts", None)
             or 1
         )
 
@@ -687,9 +691,12 @@ class LoRAMemoryPool:
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
             has_shared_experts = (
-                getattr(cfg, "shared_expert_intermediate_size", 0) or 0
-            ) > 0 or (shared_experts_count(cfg) or 0) > 0
-            has_moe = self._has_moe_module(base_model)
+                (getattr(cfg, "shared_expert_intermediate_size", 0) or 0) > 0
+                or (shared_experts_count(cfg) or 0) > 0
+                # Step3/Step5
+                or (getattr(cfg, "share_expert_dim", 0) or 0) > 0
+            )
+            has_moe = self._has_moe_module(base_model) and self.adapts_routed_experts
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)

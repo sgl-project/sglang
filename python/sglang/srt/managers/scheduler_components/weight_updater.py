@@ -605,6 +605,11 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            from sglang.srt.mem_cache.step5_kv_pool import Step5TokenToKVPool
+
+            pool = self.tp_worker.model_runner.token_to_kv_pool
+            if isinstance(pool, Step5TokenToKVPool):
+                pool.reset_dsa_state()
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:

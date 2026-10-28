@@ -368,6 +368,46 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
     from sglang.srt.configs.dots3 import Dots3Config
     from sglang.srt.configs.model_config import is_minimax_sparse
+    from sglang.srt.configs.step5 import Step5Config
+
+    if isinstance(runner.model_config.hf_text_config, Step5Config):
+        # The three MTP layers are SWA-only and own no target DSA storage.
+        if runner.is_draft_worker:
+            return full_attn_backend
+
+        from sglang.srt.configs.step5 import get_step5_position_padding
+        from sglang.srt.layers.attention.step5_backend import Step5AttentionBackend
+
+        if runner.prefill_attention_backend_str not in (
+            "fa3",
+            "fa4",
+        ) or (
+            runner.decode_attention_backend_str != runner.prefill_attention_backend_str
+        ):
+            raise ValueError("Step5 eager target requires FA3 or FA4 for SWA")
+        spec = get_spec()
+        return Step5AttentionBackend(
+            swa_backend=full_attn_backend,
+            kv_pool=runner.token_to_kv_pool,
+            req_to_token_pool=runner.req_to_token_pool,
+            context_len=runner.model_config.context_len,
+            position_padding=get_step5_position_padding(),
+            speculative_eagle_topk=(
+                spec.speculative_eagle_topk
+                if spec.speculative_algorithm is not None
+                else 1
+            ),
+            speculative_num_steps=(
+                spec.speculative_num_steps
+                if spec.speculative_algorithm is not None
+                else 0
+            ),
+            speculative_num_draft_tokens=(
+                spec.speculative_num_draft_tokens
+                if spec.speculative_algorithm is not None
+                else 1
+            ),
+        )
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):
         return runner.model_config.hf_text_config.wrap_attention_backend(
@@ -477,7 +517,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 ), (
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+            logger.info("Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 

@@ -1,0 +1,289 @@
+--- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/data/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -583,6 +583,13 @@
+   // Optional activation output.
+   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+   Optional<Tensor> activation_output;
++  // Optional diagnostic tensors (DeepSeekFp8 + do_finalize=false only): the raw
++  // pre-activation FC1 output and its FP32 block scales, and/or the post-activation
++  // tensor and its scales. Appended after the base ABI in this order.
++  Optional<Tensor> diag_fc1_output;
++  Optional<Tensor> diag_fc1_output_scale;
++  Optional<Tensor> diag_activation_output;
++  Optional<Tensor> diag_activation_output_scale;
+   // Whether FFI[0] is finalized output rather than an unfinalized FC2 buffer.
+   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+   bool is_finalized{true};
+@@ -604,6 +611,14 @@
+     }
+     if (activation_output.has_value()) {
+       tensors.push_back(activation_output.value());
++    }
++    if (diag_fc1_output.has_value()) {
++      tensors.push_back(diag_fc1_output.value());
++      tensors.push_back(diag_fc1_output_scale.value());
++    }
++    if (diag_activation_output.has_value()) {
++      tensors.push_back(diag_activation_output.value());
++      tensors.push_back(diag_activation_output_scale.value());
+     }
+     return tensors;
+   }
+@@ -3915,6 +3930,18 @@
+   }
+ };
+
++/** Clone one 2D launcher-owned buffer into an independent tensor on the given stream. */
++static Tensor cloneLauncherTensor2D(Tensor const& src, cudaStream_t stream) {
++  TVM_FFI_ICHECK_EQ(src.ndim(), 2) << "diagnostic clone expects a 2D tensor.";
++  Tensor dst = alloc_tensor({src.size(0), src.size(1)}, src.dtype(), src.device());
++  size_t const nbytes = static_cast<size_t>(src.numel()) * src.dtype().bits / 8;
++  cudaError_t const err =
++      cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), nbytes, cudaMemcpyDeviceToDevice, stream);
++  FLASHINFER_CHECK(err == cudaSuccess,
++                   "diagnostic clone cudaMemcpyAsync failed: ", cudaGetErrorString(err));
++  return dst;
++}
++
+ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
+  public:
+   static constexpr std::array<int32_t, 5> mBaseSupportedTileNums = {8, 16, 32, 64, 128};
+@@ -3952,6 +3979,12 @@
+         expert_indices(expert_indices),
+         expert_weights(expert_weights),
+         quantization_type(quantization_type) {}
++
++  /** Enable the diagnostic FC1/activation export for the next run() (verification only). */
++  void set_diag_return(bool fc1, bool activation) {
++    diag_return_fc1_ = fc1;
++    diag_return_activation_ = activation;
++  }
+
+   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
+             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
+@@ -4387,6 +4420,8 @@
+   TensorView expert_indices;
+   TensorView expert_weights;
+   Fp8QuantizationType quantization_type;
++  bool diag_return_fc1_{false};
++  bool diag_return_activation_{false};
+
+  public:
+   // Override to handle pre-computed routing.
+@@ -4446,6 +4481,25 @@
+       // MxFp8 fuses SwiGLU into FC1 so gemm1_output IS already post-activation.
+       result.activation_output =
+           quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output : gemm1_output;
++    }
++    if (diag_return_fc1_ || diag_return_activation_) {
++      TVM_FFI_ICHECK(!args->do_finalize)
++          << "diag_return_fc1/diag_return_activation require do_finalize=false.";
++      TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8)
++          << "diag_return_fc1/diag_return_activation are only supported for DeepSeekFp8.";
++      // Clone into independent tensors: the workspace buffers are per-call allocations
++      // owned by this launcher; the diagnostic caller gets fresh copies whose lifetime
++      // is decoupled from the launcher internals. Copies are stream-ordered after the MoE.
++      cudaStream_t diag_stream = get_stream(hidden_states.device());
++      if (diag_return_fc1_) {
++        result.diag_fc1_output = cloneLauncherTensor2D(gemm1_output, diag_stream);
++        result.diag_fc1_output_scale = cloneLauncherTensor2D(gemm1_output_scale, diag_stream);
++      }
++      if (diag_return_activation_) {
++        result.diag_activation_output = cloneLauncherTensor2D(activation_output, diag_stream);
++        result.diag_activation_output_scale =
++            cloneLauncherTensor2D(activation_output_scale, diag_stream);
++      }
+     }
+     return result;
+   }
+@@ -5590,7 +5644,7 @@
+     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+-    int64_t silu_clamp_mode) {
++    int64_t silu_clamp_mode, bool diag_return_fc1, bool diag_return_activation) {
+   auto activation_type = validateAndCastActivationType(act_type);
+   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                              quantization_type, activation_type);
+@@ -5602,6 +5656,13 @@
+                      "post-SiLU clamp only supported for DeepSeekFp8");
+     FLASHINFER_CHECK(gemm1_clamp_limit.has_value(),
+                      "post-SiLU clamp (silu_clamp_mode=1) requires gemm1_clamp_limit");
++  }
++  if (diag_return_fc1 || diag_return_activation) {
++    FLASHINFER_CHECK(!do_finalize,
++                     "diag_return_fc1/diag_return_activation require do_finalize=false");
++    FLASHINFER_CHECK(
++        quantization_type == Fp8QuantizationType::DeepSeekFp8,
++        "diag_return_fc1/diag_return_activation only supported for DeepSeekFp8");
+   }
+   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
+   // Fail for any other activation to avoid silently running incorrect activation behavior.
+@@ -5724,6 +5785,7 @@
+                    weight_layout, activation_type, static_cast<int64_t>(gemm1_bias_type_enum),
+                    norm_topk_prob);
+     launcher->set_routing_replay_out(routing_replay_out);
++    launcher->set_diag_return(diag_return_fc1, diag_return_activation);
+
+     launchers_map[curr_tile_N] = std::move(launcher);
+   }
+--- a/fused_moe/backends/trtllm/sm100_runner.py
++++ b/fused_moe/backends/trtllm/sm100_runner.py
+@@ -459,6 +459,8 @@
+                     kwargs.get("valid_hidden_size"),
+                     kwargs.get("valid_intermediate_size"),
+                     kwargs.get("silu_clamp_mode", 0),
++                    kwargs.get("diag_return_fc1", False),
++                    kwargs.get("diag_return_activation", False),
+                 )
+             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
+                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
+--- a/fused_moe/core.py
++++ b/fused_moe/core.py
+@@ -3011,6 +3011,8 @@
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
+         silu_clamp_mode: int = 0,
++        diag_return_fc1: bool = False,
++        diag_return_activation: bool = False,
+     ) -> List[torch.Tensor]:
+         # Determine routing mode: compute from logits or use pre-computed
+         if routing_logits is None:
+@@ -3107,6 +3109,9 @@
+             fp8_quantization_type,
+             activation_type,
+             gemm1_clamp_limit,
++        )
++        _normalize_diag_return(
++            diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
+         )
+
+         moe_runner = TrtllmMoERunner(
+@@ -3181,6 +3186,8 @@
+             "valid_hidden_size": valid_hidden_size,
+             "valid_intermediate_size": valid_intermediate_size,
+             "silu_clamp_mode": silu_clamp_mode,
++            "diag_return_fc1": diag_return_fc1,
++            "diag_return_activation": diag_return_activation,
+         }
+         _, tactic = tuner.choose_one(
+             "flashinfer::trtllm_fp8_block_scale_moe",
+@@ -3238,6 +3245,8 @@
+                 valid_hidden_size,
+                 valid_intermediate_size,
+                 silu_clamp_mode,
++                diag_return_fc1,
++                diag_return_activation,
+             )
+             # Reconstruct the public result without exposing dtype-specific body workspaces.
+             return _unpack_trtllm_moe_output(
+@@ -3341,6 +3350,8 @@
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
+         silu_clamp_mode: int = 0,
++        diag_return_fc1: bool = False,
++        diag_return_activation: bool = False,
+     ) -> List[torch.Tensor]:
+         # Acknowledge mutation-only and fallback-only controls without executing the native op.
+         _ = routing_replay_out, valid_intermediate_size
+@@ -4764,6 +4775,33 @@
+             )
+         if gemm1_clamp_limit is None:
+             raise ValueError("silu_clamp_mode=1 (post-SiLU clamp) requires gemm1_clamp_limit.")
++
++
++def _normalize_diag_return(
++    diag_return_fc1: bool,
++    diag_return_activation: bool,
++    do_finalize: bool,
++    fp8_quantization_type: Fp8QuantizationType,
++) -> None:
++    """Validate the verification-only diagnostic-return flags.
++
++    Both flags require ``do_finalize=False`` (the finalized path has no permuted
++    intermediate to export) and DeepSeekFp8 (the only path with an unfused FC1
++    plus per-block FP32 scales).  When set, the returned list grows by
++    ``[gemm1_output, gemm1_output_scale]`` and/or
++    ``[activation_output, activation_output_scale]`` (in this order).
++    """
++    if not (diag_return_fc1 or diag_return_activation):
++        return
++    if do_finalize:
++        raise ValueError(
++            "diag_return_fc1/diag_return_activation require do_finalize=False."
++        )
++    if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.DeepSeekFp8:
++        raise ValueError(
++            "diag_return_fc1/diag_return_activation are only supported for "
++            f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
++        )
+
+
+ @flashinfer_api(trace=trtllm_bf16_moe_trace)
+@@ -5792,6 +5830,8 @@
+     gemm1_bias: Optional[torch.Tensor] = None,
+     gemm2_bias: Optional[torch.Tensor] = None,
+     silu_clamp_mode: Optional[str] = None,
++    diag_return_fc1: bool = False,
++    diag_return_activation: bool = False,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""FP8 block-scaled MoE operation.
+
+@@ -5970,6 +6010,9 @@
+     silu_clamp_mode_int = _normalize_silu_clamp_mode(
+         silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
+     )
++    _normalize_diag_return(
++        diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
++    )
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+         RoutingInputMode.FromLogits,
+         routing_logits,
+@@ -6011,6 +6054,8 @@
+         valid_hidden_size,
+         valid_intermediate_size,
+         silu_clamp_mode_int,
++        diag_return_fc1,
++        diag_return_activation,
+     )
+
+     if do_finalize:
+@@ -6056,6 +6101,8 @@
+     valid_hidden_size: Optional[int] = None,
+     valid_intermediate_size: Optional[int] = None,
+     silu_clamp_mode: Optional[str] = None,
++    diag_return_fc1: bool = False,
++    diag_return_activation: bool = False,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""Pre-routed FP8 block-scaled MoE operation.
+
+@@ -6219,6 +6266,9 @@
+     silu_clamp_mode_int = _normalize_silu_clamp_mode(
+         silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
+     )
++    _normalize_diag_return(
++        diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
++    )
+     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+@@ -6262,6 +6312,8 @@
+         valid_hidden_size,
+         valid_intermediate_size,
+         silu_clamp_mode_int,
++        diag_return_fc1,
++        diag_return_activation,
+     )
+
+     if do_finalize and gemm1_lora_delta is None:
+--- a/fused_moe/shared/inputs.py
++++ b/fused_moe/shared/inputs.py
+@@ -207,4 +207,8 @@
+     ]
+     if gemm1_lora_delta is not None:
+         result.append(torch.from_dlpack(intermediate_output[3]))  # gemm1_output
++    # Diagnostic slots (diag_return_fc1 / diag_return_activation) are appended by the
++    # launcher after the base ABI; pass them through verbatim.
++    for _diag_idx in range(4 if gemm1_lora_delta is not None else 3, len(intermediate_output)):
++        result.append(torch.from_dlpack(intermediate_output[_diag_idx]))
+     return result

@@ -1,0 +1,330 @@
+--- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
++++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
+@@ -256,6 +256,41 @@
+     routingData.mNumLocalExperts = localNumExperts;
+     routingData.mPtrRoutingReplayOut = routing_replay_out;
+     moe::dev::routing::routingLlama4::run(routingData, stream);
++  } else if (routingMethodType == RoutingMethodType::SigmoidBiasOrderedRenorm) {
++    FLASHINFER_CHECK(numFusedSharedExpert == 0,
++                     "SigmoidBiasOrderedRenorm routing does not support fusing shared expert");
++    moe::dev::routing::routingCustom::Data routingData;
++    routingData.mDtypeOutput = btg::Dtype::Fp32;
++    routingData.mDtypeInput = dtypeLogits;
++    routingData.mUsePdl = enable_pdl;
++    routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBiasPrecise;
++    routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledOrderedSumNormalize;
++    routingData.mPtrRoutingBias = routingBias;
++    routingData.mDtypeBias = dtypeBias;
++    routingData.mRouteScale = routedScalingFactor;
++    routingData.mSumEpsilon = 1e-20f;
++    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
++    routingData.mPtrTopKIds = expertIds;
++    routingData.mPtrTopKPacked = routingExpertIndexes;
++    routingData.mPtrExpertCounts = expertCountHistogram;
++    routingData.mPtrPermutedIdxSize = permutedIdxSize;
++    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
++    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
++    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
++    routingData.mPtrTopKWeights = expertWeights;
++    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
++    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
++    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
++    routingData.mNumTokens = numTokens;
++    routingData.mNumExperts = numExperts;
++    routingData.mTopK = topK;
++    routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
++    routingData.mTileTokensDim = mTileTokensDim;
++    routingData.mLocalExpertsStartIdx = localExpertOffset;
++    routingData.mLocalExpertsStrideLog2 = 0;
++    routingData.mNumLocalExperts = localNumExperts;
++    routingData.mPtrRoutingReplayOut = routing_replay_out;
++    moe::dev::routing::routingCustom::run(routingData, stream);
+   } else if (routingMethodType == RoutingMethodType::Default        /* Softmax -> TopK */
+              || routingMethodType == RoutingMethodType::Renormalize /* TopK -> Softmax */
+              || routingMethodType ==
+--- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/data/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1258,6 +1258,13 @@
+     return weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+   }
+
++  bool uses_fp32_logits_routing() const {
++    return static_cast<RoutingMethodType>(routing_method_type) ==
++           RoutingMethodType::SigmoidBiasOrderedRenorm;
++  }
++
++  virtual bool supports_fp32_logits_routing() const { return false; }
++
+   bool is_unpacked_routing() const {
+     return routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed;
+   }
+@@ -1398,6 +1405,16 @@
+
+     if (routing_bias.has_value()) {
+       check_routing_bias_shape();
++    }
++    if (uses_fp32_logits_routing()) {
++      TVM_FFI_ICHECK(supports_fp32_logits_routing())
++          << "SigmoidBiasOrderedRenorm routing is only supported by the FP8 block-scale launcher.";
++      TVM_FFI_ICHECK(routing_bias.has_value())
++          << "SigmoidBiasOrderedRenorm routing requires routing_bias.";
++      TVM_FFI_ICHECK(args->top_k > 0 && args->top_k <= 8)
++          << "SigmoidBiasOrderedRenorm routing only supports 0 < top_k <= 8.";
++      TVM_FFI_ICHECK(args->num_experts <= 384)
++          << "SigmoidBiasOrderedRenorm routing only supports num_experts <= 384.";
+     }
+   }
+
+@@ -4020,7 +4037,13 @@
+                                   gemm1_bias_type, norm_topk_prob);
+   }
+
++  bool supports_fp32_logits_routing() const override { return true; }
++
+   void check_routing() const override {
++    if (uses_fp32_logits_routing()) {
++      TVM_FFI_ICHECK(!has_precomputed(expert_indices) && !has_precomputed(expert_weights))
++          << "SigmoidBiasOrderedRenorm routing requires routing_logits, not precomputed routing.";
++    }
+     if (has_precomputed(expert_indices)) {
+       TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2) << "expert_indices must be 2D.";
+       TVM_FFI_ICHECK_EQ(expert_indices.size(0), hidden_states.size(0))
+@@ -4131,12 +4154,23 @@
+
+     bool has_precomputed_weights = has_precomputed(expert_weights);
+     if (!has_precomputed_weights) {
+-      // Allocate the routing-output buffer as bf16 to match the kernel's output
+-      // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
+-      // bf16 data when this buffer is surfaced to the caller verbatim on
+-      // do_finalize=false. See #3595.
+-      FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
+-                                                      dl_bfloat16, hidden_states.device());
++      if (uses_fp32_logits_routing()) {
++        static_assert(sizeof(moe::dev::routing::PackedScoreIdx<float>) == 2 * sizeof(int32_t),
++                      "fp32 packed routing entries must span two int32 slots");
++        expert_indexes = alloc_tensor({args->num_tokens, totalExpertsPerToken * 2}, dl_int32,
++                                      hidden_states.device());
++        workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
++        args->mDtypeExpW = btg::Dtype::Fp32;
++        FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
++                                                        dl_float32, hidden_states.device());
++      } else {
++        // Allocate the routing-output buffer as bf16 to match the kernel's output
++        // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
++        // bf16 data when this buffer is surfaced to the caller verbatim on
++        // do_finalize=false. See #3595.
++        FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
++                                                        dl_bfloat16, hidden_states.device());
++      }
+       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+     } else {
+       if (is_unpacked_routing()) {
+--- a/data/include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh
++++ b/data/include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh
+@@ -253,6 +253,57 @@
+   }
+ };
+
++static __device__ inline float sigmoid_precise(float x) {
++  float const e = expf(-fabsf(x));
++  float const r = 1.0f / (1.0f + e);
++  return x >= 0.f ? r : e * r;
++}
++
++struct SigmoidBiasPrecisePreprocess {
++  static constexpr bool kSupportsBlockPerToken = true;
++
++  template <typename InputT>
++  using BaseType = float;
++
++  template <typename OutputT>
++  struct Params {
++    void const* ptrRoutingBias = nullptr;
++    batchedGemm::trtllm::gen::Dtype dtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
++
++    void set(routingCustom::Data const& data) {
++      ptrRoutingBias = data.mPtrRoutingBias;
++      dtypeBias = data.mDtypeBias;
++    }
++  };
++
++  template <typename DataType, int VecSize, typename ParamsT>
++  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& /*warp*/,
++                                               DataType (&score)[VecSize],
++                                               int32_t const (&idx)[VecSize], int32_t numExperts,
++                                               ParamsT const& params) {
++#pragma unroll
++    for (int i = 0; i < VecSize; i++) {
++      float s = sigmoid_precise(static_cast<float>(score[i]));
++      float bias = idx[i] < numExperts ? loadScalar(params.ptrRoutingBias, idx[i], params.dtypeBias)
++                                       : float{-INFINITY};
++      score[i] = static_cast<DataType>(s + bias);
++    }
++  }
++
++  template <typename SmemT, typename InputT, typename ParamsT>
++  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
++                                                     InputT const* ptrScores, int32_t numExperts,
++                                                     SmemT* smemBiased, SmemT* smemAux,
++                                                     ParamsT const& params) {
++    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
++      float s = sigmoid_precise(static_cast<float>(ptrScores[e]));
++      float bias = loadScalar(params.ptrRoutingBias, e, params.dtypeBias);
++      smemAux[e] = static_cast<SmemT>(s);
++      smemBiased[e] = static_cast<SmemT>(s + bias);
++    }
++  }
++};
++
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Postprocess policies: applied to the top-K scores AFTER topK selection.
+ //
+@@ -529,6 +580,95 @@
+   }
+ };
+
++struct ScaledOrderedSumNormalizePostprocess {
++  static constexpr bool kSupportsBlockPerToken = true;
++  static constexpr bool kSupportsLaneOwnedTopK = true;
++  static constexpr bool kNeedsRawScores = true;
++  static constexpr bool kNeedsAux = true;
++
++  template <typename OutputT>
++  struct Params {
++    float routeScale = 1.0f;
++    float sumEpsilon = 0.0f;
++
++    void set(routingCustom::Data const& data) {
++      routeScale = data.mRouteScale;
++      sumEpsilon = data.mSumEpsilon;
++    }
++  };
++
++  __forceinline__ __device__ static float orderedSum(cg::thread_block_tile<WarpSize> const& warp,
++                                                     float value, int32_t topK) {
++    float sum = 0.f;
++    for (int32_t k = 0; k < topK; ++k) {
++      sum = sum + warp.shfl(value, k);
++    }
++    return sum;
++  }
++
++  template <typename ParamsT>
++  __forceinline__ __device__ static float normalize(float sigmoidScore, float sum,
++                                                    ParamsT const& params) {
++    return sigmoidScore / (sum + params.sumEpsilon) * params.routeScale;
++  }
++
++  template <typename DataType, typename InputType, int K, typename ParamsT>
++  __forceinline__ __device__ static void applyWithScores(
++      cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
++      int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
++      InputType const* ptrScores, ParamsT const& params) {
++    float sigmoidScore = 0.f;
++    if (laneIdx < topK) {
++      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
++      sigmoidScore = sigmoid_precise(static_cast<float>(ptrScores[expertIdx]));
++    }
++    float const sum = orderedSum(warp, sigmoidScore, topK);
++    if (laneIdx < topK) {
++      warpTopKScore[laneIdx] = static_cast<DataType>(normalize(sigmoidScore, sum, params));
++    }
++  }
++
++  template <typename DataType, typename InputType, typename ParamsT>
++  __forceinline__ __device__ static void applyForLaneWithScores(
++      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
++      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, InputType const* ptrScores,
++      ParamsT const& params) {
++    float const sigmoidScore =
++        laneIdx < topK ? sigmoid_precise(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
++    float const sum = orderedSum(warp, sigmoidScore, topK);
++    if (laneIdx < topK) {
++      laneTopKScore = static_cast<DataType>(normalize(sigmoidScore, sum, params));
++    }
++  }
++
++  template <typename DataType, typename SmemT, typename ParamsT>
++  __forceinline__ __device__ static void applyForLaneWithAux(
++      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
++      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, SmemT const* smemAux,
++      ParamsT const& params) {
++    float const sigmoidScore =
++        laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
++    float const sum = orderedSum(warp, sigmoidScore, topK);
++    if (laneIdx < topK) {
++      laneTopKScore = static_cast<DataType>(normalize(sigmoidScore, sum, params));
++    }
++  }
++
++  template <typename DataType, int K, typename SmemT, typename ParamsT>
++  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
++                                                      DataType (&warpTopKScore)[K],
++                                                      int32_t const (&warpTopKExpertIdx)[K],
++                                                      int32_t laneIdx, int32_t topK,
++                                                      SmemT const* smemAux, ParamsT const& params) {
++    float const sigmoidScore =
++        laneIdx < topK ? static_cast<float>(smemAux[warpTopKExpertIdx[laneIdx]]) : 0.f;
++    float const sum = orderedSum(warp, sigmoidScore, topK);
++    if (laneIdx < topK) {
++      warpTopKScore[laneIdx] = static_cast<DataType>(normalize(sigmoidScore, sum, params));
++    }
++  }
++};
++
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ // ExpertSelectPolicy: encapsulates the entire expert selection logic.
+ //
+@@ -877,6 +1017,11 @@
+                          Tier<896, 16>,  // 513..896 experts with topK <=16
+                          Tier<1024, 32>  // Default fallback (expert count may grow beyond 896)
+                          >;
++};
++
++template <>
++struct PolicyTraits<SigmoidBiasPrecisePreprocess, ScaledOrderedSumNormalizePostprocess> {
++  using Pairs = TierList<Tier<128, 8>, Tier<256, 8>, Tier<384, 8>>;
+ };
+
+ /// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
+@@ -1042,7 +1187,11 @@
+ // string for diagnostics.
+ template <typename Fn>
+ inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
+-  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
++  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBiasPrecise &&
++      data.mPostprocessType == RoutingPostprocessType::ScaledOrderedSumNormalize)
++    fn(SigmoidBiasPrecisePreprocess{}, ScaledOrderedSumNormalizePostprocess{},
++       "SigmoidBiasPrecisePreprocess+ScaledOrderedSumNormalizePostprocess");
++  else if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
+     fn(SigmoidBiasPreprocess{}, ScaledSumNormalizePostprocess{},
+        "SigmoidBiasPreprocess+ScaledSumNormalizePostprocess");
+   else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid)
+--- a/data/include/flashinfer/trtllm/fused_moe/RoutingKernel.h
++++ b/data/include/flashinfer/trtllm/fused_moe/RoutingKernel.h
+@@ -375,6 +375,7 @@
+   Softmax,      // Apply softmax on all expert scores before topK
+   Sigmoid,      // Apply sigmoid(score) for topK selection (no bias)
+   SigmoidBias,  // Apply sigmoid(score) + bias for topK selection (DeepSeek-style)
++  SigmoidBiasPrecise,
+ };
+
+ enum class RoutingPostprocessType {
+@@ -383,6 +384,7 @@
+   Sigmoid,             // Apply sigmoid on top-K scores (selection ranks the raw logits)
+   SumNormalize,        // Normalize top-K scores by their sum
+   ScaledSumNormalize,  // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
++  ScaledOrderedSumNormalize,
+ };
+
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+--- a/data/include/flashinfer/trtllm/fused_moe/runner.h
++++ b/data/include/flashinfer/trtllm/fused_moe/runner.h
+@@ -62,6 +62,7 @@
+   TopKSigmoid = 9,
+   // Unspecified
+   Unspecified = 10,
++  SigmoidBiasOrderedRenorm = 11,
+ };
+
+ inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,

@@ -279,7 +279,9 @@ class RadixAttention(nn.Module):
             return output
         else:
             real_num_tokens = padded_extend_real_tokens(q, forward_batch)
-            if real_num_tokens is not None:
+            if real_num_tokens is not None and not getattr(
+                get_attn_backend(), "handles_padded_extend", False
+            ):
                 return _attention_on_real_rows(
                     self,
                     real_num_tokens,
@@ -386,6 +388,7 @@ def _attention_on_real_rows(
         return t[:real_num_tokens]
 
     for name in (
+        "head_gate",
         "q_rope",
         "k_rope",
         "topk_indices",
@@ -469,6 +472,7 @@ def _unified_attention_with_output_impl(
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
     # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
     # they must appear in the schema when --cuda-graph-backend-prefill=tc_piecewise is on.
     cos_sin_cache: Optional[torch.Tensor] = None,
@@ -523,6 +527,8 @@ def _unified_attention_with_output_impl(
         kwargs["sinks"] = sinks
     if attn_sink is not None:
         kwargs["attn_sink"] = attn_sink
+    if head_gate is not None:
+        kwargs["head_gate"] = head_gate[:real_query_num_tokens]
     if cos_sin_cache is not None:
         kwargs["cos_sin_cache"] = cos_sin_cache
     if is_neox is not None:
@@ -598,6 +604,7 @@ def unified_attention_with_output(
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -617,6 +624,7 @@ def unified_attention_with_output(
         k_rope=k_rope,
         sinks=sinks,
         attn_sink=attn_sink,
+        head_gate=head_gate,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
@@ -648,6 +656,7 @@ def unified_attention_with_output_and_lse(
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -667,6 +676,7 @@ def unified_attention_with_output_and_lse(
         k_rope=k_rope,
         sinks=sinks,
         attn_sink=attn_sink,
+        head_gate=head_gate,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,

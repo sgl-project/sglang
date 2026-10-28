@@ -2170,6 +2170,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 build_sm90_mega_moe_experts_weights(layer)
                 return
 
+            if (
+                get_moe_a2a_backend().is_megamoe()
+                and not self.is_fp4_expert
+                and torch.cuda.get_device_capability()[0] == 10
+                and self.quant_config.weight_block_size is not None
+            ):
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_fp8_block_experts_weights,
+                )
+
+                build_mega_moe_fp8_block_experts_weights(layer)
+                return
+
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
                 for weight, weight_scale in (

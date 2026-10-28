@@ -1,0 +1,38 @@
+{
+  "flashinfer_version": "0.7.1",
+  "baseline_note": "Exact installed package file hashes; version number alone is insufficient.",
+  "files": {
+    "data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu": {
+      "before": "4fec8e6380aaab32cb073b70f943cbc9e3c16cc0171c7c3aabcdcae478ab9e69",
+      "after": "0c9504a6628e4759b0eb50d30ab0962de7dad026d908503c6267dbce2971e2b3"
+    },
+    "data/csrc/trtllm_fused_moe_kernel_launcher.cu": {
+      "before": "82c24909c7c56a4001061afa4e582f0a372b9267c22fcd439517e7fe330b76d1",
+      "after": "39b193aca1ac64bc27e41e4400f8ea8056db3cc06b5dbcb430795898371e80cc"
+    },
+    "data/csrc/trtllm_fused_moe_runner.cu": {
+      "before": "f155765b0062a5d8a2395d4c654d10b2a56075abdf0aefd26a6f4274c56867c4",
+      "after": "2c4048150c4863be7d9bb6073e1a154023c0731bce4dc7460bdfdf81f7cb56e3"
+    },
+    "data/include/flashinfer/trtllm/fused_moe/DevKernel.h": {
+      "before": "12faa83dddae3b212a9a365f4cc7cfc6b6aa5e1c269dba7ea11996ed08f5b96c",
+      "after": "1e8d92cdf62cc434e46463c54fb35daccd36d1922ab3eeb58f854b9ca6a80b4a"
+    },
+    "data/include/flashinfer/trtllm/fused_moe/runner.h": {
+      "before": "75a6542d3dbcb8b4ee451b35c598bc2831c6ba3ae3f80483e0daaffc2f2550ae",
+      "after": "b8c547e8fa8cbdde091618ce9958ba234f0677b92c60a47b9b7f3015154f6c87"
+    },
+    "fused_moe/backends/trtllm/sm100_runner.py": {
+      "before": "9ae2ae0f475697b137710028c71517db08bb6ee7c2bdd5a7e40a2849c91df3e8",
+      "after": "d1e9aeb87ded89506679035aae9fbdda60161ec48586afd42056346b0915be87"
+    },
+    "fused_moe/core.py": {
+      "before": "d6a8333a2749e45e17f4ad6443c3ca84fcc8b15bca4d32adecc6cd0373528b17",
+      "after": "e1381c794e39256cc6b9a8a2d275ba5b0bd86ee318616e574643f4a603572193"
+    },
+    "fused_moe/shared/inputs.py": {
+      "before": "f9bbc0be9df8ec492c3c128c7d62fd93aa4b12fca8f672774903a2b1e2d4e61c",
+      "after": "c532f1aef62942590840497525df8fdc27b0b5a4c582f307885953280c63c548"
+    }
+  }
+}

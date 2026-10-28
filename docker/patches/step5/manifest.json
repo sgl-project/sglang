@@ -1,0 +1,62 @@
+{
+  "flashinfer_version": "0.7.1",
+  "baseline": "Installed package after base patches 01/02/03/06/07; hashes, not the version string, identify compatible sources.",
+  "files": {
+    "data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu": {
+      "patch": "01-flashinfer-moe.patch",
+      "group": "moe",
+      "before": "0c9504a6628e4759b0eb50d30ab0962de7dad026d908503c6267dbce2971e2b3",
+      "after": "32d3f5f8a0a9e3fc628dc26756604827ce786ec3279b33754e603040bc5b68d9",
+      "patch_sha256": "baaa92362fc6cc8e32909bc47b808471d658f5905f0eec5878321ba17643a439"
+    },
+    "data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh": {
+      "patch": "03-flashinfer-tp4-rmsnorm-order.patch",
+      "group": "comm",
+      "before": "3b33d6d3117e603335db7779c9d7e81b1da3840745ad731f8c4f4795a6365e9f",
+      "after": "55fa6fd6c1fb44d141a1dba370206429423323a758f9f81cd88ff5e422320000",
+      "patch_sha256": "b64fd6287167c46e6301f79e3c61bc79e75e6b33c1cc8a7c41f2f568d2c9a9a1"
+    },
+    "data/csrc/trtllm_mnnvl_allreduce.cu": {
+      "patch": "03-flashinfer-tp4-rmsnorm-order.patch",
+      "group": "comm",
+      "before": "6c305d4e79ae5b4a2e616f934945c42a032fd2c9f1f8bc80b9f839420d01b37e",
+      "after": "43c2932760e317236e6963d22aa5a095c8f9c2403fc40c6b827534b72d2fb106",
+      "patch_sha256": "b64fd6287167c46e6301f79e3c61bc79e75e6b33c1cc8a7c41f2f568d2c9a9a1"
+    },
+    "data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh": {
+      "patch": "02-flashinfer-routing-prefix.patch",
+      "group": "moe",
+      "before": "5a7a6e4da2e1ad1155ee5b0dca6d7a2676b6b1ba05980235f373c18c60123786",
+      "after": "d2b14441f33c1ad5abbb6dbcb3495d40b3640a85da004d66bf4e174c0f1dfaf2",
+      "patch_sha256": "76dbe819c627d0e5d8e7e8fffeb80b1ead0a74a65416684e07e6d3c853f0094e"
+    },
+    "data/csrc/trtllm_fused_moe_runner.cu": {
+      "patch": "04-flashinfer-bf16-swiglu-step.patch",
+      "group": "moe",
+      "before": "2c4048150c4863be7d9bb6073e1a154023c0731bce4dc7460bdfdf81f7cb56e3",
+      "after": "a0fced5a74b3b2f057e3cc14c4c3f8186828a90285d3c2c21c8d47a42d68831d",
+      "patch_sha256": "443de48f94c094cc52851d07e610c9308625ddb6a2805a766e82d93294eeb675"
+    },
+    "data/csrc/trtllm_fused_moe_kernel_launcher.cu": {
+      "patch": "04-flashinfer-bf16-swiglu-step.patch",
+      "group": "moe",
+      "before": "cb19b8343cd2ac0ab1dcd558c3b31d22ac784221c9f6ef3f286dd1d60ac4edbc",
+      "after": "6bd0e3d0045a6c59abd921d0576bae8adc57c8bb0e8dde610d36d9df87ab39ad",
+      "patch_sha256": "443de48f94c094cc52851d07e610c9308625ddb6a2805a766e82d93294eeb675"
+    },
+    "fused_moe/core.py": {
+      "patch": "04-flashinfer-bf16-swiglu-step.patch",
+      "group": "moe",
+      "before": "e1381c794e39256cc6b9a8a2d275ba5b0bd86ee318616e574643f4a603572193",
+      "after": "c09804361caf936f31a96e6baf0affdcdaece75d13950bcd44a1c8535f059dce",
+      "patch_sha256": "443de48f94c094cc52851d07e610c9308625ddb6a2805a766e82d93294eeb675"
+    },
+    "fused_moe/shared/validation.py": {
+      "patch": "04-flashinfer-bf16-swiglu-step.patch",
+      "group": "moe",
+      "before": "37b573ad63e2921a18bb02f206bb7ff9ad4b811a8fd0200ab0ea8ff648c632cb",
+      "after": "d4af29c24fe611061b01eafb60566a75f0644a34372154cb94888aabad3c58da",
+      "patch_sha256": "443de48f94c094cc52851d07e610c9308625ddb6a2805a766e82d93294eeb675"
+    }
+  }
+}

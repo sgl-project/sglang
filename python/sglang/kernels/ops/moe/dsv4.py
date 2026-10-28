@@ -165,6 +165,8 @@ def mega_moe_pre_dispatch(
     *,
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
+    expert_offset: int = 0,
+    num_local_experts: int = 2**31 - 1,
 ) -> None:
     # shared_block_m must match the consuming MoE's paged scale layout
     module = _jit_mega_moe_pre_dispatch_module(
@@ -180,6 +182,8 @@ def mega_moe_pre_dispatch(
         buf_topk_weights,
         shared_x_sf,
         shared_block_m,
+        expert_offset,
+        num_local_experts,
     )
 
 

@@ -198,6 +198,9 @@ struct MaskKernel {
       RuntimeCheck(false, "num_token_non_padded must be on CPU or CUDA");
     }
 
+    // An empty routing result needs no mask and cannot launch a zero-sized grid.
+    if (N.unwrap() == 0) return;
+
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = TopKParams{
         .topk_ids = static_cast<int32_t*>(topk_ids.data_ptr()),

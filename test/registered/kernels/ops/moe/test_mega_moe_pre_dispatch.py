@@ -66,5 +66,54 @@ def test_mxfp8_scale_output_uses_padded_row_stride() -> None:
     assert torch.all(buf_topk_weights[num_tokens:] == 0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+def test_expert_offset_maps_remote_experts_to_masked_slots() -> None:
+    torch.manual_seed(0)
+    num_tokens, padded_max, hidden, top_k = 7, 16, 4096, 8
+    num_local, offset = 88, 176
+
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_idx = torch.randint(
+        0, 352, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    topk_idx[0, 0], topk_idx[0, 1], topk_idx[0, 2] = offset - 1, offset, offset + 87
+    topk_idx[0, 3] = offset + num_local
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+
+    buf_x = torch.empty(padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn)
+    buf_x_sf = torch.empty(padded_max, hidden // 128, device="cuda", dtype=torch.int32)
+    buf_topk_idx = torch.empty(padded_max, top_k, device="cuda", dtype=torch.int64)
+    buf_topk_weights = torch.empty(
+        padded_max, top_k, device="cuda", dtype=torch.float32
+    )
+    mega_moe_pre_dispatch(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        expert_offset=offset,
+        num_local_experts=num_local,
+    )
+    torch.cuda.synchronize()
+
+    local = topk_idx - offset
+    is_local = (local >= 0) & (local < num_local)
+    assert is_local[0, :4].tolist() == [False, True, True, False]
+    torch.testing.assert_close(
+        buf_topk_idx[:num_tokens], torch.where(is_local, local, -1).to(torch.int64)
+    )
+    torch.testing.assert_close(
+        buf_topk_weights[:num_tokens], torch.where(is_local, topk_weights, 0.0)
+    )
+    assert torch.all(buf_topk_idx[num_tokens:] == -1)
+    assert torch.all(buf_topk_weights[num_tokens:] == 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

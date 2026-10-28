@@ -534,6 +534,28 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             None,
         ),
         (
+            "step5_actual_template_shape",
+            "{%- set preserve_thinking = preserve_thinking | default(true) %}\n"
+            "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}\n"
+            "{%- generation %}<tool_call><function=get_weather>"
+            "<parameter=city>Paris</parameter></function></tool_call>{%- endgeneration %}\n"
+            "{% if '<think>' in content %}{{ content.split('</think>')[-1] }}{% endif %}",
+            ["<tool_call>", "<tool_calls>"],
+            "step5",
+            None,
+        ),
+        (
+            "step3p5_with_add_generation_prompt",
+            "{%- set preserve_thinking = preserve_thinking | default(true) %}\n"
+            "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}\n"
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Paris</parameter></function></tool_call>\n"
+            "{%- if add_generation_prompt %}<think>{%- endif %}",
+            ["<tool_call>", "<tool_calls>"],
+            "step3p5",
+            None,
+        ),
+        (
             "step3p5_think_tags",
             "Step3.5-Flash\n<function=tool><parameter=arg>value</parameter></function>\n<think>",
             [],
@@ -814,6 +836,15 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "step3p5",
             ),
             (
+                "step5_actual_template_shape",
+                "{%- set preserve_thinking = preserve_thinking | default(true) %}\n"
+                "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}\n"
+                "{%- generation %}<tool_call><function=get_weather>"
+                "<parameter=city>Paris</parameter></function></tool_call>{%- endgeneration %}",
+                ["<tool_call>", "<tool_calls>"],
+                "step5",
+            ),
+            (
                 "step3",
                 "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>"
                 '<steptml:invoke name="get_weather"><steptml:parameter name="city">Paris</steptml:parameter>'
@@ -904,6 +935,7 @@ class TestToolCallParserDetection(unittest.TestCase):
             reasoning_index["hunyuan"], reasoning_index["deepseek_r1_think_tags"]
         )
         self.assertLess(reasoning_index["poolside_v1"], reasoning_index["mimo"])
+        self.assertLess(reasoning_index["step5"], reasoning_index["step3p5"])
         self.assertLess(
             reasoning_index["step3p5"], reasoning_index["deepseek_r1_think_tags"]
         )
@@ -915,6 +947,7 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["deepseek_v31"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
+        self.assertLess(tool_index["step5"], tool_index["step3p5"])
         self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])

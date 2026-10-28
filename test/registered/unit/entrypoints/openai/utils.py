@@ -53,6 +53,7 @@ class MockTokenizerManager:
         )
         self.served_model_name = self.SERVED_MODEL_NAME
         self.lora_registry = None
+        self.mm_processor = None
         self.server_args = Mock(
             enable_cache_report=False,
             reasoning_parser=None,

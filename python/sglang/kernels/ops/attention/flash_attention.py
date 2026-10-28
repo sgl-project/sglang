@@ -39,6 +39,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    head_gate=None,
+    use_pdl=False,
     score_mod=None,
     aux_tensors=None,
     sfq=None,
@@ -46,6 +48,7 @@ def flash_attn_with_kvcache(
     sfv=None,
     rel_bias=None,
     rel_bias_prep_cache=None,
+    tile_mn=None,
     ver=3,
     out=None,
     max_seqlen_k: Optional[int] = None,
@@ -143,6 +146,10 @@ def flash_attn_with_kvcache(
     if mask_mod is not None and ver != 4:
         raise NotImplementedError("mask_mod requires FlashAttention 4")
     if ver == 3:
+        if head_gate is not None:
+            raise RuntimeError("head_gate is only supported by FlashAttention-4")
+        if tile_mn is not None:
+            raise RuntimeError("tile_mn is only supported by FlashAttention-4")
         return fa3_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -210,6 +217,8 @@ def flash_attn_with_kvcache(
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sinks=sinks,
+            head_gate=head_gate,
+            use_pdl=use_pdl,
             score_mod=score_mod,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
@@ -218,6 +227,7 @@ def flash_attn_with_kvcache(
             sfv=sfv,
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            tile_mn=tile_mn,
             return_softmax_lse=return_softmax_lse,
             out=out,
         )
@@ -251,6 +261,8 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    head_gate=None,
+    use_pdl=False,
     score_mod=None,
     aux_tensors=None,
     sfq=None,
@@ -258,6 +270,7 @@ def flash_attn_varlen_func(
     sfv=None,
     rel_bias=None,
     rel_bias_prep_cache=None,
+    tile_mn=None,
     ver=3,
     out=None,
     mask_mod=None,
@@ -265,6 +278,10 @@ def flash_attn_varlen_func(
     if mask_mod is not None and ver != 4:
         raise NotImplementedError("mask_mod requires FlashAttention 4")
     if ver == 3:
+        if head_gate is not None:
+            raise RuntimeError("head_gate is only supported by FlashAttention-4")
+        if tile_mn is not None:
+            raise RuntimeError("tile_mn is only supported by FlashAttention-4")
         return fa3_flash_attn_varlen_func(
             q,
             k,
@@ -315,8 +332,10 @@ def flash_attn_varlen_func(
             softcap=softcap,
             window_size=window_size,
             sinks=sinks,
+            head_gate=head_gate,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            use_pdl=use_pdl,
             score_mod=score_mod,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
@@ -328,6 +347,7 @@ def flash_attn_varlen_func(
             sfv=sfv,
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            tile_mn=tile_mn,
             return_softmax_lse=return_softmax_lse,
             out=out,
         )

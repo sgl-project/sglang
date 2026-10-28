@@ -27,6 +27,12 @@ def init_mm_embedding_cache(max_size: int = 0):
     embedding_cache = MultiModalStaticCache(max_size)
 
 
+def clear_mm_embedding_cache() -> None:
+    """Drop the cached multimodal embeddings, which the encoder's current weights computed."""
+    if embedding_cache is not None:
+        embedding_cache.clear()
+
+
 def get_embedding_chunk(
     embedding: torch.Tensor,
     extend_prefix_len: int,
@@ -218,6 +224,20 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "Qwen3_5MoeForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+    }
+
+
+def _encodes_multi_run_items_independently(
+    data_embedding_func: DataEmbeddingFunc,
+) -> bool:
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return False
+    if getattr(data_embedding_func, "__name__", None) != "get_image_feature":
+        return False
+    return owner.__class__.__name__ in {
+        "Step3p7ForConditionalGeneration",
+        "Step5ForConditionalGeneration",
     }
 
 
@@ -586,7 +606,9 @@ def _get_chunked_prefill_embedding(
         )
 
         # Audio items may span several runs (interleaved with transcript text).
-        is_per_image = all(
+        is_per_image = _encodes_multi_run_items_independently(
+            data_embedding_func
+        ) or all(
             len(item.offsets) == 1 or item.is_audio()
             for item in embedding_items_per_req
         )

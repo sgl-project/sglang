@@ -256,6 +256,9 @@ class TopKConfig:
     renormalize: bool = True
     num_fused_shared_experts: int = 0
     custom_routing_function: Optional[Callable] = None
+    # Opt-in callbacks accept the device count and mask CUDA padded IDs.
+    # Postprocessing retains ownership when remapping/capture can alter IDs.
+    custom_routing_handles_padding: bool = False
     correction_bias: Optional[torch.Tensor] = None
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
@@ -601,6 +604,7 @@ class TopK(BaseFusedOp):
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
+        custom_routing_handles_padding: bool = False,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -644,6 +648,7 @@ class TopK(BaseFusedOp):
             num_expert_group=num_expert_group,
             num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
+            custom_routing_handles_padding=custom_routing_handles_padding,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
@@ -2572,6 +2577,21 @@ def select_experts(
     renormalize = topk_config.renormalize
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     custom_routing_function = topk_config.custom_routing_function
+    # Only fold the final CUDA ID mask into a custom router when no later
+    # routing transform can replace IDs. Capture observes unmasked logical IDs
+    # on the legacy path, so retain that ordering when capture is active.
+    custom_padding_fused = (
+        _is_cuda
+        and custom_routing_function is not None
+        and topk_config.custom_routing_handles_padding
+        and num_token_non_padded is not None
+        and expert_location_dispatch_info is None
+        and not _eplb_remap_enabled()
+        and num_fused_shared_experts == 0
+        and get_global_experts_capturer() is None
+        and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
     correction_bias = (
         topk_config.correction_bias
         if dynamic_expert_bias is None
@@ -2826,16 +2846,20 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        # custom_routing_function itself is padding-unaware; its output on
-        # padded rows is garbage. That is fine because _post_process_topk_ids
-        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
-        # weights on HIP) after the logical->physical remap.
+        # Legacy callbacks do not accept a padding count. Opt-in callbacks
+        # receive the device scalar only when they can own the final ID mask.
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        padding_kwargs = (
+            {"num_token_non_padded": num_token_non_padded}
+            if custom_padding_fused
+            else {}
+        )
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
+            **padding_kwargs,
         )
 
     if routing_overridden:
@@ -2886,7 +2910,7 @@ def select_experts(
         topk_weights=topk_weights,
         topk_config=topk_config,
         router_logits=router_logits,
-        num_token_non_padded=num_token_non_padded,
+        num_token_non_padded=None if custom_padding_fused else num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,

@@ -171,6 +171,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
+                    "disable_attn_tp_gather",
                     "quantization",
                     "dp_size",
                     "attn_dp_size",
@@ -225,6 +226,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "disaggregation_decode_retraction_backup",
                 }
             ),
         )
@@ -3899,6 +3901,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {"swa_full_tokens_ratio": 1.0, "disable_hybrid_swa_memory": True},
         )
         self.assertEqual(_step3p_overrides(_args(), None), {})
+
+    def test_step5_mega_moe_resolves_runner_and_attn_tp_gather(self):
+        from sglang.srt.arg_groups.overrides import _step3p_overrides
+
+        def _args(**kw):
+            defaults = dict(
+                moe_runner_backend="flashinfer_trtllm",
+                moe_a2a_backend="megamoe",
+                enable_dp_attention=False,
+                kv_cache_dtype="fp8_e4m3",
+                speculative_draft_kv_cache_dtype=None,
+                disaggregation_decode_retraction_backup="cpu_tensor",
+                speculative_algorithm=None,
+                attention_backend="fa4",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch.object(
+            overrides_module, "get_step5_text_config", return_value=object()
+        ):
+            mega = _step3p_overrides(_args(), None)
+            self.assertEqual(mega["moe_runner_backend"], "deep_gemm")
+            self.assertTrue(mega["disable_attn_tp_gather"])
+
+            plain = _step3p_overrides(_args(moe_a2a_backend="none"), None)
+            self.assertEqual(plain["moe_runner_backend"], "flashinfer_trtllm")
+            self.assertNotIn("disable_attn_tp_gather", plain)
+
+            # Step5 gathers and scatters attention-DP tokens explicitly.
+            self.assertEqual(
+                _step3p_overrides(_args(enable_dp_attention=True), None), mega
+            )
 
 
 class TestDeclarationValidation(CustomTestCase):

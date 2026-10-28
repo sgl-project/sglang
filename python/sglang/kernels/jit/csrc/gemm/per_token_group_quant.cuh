@@ -243,7 +243,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kUseRnDivision_ = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -253,6 +254,10 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
+  static constexpr bool kUseRnDivision = kUseRnDivision_;
+  static_assert(
+      !kUseRnDivision || (std::is_same_v<QuantType, fp8_e4m3_t> && !kUe8m0 && !kFuseSiluAndMul),
+      "RN division requires E4M3, FP32 scales and no fused activation");
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
@@ -320,7 +325,10 @@ struct QuantTrait {
     }
     const auto amax2 = cast<float2>(warp::reduce_max<kNumLanes>(local_amax2));
     const auto amax = math::max(math::max(amax2.x, amax2.y), 1e-10f);
-    const float raw_scale = amax * kMaxValueInv;  // the dequant scale the GEMM consumes
+    // Preserve the stored scale's rounding before quantizing with it.
+    // Explicit intrinsics prevent fast math from replacing division by a reciprocal.
+    const float raw_scale =
+        kUseRnDivision ? __fdiv_rn(amax, kMaxValue) : amax * kMaxValueInv;  // the dequant scale the GEMM consumes
 
     out_vec_t out;
     detail::scale_t<kUe8m0> scale_inv;
@@ -340,6 +348,13 @@ struct QuantTrait {
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+      }
+    } else if constexpr (kUseRnDivision) {
+      scale_inv = raw_scale;
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        const auto v = cast<float2>(in[i]);
+        out[i] = WTrait::quant(float2{__fdiv_rn(v.x, raw_scale), __fdiv_rn(v.y, raw_scale)});
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
@@ -391,7 +406,9 @@ struct QuantTrait {
       local_amax = math::max(local_amax, fabsf(in(i)));
     }
     const auto amax = math::max(warp::reduce_max<kNumLanes>(local_amax), 1e-10f);
-    const float raw_scale = amax * kMaxValueInv;
+    // Preserve the stored scale's rounding before quantizing with it.
+    // Explicit intrinsics prevent fast math from replacing division by a reciprocal.
+    const float raw_scale = kUseRnDivision ? __fdiv_rn(amax, kMaxValue) : amax * kMaxValueInv;
 
     out_vec_t out;
     detail::scale_t<kUe8m0> scale_inv;
@@ -408,7 +425,11 @@ struct QuantTrait {
     const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      out[i] = WTrait::quant(detail::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
+      if constexpr (kUseRnDivision) {
+        out[i] = WTrait::quant(float2{__fdiv_rn(in(2 * i), raw_scale), __fdiv_rn(in(2 * i + 1), raw_scale)});
+      } else {
+        out[i] = WTrait::quant(detail::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
+      }
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
@@ -618,9 +639,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUseRnDivision = false>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kUseRnDivision>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
@@ -636,9 +659,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUseRnDivision = false>
 struct PerTokenGroupQuantSortedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kUseRnDivision>;
 
   /// \brief Flat quantization over the sorted, block-padded MoE layout.
   /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
@@ -676,9 +701,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUseRnDivision = false>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kUseRnDivision>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means

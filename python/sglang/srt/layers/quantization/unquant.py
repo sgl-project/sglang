@@ -365,9 +365,7 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
-        m, weight.shape[0], weight.shape[1]
-    ):
+    elif _can_use_cutedsl_bf16_gemm(x, weight):
         output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
@@ -382,6 +380,18 @@ def _bf16_gemm_dispatch_impl(
     if addend is not None:
         output.add_(addend)
     return output
+
+
+def _can_use_cutedsl_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the specialized kernel supports this input layout."""
+    return (
+        x.stride(-1) == 1
+        and weight.stride(-1) == 1
+        and _use_cutedsl_bf16_gemm is not None
+        and _use_cutedsl_bf16_gemm(
+            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        )
+    )
 
 
 @register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
@@ -590,9 +600,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and (bias is None or bias.dtype == torch.bfloat16)
             and not layer.weight.requires_grad
             and (bias is None or not bias.requires_grad)
-            and _use_cutedsl_bf16_gemm(
-                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
-            )
+            and _can_use_cutedsl_bf16_gemm(x, layer.weight)
         ):
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 cutedsl_bf16_gemm_out,
@@ -669,9 +677,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         use_triton_kernels: bool = False,
         use_flashinfer_trtllm_moe: bool = False,
         use_deep_gemm: bool = False,
+        use_flashinfer_cutlass: bool | None = None,
     ):
         super().__init__()
-        self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_flashinfer_cutlass = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+            if use_flashinfer_cutlass is None
+            else use_flashinfer_cutlass
+        )
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
@@ -836,7 +849,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
                     epilogue_tile_m,
-                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
+                    is_gated_act_gemm=(
+                        layer.moe_runner_config.is_gated
+                        and layer.moe_runner_config.silu_clamp_mode != "post"
+                    ),
                 )
                 tmp_weights1 = (
                     layer.w13_weight.data[i]
@@ -888,6 +904,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             # clobber a subclass that attached a quantized kernel instead.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
+
+        if (
+            self.use_flashinfer_trtllm_moe
+            and layer.moe_runner_config.silu_clamp_mode == "post"
+        ):
+            limit = layer.moe_runner_config.gemm1_clamp_limit
+            if limit is None or limit <= 0:
+                raise ValueError(
+                    "TRTLLM BF16 post-SiLU clamp requires a positive limit"
+                )
+            layer.register_buffer(
+                "step_bf16_clamp_limit",
+                torch.full(
+                    (layer.num_local_experts,),
+                    limit,
+                    dtype=torch.float32,
+                    device=layer.w13_weight.device,
+                ),
+            )
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
         return
@@ -1031,7 +1066,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
-                if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                if (
+                    get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                    or moe_runner_config.silu_clamp_mode == "post"
+                )
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
         elif self.use_flashinfer_cutlass:
@@ -1167,6 +1205,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                gemm1_clamp_limit=getattr(layer, "step_bf16_clamp_limit", None),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

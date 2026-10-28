@@ -1,0 +1,34 @@
+--- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
++++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
+@@ -223,20 +223,21 @@
+   int32_t ctaOffsetPerExpert[ExpertsPerThread];
+   int32_t numNonExitingCtas;
+   Scan(tempStorage).ExclusiveSum(numCtaPerExpert, ctaOffsetPerExpert, numNonExitingCtas);
+-  __syncthreads();  // Required barrier before reusing TempStorage for the next BlockScan
+-
+-  // Compute padded expert scan counts (same array-overload pattern)
+-  int32_t tmpCountPerExpert[ExpertsPerThread];
++
++  // All experts share one tile size, so scaling the CTA prefix gives the
++  // padded-row prefix exactly. Reuse the first scan instead of scanning the
++  // same counts again after multiplication by that uniform tile size.
++  int32_t expertScanCountsPerExpert[ExpertsPerThread];
+ #pragma unroll
+   for (int e = 0; e < ExpertsPerThread; e++) {
+     if (params.mIsPow2) {
+-      tmpCountPerExpert[e] = divUpMulLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
++      expertScanCountsPerExpert[e] =
++          mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2);
+     } else {
+-      tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
+-    }
+-  }
+-  int32_t expertScanCountsPerExpert[ExpertsPerThread];
+-  Scan(tempStorage).ExclusiveSum(tmpCountPerExpert, expertScanCountsPerExpert);
++      expertScanCountsPerExpert[e] =
++          mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim);
++    }
++  }
+   __syncthreads();
+
+   // Write CTA configs for each expert this thread handles

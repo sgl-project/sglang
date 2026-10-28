@@ -33,6 +33,8 @@ def _fake_fp8_block_scale_moe_out(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    silu_clamp_mode: Optional[str] = None,
+    fc1_output_dtype: Optional[str] = None,
 ) -> None:
     return None
 
@@ -69,6 +71,8 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    silu_clamp_mode: Optional[str] = None,
+    fc1_output_dtype: Optional[str] = None,
 ) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -115,6 +119,11 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
+    if silu_clamp_mode is not None:
+        kwargs["silu_clamp_mode"] = silu_clamp_mode
+    if fc1_output_dtype is not None:
+        kwargs["fc1_output_dtype"] = fc1_output_dtype
+
     trtllm_fp8_block_scale_moe(**kwargs)
 
 
@@ -147,6 +156,8 @@ def _fake_fp8_block_scale_routed_moe_out(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    silu_clamp_mode: Optional[str] = None,
+    fc1_output_dtype: Optional[str] = None,
 ) -> None:
     return None
 
@@ -184,6 +195,8 @@ def trtllm_fp8_block_scale_routed_moe_out_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    silu_clamp_mode: Optional[str] = None,
+    fc1_output_dtype: Optional[str] = None,
 ) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
@@ -230,6 +243,11 @@ def trtllm_fp8_block_scale_routed_moe_out_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
+    # Only pass opt-in extensions: unmodified models work with stock FlashInfer.
+    if silu_clamp_mode is not None:
+        kwargs["silu_clamp_mode"] = silu_clamp_mode
+    if fc1_output_dtype is not None:
+        kwargs["fc1_output_dtype"] = fc1_output_dtype
     trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 

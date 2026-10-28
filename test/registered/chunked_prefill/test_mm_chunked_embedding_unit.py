@@ -482,6 +482,135 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
     concat.assert_called_once()
 
 
+MULTI_RUN_ITEM_OFFSETS = [
+    [(2, 4), (6, 9)],
+    [(12, 13), (15, 19), (21, 22)],
+    [(25, 27)],
+]
+
+
+def _multi_run_token_count(item: MultimodalDataItem) -> int:
+    return sum(end - start + 1 for start, end in item.offsets)
+
+
+def _multi_run_item_embedding(item: MultimodalDataItem) -> torch.Tensor:
+    gen = torch.Generator().manual_seed(item.hash)
+    return torch.randn(_multi_run_token_count(item), HIDDEN, generator=gen)
+
+
+def _multi_run_encoder_list(items):
+    return [_multi_run_item_embedding(item) for item in items]
+
+
+def _multi_run_encoder_tensor(items):
+    return torch.cat(_multi_run_encoder_list(items), dim=0)
+
+
+def _make_multi_run_items():
+    return [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=2000 + i,
+            feature=torch.zeros(1),
+            offsets=list(offsets),
+        )
+        for i, offsets in enumerate(MULTI_RUN_ITEM_OFFSETS)
+    ]
+
+
+def _flat_multi_run_offsets():
+    return [run for runs in MULTI_RUN_ITEM_OFFSETS for run in runs]
+
+
+class Step5ForConditionalGeneration:
+    def __init__(self):
+        self.calls = []
+
+    def get_image_feature(self, items):
+        self.calls.append([item.hash for item in items])
+        return _multi_run_encoder_tensor(items)
+
+
+class OtherVisionModel(Step5ForConditionalGeneration):
+    pass
+
+
+def _run_prefill_chunks(data_embedding_func):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_multi_run_items()
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    outs = []
+    for prefix_len, extend_len in CHUNKS:
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            data_embedding_func,
+            items,
+            [0, len(items)],
+            [prefix_len],
+            [extend_len],
+            [_flat_multi_run_offsets()],
+            input_ids,
+        )
+        outs.append(chunk)
+    return outs
+
+
+def _run_multi_run_full_chunks():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_multi_run_items()
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    return [
+        mm_schedule._get_chunked_embedding_full(
+            _multi_run_encoder_tensor,
+            items,
+            _flat_multi_run_offsets(),
+            prefix_len,
+            extend_len,
+            input_ids,
+            _CPU,
+        )[0]
+        for prefix_len, extend_len in CHUNKS
+    ]
+
+
+def test_multi_run_by_item_matches_full():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_multi_run_items()
+    by_item = [
+        mm_schedule._get_chunked_embedding_by_item(
+            _multi_run_encoder_list,
+            items,
+            prefix_len,
+            extend_len,
+            _CPU,
+        )
+        for prefix_len, extend_len in CHUNKS
+    ]
+    _assert_chunks_equal(
+        _run_multi_run_full_chunks(), [torch.cat(x, dim=0) for x in by_item]
+    )
+
+
+def test_multi_run_batched_matches_full():
+    model = Step5ForConditionalGeneration()
+    _assert_chunks_equal(
+        _run_multi_run_full_chunks(), _run_prefill_chunks(model.get_image_feature)
+    )
+
+
+def test_multi_run_items_are_encoded_once_per_overlapping_chunk():
+    model = Step5ForConditionalGeneration()
+    _run_prefill_chunks(model.get_image_feature)
+
+    assert model.calls == [[2000], [2001], [2002]]
+
+
+def test_multi_run_items_of_unlisted_model_use_full_path():
+    model = OtherVisionModel()
+    _run_prefill_chunks(model.get_image_feature)
+
+    assert model.calls == [[2000, 2001, 2002]]
+
+
 if __name__ == "__main__":
     import sys
 
