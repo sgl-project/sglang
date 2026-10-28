@@ -188,6 +188,30 @@ class TestSpecTopk1Triton(CustomTestCase):
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
+    def test_ties_resolve_to_lowest_index_across_splits(self):
+        # The maximum repeated in several vocabulary splits (and -0.0 against 0.0):
+        # the lowest index wins, as torch.argmax; repeated launches reuse the
+        # per-row state the previous one reset, and a batch past its size grows it.
+        vocab_size = 154880
+        g = torch.Generator(device=self.device).manual_seed(7)
+        for batch_size in (1, 4, 1500):
+            logits = (
+                torch.randn((batch_size, vocab_size), device=self.device, generator=g)
+                .to(torch.bfloat16)
+                .float()
+            )
+            cols = torch.tensor([150000, 70000, 8191, 8192], device=self.device)
+            logits[:, cols] = 100.0
+            logits[1:2, :] = -1.0
+            logits[1:2, 9000] = -0.0
+            logits[1:2, 20000] = 0.0
+            for _ in range(3):
+                with self.subTest(batch_size=batch_size):
+                    _, topk_index = draft_topk1_argmax_only(logits)
+                    torch.testing.assert_close(
+                        topk_index[:, 0], torch.argmax(logits, dim=-1), rtol=0, atol=0
+                    )
+
     def test_empty_batch(self):
         logits = torch.empty((0, 1024), dtype=torch.float32, device=self.device)
         positions = torch.empty((0,), dtype=torch.long, device=self.device)
