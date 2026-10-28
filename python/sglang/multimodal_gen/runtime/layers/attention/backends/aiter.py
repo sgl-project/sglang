@@ -416,5 +416,6 @@ class AITerImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return output[0] if isinstance(output, tuple) else output
