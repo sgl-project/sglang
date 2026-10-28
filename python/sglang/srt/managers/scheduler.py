@@ -1721,7 +1721,7 @@ class Scheduler:
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
-        freeze_gc("Scheduler")
+        freeze_gc("Scheduler", recv_req.gc_threshold)
         self.parts.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
