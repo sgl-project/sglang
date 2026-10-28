@@ -152,21 +152,27 @@ jobs:
           # exclusive (the prefill tuning crashed a DSPARK+decode-graph
           # server with ACL 507034 in DeepEP dispatch - run 39917316049),
           # so each scenario gets its own server and job.
-          # cann9.1.0-a3-B106 image (latest cann9.1.0 build on
-          # https://ascend.github.io/sglang/, 2026-10-26, sglang
-          # release/2026930 @ 545ed1c664). The older main-cann9.1.0-a3
-          # image failed to compile the kda_target_verify triton kernel
-          # (UB overflow) at graph capture; B103 was baked as a stopgap.
-          - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill_aisbench
-            node_size: 4
-            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
-            test_type: 'perf'
-            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106
+          # cann9.1.0-a3-B103: B106 (2026-10-26, sglang 545ed1c664 +
+          # sgl_kernel_npu 2026.9.0.post11) regressed for Kimi-K3 decode -
+          # the post11 kimi_k3 attn_residual mix_fused triton kernel dies
+          # during DSPARK target-verify graph capture (aclnnInplaceFillScalar
+          # PTA ERR00100, all 16 ranks, run 40685886349). sglang has no
+          # switch around the sgl_kernel_npu call on NPU, so stay on B103
+          # (kernel post10, verified by runs 11-15) until a fixed B-series
+          # image ships.
+          # Pure-prefill entry commented out: it has been green for 8 consecutive
+          # runs (run11-19); decode is the only case under debugging, so skip
+          # prefill to save pool capacity until decode is settled.
+  #           - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill_aisbench
+  #             node_size: 4
+  #             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
+  #             test_type: 'perf'
+  #             image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
           - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix_aisbench
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py
             test_type: 'perf'
-            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
