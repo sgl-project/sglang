@@ -640,12 +640,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
         ):
             request_gc.collect_after_warmup()
-        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        # Check before the group starts, so a cancelled request does not run.
+        # Each rank checks the same requests, so the check stays a collective.
+        cancel_errors = [self._cancel_error(req) for req in batch]
+        live_reqs = [req for req, e in zip(batch, cancel_errors) if e is None]
+        results = (
+            self.pipeline.forward_batch_sequentially(live_reqs, self.server_args)
+            if live_reqs
+            else iter(())
+        )
         group_start_time = time.monotonic()
         failed = False
 
         try:
-            for req in batch:
+            for req, cancel_error in zip(batch, cancel_errors):
+                if cancel_error is not None:
+                    logger.info(
+                        "Stopped grouped request %s: %s", req.request_id, cancel_error
+                    )
+                    yield OutputBatch(error=str(cancel_error), cancelled=True)
+                    continue
                 warming_up = req.is_warmup or bool(
                     req.extra.get("server_internal_prewarm")
                 )
@@ -669,7 +683,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
                     propagate_forward_errors=True,
-                    # a skipped request would leave its output to the next one
+                    # checked above; the group already runs this request, so a
+                    # skipped request would leave its output to the next one
                     check_cancelled=False,
                 )
                 assert isinstance(output_batch, OutputBatch)
@@ -688,6 +703,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 close()
             if failed:
                 request_gc.collect_after_warmup()
+
+    @staticmethod
+    def _cancel_error(req: Req) -> RequestCancelledError | None:
+        try:
+            raise_if_cancelled([req])
+        except RequestCancelledError as e:
+            return e
+        return None
 
     def _collect_sequential_outputs(
         self,
@@ -1531,6 +1554,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+            merged.cancelled = output_batch.cancelled
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
         if output_batch.usage is not None:
             if merged.usage is None:

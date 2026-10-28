@@ -13,6 +13,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
+from fastapi import HTTPException
 from tqdm.auto import tqdm
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
@@ -31,6 +32,12 @@ from sglang.multimodal_gen.runtime.managers.request_cancel import (
     raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines_core.executors import (
+    pipeline_executor as pipeline_executor_module,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+    SyncExecutor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import base as stage_base
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -136,6 +143,7 @@ def test_publish_without_publisher_is_a_no_op(monkeypatch):
     [
         "sglang.multimodal_gen.runtime.managers.request_cancel",
         "sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel",
+        "sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor",
     ],
 )
 def test_module_imports_first(module):
@@ -392,43 +400,170 @@ def test_worker_reports_cancel_inside_forward(monkeypatch, propagate):
         assert "cancelled" in run().error
 
 
-@pytest.mark.parametrize("running", [False, True])
-def test_delete_publishes_cancel_of_running_job(monkeypatch, running):
+def _sequential_worker(monkeypatch):
+    """Return a worker whose pipeline yields one output per request it runs."""
+    worker = _bare_worker(monkeypatch)
+    worker.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: False
+        )
+    )
+    worker._execute_forward_common = lambda req, *, forward_fn, **kwargs: forward_fn()
+    groups = []
+    outputs = {}
+
+    def forward_batch_sequentially(reqs, server_args):
+        groups.append([req.request_id for req in reqs])
+        return (outputs.setdefault(req.request_id, OutputBatch()) for req in reqs)
+
+    worker.pipeline = SimpleNamespace(
+        forward_batch_sequentially=forward_batch_sequentially
+    )
+    return worker, groups, outputs
+
+
+def test_sequential_worker_skips_a_cancelled_request(monkeypatch, cancel_state):
+    worker, groups, outputs = _sequential_worker(monkeypatch)
+    cancel_state("a")
+
+    results = list(worker.execute_forward_sequentially([_req("a"), _req("b")]))
+
+    assert groups == [["b"]]
+    assert results[0].cancelled and "cancelled" in results[0].error
+    assert results[1] is outputs["b"]
+
+
+def test_sequential_worker_does_not_start_a_cancelled_group(monkeypatch, cancel_state):
+    worker, groups, _ = _sequential_worker(monkeypatch)
+    cancel_state("a")
+
+    results = list(worker.execute_forward_sequentially([_req("a")]))
+
+    assert groups == []
+    assert len(results) == 1 and results[0].cancelled
+
+
+def _sequential_executor(execute):
+    executor = object.__new__(SyncExecutor)
+    executor.execute_group = lambda stages, batches, server_args: batches
+    executor.execute = execute
+    first_stage = SimpleNamespace(
+        iter_sequential_requests=lambda batch, server_args: iter((batch,))
+    )
+    return executor, [first_stage, object()]
+
+
+def test_sequential_outputs_stop_after_a_cancel(monkeypatch, cancel_state):
+    error = Mock()
+    monkeypatch.setattr(pipeline_executor_module.logger, "error", error)
+    executed = []
+
+    def execute(stages, batch, server_args):
+        executed.append(batch.request_id)
+        # the client cancels the job while its first output denoises
+        cancel_state("job:0", "job:1", "job:2")
+        raise RequestCancelledError(["job"])
+
+    executor, stages = _sequential_executor(execute)
+    batches = [_req(f"job:{i}") for i in range(3)]
+
+    outputs = list(executor.execute_group_sequentially(stages, batches, None))
+
+    assert executed == ["job:0"]
+    assert [output.cancelled for output in outputs] == [True, True, True]
+    error.assert_not_called()
+
+
+def test_sequential_cancel_skips_only_the_cancelled_request(cancel_state):
+    executed = []
+
+    def execute(stages, batch, server_args):
+        executed.append(batch.request_id)
+        return OutputBatch()
+
+    executor, stages = _sequential_executor(execute)
+    cancel_state("job")
+
+    outputs = list(
+        executor.execute_group_sequentially(stages, [_req("job"), _req("other")], None)
+    )
+
+    assert executed == ["other"]
+    assert [output.cancelled for output in outputs] == [True, False]
+
+
+@pytest.mark.parametrize(
+    "first_error, cancelled", [(None, True), ("Error executing job:0", False)]
+)
+def test_merged_outputs_keep_the_cancel(first_error, cancelled):
+    merged = GPUWorker._merge_expanded_output_batches(
+        [
+            OutputBatch(error=first_error),
+            OutputBatch(error="Request job:1 was cancelled", cancelled=True),
+        ]
+    )
+    assert merged.error is not None
+    assert merged.cancelled is cancelled
+
+
+_VIDEO_JOB = {
+    "id": "job",
+    "object": "video",
+    "model": "m",
+    "status": "in_progress",
+    "progress": 40,
+    "created_at": 0,
+    "size": "1x1",
+    "seconds": "1",
+}
+
+
+def test_delete_publishes_cancel(monkeypatch):
     store = AsyncDictStore()
     published = []
     monkeypatch.setattr(video_api, "VIDEO_STORE", store)
     monkeypatch.setattr(video_api, "publish_cancel", published.append)
 
     async def run_test():
-        await store.upsert(
-            "job",
-            {
-                "id": "job",
-                "object": "video",
-                "model": "m",
-                "status": "in_progress",
-                "progress": 40,
-                "created_at": 0,
-                "size": "1x1",
-                "seconds": "1",
-            },
-        )
-        task = asyncio.create_task(asyncio.Event().wait())
-        if not running:
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        video_api._VIDEO_JOB_TASKS["job"] = task
-        try:
-            response = await video_api.delete_video("job")
-        finally:
-            del video_api._VIDEO_JOB_TASKS["job"]
-            task.cancel()
+        await store.upsert("job", dict(_VIDEO_JOB))
+        response = await video_api.delete_video("job")
         assert response.status == "deleted"
         assert await store.get("job") is None
+        with pytest.raises(HTTPException):
+            await video_api.delete_video("job")
 
     asyncio.run(run_test())
-    assert published == (["job"] if running else [])
+    assert published == ["job"]
+
+
+def test_delete_after_rpc_timeout_publishes_cancel(monkeypatch):
+    """A timeout marks the job failed, but the GPU still runs it."""
+    store = AsyncDictStore()
+    published = []
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_api, "publish_cancel", published.append)
+
+    async def timed_out(*args, **kwargs):
+        raise TimeoutError("Scheduler did not respond in time.")
+
+    monkeypatch.setattr(video_api, "process_generation_batch", timed_out)
+
+    async def run_test():
+        await store.upsert("job", dict(_VIDEO_JOB))
+        task = video_api._start_video_job(
+            "job",
+            video_api._dispatch_job_async(
+                "job",
+                Req(sampling_params=SamplingParams(prompt="p")),
+                resources=AsyncExitStack(),
+            ),
+        )
+        await task
+        assert (await store.get("job"))["status"] == "failed"
+        await video_api.delete_video("job")
+
+    asyncio.run(run_test())
+    assert published == ["job"]
 
 
 def test_stopped_job_of_deleted_video_is_not_failed(monkeypatch):

@@ -416,8 +416,8 @@ job ownership, and queue admission limits require an external serving layer.
 
 An accepted job continues after the submitting client disconnects. For a bounded
 scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
-and generation. A timeout marks the job failed but does not cancel GPU work.
-Retrying creates another job, so clients should retain and poll the returned ID.
+and generation. A timeout marks the job failed but does not cancel GPU work; to
+stop that work, delete the job. Retrying creates another job, so clients should retain and poll the returned ID.
 
 `DELETE /v1/videos/&#123;video_id&#125;` removes the API record and cancels the
 generation: a queued job does not start, and a running job stops after its

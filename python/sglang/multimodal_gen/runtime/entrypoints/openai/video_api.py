@@ -852,11 +852,10 @@ async def delete_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.pop(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    task = _VIDEO_JOB_TASKS.get(video_id)
-    if task is not None and not task.done():
-        # a queued job does not start; a running job stops after its current
-        # denoising step
-        publish_cancel(video_id)
+    # A queued job does not start; a running job stops after its current
+    # denoising step. Publish also when the job task is done: a job that hit
+    # the scheduler RPC timeout is marked failed but still runs on the GPU.
+    publish_cancel(video_id)
     # Mark as deleted in response semantics
     job["status"] = "deleted"
     return VideoResponse(**job)
