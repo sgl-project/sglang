@@ -388,17 +388,16 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return manager.validate_request(req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
         from sglang.srt.runtime_context import get_context, get_parallel
         from sglang.test.scheduler_request_intake import make_request_intake
 
-        sender = Mock()
+        retirer = Mock()
         intake = make_request_intake(
             model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
             mode_owners=ModeOwners(dllm=_manager(fdfo=False)),
             output_streamer=Mock(),
-            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+            request_retirer=retirer,
         )
         intake._maybe_namespace_elastic_radix_cache = Mock()
         intake.add_request_to_queue = Mock()
@@ -431,12 +430,12 @@ class TestGemma4RequestValidation(unittest.TestCase):
             ),
         ):
             intake.handle_generate_request(recv_req)
-        sender.send_output.assert_called_once()
-        abort, original = sender.send_output.call_args.args
-        self.assertIsInstance(abort, AbortReq)
+        retirer.send_abort_output.assert_called_once()
+        (original,) = retirer.send_abort_output.call_args.args
+        finished_reason = retirer.send_abort_output.call_args.kwargs["finished_reason"]
         self.assertIs(original, req)
-        self.assertEqual(abort.finished_reason["status_code"], 400)
-        self.assertIn("return_logprob", abort.finished_reason["message"])
+        self.assertEqual(finished_reason["status_code"], 400)
+        self.assertIn("return_logprob", finished_reason["message"])
         intake.add_request_to_queue.assert_not_called()
         intake.output_streamer.stream_output.assert_not_called()
 

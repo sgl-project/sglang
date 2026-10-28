@@ -29,7 +29,6 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillSta
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -894,9 +893,8 @@ class StepPlanner:
         self.new_token_ratio_tracker.current = new_token_ratio
         for req in reqs_to_abort:
             abort_reason: FINISH_ABORT = req.to_finish
-            self.ipc_channels.send_to_tokenizer.send_output(
-                make_abort_req(req, finished_reason=abort_reason.to_json()),
-                req,
+            self.request_retirer.send_abort_output(
+                req, finished_reason=abort_reason.to_json()
             )
         for req in reqs_to_abort:
             # Member rows were freed inside retract_decode; the group only

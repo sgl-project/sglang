@@ -490,9 +490,9 @@ class TestSpanlessAbortPaths(CustomTestCase):
         enter_scope(self, published_topology())
         get_context().override("test", abort_on_priority_when_disabled=True)
         intake = make_request_intake(
-            ipc_channels=SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda obj, req_arg: sent.append(obj)
+            request_retirer=SimpleNamespace(
+                send_abort_output=lambda req_arg, finished_reason=None: sent.append(
+                    make_abort_req(req_arg, finished_reason=finished_reason)
                 )
             ),
         )

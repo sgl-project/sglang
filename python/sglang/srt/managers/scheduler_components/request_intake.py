@@ -36,7 +36,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
     Req,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.runtime_context import (
     get_device,
@@ -691,16 +690,7 @@ class RequestIntake:
         if self.mode_owners.dllm is not None and (
             error_msg := self.mode_owners.dllm.validate_request(req)
         ):
-            abort_req = make_abort_req(
-                req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.BAD_REQUEST,
-                    "message": error_msg,
-                },
-            )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self._reject_request(req, HTTPStatus.BAD_REQUEST, error_msg)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -1056,18 +1046,23 @@ class RequestIntake:
             and req.priority is not None
             and get_schedule().abort_on_priority_when_disabled
         ):
-            abort_req = make_abort_req(
+            self._reject_request(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
-                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Using priority is disabled for this server. Please send a new request without a priority.",
             )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
+
+    def _reject_request(self, req: Req, status_code: HTTPStatus, message: str) -> None:
+        """Abort a request before it is queued."""
+        finished_reason = {
+            "type": "abort",
+            "status_code": status_code,
+            "message": message,
+        }
+        req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+        self.request_retirer.send_abort_output(req, finished_reason=finished_reason)
 
     def _abort_on_queued_limit(
         self, recv_req: Req, admitted: AbstractSet[Req] = frozenset()
@@ -1109,16 +1104,13 @@ class RequestIntake:
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.ipc_channels.send_to_tokenizer.send_output(
-            make_abort_req(
-                req_to_abort,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": message,
-                },
-            ),
+        self.request_retirer.send_abort_output(
             req_to_abort,
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
