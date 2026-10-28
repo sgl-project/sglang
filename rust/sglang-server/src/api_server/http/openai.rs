@@ -22,7 +22,8 @@ pub(super) use lowered::OpenAiChat;
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
 use crate::utils::response::error_response;
