@@ -7,7 +7,7 @@ from unittest import mock
 
 import torch
 
-import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
+import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestStorageSuffix(CustomTestCase):
@@ -120,7 +120,7 @@ class TestEveryRankWrites(CustomTestCase):
         fake_device = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda: None)
         )
-        with mock.patch.object(umbp_direct_linker, "device_module", fake_device):
+        with mock.patch.object(unified_cache_linker, "device_module", fake_device):
             self.assertTrue(linker.offload(["t"]))
         self.assertEqual(linker._offload_queue.qsize(), 1)
         # The result comes from the offload thread once the write lands, so

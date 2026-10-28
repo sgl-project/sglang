@@ -45,7 +45,7 @@ class _Pool:
 
     def __init__(self):
         self.freed = []
-        self.mamba_allocator = SimpleNamespace(
+        self.state_slots = SimpleNamespace(
             free=lambda slots: self.freed.extend(slots.tolist())
         )
 
@@ -93,6 +93,11 @@ def _batch(reqs, pool, **fields):
     batch = ScheduleBatch(
         reqs=reqs,
         req_to_token_pool=pool,
+        # The allocator carries the state slots.
+        # Static pools: the batch's tracking slots go through the static adapter.
+        token_to_kv_pool_allocator=SimpleNamespace(
+            state_slots=pool.state_slots, storage=None
+        ),
         model_config=SimpleNamespace(
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(mamba_chunk_size=STATE_CHUNK),
@@ -151,7 +156,11 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         # The assembly at the end of prepare_for_extend.
         extend.mamba_prefill_track_mask_cpu = [e.track_mask for e in entries]
         extend.mamba_track_seqlens_cpu = [e.track_seqlen for e in entries]
-        extend.mamba_track_indices = torch.tensor([e.track_index for e in entries])
+        extend.mamba_track_indices = sb._gather_mamba_track_indices(
+            torch.stack([r.kv.mamba_ping_pong_track_buffer for r in extend.reqs]),
+            extend.req_pool_indices,
+            torch.tensor([e.track_position for e in entries]),
+        )
         extend.mamba_track_mask = torch.tensor([e.track_mask for e in entries])
         extend.mamba_track_seqlens = torch.tensor([e.track_seqlen for e in entries])
 
