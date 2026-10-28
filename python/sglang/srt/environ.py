@@ -1032,6 +1032,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Set this to 1 to stop sglang from clearing an inherited
+    # ROCPROFILER_REGISTER_LIBRARY.
+    SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
