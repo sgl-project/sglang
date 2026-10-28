@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.runtime_context import get_parallel
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -116,3 +117,25 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:
+    """``(per, slot, lo, hi)``: every rank owns a stride of ``per`` rows starting
+    at ``slot``, and scores the rows ``[lo, hi)`` of it that exist.
+
+    The uniform stride makes the rank-major concatenation of the strides land
+    row ``i`` back at row ``i``. ``slot`` is not clamped to ``rows``: the
+    in-place all-gather needs this rank's own slot even when it has no rows.
+    """
+    group = get_parallel().dcp_group
+    per = -(-rows // group.world_size)
+    slot = group.rank_in_group * per
+    return per, slot, min(slot, rows), min(slot + per, rows)
+
+
+def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
+    """In-place inverse of ``dcp_split_rows`` on ``world_size * per`` rows of
+    ``buf``. Rows at and past the real row count are left unspecified."""
+    group = get_parallel().dcp_group
+    out = buf[: group.world_size * per]
+    group.all_gather_into_tensor(out, out[slot : slot + per])

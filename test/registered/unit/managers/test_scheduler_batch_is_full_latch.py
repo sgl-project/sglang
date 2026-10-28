@@ -29,6 +29,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
         s.processed_tokens_counter = 0
+        s.disagg_prefill_bootstrap_queue = None
         # Reaching the policy means the admission gates were passed.
         s.policy = SimpleNamespace(calc_priority=Mock(side_effect=_AdmissionAttempted))
         return s

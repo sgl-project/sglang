@@ -566,6 +566,15 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
+                "triton with --dcp-size > 1."
+            )
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
@@ -1587,6 +1596,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
+        "ascend_ops",
         "deepep_v2",
     }
 )
@@ -1825,10 +1835,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
     if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
+        from sglang.srt.mem_cache.kv.plan import resized_after_capture
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        if not resized_after_capture(declared_lifetime_types(model_config)):
             return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)

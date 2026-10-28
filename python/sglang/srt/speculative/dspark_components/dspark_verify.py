@@ -45,7 +45,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
+    build_speculative_verify_target_probs,
+)
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
     DeferredContextCommit,
 )
@@ -213,9 +216,12 @@ class TargetVerifyExecutor:
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
         )
+        greedy_bonus = simulate_bonus_sampling_info is None and (
+            accept_sampling_info is None or accept_sampling_info.is_all_greedy
+        )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if accept_sampling_info is None or accept_sampling_info.is_all_greedy
+            if greedy_bonus
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         return build_accept_outs(
@@ -314,7 +320,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -391,7 +397,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
-                kv_loc_plan=verify_window.kv_loc_plan,
+                iteration_ids=verify_window.iteration_ids,
             )
             return
         hidden = logits_output.hidden_states
@@ -408,7 +414,7 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -425,7 +431,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
-        kv_loc_plan,
+        iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -436,8 +442,8 @@ class TargetVerifyExecutor:
             ragged_verify_layout=layout,
             live_seq_lens_cpu=batch.seq_lens_cpu,
             # The packed rows are a selection of the planned verify window.
-            kv_loc_plan=kv_loc_plan,
-            kv_loc_cols=ragged_window.window_index,
+            iteration_ids=iteration_ids,
+            iteration_cols=ragged_window.window_index,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -490,7 +496,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
 
@@ -843,7 +849,7 @@ class DsparkVerifyEpilogue:
         if not self.simulate_fold:
             target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
         elif self._tail_broadcasts:
-            bonus_in = self._sim_bonus(logits, bs)
+            bonus_in = self.sim_bonus(logits, bs)
             # Rank 0's length and draw, as build_accept_outs broadcasts them.
             self._tp_sync.sync(
                 SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
@@ -885,7 +891,8 @@ class DsparkVerifyEpilogue:
             rows_per_request=self.stride,
         )
 
-    def _sim_bonus(self, logits, bs: int) -> torch.Tensor:
+    def sim_bonus(self, logits, bs: int) -> torch.Tensor:
+        """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
 
     def _log_accept_tail(self, bs: int, *, bonus_in) -> None:
@@ -1053,7 +1060,7 @@ class DsparkVerifyEpilogue:
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
-            bonus = self._sim_bonus(logits, bs).to(bonus.dtype).view_as(bonus)
+            bonus = self.sim_bonus(logits, bs).to(bonus.dtype).view_as(bonus)
         accept = build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
@@ -1065,6 +1072,7 @@ class DsparkVerifyEpilogue:
             tp_sync=self._tp_sync,
             sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
             simulated_correct_len=self.simulated_correct_len,
+            target_logits=None if self.simulate_fold else logits,
             out=self.read_accept(bs),
             block_accept_lens_out=self.read_block_accept_lens(bs),
         )
@@ -1140,6 +1148,16 @@ def build_accept_outs(
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
             )
+        elif target_logits is not None:
+            # The accept's bonus is the real-length row's; take the simulated row's argmax.
+            bonus = (
+                target_logits.index_select(
+                    0, _simulated_rows(correct_len, verify_num_draft_tokens)
+                )
+                .argmax(dim=-1)
+                .to(bonus.dtype)
+                .view_as(bonus)
+            )
     tp_sync.sync(sync_site, correct_len)
     tp_sync.sync(sync_site, bonus)
     tp_sync.sync(sync_site, cap_trim_lens)
@@ -1188,16 +1206,35 @@ def sample_simulated_bonus(
     bs: int,
     verify_num_draft_tokens: int,
 ) -> torch.Tensor:
-    """Temperature-sample every verify row and return the row at the (simulated)
-    correct_len as the bonus token. Temperature only: callers exclude top-p/top-k/min-p."""
-    bonus = simulated_bonus_sample(
-        target_logits=target_logits,
-        correct_len=correct_len,
-        temperatures=sampling_info.temperatures,
-        bs=bs,
-        rows_per_request=verify_num_draft_tokens,
-    )
+    """The bonus token at the (simulated) correct_len row, drawn from the target
+    distribution the sampling accept uses: temperature, then top-k / top-p."""
+    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+        probs = build_speculative_verify_target_probs(
+            next_token_logits=target_logits.index_select(
+                0, _simulated_rows(correct_len, verify_num_draft_tokens)
+            ),
+            sampling_info=sampling_info,
+            draft_token_num=1,
+            bs=bs,
+        ).view(bs, -1)
+        bonus = torch.multinomial(probs, num_samples=1)
+    else:
+        bonus = simulated_bonus_sample(
+            target_logits=target_logits,
+            correct_len=correct_len,
+            temperatures=sampling_info.temperatures,
+            bs=bs,
+            rows_per_request=verify_num_draft_tokens,
+        )
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
+
+
+def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.Tensor:
+    bs = correct_len.shape[0]
+    return (
+        torch.arange(bs, device=correct_len.device) * rows_per_request
+        + correct_len.long()
+    )
 
 
 _blockwise_rejection_noted = False
