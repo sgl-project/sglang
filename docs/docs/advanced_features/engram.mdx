@@ -48,7 +48,7 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
 
 With the tables in GPU memory, CUDA, and a TP group that is one NVLink domain (one node with
 full NVLink, or one multi-node NVLink fabric such as GB300 NVL72), `auto` reads the rows in
-place, as `peer_read` does; the startup log says `Engram lookup auto: peer_read`. Measured with
+place, as `peer_read` does, and logs `Engram lookup auto -> peer_read`. Measured with
 one Engram layer, it was faster than every collective, for prefill (1K to 32K tokens per rank)
 and decode (1 to 1,024 tokens per rank, in CUDA graphs):
 
