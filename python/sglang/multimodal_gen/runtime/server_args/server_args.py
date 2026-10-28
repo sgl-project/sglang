@@ -1273,7 +1273,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
         if (
             self.backend != Backend.DIFFUSERS
-            and self.attention_backend in ("laser_attn", "rain_fusion_attn")
+            and current_platform.is_npu()
+            and self.attention_backend is not None
+            and AttentionBackendEnum[self.attention_backend.upper()].is_sparse
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
