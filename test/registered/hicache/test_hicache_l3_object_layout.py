@@ -57,6 +57,19 @@ def _sidecar(pool_name: PoolName, hit_policy: PoolHitPolicy) -> SidecarPoolSpec:
     )
 
 
+class _LayoutScheduler(Scheduler):
+    """A scheduler shell whose L3 layout reads its own HiCache switch, so a
+    test can hold an enabled and a disabled scheduler at once."""
+
+    hierarchical = True
+
+    def _hicache_l3_layout(self) -> dict:
+        with get_context().override_server_args(
+            enable_hierarchical_cache=self.hierarchical, page_size=64
+        ):
+            return super()._hicache_l3_layout()
+
+
 class TestHiCacheL3ObjectLayout(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -97,19 +110,22 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
 
     @staticmethod
     def _scheduler(store=None, *, hierarchical=True):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.enable_hierarchical_cache = hierarchical
-        scheduler.page_size = 64
-        scheduler.max_total_num_tokens = 8192
-        scheduler.max_req_input_len = 4096
-        scheduler.startup_time = None
+        scheduler = _LayoutScheduler.__new__(_LayoutScheduler)
+        scheduler.hierarchical = hierarchical
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(
             storage_backend=store, storage_backend_type="mooncake" if store else None
         )
         cache.sidecar_pool_specs = []
         cache.components = {}
-        scheduler.tree_cache = cache
+        scheduler.parts = SimpleNamespace(
+            kv=SimpleNamespace(tree_cache=cache),
+            capacity=SimpleNamespace(max_total_num_tokens=8192),
+            limits=SimpleNamespace(max_req_input_len=4096),
+        )
+        scheduler.hub = SimpleNamespace(
+            internal_state=SimpleNamespace(startup_time=None)
+        )
         return scheduler
 
     def test_physical_primary_and_components_match_actual_write_keys(self):
@@ -120,10 +136,10 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         mamba.temporal_state_elem_size = 1
         mamba.get_page_buffer_meta = self._host_pool(3).get_page_buffer_meta
         scheduler = self._scheduler(store)
-        scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
+        scheduler.parts.kv.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
             full_window_pages=3
         )
-        scheduler.tree_cache.sidecar_pool_specs = [
+        scheduler.parts.kv.tree_cache.sidecar_pool_specs = [
             _sidecar(PoolName.INDEXER, PoolHitPolicy.ALL_PAGES)
         ]
 
@@ -188,8 +204,8 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 store.is_mla_backend = mla
                 store.registered_pools[PoolName.SWA].v_buffer = object()
                 scheduler = self._scheduler(backend, hierarchical=hierarchical)
-                scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
-                    full_window_pages=2
+                scheduler.parts.kv.tree_cache.components[ComponentType.SWA] = (
+                    SimpleNamespace(full_window_pages=2)
                 )
                 reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
                 self.assertEqual(
@@ -219,7 +235,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
     def test_cache_without_controller_does_not_break_startup(self):
         """Pure-SWA and unattached caches must return an unavailable layout."""
         scheduler = self._scheduler()
-        scheduler.tree_cache.cache_controller = None
+        scheduler.parts.kv.tree_cache.cache_controller = None
         reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
         self.assertFalse(reply.layout["enabled"])
         self.assertIn("controller", reply.layout["reason"])
@@ -494,8 +510,8 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store = self._store()
         store.mem_pool_host = self._host_pool()
         scheduler = self._scheduler(store)
-        scheduler.tree_cache = SimpleNamespace(
-            cache_controller=scheduler.tree_cache.cache_controller
+        scheduler.parts.kv.tree_cache = SimpleNamespace(
+            cache_controller=scheduler.parts.kv.tree_cache.cache_controller
         )
         layout = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq()).layout
         self.assertTrue(layout["enabled"])

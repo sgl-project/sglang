@@ -1430,9 +1430,9 @@ class Scheduler:
     def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
 
-        if not self.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             return disabled_l3_layout(
-                "Hierarchical cache is disabled", page_size=self.page_size
+                "Hierarchical cache is disabled", page_size=get_schedule().page_size
             )
 
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -1441,18 +1441,18 @@ class Scheduler:
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        tree_cache = self.tree_cache
+        tree_cache = self.parts.kv.tree_cache
         controller = tree_cache.cache_controller
         if controller is None:
             return disabled_l3_layout(
-                "HiCache controller is not attached", page_size=self.page_size
+                "HiCache controller is not attached", page_size=get_schedule().page_size
             )
         storage_backend = controller.storage_backend
         if not isinstance(storage_backend, MooncakeStore):
             return disabled_l3_layout(
                 "Mooncake storage is not attached",
                 backend=controller.storage_backend_type,
-                page_size=self.page_size,
+                page_size=get_schedule().page_size,
             )
 
         sidecar_pool_specs = ()
@@ -1463,7 +1463,7 @@ class Scheduler:
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
             swa_trailing_pages=swa.full_window_pages if swa is not None else None,
-            page_size=self.page_size,
+            page_size=get_schedule().page_size,
         )
 
     def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
