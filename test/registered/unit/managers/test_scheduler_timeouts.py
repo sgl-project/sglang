@@ -24,22 +24,26 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
+    release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
+        self.session = None
+        self.multimodal_inputs = None
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
@@ -72,6 +76,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+    s.rust_server = None
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None

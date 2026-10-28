@@ -3,7 +3,6 @@
 
 import copy
 import json
-import os
 from collections import Counter
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -32,10 +31,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     Kandinsky6SRPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -61,9 +56,6 @@ from sglang.multimodal_gen.runtime.pipelines.kandinsky6_sr_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.run_spec import (
     build_sampling_spec,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.sampling import (
-    PiflowParams,
-)
 
 
 class Bundle(NamedTuple):
@@ -77,7 +69,6 @@ class Bundle(NamedTuple):
     head_width: int  # ``out_visual_dim`` of the transformer: the TOTAL head width
     n_grid: int  # grids of the head: 1 (flow-matching) or the scheduler's ``n_grid``
     scheduler_scale: float  # ``sr_params.scheduler_scale``
-    calls_per_tile: int  # DiT calls per tile at the default ``num_inference_steps`` 5
 
 
 FLOW = Bundle(
@@ -89,7 +80,6 @@ FLOW = Bundle(
     head_width=64,
     n_grid=1,
     scheduler_scale=5.0,
-    calls_per_tile=5,
 )
 DISTILLED = Bundle(
     model_index=DISTILLED_MODEL_INDEX,
@@ -100,26 +90,13 @@ DISTILLED = Bundle(
     head_width=640,
     n_grid=10,
     scheduler_scale=3.5,
-    calls_per_tile=2,
 )
 both_repos = pytest.mark.parametrize(
     "bundle", [FLOW, DISTILLED], ids=["flow_matching", "distilled_pi_flow"]
 )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def single_process_model_parallel():
-    """The K6 feed-forward uses TP-aware linears, which need a (size-1) TP group."""
-    if not model_parallel_is_initialized():
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT="29509",
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            os.environ.setdefault(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 def _prefixes(keys, depth=2):
@@ -162,17 +139,18 @@ def test_real_transformer_config_builds_the_release_dit(bundle):
     # ``out_visual_dim`` is the TOTAL head width (64 * n_grid); a pi-Flow repo keeps its
     # n_grid in the scheduler config
     assert state["out_layer.out_layer.weight"].shape == (bundle.head_width, 1792)
-    assert model.base_out_visual_dim == 64 and model.n_grid == 1
-    assert bundle.n_grid * model.base_out_visual_dim == bundle.head_width
+    assert bundle.n_grid * model.in_visual_dim == bundle.head_width
     assert model.instruct_type == "hybrid_anchor" and model.visual_cond
     assert model.visual_embed_dim == 2 * 64 + 1  # wide [x | cond | mask] input
     arch = config.arch_config
     assert arch.sr_scale_factor == {"512": [1.0, 2.0, 2.0]}
-    assert arch.sr_scheduler_scale == bundle.scheduler_scale and not arch.is_piflow
+    assert arch.sr_scheduler_scale == bundle.scheduler_scale
 
 
 @both_repos
-def test_real_scheduler_config_loads_through_the_scheduler_loader(bundle, tmp_path):
+def test_loaded_scheduler_controls_sampling_and_rejects_a_mismatched_head(
+    bundle, tmp_path
+):
     scheduler = _load_scheduler(bundle, tmp_path)
     # PiflowScheduler subclasses the flow-matching scheduler: compare exact types
     assert type(scheduler) is bundle.scheduler_cls
@@ -180,43 +158,48 @@ def test_real_scheduler_config_loads_through_the_scheduler_loader(bundle, tmp_pa
     if bundle is DISTILLED:
         assert (scheduler.config["nfe"], scheduler.config["n_grid"]) == (2, 10)
 
-
-@both_repos
-def test_real_scheduler_selects_the_sampler_of_its_repo(bundle, tmp_path):
-    """The distilled repo resolves to pi-Flow (``nfe`` = 2 calls per tile, whatever
-    ``num_inference_steps`` is), the flow-matching repo to flow-Euler
-    (``num_inference_steps`` calls per tile directly -- this repo's own convention, not
-    the upstream Diffusers pipeline's timestep-grid-point count).
-    """
-    scheduler = _load_scheduler(bundle, tmp_path)
     arch = _dit_config(bundle).arch_config
+    for num_steps in (3, 5, 9):
+        spec = _sampling_spec(arch, scheduler, num_steps)
+        assert spec.is_piflow == (bundle is DISTILLED)
+        assert spec.num_steps == (2 if bundle is DISTILLED else num_steps)
+    mismatched = _dit_config(FLOW if bundle is DISTILLED else DISTILLED).arch_config
+    with pytest.raises(ValueError, match="head.*same checkpoint"):
+        _sampling_spec(mismatched, scheduler)
 
-    def spec(num_steps):
-        return build_sampling_spec(
-            arch=arch,
-            tiling_scale=2,
-            seed=42,
-            num_steps=num_steps,
-            tiles_batch_size=1,
-            tile_min_overlap=0.2,
-            scheduler=scheduler,
+
+def _sampling_spec(arch, scheduler, num_steps=5):
+    return build_sampling_spec(
+        arch=arch,
+        scheduler=scheduler,
+        tiling_scale=2,
+        seed=42,
+        num_steps=num_steps,
+        tiles_batch_size=1,
+        tile_min_overlap=0.2,
+    )
+
+
+@pytest.mark.parametrize("nfe", [None, 0, -1])
+def test_piflow_requires_a_positive_checkpoint_step_count(nfe):
+    with pytest.raises(ValueError, match="nfe >= 1"):
+        _sampling_spec(
+            _dit_config(DISTILLED).arch_config, PiflowScheduler(nfe=nfe, n_grid=10)
         )
 
-    assert spec(5).steps_per_chunk == bundle.calls_per_tile
-    assert spec(5).scheduler_scale == bundle.scheduler_scale
-    if bundle is DISTILLED:
-        assert spec(5).piflow == PiflowParams(
-            nfe=2,
-            num_policy_substeps=128,
-            final_step_size_scale=0.5,
-            shift=3.5,
-            n_grid=10,
-            eps=1e-6,
-        )
-        assert spec(3).steps_per_chunk == spec(9).steps_per_chunk == 2
-    else:
-        assert spec(5).piflow is None
-        assert (spec(3).steps_per_chunk, spec(9).steps_per_chunk) == (3, 9)
+
+def test_sampling_rejects_missing_scheduler_steps_and_unsupported_cap():
+    arch = _dit_config(DISTILLED).arch_config
+    for scheduler in (None, object()):
+        with pytest.raises(ValueError, match="scheduler|Scheduler"):
+            _sampling_spec(arch, scheduler)
+    scheduler = PiflowScheduler(nfe=2, n_grid=10)
+    with pytest.raises(ValueError, match="num_inference_steps"):
+        _sampling_spec(arch, scheduler, num_steps=0)
+    arch.sr_cap_noise_timestep = True
+    arch.attribute_overrides = {"instruct_type": "noise"}
+    with pytest.raises(NotImplementedError, match="cap_noise_timestep"):
+        _sampling_spec(arch, scheduler)
 
 
 def test_real_vae_config_builds_the_release_kvae_and_maps_official_keys():
@@ -301,10 +284,12 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
         loader_cls=None,
         component_attn_backend=None,
         component_attn_name=None,
+        component_backend_by_role=None,
     ):
         assert component_type == component_name
         assert loader_cls is None and component_attn_backend is None
         assert component_attn_name == component_name
+        assert component_backend_by_role == {}
         requested[component_name] = (transformers_or_diffusers, component_architecture)
         return SimpleNamespace(name=component_name), 0.0
 
@@ -319,6 +304,7 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
         component_direct_gpu_weight_loading={},
         pipeline_config=Kandinsky6SRPipelineConfig(),
         resolve_component_attention_backend=lambda *names: (None, None),
+        resolve_component_backend_by_role=lambda *names: {},
     )
     # the state ``ComposedPipelineBase.__init__`` sets up before it calls load_modules
     pipeline = object.__new__(Kandinsky6SRPipeline)

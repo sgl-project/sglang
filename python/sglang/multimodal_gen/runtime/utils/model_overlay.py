@@ -26,6 +26,11 @@ logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "tencent/Hy-Nomas": {
+        "overlay_repo_id": "Niehen6174/Hy-Nomas-overlay",
+        "overlay_revision": "14088cc131c66fb7265cefbf99276428ccd5a957",
+        "source_revision": "dea948068220d1037f1d1c10b95b6793d92bee28",
+    },
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
@@ -45,13 +50,18 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
     },
-    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
-        "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
-        "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
+    "FastVideo/FastVideo-FastH3-8-Step-V2": {
+        "overlay_repo_id": "kevin-mi/FastH3-8step-V2-overlay",
+        "overlay_revision": "308e2dd627218c40ae759a93745429800771a625",
     },
     "OpenVDN/vdn-minimax-h3": {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
         "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
+    },
+    "FastVideo/FastVideo-FastH3-Omni-8-Step-V1": {
+        "overlay_repo_id": "Niehen6174/FastH3-Omni-overlay",
+        "overlay_revision": "953ede55daf20a70cc6f0b59464293e2f408608c",
+        "source_revision": "53e0d26a1691aa473b6262d8196a8feb2c297df0",
     },
 }
 
@@ -97,33 +107,8 @@ def _compute_overlay_fingerprint(overlay_dir: str) -> str:
     return hasher.hexdigest()
 
 
-def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
-    bundled_overlay_subdir = overlay_spec.get("bundled_overlay_subdir")
-    if not bundled_overlay_subdir:
-        return None
-    bundled_overlay_dir = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "model_overlays",
-            str(bundled_overlay_subdir),
-        )
-    )
-    if not os.path.isdir(bundled_overlay_dir):
-        return None
-    if load_overlay_manifest_if_present(bundled_overlay_dir) is None:
-        return None
-    return bundled_overlay_dir
-
-
 def get_diffusion_cache_root() -> str:
     return envs.SGLANG_DIFFUSION_CACHE_ROOT
-
-
-def clear_model_overlay_registry_cache() -> None:
-    global _MODEL_OVERLAY_REGISTRY_CACHE
-    _MODEL_OVERLAY_REGISTRY_CACHE = None
 
 
 def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
@@ -182,8 +167,8 @@ def resolve_model_overlay_target(
     if os.path.exists(model_name_or_path):
         # Local source dirs do not have a repo id, so match them by basename.
         base_name = os.path.basename(os.path.normpath(model_name_or_path))
-        normalized_path = (
-            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/")
+        path_parts = (
+            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/").split("/")
         )
         for source_model_id, spec in registry.items():
             if base_name == source_model_id.rsplit("/", 1)[-1]:
@@ -191,7 +176,7 @@ def resolve_model_overlay_target(
             cache_repo_fragment = (
                 f"models--{source_model_id.lower().replace('/', '--')}"
             )
-            if cache_repo_fragment in normalized_path:
+            if cache_repo_fragment in path_parts:
                 return source_model_id, spec
 
     return None
@@ -383,6 +368,7 @@ def resolve_direct_overlay_repo(
     model_name_or_path: str,
     *,
     hf_hub_download_fn: Callable[..., str],
+    snapshot_download_fn: Callable[..., str] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
     if os.path.exists(model_name_or_path):
         manifest = load_overlay_manifest_if_present(model_name_or_path)
@@ -416,6 +402,22 @@ def resolve_direct_overlay_repo(
     except Exception:
         return None
 
+    if snapshot_download_fn is not None:
+        # The manifest alone leaves model_index.json and configs out of the snapshot.
+        try:
+            overlay_dir = download_overlay_metadata(
+                model_name_or_path,
+                {"overlay_repo_id": model_name_or_path},
+                snapshot_download_fn=snapshot_download_fn,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to download overlay metadata for %s",
+                model_name_or_path,
+                exc_info=True,
+            )
+            return None
+
     manifest = load_overlay_manifest_if_present(overlay_dir)
     if manifest is None:
         return None
@@ -446,15 +448,6 @@ def download_overlay_metadata(
     *,
     snapshot_download_fn: Callable[..., str],
 ) -> str:
-    bundled_overlay_dir = _resolve_bundled_overlay_dir(overlay_spec)
-    if bundled_overlay_dir is not None:
-        logger.info(
-            "Using bundled overlay metadata for %s from %s",
-            source_model_id,
-            bundled_overlay_dir,
-        )
-        return bundled_overlay_dir
-
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     if os.path.exists(overlay_repo_id):
         logger.info(
@@ -702,7 +695,9 @@ def maybe_load_overlay_model_index(
         return load_model_index_from_dir(overlay_dir)
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None
@@ -780,7 +775,9 @@ def maybe_resolve_overlay_model_path(
         )
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None

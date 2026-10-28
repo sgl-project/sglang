@@ -12,16 +12,11 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
-    ATTRIBUTE_OVERRIDE_WHITELIST,
+    WIDE_INPUT_INSTRUCT_TYPES,
     Kandinsky6SRArchConfig,
     Kandinsky6SRDitConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_ctx,
-    get_ulysses_ctx,
-)
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     gather_seq,
     shard_like,
@@ -38,14 +33,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.kandinsky6 import (
-    Kandinsky6Attention,
-    Kandinsky6FeedForward,
-    Kandinsky6Modulation,
     Kandinsky6OutLayer,
     Kandinsky6RoPE3D,
     Kandinsky6TimeEmbeddings,
+    Kandinsky6TransformerBlock,
     Kandinsky6VisualEmbeddings,
     _build_rotary_freqs,
+    _validate_parallelism,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -80,40 +74,8 @@ class Kandinsky6SRRoPE3D(Kandinsky6RoPE3D):
         return self
 
 
-class Kandinsky6SRDecoderBlock(nn.Module):
-    """Modulated self-attention and FFN with fp32 residuals and parameter-dtype linears."""
-
-    def __init__(
-        self,
-        model_dim: int,
-        time_dim: int,
-        ff_dim: int,
-        head_dim: int,
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        prefix: str = "",
-        quant_config: QuantizationConfig | None = None,
-    ):
-        super().__init__()
-        self.visual_modulation = Kandinsky6Modulation(time_dim, model_dim, 6)
-        self.self_attention_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.self_attention = Kandinsky6Attention(
-            model_dim,
-            head_dim,
-            supported_attention_backends=supported_attention_backends,
-            prefix=add_prefix("self_attention", prefix),
-            quant_config=quant_config,
-        )
-        self.feed_forward_norm = LayerNormScaleShift(
-            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
-        )
-        self.feed_forward = Kandinsky6FeedForward(
-            model_dim,
-            ff_dim,
-            prefix=add_prefix("feed_forward", prefix),
-            quant_config=quant_config,
-        )
+class Kandinsky6SRDecoderBlock(Kandinsky6TransformerBlock):
+    """Modulated self-attention and FFN with fp32 residuals."""
 
     def forward(
         self,
@@ -139,32 +101,6 @@ class Kandinsky6SRDecoderBlock(nn.Module):
         return visual_embed + gate.float() * out.float()
 
 
-class Kandinsky6SROutLayer(Kandinsky6OutLayer):
-    """K6 ``OutLayer`` for an fp32 residual stream (norm in fp32, linear in weight dtype)."""
-
-    def forward(
-        self, visual_embed: torch.Tensor, time_embed: torch.Tensor
-    ) -> torch.Tensor:
-        shift, scale = torch.chunk(
-            self.modulation(time_embed).unsqueeze(dim=1), 2, dim=-1
-        )
-        x = (
-            self.norm(visual_embed.float()) * (scale.float()[:, None, None] + 1.0)
-            + shift.float()[:, None, None]
-        )
-        x, _ = self.out_layer(x.to(self.out_layer.weight.dtype))
-
-        batch_size, duration, height, width, _ = x.shape
-        pt, ph, pw = self.patch_size
-        return (
-            x.view(batch_size, duration, height, width, -1, pt, ph, pw)
-            .permute(0, 1, 5, 2, 6, 3, 7, 4)
-            .flatten(1, 2)
-            .flatten(2, 3)
-            .flatten(3, 4)
-        )
-
-
 class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     """Text-free Kandinsky 6 SR DiT (optionally with a DX / pi-Flow head)."""
 
@@ -179,39 +115,6 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.TORCH_SDPA,
     }
 
-    @staticmethod
-    def _validate_tp_config(*, arch: Kandinsky6SRArchConfig, tp_size: int) -> None:
-        if tp_size <= 0:
-            raise ValueError("Kandinsky6SR TP size must be positive.")
-        for name, value in (
-            ("num_attention_heads", arch.num_attention_heads),
-            ("ff_dim", arch.ff_dim),
-        ):
-            if value % tp_size:
-                raise ValueError(
-                    f"Kandinsky6SR {name}={value} must be divisible by TP size {tp_size}."
-                )
-
-    @staticmethod
-    def _validate_sequence_parallel_config(
-        *, arch: Kandinsky6SRArchConfig, tp_size: int, ulysses_size: int, ring_size: int
-    ) -> None:
-        if ulysses_size <= 0:
-            raise ValueError("Kandinsky6SR Ulysses size must be positive.")
-        if ring_size <= 0:
-            raise ValueError("Kandinsky6SR ring size must be positive.")
-        if ulysses_size == 1 and ring_size == 1:
-            return
-        # Ring Attention rotates whole K/V shards between ranks rather than
-        # splitting heads, so only Ulysses constrains head divisibility.
-        local_heads = arch.num_attention_heads // tp_size
-        if local_heads % ulysses_size:
-            raise ValueError(
-                f"Kandinsky6SR TP-local attention heads {local_heads} must be "
-                f"divisible by Ulysses size {ulysses_size} (total heads="
-                f"{arch.num_attention_heads}, TP={tp_size})."
-            )
-
     def __init__(
         self,
         config: Kandinsky6SRDitConfig,
@@ -223,45 +126,19 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.quant_config = quant_config
         head_dim = sum(arch.axes_dims)
 
-        tp_size = get_tp_world_size()
-        ulysses_size, _ = get_ulysses_ctx()
-        ring_size, _ = get_ring_ctx()
-        self._validate_tp_config(arch=arch, tp_size=tp_size)
-        self._validate_sequence_parallel_config(
-            arch=arch, tp_size=tp_size, ulysses_size=ulysses_size, ring_size=ring_size
-        )
+        _validate_parallelism(arch.num_attention_heads, ff_dim=arch.ff_dim)
 
         self.in_visual_dim = arch.in_visual_dim
-        self.base_out_visual_dim = arch.base_out_visual_dim
-        self.n_grid = arch.n_grid
         self.model_dim = arch.model_dim
         self.patch_size = arch.patch_size
         self.use_motion_score = arch.use_motion_score
         self.use_lq_noise_cond = arch.use_lq_noise_cond
-        # The input width is fixed by the *trained* configuration ...
+        # overrides change inference behavior, never the trained input width
         self.visual_embed_dim = (
             2 * arch.in_visual_dim + 1
             if arch.trained_wide_input
             else arch.in_visual_dim
         )
-        self._build_layers(arch, head_dim=head_dim, quant_config=quant_config)
-
-        self.hidden_size = arch.hidden_size
-        self.num_attention_heads = arch.num_attention_heads
-        self.num_channels_latents = arch.num_channels_latents
-        self.layer_names = list(_BLOCK_CONTAINERS)
-        # ... while inference behaviour comes from the post-load overrides.
-        self._apply_attribute_overrides(arch)
-        self._require_all_checkpoint_keys()
-        self.__post_init__()
-
-    def _build_layers(
-        self,
-        arch: Kandinsky6SRArchConfig,
-        *,
-        head_dim: int,
-        quant_config: QuantizationConfig | None,
-    ) -> None:
         self.time_embeddings = Kandinsky6TimeEmbeddings(arch.model_dim, arch.time_dim)
         if arch.use_motion_score:
             self.motion_embeddings = Kandinsky6TimeEmbeddings(
@@ -295,35 +172,17 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(arch.num_visual_blocks)
             ]
         )
-        self.out_layer = Kandinsky6SROutLayer(
+        self.out_layer = Kandinsky6OutLayer(
             arch.model_dim,
             arch.time_dim,
-            arch.head_width,
+            arch.out_visual_dim,
             arch.patch_size,
         )
 
-    def _apply_attribute_overrides(self, arch: Kandinsky6SRArchConfig) -> None:
-        self.instruct_type = arch.instruct_type
-        self.visual_cond = arch.visual_cond
-        self.attention_params = arch.attention_params
-        for name in ATTRIBUTE_OVERRIDE_WHITELIST:
-            if name in arch.attribute_overrides:
-                setattr(self, name, arch.attribute_overrides[name])
-        self._check_input_width_matches_overrides()
-        sparse_type = arch.requested_sparse_attention()
-        if sparse_type is not None:
-            logger.warning(
-                "Kandinsky6SR: attention_params request %r sparse attention; this port "
-                "runs dense attention, so outputs differ from the sparse reference.",
-                sparse_type,
-            )
-
-    def _check_input_width_matches_overrides(self) -> None:
-        run_wide = self.visual_cond or self.instruct_type in (
-            "channel",
-            "hybrid",
-            "hybrid_anchor",
-        )
+        self.instruct_type = arch.effective_override("instruct_type")
+        self.visual_cond = arch.effective_override("visual_cond")
+        self.attention_params = arch.effective_override("attention_params")
+        run_wide = self.visual_cond or self.instruct_type in WIDE_INPUT_INSTRUCT_TYPES
         run_width = 2 * self.in_visual_dim + 1 if run_wide else self.in_visual_dim
         if run_width != self.visual_embed_dim:
             raise ValueError(
@@ -334,10 +193,21 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 "under instruct_type='noise'."
             )
 
-    def _require_all_checkpoint_keys(self) -> None:
-        """A missing tensor must fail loudly instead of being zero-filled by the loader."""
+        sparse_type = arch.requested_sparse_attention()
+        if sparse_type is not None:
+            logger.warning(
+                "Kandinsky6SR: attention_params request %r sparse attention; this port "
+                "runs dense attention, so outputs differ from the sparse reference.",
+                sparse_type,
+            )
+        self.hidden_size = arch.hidden_size
+        self.num_attention_heads = arch.num_attention_heads
+        self.num_channels_latents = arch.num_channels_latents
+        self.layer_names = list(_BLOCK_CONTAINERS)
+        # missing checkpoint tensors must fail, not be zero-filled
         for param in self.parameters():
             param.missing_param_init = "error"
+        self.__post_init__()
 
     def preprocess_loaded_state_dict(
         self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
@@ -371,7 +241,16 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         timesteps are scaled by 1000. DX channels are ordered grid-major;
         the scheduler reshapes them into n_grid velocity predictions."""
-        self._check_latent_shape(hidden_states)
+        if hidden_states.ndim != 5 or hidden_states.shape[-1] != self.visual_embed_dim:
+            raise ValueError(
+                "Kandinsky6SR expects a [B, T, H, W, "
+                f"{self.visual_embed_dim}] latent, got {tuple(hidden_states.shape)}"
+            )
+        height, width = hidden_states.shape[2:4]
+        if height % self.patch_size[1] or width % self.patch_size[2]:
+            raise ValueError(
+                f"latent {height}x{width} is not divisible by patch {self.patch_size}"
+            )
         compute_dtype = self.visual_embeddings.in_layer.weight.dtype
         time_embed = self.time_embeddings(timestep)
         if motion_score is not None and self.use_motion_score:
@@ -397,19 +276,11 @@ class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask_meta=attn_meta,
             )
         visual_embed = gather_seq(visual_embed, shard.orig_len)
-        return self.out_layer(visual_embed.reshape(*visual_shape, -1), time_embed)
-
-    def _check_latent_shape(self, hidden_states: torch.Tensor) -> None:
-        if hidden_states.ndim != 5 or hidden_states.shape[-1] != self.visual_embed_dim:
-            raise ValueError(
-                "Kandinsky6SR expects a [B, T, H, W, "
-                f"{self.visual_embed_dim}] latent, got {tuple(hidden_states.shape)}"
-            )
-        height, width = hidden_states.shape[2:4]
-        if height % self.patch_size[1] or width % self.patch_size[2]:
-            raise ValueError(
-                f"latent {height}x{width} is not divisible by patch {self.patch_size}"
-            )
+        return self.out_layer(
+            visual_embed.reshape(*visual_shape, -1),
+            time_embed,
+            compute_dtype=self.out_layer.out_layer.weight.dtype,
+        )
 
     def post_load_weights(self) -> None:
         """Rebuild RoPE / time-embedding tables that a meta-device init left on meta."""

@@ -37,8 +37,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -66,6 +67,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         return scheduler
 
     def _new_req(self, priority=None):
@@ -207,7 +209,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 req_pool_idx=1,
                 cache_protected_len=2,
             ),
-            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
+            prefix_len=2,
             priority=3,
             extra_key=None,
             cache_salt=None,
@@ -216,8 +218,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         return cache, component, req
 
-    def _pop_bootstrapping_swa_branch(self, write_policy):
-        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+    def _pop_bootstrapping_swa_branch(
+        self, write_policy, *, queue_cls=PrefillBootstrapQueue, is_retracted=False
+    ):
+        queue = queue_cls.__new__(queue_cls)
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -233,7 +237,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             rid="req",
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
-            is_retracted=False,
+            is_retracted=is_retracted,
             swa_branching_seqlen=4,
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
@@ -272,6 +276,27 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 self.assertEqual(req.prefill_attempt_count, 1)
                 queue.ensure_metadata_buffer.assert_called_once_with(req)
 
+    def test_subclass_eligibility_admits_prefill_but_never_a_paused_request(self):
+        """`can_prefill_before_bootstrap` is the override point; the pause check
+        stays outside it, so a permissive subclass cannot resume a retracted req."""
+
+        class _Eager(PrefillBootstrapQueue):
+            def can_prefill_before_bootstrap(self, req):
+                return True
+
+        queue, req, result = self._pop_bootstrapping_swa_branch(
+            "write_through", queue_cls=_Eager
+        )
+        self.assertEqual(result, [req])
+        self.assertEqual(req.prefill_attempt_count, 1)
+
+        queue, req, result = self._pop_bootstrapping_swa_branch(
+            "write_through", queue_cls=_Eager, is_retracted=True
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(queue.queue, [req])
+        queue.ensure_metadata_buffer.assert_not_called()
+
     def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
         cache, component, req = self._new_unpublished_swa_state()
         last_node = req.last_node
@@ -279,7 +304,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.advance_unpublished_req(req)
 
-        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
         self.assertEqual(req.kv.cache_protected_len, 2)
         self.assertIs(req.last_node, last_node)
         prepare_params = component.prepare_for_caching_req.call_args.kwargs[
@@ -343,12 +367,21 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.int32).reshape(1, 8)
+        )
         scheduler.tree_cache = cache
-        req = SimpleNamespace(pending_bootstrap=True)
+        req = SimpleNamespace(
+            pending_bootstrap=True,
+            kv=SimpleNamespace(req_pool_idx=0),
+            extend_end=5,
+        )
 
         SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
 
         cache.advance_unpublished_req.assert_called_once_with(req)
+        # The next chunk still resumes after this one.
+        self.assertEqual(req.prefix_len, 5)
 
     def test_bootstrap_success_publishes_once(self):
         scheduler = SimpleNamespace(
@@ -403,6 +436,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None
@@ -424,7 +458,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         release.assert_not_called()
 
 
-class TestDecodePreallocQueuePriority(unittest.TestCase):
+class TestDecodePreallocQueuePriority(CustomTestCase):
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()
@@ -510,6 +544,46 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
+
+    def test_hisparse_prealloc_reserves_scratch_for_pending_transfers(self):
+        """Pending PD requests consume a full buffer and scratch, not just a buffer."""
+        for available, pending, admitted in (
+            (4160, 0, 0),
+            (8320, 1, 0),
+            (10368, 1, 1),
+            (10368, 0, 2),
+        ):
+            with self.subTest(available=available, pending=pending):
+                reqs = [self._new_decode_req(f"hisparse-{i}", i) for i in range(3)]
+                queue = self._new_queue(reqs)
+                queue.scheduler.enable_priority_scheduling = False
+                queue.scheduler.enable_hisparse = True
+                queue.scheduler.enable_decode_hicache = False
+                queue.scheduler.hisparse_coordinator = SimpleNamespace(
+                    padded_buffer_size=4160,
+                    spec_swap=SimpleNamespace(scratch_capacity=1024),
+                )
+                queue.token_to_kv_pool_allocator.logical_attn_allocator = (
+                    SimpleNamespace(available_size=lambda: 32768)
+                )
+                queue.token_to_kv_pool_allocator.hisparse_attn_allocator = (
+                    SimpleNamespace(available_size=lambda: available)
+                )
+                queue.token_to_kv_pool_allocator.page_size = 64
+                queue.token_to_kv_pool.page_size = 64
+                queue.draft_token_to_kv_pool = None
+                queue.transfer_queue.queue = [
+                    SimpleNamespace(host_staged=False) for _ in range(pending)
+                ]
+                queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+                queue._uses_swa_reservation = MagicMock(return_value=False)
+                queue._send_kv_metadata = MagicMock()
+
+                preallocated, failed = queue.pop_preallocated()
+
+                self.assertEqual(failed, [])
+                self.assertEqual(preallocated, reqs[:admitted])
+                self.assertEqual(queue.queue, reqs[admitted:])
 
     def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
         """In-flight requests retain their adapter slots."""
@@ -619,6 +693,30 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
+
+    def test_admission_without_radix_cache_charges_the_alloc_hook(self):
+        """Bug regression: with the decode radix cache disabled, admission
+        charged the raw fill length while ``_pre_alloc`` allocates the
+        page-rounded ``_required_alloc_tokens``. On a paged pool a request
+        could pass admission and then fail allocation; the radix-cache path
+        already charged the rounded amount. Admission must charge what the
+        pool will allocate, so the mocked charge decides whether the request
+        fits."""
+        for charge, fits in ((50, True), (200, False)):
+            with self.subTest(charge=charge):
+                decode_req = self._new_decode_req("req", 1)
+                queue = self._new_queue([decode_req])
+                queue.token_to_kv_pool_allocator.available_size.return_value = 100
+                queue._required_alloc_tokens = MagicMock(return_value=charge)
+
+                preallocated, failed = queue.pop_preallocated()
+
+                queue._required_alloc_tokens.assert_called_once_with(
+                    fill_len=3, prefix_len=0
+                )
+                self.assertEqual(preallocated, [decode_req] if fits else [])
+                self.assertEqual(queue.queue, [] if fits else [decode_req])
+                self.assertEqual(failed, [])
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
