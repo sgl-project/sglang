@@ -64,9 +64,10 @@ def _backend(wrappers, kv_cache, *, use_ragged=False):
     backend.num_wrappers = 2
     backend.dispatch_reason = fb.WrapperDispatch.SLIDING_WINDOW
     backend.prefill_uses_dequant_workspace = False
-    backend.token_to_kv_pool = None
-    backend.kv_layers = SimpleNamespace(
-        read=lambda layer_id: SimpleNamespace(kv=lambda: kv_cache)
+    backend.token_to_kv_pool = SimpleNamespace(
+        layer_router=SimpleNamespace(
+            read=lambda layer_id: SimpleNamespace(kv=lambda: kv_cache)
+        )
     )
     backend.forward_metadata = fb.PrefillMetadata(wrappers, use_ragged, False)
     backend.is_dllm_model = False
