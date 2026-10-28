@@ -322,6 +322,13 @@ class FunctionCallParser:
             for tool in self.tools
         ]
 
+    def constrains_auto_tool_choice(self) -> bool:
+        """Whether automatic tool choice takes the tools' structural tag."""
+        return (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -340,9 +347,8 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
-            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        should_constrain_auto = (
+            tool_choice == "auto" and self.constrains_auto_tool_choice()
         )
         structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):

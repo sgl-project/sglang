@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 import orjson
 import partial_json_parser
 from partial_json_parser.core.options import Allow
+from pydantic import BaseModel
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
@@ -503,13 +504,16 @@ def strip_structural_tag_excludes(structural_tag: Any, tokens: Iterable[str]) ->
                 if key in node:
                     visit(node[key])
             return
-        if not hasattr(node, "__dict__"):
+        if not isinstance(node, BaseModel):
             return
-        excludes = getattr(node, "excludes", None)
+        # Read fields from __dict__: hasattr on an absent pydantic field raises
+        # and catches an AttributeError, which made this walk slow.
+        fields = node.__dict__
+        excludes = fields.get("excludes")
         if isinstance(excludes, list):
             node.excludes = [s for s in excludes if s not in tokens]
         for key in ("format", "content", "tags", "elements"):
-            if hasattr(node, key):
-                visit(getattr(node, key))
+            if key in fields:
+                visit(fields[key])
 
     visit(structural_tag)

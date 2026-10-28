@@ -86,6 +86,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
+from sglang.srt.entrypoints.openai.tool_call_constraint_cache import (
+    ToolCallConstraintCache,
+    tool_call_constraint_key,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -150,6 +154,9 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+_TOOL_CALL_CONSTRAINT_CACHE_MAX_ENTRIES = 256
+# A 177-tool strict tag with its key takes about 1 MiB.
+_TOOL_CALL_CONSTRAINT_CACHE_MAX_BYTES = 64 << 20
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -471,6 +478,10 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
+        )
+        self._tool_call_constraint_cache = ToolCallConstraintCache(
+            max_entries=_TOOL_CALL_CONSTRAINT_CACHE_MAX_ENTRIES,
+            max_bytes=_TOOL_CALL_CONSTRAINT_CACHE_MAX_BYTES,
         )
 
     def _probe_prompt_text_round_trip(self) -> bool:
@@ -1438,6 +1449,60 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         return adapted_request, request
 
+    def _tool_call_constraint(
+        self,
+        request: ChatCompletionRequest,
+        parser: FunctionCallParser,
+        *,
+        thinking_mode: bool,
+    ) -> ToolCallConstraint | None:
+        """The tool-call constraint, serialized and cached across requests;
+        response-template parsers build theirs per request."""
+        template_parser = isinstance(parser.detector, ResponseTemplateToolDetector)
+        # The reasoning parser owns think tokens, so free text may hold them; template
+        # tags exclude their own closers, which can be think literals (Beam's <|end|>).
+        stripped_excludes = (
+            None
+            if self._reasoning_detector is None or template_parser
+            else (
+                self._reasoning_detector.think_start_token,
+                self._reasoning_detector.think_end_token,
+            )
+        )
+        key = None
+        # Unconstrained automatic choice, the common case, stays unkeyed so it
+        # never pays for the key.
+        if not template_parser and (
+            request.tool_choice != "auto" or parser.constrains_auto_tool_choice()
+        ):
+            key = tool_call_constraint_key(
+                tool_call_parser=self.tool_call_parser,
+                tools=parser.tools,
+                tool_strict_level=parser.tool_strict_level,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                thinking_mode=thinking_mode,
+                stripped_excludes=stripped_excludes,
+            )
+        if key is not None:
+            cached = self._tool_call_constraint_cache.get(key)
+            if cached is not None:
+                return cached
+        constraint = parser.get_structure_constraint(
+            request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=thinking_mode,
+        )
+        if (
+            constraint is not None
+            and constraint[0] == "structural_tag"
+            and stripped_excludes is not None
+        ):
+            strip_structural_tag_excludes(constraint[1], stripped_excludes)
+        if key is None:
+            return constraint
+        return self._tool_call_constraint_cache.put(key, constraint)
+
     def _set_response_parser_context(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -1878,28 +1943,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                    thinking_mode=xgrammar_reasoning,
+                tool_call_constraint = self._tool_call_constraint(
+                    request, parser, thinking_mode=xgrammar_reasoning
                 )
-                if (
-                    tool_call_constraint is not None
-                    and tool_call_constraint[0] == "structural_tag"
-                    and self._reasoning_detector is not None
-                    # Template tags exclude their own field closers,
-                    # which can be the think literals (Beam's <|end|>).
-                    and not isinstance(parser.detector, ResponseTemplateToolDetector)
-                ):
-                    # Same ownership rule: the reasoning parser handles think
-                    # tokens, so the grammar must not forbid them in free text.
-                    strip_structural_tag_excludes(
-                        tool_call_constraint[1],
-                        (
-                            self._reasoning_detector.think_start_token,
-                            self._reasoning_detector.think_end_token,
-                        ),
-                    )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if isinstance(parser.detector, ResponseTemplateToolDetector):
                     template_tool_parser = parser
