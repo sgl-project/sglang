@@ -4,7 +4,7 @@ import copy
 import dataclasses
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -434,6 +434,9 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
+        # Rows of this rank's first micro-batch, gathered so each micro-batch's
+        # dispatch can be bounded by its own per-rank rows.
+        self.local_tbo_split_num_tokens = 0
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
@@ -468,6 +471,13 @@ class TboDPAttentionPreparer:
                 and not ll_supports_extend
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if local_can_run_tbo and not local_batch.forward_mode.is_prebuilt():
+                self.local_tbo_split_num_tokens = compute_split_token_index(
+                    split_seq_index=self.local_tbo_split_seq_index,
+                    forward_mode=local_batch.forward_mode,
+                    extend_seq_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
+                )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -614,6 +624,8 @@ class TboForwardBatchPreparer:
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_b,
         )
 
+        cls._bound_children_dp_rows(batch, child_a=child_a, child_b=child_b)
+
         if is_enable_two_chunk:
             cls.derive_fields_related_to_seq_len_for_two_chunk(
                 batch,
@@ -688,6 +700,39 @@ class TboForwardBatchPreparer:
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
         )
+
+    @classmethod
+    def _bound_children_dp_rows(
+        cls, batch: ForwardBatch, *, child_a: ForwardBatch, child_b: ForwardBatch
+    ) -> None:
+        """Set the per-rank rows that bound each micro-batch's MoE dispatch, by
+        position: an idle or empty-split rank starts both children at token 0."""
+        parent_rows = (
+            batch.global_num_tokens_padded_cpu
+            if batch.global_num_tokens_padded_cpu is not None
+            else batch.global_num_tokens_cpu
+        )
+        rows_a, rows_b = cls._children_dp_global_num_tokens(
+            parent_rows, batch.global_tbo_split_num_tokens
+        )
+        child_a.tbo_dp_global_num_tokens_bound = rows_a
+        child_b.tbo_dp_global_num_tokens_bound = rows_b
+
+    @staticmethod
+    def _children_dp_global_num_tokens(
+        parent_rows: Optional[List[int]], split_rows: Optional[List[int]]
+    ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+        """Per-rank rows of both micro-batches: the first takes each rank's split
+        rows, the second the rest of that rank's parent rows. Both fall back to the
+        parent's rows, still an upper bound, when the split was not gathered."""
+        if (
+            parent_rows is None
+            or split_rows is None
+            or len(parent_rows) != len(split_rows)
+        ):
+            return parent_rows, parent_rows
+        first = [min(max(s, 0), p) for s, p in zip(split_rows, parent_rows)]
+        return first, [p - f for p, f in zip(parent_rows, first)]
 
     @classmethod
     def filter_batch(
@@ -860,12 +905,7 @@ class TboForwardBatchPreparer:
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
-                # The counts the parent published for its DP gather.
-                tbo_parent_global_num_tokens_cpu=(
-                    batch.global_num_tokens_padded_cpu
-                    if batch.global_num_tokens_padded_cpu is not None
-                    else batch.global_num_tokens_cpu
-                ),
+                global_tbo_split_num_tokens=None,
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,

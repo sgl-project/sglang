@@ -285,7 +285,7 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             global_dp_buffer_len=None,
             tbo_padded_len=None,
             global_num_tokens_cpu=None,
-            tbo_parent_global_num_tokens_cpu=[3, 5],
+            tbo_dp_global_num_tokens_bound=[3, 5],
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
             moe_num_token_non_padded=None,
         )
