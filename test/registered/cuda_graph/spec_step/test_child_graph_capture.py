@@ -93,6 +93,8 @@ class TestChildGraphCapture(CustomTestCase):
         ]
         self.x = torch.zeros(N, device="cuda")
         self.y = torch.zeros(N, device="cuda")
+        # An eager break writes into a buffer its caller owns (it returns None).
+        self.brk = torch.zeros(N, device="cuda")
         self.coins = torch.zeros(8, device="cuda")
 
     def _step(self, host_break=None, coins=False):
@@ -106,7 +108,8 @@ class TestChildGraphCapture(CustomTestCase):
             self.coins.copy_(torch.rand(8, device="cuda"))
         mid = o1 * 0.5 + self.x
         if host_break is not None:
-            mid = host_break(mid)
+            host_break(mid, self.brk)
+            mid = self.brk
         s2.inp.copy_(mid)
         o2 = s2.replay()
         s3.inp.copy_(o2 - o1)
@@ -160,8 +163,8 @@ class TestChildGraphCapture(CustomTestCase):
         scale = {"value": 1.0}
 
         @self.eager_on_graph
-        def host_break(src):
-            return src * scale["value"]
+        def host_break(src, dst):
+            torch.mul(src, scale["value"], out=dst)
 
         def set_scale(i):
             scale["value"] = float(i % 4) + 0.25

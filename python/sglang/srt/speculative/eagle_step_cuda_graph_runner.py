@@ -425,11 +425,12 @@ class _GrammarStep:
         self.mask = torch.empty(host_mask.shape, dtype=host_mask.dtype, device=device)
         sampling_info.grammar_mask = None
         _check_host_copies()
-        eager_on_graph(self._build_mask, capture_stub=lambda: self.mask)()
+        eager_on_graph(self._build_mask)()
         return GrammarMask(grammar, self.mask)
 
-    def _build_mask(self) -> torch.Tensor:
-        # Same steps as spec_utils.build_grammar_vocab_mask, on the live batch.
+    def _build_mask(self) -> None:
+        # Same steps as spec_utils.build_grammar_vocab_mask, on the live batch, into
+        # the runner-owned mask (a graph break returns None).
         from sglang.srt.speculative.spec_utils import generate_token_bitmask
 
         batch = self.runner._live_batch
@@ -442,7 +443,6 @@ class _GrammarStep:
         )
         self.mask.copy_(vocab_mask, non_blocking=True)
         batch.sampling_info.grammar_mask = None
-        return self.mask
 
 
 @dataclasses.dataclass
@@ -470,7 +470,7 @@ class _StepGraph:
     # Simulated acceptance: device length read by the graph and the arguments
     # of the host draw.
     sim_accept_len: Optional[torch.Tensor] = None
-    sim_draw_args: Optional[Tuple[float, str, int]] = None
+    sim_draw_args: Optional[Tuple[float, str, int, Optional[torch.Generator]]] = None
     grammar: Optional[_GrammarStep] = None
     num_replays: int = 0
     memory_bytes: int = 0
@@ -1072,9 +1072,13 @@ class EagleStepCudaGraphRunner:
             simulate_acc_len: float = spec_utils.SIMULATE_ACC_LEN,
             simulate_acc_method: str = spec_utils.SIMULATE_ACC_METHOD,
             simulate_acc_token_mode: str = spec_utils.SIMULATE_ACC_TOKEN_MODE,
+            generator: Optional[torch.Generator] = None,
         ):
             assert simulate_acc_len > 0.0
-            draw_args.append((simulate_acc_len, simulate_acc_method, spec_steps + 1))
+            # Each replay draws the length from the same generator as the eager step.
+            draw_args.append(
+                (simulate_acc_len, simulate_acc_method, spec_steps + 1, generator)
+            )
             return simulated_accept_index_from_device_length(
                 accept_index,
                 predict,
