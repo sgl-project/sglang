@@ -359,3 +359,7 @@ configuration and is not used with context-parallel prefill. It returns the
 normalized activation in BF16; the following projection performs its existing
 activation quantization. Leave the variable unset to retain the default fused
 HIP mHC boundary.
+
+Without `--enable-amd-monokernel`, Mega-mHC replaces the fused HIP mHC boundary
+on every step, decode included. With it, Mega-mHC runs on prefill only: decode
+and verify steps keep the fused boundary, which the monokernel's kernels follow.

@@ -6,6 +6,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -131,13 +132,13 @@ class TestHipFlydslDispatch(unittest.TestCase):
         self.assertTrue(torch.equal(state.pre, pre))
 
 
-class TestFusedBoundaryYieldsToMega(unittest.TestCase):
-    def test_env_disables_fused_boundary(self):
+class TestFusedBoundaryRouting(unittest.TestCase):
+    def _init_layer(self, mega: bool):
         layer = mock.Mock()
         layer.hc_pre_from_prev_sublayer = True
         layer.hc_mult = 4
         with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
             mock.patch.object(deepseek_v4_hip, "_is_gfx95_supported", True),
             mock.patch.object(
                 deepseek_v4_hip.gfx95_dense,
@@ -151,28 +152,53 @@ class TestFusedBoundaryYieldsToMega(unittest.TestCase):
             ),
         ):
             deepseek_v4_hip.init_decoder_layer(layer, quant_config=None)
-        self.assertFalse(layer.hc_boundary_fused)
+        return layer
 
-    def test_env_off_keeps_fused_boundary(self):
-        layer = mock.Mock()
-        layer.hc_pre_from_prev_sublayer = True
-        layer.hc_mult = 4
+    def test_layer_keeps_fused_boundary_with_mega_on(self):
+        # the AMD monokernel refuses a layer without it at attach
+        self.assertTrue(self._init_layer(mega=True).hc_boundary_fused)
+        self.assertTrue(self._init_layer(mega=False).hc_boundary_fused)
+
+    def _route(self, mode, *, mega: bool, monokernel: bool) -> bool:
         with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(False),
-            mock.patch.object(deepseek_v4_hip, "_is_gfx95_supported", True),
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
             mock.patch.object(
-                deepseek_v4_hip.gfx95_dense,
-                "fused_rmsnorm_fp8_quant_eligible",
-                return_value=False,
-            ),
-            mock.patch.object(
-                deepseek_v4_hip.gfx95_dense,
-                "fused_rmsnorm_fake_quant_eligible",
-                return_value=False,
+                deepseek_v4_hip, "_amd_monokernel_enabled", return_value=monokernel
             ),
         ):
-            deepseek_v4_hip.init_decoder_layer(layer, quant_config=None)
-        self.assertTrue(layer.hc_boundary_fused)
+            return deepseek_v4_hip.fused_boundary_this_step(
+                types.SimpleNamespace(forward_mode=mode)
+            )
+
+    def test_mega_off_always_fused(self):
+        for monokernel in (False, True):
+            for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+                self.assertTrue(self._route(mode, mega=False, monokernel=monokernel))
+
+    def test_mega_on_without_monokernel_every_step(self):
+        for mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+        ):
+            self.assertFalse(self._route(mode, mega=True, monokernel=False))
+
+    def test_mega_on_with_monokernel_prefill_only(self):
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            self.assertFalse(self._route(mode, mega=True, monokernel=True))
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            self.assertTrue(self._route(mode, mega=True, monokernel=True))
+
+    def test_monokernel_off_without_server_config(self):
+        context = mock.Mock()
+        context.is_config_namespace_published.return_value = False
+        with mock.patch.object(deepseek_v4_hip, "get_context", return_value=context):
+            self.assertFalse(deepseek_v4_hip._amd_monokernel_enabled())
 
 
 if __name__ == "__main__":
