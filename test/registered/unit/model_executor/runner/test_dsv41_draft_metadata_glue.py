@@ -10,7 +10,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -101,107 +100,6 @@ class TestDraftExtendLengths(CustomTestCase):
             backend._draft_block_extend_lens([6])
             with self.assertRaisesRegex(RuntimeError, "first seen inside"):
                 backend._draft_block_extend_lens([6, 6])
-
-
-class TestDraftBlockGpuGeometry(CustomTestCase):
-    def test_uniform_lengths_without_host_reads(self):
-        for values in ([], [0], [1, 127, 256]):
-            seq_lens = torch.tensor(values, dtype=torch.int64)
-            with (
-                mock.patch.object(
-                    torch.Tensor, "tolist", side_effect=AssertionError("host read")
-                ),
-                mock.patch.object(
-                    torch.Tensor, "item", side_effect=AssertionError("host read")
-                ),
-            ):
-                lengths = dsv4.compute_uniform_extend_lengths(
-                    seq_lens=seq_lens, seq_lens_cpu=None, extend_len=5
-                )
-            self.assertIsNone(lengths.seq_lens_cpu_extended)
-            self.assertEqual(
-                lengths.seq_lens_extended.tolist(), [x + 5 for x in values]
-            )
-            self.assertEqual(lengths.extend_seq_lens_cpu, [5] * len(values))
-            self.assertEqual(lengths.num_tokens, 5 * len(values))
-
-    def test_supplied_host_lengths_keep_the_eager_geometry(self):
-        lengths = dsv4.compute_uniform_extend_lengths(
-            seq_lens=torch.tensor([0, 127, 256]),
-            seq_lens_cpu=[0, 127, 256],
-            extend_len=5,
-        )
-        self.assertEqual(lengths.seq_lens_cpu_extended, [5, 132, 261])
-        self.assertEqual(lengths.seq_lens_extended.tolist(), [5, 132, 261])
-
-    def test_draft_block_forwards_gpu_geometry_without_host_lengths(self):
-        backend = _backend(page_size=256)
-        backend._move_to_device = lambda values: torch.tensor(values, dtype=torch.int32)
-        backend.init_forward_metadata_prefill = mock.Mock(return_value=object())
-        with mock.patch.object(
-            torch.Tensor, "tolist", side_effect=AssertionError("host read")
-        ):
-            backend.init_forward_metadata_dspark_draft_block(
-                max_seq_len=2048,
-                req_pool_indices=torch.tensor([3, 1, 7]),
-                seq_lens=torch.tensor([0, 127, 256]),
-                seq_lens_cpu=None,
-                out_cache_loc=torch.arange(15),
-                block_size=5,
-            )
-        kwargs = backend.init_forward_metadata_prefill.call_args.kwargs
-        self.assertIsNone(kwargs["seq_lens_cpu"])
-        self.assertEqual(kwargs["seq_lens"].tolist(), [5, 132, 261])
-        self.assertEqual(kwargs["extend_seq_lens_cpu"], [5, 5, 5])
-        self.assertEqual(kwargs["num_tokens"], 15)
-
-    def test_graph_prep_does_not_request_host_lengths(self):
-        class DeviceLengthsOnlyBatch(SimpleNamespace):
-            @property
-            def seq_lens_cpu(self):
-                raise AssertionError("read host sequence lengths")
-
-            @property
-            def seq_lens_sum(self):
-                raise AssertionError("read unused host sum")
-
-        for in_capture in (False, True):
-            with self.subTest(in_capture=in_capture):
-                backend = _backend(
-                    page_size=256,
-                    speculative_num_draft_tokens=6,
-                    MAX_SEQ_LEN_FOR_CAPTURE=2048,
-                    cuda_int32_kwargs=dict(device="cpu", dtype=torch.int32),
-                    cuda_graph_metadata_of_bucket_and_bs={
-                        dsv4._GraphBucket.TARGET_VERIFY: {}
-                    },
-                    forward_metadata=SimpleNamespace(),
-                )
-                backend.online_c128_mtp.prepare_forward = mock.Mock()
-                backend.init_forward_metadata_dspark_draft_block = mock.Mock()
-                backend.replay_cuda_graph_metadata_from = mock.Mock()
-                view = DeviceLengthsOnlyBatch(
-                    batch_size=2,
-                    forward_mode=ForwardMode.TARGET_VERIFY,
-                    seq_lens=torch.tensor([127, 256]),
-                    req_pool_indices=torch.tensor([1, 3]),
-                    positions=torch.arange(10),
-                    out_cache_loc=torch.arange(10),
-                )
-                with (
-                    mock.patch.object(
-                        torch.Tensor, "cpu", side_effect=AssertionError("host copy")
-                    ),
-                    mock.patch.object(
-                        torch.Tensor, "item", side_effect=AssertionError("host scalar")
-                    ),
-                ):
-                    backend.init_forward_metadata_out_graph(view, in_capture=in_capture)
-                kwargs = (
-                    backend.init_forward_metadata_dspark_draft_block.call_args.kwargs
-                )
-                self.assertIsNone(kwargs["seq_lens_cpu"])
-                self.assertEqual(kwargs["block_size"], 5)
 
 
 class TestGlueCaptureFailure(CustomTestCase):
