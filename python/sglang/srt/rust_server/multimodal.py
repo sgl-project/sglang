@@ -338,14 +338,15 @@ class RustMmProcessor:
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
         feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
         int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
+        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
         "token_ids", "mrope_delta"}`` with the items in buffer order. External
         model packages receive the same layout and wrap it their own way.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
-        views them, and each item's ``hash`` is worker-precomputed so
-        ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
+        views them, and each item's full ``identity`` is worker-precomputed so
+        ``set_pad_value`` never rereads feature bytes. The drain boundary binds
+        these short digests to the serving configuration. Any feature-sized work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
         import msgspec

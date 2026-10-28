@@ -27,6 +27,7 @@ from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
@@ -96,6 +97,7 @@ class RustServer:
         self.http_port = http_port
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
+        self._mm_cache_namespace: Optional[str] = None
         self._max_per_poll = max_per_poll
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
@@ -258,6 +260,18 @@ class RustServer:
             if scheduler.model_config.is_multimodal
             else None
         )
+        mm_cache_namespace = (
+            build_processor_fingerprint(
+                scheduler.processor,
+                scheduler.model_config.hf_config,
+                extra={
+                    "model_path": scheduler.model_config.model_path,
+                    "rust_spec": mm_spec.rust_json() if mm_spec is not None else None,
+                },
+            )
+            if scheduler.model_config.is_multimodal
+            else None
+        )
 
         extension = cls._load_extension()
         server = extension.Server(
@@ -273,6 +287,7 @@ class RustServer:
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
+        instance._mm_cache_namespace = mm_cache_namespace
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
@@ -426,6 +441,20 @@ class RustServer:
             # step of the Rust path; a text-only request on a multimodal
             # model carries no `mm.*` buffers.
             obj.mm_inputs = self._wrap_mm_result(buffers)
+            if self._mm_cache_namespace is None:
+                raise RuntimeError("Rust multimodal cache namespace is not initialized")
+            for item in obj.mm_inputs.mm_items:
+                if item.identity is None or len(item.identity) != 32:
+                    raise ValueError(
+                        "Rust multimodal workers must return a full 32-byte identity"
+                    )
+                # Bind all wrappers, including external packages. Only the
+                # 32-byte worker digest is hashed on the scheduler thread.
+                item.bind_processor_fingerprint(self._mm_cache_namespace)
+            if obj.mm_inputs.padded_input_ids is not None:
+                obj.mm_inputs.padded_input_ids = obj.mm_inputs.build_padded_input_ids(
+                    obj.mm_inputs.input_ids, obj.mm_inputs.mm_items
+                )
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

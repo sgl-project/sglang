@@ -16,7 +16,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.rust_server.multimodal import (  # noqa: E402
     RustMmProcessor,
     RustMmSpec,
@@ -274,7 +278,9 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
             ],
             push_error=lambda rid, msg: errors.append((rid, msg)),
         )
-        return RustServer(server=fake, http_port=0, mm_spec=self.spec), errors
+        server = RustServer(server=fake, http_port=0, mm_spec=self.spec)
+        server._mm_cache_namespace = "sha256:" + "12" * 32
+        return server, errors
 
     @staticmethod
     def _header(rid):
@@ -347,6 +353,27 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
             item.feature.materialize()
         self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
 
+    def test_drain_binds_full_worker_identity_without_feature_reads(self):
+        identities = []
+        for namespace in ("12", "34", "12"):
+            server, errors = self._server(
+                self._header("namespace"), self._request_buffers()
+            )
+            server._mm_cache_namespace = "sha256:" + namespace * 32
+            with patch(
+                "sglang.srt.managers.mm_utils.hash_feature_digest",
+                side_effect=AssertionError("feature reread"),
+            ):
+                (obj,) = server.drain(8)
+                identities.append(
+                    tuple(item.cache_key for item in obj.mm_inputs.mm_items)
+                )
+            self.assertFalse(errors)
+            for item in obj.mm_inputs.mm_items:
+                item.feature.close_and_unlink()
+        self.assertNotEqual(identities[0], identities[1])
+        self.assertEqual(identities[0], identities[2])
+
     def test_external_wrapper_never_touches_ownership(self):
         """An external package's `_wrap_mm_result` builds stubs from the
         segment names and knows nothing about release/discard. Its segments
@@ -369,7 +396,17 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
                         {"shm_name": b.name, "shape": b.shape, "dtype": None}
                     )
                     stubs.append(stub)
-                return stubs  # opaque to drain; only ownership matters here
+                meta = msgspec.msgpack.decode(memoryview(buffers["mm.meta"]))
+                return MultimodalProcessorOutput(
+                    mm_items=[
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE,
+                            feature=stub,
+                            identity=bytes(item["identity"]),
+                        )
+                        for stub, item in zip(stubs, meta["items"])
+                    ]
+                )
 
         for fail in (False, True):
             with self.subTest(fail=fail):
@@ -388,8 +425,11 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
                     self.assertEqual(len(drained), 1)
                     self.assertTrue(all(b.released for b in self._buffers))
                     self.assertTrue(all(segment_exists(b.name) for b in self._buffers))
-                    for stub in drained[0].mm_inputs:
-                        stub.close_and_unlink()
+                    for item in drained[0].mm_inputs.mm_items:
+                        self.assertEqual(
+                            item.processor_fingerprint, server._mm_cache_namespace
+                        )
+                        item.feature.close_and_unlink()
                 self._segments, self._buffers = [], []
                 self.setUp()
 
