@@ -1532,15 +1532,17 @@ class BufferModePipeline:
         return True
 
     def _window_head_end(self, f: _StagedPrefetch) -> int:
+        entry_map = self._cache.cache_controller.mem_pool_host.entry_map
         span_end = f.matched_len + f.num_tokens
         head_end = 0
         for component in self._swa_components():
+            page_size = entry_map[component.pool_name].host_pool.page_size
             staged_tokens = sum(
                 len(t.host_indices)
                 for t in f.aux_xfers
                 if t.name == component.pool_name and t.host_indices is not None
             )
-            if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+            if 0 < staged_tokens < component.full_window_pages * page_size:
                 head_end = max(head_end, span_end - staged_tokens)
         return head_end
 
