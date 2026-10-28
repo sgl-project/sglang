@@ -165,6 +165,7 @@ fn test_limits() -> Limits {
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         enable_return_hidden_states: false,
+        default_priority: None,
     }
 }
 
@@ -180,6 +181,28 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
             sampling_params,
             ..Default::default()
         })),
+    }
+}
+
+/// An unset priority takes the configured default; an explicit one is kept
+/// (Python `_set_default_priority`).
+#[test]
+fn unset_priority_takes_the_default() {
+    let limits = Limits {
+        default_priority: Some(0),
+        ..test_limits()
+    };
+    for (sent, want) in [(None, Some(0)), (Some(-2), Some(-2))] {
+        let mut req = generate_req(1, SamplingParams::default());
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        g.priority = sent;
+        validate(&mut req, &limits).unwrap();
+        let RequestKind::Generate(g) = &req.kind else {
+            unreachable!()
+        };
+        assert_eq!(g.priority, want);
     }
 }
 

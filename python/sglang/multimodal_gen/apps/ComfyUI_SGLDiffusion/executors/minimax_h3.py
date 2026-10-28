@@ -237,6 +237,11 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
         enable_cache_dit = getattr(self, "enable_cache_dit", None)
         if enable_cache_dit is not None:
             kwargs["enable_cache_dit"] = bool(enable_cache_dit)
+        cache_dit_params = getattr(self, "cache_dit_params", None)
+        if cache_dit_params:
+            kwargs["cache_dit_params"] = dict(cache_dit_params)
+        if getattr(self, "enable_spectrum", False):
+            kwargs["enable_spectrum"] = True
         return kwargs
 
 

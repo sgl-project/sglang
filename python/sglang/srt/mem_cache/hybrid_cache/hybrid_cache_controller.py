@@ -184,6 +184,8 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        # Cut by the stop policy, not a storage shortfall: the span is still stored.
+        self.deadline_expired = False
 
     def mark_terminate(self):
         with self._lock:

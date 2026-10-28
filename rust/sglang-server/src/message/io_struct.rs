@@ -54,12 +54,12 @@ wire_struct! {
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
         /// The scheduler decodes this header by position (Python's
-        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so the
-        /// fields between `disagg_prefill_dp_rank` and `extra_key` must be sent,
-        /// at their defaults, for `extra_key` to land in its slot.
+        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so
+        /// `routing_key` and `require_reasoning` are sent at their defaults for
+        /// `priority` and `extra_key` to land in their slots.
         routing_key: (),
         require_reasoning: bool,
-        priority: (),
+        priority: Option<i64>,
         extra_key: Option<&'a str>,
     }
 }
@@ -133,7 +133,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
             routing_key: (),
             require_reasoning: false,
-            priority: (),
+            priority: req.priority,
             extra_key: req.extra_key.as_deref(),
         }
     }
@@ -295,6 +295,7 @@ mod tests {
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
             extra_key: Some("salt".into()),
+            priority: Some(-2),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -315,7 +316,7 @@ mod tests {
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
         assert!(arr[32].is_nil(), "routing_key at 32");
         assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
-        assert!(arr[34].is_nil(), "priority at 34");
+        assert_eq!(arr[34].as_i64(), Some(-2), "priority at 34");
         assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
     }
 }

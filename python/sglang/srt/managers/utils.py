@@ -24,6 +24,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
@@ -65,7 +66,7 @@ class GenerationBatchResult:
     skipped_output_comm: bool = False
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
@@ -369,7 +370,7 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")

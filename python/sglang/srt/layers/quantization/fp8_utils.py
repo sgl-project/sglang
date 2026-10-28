@@ -54,6 +54,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -118,6 +119,121 @@ _FORCE_CK_W8A8: bool = False
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
+
+
+# DeepSeek-V4 dense 128x128 block-fp8 linears on aiter's e8m0 mxscale bpreshuffle
+# GEMM (SGLANG_DSV4_DENSE_MXSCALE). DeepseekV4 enables it via
+# set_dense_mxscale(True) before its weights load, like set_force_ck_w8a8.
+_DENSE_MXSCALE: bool = False
+
+# (N, K) where the e8m0 GEMM (with aiter's dsv4 mxscale tuned rows) beats the
+# fp32-scale bpreshuffle GEMM (incl. aiter #6004/#6029 tuned rows) on gfx950,
+# cold-weight, over the decode M range. See dsv4_perf_opt reports/dense_gemm.md.
+# (512, 7168) (DSpark draft wkv) is untuned on the e8m0 side and loses at M>=96.
+DSV4_DENSE_MXSCALE_DEFAULT_SHAPES = frozenset(
+    {
+        (2048, 7168),  # wqkv_a
+        (1536, 7168),  # wq_a (unfused: DSpark draft)
+        (8192, 1536),  # wq_b TP8, indexer wq_b
+        (16384, 1536),  # wq_b TP4
+        (65536, 1536),  # wq_b attn-TP1 (DP attention)
+        (7168, 2048),  # wo_b TP8
+        (7168, 4096),  # wo_b TP4
+        (7168, 16384),  # wo_b attn-TP1 (DP attention)
+        (6144, 7168),  # shared expert w13, TP1
+        (7168, 3072),  # shared expert w2, TP1
+        (768, 7168),  # shared expert w13, TP8
+        (7168, 384),  # shared expert w2, TP8
+        (7168, 21504),  # DSpark main_proj
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def aiter_has_dense_mxscale() -> bool:
+    """Whether the installed aiter dispatches e8m0 block scales in
+    gemm_a8w8_blockscale_bpreshuffle. Older aiter takes the e8m0 bytes as fp32
+    scales and silently returns wrong results."""
+    try:
+        from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def set_dense_mxscale(enabled: bool = True) -> None:
+    global _DENSE_MXSCALE
+    if enabled and not aiter_has_dense_mxscale():
+        logger.warning(
+            "SGLANG_DSV4_DENSE_MXSCALE is set but the installed aiter has no e8m0 "
+            "mxscale bpreshuffle GEMM; keeping the fp32-scale GEMM."
+        )
+        enabled = False
+    _DENSE_MXSCALE = enabled
+
+
+@lru_cache(maxsize=1)
+def _dense_mxscale_shapes() -> Optional[frozenset]:
+    """The (N, K) whitelist, or None for every shape."""
+    spec = envs.SGLANG_DSV4_DENSE_MXSCALE_SHAPES.get().strip()
+    if not spec:
+        return DSV4_DENSE_MXSCALE_DEFAULT_SHAPES
+    if spec.lower() == "all":
+        return None
+    shapes = set()
+    for item in spec.split(","):
+        n, k = item.strip().split(":")
+        shapes.add((int(n), int(k)))
+    return frozenset(shapes)
+
+
+def dense_mxscale_wanted(n: int, k: int) -> bool:
+    if not (_DENSE_MXSCALE and _use_aiter_bpreshuffle_gfx95):
+        return False
+    shapes = _dense_mxscale_shapes()
+    return shapes is None or (n, k) in shapes
+
+
+def block_fp8_scale_to_e8m0_128(scale: torch.Tensor) -> Optional[torch.Tensor]:
+    """fp32 128x128 block scales [N/128, K/128] -> e8m0 bytes of the same shape,
+    or None if any scale is not a positive normal power of two (not lossless)."""
+    s = scale.detach().float().contiguous()
+    bits = s.view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    ok = (s > 0) & ((bits & 0x7FFFFF) == 0) & (exp > 0) & (exp < 0xFF)
+    if not bool(ok.all()):
+        return None
+    return exp.to(torch.uint8).view(torch.float8_e8m0fnu).contiguous()
+
+
+def is_e8m0_scale(scale: Optional[torch.Tensor]) -> bool:
+    return scale is not None and scale.dtype == torch.float8_e8m0fnu
+
+
+def dense_mxscale_ready(*linears) -> bool:
+    """Whether every given linear consumes e8m0 (mxscale) activations, i.e. a
+    shared producer of their fp8 operand should emit ue8m0 scales."""
+    if not _DENSE_MXSCALE:
+        return False
+    for linear in linears:
+        if linear is None:
+            continue
+        weight = getattr(linear, "weight", None)
+        if getattr(weight, "_mxscale_w_scale", None) is None:
+            return False
+    return True
+
+
+def quant_fp8_e8m0_128(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token 1x128 fp8 quant with ue8m0 scales, the scale bytes column-major
+    ([K/128, M] storage viewed as [M, K/128]) as the mxscale GEMM reads them."""
+    return per_group_quant_hip(
+        x,
+        quant_dtype=aiter.dtypes.fp8,
+        group_size=128,
+        transpose_scale=True,
+        scale_type=torch.float8_e8m0fnu,
+    )
 
 
 def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -234,6 +350,8 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    from aiter.ops.quant import per_group_quant_hip
+
     from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
         smallm_fp8_gemm,
         smallm_fp8_gemm_supported,
@@ -252,7 +370,9 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    _raw_bmm_fp8_batched = LazyImport("flashinfer", "bmm_fp8")
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
@@ -1470,6 +1590,30 @@ def aiter_w8a8_block_fp8_linear(
                 bias=bias,
             )
             return out.to(input.dtype).view(*output_shape)
+
+    # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
+    # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that
+    # already emitted an fp32-scale operand keeps the fp32 GEMM below.
+    mx_w_scale = getattr(weight, "_mxscale_w_scale", None)
+    if is_e8m0_scale(input_scale) or (mx_w_scale is not None and input_scale is None):
+        if mx_w_scale is None:
+            raise RuntimeError(
+                "e8m0-scaled fp8 activation reached a linear without an e8m0 "
+                f"weight scale (weight {tuple(weight.shape)})"
+            )
+        out_dtype = torch.bfloat16 if input_scale is not None else input_2d.dtype
+        if input_2d.shape[0] == 0:
+            return input_2d.new_empty(output_shape, dtype=out_dtype)
+        if input_scale is None:
+            q_input, x_scale = quant_fp8_e8m0_128(input_2d)
+        else:
+            q_input, x_scale = input_2d, input_scale
+        output = gemm_a8w8_blockscale_bpreshuffle(
+            q_input, weight, x_scale, mx_w_scale, dtype=torch.bfloat16
+        )
+        if bias is not None:
+            output += bias
+        return output.to(dtype=out_dtype).view(*output_shape)
 
     n, k = weight.shape
 

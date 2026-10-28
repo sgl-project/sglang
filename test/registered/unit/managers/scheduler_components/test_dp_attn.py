@@ -392,6 +392,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -445,6 +446,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = True
         runner.can_replay_locally.side_effect = lambda **kwargs: (
             not kwargs["contains_mm_inputs"]
@@ -492,6 +494,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = False
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2

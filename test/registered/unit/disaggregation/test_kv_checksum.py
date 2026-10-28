@@ -219,9 +219,11 @@ class _FakeOwner(DisaggDecode):
         self.streamed_aborts.extend(reqs)
 
 
-def _make_req(expected_chksum, num_input_tokens, rid="r0"):
+def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0.0.1"):
     return SimpleNamespace(
         rid=rid,
+        bootstrap_host=bootstrap_host,
+        bootstrap_port=8998,
         bootstrap_room=12345,
         kv=SimpleNamespace(req_pool_idx=0, holds_kv=True),
         origin_input_ids=list(range(num_input_tokens)),
@@ -386,6 +388,29 @@ class TestAdmissionChecksum(unittest.TestCase):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0, self.num_pages)
         self.assertEqual(sched._verify_kv_checksums([req]), [req])
+
+    def test_backend_can_skip_incomparable_checksum(self):
+        """A request whose sender the backend declares incomparable is admitted
+        without a digest, decided per bootstrap address, and skipping it must not
+        disturb the index-based filtering of a mismatching sibling."""
+        sched = self._make_sched(_SENTINEL)
+        sched.disagg_decode_prealloc_queue.kv_manager.should_verify_kv_checksum = (
+            lambda bootstrap_addr: not bootstrap_addr.startswith("10.0.0.1:")
+        )
+        aborted = _make_req(0xDEADBEEF, self.num_pages, rid="aborted")
+        skipped = _make_req(
+            0xDEADBEEF, self.num_pages, rid="skipped", bootstrap_host="10.0.0.1"
+        )
+        sched.waiting_queue = [aborted, skipped]
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            batch = self._run_once(sched)
+        self.assertEqual(batch.reqs, [skipped])
+        self.assertEqual(sched.streamed_aborts, [aborted])
+        mock_abort.assert_called_once()
 
 
 _SENTINEL = object()

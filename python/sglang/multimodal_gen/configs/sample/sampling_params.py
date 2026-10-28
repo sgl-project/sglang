@@ -566,7 +566,11 @@ class SamplingParams:
             if self.true_cfg_scale is not None
             else self.guidance_scale
         )
-        return cfg_scale > 1.0 and self.negative_prompt is not None
+        return (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        )
 
     @classmethod
     def default_image_output_format(cls) -> str | None:

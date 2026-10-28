@@ -658,40 +658,43 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             if arch.vec_in_dim is not None
             else None
         )
+        self.quant_config = quant_config
         streams = sorted(self.in_channels)
         self.early_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"early_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
         self.single_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"single_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
-
-        def block(prefix: str) -> Flux3Block:
-            return Flux3Block(
-                hidden,
-                arch.num_attention_heads,
-                arch.mlp_ratio,
-                quant_config=quant_config,
-                supported_attention_backends=self._supported_attention_backends,
-                prefix=prefix,
-            )
-
         self.content_mode_blocks = nn.ModuleDict(
             {
                 m: nn.ModuleList(
-                    block(f"content_mode_blocks.{m}.{i}") for i in range(arch.depth)
+                    self._make_block(f"content_mode_blocks.{m}.{i}")
+                    for i in range(arch.depth)
                 )
                 for m in streams
             }
         )
         self.txt_mode_blocks = nn.ModuleList(
-            block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
+            self._make_block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
         )
         self.single_blocks = nn.ModuleList(
-            block(f"single_blocks.{i}") for i in range(arch.depth_single_blocks)
+            self._make_block(f"single_blocks.{i}")
+            for i in range(arch.depth_single_blocks)
         )
+        out_modes = self.in_channels if arch.out_modes is None else arch.out_modes
         self.final_layer = nn.ModuleDict(
-            {m: Flux3LastLayer(hidden, c) for m, c in self.in_channels.items()}
+            {
+                m: Flux3LastLayer(hidden, c)
+                for m, c in self.in_channels.items()
+                if m in out_modes
+            }
         )
         self.layer_names = [
             "txt_mode_blocks",
@@ -699,6 +702,23 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             "single_blocks",
         ]
         self.__post_init__()
+
+    # ------------------------------------------------------------------ factories
+    # Subclasses swap the block / modulation implementation; the module tree
+    # (and therefore the checkpoint layout) stays the same.
+    def _make_modulation(self, prefix: str) -> nn.Module:
+        del prefix
+        return Flux3Modulation(self.hidden_size)
+
+    def _make_block(self, prefix: str) -> nn.Module:
+        return Flux3Block(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.arch.mlp_ratio,
+            quant_config=self.quant_config,
+            supported_attention_backends=self._supported_attention_backends,
+            prefix=prefix,
+        )
 
     # ------------------------------------------------------------------ pieces
     @property
@@ -856,10 +876,11 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
             )
             names.append(key)
-        outputs = self.denoise(
-            context=context, streams=streams, targets=[s.name for s in streams]
-        )
-        return {key: outputs[s.name] for key, s in zip(names, streams)}
+        targets = [s.name for s in streams if s.name in self.final_layer]
+        outputs = self.denoise(context=context, streams=streams, targets=targets)
+        return {
+            key: outputs[s.name] for key, s in zip(names, streams) if s.name in outputs
+        }
 
 
 def _compute_dtype(linear: nn.Module) -> torch.dtype:

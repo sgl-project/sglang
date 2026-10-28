@@ -948,13 +948,13 @@ docker run \
     python3 -m sglang.launch_server <role args below>
 ```
 
-The Deployment and Playground Docker outputs use this `v0.5.21` build for the MI355X Pro and Pro Official FP4 multi-node recipes. It is the build the PD roles ran on, and the first one carrying the Aiter MegaMoEv2 kernels the high-throughput prefill role needs. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+The Deployment and Playground Docker outputs retain this `v0.5.21` base image for the MI355X Pro and Pro Official FP4 multi-node recipes. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
 For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 
 #### Role-based configuration
 
-Select **MI355X → Pro Official → FP4 → Multi-Nodes**, then a strategy and role. The commands use the [submitted recipe at `df5e433239d7`](https://github.com/SemiAnalysisAI/InferenceX/blob/df5e433239d72106529ece4dd97cc36e4c3adf4c/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/mi355x-fp4/agentx/disagg-umbp-dspark.yaml), with cluster-specific paths replaced by local placeholders and benchmark acceptance simulation removed.
+Select **MI355X → Pro Official → FP4 → Multi-Nodes**, then a strategy and role. The commands use the [submitted recipe at `df5e433239d7`](https://github.com/SemiAnalysisAI/InferenceX/blob/df5e433239d72106529ece4dd97cc36e4c3adf4c/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/mi355x-fp4/agentx/disagg-umbp-dspark.yaml), with cluster-specific paths replaced by local placeholders and benchmark acceptance simulation removed. The Pro Official commands additionally apply the kernel and routing updates described below.
 
 | Strategy | Concurrency | Prefill → Decode | `--max-running-requests` | DSpark block size |
 |---|---|---|---|---|
@@ -966,7 +966,7 @@ These are two separate workers: neither receives `--nnodes 2` or a cross-node TP
 
 `--cuda-graph-bs-decode` covers 1 to `--max-running-requests / attn_dp_size`: the full value on the TP-only rows and an eighth on the DP8 rows. Each strategy sets both workers' admission limit and decode's graph sizes together. The TP-only points use `--mem-fraction-static 0.86` and SWA ratio `0.1`; the DP8 points use `0.92` and `0.15`.
 
-All prefill roles enable [UMBP](#3-8-unified-cache-external-linker-umbp), `--optimistic-prefill-attempts 2`, and cache reporting. Decode does not use an offload tier. The high-throughput prefill worker uses Aiter MegaMoEv2 with EP8; decode keeps TP MoE. Both high-throughput workers enable the FP8 unified KV layout. The commands below show concurrency 256.
+All prefill roles enable [UMBP](#3-8-unified-cache-external-linker-umbp), `--optimistic-prefill-attempts 2`, and cache reporting. Decode does not use an offload tier. The high-throughput prefill worker uses Aiter MegaMoEv2 with EP8; decode keeps TP MoE. All Pro Official PD workers enable `SGLANG_DSV4_UNIFIED_KV_FP8=1`. Low-Latency and Balanced also set `SGLANG_DSV4_DENSE_MXSCALE=1` on both roles; High-Throughput sets mxscale on decode only. The decode dispatch budget is `64 × (DSpark block size + 1)`: `MORI_MAX_DISPATCH_TOKENS_DECODE=448` at concurrency 16 and `256` at concurrency 48 or 256. The commands below show concurrency 256.
 
 Select **Pro** to use the original checkpoint's **EAGLE/MTP 3-1-4** head with the same topology and admission limits. Its commands contain no DSpark parameters. In the Playground, **Off (greedy)** removes speculative decoding. Enabling **HiCache** automatically turns off **Unified Cache External Linker** and removes UMBP's socket configuration and optimistic prefill. Enabling the linker turns HiCache off.
 
@@ -1047,6 +1047,7 @@ python3 -m sglang.launch_server \
 ```bash Command
 GPU_MAX_HW_QUEUES=5 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_DSV4_DENSE_MXSCALE=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
@@ -1102,17 +1103,63 @@ On the prefill env:
 These recipes leave `MORI_SHMEM_MODE` unset and use MORI's default `STATIC_HEAP`. The pinned Aiter MegaMoEV2 implementation allocates its buffers through `mori_shmem_create_tensor()` / `shmem_malloc()` after SGLang initializes MORI shmem. This requires the symmetric heap; the separate MORI CCO allocator is not used by this implementation. If your launch script exports `MORI_SHMEM_MODE=ISOLATION`, unset it before launching MegaMoE: its peer-pointer lookup requires the heap mapping. Keep `MORI_SHMEM_HEAP_SIZE=8G` for the prefill recipe above.
 </Note>
 
-**Both roles set `SGLANG_DSV4_UNIFIED_KV_FP8=1`**, which splits the unified KV cache pool into an FP8 nope pool and a BF16 rope pool. It requires the `unified_kv_triton` kernels, which the base cell already selects through `SGLANG_HACK_FLASHMLA_BACKEND`. The value must match on both roles — the PD handshake compares KV cache layouts and fails if they differ. The DSpark draft worker stays BF16 either way.
+**Both roles set `SGLANG_DSV4_UNIFIED_KV_FP8=1` at every Pro Official PD concurrency**, which splits the unified KV cache pool into an FP8 nope pool and a BF16 rope pool. It requires the `unified_kv_triton` kernels, which the base cell already selects through `SGLANG_HACK_FLASHMLA_BACKEND`. The value must match on both roles — the PD handshake compares KV cache layouts and fails if they differ. The DSpark draft worker stays BF16 either way.
 
 #### Router configuration
 
-Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. Decode holds no reusable prefix, so `--decode-policy round_robin` spreads it evenly. `--dp-aware` takes effect only when the workers run DP attention.
+Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. The TP-only presets keep `--decode-policy round_robin`. Pro Official's DP-attention presets (concurrency 192–512, including the High-Throughput preset at 256) instead use:
+
+```bash Router settings
+SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests \
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 \
+  --decode http://<decode-host>:30100 \
+  --host 0.0.0.0 --port 8000 \
+  --policy consistent_hashing --dp-aware \
+  --decode-policy power_of_two \
+  --worker-startup-check-interval 1 \
+  --cache-threshold 0.3 \
+  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \
+  --disable-circuit-breaker --health-failure-threshold 100 \
+  --health-check-timeout-secs 600 --health-check-interval-secs 30
+```
+
+Power-of-two compares in-flight request counts across decode DP ranks. The one-second load polling interval replaces the 30-second default. Check for `Power-of-two load metric: LeastRequests` in the router startup log.
 
 The multi-node router presets retain the default request timeout. The standalone high-throughput Playground preset uses `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
 
 <Warning>
 `--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the lower-concurrency recipes keep the default. Lower it again if you lower the concurrency.
 </Warning>
+
+#### Additional Pro Official concurrency points
+
+The panel keeps its c16 / c48 / c256 strategy presets. Apply the following overrides to the **Multi-Nodes** commands to reproduce the optimized recipe's endpoints. Here `cN` means a target concurrency of N.
+
+**c1 (replaces c4):** start from Low-Latency. Keep prefill TP4, set decode to `--tp 4`, and set `--max-running-requests 2` on both roles. Replace decode's graph list with `--cuda-graph-bs-decode 1 2`. Keep DSpark block size 6 (7 draft tokens), `MORI_MAX_DISPATCH_TOKENS_DECODE=448`, and both kernel switches on both roles. The source also sets `SGLANG_MLA_HCA_KV_SPLITS=8` on both roles; the FP8 KV path does not read this setting. Benchmark with concurrency 1.
+
+**c32:** start from Low-Latency, keep TP4 → TP8 and block size 6, set both admission limits to 64, and capture decode graph sizes 1–64. Both roles use FP8 KV and mxscale, as at c16 and c48.
+
+**c192 / c384 / c512:** start from High-Throughput. Keep TP8+DP8+EP8 prefill → TP8+DP8 decode, DSpark block size 3 (4 draft tokens), and decode dispatch budget 256. Set both admission limits to 384 / 768 / 1024 and capture decode graph sizes 1–48 / 1–96 / 1–128, respectively. Keep FP8 KV on both roles, mxscale on decode only, and the power-of-two router settings above. At c384 and c512, add `--request-timeout-secs 14400` to the router.
+
+**c512 prefill EPLB:** additionally set these environment variables on the prefill worker:
+
+```bash Prefill environment
+export SGLANG_AITER_MEGA_RANK_SYNC=1
+export SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1
+export SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD=1
+```
+
+Append these flags to its launch command:
+
+```text Prefill flags
+--enable-eplb
+--eplb-rebalance-num-iterations 200
+--expert-distribution-recorder-mode stat
+```
+
+Keep shared-expert fusion enabled. Rank synchronization lets idle DP ranks participate in MegaMoE dispatch; the prefill-only mode records load and advances rebalancing on synchronized extend passes. Do not set `--expert-balancedness-report-mode` with this mode: it can deadlock prefill on the first request. Decode uses TP MoE and receives none of these EPLB settings. EPLB is specific to c512; the c256 panel preset leaves it disabled.
 
 ### 3.8 Unified Cache External Linker (UMBP)
 

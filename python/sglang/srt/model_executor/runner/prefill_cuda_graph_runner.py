@@ -303,6 +303,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
+    @property
+    def _attn_backend_is_dsa(self) -> bool:
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
+        # companion never runs there and any prefix goes through sparse MLA.
+        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
+
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
             backend = get_exec().graph.cuda_graph_config.prefill.backend
@@ -324,6 +332,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.is_dsv41_model = (
+            model_runner.model_config.hf_config.model_type == "deepseek_v41"
+        )
         self.enable_lora = model_runner.lora_manager is not None
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
@@ -357,6 +368,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
+        self.max_seq_len = prefill_config.max_seq_len
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
@@ -1322,13 +1334,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is
+        # uncapturable. DSA is exempt: it stays on sparse MLA under BCG.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
+            and not self._attn_backend_is_dsa
         ):
             return False
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
@@ -1345,10 +1359,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
-        if self.max_context_size is not None:
-            if (
-                batch_max_context_len is None
-                or batch_max_context_len > self.max_context_size
+        # Vote on both bounds so DP ranks agree on graph versus eager.
+        for context_limit in (self.max_context_size, self.max_seq_len):
+            if context_limit is not None and (
+                batch_max_context_len is None or batch_max_context_len > context_limit
             ):
                 return False
         if num_tokens is None:
@@ -1386,7 +1400,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
             self._batch_max_context_len(forward_batch)
-            if self.max_context_size is not None
+            if self.max_context_size is not None or self.max_seq_len is not None
             else None
         )
         if not self.can_replay_locally(
@@ -2104,6 +2118,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
+            prepared_ids = layer_kwargs.get("input_ids", args[0] if args else None)
+            # TODO: Add general multimodal replay tests before enabling for other models.
+            if self.is_dsv41_model and prepared_ids is not None:
+                static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
+                    prepared_ids
+                )
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the

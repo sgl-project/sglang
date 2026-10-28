@@ -41,6 +41,14 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         ));
     }
 
+    // Python `_set_default_priority`: an unset priority takes the configured
+    // default instead of ranking as the scheduler's lowest.
+    if let RequestKind::Generate(g) = &mut req.kind
+        && g.priority.is_none()
+    {
+        g.priority = limits.default_priority;
+    }
+
     // Multimodal processors may consume sentinel ids outside the vocabulary.
     // Validate their resulting ids at PreSendValidating instead. Non-MM client
     // ids can be rejected now.

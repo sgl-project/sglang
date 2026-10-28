@@ -4,6 +4,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.request_window_copy import copy_packed_rows
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -126,20 +127,7 @@ def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout
     """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
         return
-    src_loc, dst_loc = src_loc.long(), dst_loc.long()
-    for width, base in (
-        (layout.data_bytes, 0),
-        (layout.scale_bytes, page_size * layout.data_bytes),
-    ):
-        cols = torch.arange(width, device=src.device)
-        values = src[
-            src_loc[:, None] // page_size,
-            base + (src_loc[:, None] % page_size) * width + cols,
-        ]
-        dst[
-            dst_loc[:, None] // page_size,
-            base + (dst_loc[:, None] % page_size) * width + cols,
-        ] = values
+    copy_packed_rows(src, dst, src_loc, dst_loc, page_size=page_size, layout=layout)
 
 
 def _capturing() -> bool:

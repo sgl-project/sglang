@@ -411,6 +411,83 @@ def build_dspark_swa_page_indices_triton(
     return swa_page_indices, swa_topk_lengths
 
 
+def swa_ring_rows(
+    slots: torch.Tensor, positions: torch.Tensor, ring_size: int
+) -> torch.Tensor:
+    """Row of ``positions`` in a per-request SWA ring: request slot ``s`` keeps
+    position ``p`` at row ``s * ring_size + p % ring_size``."""
+    return slots.to(torch.int64) * ring_size + positions.to(torch.int64) % ring_size
+
+
+class BuildDsparkSwaRingIndices:
+    """``BuildDsparkSwaPageIndices`` over a per-request SWA ring (`swa_ring_rows`),
+    with each request's window starting no earlier than its ``valid_from``."""
+
+    @classmethod
+    def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(
+        cls,
+        *,
+        seq_lens_casual: torch.Tensor,
+        req_pool_indices_repeated: torch.Tensor,
+        valid_from: torch.Tensor,
+        ring_size: int,
+        block_size: int,
+        swa_window: int,
+        page_index_aligned_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_q = seq_lens_casual.size(0)
+        assert num_q % block_size == 0, (
+            f"DSpark draft block forward must be uniform-gamma: num_q={num_q} not "
+            f"divisible by block_size={block_size}."
+        )
+        bs = num_q // block_size
+        device = seq_lens_casual.device
+        first_token = torch.arange(bs, device=device, dtype=torch.int64) * block_size
+        prefix_lens = seq_lens_casual[first_token].to(torch.int64) - 1
+        slots = req_pool_indices_repeated[first_token].to(torch.int64).view(-1, 1)
+        start = torch.maximum(
+            prefix_lens - swa_window, valid_from[slots.view(-1)]
+        ).clamp_(min=0)
+        context_lens = (prefix_lens - start).clamp_(min=0)
+
+        cols = torch.arange(swa_window, device=device, dtype=torch.int64).view(1, -1)
+        window_rows = swa_ring_rows(slots, start.view(-1, 1) + cols, ring_size)
+        window_rows = torch.where(cols < context_lens.view(-1, 1), window_rows, -1)
+        block_offsets = torch.arange(block_size, device=device, dtype=torch.int64)
+        block_rows = swa_ring_rows(
+            slots, prefix_lens.view(-1, 1) + block_offsets.view(1, -1), ring_size
+        )
+
+        target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
+        out = torch.full((bs, target_width), -1, dtype=torch.int32, device=device)
+        out[:, :swa_window] = window_rows.to(torch.int32)
+        out.scatter_(
+            1,
+            context_lens.view(-1, 1) + block_offsets.view(1, -1),
+            block_rows.to(torch.int32),
+        )
+
+        swa_page_indices = (
+            out.view(bs, 1, target_width)
+            .expand(bs, block_size, target_width)
+            .reshape(bs * block_size, target_width)
+            .contiguous()
+        )
+        swa_topk_lengths = (
+            (context_lens + block_size)
+            .view(bs, 1)
+            .expand(bs, block_size)
+            .reshape(bs * block_size)
+            .contiguous()
+            .to(torch.int32)
+        )
+        return swa_page_indices, swa_topk_lengths
+
+
 class BuildBlockSeqLensCausal:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:

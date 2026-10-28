@@ -6,15 +6,22 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.entrypoints.v1_loads import (
+    _accelerator_name,
+    _num_accelerators_per_dp_rank,
+)
+from sglang.srt.environ import envs
+from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
     get_mm,
     get_model,
     get_observability,
+    get_schedule,
     get_serving,
 )
 from sglang.version import __version__
@@ -58,6 +65,11 @@ def _build_server_args(
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
         else get_serving().grpc_port
     )
+    # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
+    # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
+    shm_writer = scheduler.load_snapshot_writer
+    if not isinstance(shm_writer, ShmLoadSnapshotWriter):
+        shm_writer = None
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
@@ -80,6 +92,13 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        health_generate_headers=dict(health_generate_headers or {}),
+        default_priority_value=(
+            get_schedule().default_priority_value
+            if get_schedule().enable_priority_scheduling
+            else None
+        ),
+        enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(

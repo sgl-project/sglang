@@ -79,6 +79,7 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     backend.is_dspark = True
     backend.needs_cpu_seq_lens = False
     backend._fp4_graph_row_limit = None
+    backend._fp4_c4_rowgroup_columns = None
     backend.is_draft_worker = is_dspark_draft
     # compressed-KV metadata is built only on the target worker
     backend.need_compress = not is_dspark_draft

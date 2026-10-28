@@ -56,11 +56,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_fp8_scale_to_e8m0_128,
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    dense_mxscale_wanted,
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
@@ -183,6 +185,7 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+_DENSE_MXSCALE_LOGGED: set = set()
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -902,6 +905,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # instead of silently reading a permuted weight.
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
+                self._maybe_prepare_dense_mxscale(layer)
 
         if (
             is_xpu()
@@ -925,6 +929,36 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_reordered.copy_(scale)
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
+
+    def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
+        """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
+        weight an e8m0 copy of its scale, which routes aiter_w8a8_block_fp8_linear
+        onto aiter's mxscale bpreshuffle GEMM. Lossless only for power-of-two
+        scales (ue8m0 checkpoints); any other layer stays on the fp32 GEMM. The
+        weight bytes are shared, the copy costs N*K/16384 bytes."""
+        if self.weight_block_size != [128, 128] or self.convert_mxfp8_to_block:
+            return
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return
+        n, k = layer.weight.shape
+        if not dense_mxscale_wanted(n, k):
+            return
+        scale = layer.weight_scale_inv.data
+        if tuple(scale.shape) != (n // 128, k // 128) or n % 128 or k % 128:
+            return
+        e8m0 = block_fp8_scale_to_e8m0_128(scale)
+        if e8m0 is None:
+            logger.warning(
+                "Dense mxscale: %s keeps the fp32 GEMM (scales are not powers of two)",
+                getattr(layer, "prefix", tuple(layer.weight.shape)),
+            )
+            return
+        layer.weight._mxscale_w_scale = e8m0
+        if (n, k) not in _DENSE_MXSCALE_LOGGED:
+            _DENSE_MXSCALE_LOGGED.add((n, k))
+            logger.info(
+                "Dense mxscale (e8m0 bpreshuffle GEMM) enabled for N=%d K=%d", n, k
+            )
 
     def _prepare_block_fp8_as_mxfp8(self, layer: Module) -> None:
         layer.block_fp8_mxfp8_ready = False

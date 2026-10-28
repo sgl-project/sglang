@@ -56,7 +56,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013",
   },
 
   github: {
@@ -357,6 +357,7 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -394,6 +395,7 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",

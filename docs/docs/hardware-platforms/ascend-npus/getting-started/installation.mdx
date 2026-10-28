@@ -9,7 +9,7 @@ You can install SGLang using any of the methods below. Please go through `System
 Each CANN version requires its own matched set of component versions — do not mix versions across sets.
 
 <Tabs>
-  <Tab title="CANN 9.1.0">
+  <Tab title="Ascend A3 Series">
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -42,8 +42,13 @@ Each CANN version requires its own matched set of component versions — do not 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.3.0</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memfabric_hybrid-1.3.0](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/master/20261010.5/memfabric_hybrid-1.3.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memfabric_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memcache_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
@@ -52,13 +57,68 @@ Each CANN version requires its own matched set of component versions — do not 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post10</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post10">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.3</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-zbal==1.1.3`</td>
+    </tr>
+  </tbody>
+</table>
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Method</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.1.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memfabric_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memcache_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.2.2](https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
     </tr>
   </tbody>
 </table>
@@ -79,6 +139,13 @@ You can obtain the dependency of a specified version of CANN through an image.
 
 ```bash Command
 docker pull quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
+```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
 ```
 
   </Tab>
@@ -131,8 +198,12 @@ Prior to starting work with SGLang on Ascend, you need to install CANN Toolkit, 
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```bash Command
-# On an x86_64 host, use memfabric_hybrid-1.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl from the same directory instead
-pip install https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/master/20261010.5/memfabric_hybrid-1.3.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl
+# On an x86_64 host, use memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl from the same directory instead
+pip install https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl
+
+# Install the device-specific MemFabric kernels:
+# --soc-version is A5 on the 950PR/DT Series, A3 on the A3 Series
+mfcli kernel install --soc-version A5
 ```
 
 #### MemFabric-zbal
@@ -143,6 +214,7 @@ installed in addition to MemFabric-Hybrid.
 
 ```bash Command
 # Only needed on aarch64 (arm64) hosts
+# A3 Series:
 pip install memfabric-zbal==1.1.3
 ```
 
@@ -211,9 +283,11 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes. CANN 9.1.0 has no stable image yet, so use the daily build tag for now.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes. CANN 9.1.0 has no stable image yet, so use the daily build tag for now.
 
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
+Validated release builds are also published as `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-950-B080`). The exact component versions inside each release image are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B100` entry for the 950PR/DT Series.
+
+{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tags `main-cann9.1.0-a3` / `main-cann9.1.0-950`. Once the stable image is published, switch back to the stable release tag. */}
 </Tip>
 
 <Tabs>
@@ -224,6 +298,16 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 # daily build tag. Once the stable image is published, switch back to the
 # stable release tag.
 docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
+```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
+docker pull quay.io/ascend/sglang:main-cann9.1.0-950
 ```
 
   </Tab>
@@ -258,6 +342,30 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
     --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for downloading models by SGLang.
+# The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# Create a shortcut 'drun' to launch a privileged Docker container
+# The 950PR/DT Series exposes 8 devices: /dev/davinci0 through /dev/davinci7
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --env ASCEND_USE_FIA=1 \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci_manager --device=/dev/hisi_hdc \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
@@ -314,6 +422,9 @@ cat /proc/sys/vm/swappiness # shows 10
 
 #### PD Mixed Scene
 
+<Tabs>
+  <Tab title="Ascend A3 Series">
+
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
@@ -323,6 +434,24 @@ python3 -m sglang.launch_server \
   --host 127.0.0.1 \
   --port 30000
 ```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --attention-backend ascend \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+  </Tab>
+</Tabs>
 
 #### PD Disaggregation Scene
 
@@ -334,6 +463,34 @@ python3 -m sglang.launch_server \
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30001
+```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+# PD disaggregation transfer protocol on the 950PR/DT Series
+export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 
 # PREFILL_IP: IP address of the first Prefill Server
 # FREE_PORT: any available port
@@ -378,6 +535,31 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+# PD disaggregation transfer protocol on the 950PR/DT Series
+export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30002
+```
+
+  </Tab>
 </Tabs>
 
 3. Launch Router
@@ -401,6 +583,9 @@ The `8995` in command script is the disaggregation bootstrap port. It must match
 
 #### PD Mixed Scene
 
+<Tabs>
+  <Tab title="Ascend A3 Series">
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
@@ -415,6 +600,29 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --sampling-backend ascend
 ```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --tp 4 \
+    --device npu \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --enable-multimodal \
+    --sampling-backend ascend
+```
+
+  </Tab>
+</Tabs>
 
 ## Testing the Service
 

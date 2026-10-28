@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import MOE
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -280,6 +282,35 @@ class TestNemotronHOmniModel(CustomTestCase):
             [name for name, _ in loaded_sound_weights],
             ["sound_encoder.projection.weight"],
         )
+
+    def test_expert_location_config_spans_full_hybrid_stack(self):
+        """The VL wrapper exposes the full-stack expert-location config for EPLB."""
+        pattern = "ME*E-E"
+        llm_config = NemotronHConfig(
+            hybrid_override_pattern=pattern, n_routed_experts=8, n_group=1
+        )
+
+        expert_config = (
+            NemotronH_Omni_Reasoning_V3.get_model_config_for_expert_location(
+                SimpleNamespace(llm_config=llm_config)
+            )
+        )
+
+        self.assertEqual(expert_config.num_layers, len(pattern))
+        moe_layer_ids = [i for i, c in enumerate(pattern) if c == MOE]
+        self.assertLess(max(moe_layer_ids), expert_config.num_layers)
+        self.assertEqual(expert_config.num_logical_experts, 8)
+
+    def test_routed_expert_weights_come_from_language_model(self):
+        """The VL wrapper exposes the language model's expert weights for EPLB."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        weights_of_layer = {1: [torch.ones(1)]}
+        model.language_model = SimpleNamespace(
+            routed_experts_weights_of_layer=weights_of_layer
+        )
+
+        self.assertIs(model.routed_experts_weights_of_layer, weights_of_layer)
 
 
 if __name__ == "__main__":

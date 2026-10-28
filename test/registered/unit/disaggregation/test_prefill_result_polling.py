@@ -701,7 +701,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda: 0,
+                    swa_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 # The intake reads its config when built; _run_loop publishes

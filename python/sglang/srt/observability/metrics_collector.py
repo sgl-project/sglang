@@ -2175,7 +2175,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap means the live device prefix diverged from the "
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
-            "reusable when cache-mode admission ran.",
+            "reusable when cache-mode admission ran; deadline means the "
+            "storage prefetch stop policy ended the read before it completed.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2184,6 +2185,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_capacity",
             "device_covered",
             "storage_transfer",
+            "deadline",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",

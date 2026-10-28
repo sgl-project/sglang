@@ -8,6 +8,7 @@ from typing import Iterator, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -16,16 +17,31 @@ from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
+_LOGITS_DTYPE = (
+    torch.bfloat16 if envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get() else torch.float32
+)
+_LOGITS_DTYPE_BYTES = _LOGITS_DTYPE.itemsize
+# Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
+# DeepSelect reads past a row's end (DeepGEMM pads the stride but its tensor's storage ends at the last row)
+FLAT_LOGITS_WIDTH_ALIGN = 64
+
 
 def flat_index_logits_rows_per_tile(
-    rows: int, width: int, *, heads: int, budget_bytes: int
+    rows: int,
+    width: int,
+    *,
+    heads: int,
+    budget_bytes: int,
+    item_size: int = _LOGITS_DTYPE_BYTES,
 ) -> int:
-    """Rows per fp32 logits tile within ``budget_bytes``, at the kernel's row
-    alignment."""
+    """Rows per logits tile within ``budget_bytes`` (sized as fp32, which also
+    bounds bf16), at the kernel's row alignment."""
     row_alignment = 128 // heads
+    # NOTE: for bf16, the estimated row bytes is 2 times the actual bytes
+    effective_width = width * item_size // 4
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
+        row_bytes=mqa_logits_row_bytes(effective_width),
         budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
@@ -42,16 +58,15 @@ def flat_index_logits_tiles(
     lengths: torch.Tensor,
     context_lengths: list[int],
     budget_bytes: int,
-    width_align: int = 4,
 ) -> Iterator[tuple[slice, torch.Tensor]]:
-    """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
+    """``(rows, logits)`` per row tile, each tile within ``budget_bytes``:
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
-    aligned to ``width_align``."""
+    aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]
-    width = ceil_align(max(context_lengths, default=0), width_align)
+    width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
         return
     rows_per_chunk = flat_index_logits_rows_per_tile(
@@ -70,6 +85,7 @@ def flat_index_logits_tiles(
                 tile_starts + lengths[tile],
                 False,
                 width,
+                logits_dtype=_LOGITS_DTYPE,
             ),
         )
 
@@ -98,6 +114,7 @@ def deep_gemm_fp4_paged_mqa_logits(
         deep_gemm_metadata,
         max_seq_len,
         False,
+        logits_dtype=_LOGITS_DTYPE,
     )
 
 

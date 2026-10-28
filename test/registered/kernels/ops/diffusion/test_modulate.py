@@ -42,7 +42,7 @@ register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
 DEVICE = "cuda"
 CUDA_NATIVE_ONLY = pytest.mark.skipif(
     torch.version.hip is not None,
-    reason="the bit-exact residual-gate fast path is CUDA-only",
+    reason="the bit-exact fast path is CUDA-only",
 )
 
 
@@ -77,9 +77,12 @@ def test_modulate_scale_shift_matches_eager(shape, dtype):
     x = torch.randn(shape, device=DEVICE, dtype=dtype)
     scale = torch.randn((shape[0], shape[-1]), device=DEVICE, dtype=dtype)
     shift = torch.randn_like(scale)
-    assert torch.equal(
-        modulate_scale_shift_cuda(x, scale, shift), _eager_modulate(x, scale, shift)
-    )
+    ref = _eager_modulate(x, scale, shift)
+    if torch.version.hip is None:
+        assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
+    else:
+        assert not can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert torch.equal(modulate_scale_shift(x, scale, shift), ref)
 
 
 def test_modulate_scale_shift_accepts_adaln_chunk_views():
@@ -87,10 +90,13 @@ def test_modulate_scale_shift_accepts_adaln_chunk_views():
     x = torch.randn((1, 4096, 3072), device=DEVICE, dtype=torch.bfloat16)
     emb = torch.randn((1, 6 * 3072), device=DEVICE, dtype=torch.bfloat16)
     shift, scale = emb.chunk(6, dim=1)[:2]
-    assert can_use_modulate_scale_shift_cuda(x, scale, shift)
-    assert torch.equal(
-        modulate_scale_shift_cuda(x, scale, shift), _eager_modulate(x, scale, shift)
-    )
+    ref = _eager_modulate(x, scale, shift)
+    if torch.version.hip is None:
+        assert can_use_modulate_scale_shift_cuda(x, scale, shift)
+        assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
+    else:
+        assert not can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert torch.equal(modulate_scale_shift(x, scale, shift), ref)
 
 
 def test_modulate_scale_shift_guards_reject_fp32():
@@ -326,12 +332,16 @@ def test_residual_gate_add_batched_rows(dtype, shape, strided_gate):
         assert not gate.is_contiguous()
     else:
         gate = torch.randn((batch, 1, hidden), device=DEVICE, dtype=dtype)
-    assert can_use_residual_gate_add_cuda(residual, update, gate)
     expected = residual + update * gate
-    _assert_gate_add(residual_gate_add_cuda(residual, update, gate), expected)
+    if torch.version.hip is None:
+        assert can_use_residual_gate_add_cuda(residual, update, gate)
+        _assert_gate_add(residual_gate_add_cuda(residual, update, gate), expected)
+    else:
+        assert not can_use_residual_gate_add_cuda(residual, update, gate)
     _assert_gate_add(residual_gate_add(residual, update, gate), expected)
 
 
+@CUDA_NATIVE_ONLY
 def test_residual_gate_add_batched_rows_cuda_graph():
     residual = torch.randn((4, 33, 128), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
@@ -351,6 +361,7 @@ def test_residual_gate_add_batched_rows_cuda_graph():
 
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@CUDA_NATIVE_ONLY
 def test_scaled_residual_add_is_bit_exact(dtype):
     # fp32 residual accumulator + half-precision update, as the DiT blocks
     # that keep their residual stream in fp32 emit it.
@@ -569,6 +580,8 @@ def timestep_embedding_reference(
         (True, 1, 0.01),  # scaled variant used by the SD-style embedders
     ],
 )
+# ROCm uses diffusers' get_timestep_embedding instead (see Timesteps.forward).
+@CUDA_NATIVE_ONLY
 def test_timestep_embedding_matches_diffusers(
     batch_size, dim, dtype, flip_sin_to_cos, downscale_freq_shift, scale
 ):

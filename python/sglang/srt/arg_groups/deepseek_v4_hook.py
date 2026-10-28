@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
+    from sglang.srt.utils.common import is_sm100_supported
+
+    cfg = resolving_view(server_args)
+    layout = envs.SGLANG_DSV4_KV_LAYOUT
+    if (
+        model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        or cfg.device != "cuda"
+        or not is_sm100_supported()
+        or cfg.kv_cache_dtype != "fp8_e4m3"
+        or cfg.disaggregation_mode != "null"
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
+    ):
+        return "flashmla"
+    return "flashmla_mega"
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -47,6 +64,22 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+
+    if cfg.dsv4_attn_backend == "auto":
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            dsv4_attn_backend=_default_dsv4_attention_backend(server_args),
+        )
+
+    if cfg.dsv4_attn_backend == "flashmla_mega":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert (
+            model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+            and cfg.device == "cuda"
+            and is_sm100_supported()
+        ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
@@ -215,10 +248,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         return
     if (
         cfg.dsv4_attn_backend == "trtllm"
-        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        and cfg.cuda_graph_config.prefill.backend
+        not in (Backend.DISABLED, Backend.BREAKABLE)
     ):
         raise ValueError(
-            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
+            "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
         incompatible = (
@@ -266,12 +301,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         (
-            "TRT-LLM with SWA bounded replay",
-            cfg.dsv4_attn_backend == "trtllm"
-            and (
-                cfg.enable_encoder_swa_bounded_replay
-                or cfg.enable_decoder_swa_bounded_replay
-            ),
+            "TRT-LLM with encoder SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),

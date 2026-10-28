@@ -1566,6 +1566,21 @@ def _configure_mixin_model(monkeypatch) -> _MixinModel:
     return model
 
 
+def test_streamed_parameters_opt_out_of_prepared_kernel_caches(monkeypatch):
+    model = _configure_mixin_model(monkeypatch)
+    manager = model.layerwise_offload_managers[0]
+    parameters = dict(model.named_parameters())
+
+    managed = {
+        name for metadata in manager._weight_metadata.values() for name in metadata
+    }
+    assert managed
+    assert all(
+        getattr(parameters[name], "_sglang_layerwise_offloaded", False)
+        for name in managed
+    )
+
+
 def test_disable_offload_short_circuits_residency_release(monkeypatch):
     """disable_offload() must make later layerwise calls no-ops.
 

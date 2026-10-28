@@ -129,6 +129,13 @@ class BaseKVManager(ABC):
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
 
+    def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
+        """Whether the checksum sent by the prefill at bootstrap_addr is comparable
+        with one over this rank's local KV. A backend returns False for a peer
+        whose digest covers a different byte range, e.g. a TP width mismatch where
+        each decode rank receives only a slice of what the sender digested."""
+        return True
+
     @abstractmethod
     def __init__(
         self,

@@ -6,6 +6,9 @@ import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    _local_prefill_cuda_graph_vote,
+)
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -36,6 +39,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 16
         return runner
 
@@ -237,6 +241,56 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         uncovered = self._make_forward_batch(4)
         uncovered.seq_lens_cpu.fill_(701)
         self.assertFalse(runner.can_run_graph(uncovered))
+
+    def test_sequence_bound_votes_eager_for_active_and_idle_dp_ranks(self):
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.max_seq_len = 16384
+        for context_len, expected in ((16384, True), (17000, False)):
+            with self.subTest(context_len=context_len):
+                active = self._make_forward_batch(4)
+                active.seq_lens_cpu.fill_(context_len)
+                schedule_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=lambda: 1,
+                    extend_num_tokens=4,
+                    input_embeds=None,
+                    replace_embeds=None,
+                    prefix_lens=[context_len - 4],
+                    return_logprob=False,
+                    multimodal_inputs=None,
+                    seq_lens_cpu=active.seq_lens_cpu,
+                )
+                votes = [
+                    _local_prefill_cuda_graph_vote(
+                        local_batch=batch,
+                        prefill_graph_runner=runner,
+                        coordinated_prefill=True,
+                        breakable_prefill=True,
+                        spec_algorithm=None,
+                        model_config=None,
+                    )
+                    for batch in (schedule_batch, None)
+                ]
+                self.assertEqual(votes, [expected, True])
+                # The padded idle request fits; it must still honor the vote.
+                idle = self._make_forward_batch(4)
+                for batch in (active, idle):
+                    batch.global_num_tokens_cpu = [4, 4]
+                    batch.can_run_dp_prefill_cuda_graph = all(votes)
+                    self.assertEqual(runner.can_run_graph(batch), expected)
+
+    def test_context_and_sequence_bounds_both_apply(self):
+        runner = self._make_runner()
+        for context_limit, sequence_limit in ((700, 900), (900, 700)):
+            with self.subTest(context=context_limit, sequence=sequence_limit):
+                runner.max_context_size = context_limit
+                runner.max_seq_len = sequence_limit
+                batch = self._make_forward_batch(4)
+                batch.seq_lens_cpu.fill_(700)
+                self.assertTrue(runner.can_run_graph(batch))
+                batch.seq_lens_cpu.fill_(701)
+                self.assertFalse(runner.can_run_graph(batch))
 
     def test_unsupported_path_ignores_max_context_size(self):
         runner = self._make_runner()

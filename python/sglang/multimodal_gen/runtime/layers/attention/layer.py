@@ -800,6 +800,15 @@ class LocalAttention(nn.Module):
         return output
 
 
+@functools.lru_cache(maxsize=64)
+def _cu_seqlens_on_device(
+    bounds: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    # Bounds repeat for every block and step; a fresh pageable H2D copy per call
+    # blocks the host until the stream drains. Callers must not mutate the result.
+    return torch.tensor(bounds, dtype=torch.int32, device=device)
+
+
 class USPAttention(nn.Module):
     """
     Sequence-parallel attention with Ulysses, K/V gather, and Ring Attention.
@@ -982,7 +991,28 @@ class USPAttention(nn.Module):
                 and not num_replicated_kv_prefix
             ), "Varlen USPAttention does not support masks or replicated tokens"
             if effective_skip_sp or get_sequence_parallel_world_size() == 1:
-                return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+                if q.shape[0] != 1:
+                    raise NotImplementedError(
+                        "Local varlen USPAttention expects one packed batch row"
+                    )
+                total = sum(seq_lens)
+                if total != q.shape[1]:
+                    raise ValueError(
+                        f"sum(seq_lens)={total} must match packed length {q.shape[1]}"
+                    )
+                bounds = [0]
+                for length in seq_lens:
+                    bounds.append(bounds[-1] + int(length))
+                cu_seqlens = _cu_seqlens_on_device(tuple(bounds), q.device)
+                out = self.attn_impl.forward_varlen(
+                    q[0],
+                    k[0],
+                    v[0],
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max(seq_lens),
+                    cu_seqlens_host=tuple(bounds),
+                )
+                return out.unsqueeze(0)
             if get_ring_parallel_world_size() > 1:
                 # The varlen all-to-all spans the combined SP group and is not
                 # ring-aware; it would shuffle rows across ring ranks instead

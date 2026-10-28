@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import os
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -219,6 +221,28 @@ class GroupCoordinator:
 
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
+        self.shm_handle = None
+        global_world_size = torch.distributed.get_world_size()
+        local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+        self.is_single_node = local_size > 0 and global_world_size == local_size
+        if (
+            current_platform.is_cpu()
+            and self.is_single_node
+            and self.world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+            and self.unique_name.startswith(("tp", "sp"))
+        ):
+            group_ranks = "-".join(str(rank) for rank in self.ranks)
+            group_name = f"{self.unique_name}-{group_ranks}"
+
+            self.shm_handle = int(
+                torch.ops.sgl_kernel.shm_group_initialize(
+                    group_name,
+                    self.world_size,
+                    self.rank_in_group,
+                )
+            )
+            torch.distributed.barrier(group=self.cpu_group)
 
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
@@ -375,7 +399,9 @@ class GroupCoordinator:
             torch.compiler.is_compiling()
             and self.srt_custom_allreduce is not None
             and not async_op
-            and op == torch.distributed.ReduceOp.SUM
+            # Compare by identity: Dynamo before torch 2.14 cannot trace
+            # RedOpType.__eq__ and breaks the graph on `==`.
+            and op is torch.distributed.ReduceOp.SUM
             and not input_.is_cpu
         ):
             return diffusion_all_reduce(input_, group_name=self.unique_name)
@@ -384,7 +410,7 @@ class GroupCoordinator:
             if (
                 not async_op
                 and custom_ar is not None
-                and op == torch.distributed.ReduceOp.SUM
+                and op is torch.distributed.ReduceOp.SUM
                 and not input_.is_cpu
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
@@ -394,17 +420,20 @@ class GroupCoordinator:
                     return output
             if (
                 current_platform.is_cpu()
+                and not async_op
+                and self.shm_handle is not None
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
                 and op is torch.distributed.ReduceOp.SUM
             ):
                 # for CPU platform, intra-node case we could speedup with shared memory based comm ops
                 torch.ops.sgl_kernel.shm_allreduce(
-                    input_, int(torch.distributed.ReduceOp.SUM)
+                    input_, int(torch.distributed.ReduceOp.SUM), self.shm_handle
                 )
             else:
                 torch.distributed.all_reduce(
                     input_, op=op, group=self.device_group, async_op=async_op
                 )
+
         return input_
 
     def _all_reduce_out_of_place(self, input_: torch.Tensor) -> torch.Tensor:
@@ -438,18 +467,24 @@ class GroupCoordinator:
             input_size, dtype=input_.dtype, device=input_.device
         )
 
-        # All-gather.
-        if current_platform.is_cpu() and is_shm_available(
-            input_.dtype, self.world_size, len(self.ranks)
+        # Group-aware CPU SHM all-gather.
+        if (
+            current_platform.is_cpu()
+            and self.shm_handle is not None
+            and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
         ):
-            output_tensor = torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            output_tensor = torch.ops.sgl_kernel.shm_allgather(
+                input_, dim, self.shm_handle
+            )
+
             if separate_tensors:
                 return list(output_tensor.chunk(world_size, dim=dim))
             return output_tensor
-        else:
-            if not input_.is_contiguous():
-                input_ = input_.contiguous()
-            all_gather_single(output_tensor, input_, group=self.device_group)
+
+        # Fallback.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
+        all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
@@ -887,3 +922,13 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.ulysses_shm_handle = None
+        if (
+            current_platform.is_cpu()
+            and self.ulysses_world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+        ):
+            # TODO: Initialize a dedicated SHM handle for the Ulysses subgroup
+            # when Ring Attention is supported on CPU. The current SP handle
+            # is only valid when ring_degree == 1.
+            self.ulysses_shm_handle = self.shm_handle

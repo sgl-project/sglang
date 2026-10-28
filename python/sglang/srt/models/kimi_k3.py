@@ -438,6 +438,7 @@ def _uses_ep_a2a() -> bool:
     _a2a_backend = get_moe_a2a_backend()
     return (
         _a2a_backend.is_megamoe()
+        or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
@@ -546,6 +547,7 @@ class KimiK3MoE(nn.Module):
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
         )
@@ -3005,6 +3007,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(

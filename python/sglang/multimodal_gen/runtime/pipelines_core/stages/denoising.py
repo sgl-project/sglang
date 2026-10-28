@@ -845,6 +845,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
 
+    def _cache_dit_has_separate_cfg(self, batch: Req) -> bool:
+        """Whether CFG runs as separate cond/uncond transformer calls per step."""
+        return (
+            batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
+
+    def _cache_dit_joint_cfg_decision(self) -> bool:
+        """Whether one forward carries the whole CFG pair (see
+        ``enable_cache_on_transformer``)."""
+        return False
+
     def _cache_dit_requested(self) -> bool:
         """Request-independent server default (init-time decisions only)."""
         return envs.SGLANG_CACHE_DIT_ENABLED
@@ -1076,11 +1088,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
-        has_separate_cfg = (
-            requested
-            and batch.do_classifier_free_guidance
-            and not self.server_args.enable_cfg_parallel
-        )
+        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(batch)
         desired_key = (
             (
                 cache_dit_overrides_key(self._cache_dit_request_overrides),
@@ -1207,6 +1215,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 sp_group=sp_group,
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
+                joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",

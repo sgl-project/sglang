@@ -44,6 +44,7 @@ fn config(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             dp_aware: false,
+            dp_rank_policy: Default::default(),
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

@@ -9,7 +9,8 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd | npu.
+//                      vendor picks the selector group: blackwell | hopper | amd |
+//                      npu | cpu (cpu also drops GPU passthrough from docker run).
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -928,6 +929,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             "  -v /etc/ascend_install.info:/etc/ascend_install.info",
             "  -v /var/queue_schedule:/var/queue_schedule",
             "  -v ~/.cache/:/root/.cache/",
+          ]
+        : vendorOf(sel.hw) === "cpu"
+        ? [
+            // CPU-only platform: no GPU device passthrough. --privileged and a
+            // large /dev/shm are what the CPU TP ranks need for their shared
+            // memory transport.
+            "docker run --privileged",
+            "  --shm-size 32g",
           ]
         : [
             "docker run --gpus all",

@@ -21,24 +21,21 @@ Vibe-coded PRs are welcome — we judge code quality, not how it was produced. T
 - **No over-catching.** Don't guard against errors that virtually never happen in practice.
 - **Test before submitting.** AI-generated code can be subtly wrong — verify correctness end-to-end.
 
-## Commit Message Convention
+<a id="commit-message-convention" />
 
-We follow a structured commit message format to maintain a clean history.
+## Pull request titles
 
-**Format:**
+Follow the repository-wide [PR title convention](/docs/developer_guide/contribution_guide#pull-request-titles). Use `diffusion` as the scope, or `diffusion/<submodule-or-model>` when a more specific scope helps.
+
 ```text
-[diffusion] <scope>: <subject>
+[Perf] diffusion/scheduler: Reduce scheduling overhead
+[Fix] diffusion/cli: Fix argument parsing
+[Feat] diffusion/wan: Add model support
+[Doc] diffusion: Update the contribution guide
+[Perf] [NVIDIA] diffusion/attention: Optimize attention kernels
 ```
 
-**Examples:**
-- `[diffusion] cli: add --perf-dump-path argument`
-- `[diffusion] scheduler: fix deadlock in batch processing`
-- `[diffusion] model: support Stable Diffusion 3.5`
-
-**Rules:**
-- **Prefix**: Always start with `[diffusion]`.
-- **Scope** (Optional): `cli`, `scheduler`, `model`, `pipeline`, `docs`, etc.
-- **Subject**: Imperative mood, short and clear (e.g., "add feature" not "added feature").
+Put the change type in the first bracketed tag. `diffusion` belongs in the scope, not in a hardware tag or a separate `[Diffusion]` prefix. Omit the hardware tag unless the change is hardware-specific.
 
 ## Performance Reporting
 

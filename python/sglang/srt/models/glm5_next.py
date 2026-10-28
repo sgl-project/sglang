@@ -137,7 +137,7 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
-# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
+# Matches deepseek_v4_mhc.MHC_POST_MULT_VALUE; the fused and unfused boundaries
 # must agree on it.
 _MHC_POST_MULT_VALUE = 2.0
 

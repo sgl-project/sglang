@@ -26,6 +26,9 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -50,6 +53,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -82,6 +86,7 @@ from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
@@ -170,9 +175,12 @@ class NemotronHMoE(nn.Module):
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
 
+        self.layer_id = layer_idx
+        self.is_nextn = is_nextn
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -279,16 +287,20 @@ class NemotronHMoE(nn.Module):
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
+        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            return self._forward_core_shared_routed_overlap(hidden_states)
-        return self._forward_core_normal(hidden_states)
+            return self._forward_core_shared_routed_overlap(
+                hidden_states, num_token_non_padded
+            )
+        return self._forward_core_normal(hidden_states, num_token_non_padded)
 
     def _forward_core_normal(
         self,
         hidden_states: torch.Tensor,
+        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
         # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
@@ -299,7 +311,16 @@ class NemotronHMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
+            ),
+        )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
         final_hidden_states = self.experts(hidden_states, topk_output)
@@ -308,6 +329,7 @@ class NemotronHMoE(nn.Module):
     def _forward_core_shared_routed_overlap(
         self,
         hidden_states: torch.Tensor,
+        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
@@ -324,13 +346,32 @@ class NemotronHMoE(nn.Module):
             router_logits = torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                    if not self.is_nextn
+                    else None
+                ),
+            )
             if self.use_latent_moe:
                 hidden_states = self._apply_fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
         get_current_device_stream_fast().wait_stream(alt_stream)
 
         return final_hidden_states, shared_output
+
+    def get_moe_weights(self) -> list[torch.Tensor]:
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
     def _apply_latent_projection(
         self,
@@ -351,11 +392,19 @@ class NemotronHMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
         # MoE runner / topk), so final_hidden_states is already scaled.
-        final_hidden_states, shared_output = self._forward_core(hidden_states)
+        final_hidden_states, shared_output = self._forward_core(
+            hidden_states,
+            num_token_non_padded=(
+                forward_batch.moe_num_token_non_padded()
+                if forward_batch is not None
+                else None
+            ),
+        )
 
         if self.use_latent_moe:
             final_hidden_states = self._apply_latent_projection(
@@ -430,6 +479,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
@@ -440,10 +490,21 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
+            is_nextn=is_nextn,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self._init_stage_boundary(config, layer_idx)
+
+    def forward(
+        self,
+        *,
+        hidden_states,
+        forward_batch: ForwardBatch,
+    ):
+        hidden_states = self.boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.mixer.forward(hidden_states, forward_batch=forward_batch)
+        return self.boundary.finish(hidden_states, forward_batch)
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
@@ -729,10 +790,11 @@ class NemotronHModel(nn.Module):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
-            hidden_states = layer.forward(
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                hidden_states = layer.forward(
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
@@ -841,6 +903,22 @@ class NemotronHForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mixer.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id], NemotronHMoEDecoderLayer)
+            }
+        )
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.max_n_routed_experts,
+            num_groups=config.n_group,
+        )
 
     def _init_model(
         self,

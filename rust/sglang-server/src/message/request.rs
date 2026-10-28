@@ -80,6 +80,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         video_data,
         audio_data,
         extra_key,
+        priority,
     } = req;
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
@@ -376,6 +377,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             routed_dp_rank,
             disagg_prefill_dp_rank,
             extra_key,
+            priority,
             mm: pack_mm(image_data, video_data, audio_data),
             mm_buffers: Vec::new(),
         },
@@ -521,6 +523,8 @@ pub struct GenerateRequest {
     /// Prefix-cache namespace: requests share cached prefixes only under the
     /// same key.
     pub extra_key: Option<String>,
+    /// Scheduling priority, shared by every item of a batch.
+    pub priority: Option<i64>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
@@ -825,7 +829,6 @@ mod tests {
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
-            r#""priority": 3"#,
             r#""session_id": "s""#,
             r#""session_params": {"a": 1}"#,
             r#""return_sampling_mask": true"#,
