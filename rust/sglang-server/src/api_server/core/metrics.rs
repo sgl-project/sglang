@@ -472,6 +472,10 @@ impl FrontendMetrics {
     /// Write the current values as this process's multiprocess files, each
     /// only if it changed since the last write.
     pub(crate) fn flush(&self) -> io::Result<()> {
+        // Held from the snapshot through the write, so a scrape-triggered
+        // flush racing the periodic one cannot write an older snapshot over
+        // a newer one.
+        let mut written = self.written.lock().unwrap();
         let mut counters = Vec::new();
         for family in self.counters() {
             family.entries(&mut counters);
@@ -480,7 +484,6 @@ impl FrontendMetrics {
         for family in self.histograms() {
             family.entries(&mut histograms);
         }
-        let mut written = self.written.lock().unwrap();
         for (file, entries) in [
             (&self.counter_file, counters),
             (&self.histogram_file, histograms),
