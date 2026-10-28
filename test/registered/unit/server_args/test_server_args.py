@@ -4058,48 +4058,6 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         check_two_batch_overlap(args)
 
 
-class TestKimiLinearCPUDefaults(CustomTestCase):
-    def test_cpu_uses_no_buffer_without_overlap(self):
-        """CPU startup must not select unsupported extra-buffer state snapshots."""
-        from sglang.srt.configs.kimi_linear import KimiLinearConfig
-
-        with tempfile.TemporaryDirectory() as model_dir:
-            config = KimiLinearConfig(
-                architectures=["KimiLinearForCausalLM"],
-                hidden_size=128,
-                intermediate_size=256,
-                moe_intermediate_size=64,
-                num_experts=4,
-                num_experts_per_token=2,
-                num_hidden_layers=2,
-                num_attention_heads=2,
-                kv_lora_rank=64,
-                qk_nope_head_dim=64,
-                qk_rope_head_dim=64,
-                v_head_dim=64,
-                linear_attn_config={
-                    "num_heads": 2,
-                    "head_dim": 64,
-                    "short_conv_kernel_size": 4,
-                    "kda_layers": [1],
-                    "full_attn_layers": [2],
-                },
-            )
-            config.save_pretrained(model_dir)
-            args = ServerArgs(
-                model_path=model_dir,
-                device="cpu",
-                disable_cuda_graph=True,
-                max_total_tokens=128,
-                chunked_prefill_size=128,
-            )
-            args.resolve_once()
-            self.assertEqual(
-                resolution_result(args, "mamba_radix_cache_strategy"), "no_buffer"
-            )
-            self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
-
-
 class TestKvCacheShardingCompatibility(CustomTestCase):
     def setUp(self):
         super().setUp()

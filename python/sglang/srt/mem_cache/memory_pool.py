@@ -743,7 +743,7 @@ class MambaPool:
                     from sglang.srt.layers.amx_utils import _init_amx_conv_state
 
                     # CPU uses a different layout of conv_state for kernel optimization
-                    # KDA is already window-major; only GDN needs the AMX stride conversion.
+                    # KDA is already window-major, skip AMX Layout packing
                     conv_state = _init_amx_conv_state(conv_state)
 
                 temporal_state = torch.zeros(

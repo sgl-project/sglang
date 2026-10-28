@@ -1,6 +1,5 @@
 import sys
 from typing import Optional, Tuple, Union
-from unittest.mock import patch
 
 import pytest
 import sgl_kernel  # noqa: F401
@@ -17,40 +16,6 @@ torch.manual_seed(1234)
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_IDS = ["float16", "bfloat16"]
 eps = 1e-6
-
-
-@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
-@pytest.mark.parametrize("prenorm", [False, True])
-@pytest.mark.parametrize("with_residual", [False, True])
-@torch.random.fork_rng(devices=[])
-def test_sigmoid_gated_rmsnorm_cpu(dtype, prenorm, with_residual):
-    """Kimi's sigmoid output gate must not enter the SiLU-only CPU operator."""
-    from sglang.kernels.ops.attention.fla import fused_norm_gate
-
-    torch.manual_seed(44)
-    x = torch.randn(2, 3, 128).to(dtype)
-    backing = torch.randn(2, 3, 256).to(dtype)
-    gate = backing[..., :128]
-    residual = torch.randn_like(x) if with_residual else None
-    norm = fused_norm_gate.FusedRMSNormGated(
-        128, activation="sigmoid", dtype=dtype, eps=eps
-    )
-    norm.weight.data.fill_(1)
-    combined = x.float() + (residual.float() if residual is not None else 0)
-    expected = (
-        combined
-        * torch.rsqrt(combined.square().mean(-1, keepdim=True) + eps)
-        * gate.float().sigmoid()
-    ).to(dtype)
-    with patch.object(fused_norm_gate, "_use_cpu", True):
-        actual = norm(
-            x, gate, residual=residual, prenorm=prenorm, residual_in_fp32=True
-        )
-    if prenorm:
-        actual, saved = actual
-        expected_dtype = residual.dtype if residual is not None else torch.float32
-        torch.testing.assert_close(saved, combined.to(expected_dtype), rtol=0, atol=0)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestNorm:

@@ -400,7 +400,7 @@ class KimiDeltaAttention(nn.Module):
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
-            params_dtype=config.dtype if is_cpu() else torch.float32,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
             parallel_group=parallel_group,
         )
