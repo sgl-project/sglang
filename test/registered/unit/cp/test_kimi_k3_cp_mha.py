@@ -63,7 +63,9 @@ class TestKimiK3CPMHAWorkspace(CustomTestCase):
             seq_lens_cpu=[211, 307],
             attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[40, 48]),
         )
-        self.enterContext(get_parallel().override(tp_size=2, moe_tp_size=2, attn_cp_size=2))
+        self.enterContext(
+            get_parallel().override(tp_size=2, moe_tp_size=2, attn_cp_size=2)
+        )
         self.enterContext(patch(_K3 + "is_cp_active", return_value=True))
         self.enterContext(patch(_K3 + "get_is_capture_mode", return_value=False))
         self.enterContext(patch(_K3 + "is_in_breakable_cuda_graph", return_value=False))
@@ -104,7 +106,7 @@ class TestKimiK3CPMHAWorkspace(CustomTestCase):
                     per_rank_actual_token=[tokens // cp] * cp
                 ),
             )
-            with get_parallel().override(attn_cp_size=cp):
+            with get_parallel().override(tp_size=cp, moe_tp_size=cp, attn_cp_size=cp):
                 needed = self.attention._cp_mha_workspace_size(batch)
             with self.subTest(cp=cp, tokens=tokens):
                 self.assertEqual(needed <= budget, expect, (needed, budget))
@@ -530,7 +532,10 @@ def check_cp_mha_numerical(
     backend.num_splits = 1
     backend.device = device
     if real_flash:
-        from sglang.kernels.ops.attention.flash_attention_v4 import flash_attn_varlen_func
+        from sglang.kernels.ops.attention.flash_attention_v4 import (
+            flash_attn_varlen_func,
+        )
+
         backend.flash_attn_varlen_func = flash_attn_varlen_func
     else:
         backend.flash_attn_varlen_func = _varlen_reference

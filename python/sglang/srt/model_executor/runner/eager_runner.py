@@ -353,9 +353,14 @@ class EagerRunner(BaseRunner):
             device_timer_ctx(model_runner.device_timer, category),
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
-            if cp_active and not cp_full_sequence and (
-                not get_parallel().enable_cp_tp_group_sharing
-                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
+            if (
+                cp_active
+                and not cp_full_sequence
+                and (
+                    not get_parallel().enable_cp_tp_group_sharing
+                    or getattr(model_runner.model, "prepare_cp_inputs", None)
+                    is not None
+                )
             ):
                 # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
                 # Other group-sharing models keep owning the layout in forward().

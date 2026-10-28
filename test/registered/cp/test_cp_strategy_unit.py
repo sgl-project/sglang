@@ -356,8 +356,13 @@ class TestCPZigzagStrategy(CustomTestCase):
                     patch(
                         "sglang.srt.model_executor.runner.eager_runner.maybe_publish_prefill_shared_read_done"
                     ),
-                    patch("sglang.srt.model_executor.runner.eager_runner.get_forward_context"),
-                    patch("sglang.srt.model_executor.runner.eager_runner.forward_context", return_value=nullcontext()),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.get_forward_context"
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.forward_context",
+                        return_value=nullcontext(),
+                    ),
                 ):
                     result = runner._execute_extend(batch)
                 backend.init_forward_metadata.assert_called_once_with(batch)

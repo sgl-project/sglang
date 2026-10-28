@@ -26,8 +26,13 @@ class TestKimiK3CPKDAFusion(CustomTestCase):
         with (
             get_context().override_server_args(enable_linear_attn_cp=linear_cp),
             get_parallel().override(
-                tp_size=8, tp_rank=0, moe_tp_size=8, attn_tp_size=8 // cp_size,
-                attn_cp_size=cp_size, attn_cp_rank=0, attn_tp_rank=0,
+                tp_size=8,
+                tp_rank=0,
+                moe_tp_size=8,
+                attn_tp_size=8 // cp_size,
+                attn_cp_size=cp_size,
+                attn_cp_rank=0,
+                attn_tp_rank=0,
             ),
             patch(_K3 + "k3_ar_fusion.enabled", return_value=fusion),
         ):
@@ -40,7 +45,9 @@ class TestKimiK3CPKDAFusion(CustomTestCase):
             for kda in (False, True):
                 with self.subTest(cp_size=cp_size, kda=kda):
                     self.assertEqual(
-                        self._fusion_enabled(cp_size=cp_size, linear_cp=cp_size > 1, kda=kda),
+                        self._fusion_enabled(
+                            cp_size=cp_size, linear_cp=cp_size > 1, kda=kda
+                        ),
                         kda or cp_size == 1,
                     )
         for kwargs in (
@@ -55,20 +62,39 @@ class TestKimiK3CPKDAFusion(CustomTestCase):
             for kda in (False, True):
                 with self.subTest(cp_size=cp_size, kda=kda):
                     config = SimpleNamespace(
-                        is_moe=False, attn_res_block_size=None, is_kda_layer=lambda _: kda
+                        is_moe=False,
+                        attn_res_block_size=None,
+                        is_kda_layer=lambda _: kda,
                     )
                     with (
                         get_context().override_server_args(enable_linear_attn_cp=True),
                         get_parallel().override(
-                            tp_size=8, tp_rank=0, moe_tp_size=8, attn_tp_size=8 // cp_size,
-                            attn_cp_size=cp_size, attn_cp_rank=0, attn_tp_rank=0,
+                            tp_size=8,
+                            tp_rank=0,
+                            moe_tp_size=8,
+                            attn_tp_size=8 // cp_size,
+                            attn_cp_size=cp_size,
+                            attn_cp_rank=0,
+                            attn_tp_rank=0,
                         ),
-                        planning(parallel_of(attn_dp=1, attn_tp=8 // cp_size, attn_cp=cp_size, enable_prefill_cp=True), dsa_cp=True),
+                        planning(
+                            parallel_of(
+                                attn_dp=1,
+                                attn_tp=8 // cp_size,
+                                attn_cp=cp_size,
+                                enable_prefill_cp=True,
+                            ),
+                            dsa_cp=True,
+                        ),
                     ):
                         attn, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
-                        attention, feed_forward = build_stages((attn, nn.Identity()), (ffn, nn.Identity()))
+                        attention, feed_forward = build_stages(
+                            (attn, nn.Identity()), (ffn, nn.Identity())
+                        )
                     cp_attn = attention.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
-                    cp_ffn = feed_forward.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
+                    cp_ffn = feed_forward.plan.paths[
+                        BatchVariant.CONTEXT_PARALLEL
+                    ].entry
                     self.assertEqual(cp_attn.input_rows.sharded, frozenset())
                     self.assertEqual(cp_ffn.input_rows.sharded, frozenset())
                     self.assertIsNone(cp_attn.input_move)
@@ -144,7 +170,9 @@ class TestKimiK3CPKDAFusion(CustomTestCase):
         residual = torch.full_like(hidden, 3)
         with (
             patch(_K3 + "k3_ar_fusion.find_mc_ptr", return_value=1),
-            patch(_K3 + "k3_ar_fusion.all_reduce", side_effect=lambda x, r: x * 8 + r) as reduce,
+            patch(
+                _K3 + "k3_ar_fusion.all_reduce", side_effect=lambda x, r: x * 8 + r
+            ) as reduce,
         ):
             output = kimi_k3._k3_all_reduce_add(partial, residual, SimpleNamespace())
         reduce.assert_called_once()
@@ -152,7 +180,9 @@ class TestKimiK3CPKDAFusion(CustomTestCase):
         self.assertIs(reduce.call_args.args[1], residual)
         torch.testing.assert_close(output, hidden + residual)
         with patch(_K3 + "k3_ar_fusion.find_mc_ptr", return_value=None):
-            self.assertIsNone(kimi_k3._k3_all_reduce_add(partial, residual, SimpleNamespace()))
+            self.assertIsNone(
+                kimi_k3._k3_all_reduce_add(partial, residual, SimpleNamespace())
+            )
 
 
 if __name__ == "__main__":

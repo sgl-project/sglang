@@ -395,9 +395,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
         single_launch: bool = False,
     ) -> Any:
-        assert (
-            attention_backend in self.get_supported_attention_backend()
-        ), f"{self.name} CP does not support {attention_backend=}"
+        assert attention_backend in self.get_supported_attention_backend(), (
+            f"{self.name} CP does not support {attention_backend=}"
+        )
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]

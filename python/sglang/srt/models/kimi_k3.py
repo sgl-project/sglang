@@ -61,11 +61,6 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary.layout import Layout, TokenAxis
-from sglang.srt.layers.layer_boundary.row_transport import (
-    ComputeTransport,
-    RowTransport,
-    TransportRows,
-)
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -76,6 +71,11 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
+)
+from sglang.srt.layers.layer_boundary.row_transport import (
+    ComputeTransport,
+    RowTransport,
+    TransportRows,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1330,7 +1330,6 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
-
 
     def _forward_unfused(
         self,
@@ -2643,7 +2642,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             + 64 * 1024 * 1024
         )
 
-
     def _can_use_cp_mha(self, forward_batch: ForwardBatch) -> bool:
         if (
             self._cp_mha_max_workspace_bytes <= 0
@@ -2670,7 +2668,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             <= self._cp_mha_max_workspace_bytes
         )
 
-
     def record_mla_cp_kv_producer_event(
         self, forward_batch: ForwardBatch, k_nope: torch.Tensor
     ) -> Optional[torch.cuda.Event]:
@@ -2690,7 +2687,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
         return event
-
 
     def prepare_mla_cp_kv(
         self,
@@ -2721,14 +2717,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             )
         return False
 
-
     def launch_mla_cp_kv(self, forward_batch: ForwardBatch) -> bool:
         # Called only after successful preparation. Keep this path small so
         # NCCL is submitted while the already-queued Q-B GEMM is still running.
         strategy = get_cp_strategy()
         assert strategy is not None
         return strategy.launch_mla_kv_materialization(forward_batch, self.attn_mqa)
-
 
     def dispatch_attn_forward_method(self, forward_batch) -> AttnForwardMethod:
         method = super().dispatch_attn_forward_method(forward_batch)
@@ -2820,7 +2814,11 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig, *, is_kda: bool = False) ->
     with the pending residual add."""
     attn_tp_size = linear_attn_tp_size() if is_kda else get_parallel().attn_tp_size
     return (
-        (is_kda or get_parallel().attn_cp_size == 1 or not get_parallel().enable_linear_attn_cp)
+        (
+            is_kda
+            or get_parallel().attn_cp_size == 1
+            or not get_parallel().enable_linear_attn_cp
+        )
         and attn_tp_size > 1
         and attn_tp_size == get_parallel().tp_size
         and config.attn_res_block_size is not None
@@ -2918,7 +2916,8 @@ def _stage_facts(
         declare_attn(
             **attn_ops,
             tp_group=(
-                SumGroup.TP if linear_cp and config.is_kda_layer(layer_idx)
+                SumGroup.TP
+                if linear_cp and config.is_kda_layer(layer_idx)
                 else SumGroup.ATTN_TP
             ),
             replicated_cp_residual=linear_cp and not sp_cp,
@@ -3096,7 +3095,11 @@ class KimiK3DecoderLayer(nn.Module):
         if self.all_reduce_fusion:
             parallel = get_parallel()
             group = SumGroup.ATTN_TP
-            if parallel.attn_cp_size > 1 and parallel.enable_linear_attn_cp and self.is_kda_layer:
+            if (
+                parallel.attn_cp_size > 1
+                and parallel.enable_linear_attn_cp
+                and self.is_kda_layer
+            ):
                 group = (
                     SumGroup.ATTN_CP
                     if parallel.attn_cp_size == parallel.tp_size
@@ -3186,9 +3189,11 @@ class KimiK3DecoderLayer(nn.Module):
         )
         if self._sp_cp and self.is_kda_layer:
             with self.attn_boundary.exit(forward_batch) as output:
-                hidden_states = output.finish(self._run_self_attn(
-                    hidden_states, positions, forward_batch, zero_allocator
-                ))
+                hidden_states = output.finish(
+                    self._run_self_attn(
+                        hidden_states, positions, forward_batch, zero_allocator
+                    )
+                )
         else:
             hidden_states = self._run_self_attn(
                 hidden_states, positions, forward_batch, zero_allocator

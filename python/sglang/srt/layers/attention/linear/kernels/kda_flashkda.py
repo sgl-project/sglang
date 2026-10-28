@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
 
+
 def _flashkda_max_seq_len() -> int:
     """FlashKDA's max sequence length: batches whose longest sequence exceeds
     it fall back to Triton for the whole batch. SGLANG_FLASHKDA_MAX_SEQ_LEN,
