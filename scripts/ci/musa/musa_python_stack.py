@@ -78,7 +78,7 @@ def ci_install_extras(torch_version: str) -> str:
     # The legacy runner supplies its own 2.9 vendor wheel bundle. dev_musa
     # targets MUSA 5.2 / Torch 2.11, so its exact vendor pins cannot be resolved
     # against that bundle. Install the shared runtime and test dependencies;
-    # build_constraints still pins every installed vendor distribution.
+    # build_constraints still protects bundled vendor versions during resolution.
     compressed_tensors_version(torch_version)
     if torch_minor(torch_version) == (2, 9):
         return "runtime_common,diffusion_musa,test"

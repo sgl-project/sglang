@@ -260,10 +260,13 @@ else
 
     MUSA_SGLANG_EXTRAS="$(python3 "$STACK_HELPER" install-extras)"
     echo "Installing checkout SGLang extras: ${MUSA_SGLANG_EXTRAS}"
+    # Keep the legacy MUSA runtime requirements explicit when its vendor stack
+    # comes from the runner bundle rather than the MUSA 5.2 dev_musa extra.
     cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" \
         --constraint "$MUSA_CONSTRAINTS" \
         -v \
         -e "python[${MUSA_SGLANG_EXTRAS}]" \
+        "deep-gemm>=0.1.3" "flash-attn-3>=0.1.4" "mate>=0.2.0" \
         "numpy<2.0" "mthreads-ml-py" \
         --user
 
