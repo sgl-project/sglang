@@ -9,10 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 IM_PATCH_ID, VIDEO_START_ID, VIDEO_END_ID = 100, 101, 102
 VIDEO_PAD = 5000
