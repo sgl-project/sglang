@@ -1629,7 +1629,7 @@ def test_linker_load_preserves_swa_boundaries(
         swa.update_external_linker_load.assert_not_called()
 
 
-class TestOffloadReadyEvents(CustomTestCase):
+class TestTransferReadyEvents(CustomTestCase):
     def _record(self, forward_stream):
         device = MagicMock(name="device_module")
         device.Event.side_effect = lambda: MagicMock(name="event")
@@ -1639,17 +1639,17 @@ class TestOffloadReadyEvents(CustomTestCase):
             "sglang.srt.mem_cache.unified_cache.unified_cache_linker.device_module",
             device,
         ):
-            return linker.record_offload_ready()
+            return linker.record_transfer_ready()
 
-    def test_offload_waits_on_the_forward_writing_the_pages(self):
+    def test_transfer_waits_on_the_forward_using_the_pages(self):
         forward_stream = MagicMock(name="forward_stream")
-        indices_ready, kv_written = self._record(forward_stream)
+        indices_ready, forward_done = self._record(forward_stream)
         indices_ready.record.assert_called_once_with()
-        kv_written.record.assert_called_once_with(forward_stream)
-        # The offload thread waits; the forward stream's own order is untouched.
+        forward_done.record.assert_called_once_with(forward_stream)
+        # The transfer thread waits; the forward stream's own order is untouched.
         self.assertEqual(forward_stream.mock_calls, [])
 
-    def test_offload_without_a_forward_stream_waits_on_the_current_one(self):
+    def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
         (indices_ready,) = self._record(None)
         indices_ready.record.assert_called_once_with()
 
@@ -1678,6 +1678,36 @@ class TestOffloadReadyEvents(CustomTestCase):
             ],
         )
         self.assertTrue(linker.offload_results.get_nowait())
+
+    def test_mooncake_load_thread_waits_on_every_event(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.record_transfer_ready = order.record_transfer_ready
+        order.record_transfer_ready.return_value = [
+            order.indices_ready,
+            order.forward_done,
+        ]
+        linker.load_layer_wise = order.load_layer_wise
+        linker.layer_done_counter = MagicMock()
+        linker.layer_done_counter.update_producer.return_value = 3
+        linker.mla_broadcaster = None
+        linker.gc_frozen = True
+        linker.pending_loads = {"rid": ["transfer"]}
+        linker.stats = {"load": 0}
+        linker.load_queue = queue.Queue()
+        self.assertEqual(linker.start_layer_wise_loading(), 3)
+        linker.load_queue.put(None)
+        linker.load_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.record_transfer_ready(),
+                call.indices_ready.synchronize(),
+                call.forward_done.synchronize(),
+                call.load_layer_wise(3, [["transfer"]]),
+            ],
+        )
+        linker.layer_done_counter.fail.assert_not_called()
 
 
 if __name__ == "__main__":

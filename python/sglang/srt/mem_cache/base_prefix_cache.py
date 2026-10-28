@@ -401,9 +401,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # Tokens back from the committed length a fused draft reads in the swa
     # sub-pool (CacheInitParams.draft_swa_window); 0 when it reads none.
     draft_swa_window: int = 0
-    # Inserts that freed duplicate device KV. Only UnifiedRadixCache counts them:
-    # its external linker writes loaded pages off the forward stream.
-    dedup_free_count: int = 0
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled

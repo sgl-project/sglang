@@ -135,8 +135,8 @@ class UnifiedCacheLinker(ABC):
 
     Out-of-tree linkers are constructed per worker as
     ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
-    Store ``forward_stream`` and use ``record_offload_ready()`` to gate offloads.
-    ``layer_done_counter`` provides ``set_consumer(index)`` and
+    Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
+    and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
     ``wait_until(layer)``. Report completion only after device copies finish.
     """
 
@@ -146,20 +146,22 @@ class UnifiedCacheLinker(ABC):
     # stream is the pages' only writer.
     forward_stream: Optional[torch.cuda.Stream] = None
 
-    def record_offload_ready(self) -> list[torch.cuda.Event]:
-        """Record the events an offload waits on before it reads device pages.
+    def record_transfer_ready(self) -> list[torch.cuda.Event]:
+        """Record the events a transfer waits on before it touches device pages.
 
-        The current stream has computed which pages to offload, and the forward
-        stream may still be writing them: prefill read-done lets the scheduler's
-        stream run ahead of the forward that fills a stashed chunk.
+        The current stream has computed which pages to transfer, and the forward
+        stream may still use them: read-done lets the scheduler's stream run
+        ahead of the forward in flight. An offload reads pages that forward
+        writes; a load may write pages freed while it still uses them, such as
+        a stashed chunk's duplicates.
         """
         indices_ready = device_module.Event()
         indices_ready.record()
         events = [indices_ready]
         if self.forward_stream is not None:
-            kv_written = device_module.Event()
-            kv_written.record(self.forward_stream)
-            events.append(kv_written)
+            forward_done = device_module.Event()
+            forward_done.record(self.forward_stream)
+            events.append(forward_done)
         return events
 
     @abstractmethod

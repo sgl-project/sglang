@@ -20,7 +20,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -458,10 +457,6 @@ class TestAllocationIntegration(CustomTestCase):
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
-                        )
-                        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-                        scheduler.stash_chunked_request = MethodType(
-                            Scheduler.stash_chunked_request, scheduler
                         )
                         running = SimpleNamespace(batch_is_full=True)
                         with patch(

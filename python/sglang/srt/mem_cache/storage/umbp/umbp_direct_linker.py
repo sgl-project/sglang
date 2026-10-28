@@ -504,10 +504,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._freeze_gc_once()
         pending = self._pending
         plans = self._build_load_plans(list(pending.values()))
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready_events = self.record_transfer_ready()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans, ready_event))
+        self._load_queue.put((counter_index, plans, ready_events))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -649,8 +648,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans, ready_event = task
-                self._run_layer_wise_batch(counter_index, plans, ready_event)
+                counter_index, plans, ready_events = task
+                self._run_layer_wise_batch(counter_index, plans, ready_events)
             finally:
                 self._load_queue.task_done()
 
@@ -784,10 +783,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
+        self,
+        counter_index: int,
+        plans: list[_PoolRangePlan],
+        ready_events: list[object],
     ) -> None:
         try:
-            ready_event.synchronize()
+            for event in ready_events:
+                event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
@@ -844,7 +847,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_events = self.record_offload_ready()
+        ready_events = self.record_transfer_ready()
         self._offload_queue.put((expanded, ready_events))
         return True
 

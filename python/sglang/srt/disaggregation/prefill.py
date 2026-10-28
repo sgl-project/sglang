@@ -1417,7 +1417,7 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
             reqs_to_exclude.add(req)
-            self.stash_chunked_request(req)
+            self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):

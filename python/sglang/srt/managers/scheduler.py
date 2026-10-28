@@ -3830,19 +3830,10 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        dedup_free_count = self.tree_cache.dedup_free_count
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
         else:
             checkpoint_kv_cache(req, self.tree_cache)
-        # A checkpoint that frees duplicate pages of the chunk still in flight
-        # lets a linker load released by an early read-done event land in them
-        # under that forward, so the rest of this round waits for it.
-        if (
-            self.tree_cache.dedup_free_count != dedup_free_count
-            and self._war_barrier_enabled
-        ):
-            self.schedule_stream.wait_stream(self.forward_stream)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.

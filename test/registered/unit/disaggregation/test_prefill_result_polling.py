@@ -112,7 +112,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
-    stash_chunked_request = Scheduler.stash_chunked_request
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
@@ -182,9 +181,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.copy_stream = Mock(spec=["wait_stream"])
         self.schedule_stream = object()
         self._relay_forward_payload = Mock()
-        self.tree_cache = Mock(
-            spec=["flush_pending_backups", "finish"], dedup_free_count=0
-        )
+        self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = Mock(
             spec=["snapshot_auxiliary_output_starts", "move_logprobs_to_cpu"]
         )

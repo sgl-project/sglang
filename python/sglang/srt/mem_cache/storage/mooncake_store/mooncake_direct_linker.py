@@ -264,12 +264,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if not broadcaster.is_src:
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready_events = self.record_transfer_ready()
         if broadcaster is not None:
-            self.broadcast_loads[counter_index] = (0, prepared, ready_event)
+            self.broadcast_loads[counter_index] = (0, prepared, ready_events)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready_event))
+            self.load_queue.put((counter_index, pending, ready_events))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -277,9 +276,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         batch = self.broadcast_loads.get(index)
         if batch is None:
             return
-        first, prepared, ready_event = batch
+        first, prepared, ready_events = batch
         if first == 0:
-            device_module.current_stream().wait_event(ready_event)
+            for event in ready_events:
+                device_module.current_stream().wait_event(event)
         # KV access may wait several times per layer, or skip sparse layers.
         # Launch each broadcast exactly once, in order, on the forward stream.
         for layer in range(first, threshold + 1):
@@ -290,7 +290,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.broadcast_loads[index] = (
                 max(first, threshold + 1),
                 prepared,
-                ready_event,
+                ready_events,
             )
 
     def load_thread_func(self) -> None:
@@ -299,9 +299,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event = task
+                counter_index, pending, ready_events = task
                 try:
-                    ready_event.synchronize()
+                    for event in ready_events:
+                        event.synchronize()
                     self.load_layer_wise(counter_index, list(pending.values()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
@@ -385,7 +386,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_events = self.record_offload_ready()
+        ready_events = self.record_transfer_ready()
         self.offload_queue.put((expanded, tokens, ready_events, session_id))
         return True
 
