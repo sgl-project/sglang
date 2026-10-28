@@ -50,18 +50,6 @@ def flux3_image_dit_config_from_package(package: Flux3ImagePackage) -> Flux3DiTC
     )
 
 
-def flux3_image_quantization_name(
-    quant_config: QuantizationConfig | None,
-) -> str | None:
-    if quant_config is None:
-        return None
-    name = quant_config.get_name()
-    return {
-        "modelopt_fp4": "nvfp4",
-        "rowwise_fp8": "rowwise-fp8",
-    }.get(name, name)
-
-
 def resolve_flux3_image_dit_quant_config(
     dit_path: str,
     quantization: str | None = None,
@@ -69,9 +57,6 @@ def resolve_flux3_image_dit_quant_config(
 ) -> QuantizationConfig | None:
     from sglang.multimodal_gen.runtime.layers.quantization import (
         get_quantization_config,
-    )
-    from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
-        canonical_quantization_method,
     )
     from sglang.multimodal_gen.runtime.utils.quantization_utils import (
         get_quant_config_from_safetensors_metadata,
@@ -85,7 +70,6 @@ def resolve_flux3_image_dit_quant_config(
             "FLUX.3 checkpoint already has quantization metadata; "
             "do not also set --quantization"
         )
-    quantization = canonical_quantization_method(quantization)
     quant_cls = get_quantization_config(quantization)
     if quantization in {"fp8", "mxfp4", "convrot_int8"}:
         return quant_cls(ignored_layers=ignored_layers)

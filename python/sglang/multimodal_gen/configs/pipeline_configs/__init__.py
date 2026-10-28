@@ -2,7 +2,6 @@
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
-    SlidingTileAttnConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
@@ -109,7 +108,6 @@ __all__ = [
     "SanaPipelineConfig",
     "SanaVideoPipelineConfig",
     "SenseNovaU1PipelineConfig",
-    "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "Pi05PipelineConfig",
     "StableDiffusion3PipelineConfig",

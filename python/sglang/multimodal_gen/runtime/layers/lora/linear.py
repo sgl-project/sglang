@@ -438,14 +438,7 @@ class BaseLayerWithLoRA(nn.Module):
         )
 
         if clear_existing:
-            self.lora_weights_list.clear()
-            # Also clear backward compatibility attributes
-            self.lora_A = None
-            self.lora_B = None
-            self.lora_output_offset = None
-            self.has_lora_output_offset = False
-            self.lora_path = None
-            self.strength = 1.0
+            self.clear_lora_weights()
 
         # Add to list for multi-LoRA support
         self.lora_weights_list.append(
@@ -474,6 +467,16 @@ class BaseLayerWithLoRA(nn.Module):
             self.merge_lora_weights()
         elif self.merged:
             self.unmerge_lora_weights()
+
+    def clear_lora_weights(self) -> None:
+        self.lora_weights_list.clear()
+        # Also clear backward compatibility attributes
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_output_offset = None
+        self.has_lora_output_offset = False
+        self.lora_path = None
+        self.strength = 1.0
 
     def _active_lora_list(self) -> list[LoRAWeightEntry]:
         if self.lora_weights_list:
@@ -582,8 +585,9 @@ class BaseLayerWithLoRA(nn.Module):
             )
             for start in range(0, lora_B_2d.shape[0], chunk_rows):
                 end = min(start + chunk_rows, lora_B_2d.shape[0])
-                chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
-                data_2d[start:end].add_(chunk_delta, alpha=scale)
+                data_2d[start:end].addmm_(
+                    lora_B_2d[start:end], lora_A_sliced, alpha=scale
+                )
 
     def _should_merge_in_fp32(
         self,
@@ -790,9 +794,6 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def unmerge_lora_weights(self) -> None:
-        if self.disable_lora:
-            return
-
         if not self.merged:
             raise ValueError(
                 "LoRA weights not merged. Please merge them first before unmerging."

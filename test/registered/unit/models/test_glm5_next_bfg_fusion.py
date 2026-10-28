@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PREFIX = "model.layers.0.self_attn"
 QKV = ("q_proj", "k_proj", "v_proj")
@@ -324,7 +324,9 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
                     return raw + 11 if consume else raw
 
                 backend.side_effect = run_backend
-                batch = SimpleNamespace(forward_mode=mode, attn_cp_metadata=None)
+                batch = SimpleNamespace(
+                    forward_mode=mode, logical_forward_mode=mode, attn_cp_metadata=None
+                )
                 actual = attention(hidden, batch)
                 expected = (raw + (11 if consume else 3)).squeeze(0).flatten(-2)
                 torch.testing.assert_close(actual, expected)
@@ -340,7 +342,9 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
             attention(
                 hidden,
                 SimpleNamespace(
-                    forward_mode=ForwardMode.TARGET_VERIFY, attn_cp_metadata=None
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    logical_forward_mode=ForwardMode.TARGET_VERIFY,
+                    attn_cp_metadata=None,
                 ),
             )
         self.assertIsNone(attention.attn._k3_onorm_gate)

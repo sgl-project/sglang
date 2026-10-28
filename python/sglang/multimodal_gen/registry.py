@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.utils.external_model_package import (
     load_external_model_package,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    load_dict,
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -189,6 +190,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
+    "fastvideo/fastvideo-fasth3-omni-8-step-v1": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
@@ -368,24 +370,36 @@ def _normalize_hf_cache_path(path: str) -> str:
     return os.path.normpath(path).lower().replace("\\", "/")
 
 
-def has_registered_diffusion_model_path(model_path: str) -> bool:
-    _ensure_registry_initialized()
+def _match_registered_hf_path(model_path: str) -> Optional[str]:
+    """The registered HF id ``model_path`` names: exactly, by short name, or as
+    a local HuggingFace cache path."""
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
-    if is_sensenova_u1_model(model_path):
-        return True
-
+    # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
-        return True
+        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
+        return model_path
 
+    # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
-        if registered_model_name in model_short_name:
-            return True
 
+        if registered_model_name in model_short_name:
+            logger.debug(
+                f"Resolved model name '{registered_model_hf_id}' from partial path match."
+            )
+            return registered_model_hf_id
+
+    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
+    #   .../models--org--repo/snapshots/<hash>
+    # This lets users pass a local HF cache snapshot directory directly even
+    # when its basename is only the snapshot hash.
+    # Example:
+    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
@@ -394,9 +408,22 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
         if cache_repo_fragment in normalized_model_path:
-            return True
+            logger.debug(
+                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
+                model_path,
+                registered_model_hf_id,
+            )
+            return registered_model_hf_id
 
-    return False
+    return None
+
+
+def has_registered_diffusion_model_path(model_path: str) -> bool:
+    _ensure_registry_initialized()
+    return (
+        is_sensenova_u1_model(model_path)
+        or _match_registered_hf_path(model_path) is not None
+    )
 
 
 @lru_cache(maxsize=1)
@@ -436,48 +463,10 @@ def _get_config_info(
     if is_flux3_image_package(model_path):
         return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_IMAGE_HF_PATHS[0]])
 
-    # 1. Exact match
-    if model_path in _MODEL_HF_PATH_TO_NAME:
-        model_id = _MODEL_HF_PATH_TO_NAME[model_path]
-        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
-        return _CONFIG_REGISTRY.get(model_id)
-
-    # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_short_name = get_model_short_name(model_path.lower())
-    for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
-            continue
-        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
-
-        if registered_model_name in model_short_name:
-            logger.debug(
-                f"Resolved model name '{registered_model_hf_id}' from partial path match."
-            )
-            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
-            return _CONFIG_REGISTRY.get(model_id)
-
-    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
-    #   .../models--org--repo/snapshots/<hash>
-    # This lets users pass a local HF cache snapshot directory directly even
-    # when its basename is only the snapshot hash.
-    # Example:
-    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
-    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
-    normalized_model_path = _normalize_hf_cache_path(model_path)
-    for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
-            continue
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
-            logger.debug(
-                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
-                model_path,
-                registered_model_hf_id,
-            )
-            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
-            return _CONFIG_REGISTRY.get(model_id)
+    # 1/2/2b. Exact, short-name, or local HuggingFace cache path match
+    registered_hf_id = _match_registered_hf_path(model_path)
+    if registered_hf_id is not None:
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
 
     # 3. Use detectors
     pipeline_name = get_non_diffusers_pipeline_name(model_path)
@@ -485,10 +474,22 @@ def _get_config_info(
         config = maybe_download_model_index(model_path)
         pipeline_name = config.get("_class_name", "")
     pipeline_name = pipeline_name.lower()
+    # A local checkpoint that ships modular_model_index.json next to model_index.json
+    # may name a finer-grained pipeline there (the Wan-Animate-2 variants);
+    # maybe_download_model_index reads the modular file only when model_index.json is
+    # absent, so probe the detectors with its class as well.
+    modular_pipeline_name = (
+        load_dict(os.path.join(model_path, "modular_model_index.json"))
+        .get("_class_name", "")
+        .lower()
+    )
+    probes = [model_path.lower(), pipeline_name]
+    if modular_pipeline_name and modular_pipeline_name != pipeline_name:
+        probes.append(modular_pipeline_name)
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
-        if detector(model_path.lower()) or detector(pipeline_name):
+        if any(detector(probe) for probe in probes):
             logger.debug(
                 f"Matched model name '{model_id}' using a registered detector."
             )

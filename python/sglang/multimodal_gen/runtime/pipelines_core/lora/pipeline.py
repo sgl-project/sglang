@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     load_peft_config,
     scale_fused_sections,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -342,10 +343,8 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
-        # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
-            torch.get_device_module().synchronize()
-            torch.get_device_module().empty_cache()
+        current_platform.synchronize()
+        current_platform.empty_cache()
 
         offload_disabled_modules = []
         for module_name in module_names:
@@ -809,7 +808,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     alpha_key = name + ".alpha"
                     adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
                     if alpha_key in self.lora_adapters[nickname]:
-                        inferred_alpha = int(
+                        inferred_alpha = float(
                             self.lora_adapters[nickname][alpha_key].item()
                         )
                     elif adapter_lora_alpha is not None:
@@ -851,6 +850,11 @@ class LoRAPipeline(ComposedPipelineBase):
                             for n in lora_nicknames
                         )
                         if not has_any_lora:
+                            # A previous adapter may still be merged here.
+                            if clear_existing:
+                                if layer.merged:
+                                    layer.unmerge_lora_weights()
+                                layer.clear_lora_weights()
                             layer.disable_lora = True
 
         if rank == 0:
@@ -1024,7 +1028,7 @@ class LoRAPipeline(ComposedPipelineBase):
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
-            name = name.replace(".weight", "")
+            name = name.removesuffix(".weight")
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
@@ -1033,8 +1037,8 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
-                # A/B of one fused layer must be laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B")):
+                # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
+                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
                     continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
