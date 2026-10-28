@@ -824,6 +824,25 @@ class HybridCacheController(BaseHiCacheController):
         else:
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
+        if any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        ):
+            pages = operation.pool_storage_result.restorable_prefix_pages
+            if pages is not None:
+                # Capacity is not a restorable boundary: a shorter prefix can
+                # lack the SWA/Mamba checkpoint that made the queried hit usable.
+                # Choose before allocating, including shared side-pool buffers.
+                alloc_len = max(
+                    (
+                        page * self.page_size
+                        for page in pages
+                        if page * self.page_size <= alloc_len
+                    ),
+                    default=0,
+                )
+                if alloc_len == 0:
+                    return None, 0
         if alloc_len >= min_tokens:
             host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
         return host_indices, alloc_len
@@ -1424,10 +1443,19 @@ class HybridCacheController(BaseHiCacheController):
 
         if operation.assume_stored:
             # A prior hit on a suffix of this span proved it stored, and writes
-            # are prefix-covered, so re-querying only adds a round trip. Nothing
-            # is verified now, so no pool gets a verdict to learn from.
+            # are prefix-covered, so re-querying only adds a round trip. For a
+            # trailing pool this proves only the original endpoint, not every
+            # shorter checkpoint. Nothing is verified now, so no pool gets a
+            # verdict to learn from.
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+            if any(
+                transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                for transfer in operation.pool_transfers or []
+            ):
+                operation.pool_storage_result.restorable_prefix_pages = (
+                    [kv_hit_pages] if kv_hit_pages else []
+                )
             operation.query_pool_hit_pages = {}
             return hash_value, kv_hit_pages * self.page_size
 
@@ -1469,10 +1497,11 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
-        if any(
+        has_trailing_pool = any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
-        ):
+        )
+        if has_trailing_pool:
             # A trailing state can exist at 512 and 1024 but not at 768. Taking
             # MIN of each rank's longest hit would choose a missing checkpoint,
             # so reduce one restorable flag per prefix length instead. Use the
@@ -1510,10 +1539,14 @@ class HybridCacheController(BaseHiCacheController):
             for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        if len(hits) == 1:
+        if not has_trailing_pool:
             return int(reduced[0])
-        restorable = reduced[: len(hits)]
-        return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+        # Allocation may later need a shorter hit. Retain the common set, not
+        # the rank-local query result, so it cannot choose a peer's missing
+        # checkpoint after this collective has agreed on the longest one.
+        restorable = [i for i, ok in enumerate(reduced[: len(hits)]) if i and ok]
+        operation.pool_storage_result.restorable_prefix_pages = restorable
+        return max(restorable, default=0) * self.page_size
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool

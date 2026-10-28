@@ -504,6 +504,48 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(len(operation.hash_value), free_pages)
         self.assertFalse(operation.is_terminated())
 
+    def test_sparse_checkpoint_vote_does_not_invent_capacity_endpoint(self):
+        """A host cap between sparse checkpoints must choose a stored state."""
+        c = self.c
+        stored_pages, free_pages = 32, 24
+        c.mem_pool_host.available_size.return_value = free_pages * c.page_size
+        c.mem_pool_host.get_pool.side_effect = lambda name: Mock(
+            page_size=c.page_size if name == PoolName.KV else 1
+        )
+
+        def query(operation):
+            hashes = [f"page-{page}" for page in range(1, stored_pages + 1)]
+            operation.all_hash_values = hashes
+            operation.query_pool_hit_pages = {PoolName.KV: stored_pages}
+            operation.pool_storage_result.restorable_prefix_pages = [16, 32]
+            return hashes[:stored_pages], stored_pages * c.page_size
+
+        c._storage_hit_query.side_effect = query
+        votes = []
+        c._all_reduce.side_effect = lambda tensor, *_: votes.append(tensor.tolist())
+        kda = PoolTransfer(
+            PoolName.MAMBA, keys=["kda"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        c.submit_prefetch(
+            CacheRequestHandle("sparse-capped", 0),
+            RadixKey(array("q", range(stored_pages * c.page_size + 1))),
+            None,
+            None,
+            [],
+            [kda],
+        )
+        self.run_commands(c.pp_prefetch_states["sparse-capped"].ticket)
+
+        operation = c.prefetch_buffer.get_nowait()
+        self.assertEqual([i for i, flag in enumerate(votes[0][:33]) if flag], [0, 16])
+        self.assertEqual(operation.storage_hit_count, 16 * c.page_size)
+        self.assertEqual(operation.host_indices.numel(), 16 * c.page_size)
+        self.assertEqual(len(operation.hash_value), 16)
+        # PP resets the query result before IO; the agreed count and buffer
+        # length, rather than that transient result, carry its selected endpoint.
+        self.assertIsNone(operation.pool_storage_result.restorable_prefix_pages)
+        self.assertFalse(operation.is_terminated())
+
     def test_local_miss_or_query_error_completes_before_next_ticket(self):
         """A stage miss/error must complete admission without breaking ACK order."""
         c, cache = self.c, self.cache

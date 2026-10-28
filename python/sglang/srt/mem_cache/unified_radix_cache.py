@@ -3186,7 +3186,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     max(alloc_len, aux_hit_tokens), "host_capacity"
                 )
                 return True
-            if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
+            if not self._alloc_prefetch_aux_staging(info, alloc_len):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
                 self._finish_storage_prefetch(
