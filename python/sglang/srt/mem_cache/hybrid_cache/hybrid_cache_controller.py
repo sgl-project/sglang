@@ -199,6 +199,7 @@ class StorageOperation(BaseStorageOperation):
         pool_transfers: Optional[list[PoolTransfer]] = None,
         kv_hints=None,
         storage_key_to_event_hash: Optional[dict[str, int]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ):
         super().__init__(
             host_indices,
@@ -208,6 +209,7 @@ class StorageOperation(BaseStorageOperation):
             prefix_keys,
             kv_hints,
             storage_key_to_event_hash=storage_key_to_event_hash,
+            kv_event_metadata=kv_event_metadata,
         )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
@@ -224,6 +226,7 @@ class PrefetchOperation(StorageOperation):
         assume_stored: bool = False,
         kv_hints=None,
         storage_key_to_event_hash: Optional[dict[str, int]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -246,6 +249,7 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
             kv_hints=kv_hints,
             storage_key_to_event_hash=storage_key_to_event_hash,
+            kv_event_metadata=kv_event_metadata,
         )
         # A request can be re-matched while an older prefetch is still draining.
         # Keep KVCR lookup claims scoped to this operation, not just its RID.
@@ -1328,6 +1332,7 @@ class HybridCacheController(BaseHiCacheController):
         assume_stored: bool = False,
         kv_hints=None,
         storage_key_to_event_hash: Optional[dict[str, int]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1338,6 +1343,7 @@ class HybridCacheController(BaseHiCacheController):
             assume_stored=assume_stored,
             kv_hints=kv_hints,
             storage_key_to_event_hash=storage_key_to_event_hash,
+            kv_event_metadata=kv_event_metadata,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1366,6 +1372,7 @@ class HybridCacheController(BaseHiCacheController):
         pool_transfers: Optional[list[PoolTransfer]],
         assume_stored: bool = False,
         kv_hints=None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> PrefetchSubmission:
         key_binding = (
             storage_key_to_event_hashes(
@@ -1385,6 +1392,7 @@ class HybridCacheController(BaseHiCacheController):
                     assume_stored=assume_stored,
                     kv_hints=kv_hints,
                     storage_key_to_event_hash=key_binding,
+                    kv_event_metadata=kv_event_metadata,
                 )
             )
 
@@ -1692,6 +1700,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1699,6 +1708,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            kv_event_metadata=kv_event_metadata,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -2234,6 +2244,9 @@ class HybridCacheController(BaseHiCacheController):
                 if self.storage_stop_event.is_set():
                     # Stopping: no new backend writes.
                     break
+                extra_info.extra_info = storage_operation_extra_info(
+                    operation, **(extra_info.extra_info or {})
+                )
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
                 )
@@ -2304,8 +2317,9 @@ class HybridCacheController(BaseHiCacheController):
                 transfers,
                 extra_info=HiCacheStorageExtraInfo(
                     prefix_keys=prefix_keys,
-                    extra_info=_storage_trace_extra(operation, include_request_id=False)
-                    or None,
+                    extra_info=storage_operation_extra_info(
+                        operation, **_storage_trace_extra(operation, include_request_id=False)
+                    ),
                 ),
             )
             if not isinstance(results, dict) or any(

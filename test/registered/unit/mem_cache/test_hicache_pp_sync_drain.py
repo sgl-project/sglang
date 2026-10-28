@@ -43,6 +43,24 @@ def _holder(*, window: int) -> _Holder:
     holder.work_rounds = deque([[]])
     return holder
 
+class TestPPSyncDrain(CustomTestCase):
+    def test_inventory_follower_drains_without_retaining_publish_queue(self):
+        cache = object.__new__(UnifiedRadixCache)
+        backend = SimpleNamespace(
+            kv_event_shard=0,
+            kv_event_shard_count=1,
+            take_kv_events=MagicMock(return_value=[]),
+        )
+        cache.cache_controller = SimpleNamespace(storage_backend=backend)
+        cache.tree_core = SimpleNamespace(kv_events=SimpleNamespace(enabled=False))
+        cache.attn_cp_group = cache.attn_tp_group = None
+        cache.tp_world_size = 1
+        cache._storage_event_backend = None
+
+        cache._drain_storage_kv_events()
+
+        backend.take_kv_events.assert_called_once()
+        self.assertIsNone(cache._storage_event_backend)
 
 def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:
     # one scheduler round: bound the outstanding sends, then issue this round's
@@ -254,14 +272,14 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         leader.check_hicache_events()
 
         leader._all_reduce.assert_called_once()
-        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2, 0, 0])
+        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2, 0, 0, 0])
         leader.writing_check.assert_called_once_with(finish_count=1)
         leader.loading_check.assert_called_once_with(finish_count=2)
 
         follower = self._make_cache(1, [True], [True])
 
         def reduce_to_min(counts, _):
-            counts.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int64))
+            counts.copy_(torch.tensor([1, 1, 0, 0, 0], dtype=torch.int64))
 
         follower._all_reduce.side_effect = reduce_to_min
         follower.check_hicache_events()

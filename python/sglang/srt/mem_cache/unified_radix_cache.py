@@ -379,6 +379,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        self._storage_event_backend = None
+        self._storage_event_reducer = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -2572,6 +2574,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            kv_event_metadata=self.storage_kv_event_metadata(node_id),
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -2580,6 +2583,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+
+    @property
+    def storage_kv_events_enabled(self) -> bool:
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        return getattr(backend, "publishes_kv_events", False) is True
+
+    def storage_kv_event_metadata(self, node_id: NodeId) -> Optional[dict]:
+        if not self.storage_kv_events_enabled:
+            return None
+        return self.tree_core.storage_event_metadata(node_id)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2791,6 +2804,16 @@ class UnifiedRadixCache(BasePrefixCache):
             aux_xfers or None,
             assume_stored=assume_stored,
             kv_hints=kv_hints,
+            kv_event_metadata=(
+                self.tree_core.kv_events.prefetch_storage_metadata(
+                    prefetch_key, matched_prefix_tokens, last_hash
+                )
+                if getattr(
+                    self.cache_controller.storage_backend, "publishes_kv_events", False
+                )
+                is True
+                else None
+            ),
         )
         operation = submission.operation
         if operation is None:
@@ -4226,9 +4249,18 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order and live prefetch set matched on every rank.
         digest = self._hicache_sync_digest()
+        backend = getattr(cc, "storage_backend", None)
+        inventory_count = (
+            backend.pending_kv_events()
+            if getattr(backend, "publishes_kv_events", False) is True
+            else 0
+        )
         exchange = self._shm_count_exchange()
         if exchange is not None:
-            values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
+            values = [
+                write_acks, load_acks, *storage_queue_sizes,
+                -inventory_count, *fold_u64(digest),
+            ]
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.
             if len(values) <= exchange.width:
@@ -4238,12 +4270,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     "prefetches diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
-                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+                if mins[-3] < 0:
+                    self._drain_storage_kv_events()
+                return mins[0], mins[1], tuple(mins[2:-3]), extra_pool_names
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                -inventory_count,
                 digest,
                 -digest,
             ],
@@ -4260,10 +4295,12 @@ class UnifiedRadixCache(BasePrefixCache):
             "write_back duplicate-reclaim victims or live storage prefetches "
             "diverged across PP/TP ranks"
         )
+        if count_values[-3] < 0:
+            self._drain_storage_kv_events()
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            tuple(count_values[2:-3]),
             extra_pool_names,
         )
 
@@ -4284,6 +4321,41 @@ class UnifiedRadixCache(BasePrefixCache):
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
         return get_shm_exchange(group, "hicache", multihost=True)
+
+    def _drain_storage_kv_events(self) -> None:
+        from sglang.srt.mem_cache.storage_events import StorageEventReducer
+
+        backend = self.cache_controller.storage_backend
+        batches = {backend.kv_event_shard: backend.take_kv_events()}
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups and self.tp_world_size > 1:
+            groups = [self.tp_group]
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, batches, group=group)
+            batches = {
+                rank: events for batch in gathered for rank, events in batch.items()
+            }
+        batches = {
+            rank: events
+            for rank, events in batches.items()
+            if rank < backend.kv_event_shard_count
+        }
+        # Every shard participates in the collective, but only the publisher
+        # consumes a recorder queue. Do not retain unused events on followers.
+        if not self.tree_core.kv_events.enabled:
+            return
+        if self._storage_event_backend is not backend:
+            self._storage_event_backend = backend
+            self._storage_event_reducer = StorageEventReducer(
+                backend.kv_event_shard_count
+            )
+        for event in self._storage_event_reducer.update(batches):
+            self.tree_core.kv_events.enqueue(event)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
