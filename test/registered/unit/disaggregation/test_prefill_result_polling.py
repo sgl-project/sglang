@@ -184,6 +184,7 @@ class _Launcher:
     scheduler double's run_batch."""
 
     launch_batch_sample_if_needed = StepLauncher.launch_batch_sample_if_needed
+    _copy_result_to_cpu = StepLauncher._copy_result_to_cpu
 
     def __init__(self, scheduler):
         self.scheduler = scheduler
@@ -191,6 +192,7 @@ class _Launcher:
         self.copy_stream_ctx = nullcontext()
         self.forward_stream = Mock(spec=["wait_stream"])
         self.copy_stream = Mock(spec=["wait_stream"])
+        self.async_d2h_worker = None
         self.schedule_stream = object()
         self._relay_beam_tokens = Mock()
 

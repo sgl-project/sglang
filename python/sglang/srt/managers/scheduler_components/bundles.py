@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
     from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -101,6 +102,9 @@ class Streams:
     schedule_stream: Any
     forward_stream: Any
     copy_stream: Any
+    # Issues the result readback from its own thread; None unless overlap runs
+    # under NVIDIA Confidential Computing.
+    async_d2h_worker: Optional[AsyncD2HCopyWorker]
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

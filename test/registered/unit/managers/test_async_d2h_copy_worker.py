@@ -165,16 +165,17 @@ class TestSchedulerReadbackRouting(CustomTestCase):
         self.addCleanup(self.worker.shutdown)
 
     def _readback(self, cc: bool, hidden: bool, dspark: bool):
-        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.step_launcher import (
+            StepLauncher,
+        )
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         forward_stream, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
-        scheduler = SimpleNamespace(
+        launcher = SimpleNamespace(
             forward_stream=forward_stream,
             copy_stream=copy_stream,
             copy_stream_ctx=torch.cuda.stream(copy_stream),
-            enable_async_d2h_copy=cc,
             async_d2h_worker=self.worker if cc else None,
         )
         # Distinct per case, so a reused host block cannot pass a stale value.
@@ -195,7 +196,7 @@ class TestSchedulerReadbackRouting(CustomTestCase):
         )
         with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(cc):
             is_confidential_compute.cache_clear()
-            Scheduler._copy_result_to_cpu(scheduler, result, batch)
+            StepLauncher._copy_result_to_cpu(launcher, result, batch)
             result.copy_done.synchronize()
         return result, logits.hidden_states, value
 

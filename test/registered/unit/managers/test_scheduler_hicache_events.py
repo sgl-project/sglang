@@ -191,6 +191,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             schedule_stream=None,
             forward_stream=None,
             copy_stream=None,
+            async_d2h_worker=None,
         )
         s.parts.pp_spec_forward = None
         s.mode.step_launcher = SimpleNamespace(run_batch=Mock())

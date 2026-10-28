@@ -1936,6 +1936,9 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.parts.metrics_sink._shutdown_fpm()
+            # Stop the async D2H copy worker thread if any.
+            if (worker := scheduler.parts.streams.async_d2h_worker) is not None:
+                worker.shutdown()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.parts.flags.gracefully_exit:

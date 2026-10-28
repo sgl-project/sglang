@@ -89,6 +89,7 @@ class TestPPRingCommit(CustomTestCase):
             schedule_stream=None,
             forward_stream=None,
             copy_stream=None,
+            async_d2h_worker=None,
         )
         s.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         s.parts.future_map = s.parts.workers.tp_worker = None

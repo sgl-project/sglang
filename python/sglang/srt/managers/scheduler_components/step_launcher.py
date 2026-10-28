@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
 
 from sglang.srt.managers.io_struct import ActiveRanksOutput
@@ -93,6 +94,7 @@ class StepLauncher:
         self.copy_stream = streams.copy_stream
         self.forward_stream_ctx = device_module.stream(self.forward_stream)
         self.copy_stream_ctx = device_module.stream(self.copy_stream)
+        self.async_d2h_worker = streams.async_d2h_worker
         self.future_map = future_map
         self.counters = counters
         self.flags = flags
@@ -247,15 +249,7 @@ class StepLauncher:
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                # Result D2H on copy_stream overlaps the next forward
-                # instead of serializing on forward_stream; it's a leaf
-                # gated by copy_done, so nothing on forward_stream waits.
-                self.copy_stream.wait_stream(self.forward_stream)
-                with self.copy_stream_ctx:
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
+                self._copy_result_to_cpu(batch_result, batch)
 
     def _finish_sync_launch(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -343,6 +337,32 @@ class StepLauncher:
             return_hidden_states=batch.return_hidden_states,
         )
 
+    def _copy_result_to_cpu(
+        self, batch_result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        """Issue the result readback on copy_stream so it overlaps the next forward.
+
+        copy_stream is a leaf gated by copy_done that forward_stream never waits
+        for. Under Confidential Computing the copy would block this thread until
+        the forward is done, so the worker issues it from its own thread instead.
+        """
+        copy_fn = partial(
+            batch_result.copy_to_cpu,
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
+            if self.async_d2h_worker is None:
+                copy_fn()
+            elif batch.return_hidden_states or batch.spec_algorithm.is_dspark():
+                # Hidden states and the DSpark accept lengths are views of CUDA
+                # graph buffers that the next replay rewrites; only a copy queued
+                # right behind this forward reads them in time.
+                copy_fn()
+            else:
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -359,15 +379,7 @@ class StepLauncher:
             assert _batch_result is batch_result
             self._relay_beam_tokens(cur_batch, batch_result)
 
-        # Run device-to-host copy on a separate stream to avoid blocking the
-        # forward stream. The copy waits for the sampled result and can overlap
-        # with subsequent forward computation.
-        self.copy_stream.wait_stream(self.forward_stream)
-        with self.copy_stream_ctx:
-            batch_result.copy_to_cpu(
-                return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
-            )
+        self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

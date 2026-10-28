@@ -190,6 +190,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     set_random_seed,
 )
+from sglang.srt.utils.common import is_confidential_compute
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
@@ -202,6 +203,7 @@ except ImportError:
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -645,6 +647,7 @@ def assemble_scheduler(
         schedule_stream=schedule_stream,
         forward_stream=forward_stream,
         copy_stream=copy_stream,
+        async_d2h_worker=create_async_d2h_worker_or_none(device_module),
     )
     # The forward a speculative step runs under pipeline parallelism.
     pp_spec_forward = (
@@ -1214,6 +1217,21 @@ def init_disaggregation() -> DisaggregationMode:
             ),
         )
     return disaggregation_mode
+
+
+def create_async_d2h_worker_or_none(device_module) -> Optional[AsyncD2HCopyWorker]:
+    """Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
+    forced synchronous and blocks the scheduler thread at issue, serializing the
+    overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker)."""
+    if get_schedule().disable_overlap_schedule or not is_confidential_compute():
+        return None
+    from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+
+    logger.info(
+        "NVIDIA Confidential Computing (CC) detected: "
+        "using async D2H copy worker to preserve overlap scheduling."
+    )
+    return AsyncD2HCopyWorker(device_module)
 
 
 def finalize_schedule_stream(*, schedule_stream, forward_stream, device, device_module):

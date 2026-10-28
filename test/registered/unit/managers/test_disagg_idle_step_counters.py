@@ -484,6 +484,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             schedule_stream=scheduler.parts.streams.schedule_stream,
             forward_stream=scheduler.parts.streams.forward_stream,
             copy_stream=None,
+            async_d2h_worker=None,
         )
         scheduler.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         scheduler.world_group = scheduler.attn_tp_group = None
