@@ -98,7 +98,7 @@ export const config = {
       return {
         when: { hw: [hw], pdMode: [pdMode], strategy: [...strategies],
                 hicache: ["l2"], spec: ["none", "dspark"] },
-        reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2.",
+        reason: "This recipe runs DCP, and the Playground's L3 preset keeps its non-DCP layout. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2.",
       };
     });
   },
@@ -135,7 +135,7 @@ export const config = {
     const cell = config.cellFor(s);
     const pp = config.sizeOf(cell, "--pp-size");
     const out = [`--tp-size ${config.sizeOf(cell, "--tp-size") * pp}`];
-    // L3 rejects DCP at startup, so under L3 the DCP half is dropped, not scaled.
+    // The L3 preset keeps its non-DCP layout, so under L3 the DCP half is dropped, not scaled.
     if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l3") {
       out.push(`--dcp-size ${config.sizeOf(cell, "--dcp-size") * pp}`);
     }
@@ -409,10 +409,11 @@ export const config = {
           hints: (s) =>
             !["none", "dspark"].includes(s.spec) && config.hasDcp(s)
               ? [
-                  "HiCache under DCP only accepts DSPARK speculative decoding, so this",
+                  "This preset keeps its non-DCP layout for DFLASH + HiCache, so this",
                   "recipe drops DCP and serves the MLA KV TP-replicated (any PP/EP in the",
                   "cell stays). Per-request context is far shorter than the DCP version —",
                   "DCP is what buys KV capacity. Run the cell NOSPEC or DSPARK to keep DCP.",
+                  "SGLang itself also serves DFLASH + HiCache with DCP; see the HiCache section.",
                 ]
               : [],
         },
@@ -428,8 +429,8 @@ export const config = {
             "--hicache-storage-backend mooncake",
           ],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
-          // L3 under DCP is rejected at startup (the rank-0 replicated-MLA backup
-          // and the storage keys are not dcp_rank-aware), so on the DCP recipes L3
+          // The L3 preset keeps its non-DCP layout (SGLang itself also runs L3
+          // with DCP), so on the DCP recipes L3
           // drops the DCP operating point instead (only DCP — any PP/EP in the
           // cell stays, so on B200 the result is not plain TP). The ratio
           // calculator reads --dcp-size off this command, so dropping it also
@@ -445,8 +446,9 @@ export const config = {
               "above present on every rank — the launch command alone is not enough.",
               ...(config.hasDcp(s)
                 ? [
-                    "L3 storage keys are not dcp_rank-aware yet, so this recipe drops DCP",
-                    "and serves the MLA KV TP-replicated (any PP/EP in the cell stays).",
+                    "This L3 preset keeps its non-DCP layout, so it drops DCP and serves the",
+                    "MLA KV TP-replicated (any PP/EP in the cell stays). SGLang itself also",
+                    "runs L3 with DCP; see the HiCache section.",
                     "Concurrency lands on a similar target, but",
                     "per-request context is far shorter than the DCP version — DCP is",
                     "what buys KV capacity.",
@@ -809,8 +811,8 @@ export const config = {
     // ----- Card: "HiCache" ----- (K3 hybrid L1/L2/L3, incl. KDA state)
     hicache: {
       showWhen: (b) => b.hicache !== undefined && b.hicache !== "off",
-      // Picking a storage backend here IS L3, and L3 under DCP is rejected at
-      // startup. The Deploy panel's own L3 option drops DCP first; reaching L3
+      // Picking a storage backend here IS L3, and the L3 preset keeps its
+      // non-DCP layout. The Deploy panel's own L3 option drops DCP first; reaching L3
       // through this card would not, so gate it on the DCP recipes unless Deploy
       // already switched to L3 (hicache "off"/"l2" means DCP is still standing).
       backends: [

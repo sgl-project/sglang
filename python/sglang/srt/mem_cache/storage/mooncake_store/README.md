@@ -33,10 +33,13 @@ This integration is particularly valuable for production deployments involving l
 
 ### Decode context parallelism (DCP)
 
-Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
-state, using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, other
-host pools, split KV buffers, and separate KV scale buffers are not supported
-with DCP.
+Mooncake L3 supports DCP when the primary KV pool is one materialized MLA KV
+pool, with optional KDA state, using `layer_first`, `page_first`, or
+`page_first_direct`. Registered speculative-draft host pools (for example the
+DFLASH or DSPARK draft KV) are stored as well. DCP does not shard the draft KV,
+and MHA draft objects are keyed per TP rank. A GQA/MHA primary KV pool, other
+host pool types, split KV buffers, and separate KV scale buffers are not
+supported with DCP.
 
 DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
 ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.

@@ -8,13 +8,16 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -210,6 +213,92 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertIsNone(
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
+
+    def test_dcp_full_sidecar_fits_the_auto_sized_budget(self):
+        """Under DCP a replicated draft's full sidecar mirrors every logical slot
+        of the widened MLA anchor. The default ratio must leave room for it, or
+        the sidecar allocation fails at startup."""
+        dcp_size, physical_page = 8, 64
+        target = MLATokenToKVPool(
+            size=8192,
+            page_size=physical_page,
+            dtype=torch.float16,
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        # The replicated draft spans the allocator's widened virtual slots.
+        draft = MHATokenToKVPool(
+            size=target.size * dcp_size,
+            page_size=physical_page * dcp_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=target), storage=None
+            ),
+            page_size=physical_page * dcp_size,
+        )
+        plan = Mock(mode="sidecar", device_pools=(draft,))
+        rank_budget = 1_000_000
+        host_free = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * rank_budget
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=True),
+            get_parallel().override(attn_dcp_size=dcp_size),
+            patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(base, "available_host_memory_bytes", return_value=host_free),
+            patch.object(base, "_cuda_host_unregister", lambda buffer: None),
+            patch.dict(
+                ALLOC_MEMORY_FUNCS,
+                {
+                    "cpu": lambda dims, dtype, device, **kwargs: torch.empty(
+                        dims, dtype=dtype, device=device
+                    )
+                },
+            ),
+            sizing.auto_size_hicache(params, plan, enabled=True),
+        ):
+            anchor = MLATokenToKVPoolHost(
+                target.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=get_memory().hicache_ratio,
+                host_size=0,
+                page_size=physical_page * dcp_size,
+                layout="page_first",
+                pin_memory=False,
+                device="cpu",
+                dcp_size=dcp_size,
+                dcp_rank=0,
+                device_capacity_tokens=target.size,
+                start_layer=target.start_layer,
+                end_layer=target.end_layer,
+                target_layer_num=target.layer_num,
+                layer_shard_enabled=target.layer_shard_enabled,
+            )
+            _, entries = assembler.build_full_draft_pools(
+                draft_kv_pool=draft,
+                tree_cache=SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        mem_pool_host=anchor,
+                        page_size=anchor.logical_page_size,
+                        transfer_layer_id_max=draft.layer_num,
+                    )
+                ),
+            )
+            sidecar = entries[0].host_pool
+            self.assertEqual(sidecar.size, anchor.logical_size)
+            self.assertLessEqual(
+                anchor.kv_buffer.nbytes + sidecar.kv_buffer.nbytes,
+                0.8 * rank_budget,
+            )
 
 
 if __name__ == "__main__":

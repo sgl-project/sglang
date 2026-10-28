@@ -2476,6 +2476,31 @@ class TestHiCacheArgs(CustomTestCase):
                     ):
                         handle_hicache(args)
 
+    def test_dcp_admits_only_replicated_draft_algorithms(self):
+        """Under DCP the draft host sidecar mirrors the widened logical slots
+        untranslated, so only DSPARK and DFLASH, whose drafts replicate over
+        those slots, may launch HiCache; other draft algorithms must fail."""
+        for algorithm in (None, "DSPARK", "DFLASH", "EAGLE"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="mooncake",
+                    dcp_size=8,
+                    tp_size=8,
+                    speculative_algorithm=algorithm,
+                )
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    if algorithm == "EAGLE":
+                        with self.assertRaisesRegex(
+                            NotImplementedError, "only supports DSPARK"
+                        ):
+                            handle_hicache(args)
+                    else:
+                        handle_hicache(args)
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through

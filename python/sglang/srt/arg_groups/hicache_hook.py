@@ -141,11 +141,13 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         raise NotImplementedError(
             "HiCache L3 with DCP does not support buffer_only host memory."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    # DSPARK and DFLASH drafts replicate over the widened logical slots, which
+    # their host sidecar mirrors without translation.
+    if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK and DFLASH "
+            "speculative decoding; other draft-model host pools have no DCP "
+            "index translation."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(
