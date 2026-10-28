@@ -5,6 +5,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -230,6 +232,21 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        self.use_table_qk_norm_rope = (
+            _is_cuda
+            and get_exec().kernel.enable_fused_qk_norm_rope
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            and get_exec().deterministic.rl_on_policy_target is None
+            and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.rotary_emb.is_neox_style
+            and not self.rotary_emb.use_fallback_kernel
+            and self.head_dim in (64, 128, 256)
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -253,18 +270,40 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(positions, q, k)
+
+        if (
+            self.use_table_qk_norm_rope
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and qkv.dtype == torch.bfloat16
+            and self.q_norm.weight.dtype == torch.bfloat16
+            and self.k_norm.weight.dtype == torch.bfloat16
+        ):
+            table_qk_norm_rope_(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                match_cuda=True,
+            )
+        else:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+            q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -343,6 +382,8 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                # use fused kernel for decode
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(
