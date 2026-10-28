@@ -1710,5 +1710,28 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
 
 
+class TestMambaHostShare(CustomTestCase):
+    def test_host_capacity_excludes_speculative_scratch(self):
+        """Spec verify scratch is device-only; counting it inflated the Mamba host share."""
+        pool = MambaPool(
+            size=8,
+            spec_state_size=8,
+            cache_params=InklingConvCacheParams(
+                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                layers=[0],
+                dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+            ),
+            mamba_layer_ids=[0],
+            speculative_num_draft_tokens=4,
+            device="cpu",
+        )
+
+        self.assertEqual(
+            pool.host_capacity_bytes,
+            pool.mamba_cache.conv[0].nbytes + pool.mamba_cache.temporal.nbytes,
+        )
+        self.assertLess(pool.host_capacity_bytes, pool.get_kv_size_bytes())
+
+
 if __name__ == "__main__":
     unittest.main()
