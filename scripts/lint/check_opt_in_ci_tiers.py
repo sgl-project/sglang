@@ -19,7 +19,7 @@ import yaml
 TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
 # Tier names become `/run-<tier>-ci`; these spellings are taken by other commands.
-RESERVED_TIER_NAMES = {"base", "cpu", "failed", "full"}
+RESERVED_TIER_NAMES = {"base", "cpu", "extra", "failed", "full"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
@@ -32,9 +32,6 @@ def gate_labels(workflow: dict) -> set[str]:
             label = inputs.get("require-label")
             if label:
                 labels.add(label)
-                alternative = inputs.get("alternative-label")
-                if alternative:
-                    labels.add(alternative)
     return labels
 
 
@@ -85,7 +82,7 @@ def main() -> int:
             if label not in gate_labels(workflows[path]):
                 errors.append(
                     f"tier `{name}`: {path} does not call pr-gate.yml "
-                    f"accepting `{label}` via `require-label` or `alternative-label`"
+                    f"with `require-label: {label}`"
                 )
             if refires_on_labeled(workflows[path]):
                 errors.append(

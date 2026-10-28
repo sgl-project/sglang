@@ -19,7 +19,7 @@ Recognized permission keys:
 `/run-ci`, `/run-base-ci`, and `/rerun-base-ci` with no argument are aliases of
 `/tag-and-rerun-ci`: labeling and retrying each use their existing permission
 checks. With one registered tier argument, they are aliases of `/run-<tier>-ci`
-and require both permissions. For example, `/run-ci extra` equals `/run-extra-ci`.
+and require both permissions. For example, `/run-ci nv-extra` equals `/run-extra-ci nv`.
 Use `/run-ci nv` (or `/run-nv-ci`) for NVIDIA base and shared checks only.
 Use `/run-ci amd`, `/run-base-ci amd`, or `/run-amd-ci` for AMD Base only.
 The `nv` and `amd` entries have `label: null`: they add only `run-ci` and select
@@ -28,35 +28,38 @@ hardware labels and path filters are kept; future pushes follow the existing
 workflow gates. AMD Base does not require a new `run-ci-amd` label.
 Legacy `/tag-and-rerun-ci <tier>` still retries broadly; its arguments add labels.
 
-`/run-extra-ci <hardware>` (also `/rerun-extra-ci <hardware>`) selects the
-`<hardware>-extra` tier only when it is registered. Otherwise, the existing
-ignored-suffix behavior is preserved. The registry contains `extra`, covering
-both NVIDIA and AMD extra workflows, `amd-extra`, selecting only the AMD extra
-workflow with `run-ci-amd-extra`, `nv`, selecting NVIDIA base/shared checks,
-`amd`, selecting `pr-test-amd.yml`, and `mlu`, selecting `pr-test-mlu.yml` with
-`run-ci-mlu`. PPU remains outside the registry; its workflow uses `run-ci` and
-`run-ci-ppu` labels plus PPU path filters.
+`/run-extra-ci nv` and `/run-extra-ci amd` select NVIDIA/shared Extra and AMD
+Extra, respectively. They add `run-ci` and the matching `run-ci-nv-extra` or
+`run-ci-amd-extra` label, then rerun only that tier's workflows. Their aliases
+include `/rerun-extra-ci <hardware>`, `/run-<hardware>-extra-ci`, and
+`/run-ci <hardware>-extra`. NVIDIA/shared Extra retains its Xeon CPU coverage.
 
-`/run-full-ci amd` (alias `/rerun-full-ci amd`) combines `amd` and `amd-extra`:
-it adds only `run-ci` and `run-ci-amd-extra`, then selects AMD Base and AMD Extra
-runs for the current commit, including green runs. Active runs are left alone;
-missing base runs are skipped and missing extra runs are reported. Both labeling
-and rerun permissions are required.
-This selection requires exactly one argument with both `<hardware>` and
-`<hardware>-extra` registered. Bare `/run-full-ci` and all other full-CI forms
-keep shared Extra and broad retries; `/run-full-ci nv` still uses that legacy path.
+`/run-full-ci nv` and `/run-full-ci amd` combine the selected hardware's Base and
+Extra tiers. Alias: `/rerun-full-ci <hardware>`. These commands select current
+commit runs, including green runs, and require both labeling and rerun
+permissions. Active runs are left alone; missing base runs are skipped and
+missing extra runs are reported.
 
-`/run-extra-ci amd` equals `/run-amd-extra-ci`: it adds `run-ci` and
-`run-ci-amd-extra` and reruns only AMD Extra. Base CI behavior is unchanged.
-`/run-extra-ci` keeps the shared `run-ci-extra` label and selects both hardware
-extra workflows. Commands preserve existing labels: if a PR already has
-`run-ci-extra`, remove that label to stop opting into NVIDIA Extra on future
-pushes or broad reruns. The AMD command does not cancel existing NVIDIA runs.
+Extra and Full require exactly one hardware argument: `nv` or `amd`. Missing,
+unknown, or multiple hardware arguments are rejected before adding labels or
+rerunning workflows. Regular Base CI triggers and path filters are unchanged.
 
-Hardware extra workflows can accept their own tier label through `require-label`
-and the shared label through `alternative-label` in `pr-gate.yml`. Either label
-satisfies the live opt-in check; `run-ci` remains required. Register the workflow
-under both accepted tiers so each command selects it. No handler change is needed.
+The shared `extra` tier and `run-ci-extra` label are retired. The old label no
+longer enables either Extra workflow on updated branches. `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` are rejected with migration guidance. To
+intentionally opt into both hardware tiers, use `/tag-run-ci-label nv-extra amd-extra`; rerun each tier with its dedicated command. Legacy
+`/tag-and-rerun-ci <tier>` still retries broadly, so prefer the dedicated run
+commands when selecting hardware.
+
+Commands preserve existing labels and do not cancel queued or running workflows.
+For existing PRs, update the branch to include the registry, handler, and gate
+changes, then push to create fresh runs. Rerunning an older run keeps its original
+workflow revision and label behavior.
+
+The registry also contains `nv` and `amd` Base selections and `mlu`, selecting
+`pr-test-mlu.yml` with `run-ci-mlu`. PPU remains outside the registry; its workflow
+uses `run-ci` and `run-ci-ppu` labels plus PPU path filters. Each Extra workflow
+requires its dedicated opt-in label through `require-label` in `pr-gate.yml`,
+in addition to `run-ci`. Register each opt-in workflow under its matching tier.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

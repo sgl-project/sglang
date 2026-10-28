@@ -333,7 +333,7 @@ def handle_tag_run_ci(
     Handles the /tag-run-ci-label command.
 
     tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
-    the command (e.g. `extra`). Opt-in workflows gate on BOTH `run-ci` and
+    the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
     their own label, so `run-ci` is always added alongside. Reuses the same
     `can_tag_run_ci_label` permission for every tier.
 
@@ -1909,21 +1909,39 @@ def main():
     command = tokens[0] if tokens else ""
     tiers = _load_opt_in_tiers()
 
-    # A registered hardware pair selects base + extra without the shared extra
-    # label or broad retry scope. Other full-CI forms retain their legacy path.
-    if (
-        command in ("/run-full-ci", "/rerun-full-ci")
-        and len(tokens) == 2
-        and tokens[1] in tiers
-        and f"{tokens[1]}-extra" in tiers
+    # Extra and Full require an explicit hardware selection. Never fall back
+    # to shared labels or broad retries for missing or misspelled arguments.
+    if command in (
+        "/run-extra-ci",
+        "/rerun-extra-ci",
+        "/run-full-ci",
+        "/rerun-full-ci",
     ):
+        hardware = tokens[1] if len(tokens) == 2 else ""
+        extra_tier = tiers.get(f"{hardware}-extra")
+        base_tier = tiers.get(hardware)
+        full = command in ("/run-full-ci", "/rerun-full-ci")
+        if extra_tier is None or (full and base_tier is None):
+            choices = ", ".join(
+                f"`{name.removesuffix('-extra')}`"
+                for name in sorted(tiers)
+                if name.endswith("-extra")
+                and (not full or name.removesuffix("-extra") in tiers)
+            )
+            pr.create_issue_comment(
+                f"⛔ `{command}` requires exactly one hardware argument: {choices}. "
+                "The shared `run-ci-extra` label is retired. "
+                "No labels were added and no workflows were re-run."
+            )
+            comment.create_reaction("confused")
+            return
         handle_run_tier_ci(
             repo,
             pr,
             comment,
             user_perms,
-            tiers[tokens[1]],
-            additional_tiers=[tiers[f"{tokens[1]}-extra"]],
+            base_tier if full else extra_tier,
+            additional_tiers=[extra_tier] if full else (),
         )
         return
 
@@ -1949,37 +1967,33 @@ def main():
             return
         first_line = command
         tokens = [command]
-    elif (
-        command in ("/run-extra-ci", "/rerun-extra-ci")
-        and len(tokens) == 2
-        and f"{tokens[1]}-extra" in tiers
-    ):
-        # Unregistered suffixes keep the existing extra command's behavior.
-        command = f"/run-{tokens[1]}-extra-ci"
-        first_line = command
-        tokens = [command]
-
     is_tag = first_line.startswith("/tag-run-ci-label")
     is_tag_and_rerun = first_line.startswith("/tag-and-rerun-ci")
-    # Bare /run-full-ci is the short form of `/tag-and-rerun-ci extra`
-    # and shares its branch below. /rerun-* spellings are accepted silently as
-    # aliases: they sit one keystroke from the documented name and from the
-    # neighbouring /rerun-* commands, and failing them closed would just look
-    # like the bot ignoring the comment.
-    is_full_ci = first_line.startswith(("/run-full-ci", "/rerun-full-ci"))
     run_tier_match = RUN_TIER_COMMAND.match(command)
     run_tier = run_tier_match and tiers.get(run_tier_match.group(1))
-    # Keep the legacy extra command's prefix/suffix handling.
-    if first_line.startswith(("/run-extra-ci", "/rerun-extra-ci")):
-        run_tier = tiers["extra"]
+    if run_tier and run_tier_match.group(1).endswith("-extra") and len(tokens) != 1:
+        pr.create_issue_comment(
+            f"⛔ `{command}` accepts no arguments. Use `/run-extra-ci nv` or "
+            "`/run-extra-ci amd` to select hardware. "
+            "No labels were added and no workflows were re-run."
+        )
+        comment.create_reaction("confused")
+        return
 
-    # Tier arguments (`/tag-run-ci-label extra`) are shared by both labeling
+    # Tier arguments (`/tag-run-ci-label nv-extra`) are shared by both labeling
     # commands so the surface is symmetric.
     tier_names = []
-    if is_tag or is_tag_and_rerun or is_full_ci:
+    if is_tag or is_tag_and_rerun:
+        if "extra" in tokens[1:]:
+            pr.create_issue_comment(
+                "⛔ The shared `extra` tier and `run-ci-extra` label are retired. "
+                "Use `nv-extra` or `amd-extra`, or `/run-extra-ci nv` or "
+                "`/run-extra-ci amd` for hardware-specific reruns. "
+                "No labels were added and no workflows were re-run."
+            )
+            comment.create_reaction("confused")
+            return
         tier_names = _parse_opt_in_tiers(tokens[1:], tiers)
-    if is_full_ci and "extra" not in tier_names:
-        tier_names.insert(0, "extra")
     tier_labels = [
         tiers[name]["label"] for name in tier_names if tiers[name]["label"] is not None
     ]
@@ -1996,7 +2010,7 @@ def main():
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
-    elif is_tag_and_rerun or is_full_ci:
+    elif is_tag_and_rerun:
         # Perform both actions, but suppress individual reactions
         print(f"Processing combined command: {first_line} (tiers={tier_names})")
 
