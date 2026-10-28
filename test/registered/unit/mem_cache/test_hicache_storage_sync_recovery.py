@@ -16,7 +16,11 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.cache_controller import (
+    STORAGE_SYNC_TIMEOUT_DEFAULT_S,
+    HiCacheController,
+    PrefetchAck,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -441,15 +445,18 @@ class TestStorageSyncRecovery(unittest.TestCase):
         self.assertEqual(
             (cc.storage_sync_failed, cc.storage_sync_failure), (False, None)
         )
-        cc._apply_storage_sync_config({})
-        self.assertEqual(
-            (cc.storage_failure_policy, cc.storage_sync_timeout), ("disable", None)
-        )
+        for absent in ({}, {"storage_sync_timeout": None}):
+            cc._apply_storage_sync_config(absent)
+            self.assertEqual(
+                (cc.storage_failure_policy, cc.storage_sync_timeout),
+                ("disable", STORAGE_SYNC_TIMEOUT_DEFAULT_S),
+            )
         for bad in (
             {"storage_failure_policy": "ignore"},
             {"storage_sync_timeout": 0},
             {"storage_sync_timeout": "30"},
             {"storage_sync_timeout": True},
+            {"storage_sync_timeout": float("inf")},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 cc._apply_storage_sync_config(bad)
@@ -471,6 +478,51 @@ class TestStorageSyncRecovery(unittest.TestCase):
         create_group.assert_called_once_with(
             group_ranks=[0, 1], backend="gloo", timeout=timedelta(seconds=12.5)
         )
+
+    def test_pp_ticket_group_is_bounded_like_the_sync_groups(self):
+        """The ticket broadcast is a storage collective too: it is created once
+        attach has applied storage_sync_timeout, with that timeout."""
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.host_memory_mode = "buffer_only"
+        cc.pp_group = object()
+        cc.pp_prefetch_command_group = None
+        cc.pp_prefetch_command_thread = None
+        cc.storage_sync_timeout = 7.5
+        cc._init_extra_host_mem_release_queues = Mock()
+        with (
+            patch.object(torch.distributed, "get_world_size", return_value=2),
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                return_value="ticket-group",
+            ) as create_group,
+            patch.object(HiCacheController, "_start_storage_threads"),
+            patch.object(threading, "Thread"),
+        ):
+            cc._start_storage_threads()
+        create_group.assert_called_once_with(
+            group_ranks=[0, 1], backend="gloo", timeout=timedelta(seconds=7.5)
+        )
+        self.assertEqual(cc.pp_prefetch_command_group, "ticket-group")
+
+    def test_controller_without_python_workers_is_healthy(self):
+        """Liveness covers the workers a controller started: a controller whose
+        storage I/O runs elsewhere (no Python worker threads) must not read as
+        dead, while a started worker that exited must."""
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.storage_sync_failed, cc.storage_sync_failure = False, None
+        cc.prefetch_thread = cc.prefetch_io_aux_thread = None
+        cc.prefetch_sync_thread = cc.backup_thread = None
+        self.assertTrue(cc.storage_workers_healthy())
+        self.assertIsNone(cc.storage_health_reason())
+        exited = threading.Thread(target=lambda: None, name="backup")
+        exited.start()
+        exited.join()
+        cc.backup_thread = exited
+        self.assertFalse(cc.storage_workers_healthy())
+        self.assertIn("backup", cc.storage_health_reason())
 
 
 if __name__ == "__main__":

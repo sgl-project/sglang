@@ -2527,13 +2527,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             if operation.deadline_expired:
-                self._finish_storage_prefetch(request, 0, reason="deadline")
+                self._finish_storage_prefetch(
+                    request, 0, reason=self._prefetch_cut_reason(operation, "deadline")
+                )
             else:
                 self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
             self._handle_prefetch_result(operation)
         return True
+
+    def _prefetch_cut_reason(self, operation: PrefetchOperation, default: str) -> str:
+        """Metric reason for a prefetch that ended short: the rank-agreed
+        storage degrade, else the stop-policy deadline, else ``default``."""
+        if self.storage_unavailable:
+            return "storage_unavailable"
+        return "deadline" if operation.deadline_expired else default
 
     def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
         # This function **owns**:
@@ -2569,7 +2578,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="deadline" if operation.deadline_expired else "storage_transfer",
+                reason=self._prefetch_cut_reason(operation, "storage_transfer"),
             )
         if (
             completed_tokens > 0
@@ -2732,7 +2741,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            reason = self._prefetch_cut_reason(operation, "storage_transfer")
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])

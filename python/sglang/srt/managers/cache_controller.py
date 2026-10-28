@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -268,6 +269,12 @@ class StorageOperation:
 # "disable" degrades to no-L3 until the backend is re-attached, "raise"
 # fails the scheduler loudly.
 STORAGE_FAILURE_POLICIES = ("disable", "raise")
+# Default timeout of the storage sync collectives (the worker threads' hit and
+# ack reductions, the PP ticket broadcast). Tripping it degrades L3 until the
+# backend is re-attached, so it sits far above any healthy batch call and the
+# 60 s idle ticket broadcast, while a hung peer is noticed in minutes rather
+# than after torch's 30-minute gloo default.
+STORAGE_SYNC_TIMEOUT_DEFAULT_S = 300.0
 
 # Buffer-mode staging budgets. Prefetch staging is latency-critical
 # (wait_complete gates TTFT), so loads may fill the pool up to this fraction
@@ -364,8 +371,8 @@ class HiCacheController:
         self.storage_sync_failure: Optional[str] = None
         self._storage_sync_lock = threading.Lock()
         self.storage_failure_policy = "disable"
-        # Seconds; None keeps torch's default group timeout (30 min on gloo).
-        self.storage_sync_timeout: Optional[float] = None
+        # Seconds; attach applies the configured value.
+        self.storage_sync_timeout: float = STORAGE_SYNC_TIMEOUT_DEFAULT_S
 
         # Storage worker threads, started by _start_storage_threads and reset.
         self.prefetch_thread: Optional[threading.Thread] = None
@@ -441,11 +448,7 @@ class HiCacheController:
         if self.pp_group is not None:
             base_groups.append(self.pp_group)
 
-        timeout = (
-            None
-            if self.storage_sync_timeout is None
-            else timedelta(seconds=self.storage_sync_timeout)
-        )
+        timeout = self._storage_sync_timedelta()
         for group in base_groups:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
                 continue
@@ -511,12 +514,19 @@ class HiCacheController:
             return False
         return True
 
-    def _storage_worker_threads(self) -> List[Optional[threading.Thread]]:
+    def _storage_worker_threads(self) -> List[threading.Thread]:
+        """The Python storage workers this controller started. A controller
+        whose storage I/O runs outside these threads has none to watch and
+        reports healthy on their account."""
         return [
-            self.prefetch_thread,
-            self.prefetch_io_aux_thread,
-            self.prefetch_sync_thread,
-            self.backup_thread,
+            thread
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.prefetch_sync_thread,
+                self.backup_thread,
+            )
+            if thread is not None
         ]
 
     def storage_workers_healthy(self) -> bool:
@@ -526,22 +536,22 @@ class HiCacheController:
         item implies a 0 bit in the same round."""
         if self.storage_sync_failed:
             return False
-        return all(
-            thread is not None and thread.is_alive()
-            for thread in self._storage_worker_threads()
-        )
+        return all(thread.is_alive() for thread in self._storage_worker_threads())
 
     def storage_health_reason(self) -> Optional[str]:
         if self.storage_sync_failure is not None:
             return self.storage_sync_failure
         dead = [
-            "not started" if thread is None else thread.name
+            thread.name
             for thread in self._storage_worker_threads()
-            if thread is None or not thread.is_alive()
+            if not thread.is_alive()
         ]
         if dead:
             return f"storage worker thread(s) exited: {dead}"
         return None
+
+    def _storage_sync_timedelta(self) -> timedelta:
+        return timedelta(seconds=self.storage_sync_timeout)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -867,9 +877,12 @@ class HiCacheController:
                 f"got {policy!r}"
             )
         timeout = storage_backend_extra_config.pop("storage_sync_timeout", None)
-        if timeout is not None and (
+        if timeout is None:
+            timeout = STORAGE_SYNC_TIMEOUT_DEFAULT_S
+        if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
             or timeout <= 0
         ):
             raise ValueError(
@@ -877,7 +890,7 @@ class HiCacheController:
                 f"got {timeout!r}"
             )
         self.storage_failure_policy = policy
-        self.storage_sync_timeout = None if timeout is None else float(timeout)
+        self.storage_sync_timeout = float(timeout)
         self.storage_sync_failed = False
         self.storage_sync_failure = None
 

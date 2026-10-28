@@ -247,21 +247,32 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
 
     def test_file_attachment_enables_pp_tickets(self):
+        """Tickets are enabled for any backend; the broadcast group is built when
+        the storage workers start, once attach has applied the sync timeout."""
         c = self.c
         c.pp_prefetch_command_group = None
         c.storage_host_pool = Mock()
         c.host_memory_mode = "buffer_only"
         c.storage_backend_type = "file"
+        c.storage_sync_timeout = 7.5
+        c._init_extra_host_mem_release_queues = Mock()
         with (
-            patch.object(HiCacheController, "attach_storage_backend"),
+            patch.object(
+                HiCacheController,
+                "attach_storage_backend",
+                side_effect=lambda **_: c._start_storage_threads(),
+            ),
+            patch.object(HiCacheController, "_start_storage_threads"),
+            patch.object(threading, "Thread"),
             patch.object(torch.distributed, "get_world_size", return_value=4),
             patch(
                 "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
                 return_value="command",
-            ),
+            ) as create_group,
         ):
             c.attach_storage_backend("file", prefetch_threshold=4)
         self.assertEqual(c.pp_prefetch_command_group, "command")
+        self.assertEqual(create_group.call_args.kwargs["timeout"].total_seconds(), 7.5)
 
     def test_file_stage_hits_trim_buffers_after_local_allocation(self):
         """PP0's local files cannot reveal a shorter prefix on another stage."""

@@ -274,7 +274,30 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    def _pp_prefetch_tickets_enabled(self) -> bool:
+        return (
+            self.host_memory_mode == "buffer_only"
+            and self.pp_group is not None
+            and torch.distributed.get_world_size(group=self.pp_group) > 1
+        )
+
     def _start_storage_threads(self):
+        if (
+            self._pp_prefetch_tickets_enabled()
+            and self.pp_prefetch_command_group is None
+        ):
+            # Built here, once attach has applied storage_sync_timeout, so the
+            # ticket broadcast is bounded like the other storage collectives;
+            # reset() restarts the threads but keeps the group.
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+
+            self.pp_prefetch_command_group = create_custom_parallel_group(
+                group_ranks=torch.distributed.get_process_group_ranks(self.pp_group),
+                backend="gloo",
+                timeout=self._storage_sync_timedelta(),
+            )
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
         if self.pp_prefetch_command_group is not None:
@@ -330,21 +353,6 @@ class HybridCacheController(BaseHiCacheController):
                 f"Storage backend {storage_backend!r} requires separate host pools. "
                 "Restart with this backend selected to create compatible host pools."
             )
-        enable_pp_ticket = (
-            self.host_memory_mode == "buffer_only"
-            and self.pp_group is not None
-            and torch.distributed.get_world_size(group=self.pp_group) > 1
-        )
-        if enable_pp_ticket and self.pp_prefetch_command_group is None:
-            from sglang.srt.distributed.parallel_state import (
-                create_custom_parallel_group,
-            )
-
-            self.pp_prefetch_command_group = create_custom_parallel_group(
-                group_ranks=torch.distributed.get_process_group_ranks(self.pp_group),
-                backend="gloo",
-            )
-
         try:
             super().attach_storage_backend(
                 storage_backend=storage_backend,

@@ -2241,7 +2241,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
             "reusable when cache-mode admission ran; deadline means the "
-            "storage prefetch stop policy ended the read before it completed.",
+            "storage prefetch stop policy ended the read before it completed; "
+            "storage_unavailable means the rank-agreed storage health bit "
+            "dropped and the degraded pipeline cut the read.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2251,6 +2253,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_covered",
             "storage_transfer",
             "deadline",
+            "storage_unavailable",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",
