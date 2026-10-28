@@ -1,16 +1,14 @@
 """Unit tests for srt/sampling/watermarking — no server, no model loading."""
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+
 import json
 import math
 import os
-import stat
 import tempfile
 import unittest
-
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -25,9 +23,9 @@ from sglang.srt.sampling.watermarking.detector import (
     WatermarkStatistics,
     detect,
     hash_context,
-    position_coin,
     watermark_hash,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 # ---------------------------------------------------------------------------
