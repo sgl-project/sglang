@@ -90,7 +90,17 @@ else:
     amdgpu_targets = amdgpu_target_env.split(";")
 
 # Validate all target architectures
-supported_archs = ["gfx942", "gfx950", "gfx1100", "gfx1151", "gfx1201", "gfx1250"]
+supported_archs = [
+    "gfx942",
+    "gfx950",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+]
 for amdgpu_arch in amdgpu_targets:
     if amdgpu_arch not in supported_archs:
         print(
