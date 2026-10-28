@@ -250,21 +250,28 @@ class TokenSpaceSGLangProcessor:
     def compute_mrope_positions(self, input_ids, mm_items):
         """M-RoPE from bound items, for requests that arrive already processed.
 
-        Bound items keep only the grids, so the strategy gets input_ids and grids.
+        Rebuilds the processor output's media fields from each item's strategy fields.
         """
-        output = {"input_ids": input_ids}
-        for key, modality in (
-            ("image_grid_thw", Modality.IMAGE),
-            ("video_grid_thw", Modality.VIDEO),
-        ):
-            grids = [
-                torch.as_tensor(item.model_specific_data[key]).reshape(-1, 3)
-                for item in mm_items
-                if item.is_modality(modality) and key in item.model_specific_data
-            ]
-            if grids:
-                output[key] = torch.cat(grids)
-        return self._core.strategy.compute_mrope_positions(output)
+        # TODO(rockdu): Corner case: requests that arrive without M-RoPE positions.
+        # Check whether every frontend can send positions, so this fallback can be removed.
+        strategy = self._core.strategy
+        item_fields = {
+            name: modality
+            for name, modality in strategy.mm_item_fields.items()
+            if name not in strategy.mm_feature_fields
+        }
+        media_items = [(item.modality,) for item in mm_items]
+        item_features = [
+            {
+                name: torch.as_tensor(value)
+                for name, value in item.model_specific_data.items()
+                if item_fields.get(name) == item.modality
+            }
+            for item in mm_items
+        ]
+        output = dict(strategy.merge_media(media_items, item_features))
+        output["input_ids"] = input_ids
+        return strategy.compute_mrope_positions(output)
 
     def resolve_image_token_counts(self, images: list) -> list[int]:
         """Per-image expanded token counts, from the HF processor's own helper."""
