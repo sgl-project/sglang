@@ -190,6 +190,7 @@ def _prefill_kernel(
     mBias: cute.Tensor,  # (dim,)            conv bias (zeros when conv_bias=False)
     mOut: cute.Tensor,  # (T_total, dim)    C_gate-gated conv output
     mState: cute.Tensor,  # (slots, dim, K-1) static, mutated
+    mInit: cute.Tensor,  # (B, dim, K-1)     pre-launch snapshot of each request's state
     mQsl: cute.Tensor,  # (B+1,) int32      cumulative per-request token offsets
     mSlot: cute.Tensor,  # (B,) int64        per-request state-slot index
     mHasInit: cute.Tensor,  # (B,) int          1 if conv_state holds a real prefix
@@ -220,6 +221,7 @@ def _prefill_kernel(
     slot = mSlot[bb]
     if d < dim and c0 < treq and slot >= 0 and slot < SLOTS:
         mss = mState[slot, None, None]  # (dim, K-1) at int64 slot offset
+        minit = mInit[bb, None, None]
         has_init = mHasInit[bb]
         wv = cute.make_rmem_tensor(K, cutlass.Float32)
         for k in cutlass.range_constexpr(K):
@@ -234,7 +236,7 @@ def _prefill_kernel(
                     cutlass.Float32
                 )  # B_gate*x
             elif has_init != 0:
-                hv = mss[d, (K - 1) + r].to(
+                hv = minit[d, (K - 1) + r].to(
                     cutlass.Float32
                 )  # before request -> initial state
             win[j] = hv
@@ -269,6 +271,7 @@ def _prefill_host(
     mBias,
     mOut,
     mState,
+    mInit,
     mQsl,
     mSlot,
     mHasInit,
@@ -288,6 +291,7 @@ def _prefill_host(
         mBias,
         mOut,
         mState,
+        mInit,
         mQsl,
         mSlot,
         mHasInit,
@@ -342,6 +346,9 @@ def gated_causal_conv1d_prefill(
     qsl32 = query_start_loc.detach().to(torch.int32)
     slot64 = slot_idx.detach().to(torch.int64)
     hi32 = has_initial_state.detach().to(torch.int32)
+    # The last chunk's CTA writes the final state while chunk 0 of the same request
+    # reads the initial one, with no inter-CTA ordering; read from a snapshot.
+    init_state = conv_state.detach()[slot64.clamp(0, slots - 1)]
     mProj = from_dlpack(proj.detach(), assumed_align=32).mark_layout_dynamic(
         leading_dim=1
     )
@@ -353,6 +360,7 @@ def gated_causal_conv1d_prefill(
     )
     mO = from_dlpack(out.detach(), assumed_align=32).mark_layout_dynamic(leading_dim=1)
     mS = from_dlpack(conv_state.detach())
+    mInit = from_dlpack(init_state, assumed_align=32).mark_layout_dynamic(leading_dim=2)
     mQ = from_dlpack(qsl32, assumed_align=32).mark_layout_dynamic(leading_dim=0)
     mSlot = from_dlpack(slot64, assumed_align=32).mark_layout_dynamic(leading_dim=0)
     mHI = from_dlpack(hi32, assumed_align=32).mark_layout_dynamic(leading_dim=0)
@@ -366,6 +374,7 @@ def gated_causal_conv1d_prefill(
         mB,
         mO,
         mS,
+        mInit,
         mQ,
         mSlot,
         mHI,
@@ -377,5 +386,5 @@ def gated_causal_conv1d_prefill(
         chunk,
         block_d,
         stream,
-    )(mProj, mW, mB, mO, mS, mQ, mSlot, mHI, dim, n_chunks, B, stream)
+    )(mProj, mW, mB, mO, mS, mInit, mQ, mSlot, mHI, dim, n_chunks, B, stream)
     return out

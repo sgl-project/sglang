@@ -83,16 +83,19 @@ def ref_conv_prefill(
 # ---------------------------------------------------------------------------
 # Kernel-under-test hook (CuTe DSL kernel plugs in here once written)
 # ---------------------------------------------------------------------------
-def _load_cute_kernel():
-    try:
-        from sglang.kernels.ops.mamba.cutedsl_gated_conv import (  # noqa: F401
-            gated_causal_conv1d_decode,
-            gated_causal_conv1d_prefill,
-        )
+def _cute_kernel_supported():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] in (9, 10, 12)
 
-        return gated_causal_conv1d_prefill, gated_causal_conv1d_decode
-    except Exception:
-        return None, None
+
+def _load_cute_kernel():
+    from sglang.kernels.ops.mamba.cutedsl_gated_conv import (
+        gated_causal_conv1d_decode,
+        gated_causal_conv1d_prefill,
+    )
+
+    return gated_causal_conv1d_prefill, gated_causal_conv1d_decode
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +172,7 @@ def test_reference_prefill_matches_decode_rollout(K, with_init):
     torch.testing.assert_close(pre_state, dec_state, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(
-    _load_cute_kernel()[0] is None, reason="CuTe kernel not implemented yet"
-)
+@pytest.mark.skipif(not _cute_kernel_supported(), reason="needs sm90/sm100/sm120 CUDA")
 @pytest.mark.parametrize("K", [3, 4, 7])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_cute_decode_matches_reference(K, dtype):
@@ -197,9 +198,7 @@ def test_cute_decode_matches_reference(K, dtype):
     torch.testing.assert_close(got.float(), ref.float(), atol=atol, rtol=2e-2)
 
 
-@pytest.mark.skipif(
-    _load_cute_kernel()[0] is None, reason="CuTe kernel not implemented yet"
-)
+@pytest.mark.skipif(not _cute_kernel_supported(), reason="needs sm90/sm100/sm120 CUDA")
 @pytest.mark.parametrize("K", [3, 4, 7])
 @pytest.mark.parametrize("with_init", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -238,6 +237,36 @@ def test_cute_prefill_matches_reference(K, with_init, dtype):
     torch.testing.assert_close(
         got_state.float(), ref_state.float(), atol=atol, rtol=1e-2
     )
+
+
+@pytest.mark.skipif(not _cute_kernel_supported(), reason="needs sm90/sm100/sm120 CUDA")
+def test_cute_prefill_across_chunk_boundary_with_initial_state():
+    """A request spanning several 256-token chunks must seed its first chunk from the
+    prior conv state and leave its last K-1 inputs as the new state."""
+    prefill_k, _ = _load_cute_kernel()
+    torch.manual_seed(4)
+    dim, slots, K = 256, 4, 7
+    dev = "cuda"
+    dtype = torch.float32
+    seqlens = [600, 3]
+    qsl = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device=dev, dtype=torch.int32
+    )
+    T = qsl[-1].item()
+    B_gate, C_gate, x = (torch.randn(T, dim, device=dev, dtype=dtype) for _ in range(3))
+    proj = torch.cat([B_gate, C_gate, x], dim=-1).contiguous()
+    Bx_t = (B_gate * x).t().contiguous()
+    w = torch.randn(dim, K, device=dev, dtype=dtype)
+    state = torch.randn(slots, dim, K - 1, device=dev, dtype=dtype)
+    idx = torch.tensor([2, 0], device=dev, dtype=torch.int32)
+    hi = torch.tensor([True, True], device=dev)
+
+    ref_state = state.clone()
+    ref = C_gate * ref_conv_prefill(Bx_t, ref_state, w, None, qsl, idx, hi).t()
+    got_state = state.clone()
+    got = prefill_k(proj, got_state, w, None, qsl, idx, hi)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(got_state, ref_state, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ Two things make this thinner than the Qwen-VL processor:
     `MultiModalityDataPaddingPatternMultimodalTokens` does) handles that.
 """
 
+import asyncio
 from typing import Any, List, Optional, Union
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
@@ -109,7 +110,11 @@ class Lfm3VlImageProcessor(SGLangBaseProcessor):
             video_data=video_data,
             multimodal_tokens=self.mm_tokens,
         )
+        return await asyncio.get_running_loop().run_in_executor(
+            self.io_executor, self._process_media, base_output
+        )
 
+    def _process_media(self, base_output):
         processor_kwargs: dict = {}
         if base_output.videos:
             base_output.videos, video_metadata = self._decode_videos(

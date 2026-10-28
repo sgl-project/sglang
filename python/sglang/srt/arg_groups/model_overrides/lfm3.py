@@ -21,6 +21,8 @@ def _lfm3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.speculative_algorithm is not None:
         raise ValueError("LFM3 does not support speculative decoding yet.")
+    if cfg.attn_dp_size > 1:
+        raise ValueError("LFM3 does not support DP attention yet.")
     updates = {}
     backend = cfg.attention_backend
     if backend is None:
@@ -29,13 +31,18 @@ def _lfm3_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info(f"Use {backend} as attention backend for LFM3")
 
     prefill_backend = cfg.prefill_attention_backend or backend
-    if (
-        prefill_backend == "flashinfer"
-        and not envs.SGLANG_FLASHINFER_USE_PAGED.is_set()
-    ):
+    if prefill_backend == "flashinfer":
         # FlashInfer's ragged planner ignores SWA within prefill chunks.
         # Use paged prefill until separate SWA/full ragged plans are supported.
-        envs.SGLANG_FLASHINFER_USE_PAGED.set(True)
-        logger.info("Use FlashInfer paged prefill for LFM3 sliding-window attention")
+        if not envs.SGLANG_FLASHINFER_USE_PAGED.is_set():
+            envs.SGLANG_FLASHINFER_USE_PAGED.set(True)
+            logger.info(
+                "Use FlashInfer paged prefill for LFM3 sliding-window attention"
+            )
+        elif not envs.SGLANG_FLASHINFER_USE_PAGED.get():
+            raise ValueError(
+                "LFM3 sliding-window layers require FlashInfer paged prefill; "
+                "unset SGLANG_FLASHINFER_USE_PAGED or set it to true."
+            )
 
     return updates
