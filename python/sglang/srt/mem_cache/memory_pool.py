@@ -2005,6 +2005,11 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Prepared before final KV sizing; reused by the host pool after resizing.
+    # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
+    hicache_write_back_staging: (
+        torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | None
+    ) = None
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
@@ -2182,8 +2187,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-
     def __init__(
         self,
         size: int,
@@ -4998,6 +5001,8 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=get_parallel().attn_dcp_rank,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
