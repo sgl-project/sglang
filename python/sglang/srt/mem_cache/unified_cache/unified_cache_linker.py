@@ -408,19 +408,50 @@ class UnifiedCacheLinkerWrapper:
 
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+        build_error = None
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
                 )
-                return 0, req.last_node
-            component_transfers.append((component, transfer))
+                if transfer is None:
+                    break
+                component_transfers.append((component, transfer))
+        except BaseException as error:
+            build_error = error
+
+        # Allocation can fail on only one rank. Agree before queueing a load or
+        # touching request state, otherwise peers can admit different batches.
+        constructed = torch.tensor(
+            [
+                int(
+                    build_error is None
+                    and len(component_transfers) == len(self._components)
+                )
+            ],
+            dtype=torch.int,
+        )
+        try:
+            cache._all_reduce_attn_groups(constructed, torch.distributed.ReduceOp.MIN)
+        except BaseException:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+            raise
+        if not constructed.item():
+            try:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                )
+            except BaseException:
+                if build_error is None:
+                    raise
+                logger.exception(
+                    "External LOAD rollback failed after construction error"
+                )
+            if build_error is not None:
+                raise build_error
+            return 0, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
