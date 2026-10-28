@@ -421,7 +421,7 @@ class TestTriJointReclaim(CustomTestCase):
         self.assertFalse(a.verify_byte_accounting())
 
     def test_actual_decode_contract(self):
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.schedule_batch import check_decode_mem
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         b, a, c = self.build()
@@ -429,15 +429,21 @@ class TestTriJointReclaim(CustomTestCase):
         states = b.req_to_token_pool.mamba_allocator.alloc(8)
         self.stamp(b, a, slots, states)
         records = self.insert_parts(c, slots, states)
-        batch = object.__new__(ScheduleBatch)
-        batch.token_to_kv_pool_allocator = a
-        batch.tree_cache = c
-        batch.spec_algorithm = SpeculativeAlgorithm.NONE
-        batch.reqs = [
-            SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8), beam_group=None)
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=8, kv_allocated_len=8),
+                beam_group=None,
+            )
             for _ in range(4)
         ]
-        self.assertTrue(batch.check_decode_mem())
+        self.assertTrue(
+            check_decode_mem(
+                reqs,
+                token_to_kv_pool_allocator=a,
+                tree_cache=c,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+            )
+        )
         self.assertIsNotNone(a.alloc(4))
         self.assertEqual(c.full_evictable_size(), 95)
         self.check_payload(b, a, slots[1:], states[1:], states)

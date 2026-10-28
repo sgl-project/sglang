@@ -161,20 +161,26 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 self.check_prefixes(allocator, cache, records, range(2, 96))
 
     def test_schedule_batch_decode_uses_allocator_contract(self):
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.schedule_batch import check_decode_mem
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         allocator, cache = self.build_cache()
         records = self.mark_prefixes(allocator, cache, 96)
-        batch = object.__new__(ScheduleBatch)
-        batch.token_to_kv_pool_allocator = allocator
-        batch.tree_cache = cache
-        batch.spec_algorithm = SpeculativeAlgorithm.NONE
-        batch.reqs = [
-            SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8), beam_group=None)
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=8, kv_allocated_len=8),
+                beam_group=None,
+            )
             for _ in range(6)
         ]
-        self.assertTrue(batch.check_decode_mem())
+        self.assertTrue(
+            check_decode_mem(
+                reqs,
+                token_to_kv_pool_allocator=allocator,
+                tree_cache=cache,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+            )
+        )
         self.assertIsNotNone(allocator.alloc(6))
         self.check_prefixes(allocator, cache, records, range(3, 96))
 
