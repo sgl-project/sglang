@@ -458,9 +458,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
-            self.model_runner.capture_tail_hooks.append(
-                self._verify_epilogue.capture_hook
+            # optional: a step the epilogue does not accept (sampling, grammar) replays
+            # the verify graph captured without it
+            tail_hooks = (
+                self.model_runner.optional_capture_tail_hooks
+                if envs.SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH.get()
+                else self.model_runner.capture_tail_hooks
             )
+            tail_hooks.append(self._verify_epilogue.capture_hook)
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
@@ -1149,6 +1154,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
             and not batch.has_grammar
+        )
+        self.model_runner.want_optional_tail = (
+            fold_eligible or self._sampling_accept_graph is not None
         )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()

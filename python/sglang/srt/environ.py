@@ -586,6 +586,12 @@ class Envs:
     SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # DSpark static verify: every target-verify graph is also captured without the
+    # verify epilogue, and a step the epilogue does not accept (sampling, grammar)
+    # replays that one instead of running the epilogue disarmed.
+    SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(

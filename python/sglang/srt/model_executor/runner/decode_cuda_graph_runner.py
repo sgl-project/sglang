@@ -140,6 +140,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# The graph variant captured without ``ModelRunner.optional_capture_tail_hooks``.
+NO_TAIL = "notail"
+
+
+def with_tail_variant(label: Optional[str], tail: Optional[str]) -> Optional[str]:
+    """``label`` (a LoRA variant or None) with the optional-tail variant appended."""
+    if tail is None:
+        return label
+    return tail if label is None else f"{label}-{tail}"
+
 
 @contextlib.contextmanager
 def _attention_variant_during_prep(attention_variant):
@@ -784,6 +794,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             sizes is None or bs in sizes
         )
 
+    def _tail_variants(self) -> tuple:
+        """The optional-tail variants each shape is captured in (see
+        ``ModelRunner.optional_capture_tail_hooks``)."""
+        if getattr(self.model_runner, "optional_capture_tail_hooks", None):
+            return (None, NO_TAIL)
+        return (None,)
+
+    def _resolve_variant(self, forward_batch: ForwardBatch):
+        """The captured variant this replay takes: its LoRA variant, then without the
+        optional tail when the step does not want it."""
+        label = self._resolve_lora_variant(forward_batch)
+        if len(self._tail_variants()) > 1 and not self.model_runner.want_optional_tail:
+            return with_tail_variant(label, NO_TAIL)
+        return label
+
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
             return None
@@ -906,7 +931,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
+            variant_label=self._resolve_variant(forward_batch),
             attention_variant=(
                 self._resolve_attention_variant(forward_batch, cuda_graph_bs)
                 if self.disable_padding
@@ -1381,23 +1406,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             for variant_label in lora_variants:
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
-                        _set_capture_attention_variant(attention_variant)
-                        self._set_profile_trace_tag(
-                            bs, stream_idx, variant_label, attention_variant
-                        )
-                        with torch_compile_decoration.patch_model(
-                            self.model_runner.model,
-                            bs in self.compile_bs,
-                            num_tokens=bs * self.captured_req_width,
-                            tp_group=get_parallel().tp_group,
-                        ) as forward:
-                            self.capture_one_shape(
-                                bs,
-                                forward,
-                                stream_idx,
-                                variant_label,
-                                attention_variant,
+                        for tail_variant in self._tail_variants():
+                            label = with_tail_variant(variant_label, tail_variant)
+                            self._capture_optional_tail = tail_variant is None
+                            _set_capture_attention_variant(attention_variant)
+                            self._set_profile_trace_tag(
+                                bs, stream_idx, label, attention_variant
                             )
+                            with torch_compile_decoration.patch_model(
+                                self.model_runner.model,
+                                bs in self.compile_bs,
+                                num_tokens=bs * self.captured_req_width,
+                                tp_group=get_parallel().tp_group,
+                            ) as forward:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    label,
+                                    attention_variant,
+                                )
+        self._capture_optional_tail = True
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1503,6 +1532,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         )
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
+                    if getattr(self, "_capture_optional_tail", True):
+                        for capture_hook in getattr(
+                            self.model_runner, "optional_capture_tail_hooks", ()
+                        ):
+                            capture_hook(self, out, forward_batch, num_tokens)
                     return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1625,7 +1659,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1735,7 +1769,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_variant(forward_batch)
         if self._early_verify_metadata is not None:
             self._early_verify_metadata.count_variant(
                 attention_variant, taken=early_staged

@@ -424,6 +424,10 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        # Tail hooks a step may skip: each decode graph is also captured without them
+        # ("notail"), replayed while ``want_optional_tail`` is False.
+        self.optional_capture_tail_hooks = []
+        self.want_optional_tail = True
         # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
         self.capture_head_hooks = []
         self.page_size = get_schedule().page_size
