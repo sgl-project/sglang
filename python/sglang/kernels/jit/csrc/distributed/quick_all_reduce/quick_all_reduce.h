@@ -107,7 +107,7 @@ struct DeviceComms {
     }
 
     // Device-side list of IPC buffers.
-    buffer_list.resize(world_size);
+    buffer_list.assign(world_size, nullptr);
     HIP_CHECK(hipMalloc(&dbuffer_list, world_size * sizeof(uint8_t*)));
 
     // Create IPC handles for rank's communication buffer.
@@ -131,9 +131,10 @@ struct DeviceComms {
       d_flag_counters = nullptr;
     }
     if (initialized) {
+      // the host copy: dbuffer_list is device memory, and a peer may never have been opened
       for (int i = 0; i < world_size; i++) {
-        if (i != rank) {
-          HIP_CHECK(hipIpcCloseMemHandle(dbuffer_list[i]));
+        if (i != rank && buffer_list[i] != nullptr) {
+          HIP_CHECK(hipIpcCloseMemHandle(buffer_list[i]));
         }
       }
 
