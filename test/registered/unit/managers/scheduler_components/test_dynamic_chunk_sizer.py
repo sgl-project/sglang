@@ -19,7 +19,10 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
         live = set()
         runner = SimpleNamespace(
             model_config=SimpleNamespace(
-                context_len=context, hidden_size=2, dtype=torch.float32
+                context_len=context,
+                hidden_size=2,
+                dtype=torch.float32,
+                vocab_size=8,
             ),
             get_pp_proxy_topk_size=lambda: None,
             get_pp_proxy_residual_num_blocks=lambda: None,
@@ -43,6 +46,7 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
                 req.kv.holds_kv = True
 
             return SimpleNamespace(
+                reqs=reqs,
                 prepare_for_extend=prepare,
                 input_ids=torch.zeros(1, dtype=torch.int64),
                 forward_mode=SimpleNamespace(is_extend=lambda: True),
@@ -64,6 +68,7 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
             ),
             patch.object(module, "Req", side_effect=make_req),
             patch.object(module.ScheduleBatch, "init_new", side_effect=make_batch),
+            patch.object(module.SamplingBatchInfo, "build"),
             patch.object(
                 module.ForwardBatch, "init_new", return_value=SimpleNamespace()
             ),

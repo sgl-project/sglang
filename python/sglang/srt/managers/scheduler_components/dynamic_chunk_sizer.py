@@ -226,11 +226,11 @@ class DynamicChunkSizer:
 
             start = time.perf_counter()
             batch.prepare_for_extend()
-            batch.sampling_info = SamplingBatchInfo.build(
-                batch.reqs, self.model_config.vocab_size, self.device
-            )
 
             try:
+                batch.sampling_info = SamplingBatchInfo.build(
+                    batch.reqs, self.model_config.vocab_size, self.device
+                )
                 # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
                 if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
                     batch.input_ids = batch.prefill_input_ids_cpu.to(
