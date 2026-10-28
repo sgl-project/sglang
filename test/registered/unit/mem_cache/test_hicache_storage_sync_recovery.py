@@ -131,6 +131,7 @@ def _scheduler_cache(cc) -> UnifiedRadixCache:
     cache.writing_check = Mock()
     cache.loading_check = Mock()
     cache.storage_prefetch_retries = StoragePrefetchRetries()
+    cache._storage_prefetch_wait = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache._storage_prefetch_hit_remaining_by_reqid = {}
     cache._record_storage_prefetch_hit = Mock()

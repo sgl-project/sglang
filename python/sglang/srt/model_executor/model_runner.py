@@ -20,11 +20,12 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -76,6 +77,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.kernel_plugins.amd.binding import (
+    install_monokernel_forward,
+)
+from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -94,11 +99,12 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -112,8 +118,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_observer import ForwardObserver
 from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
     replace_graph_time_usage,
@@ -192,6 +200,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -335,6 +344,32 @@ class ModelRunner:
         """Whether this runner's sampling path publishes observer output."""
         return get_exec().dllm.dllm_algorithm is None and self.spec_algorithm.is_none()
 
+    @property
+    def forward_observer(self) -> Optional[ForwardObserver]:
+        return self._forward_observer
+
+    @forward_observer.setter
+    def forward_observer(self, observer: Optional[ForwardObserver]) -> None:
+        if observer is not None and not self.supports_forward_observer():
+            raise ValueError(
+                "forward observers are not supported by the configured forward path"
+            )
+        self._forward_observer = observer
+
+    def supports_forward_observer(self) -> bool:
+        """Whether this runner's forward path publishes forward-observer output."""
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        return (
+            not self.is_draft_worker
+            and self.is_generation
+            and not use_mlx()
+            and not get_disagg().enable_pdmux
+            and get_exec().dllm.dllm_algorithm is None
+            and self.spec_algorithm.is_none()
+            and get_parallel().pp_size == 1
+        )
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -388,6 +423,8 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
+        self.capture_head_hooks = []
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -406,6 +443,7 @@ class ModelRunner:
         # space and must not construct a second sparse coordinator.
         self.enable_hisparse = get_memory().enable_hisparse and not is_draft_worker
         self._sampling_observer: Optional[SamplingObserver] = None
+        self._forward_observer: Optional[ForwardObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
@@ -414,7 +452,7 @@ class ModelRunner:
 
         self.init_msprobe()
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
+        # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
@@ -463,9 +501,6 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
-        # Scoped by a speculative worker to stage its shared reads before
-        # the target prefill graph publishes the read-done event.
-        self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
         set_offloader(create_offloader())
@@ -642,7 +677,9 @@ class ModelRunner:
             else None
         )
 
-    def init_kv_cache_configurator(self):
+    def init_kv_cache_configurator(
+        self, draft_parallel_layout: DraftParallelLayout | None = None
+    ):
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
@@ -669,6 +706,7 @@ class ModelRunner:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             ),
             spec_aux_config=self.spec_aux_config,
+            draft_parallel_layout=draft_parallel_layout,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
@@ -725,6 +763,13 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        # after every post-load change to the model, before the KV cache is sized
+        install_megakernel(
+            model=self.model,
+            hf_config=self.model_config.hf_config,
+            capture_tail_hooks=self.capture_tail_hooks,
+            is_draft=self.is_draft_worker,
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -932,11 +977,11 @@ class ModelRunner:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
-    def init_kv_index_translator(self):
+    def init_runner_ids(self):
         """The one object that converts KV ids for this runner: attention
         backends build their read indices from the table it hands them instead
         of probing the pool's id spaces themselves."""
-        self.kv_index_translator = KVIndexTranslator(
+        self.runner_ids = RunnerIds(
             req_to_token=self.req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -953,12 +998,17 @@ class ModelRunner:
         """
         return self.max_decode_logits_rows()
 
-    def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
+        *,
+        draft_parallel_layout: DraftParallelLayout | None = None,
+    ):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
-        self.init_kv_cache_configurator()
+        self.init_kv_cache_configurator(draft_parallel_layout)
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
@@ -971,15 +1021,13 @@ class ModelRunner:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
-        # Keep a reference so the shared byte buffer is not GC'd.
-        self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
-        self.init_kv_index_translator()
+        self.init_runner_ids()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -1092,7 +1140,7 @@ class ModelRunner:
             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
-            is_dspark=self.spec_algorithm.is_dspark(),
+            is_dspark=self.spec_aux_config.is_dspark,
         )
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).
@@ -1103,7 +1151,7 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.kv_index_translator.bind_and_verify_backends(
+        self.runner_ids.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
 
@@ -1113,7 +1161,7 @@ class ModelRunner:
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
-        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # MLA decode path can skip the per-layer Q all-gather.
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -1122,28 +1170,20 @@ class ModelRunner:
             return
         n_prepared = 0
         for m in self.model.modules():
-            if not isinstance(m, DeepseekV2AttentionMLA):
-                continue
-            if m.w_kc is None:
+            if not isinstance(m, DeepseekV2AttentionMLA) or m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            # q-replicate only supports the unquantized bf16/fp16 absorb path;
-            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
-            # per-layer Q all-gather.
-            if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
-                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
-                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
-            ):
-                logger.warning(
-                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
-                    "(bf16/fp16 only); this layer keeps the Q all-gather."
-                )
+            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
+                logger.warning("dcp_replicate_q_proj: skipping non-16-bit w_kc")
+                continue
+            if isinstance(qp.quant_method, UnquantizedLinearMethod):
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(qp.weight.data, dim=0)
+            elif _is_block_fp8(qp):
+                m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
+            else:
+                logger.warning("dcp_replicate_q_proj: skipping unsupported q-proj")
                 continue
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
-            m.q_b_proj_qrep_weight = dcp_group.all_gather(
-                qp.weight.data.contiguous(), dim=0
-            )
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
@@ -1188,6 +1228,11 @@ class ModelRunner:
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
+        # Reuse startup decode graphs on a subsequent PD role switch.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
@@ -1213,7 +1258,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.kv_index_translator.capture_token_capacity(
+                num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
@@ -1225,7 +1270,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.kv_index_translator.capture_token_capacity(
+                num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
@@ -1313,6 +1358,11 @@ class ModelRunner:
             get_offloader().post_init()
 
         self.maybe_precompile_model_kernels_after_loading()
+        install_monokernel_forward(
+            model=self.model,
+            hf_config=self.model_config.hf_config,
+            capture_tail_hooks=self.capture_tail_hooks,
+        )
 
         # Register model for layerwise NVTX profiling if enabled
         if get_exec().comm.enable_layerwise_nvtx_marker:
@@ -1775,7 +1825,10 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        with device_timer_ctx(self.device_timer, "split_prefill"):
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            device_timer_ctx(self.device_timer, "split_prefill"),
+        ):
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1805,7 +1858,11 @@ class ModelRunner:
 
         # Step span
         step_span_ctx = profile_range(
-            build_step_span_name(forward_batch, is_draft_worker=self.is_draft_worker)
+            build_step_span_name(
+                forward_batch,
+                is_draft_worker=self.is_draft_worker,
+                forward_id=self.forward_pass_id,
+            )
         )
 
         canary_ctx = (
@@ -1894,7 +1951,7 @@ class ModelRunner:
         """
         pool = self.req_to_token_pool
         if (
-            not isinstance(pool, HybridReqToTokenPool)
+            not pool.holds_state_slots
             or self.is_draft_worker
             or not forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_target_verify()
@@ -1907,25 +1964,31 @@ class ModelRunner:
         ):
             # mamba_pool is a pure PHYSICAL store; translate before zeroing or
             # clear_slots zeroes the wrong physical slots.
-            pool.mamba_pool.clear_slots(
-                pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+            self.token_to_kv_pool_allocator.state.pool.clear_slots(
+                self.runner_ids.state_ids(pool.state_sub_pool).ids(
+                    forward_batch.mamba_clear_indices
+                )
             )
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
-            if pool.mamba_ckpt_pool is not None:
+            state = self.token_to_kv_pool_allocator.state
+            if state.ckpt_pool is not None:
                 # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
-                pool.mamba_ckpt_pool.load_to_active(
-                    pool.mamba_pool,
+                state.ckpt_pool.load_to_active(
+                    state.pool,
                     forward_batch.mamba_cow_src_indices,
                     forward_batch.mamba_cow_dst_indices,
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.copy_mamba_state(
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                state_ids = self.runner_ids.state_ids(pool.state_sub_pool)
+                # The copy reads every state layer of the source slot.
+                self.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
+                state.copy(
+                    state_ids.ids(forward_batch.mamba_cow_src_indices),
+                    state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
@@ -1938,11 +2001,22 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        prepare = getattr(self.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if has_forward_context():
-            ctx_mgr = contextlib.nullcontext()
+            ctx_mgr = forward_context(
+                get_forward_context(), forward_batch=forward_batch
+            )
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+            ctx_mgr = forward_context(
+                ForwardContext(attn_backend=self.attn_backend),
+                forward_batch=forward_batch,
+            )
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            ctx_mgr,
+        ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -2565,3 +2639,55 @@ class ModelRunner:
                 load_format=load_format,
             )
         self.load_config = load_config
+
+
+def _is_block_fp8(layer: torch.nn.Module) -> bool:
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = layer.quant_method
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and not method.use_mxfp8
+        and not method.use_marlin
+        and method.weight_block_size == [128, 128]
+        and layer.weight.dtype == torch.float8_e4m3fn
+        # An aiter-preshuffled weight is no longer row-major, so it cannot be
+        # gathered along the output dim.
+        and not getattr(layer, "aiter_bpreshuffled", False)
+    )
+
+
+def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
+    """Gather a column-sharded block-FP8 linear and re-run its post-load step."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        inverse_transform_scale_ue8m0,
+        transform_scale_ue8m0,
+    )
+
+    scale = layer.weight_scale_inv.data
+    packed_ue8m0 = scale.dtype == torch.int32  # DeepGEMM layout
+    if packed_ue8m0:
+        scale = inverse_transform_scale_ue8m0(scale, mn=layer.weight.shape[0])
+    replica = torch.nn.Module()
+    replica.weight = torch.nn.Parameter(
+        group.all_gather(layer.weight.data, dim=0), requires_grad=False
+    )
+    scale = group.all_gather(scale, dim=0)
+    if packed_ue8m0:
+        # The shards' weights are already requantized against these UE8M0
+        # scales. Re-pack instead of letting the post-load step requantize
+        # again: that pass is not idempotent (a block whose amax sits at a
+        # power-of-two boundary halves its scale), so the replica would not
+        # match the shards bit for bit.
+        scale = transform_scale_ue8m0(scale, mn=replica.weight.shape[0])
+    replica.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+    replica.weight_scale_inv.format_ue8m0 = packed_ue8m0
+    # The attributes Fp8LinearMethod's post-load step reads off a LinearBase,
+    # copied so the replica picks the same kernel (UE8M0 requant, MXFP8 view).
+    replica.orig_dtype = getattr(layer, "orig_dtype", None)
+    replica.deepgemm_mxfp8_input = getattr(layer, "deepgemm_mxfp8_input", False)
+    replica.keep_plain_weight_layout = getattr(layer, "keep_plain_weight_layout", False)
+    replica.prefix = f"{getattr(layer, 'prefix', 'q_b_proj')}.dcp_replica"
+    replica.quant_method = layer.quant_method
+    layer.quant_method.process_weights_after_loading(replica)
+    return replica

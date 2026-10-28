@@ -34,11 +34,13 @@ if TYPE_CHECKING:
         PoolBeliefPolicy,
     )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
     from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
     from sglang.srt.mem_cache.unified_radix_cache import (
         NodeId,
@@ -170,8 +172,12 @@ def next_component_uuid(component_type: ComponentType) -> int:
 
 
 class TreeComponent(ABC):
-    def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+    def __init__(
+        self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
+    ):
         self.cache = cache
+        # The tree slot this component keeps: its id, family and numbers.
+        self.slot = slot
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
@@ -367,10 +373,11 @@ class TreeComponent(ABC):
         return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
+        """Length of the stored device indices, including entries without backing."""
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
-    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+    def reclaimable_value_len(self, node: UnifiedTreeNode) -> int:
         """Pool tokens the allocator gets back when this node's device value
         is evicted. The evictable/protected ledgers count these (prefill
         admission adds the evictable ledger to the allocator's free space, and
@@ -526,6 +533,7 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
@@ -539,7 +547,8 @@ class TreeComponent(ABC):
                     No tombstone — caller will delete the node.
 
         Freed indices are collected into *device_frees*/*host_frees* for the
-        Controller to drain, never freed inline.
+        Controller to drain, never freed inline. Additional cache work is
+        appended to *cache_actions* in the same operation.
 
         Returns (device_freed, host_freed) token counts."""
         ...
@@ -584,6 +593,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Return a device leaf, an internal backup request, or no selection.
 
@@ -594,7 +604,9 @@ class TreeComponent(ABC):
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
         )
-        return self._evict_device_next_node(tracker, device_frees, host_frees)
+        return self._evict_device_next_node(
+            tracker, device_frees, host_frees, cache_actions=cache_actions
+        )
 
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
@@ -615,6 +627,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
@@ -779,16 +792,18 @@ class TreeComponent(ABC):
     def create_buffer_pipeline(
         self,
         *,
-        swa_window_pages: int,
+        swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
         max_context_len: int = 0,
+        auxiliary_swa_component: Optional[SWAComponent] = None,
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
         from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 
         return BufferModePipeline(
             cache=self.cache,
-            swa_window_pages=swa_window_pages,
+            swa_component=swa_component,
+            auxiliary_swa_component=auxiliary_swa_component,
             write_backlog_cap=write_backlog_cap,
             max_context_len=max_context_len,
         )
@@ -838,12 +853,19 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict from this component's host-side resources, collecting freed
         values into *device_frees*/*host_frees* for the Controller to drain.
         Called by HostPoolGroup when the host pool is full.
         Default no-op for components without host storage."""
         pass
+
+    def storage_and_sub_pool(self):
+        """The storage this component's values are rows of, and the sub-pool
+        among them it holds."""
+        storage = self.cache.kv_storage()
+        return storage, storage.tree_sub_pool(self.component_type.name)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""

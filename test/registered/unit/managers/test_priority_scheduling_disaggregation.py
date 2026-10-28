@@ -39,7 +39,7 @@ from sglang.test.separate_buffer_allocator_double import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -67,6 +67,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         return scheduler
 
     def _new_req(self, priority=None):
@@ -217,8 +218,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         return cache, component, req
 
-    def _pop_bootstrapping_swa_branch(self, write_policy):
-        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+    def _pop_bootstrapping_swa_branch(
+        self, write_policy, *, queue_cls=PrefillBootstrapQueue, is_retracted=False
+    ):
+        queue = queue_cls.__new__(queue_cls)
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -234,7 +237,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             rid="req",
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
-            is_retracted=False,
+            is_retracted=is_retracted,
             swa_branching_seqlen=4,
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
@@ -272,6 +275,27 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 self.assertEqual(queue.queue, [])
                 self.assertEqual(req.prefill_attempt_count, 1)
                 queue.ensure_metadata_buffer.assert_called_once_with(req)
+
+    def test_subclass_eligibility_admits_prefill_but_never_a_paused_request(self):
+        """`can_prefill_before_bootstrap` is the override point; the pause check
+        stays outside it, so a permissive subclass cannot resume a retracted req."""
+
+        class _Eager(PrefillBootstrapQueue):
+            def can_prefill_before_bootstrap(self, req):
+                return True
+
+        queue, req, result = self._pop_bootstrapping_swa_branch(
+            "write_through", queue_cls=_Eager
+        )
+        self.assertEqual(result, [req])
+        self.assertEqual(req.prefill_attempt_count, 1)
+
+        queue, req, result = self._pop_bootstrapping_swa_branch(
+            "write_through", queue_cls=_Eager, is_retracted=True
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(queue.queue, [req])
+        queue.ensure_metadata_buffer.assert_not_called()
 
     def test_unpublished_advance_preserves_swa_frontier_and_ownership(self):
         cache, component, req = self._new_unpublished_swa_state()
@@ -412,6 +436,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None
@@ -488,6 +513,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         # auto-create one and break the `available_size() <= 0` comparison in
         # pop_preallocated.
         queue.req_to_token_pool.mamba_allocator = None
+        queue.req_to_token_pool.holds_state_slots = False
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64
         ).reshape(8, 16)
