@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
@@ -211,6 +212,33 @@ def test_typed_config_carries_tokenizer_metrics(enable_metrics):
         # The default rule keeps the Rust side's defaults; others resolve here.
         bucket_prompt_tokens=None,
         bucket_generation_tokens=[1.0, 10.0],
+    )
+
+
+@pytest.mark.parametrize("enable_metrics", [False, True])
+def test_rust_mode_main_process_reports_startup_time(enable_metrics):
+    # A model package's override of the collector class, installed after
+    # the engine module was imported.
+    collector_cls = MagicMock()
+    with (
+        get_context().override_server_args(
+            enable_metrics=enable_metrics, served_model_name="m"
+        ),
+        patch.object(
+            engine.metrics_collector, "TokenizerMetricsCollector", collector_cls
+        ),
+    ):
+        sink = engine._rust_server_startup_time_sink()
+        sink({"load_weight": 1.0})
+
+    if not enable_metrics:
+        collector_cls.assert_not_called()
+        return
+    collector_cls.assert_called_once_with(
+        labels={"model_name": "m", "engine_type": "unified"}
+    )
+    collector_cls.return_value.emit_startup_time.assert_called_once_with(
+        {"load_weight": 1.0}
     )
 
 
