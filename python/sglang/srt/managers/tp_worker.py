@@ -205,7 +205,9 @@ class BaseTpWorker(ABC):
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
+        result = self.model_runner.load_lora_adapter(
+            recv_req.to_ref(), upsert=recv_req.upsert
+        )
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):

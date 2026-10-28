@@ -48,6 +48,7 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     get_exec,
@@ -275,12 +276,17 @@ class LoRAManager:
             },
         )
 
-    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+    def load_lora_adapter(
+        self, lora_ref: LoRARef, upsert: bool = False
+    ) -> LoRAUpdateOutput:
         logger.info(
             f"LoRA adapter loading starts: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
         )
-        result = self._load_lora_adapter(lora_ref)
+        if upsert and lora_ref.lora_id in self.loras:
+            result = self._upsert_lora_adapter_from_path(lora_ref)
+        else:
+            result = self._load_lora_adapter(lora_ref)
         logger.info(
             f"LoRA adapter loading completes: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
@@ -323,6 +329,34 @@ class LoRAManager:
             )
 
         return self.create_lora_update_result(success=True)
+
+    def _upsert_lora_adapter_from_path(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        """Refresh a loaded adapter from its PEFT directory under the same
+        lora_id, through the staged tensor path so a failed read or install
+        leaves the old weights serving."""
+        try:
+            config = LoRAConfig(
+                lora_ref.lora_path, base_vocab_size=self.base_hf_config.vocab_size
+            )
+            tensors = self._read_adapter_tensors(lora_ref.lora_path, config)
+        except Exception as e:
+            return self.create_lora_update_result(success=False, error_message=str(e))
+        return self._load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config.hf_config,
+            config.added_tokens_config,
+            upsert=True,
+        )
+
+    def _read_adapter_tensors(
+        self, lora_path: str, config: LoRAConfig
+    ) -> Dict[str, torch.Tensor]:
+        loader = DefaultModelLoader(self.load_config)
+        source = DefaultModelLoader.Source(
+            lora_path, revision=config.hf_config.get("revision"), fall_back_to_pt=True
+        )
+        return dict(loader._get_weights_iterator(source))
 
     def validate_new_adapter(
         self,

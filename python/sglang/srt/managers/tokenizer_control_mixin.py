@@ -763,11 +763,22 @@ class TokenizerControlMixin:
                         "Retry the unload before loading it again."
                     )
 
-                # Generate new uniquely identifiable LoRARef object.
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path=obj.lora_path,
-                    pinned=obj.pinned,
+                if obj.upsert:
+                    self._validate_lora_upsert_supported()
+                    if obj.lora_name in self._pending_lora_publications:
+                        raise ValueError(
+                            f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
+                            "commit or abort its session before loading over it."
+                        )
+                # A same-name adapter keeps its lora_id under upsert; otherwise
+                # the ref mints a new one.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path=obj.lora_path,
+                        pinned=obj.pinned,
+                    ),
+                    upsert=obj.upsert,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
@@ -775,10 +786,14 @@ class TokenizerControlMixin:
                 rank_results = await self.update_lora_adapter_communicator(obj)
                 result = _merge_lora_update_results(rank_results)
                 if result.success:
-                    await self.lora_registry.register(new_adapter)
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 elif (
-                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    not reused
+                    and obj.lora_name not in self.lora_registry.get_all_adapters()
                     and _lora_load_needs_cleanup(rank_results, obj.lora_name)
                 ):
                     self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id

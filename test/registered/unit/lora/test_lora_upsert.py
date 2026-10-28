@@ -9,13 +9,20 @@ instead of failing with a duplicate error. Covers:
   * failed-upsert rollback (no half-updated live adapter)
   * num_pinned_loras consistency across pinned flips
   * LoRAManager.validate_new_adapter duplicate-name / starvation checks
-  * TokenizerControlMixin from_distributed id reuse; the from_tensors route
-    rejects upsert explicitly (only from_distributed supports in-place refresh)
+  * LoRAManager.load_lora_adapter(upsert=True): a loaded adapter is refreshed
+    from its PEFT directory under the same lora_id, via the staged tensor path
+  * /load_lora_adapter with upsert in TokenizerControlMixin: lora_name resolves
+    to the registered lora_id, the registry is refreshed only after the backend
+    succeeded, and a plain load of a held name is still rejected
 """
 
 import asyncio
+import json
+import os
+import tempfile
 import unittest
-from unittest.mock import MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -26,6 +33,8 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.io_struct import LoadLoRAAdapterReqInput, LoRAUpdateOutput
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -53,6 +62,7 @@ def _make_manager(*, lora_no_cpu_backup=False) -> LoRAManager:
     manager.lora_refs = {}
     manager.num_pinned_loras = 0
     manager.lora_no_cpu_backup = lora_no_cpu_backup
+    manager.attn_dp_enabled = False
     manager.max_loras_per_batch = 4
     manager.base_hf_config = MagicMock(vocab_size=32000)
     manager.lora_modules = []
@@ -423,3 +433,149 @@ class TestValidateNewAdapterDuplicates(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _peft_dir() -> str:
+    path = tempfile.mkdtemp()
+    with open(os.path.join(path, "adapter_config.json"), "w") as f:
+        json.dump(CONFIG_DICT, f)
+    return path
+
+
+@patch("sglang.srt.lora.lora_manager.get_available_gpu_memory", return_value=0.0)
+class TestPathUpsert(CustomTestCase):
+    """load_lora_adapter(upsert=True) on a loaded adapter rereads its PEFT
+    directory and refreshes the adapter under the same lora_id; the old
+    weights keep serving if the read fails."""
+
+    def test_upsert_refreshes_a_loaded_adapter_under_the_same_id(self, _):
+        manager = _make_manager()
+        manager._read_adapter_tensors = Mock(return_value={"w": torch.zeros(1)})
+        ref = LoRARef(lora_name="a", lora_path=_peft_dir())
+        manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+        before = manager.loras[ref.lora_id]
+
+        result = manager.load_lora_adapter(ref, upsert=True)
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(set(manager.loras), {ref.lora_id})
+        self.assertIsNot(manager.loras[ref.lora_id], before)
+        manager._read_adapter_tensors.assert_called_once()
+
+    def test_upsert_of_an_unloaded_id_takes_the_fresh_path(self, _):
+        manager = _make_manager()
+        manager._load_lora_adapter = Mock(
+            return_value=manager.create_lora_update_result(success=True)
+        )
+        ref = LoRARef(lora_name="a", lora_path="/x")
+
+        manager.load_lora_adapter(ref, upsert=True)
+
+        manager._load_lora_adapter.assert_called_once_with(ref)
+
+    def test_failed_read_keeps_the_old_adapter_serving(self, _):
+        manager = _make_manager()
+        ref = LoRARef(lora_name="a", lora_path=_peft_dir())
+        manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+        before = manager.loras[ref.lora_id]
+        manager._read_adapter_tensors = Mock(side_effect=OSError("no safetensors"))
+
+        result = manager.load_lora_adapter(ref, upsert=True)
+
+        self.assertFalse(result.success)
+        self.assertIn("no safetensors", result.error_message)
+        self.assertIs(manager.loras[ref.lora_id], before)
+
+
+def _tokenizer_with(registry: LoRARegistry, backend_success: bool) -> SimpleNamespace:
+    """The TokenizerManager fields the load_lora_adapter route reads."""
+
+    async def communicator(obj):
+        return [LoRAUpdateOutput(success=backend_success, loaded_adapters={})]
+
+    async def evict():
+        return []
+
+    tm = SimpleNamespace(
+        auto_create_handle_loop=lambda: None,
+        lora_update_lock=asyncio.Lock(),
+        pending_lora_unloads={},
+        _pending_lora_publications={},
+        lora_registry=registry,
+        lora_ref_cache={},
+        update_lora_adapter_communicator=communicator,
+        _evict_lru_over_cap=evict,
+    )
+    tm._validate_lora_upsert_supported = (
+        lambda: TokenizerControlMixin._validate_lora_upsert_supported(tm)
+    )
+    return tm
+
+
+def _load(tm, **fields):
+    obj = LoadLoRAAdapterReqInput(**fields)
+    with (
+        patch(
+            "sglang.srt.managers.tokenizer_control_mixin.get_lora",
+            return_value=SimpleNamespace(enable_lora=True, max_loaded_loras=None),
+        ),
+        patch(
+            "sglang.srt.managers.tokenizer_control_mixin.get_parallel",
+            return_value=SimpleNamespace(dp_size=1),
+        ),
+        patch(
+            "sglang.srt.managers.tokenizer_control_mixin.get_serving",
+            return_value=SimpleNamespace(tokenizer_worker_num=1),
+        ),
+    ):
+        result = asyncio.run(TokenizerControlMixin.load_lora_adapter(tm, obj))
+    return obj, result
+
+
+class TestLoadLoRAAdapterUpsertRoute(CustomTestCase):
+    """/load_lora_adapter with upsert resolves lora_name to the registered
+    lora_id and refreshes the registry only after the backend succeeded; a
+    plain load of a held name is still rejected, which callers probe for."""
+
+    def test_upsert_keeps_the_registered_id_and_refreshes_the_path(self):
+        registry = LoRARegistry()
+        first = LoRARef(lora_name="a", lora_path="/v1")
+        asyncio.run(registry.register(first))
+
+        obj, result = _load(
+            _tokenizer_with(registry, backend_success=True),
+            lora_name="a",
+            lora_path="/v2",
+            upsert=True,
+        )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(obj.lora_id, first.lora_id)
+        registered = registry.get_all_adapters()["a"]
+        self.assertEqual(registered.lora_id, first.lora_id)
+        self.assertEqual(registered.lora_path, "/v2")
+
+    def test_failed_upsert_leaves_the_registry_entry_untouched(self):
+        registry = LoRARegistry()
+        first = LoRARef(lora_name="a", lora_path="/v1")
+        asyncio.run(registry.register(first))
+        tm = _tokenizer_with(registry, backend_success=False)
+
+        _, result = _load(tm, lora_name="a", lora_path="/v2", upsert=True)
+
+        self.assertFalse(result.success)
+        self.assertEqual(registry.get_all_adapters()["a"], first)
+        self.assertEqual(tm.pending_lora_unloads, {})
+
+    def test_plain_load_of_a_held_name_is_still_rejected(self):
+        registry = LoRARegistry()
+        asyncio.run(registry.register(LoRARef(lora_name="a", lora_path="/v1")))
+
+        _, result = _load(
+            _tokenizer_with(registry, backend_success=True),
+            lora_name="a",
+            lora_path="/v2",
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("already exists", result.error_message)
