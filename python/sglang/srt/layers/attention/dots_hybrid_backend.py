@@ -135,7 +135,7 @@ class DotsSWAMLAPrefillMetadata:
 class DotsSWAMLAAttnBackend(AttentionBackend):
     """Add Dots latent-cache SWA support around a FlashAttention backend."""
 
-    def __init__(self, backend: AttentionBackend):
+    def __init__(self, backend: AttentionBackend, *, num_swa_heads: int | None = None):
         self.backend = backend
         self._active_backend = backend
         self.token_to_kv_pool = backend.token_to_kv_pool
@@ -144,6 +144,19 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = True
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
+
+        self._mla_swa = None
+        # Only the Dots SWA wrapper prepares this optional native path. TP8
+        # (Hq8), other devices, and older FlashInfer versions retain fallback.
+        native_backend = (
+            backend.decode_backend
+            if isinstance(backend, HybridAttnBackend)
+            else backend
+        )
+        if num_swa_heads == 64 and getattr(native_backend, "attn_cp_size", 1) == 1:
+            from sglang.srt.layers.attention.swa_mla import FlashInferMLASWA
+
+            self._mla_swa = FlashInferMLASWA.create(native_backend.device)
 
     @property
     def forward_metadata(self):
@@ -384,7 +397,13 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         )
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        output = forward_dense_kvlora_swa_torch_fallback(
+        native = getattr(self, "_mla_swa", None)
+        forward = (
+            native.forward
+            if native is not None
+            else forward_dense_kvlora_swa_torch_fallback
+        )
+        output = forward(
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
@@ -561,8 +580,16 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
     if runner.model_config.is_draft_model:
         return _wrap_dots_swa_backend(full_attn_backend)
 
+    from sglang.srt.runtime_context import get_parallel
+
+    # FlashAttention's num_attention_heads describes full/DSA attention (128
+    # in Dots3), not SWA (64). Qualify using the actual local SWA head count.
+    num_swa_heads = (
+        runner.model_config.hf_text_config.swa_num_attention_heads
+        // get_parallel().attn_tp_size
+    )
     if runner.model_config.hf_text_config.index_topk is None:
-        return DotsSWAMLAAttnBackend(full_attn_backend)
+        return DotsSWAMLAAttnBackend(full_attn_backend, num_swa_heads=num_swa_heads)
 
     from sglang.srt.layers.attention.attention_registry import create_dsa_backend
 
@@ -573,5 +600,5 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
     )
     return DotsHybridAttnBackend(
         dsa_backend=create_dsa_backend(runner),
-        swa_backend=DotsSWAMLAAttnBackend(swa_backend),
+        swa_backend=DotsSWAMLAAttnBackend(swa_backend, num_swa_heads=num_swa_heads),
     )
