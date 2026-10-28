@@ -163,7 +163,7 @@ def test_list_cache_entries_own_storage():
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(_encoder_list, items, 0, TOTAL_LEN, _CPU)
     for item in items:
-        emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
+        emb = mm_schedule.embedding_cache.get_single(item.cache_key).embedding
         own_bytes = emb.numel() * emb.element_size()
         assert emb.untyped_storage().nbytes() == own_bytes
 
@@ -191,7 +191,7 @@ def test_tensor_cache_entries_own_storage(per_request):
             request.overlapping, embeddings, 0, TOTAL_LEN
         )
     for item, chunk in zip(items, chunks):
-        emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
+        emb = mm_schedule.embedding_cache.get_single(item.cache_key).embedding
         assert emb.untyped_storage().nbytes() == emb.numel() * emb.element_size()
         assert chunk.untyped_storage().data_ptr() == emb.untyped_storage().data_ptr()
 
@@ -222,7 +222,7 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     items = _make_items()
     first_item = items[0]
     mm_schedule.embedding_cache.set(
-        first_item.hash,
+        first_item.cache_key,
         mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
     )
     encoder = Mock(side_effect=_encoder_list)
@@ -235,7 +235,7 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
         _num_tokens(item) for item in items
     )
     encoder.assert_called_once()
-    assert mm_schedule.embedding_cache.get_single(first_item.hash).embedding.shape[
+    assert mm_schedule.embedding_cache.get_single(first_item.cache_key).embedding.shape[
         0
     ] == _num_tokens(first_item)
 
@@ -245,7 +245,7 @@ def test_batched_mismatched_cache_entry_is_reencoded():
     items = _make_items()
     first_item = items[0]
     mm_schedule.embedding_cache.set(
-        first_item.hash,
+        first_item.cache_key,
         mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
     )
     request = mm_schedule.PerImageRequestInfo(
@@ -259,7 +259,7 @@ def test_batched_mismatched_cache_entry_is_reencoded():
 
     embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
 
-    assert embeddings[(first_item.hash, _num_tokens(first_item))].shape == (
+    assert embeddings[(first_item.cache_key, _num_tokens(first_item))].shape == (
         _num_tokens(first_item),
         HIDDEN,
     )
@@ -273,10 +273,13 @@ def test_full_deferred_ipc_item_is_marked_for_borrow():
         modality=Modality.IMAGE,
         hash=1000,
         pad_value=1000,
-        feature=proxy,
+        feature=torch.zeros(1),
         offsets=[ITEM_OFFSETS[0]],
         model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
     )
+    # the frontend hashes the actual feature before wrapping its transport
+    item.set_pad_value()
+    item.feature = proxy
     request = mm_schedule.PerImageRequestInfo(
         req_idx=0,
         items=[item],
@@ -308,8 +311,8 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
 
     embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
 
-    first_key = (items[0].hash, _num_tokens(items[0]))
-    second_key = (items[1].hash, _num_tokens(items[1]))
+    first_key = (items[0].cache_key, _num_tokens(items[0]))
+    second_key = (items[1].cache_key, _num_tokens(items[1]))
     assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
     assert embeddings[second_key].shape == (_num_tokens(items[1]), HIDDEN)
     encoder.assert_called_once()
@@ -319,7 +322,7 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(
-        [item.hash for item in items]
+        [item.cache_key for item in items]
     )
     mm_schedule.embedding_cache.set(
         combined_hash,
@@ -412,7 +415,7 @@ def test_cached_audio_items_concatenate_once_in_request_order(
             )
             emb = torch.full((4, HIDDEN), item.hash, dtype=torch.bfloat16)
             mm_schedule.embedding_cache.set(
-                item.hash, mm_schedule.EmbeddingResult(embedding=emb)
+                item.cache_key, mm_schedule.EmbeddingResult(embedding=emb)
             )
             items.append(item)
             expected_slices.append(emb[1:] if item_idx == 0 else emb[:3])

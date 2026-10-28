@@ -906,7 +906,7 @@ def _identity_data(value):
         # Reading must not consume the handle needed by the encoder later.
         return value.tensor
     if isinstance(value, CudaIpcTensorTransportProxy):
-        return value.reconstruct_on_target_device(torch.cuda.current_device())
+        raise RuntimeError("Multimodal identity must be computed before CUDA transport")
     if isinstance(value, list):
         return [_identity_data(part) for part in value]
     if isinstance(value, tuple):

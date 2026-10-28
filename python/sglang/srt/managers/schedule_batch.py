@@ -395,8 +395,9 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     processor_fingerprint: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.hash is not None:
-            msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+        if self.hash is not None and not 0 <= self.hash <= _MM_HASH_MASK:
+            # retain full artifact fingerprints before narrowing the wire field
+            self.set_hash(self.hash)
 
     def __getattr__(self, name: str) -> MultimodalDataValue:
         if name in self.model_specific_data:

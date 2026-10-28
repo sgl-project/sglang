@@ -39,6 +39,7 @@ def _item(modality, rows, offsets):
 class TestPrecomputedEmbeddingValidation(unittest.TestCase):
     def setUp(self):
         self.processor = object.__new__(_StubProcessor)
+        self.processor.processor_fingerprint = "sha256:" + "12" * 32
 
     def _validate(self, items, embeddings):
         self.processor.output = MultimodalProcessorOutput(

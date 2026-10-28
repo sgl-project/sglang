@@ -21,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.cache.identity import resolve_multimodal_item_identity
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -269,12 +270,15 @@ class TestMediaIdentity(unittest.TestCase):
 
     def test_multimodal_data_item_uses_shared_feature_hash(self):
         feature = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-        expected = resolve_multimodal_item_hash(feature=feature)
+        expected = resolve_multimodal_item_identity(
+            feature=feature, modality="IMAGE", input_format="NORMAL", metadata={}
+        )
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
 
         item.set_pad_value()
 
-        self.assertEqual(item.hash, expected)
+        self.assertEqual(item.identity, expected)
+        self.assertEqual(item.hash, int.from_bytes(expected[:8], "big"))
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):

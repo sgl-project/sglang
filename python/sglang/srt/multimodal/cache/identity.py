@@ -351,6 +351,8 @@ def resolve_multimodal_item_identity(
         return structured_digest(("uncached-mm", uuid.uuid4().bytes))
     if namespace is not None:
         namespace = parse_content_hash(namespace)
+        if existing_hash is not None and existing_hash < 0:
+            raise ValueError("Artifact feature hashes must be nonnegative")
     return hash_feature_digest(
         (
             "multimodal-item-v2",
