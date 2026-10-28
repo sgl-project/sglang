@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.utils import (
@@ -419,9 +420,11 @@ class MoriKVManager(CommonKVManager):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks _num_shards threads
                 # (each parked forever in FastQueue.get()).
+                # Bind to this rank's device: _transfer_worker makes device calls
+                # (wait_event.synchronize()) that would otherwise use device 0.
                 t = threading.Thread(
-                    target=self._transfer_worker,
-                    args=(queue,),
+                    target=run_on_device,
+                    args=(self.kv_args.gpu_id, self._transfer_worker, queue),
                     daemon=True,
                     name=(
                         f"mori-xfer-dp{self.system_dp_rank}-"

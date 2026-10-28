@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
+    sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
@@ -1664,6 +1665,26 @@ class QwenSparseAttnBackend(AttentionBackend):
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        if any(prefix_lens) and save_kv_cache and q.is_cuda:
+            # Every selected token, prefix or new, is in the pool now (the
+            # gathered new K/V was just written), so read it in place instead of
+            # packing each request's whole context per layer.
+            pool = self.token_to_kv_pool
+            output = sparse_gqa_paged_prefill_triton(
+                q,
+                pool.get_key_buffer(layer.layer_id),
+                pool.get_value_buffer(layer.layer_id),
+                metadata.token_slot_table[: meta.bs],
+                indices,
+                meta.cu_seqlens_q_combined_tensor,
+                meta.kv_len_combined_tensor,
+                layer.scaling,
+                max_q=meta.max_seqlen_q_combined,
+            )
+            if pending is not None:
+                # Keep the prefetched K/V alive through the cache write above.
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
+            return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
             # replicated on each CP rank (or assembled in the KV-shard
