@@ -14,8 +14,6 @@ import math
 import queue
 import types
 import unittest
-from collections import deque
-from contextlib import nullcontext
 from functools import partial
 from itertools import count
 from types import SimpleNamespace
@@ -24,10 +22,12 @@ from unittest.mock import Mock, patch
 import prometheus_client
 import torch
 
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import CoreLists
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
     PrefillStats,
@@ -35,6 +35,16 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _CacheHitRateWindow,
 )
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.pp_ring import PPRing
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.forward_pass_metrics import (
+    ForwardPassMetrics,
+    FpmTiming,
+    _FpmPublisherThread,
+    decode,
+    wrap_forward_with_fpm,
+)
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     SchedulerMetricsCollector,
@@ -171,17 +181,15 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
         ):
             with self.subTest(algorithm=algorithm):
                 reporter = _make_reporter(self, types.SimpleNamespace())
-                reporter.scheduler.enable_fpm = True
+                reporter.metrics_sink.enable_fpm = True
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
                         is_retracted=length == 200,
                         finished=lambda length=length: length == 300,
                         grammar=None,
-                        spec_verify_ct=0,
-                        spec_num_correct_drafts=0,
-                        update_spec_correct_drafts_histogram=Mock(),
-                        kv=types.SimpleNamespace(kv_committed_len=0),
+                        spec_stats=Mock(verify_ct=0, num_correct_drafts=0),
+                        kv=ReqKvInfo(),
                     )
                     for length in (100, 200, 300)
                 ]
@@ -203,13 +211,20 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                         req.seqlen += 20
 
                 processor = types.SimpleNamespace(
-                    metrics_reporter=reporter,
-                    model_worker=types.SimpleNamespace(on_verify_complete_cpu=Mock()),
-                    advance_grammar_fsm=settle_grammar,
+                    services=types.SimpleNamespace(metrics_sink=reporter.metrics_sink),
+                    workers=types.SimpleNamespace(
+                        model_worker=types.SimpleNamespace(
+                            on_verify_complete_cpu=Mock()
+                        )
+                    ),
                 )
-                tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
-                )
+                with patch(
+                    "sglang.srt.managers.scheduler_components.batch_result_processor.advance_grammar_fsm",
+                    side_effect=settle_grammar,
+                ):
+                    tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+                        processor, result, batch
+                    )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
                 metrics = reporter._build_scheduled_request_metrics(batch, result)
@@ -218,13 +233,13 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 self.assertAlmostEqual(metrics.var_decode_kv_tokens, 20000 / 3)
 
     def test_disabled_and_unsupported_do_not_read_requests(self):
-        reporter = _make_reporter(self, types.SimpleNamespace())
+        sink = _make_reporter(self, types.SimpleNamespace()).metrics_sink
         result = GenerationBatchResult()
-        reporter.snapshot_spec_decode_metrics(None, result)
+        sink.snapshot_spec_decode_metrics(None, result)
         self.assertIsNone(result.fpm_scheduled_requests)
-        reporter.scheduler.enable_fpm = True
+        sink.enable_fpm = True
         for algorithm in (SpeculativeAlgorithm.UNO, SpeculativeAlgorithm.FROZEN_KV_MTP):
-            reporter.snapshot_spec_decode_metrics(
+            sink.snapshot_spec_decode_metrics(
                 types.SimpleNamespace(spec_algorithm=algorithm), result
             )
             self.assertIsNone(result.fpm_scheduled_requests)
@@ -373,11 +388,10 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler = types.SimpleNamespace(lists=CoreLists())
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
+        self.publisher = _CollectingPublisher()
         self.reporter.metrics_sink._fpm_worker_id = "worker-7"
         self.reporter.metrics_sink._fpm_dp_rank = 0
-        self.reporter.metrics_sink._fpm_publisher = _CollectingPublisher()
-        self.reporter.metrics_sink._fpm_uses_device_timer = False
-        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.0
+        self.reporter.metrics_sink._fpm_publisher = self.publisher
         self.reporter.metrics_sink.enable_fpm = True
 
     def test_cache_hit_rate_window_keeps_last_15s_of_tokens(self):
@@ -430,8 +444,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         self._emit_ready(batch, milliseconds=4500)
 
-        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
-        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
+        self.assertEqual(len(self.publisher.metrics), 1)
+        metrics = self.publisher.metrics[0]
         self.assertEqual(metrics.worker_id, "worker-7")
         self.assertEqual(metrics.dp_rank, 3)
         self.assertEqual(metrics.wall_time, 4.5)
@@ -445,61 +459,60 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
 
-    def test_emit_uses_device_timer_gpu_time(self):
-        self.reporter.metrics_sink._fpm_uses_device_timer = True
-        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.042
-        self.reporter.metrics_sink.forward_pass_device_timer = types.SimpleNamespace(
-            _report=lambda: None,
-        )
-        batch = self._make_batch()
+    def test_dummy_rank_keeps_gpu_time_without_local_scheduled_requests(self):
+        self.scheduler.lists.waiting_queue = [_FakeReq(128), _FakeReq(256)]
+        batch = self._make_batch(forward_mode=ForwardMode.IDLE)
+        self._emit_ready(batch, milliseconds=23)
+        metric = self.publisher.metrics[-1]
+        self.assertEqual(metric.scheduled_requests.num_prefill_requests, 0)
+        self.assertEqual(metric.scheduled_requests.num_decode_requests, 0)
+        self.assertAlmostEqual(metric.wall_time, 0.023)
+        self.assertEqual(metric.queued_requests.num_prefill_requests, 2)
+        self.assertEqual(metric.queued_requests.sum_prefill_tokens, 384)
 
     def test_scheduler_state_controls_heartbeat_with_metrics_disabled(self):
-        self.reporter.record_scheduler_active(event_ns=0)
-        self.assertFalse(self.scheduler._fpm_publisher.idle)
-        self.reporter.record_scheduler_idle()
-        self.assertTrue(self.scheduler._fpm_publisher.idle)
-        self.reporter.record_scheduler_active(event_ns=1)
-        self.assertFalse(self.scheduler._fpm_publisher.idle)
+        sink = self.reporter.metrics_sink
+        sink.record_scheduler_active(event_ns=0)
+        self.assertFalse(self.publisher.idle)
+        sink.record_scheduler_idle()
+        self.assertTrue(self.publisher.idle)
+        sink.record_scheduler_active(event_ns=1)
+        self.assertFalse(self.publisher.idle)
 
-        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
-        self.assertAlmostEqual(
-            self.reporter.metrics_sink._fpm_publisher.metrics[0].wall_time,
-            0.042,
-            places=4,
-        )
-        self.assertAlmostEqual(self.reporter.metrics_sink._fpm_gpu_time_acc, 0.0)
+    def test_emit_skips_uninstrumented_iteration(self):
+        for timing in (None, capture_timing(DeviceTimer())):
+            with self.subTest(timing=timing):
+                self.reporter._emit_forward_pass_metrics(
+                    self._make_batch(), GenerationBatchResult(fpm_timing=timing)
+                )
+                self.assertEqual(self.publisher.metrics, [])
 
-    def test_emit_skips_when_device_timer_zero(self):
-        self.reporter.metrics_sink._fpm_uses_device_timer = True
-        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.0
-        self.reporter.metrics_sink.forward_pass_device_timer = types.SimpleNamespace(
-            _report=lambda: None,
-        )
-        batch = self._make_batch()
-
-        self.reporter._emit_forward_pass_metrics(batch)
-
-        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 0)
-
-    def test_emit_uses_monotonic_without_device_timer(self):
-        batch = self._make_batch()
+    def test_delayed_timing_uses_frozen_batch_and_queue_stats(self):
+        timer = self.reporter.metrics_sink.forward_pass_device_timer = DeviceTimer()
+        interval = FakeInterval(7)
+        timing = capture_timing(timer, interval)
+        batch = self._make_batch(seq_lens_cpu=[100, 200])
+        self.scheduler.lists.waiting_queue = [_FakeReq(300)]
+        result = types.SimpleNamespace(fpm_timing=timing)
+        self.reporter._emit_forward_pass_metrics(batch, result)
+        self.assertEqual(self.publisher.metrics, [])
 
         # Later iterations may mutate both sources before timing becomes ready.
         batch.seq_lens_cpu = [900]
-        self.scheduler.waiting_queue.clear()
+        self.scheduler.lists.waiting_queue.clear()
         interval.ready = True
         with patch(
             "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
             False,
         ):
-            self.reporter._emit_forward_pass_metrics(batch, result=None)
-
-        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
-        self.assertAlmostEqual(
-            self.reporter.metrics_sink._fpm_publisher.metrics[0].wall_time,
-            0.035,
-            places=4,
-        )
+            self.reporter.metrics_sink.update_device_timer()
+        metrics = self.publisher.metrics[0]
+        self.assertAlmostEqual(metrics.wall_time, 0.007)
+        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 2)
+        self.assertEqual(metrics.scheduled_requests.sum_decode_kv_tokens, 300)
+        self.assertEqual(metrics.queued_requests.sum_prefill_tokens, 300)
+        timer._report()
+        self.assertEqual(len(self.publisher.metrics), 1)
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         _set_disaggregation_mode(self, DisaggregationMode.PREFILL)
@@ -510,7 +523,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         self._emit_ready(batch)
 
-        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
+        metrics = self.publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_prefill_tokens, 350)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 0)
@@ -529,7 +542,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         self._emit_ready(batch)
 
-        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
+        metrics = self.publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 0)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
@@ -546,19 +559,14 @@ class TestForwardPassMetrics(unittest.TestCase):
         owner.ready = [_FakeReq(30, output_len=15)]
         batch = self._make_batch()
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=101.0,
-        ):
-            self.reporter._emit_forward_pass_metrics(batch)
+        self._emit_ready(batch)
 
-        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
+        metrics = self.publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        original_forward = scheduler.run_batch = lambda batch: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -578,14 +586,15 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             reporter = _make_reporter(self, scheduler)
 
-        self.assertTrue(reporter.metrics_sink.enable_fpm)
-        self.assertEqual(reporter.metrics_sink._fpm_worker_id, "endpoint-42")
-        self.assertEqual(reporter.metrics_sink._fpm_dp_rank, 2)
-        self.assertEqual(reporter.metrics_sink._fpm_publisher.worker_id, "endpoint-42")
-        self.assertEqual(reporter.metrics_sink._fpm_publisher.dp_rank, 2)
-        self.assertTrue(
-            reporter.metrics_sink._fpm_publisher.endpoint.startswith("ipc://")
-        )
+        sink = reporter.metrics_sink
+        self.assertTrue(sink.enable_fpm)
+        # The step launcher wraps its forward with this timer.
+        self.assertIsInstance(sink.forward_pass_device_timer, DeviceTimer)
+        self.assertEqual(sink._fpm_worker_id, "endpoint-42")
+        self.assertEqual(sink._fpm_dp_rank, 2)
+        self.assertEqual(sink._fpm_publisher.worker_id, "endpoint-42")
+        self.assertEqual(sink._fpm_publisher.dp_rank, 2)
+        self.assertTrue(sink._fpm_publisher.endpoint.startswith("ipc://"))
         # The bag is what makes the write a bag write: an instance mutation
         # would still show up in the resolved dict through its ServerArgs base.
         endpoint = get_observability().forward_pass_metrics_ipc_name
@@ -598,7 +607,6 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -619,6 +627,64 @@ class TestForwardPassMetrics(unittest.TestCase):
             reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(reporter.metrics_sink.enable_fpm)
+
+    def test_pp_skipped_output_comm_keeps_timing(self):
+        timing = object()
+        launch_result = GenerationBatchResult(
+            can_run_cuda_graph=True, fpm_timing=timing
+        )
+        ring = types.SimpleNamespace(
+            device="cpu",
+            device_module=types.SimpleNamespace(
+                Event=Mock, current_stream=lambda: object()
+            ),
+        )
+        wire, result, _ = PPRing._make_skip_output_result(
+            ring, types.SimpleNamespace(reqs=[object()]), launch_result
+        )
+        self.assertIsNone(wire)
+        self.assertTrue(result.skipped_output_comm)
+        self.assertIs(result.fpm_timing, timing)
+
+
+class TestFpmPublisherIdleState(unittest.TestCase):
+    def test_queue_timeout_does_not_turn_a_long_or_dummy_forward_into_heartbeat(self):
+        publisher = object.__new__(_FpmPublisherThread)
+        publisher._running = True
+        publisher._idle = False
+        publisher._seq = count()
+        publisher._worker_id = "worker"
+        publisher._dp_rank = 1
+        publisher._pub = Mock()
+        publisher._zmq = types.SimpleNamespace(Again=RuntimeError, NOBLOCK=1)
+        dummy = ForwardPassMetrics(worker_id="worker", dp_rank=1, wall_time=0.025)
+        actions = iter(["busy", dummy, "busy", "idle", "busy", "stop"])
+
+        def next_item(**kwargs):
+            item = next(actions)
+            if item == "stop":
+                return None
+            if isinstance(item, str):
+                publisher.set_idle(item == "idle")
+                raise queue.Empty
+            return item
+
+        publisher._queue = types.SimpleNamespace(get=next_item)
+        with patch(
+            "sglang.srt.observability.forward_pass_metrics.time.monotonic",
+            side_effect=count(0, 2),
+        ):
+            publisher._run()
+        messages = [
+            decode(call.args[0][2])
+            for call in publisher._pub.send_multipart.call_args_list
+        ]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual([m.wall_time for m in messages], [0.025, 0.0])
+        self.assertEqual([m.counter_id for m in messages], [0, 1])
+        self.assertTrue(
+            all(m.scheduled_requests.num_decode_requests == 0 for m in messages)
+        )
 
 
 def _dp_balance_stats(

@@ -83,7 +83,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         model_config=SimpleNamespace(think_end_ids=None),
         kv=kv,
         services=SimpleNamespace(
-            metrics_sink=SimpleNamespace(),
+            metrics_sink=SimpleNamespace(
+                snapshot_spec_decode_metrics=lambda batch, result: None,
+            ),
             output_streamer=SimpleNamespace(),
         ),
         decode_offload_manager=None,

@@ -212,7 +212,6 @@ class _Scheduler:
     _select_decode = Scheduler._select_decode
     process_bootstrapped_queue = Scheduler.process_bootstrapped_queue
     process_prefill_transfer_queue = Scheduler.process_prefill_transfer_queue
-    _start_fpm_clock = Scheduler._start_fpm_clock
     paused_pass = Scheduler.paused_pass
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
     pause_generation = Scheduler.pause_generation

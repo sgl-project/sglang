@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
+from sglang.srt.observability.forward_pass_metrics import wrap_forward_with_fpm
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RUN_BATCH,
     scheduler_stage_method,
@@ -142,6 +143,12 @@ class StepLauncher:
             # draft input into FutureMap.
             self.forward_step = self.model_worker.forward_batch_generation
             self.finish_launch = self._finish_sync_spec_launch
+        if self.metrics_sink.enable_fpm:
+            # Each result carries its forward's GPU span for the forward pass
+            # metrics; the result processing publishes it once ready.
+            self.forward_step = wrap_forward_with_fpm(
+                self.forward_step, self.metrics_sink.forward_pass_device_timer
+            )
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(

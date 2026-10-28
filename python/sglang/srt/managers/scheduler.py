@@ -1011,7 +1011,6 @@ class Scheduler:
             stages.drain_hicache()
         else:
             self._process_hicache_events(should_retry_storage_prefetch)
-        self._start_fpm_clock()
         self.stash_chunked_request()
 
         if stages.before_admission is not None:
@@ -1103,17 +1102,10 @@ class Scheduler:
 
         if step:
             set_schedule_time_batch(step)
-            if self.parts.metrics_sink.enable_fpm:
-                step.fpm_start_time = self._fpm_batch_t0
 
         if self.parts.scripted_scheduler_hook is not None:
             self.parts.scripted_scheduler_hook.on_schedule(step, slot)
         return step
-
-    def _start_fpm_clock(self) -> None:
-        """Start the forward pass metrics clock of the step being scheduled."""
-        if self.parts.metrics_sink.enable_fpm:
-            self._fpm_batch_t0 = time.monotonic()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
     def process_batch_result(

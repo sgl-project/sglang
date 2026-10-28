@@ -19,12 +19,11 @@ from sglang.srt.managers.scheduler_components.pp_channel import (  # noqa: E402
 )
 from sglang.srt.managers.scheduler_components.pp_ring import (  # noqa: E402
     PPRing,
-    _pp_exchange_outputs_before_forward,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -251,7 +250,7 @@ class TestDSparkPPOutput(CustomTestCase):
         result = PPRing._prep_batch_result(
             scheduler,
             batch,
-            PPBatchMetadata(can_run_cuda_graph=False),
+            GenerationBatchResult(can_run_cuda_graph=False),
             PPProxyTensors(wire),
         )
         self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)

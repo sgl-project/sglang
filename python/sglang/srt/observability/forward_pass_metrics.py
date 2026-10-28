@@ -201,14 +201,10 @@ class FpmTiming:
 
 
 def wrap_forward_with_fpm(forward: Callable, timer: DeviceTimer) -> Callable:
-    """Installed on the scheduler instance only when that rank enables FPM."""
+    """Installed on the step launcher only when that rank enables FPM."""
 
     @wraps(forward)
     def timed_forward(batch, *args, **kwargs):
-        # PREBUILT can recursively dispatch an inner idle forward for DP MLP
-        # synchronization. Let that real forward own the capture and result.
-        if batch.forward_mode.is_prebuilt():
-            return forward(batch, *args, **kwargs)
         timing = FpmTiming()
         try:
             with timer.capture(timing):

@@ -408,6 +408,7 @@ class PPRing:
             next_token_ids=placeholder,
             can_run_cuda_graph=launch_result.can_run_cuda_graph,
             skipped_output_comm=True,
+            fpm_timing=launch_result.fpm_timing,
         )
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
@@ -469,6 +470,7 @@ class PPRing:
                 new_seq_lens=pp_outputs["spec_new_seq_lens"],
                 speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
                 can_run_cuda_graph=launch_result.can_run_cuda_graph,
+                fpm_timing=launch_result.fpm_timing,
             )
             return output_result
 
@@ -537,6 +539,7 @@ class PPRing:
             next_token_ids=pp_outputs["next_token_ids"],
             next_draft_input=next_draft_input,
             can_run_cuda_graph=launch_result.can_run_cuda_graph,
+            fpm_timing=launch_result.fpm_timing,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result

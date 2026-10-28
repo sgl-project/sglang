@@ -279,6 +279,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.metrics_sink.enable_fpm = False
         reporter.mode_owners = ModeOwners(
             disagg_decode=decode_owner_shell(transfer_queue=queue)
         )
@@ -356,6 +357,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         )
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.metrics_sink.enable_fpm = False
         reporter.mode_owners = ModeOwners(
             disagg_decode=decode_owner_shell(
                 transfer_queue=queue,
@@ -453,6 +455,7 @@ class TestStatusLoggerQueuedRequests(CustomTestCase):
         ready = SimpleNamespace(rid="ready")
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.metrics_sink.enable_fpm = False
         reporter.mode_owners = ModeOwners(
             disagg_decode=decode_owner_shell(ready=[ready])
         )

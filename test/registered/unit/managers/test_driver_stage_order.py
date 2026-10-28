@@ -283,7 +283,6 @@ class _Shell:
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
         s._yield_gil_if_needed = lambda: None
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
-        s._start_fpm_clock = lambda: self.log("fpm")
         s.stash_chunked_request = lambda: self.log("stash")
         s._process_hicache_events = self.hicache_events
         s.hub.request_intake = SimpleNamespace(
@@ -402,7 +401,7 @@ def _at(iteration, *events):
 
 
 # The core steps every schedule runs first, in every mode and driver.
-_PROLOGUE = ("chunked_abort", "hicache", "fpm", "stash")
+_PROLOGUE = ("chunked_abort", "hicache", "stash")
 # The tail every schedule runs, on a step and on no step.
 _HOOK = "hook.on_schedule"
 _FINALIZE_NONE = ("mlp_sync", "extend_view", "arm_interval", "ngram", _HOOK)

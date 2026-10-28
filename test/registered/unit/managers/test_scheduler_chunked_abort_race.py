@@ -112,7 +112,6 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.parts.kv.tree_cache = None
         sched.parts.ipc_channels = Mock()
         sched._process_hicache_events = Mock()
-        sched._start_fpm_clock = Mock()
         sched.hub.step_planner = Mock()
         sched.hub.request_intake = Mock()
         sched.finalize_step = lambda step, slot, need_mlp_sync: step
