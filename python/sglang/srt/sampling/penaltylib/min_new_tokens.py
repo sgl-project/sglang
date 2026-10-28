@@ -15,13 +15,25 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
+        reqs = self.orchestrator.reqs()
+        if not reqs:
+            self.min_new_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            self.stop_token_penalties = torch.zeros(
+                (0, self.orchestrator.vocab_size),
+                dtype=torch.float32,
+                device=self.orchestrator.device,
+            )
+            self.len_output_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            return
+
         pin_memory = is_pin_memory_available(self.orchestrator.device)
         self.min_new_tokens = (
             torch.tensor(
-                data=[
-                    req.sampling_params.min_new_tokens
-                    for req in self.orchestrator.reqs()
-                ],
+                data=[req.sampling_params.min_new_tokens for req in reqs],
                 dtype=torch.int32,
                 pin_memory=pin_memory,
             )
@@ -37,10 +49,15 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                         for token_id in (
                             (req.sampling_params.stop_token_ids or set())
                             | (req.eos_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
+                            | (
+                                (req.tokenizer.additional_stop_token_ids or set())
+                                if req.tokenizer is not None
+                                else set()
+                            )
                             | (
                                 {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
+                                if req.tokenizer is not None
+                                and req.tokenizer.eos_token_id is not None
                                 else set()
                             )
                         )
@@ -48,7 +65,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                     ],
                     dtype=torch.int64,
                 )
-                for req in self.orchestrator.reqs()
+                for req in reqs
             ],
             batch_first=True,
             padding_value=self.orchestrator.vocab_size,
@@ -59,7 +76,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             self.orchestrator.device, non_blocking=True
         )
         self.stop_token_penalties = torch.zeros(
-            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
+            size=(len(reqs), self.orchestrator.vocab_size + 1),
             dtype=torch.float32,
             device=self.orchestrator.device,
         ).scatter_add_(
@@ -74,7 +91,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )[:, : self.orchestrator.vocab_size]
 
         self.len_output_tokens = torch.zeros(
-            size=(len(self.orchestrator.reqs()), 1),
+            size=(len(reqs), 1),
             dtype=torch.int32,
             device=self.orchestrator.device,
         )

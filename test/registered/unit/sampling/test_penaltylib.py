@@ -525,6 +525,58 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
 
+    def test_release_preserves_callable_batch_ref_and_safe_reqs(self):
+        """Test that batch and reqs() remain safe to access after release()."""
+        reqs = [_make_req(freq=1.0)]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
+        orch.release()
+        self.assertIsNone(orch.batch)
+        self.assertEqual(orch.reqs(), [])
+
+    def test_merge_after_empty_filter_recreates_penalizers(self):
+        """Test that merging into an orchestrator emptied by filter() succeeds."""
+        reqs_a = [_make_req(freq=1.0, min_tokens=2)]
+        reqs_b = [_make_req(freq=2.0, min_tokens=3)]
+        batch_a = _make_batch(reqs_a)
+        batch_b = _make_batch(reqs_b)
+        penalizer_set = {BatchedFrequencyPenalizer, BatchedMinNewTokensPenalizer}
+        orch_a = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_a, penalizer_set)
+        orch_b = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch_b, penalizer_set)
+
+        batch_a.reqs = []
+        orch_a.filter(torch.tensor([], dtype=torch.long))
+        self.assertFalse(orch_a.is_required)
+        self.assertIsNone(orch_a.batch)
+        self.assertEqual(orch_a.reqs(), [])
+
+        orch_a.merge(orch_b)
+        self.assertTrue(orch_a.is_required)
+        freq_pen = orch_a.penalizers[BatchedFrequencyPenalizer]
+        min_pen = orch_a.penalizers[BatchedMinNewTokensPenalizer]
+        self.assertEqual(freq_pen.frequency_penalties.shape[0], 1)
+        self.assertAlmostEqual(freq_pen.frequency_penalties[0, 0].item(), 2.0, places=5)
+        self.assertEqual(min_pen.min_new_tokens.shape[0], 1)
+        self.assertEqual(min_pen.min_new_tokens[0, 0].item(), 3)
+
+    def test_min_new_tokens_with_none_tokenizer(self):
+        """Test that BatchedMinNewTokensPenalizer handles req.tokenizer=None."""
+        req = _make_req(min_tokens=2, stop_ids={4}, eos_id=None)
+        req.tokenizer = None
+        req.eos_token_ids = {6}
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertTrue(torch.isneginf(logits[0, 4]))
+        self.assertTrue(torch.isneginf(logits[0, 6]))
+        self.assertEqual(logits[0, 0].item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
