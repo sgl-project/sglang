@@ -238,6 +238,12 @@ class Qwen3XPressModel(DFlashDraftModel):
             )
         super().load_weights(mapped)
         self.xpress_head.fold_from_raw_(raw_mix)
+        self.post_load_weights()
+
+    def post_load_weights(self) -> None:
+        # Some SGLang loaders copy an already-folded state directly into the
+        # parameters instead of calling load_weights(). Their transposed mixer
+        # and projection buffers must follow the newly loaded parameters.
         self.xpress_head.build_fused_buffers()
 
 

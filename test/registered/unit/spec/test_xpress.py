@@ -1,7 +1,12 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch import nn
 
+from sglang.srt.models.dflash import _radix_topk
 from sglang.srt.models.xpress import XPressRefinerHead
+from sglang.srt.speculative.dflash_worker_v2 import _validate_xpress_lm_head
 
 
 def _head(device, topc=0):
@@ -31,6 +36,39 @@ def test_xpress_mixer_folds_training_residual():
     torch.testing.assert_close(head.refine_bias(prev, cache), expected)
 
 
+def test_xpress_mixer_is_causal():
+    head = _head("cpu")
+    head.fold_from_raw_(torch.randn_like(head.mix_L) * 0.3)
+    hidden = torch.randn(2, 8, 32)
+    prev = torch.randint(0, 61, (2, 8))
+    hcache = head.hidden_cache(hidden)
+    bias = head.refine_bias(prev, hcache)
+    changed = prev.clone()
+    changed[:, 5] = (changed[:, 5] + 1) % 61
+    changed_bias = head.refine_bias(changed, hcache)
+    torch.testing.assert_close(changed_bias[:, :5], bias[:, :5])
+    assert not torch.allclose(changed_bias[:, 5:], bias[:, 5:])
+
+
+def test_xpress_target_head_validation():
+    head = _head("cpu")
+    target_head = nn.Linear(32, 64, bias=False)  # A padded vocabulary is valid.
+    config = SimpleNamespace(hidden_size=32)
+    _validate_xpress_lm_head(target_head, head, config)
+
+    class QuantizedMethod:
+        def apply(self, layer, x, bias):
+            return x
+
+    target_head.quant_method = QuantizedMethod()
+    with pytest.raises(ValueError, match="unquantized"):
+        _validate_xpress_lm_head(target_head, head, config)
+
+    target_head.quant_method = None
+    with pytest.raises(ValueError, match="shape"):
+        _validate_xpress_lm_head(nn.Linear(31, 64, bias=False), head, config)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("topc", [0, 8])
 def test_xpress_fused_jacobi_matches_reference(topc):
@@ -41,7 +79,11 @@ def test_xpress_fused_jacobi_matches_reference(topc):
     hidden = torch.randn(2, 8, 32, device="cuda", dtype=torch.bfloat16)
     anchor = torch.randint(0, 61, (2,), device="cuda")
     block = torch.cat([anchor[:, None], base[:, 1:].argmax(dim=-1)], dim=1)
-    candidates = base[:, 1:].topk(topc, dim=-1).indices if topc else None
+    candidates = (
+        _radix_topk(base[:, 1:].reshape(-1, 61), topc)[1].view(2, 7, topc)
+        if topc
+        else None
+    )
     cache = head.hidden_cache(hidden)
     for _ in range(4):
         prev = torch.cat([anchor[:, None], block[:, :-1]], dim=1)

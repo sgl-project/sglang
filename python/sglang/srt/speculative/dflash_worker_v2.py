@@ -213,6 +213,7 @@ class _XPressDraftSampler:
     """Run the XPress head inside the DFlash draft graph."""
 
     def __init__(self, *, draft_model, lm_head, block_size, max_bs, device):
+        _validate_xpress_lm_head(lm_head, draft_model.xpress_head, draft_model.config)
         self.draft_model = draft_model
         self.weight = lm_head.weight[: int(draft_model.config.vocab_size)]
         self.logit_scale = float(getattr(draft_model.config, "logit_scale", 1.0))
@@ -235,6 +236,24 @@ class _XPressDraftSampler:
             base, hidden, anchor, self.draft_model.num_jacobi_passes
         )
         self.out[: n * (b - 1)].copy_(tokens.reshape(-1))
+
+
+def _validate_xpress_lm_head(lm_head, xpress_head, draft_config):
+    weight = getattr(lm_head, "weight", None)
+    if not is_dense_head_weight(weight) or should_apply_lm_head_quant_method(
+        lm_head, getattr(lm_head, "quant_method", None)
+    ):
+        raise ValueError("XPress requires an unquantized, dense target LM head.")
+    if (
+        weight.ndim != 2
+        or weight.shape[0] < xpress_head.vocab_size
+        or weight.shape[1] != int(draft_config.hidden_size)
+    ):
+        raise ValueError(
+            "XPress target LM head shape must match the draft vocabulary and hidden size."
+        )
+    if weight.dtype != xpress_head.w2.weight.dtype:
+        raise ValueError("XPress refiner and target LM head must use the same dtype.")
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
@@ -482,12 +501,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_head = unwrap_lora_layer(
                 getattr(self._target_worker.model_runner.model, "lm_head", None)
             )
-            if not is_dense_head_weight(getattr(target_head, "weight", None)):
-                raise ValueError("XPress requires a dense target LM head.")
-            if target_head.weight.dtype != self.xpress.w2.weight.dtype:
-                raise ValueError(
-                    "XPress refiner and target LM head must use the same dtype."
-                )
+            _validate_xpress_lm_head(target_head, self.xpress, self.draft_model.config)
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -948,10 +962,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("no target lm_head")
 
         if self.xpress is not None:
-            if not is_dense_head_weight(getattr(lm_head, "weight", None)):
-                raise ValueError("XPress requires a dense target LM head.")
-            if int(lm_head.weight.shape[0]) < self.xpress.vocab_size:
-                raise ValueError("XPress vocabulary exceeds the target LM head.")
             return _XPressDraftSampler(
                 draft_model=self.draft_model,
                 lm_head=lm_head,
