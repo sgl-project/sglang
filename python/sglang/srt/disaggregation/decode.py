@@ -908,8 +908,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         slot_layer_ids=slot_layer_ids,
                     )
         if get_disagg().nixl_use_cpu_buffer:
+            if self.draft_token_to_kv_pool is not None:
+                # Target and built-in draft share token/request indices. Preserve
+                # both pools when CPU-buffer decode retracts a request.
+                from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+                if not isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                    raise ValueError("CPU-buffer MTP requires a hybrid target pool")
+                self.token_to_kv_pool.cpu_copy_draft_pool = self.draft_token_to_kv_pool
             kv_manager.set_cpu_kv_buffers(
                 self.token_to_kv_pool,
+                self.draft_token_to_kv_pool,
                 restore_stream=(
                     self.scheduler.tp_worker.model_runner.forward_stream
                     if self.scheduler.enable_overlap
@@ -3780,7 +3789,10 @@ class SchedulerDisaggregationDecodeMixin:
                 self, req, seq_len, start_idx=start_idx
             )
             state_indices = state_indices_for_request(
-                self, req, seq_len, start_idx=start_idx
+                self,
+                req,
+                seq_len,
+                start_idx=start_idx,
             )
             actual = computer.compute(page_indices_gpu, state_indices)
             if (

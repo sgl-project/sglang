@@ -7,7 +7,7 @@ import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.nixl.cpu_buffer import (
     page_views,
     scatter_pages,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -249,6 +250,51 @@ class TestCpuBufferConfiguration(CustomTestCase):
                         # Sharding's own hook validates its role/topology rules.
                         handle_pd_disaggregation(args)
 
+    def test_qwen_mtp_configuration(self):
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen4ExpForConditionalGeneration"]
+            )
+        )
+        with patch(
+            "sglang.srt.arg_groups.pd_disaggregation_hook.model_config_of",
+            return_value=model,
+        ):
+            for mode in ("prefill", "decode"):
+                for algorithm in ("NEXTN", "EAGLE"):
+                    values = dict(
+                        model_path="dummy",
+                        device="cuda",
+                        disaggregation_mode=mode,
+                        disaggregation_transfer_backend="nixl",
+                        nixl_use_cpu_buffer=True,
+                        speculative_algorithm=algorithm,
+                        speculative_eagle_topk=1,
+                    )
+                    for architecture in (
+                        "Qwen3_5ForConditionalGeneration",
+                        "Qwen3_5MoeForConditionalGeneration",
+                    ):
+                        model.hf_config.architectures = [architecture]
+                        handle_pd_disaggregation(ServerArgs(**values))
+                    for invalid in (
+                        {"enable_multi_layer_eagle": True},
+                        {"speculative_eagle_topk": 2},
+                        {"speculative_draft_model_path": "other"},
+                    ):
+                        with self.subTest(
+                            mode=mode, algorithm=algorithm, invalid=invalid
+                        ):
+                            with self.assertRaisesRegex(
+                                ValueError, "CPU-buffer PD MTP"
+                            ):
+                                handle_pd_disaggregation(
+                                    ServerArgs(**(values | invalid))
+                                )
+            model.hf_config.architectures = ["OtherModel"]
+            with self.assertRaisesRegex(ValueError, "only Qwen3.5"):
+                handle_pd_disaggregation(ServerArgs(**values))
+
     def test_unsupported_combinations_fail(self):
         for change in (
             {"disaggregation_mode": "null"},
@@ -258,7 +304,7 @@ class TestCpuBufferConfiguration(CustomTestCase):
             {"pp_size": 2},
             {"attn_cp_size": 2},
             {"dcp_size": 2},
-            {"speculative_algorithm": "EAGLE"},
+            {"speculative_algorithm": "DFLASH"},
             {"enable_hierarchical_cache": True},
             {"disaggregation_decode_enable_offload_kvcache": True},
             {"disaggregation_decode_host_receive_threshold": 0.5},
@@ -873,6 +919,129 @@ class TestCpuBufferQsaState(CustomTestCase):
                     handle_offload_compatibility(args)
             else:
                 handle_offload_compatibility(args)
+
+
+class TestCpuBufferMtp(CustomTestCase):
+    def test_cpu_sender_keeps_unpublished_pages_until_transfer_finishes(self):
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin,
+        )
+
+        # A checkpoint may deduplicate the row and reclaim pages that an earlier
+        # chunk queued for packing. Advancing the next chunk must not publish it.
+        for write_through in (False, True):
+            cache = Mock()
+            req = SimpleNamespace(pending_bootstrap=False, prefix_len=4, extend_end=8)
+            scheduler = SimpleNamespace(tree_cache=cache)
+            with (
+                patch(
+                    "sglang.srt.disaggregation.prefill.get_disagg",
+                    return_value=SimpleNamespace(nixl_use_cpu_buffer=True),
+                ),
+                patch(
+                    "sglang.srt.disaggregation.prefill._uses_write_through_cache",
+                    return_value=write_through,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.prefill.checkpoint_kv_cache"
+                ) as publish,
+            ):
+                SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                    scheduler, req
+                )
+            publish.assert_not_called()
+            self.assertEqual(req.prefix_len, 8)
+            self.assertEqual(
+                cache.advance_unpublished_req.call_count, int(write_through)
+            )
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.get_disagg",
+                return_value=SimpleNamespace(nixl_use_cpu_buffer=False),
+            ),
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache") as publish,
+        ):
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                scheduler, req
+            )
+        publish.assert_called_once_with(req, cache)
+
+    def test_cached_prefix_waits_for_forward_stream_before_cpu_pack(self):
+        import queue
+
+        mgr = manager()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_staging = False
+        mgr.transfer_infos = {7: {"peer": SimpleNamespace(dst_port=1234)}}
+        mgr.transfer_queues = [queue.Queue()]
+        mgr.kv_args.gpu_id = 0
+        calls = Mock()
+        stream, producer, ready = Mock(), Mock(), Mock()
+        calls.attach_mock(stream.wait_event, "wait")
+        calls.attach_mock(ready.record, "record")
+        with (
+            patch("torch.cuda.current_stream", return_value=stream),
+            patch("torch.cuda.Event", return_value=ready),
+        ):
+            mgr.add_transfer_request(
+                7,
+                np.array([1], dtype=np.int32),
+                slice(0, 1),
+                False,
+                wait_event=producer,
+            )
+        self.assertEqual(calls.mock_calls, [call.wait(producer), call.record(stream)])
+        self.assertIs(mgr.transfer_queues[0].get_nowait().wait_event, ready)
+
+    def test_hybrid_target_and_draft_transfer_layout(self):
+        state = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+        mamba = SimpleNamespace(
+            _iter_transfer_state_entries=lambda: [(0, state, None, None)]
+        )
+        target = SimpleNamespace(
+            kv_buffer=[torch.full((8, 4), 11, dtype=torch.uint8)],
+            mamba_pool=mamba,
+        )
+        draft = SimpleNamespace(
+            kv_buffer=[torch.full((8, 4), 22, dtype=torch.uint8)],
+            mamba_pool=mamba,
+        )
+        mgr = manager()
+        mgr.kv_args.kv_data_ptrs = [p.kv_buffer[0].data_ptr() for p in (target, draft)]
+        mgr.kv_args.kv_item_lens = [4, 4]
+        mgr.kv_args.state_types = [StateType.MAMBA]
+        mgr.kv_args.state_data_ptrs = [[state.data_ptr()]]
+        mgr.kv_args.state_item_lens = [[4]]
+        mgr.set_cpu_kv_buffers(target, draft)
+        packed = torch.empty(16, dtype=torch.uint8)
+        pack_pages(mgr._cpu_views, np.array([1, 2]), packed)
+        self.assertEqual(packed.tolist(), [11] * 8 + [22] * 8)
+        self.assertEqual(len(mgr._cpu_state_views[0]), 1)
+        state_bytes = torch.empty(4, dtype=torch.uint8)
+        pack_pages(mgr._cpu_state_views[0], np.array([2]), state_bytes)
+        self.assertEqual(state_bytes.tolist(), [8, 9, 10, 11])
+
+    def test_hybrid_retraction_restores_draft_kv(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        target = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        target.full_kv_pool = Mock()
+        target.full_kv_pool.get_cpu_copy.return_value = "target-kv"
+        target.mamba_pool = Mock()
+        target.mamba_pool.get_cpu_copy.return_value = "target-state"
+        target._mamba_translate = lambda x: x + 10
+        draft = Mock()
+        draft.get_cpu_copy.return_value = "draft-kv"
+        target.cpu_copy_draft_pool = draft
+        saved = target.get_cpu_copy([1, 2], mamba_indices=3, req_pool_index=4)
+        self.assertEqual(saved, ("target-kv", "target-state", "draft-kv"))
+        target.load_cpu_copy(saved, [5, 6], mamba_indices=7, req_pool_index=8)
+        draft.load_cpu_copy.assert_called_once_with(
+            "draft-kv", [5, 6], mamba_indices=7, req_pool_index=8
+        )
+        target.mamba_pool.load_cpu_copy.assert_called_once_with("target-state", 17)
+        target.cpu_copy_draft_pool = None
+        self.assertEqual(len(target.get_cpu_copy([1, 2])), 2)
 
 
 if __name__ == "__main__":

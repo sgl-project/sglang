@@ -68,7 +68,26 @@ generation. Both sides must have identical state layouts and attention TP sizes.
 With `--disaggregation-enable-kv-checksum`, verification includes all three state
 components using their respective physical indices.
 
-It does not support speculative decoding, hybrid MLA layouts, other extra state
+For Qwen3.5 MTP, enable the built-in draft on **both** workers:
+
+```bash
+--speculative-algorithm NEXTN \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4
+```
+
+`NEXTN` resolves to the EAGLE execution path. Use the same target checkpoint
+and MTP configuration on both roles; decode-only MTP, multi-layer EAGLE, and
+external draft checkpoints are not supported by CPU-buffer transport. Draft KV
+uses the same host transport as target KV. Checksum verification and
+`cpu_tensor` retraction include draft state.
+On H20, use `--mamba-ssm-dtype float32` with FlashInfer GDN MTP. Keep CUDA graphs
+and overlap scheduling enabled. Allocate CPU pool capacity for both target and
+draft buffers. Prefill publishes newly computed prefixes to the radix cache
+after transfer completion, keeping queued transfers' source KV pages stable.
+
+It does not support other speculative decoding configurations, hybrid MLA layouts, other extra state
 components beyond Mamba/GDN and QSA, PLE embedding offload, HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
 Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.

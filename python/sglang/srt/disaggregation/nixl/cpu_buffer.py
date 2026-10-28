@@ -168,8 +168,9 @@ class CpuBufferMixin:
     def cpu_buffer_enabled(self):
         return getattr(self, "_cpu_pool", None) is not None
 
-    def set_cpu_kv_buffers(self, pool, *, restore_stream=None):
+    def set_cpu_kv_buffers(self, pool, draft_pool=None, *, restore_stream=None):
         self._cpu_restore_stream = restore_stream
+        pools = [pool] if draft_pool is None else [pool, draft_pool]
         self._cpu_state_views = []
         for state_type, pointers, widths in zip(
             self.kv_args.state_types or [],
@@ -181,22 +182,29 @@ class CpuBufferMixin:
                 # Includes PLE short-conv and n-gram slot siblings.
                 tensors = [
                     tensor
-                    for _, tensor, _, _ in pool.mamba_pool._iter_transfer_state_entries()
+                    for state_pool in pools
+                    for _, tensor, _, _ in state_pool.mamba_pool._iter_transfer_state_entries()
                 ]
             elif state_type == StateType.QSA_PENDING:
                 tensors = [
-                    *pool.qsa_key_state_buffer_pool,
-                    pool.qsa_rope_position_buffer,
+                    tensor
+                    for tensor in (
+                        *pool.qsa_key_state_buffer_pool,
+                        pool.qsa_rope_position_buffer,
+                    )
                 ]
             elif state_type == StateType.QSA_COMPRESSED:
-                tensors = pool.qsa_compressed_k_buffer_pool
+                tensors = list(pool.qsa_compressed_k_buffer_pool)
             else:
                 raise ValueError(f"Unsupported CPU-buffer state type: {state_type}")
             self._cpu_state_views.append(page_views(tensors, pointers, widths))
-        pool = getattr(pool, "full_kv_pool", pool)
-        buffers = getattr(pool, "kv_buffer", None)
-        if buffers is None:
-            buffers = list(pool.k_buffer) + list(pool.v_buffer)
+        buffers = []
+        for kv_pool in pools:
+            kv_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
+            kv_buffers = getattr(kv_pool, "kv_buffer", None)
+            if kv_buffers is None:
+                kv_buffers = list(kv_pool.k_buffer) + list(kv_pool.v_buffer)
+            buffers.extend(kv_buffers)
         self._cpu_views = page_views(
             buffers, self.kv_args.kv_data_ptrs, self.kv_args.kv_item_lens
         )

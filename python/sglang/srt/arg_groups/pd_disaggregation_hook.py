@@ -47,7 +47,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             cfg.pp_size != 1
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
-            or cfg.speculative_algorithm is not None
             or cfg.disaggregation_decode_host_receive_threshold != 1
             or cfg.enable_pd_role_switch
             or cfg.enable_hisparse
@@ -56,9 +55,31 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         ):
             raise ValueError(
-                "CPU-buffer PD currently requires PP=CP=DCP=1 without speculative decoding, "
+                "CPU-buffer PD currently requires PP=CP=DCP=1 without "
                 "HiCache, HiSparse, KV offload, host receive, role switching, or GPU staging"
             )
+
+        if cfg.speculative_algorithm is not None:
+            if cfg.speculative_algorithm not in ("NEXTN", "EAGLE"):
+                raise ValueError("CPU-buffer PD supports only NEXTN/EAGLE MTP")
+            model = model_config_of(server_args)
+            if model.hf_config.architectures not in (
+                ["Qwen3_5ForConditionalGeneration"],
+                ["Qwen3_5MoeForConditionalGeneration"],
+            ):
+                raise ValueError("CPU-buffer PD MTP currently supports only Qwen3.5")
+            if cfg.enable_multi_layer_eagle:
+                raise ValueError(
+                    "CPU-buffer PD MTP currently supports only a single draft layer"
+                )
+            if cfg.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    "CPU-buffer PD MTP requires --speculative-eagle-topk 1"
+                )
+            if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+                raise ValueError(
+                    "CPU-buffer PD MTP requires the draft in the target checkpoint"
+                )
 
         if cfg.disaggregation_mode == "decode":
             if cfg.disaggregation_decode_retraction_backup == "host_pool":

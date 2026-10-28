@@ -406,7 +406,7 @@ class PrefillBootstrapQueue:
                     slot_layer_ids=slot_layer_ids,
                 )
         if get_disagg().nixl_use_cpu_buffer:
-            kv_manager.set_cpu_kv_buffers(self.token_to_kv_pool)
+            kv_manager.set_cpu_kv_buffers(self.token_to_kv_pool, draft_kv_pool)
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
@@ -612,8 +612,16 @@ class SchedulerDisaggregationPrefillMixin:
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
-        if req.pending_bootstrap and _uses_write_through_cache(cache):
+        cpu_buffer = get_disagg().nixl_use_cpu_buffer
+        if (req.pending_bootstrap or cpu_buffer) and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
+            req.prefix_len = req.extend_end
+            return
+        if cpu_buffer:
+            # Checkpoint deduplication can repoint/free pages still referenced by
+            # queued CPU packing work. Keep this request's row stable until the
+            # transfer completes; release_kv_cache(checkpoint=True) then publishes
+            # its prefix for subsequent requests.
             req.prefix_len = req.extend_end
             return
 
@@ -1612,7 +1620,10 @@ class SchedulerDisaggregationPrefillMixin:
                     self, req, end_idx, start_idx=start_idx
                 )
                 state_indices = state_indices_for_request(
-                    self, req, end_idx, start_idx=start_idx
+                    self,
+                    req,
+                    end_idx,
+                    start_idx=start_idx,
                 )
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature

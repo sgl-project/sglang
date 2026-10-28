@@ -3442,8 +3442,14 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
         shard_idx = session_port_sum % len(self.transfer_queues)
         ready = wait_event
         if self.cpu_buffer_enabled:
+            stream = torch.cuda.current_stream(self.kv_args.gpu_id)
+            # Cached-prefix KV may still be written by the previous overlapping
+            # forward on another stream. Include that producer in the event the
+            # CPU packing worker waits on, as well as this stream's metadata.
+            if wait_event is not None:
+                stream.wait_event(wait_event)
             ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self.kv_args.gpu_id))
+            ready.record(stream)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
