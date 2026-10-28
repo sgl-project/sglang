@@ -3105,6 +3105,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`mooncake`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>mooncake</code>, <code>nixl</code>, <code>ascend</code>, <code>fake</code>, <code>mori</code>, <code>mooncake_tcp</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-enable-kv-checksum`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compute an Adler-32 checksum over each request's KV pages on prefill and verify it on decode. Enable on both prefill and decode engines. A mismatch aborts the request, or raises in CI. With a decode-side radix cache the digest covers only the pages prefill sends. A prefill whose KV layout differs (TP width, PP stage, page size, dtype) is admitted unverified with one warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-bootstrap-port`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bootstrap server port on the prefill server. Default is 8998.</td>
@@ -3130,9 +3136,21 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-retraction-backup`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage backend for KV preserved across PD decode retraction. 'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses a reserved HiCache pool and does not fall back on exhaustion. 'none' keeps no backup: a retracted request is aborted with 503 for the client to retry. If omitted, the backend is inferred from the decode KV pool.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>cpu_tensor</code>, <code>host_pool</code>, <code>none</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-reserved-decode-tokens`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of decode tokens that will have memory reserved when adding new request to the running batch.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`512`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-extra-slots`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
@@ -3140,6 +3158,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The interval to poll requests in decode server. Can be set to &gt;1 to reduce the overhead of this.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-host-receive-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 1 disables host receive (default), 0 always uses host receive. Size with --hicache-size or --hicache-ratio; requires dense NHD MHA buffers (including separate paged SWA pools) and a transfer backend that supports host destinations. No built-in backend currently supports this.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-radix-cache`</td>
