@@ -148,6 +148,11 @@ class KVIndexTranslator:
         self.is_translating = is_unified_target or is_fused_draft
         self._spaces: Dict[IdSpaceKind, IdSpace] = {}
         if self.is_translating:
+            if is_cp_sharded_padded():
+                # Translated ids skip the sharded projection and rank filter below.
+                raise ValueError(
+                    "A sharded --cp-kv-layout does not support --enable-unified-memory."
+                )
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
             self._full_v2p_table = alloc.full_v2p_page_table
