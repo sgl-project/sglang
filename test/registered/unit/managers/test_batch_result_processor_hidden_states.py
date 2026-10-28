@@ -44,7 +44,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         kv=kv,
         services=SimpleNamespace(
             metrics_sink=metrics_sink,
