@@ -870,13 +870,12 @@ async fn full_only_prefix_complete_fast_path_matches_reference() {
         full_tier_mask: (1 << hbm()) | (1 << dram()),
         swa_tier_mask: 0,
         mamba_tier_mask: 0,
-        ..Default::default()
     };
     fast.apply_external_kv_batch(apply_with_spec(
         "w-full",
         "10.0.0.1:1",
         1,
-        full_spec.clone(),
+        full_spec,
         vec![component_report(
             hbm(),
             &[11, 12, 13, 14],
@@ -927,7 +926,6 @@ fn swa_spec() -> WorkerCacheSpec {
         full_tier_mask: (1 << hbm()) | (1 << dram()),
         swa_tier_mask: 1 << hbm(),
         mamba_tier_mask: 0,
-        ..Default::default()
     }
 }
 

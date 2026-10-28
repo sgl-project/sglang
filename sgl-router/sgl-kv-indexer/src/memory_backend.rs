@@ -56,12 +56,12 @@ struct WorkerRecord {
     /// Number of non-legacy component placements. A spec-less worker can use
     /// the derived fast path only while this is zero.
     component_placement_count: usize,
+    /// Shared DRAM pool this worker reads; empty for none.
+    dram_pool_id: String,
 }
 
 #[derive(Debug, Default)]
 struct PoolRecord {
-    components: u32,
-    swa_window_tokens: u32,
     holdings: HashSet<i64>,
     members: HashSet<String>,
 }
@@ -124,55 +124,31 @@ impl InMemoryKvIndexerBackend {
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let mut state = self.write_state()?;
         validate_actions(&state, &req.actions)?;
-        if !req.dram_pool_id.is_empty() {
-            apply_pool(&mut state, req)?;
+        if req.worker_id.is_empty() {
+            apply_pool(&mut state, req);
             return Ok(ApplyExternalKvBatchResponse {});
         }
         let worker_id = req.worker_id;
-        let pool_id = req
-            .cache_spec
-            .as_ref()
-            .map(|s| s.dram_pool_id.as_str())
-            .unwrap_or("");
-        if let Some(spec) = req.cache_spec.as_ref().filter(|_| !pool_id.is_empty()) {
-            pool_for_spec(&mut state, pool_id, spec)?
-                .members
-                .insert(worker_id.clone());
-        }
-        // Binding is a snapshot, including detach/switch; no placements are copied.
-        if let Some(old_pool) = state
-            .workers
-            .get(&worker_id)
-            .and_then(|w| w.spec.as_ref())
-            .filter(|s| s.dram_pool_id != pool_id)
-            .map(|s| s.dram_pool_id.clone())
-        {
-            if let Some(pool) = state.pools.get_mut(&old_pool) {
-                pool.members.remove(&worker_id);
-            }
-        }
 
         let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
 
-        let mut actions = req.actions;
-        if !pool_id.is_empty() {
-            // Private tiers stop receiving updates in pool mode. Drop their old
-            // snapshots so detaching later cannot resurrect stale residency.
-            for tier in [TierType::TierDram, TierType::TierSsd] {
-                actions.push(ExternalKvAction {
-                    r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
-                    tier: tier as i32,
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Address and spec are snapshots carried on every batch. Empty address
-        // makes the worker unroutable; absent spec returns it to legacy mode.
-        {
+        // Address, spec and pool binding are snapshots carried on every batch.
+        // Empty address makes the worker unroutable; absent spec returns it to
+        // legacy mode.
+        let old_pool = {
             let worker = state.workers.entry(worker_id.clone()).or_default();
             worker.address = req.worker_address;
             worker.spec = req.cache_spec;
+            std::mem::replace(&mut worker.dram_pool_id, req.dram_pool_id.clone())
+        };
+        if old_pool != req.dram_pool_id {
+            if let Some(pool) = state.pools.get_mut(&old_pool) {
+                pool.members.remove(&worker_id);
+            }
+            if !req.dram_pool_id.is_empty() {
+                let pool = state.pools.entry(req.dram_pool_id).or_default();
+                pool.members.insert(worker_id.clone());
+            }
         }
 
         let mut dirty_roots = Vec::new();
@@ -181,7 +157,7 @@ impl InMemoryKvIndexerBackend {
         // Only a fast-path worker identity change requires a full recompute.
         // REPORT, REVOKE, and CLEAR enqueue their affected hashes directly.
         let mut recompute_from_graph_roots = false;
-        for action in actions {
+        for action in req.actions {
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
                     let has_masks = !action.component_masks.is_empty();
@@ -351,7 +327,7 @@ impl InMemoryKvIndexerBackend {
                         address: metadata
                             .map(|worker| worker.address.clone())
                             .unwrap_or_default(),
-                        spec: metadata.and_then(|worker| worker.spec.clone()),
+                        spec: metadata.and_then(|worker| worker.spec),
                         hashes_by_tier: BTreeMap::new(),
                         blocks: if with_blocks {
                             vec![None; hashes.len()]
@@ -547,8 +523,8 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
-// Expand access relationships only while querying. Shared placements never fan
-// out into worker holdings or the per-worker derived prefix cache.
+// Placements as workers see them: a member's own DRAM/SSD is replaced by its
+// pool's DRAM. Expanded per query, never stored.
 fn effective_placements<'a>(
     state: &'a State,
     block: &'a BlockRecord,
@@ -561,8 +537,7 @@ fn effective_placements<'a>(
                 || state
                     .workers
                     .get(worker)
-                    .and_then(|w| w.spec.as_ref())
-                    .is_none_or(|s| s.dram_pool_id.is_empty())
+                    .is_none_or(|w| w.dram_pool_id.is_empty())
         })
         .map(|((worker, tier), mask)| (worker, *tier, *mask));
     let shared = block.pool_placements.iter().flat_map(|(id, mask)| {
@@ -575,34 +550,9 @@ fn effective_placements<'a>(
     private.chain(shared)
 }
 
-fn pool_for_spec<'a>(
-    state: &'a mut State,
-    id: &str,
-    spec: &WorkerCacheSpec,
-) -> Result<&'a mut PoolRecord, Status> {
-    let pool = state
-        .pools
-        .entry(id.to_owned())
-        .or_insert_with(|| PoolRecord {
-            components: spec.components,
-            swa_window_tokens: spec.swa_window_tokens,
-            ..Default::default()
-        });
-    if pool.components != spec.components || pool.swa_window_tokens != spec.swa_window_tokens {
-        return Err(Status::failed_precondition(
-            "DRAM pool component/window spec mismatch",
-        ));
-    }
-    Ok(pool)
-}
-
-fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) -> Result<(), Status> {
-    let spec = req
-        .cache_spec
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("a DRAM pool requires cache_spec"))?;
-    pool_for_spec(state, &req.dram_pool_id, spec)?;
+fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
     let id = req.dram_pool_id;
+    state.pools.entry(id.clone()).or_default();
     for action in req.actions {
         if action.r#type == ExternalKvActionType::ActionReport as i32 {
             apply_report_chain(state, action.parent_block_hash, &action.hashes);
@@ -611,7 +561,9 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) -> Result<(),
                 block
                     .pool_placements
                     .insert(id.clone(), action.component_masks[i]);
-                block.token_count = action.block_sizes[i];
+                if action.block_sizes[i] > 0 {
+                    block.token_count = action.block_sizes[i];
+                }
                 state.pools.get_mut(&id).unwrap().holdings.insert(hash);
             }
         } else {
@@ -632,17 +584,16 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) -> Result<(),
             }
         }
     }
-    Ok(())
 }
 
 fn fast_path_kind(worker: &WorkerRecord) -> Option<FastPathKind> {
+    // The fast path tracks only the worker's own placements.
+    if !worker.dram_pool_id.is_empty() {
+        return None;
+    }
     match worker.spec.as_ref() {
         None if worker.component_placement_count == 0 => Some(FastPathKind::Legacy),
-        Some(spec)
-            if spec.version <= 1
-                && spec.components == COMPONENT_FULL
-                && spec.dram_pool_id.is_empty() =>
-        {
+        Some(spec) if spec.version <= 1 && spec.components == COMPONENT_FULL => {
             Some(FastPathKind::FullOnly {
                 tier_mask: spec.full_tier_mask,
             })

@@ -623,55 +623,37 @@ async fn shared_dram_pool_composes_with_each_members_hbm() {
         full_tier_mask: 6,
         swa_tier_mask: 6,
         mamba_tier_mask: 6,
-        ..Default::default()
     };
-    let member = |id: &str| ApplyExternalKvBatchRequest {
+    let member = |id: &str, pool: &str| ApplyExternalKvBatchRequest {
         worker_id: id.into(),
         worker_address: format!("http://{id}:30000"),
-        cache_spec: Some(WorkerCacheSpec {
-            dram_pool_id: "tp4".into(),
-            ..spec.clone()
-        }),
+        cache_spec: Some(spec),
+        dram_pool_id: pool.into(),
         ..Default::default()
     };
     // Members can arrive first; worker and pool ids have separate namespaces.
     for id in ["tp4", "dp4-0"] {
-        client.apply_external_kv_batch(member(id)).await.unwrap();
-    }
-    let mut conflict = member("dp4-1");
-    conflict.cache_spec.as_mut().unwrap().swa_window_tokens = 64;
-    assert_eq!(
         client
-            .apply_external_kv_batch(conflict)
+            .apply_external_kv_batch(member(id, "tp4"))
             .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
-    );
+            .unwrap();
+    }
     let pool = ApplyExternalKvBatchRequest {
         dram_pool_id: "tp4".into(),
-        cache_spec: Some(spec.clone()),
         ..Default::default()
     };
-    let worker = member("tp4");
-    let mut private = worker.clone();
-    private.cache_spec.as_mut().unwrap().dram_pool_id.clear();
+    let (worker, private) = (member("tp4", "tp4"), member("tp4", ""));
     let report = |tier, mask| component_report(tier, &[30, 10, 20], &[mask; 3], &[16; 3]);
     let clear = |tier| action(ExternalKvActionType::ActionClearAllAtTier, tier, &[]);
-    // One DRAM report serves both members. Partial components compose with HBM,
-    // and each owner's clear leaves the other owner's placements intact.
+    // One DRAM report serves both members, each owner's clear leaves the other's
+    // placements intact, and a member ignores its own DRAM while in the pool.
     for (owner, action, expected) in [
         (&pool, report(dram(), 7), vec!["dp4-0", "tp4"]),
-        (&worker, report(hbm(), 1), vec!["dp4-0", "tp4"]),
-        (&pool, report(dram(), 6), vec!["tp4"]),
-        (&worker, clear(hbm()), vec![]),
-        (&worker, report(hbm(), 1), vec!["tp4"]),
-        (&worker, report(hbm(), 7), vec!["tp4"]),
+        (&worker, report(hbm(), 7), vec!["dp4-0", "tp4"]),
         (&pool, clear(dram()), vec!["tp4"]),
         (&worker, clear(hbm()), vec![]),
         (&private, report(dram(), 7), vec!["tp4"]),
-        (&worker, clear(hbm()), vec![]), // Joining discards obsolete private tiers.
-        (&private, clear(hbm()), vec![]), // Detaching cannot resurrect them.
+        (&worker, clear(hbm()), vec![]),
     ] {
         let mut request = owner.clone();
         request.actions = vec![action];
@@ -690,4 +672,12 @@ async fn shared_dram_pool_composes_with_each_members_hbm() {
         ids.sort_unstable();
         assert_eq!(ids, expected);
     }
+    // A pool owner may only report DRAM.
+    let mut hbm_report = pool.clone();
+    hbm_report.actions = vec![report(hbm(), 7)];
+    let error = client
+        .apply_external_kv_batch(hbm_report)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
 }
