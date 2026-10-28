@@ -440,6 +440,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size=kv_size,
                 )
                 if offload_cell_size is not None:
+                    # Keep the offload validator above, but price the physical
+                    # indexer-owner layout just like the native DSA pool. The
+                    # offload helper's layer-count estimate does not account
+                    # for shared-topk owners. Draft pools retain all local
+                    # layers; eligible target pools may elide shared owners.
+                    offload_cell_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                        allocate_all_layers=kvc.is_draft_worker,
+                    )
+                    if not kvc.is_draft_worker:
+                        offload_cell_size *= dcp_size
                     return offload_cell_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -622,15 +634,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if not is_npu_arch35():
-                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

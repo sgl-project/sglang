@@ -2060,10 +2060,8 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:
@@ -2102,6 +2100,18 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
+        if token_to_kv_pool.index_k_buffer is not None:
+            logger.info(
+                "NPU MLA index pool allocated: role=%s layers=[%s,%s) "
+                "owner_layer_ids=%s shape=%s dtype=%s nbytes=%d",
+                "draft" if self.is_draft_worker else "target",
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+                token_to_kv_pool.indexer_layer_ids,
+                tuple(token_to_kv_pool.index_k_buffer.shape),
+                token_to_kv_pool.index_k_buffer.dtype,
+                token_to_kv_pool.index_k_buffer.nbytes,
+            )
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:

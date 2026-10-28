@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
@@ -380,6 +382,159 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
+
+    def test_npu_bf16_dsa_indexer_sizes_match_target_owners_and_draft_layers(self):
+        from sglang.srt.model_executor import pool_configurator
+
+        _publish_config(
+            self,
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            enable_unified_memory=False,
+        )
+        # GLM-5.2's candidate config marks 0, 1, 2, then every fourth layer
+        # from 6 as "full" and the intervening layers as "shared".
+        owner_ids = {0, 1, 2, *range(6, 78, 4)}
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+            indexer_types=[
+                "full" if layer_id in owner_ids else "shared" for layer_id in range(78)
+            ],
+        )
+
+        def make_kvc(*, start_layer, end_layer, is_draft_worker):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(hf_config=hf_config),
+                layer_info=SimpleNamespace(
+                    start_layer=start_layer, end_layer=end_layer
+                ),
+                kv_cache_dtype=torch.bfloat16,
+                server_args=SimpleNamespace(enable_hisparse=False),
+                is_draft_worker=is_draft_worker,
+                mambaish_config=None,
+            )
+
+        configurator = object.__new__(pool_configurator.DefaultPoolConfigurator)
+        target = make_kvc(start_layer=0, end_layer=78, is_draft_worker=False)
+        draft = make_kvc(start_layer=78, end_layer=79, is_draft_worker=True)
+        # The MTP draft uses the target's config but has one local layer at 78.
+        # Its existing all-layers policy remains independent of target sharing.
+        with (
+            mock_cpu_env(kv_size=2),
+            patch.object(pool_configurator, "_is_npu", True),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                return_value=(0, 1),
+            ),
+        ):
+            target_bytes = configurator._compute_dsa_indexer_cell_size(
+                kvc=target, num_layers=78
+            )
+            draft_bytes = configurator._compute_dsa_indexer_cell_size(
+                kvc=draft, num_layers=1, allocate_all_layers=True
+            )
+
+        self.assertEqual(len(owner_ids), 21)
+        self.assertEqual(target_bytes, 21 * 128 * 2)
+        self.assertEqual(draft_bytes, 1 * 128 * 2)
+
+    def test_sparse_offload_cell_size_uses_compact_target_indexer_and_draft(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=78,
+            use_mla_backend=True,
+            page_size=128,
+            max_running_requests=2,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        owner_ids = {0, 1, 2, *range(6, 78, 4)}
+        mr.model_config.hf_config.indexer_types = [
+            "full" if layer_id in owner_ids else "shared" for layer_id in range(78)
+        ]
+        mr.model_config.index_head_dim = 128
+        mr.kv_cache_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                max_running_requests=2,
+                page_size=128,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_num_draft_tokens=4,
+                speculative_eagle_topk=1,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(False),
+            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("legacy"),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(12288),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            mock_cpu_env(kv_size=2),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_cell_size",
+                side_effect=lambda **kwargs: (
+                    kwargs["num_layers"]
+                    * kwargs["model_config"].index_head_dim
+                    * kwargs["element_size"]
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_sparse_context_len",
+                return_value=2048,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
+                return_value=SimpleNamespace(managed_hbm_bytes=123),
+            ) as mock_sparse_budget,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                return_value=(None, 1),
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_layer_split_effective_num_layers",
+                side_effect=lambda kvc, count: count,
+            ),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+
+        # Target index-only charge is 21 owners * 128 values * 2-byte BF16.
+        # The final cell adds one separately priced one-layer draft indexer.
+        # Since the target cell is exactly the target indexer charge, the
+        # MTP target_kv_size remainder is zero rather than phantom MLA KV.
+        self.assertEqual(len(owner_ids), 21)
+        self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2)
+        self.assertEqual(cfg._fixed_overhead_bytes, 2 * 123)
+        self.assertEqual(mock_sparse_budget.call_count, 2)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
