@@ -61,7 +61,7 @@ class _FakeTreeCore:
         )
 
     def _cascade_evict(
-        self, node, component, tracker, device_frees, host_frees, cache_actions
+        self, node, component, tracker, device_frees, host_frees, cache_actions, target
     ):
         self.cascaded.append(node)
 
