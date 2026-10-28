@@ -63,7 +63,7 @@ class LaserAttentionImpl(AttentionImpl):
 
         # the laser attention operator has issues with small seq_len
         self.min_seqlen = 2048
-        self.sdpa_impl = AscendFABackend.get_impl_cls()(
+        self.dence_impl = AscendFABackend.get_impl_cls()(
             num_heads,
             head_size,
             causal,
@@ -198,7 +198,7 @@ class LaserAttentionImpl(AttentionImpl):
         kv_seqlen = key.shape[1]
 
         if q_seqlen < self.min_seqlen or kv_seqlen != q_seqlen:
-            output = self.sdpa_impl.forward(
+            output = self.dence_impl.forward(
                 query,
                 key,
                 value,
