@@ -491,6 +491,7 @@ class Lfm3ShortConv(nn.Module):
         conv_state: torch.Tensor,
         mamba_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        max_seq_len: int | None = None,
     ) -> torch.Tensor:
         """Per-request causal depthwise conv1d with **fused B/C gating** via the CuTe
         DSL kernel.
@@ -538,6 +539,7 @@ class Lfm3ShortConv(nn.Module):
             query_start_loc,
             mamba_indices,
             has_initial_state,
+            max_seq_len=max_seq_len,
         )
 
     def _conv_prefill_torch(
@@ -662,7 +664,15 @@ class Lfm3ShortConv(nn.Module):
         else:
             self._maybe_track_conv_prefill(proj, conv_state, metadata)
             conv_out = self._conv_prefill(
-                proj, conv_state, mamba_indices, metadata.query_start_loc
+                proj,
+                conv_state,
+                mamba_indices,
+                metadata.query_start_loc,
+                max_seq_len=(
+                    max(forward_batch.extend_seq_lens_cpu)
+                    if forward_batch.extend_seq_lens_cpu
+                    else None
+                ),
             )
 
         output, _ = self.out_proj(

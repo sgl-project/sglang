@@ -315,6 +315,7 @@ def gated_causal_conv1d_prefill(
     has_initial_state,
     chunk=256,
     block_d=128,
+    max_seq_len: int | None = None,
 ):
     """C-gated depthwise conv prefill (varlen, token-major).
 
@@ -328,6 +329,7 @@ def gated_causal_conv1d_prefill(
         has_initial_state: (B,) 1 if conv_state holds a real prefix (chunked prefill).
         chunk: tokens streamed per block along the token axis.
         block_d: threads per block (channels per d-tile).
+        max_seq_len: longest request length; defaults to the total token count.
 
     Returns:
         (T_total, dim) the C_gate-gated conv output. Bx=B_gate*x and the C_gate output
@@ -340,9 +342,7 @@ def gated_causal_conv1d_prefill(
     slots = conv_state.shape[0]
     out = proj.new_empty(T, dim)
     bias_t = bias if bias is not None else _zero_bias(dim, proj.device, proj.dtype)
-    n_chunks = (
-        T + chunk - 1
-    ) // chunk  # upper bound (any single req <= T); idle chunks early-exit
+    n_chunks = ((T if max_seq_len is None else max_seq_len) + chunk - 1) // chunk
     qsl32 = query_start_loc.detach().to(torch.int32)
     slot64 = slot_idx.detach().to(torch.int64)
     hi32 = has_initial_state.detach().to(torch.int32)
