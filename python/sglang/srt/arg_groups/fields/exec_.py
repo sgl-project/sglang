@@ -857,7 +857,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer",
             "megamoe",
             "deepep_v2",
-            "ascend_tp",
+            "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
         ],
@@ -874,7 +874,7 @@ class ExecMoe(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
                 "flashinfer_megamoe",
             ],
             resolvable=True,
@@ -960,6 +960,14 @@ class ExecMoe(msgspec.Struct):
     deepep_config: A[
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+    ] = None
+    moe_ascend_ops_config: A[
+        Optional[str],
+        (
+            "Configuration for the ascend_ops MoE backend used by the main "
+            "model and/or speculative draft as a JSON object, "
+            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+        ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
@@ -1134,7 +1142,8 @@ class ExecOffload(msgspec.Struct):
         Arg(
             help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
             "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
-            "collective|peer_read; an omitted key takes the first value. "
+            "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
+            "takes the first value. "
             "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),

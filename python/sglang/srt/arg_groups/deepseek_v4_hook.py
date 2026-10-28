@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.engram_config import (
     EngramLookup,
     EngramPlacement,
     EngramReplication,
+    cols_per_rank,
 )
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -116,6 +117,20 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         config = EngramConfig.from_dict(raw)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
+        cfg.attn_dp_size <= 1 or not get_platform().is_cuda
+    ):
+        raise ValueError(
+            f"--engram-config: lookup {config.lookup!r} applies to DP attention on CUDA."
+        )
+    if config.lookup == EngramLookup.ALL_TO_ALL:
+        text_config = model_config_of(server_args).hf_text_config
+        columns = text_config.engram_n_heads * (text_config.engram_max_ngram_size - 1)
+        if cols_per_rank(columns, cfg.tp_size) is None:
+            raise ValueError(
+                f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
+                f"columns to divide over --tp-size {cfg.tp_size}."
+            )
     # One mapping per TP group, which its ranks open through /proc.
     if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
         raise ValueError(
@@ -292,7 +307,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
-    supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
+    supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
@@ -428,7 +443,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -436,8 +451,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."

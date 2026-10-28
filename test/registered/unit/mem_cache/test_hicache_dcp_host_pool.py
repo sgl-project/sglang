@@ -158,6 +158,10 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         cc._generate_storage_config = mock.Mock()
         with (
             mock.patch(
+                "sglang.srt.managers.cache_controller.get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="rank-suffix"),
+            ),
+            mock.patch(
                 "sglang.srt.managers.cache_controller.get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=pool.dcp_size),
             ),

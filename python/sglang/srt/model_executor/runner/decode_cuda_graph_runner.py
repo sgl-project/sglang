@@ -595,7 +595,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._draft_glue_logged = 0
         self._skips_prefilled_inputs = self._resolve_skips_prefilled_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
-            self._metadata_glue = MetadataGlueGraph(self.device)
+            # The backend declared its prep capturable: in CI a failed capture fails.
+            self._metadata_glue = MetadataGlueGraph(
+                self.device, strict=envs.SGLANG_IS_IN_CI.get()
+            )
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).

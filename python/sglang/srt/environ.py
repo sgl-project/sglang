@@ -98,12 +98,14 @@ class EnvField:
         backup_value = os.environ.get(self.name)
         backup_set_to_none = self._set_to_none
         self.set(value)
-        yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
-        self._set_to_none = backup_set_to_none
+        try:
+            yield
+        finally:
+            if backup_present:
+                os.environ[self.name] = backup_value
+            else:
+                os.environ.pop(self.name, None)
+            self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)
@@ -643,6 +645,8 @@ class Envs:
     # Scheduler token budgeting and admission
     # ===================================================================
     SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
+    # PD prefill: bootstrap-queued requests each refresh also touches; 0 skips them.
+    SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = EnvInt(512)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
@@ -1030,6 +1034,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Set this to 1 to stop sglang from clearing an inherited
+    # ROCPROFILER_REGISTER_LIBRARY.
+    SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
