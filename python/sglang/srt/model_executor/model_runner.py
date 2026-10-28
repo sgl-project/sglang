@@ -2443,7 +2443,7 @@ class ModelRunner:
             )
         # Store, not dist.barrier(WORLD): that races Mooncake digesting retirees' links.
         scale_ready_barrier_via_store(target_size=target_size)
-        # Converge the bitmap here: a retry in the next dp_attn all_gather deadlocks.
+        # Converge the bitmap here, or Mooncake refuses the next dp_attn collective.
         mooncake_world_settle_probe(cohort_size=target_size)
         if get_parallel().tp_rank == 0:
             logger.debug(
