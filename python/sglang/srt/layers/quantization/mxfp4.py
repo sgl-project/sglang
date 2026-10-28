@@ -154,6 +154,12 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     return a8w4 or not a4w4
 
 
+def _aiter_situ_uses_a8w4() -> bool:
+    """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
+    gfx1250 overrides it with fp4 activations."""
+    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
