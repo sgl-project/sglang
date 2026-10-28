@@ -310,6 +310,52 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_compressed_page_size,
         )
 
+    def _qsa_cpu_copy_indices(self, indices, req_pool_index):
+        if req_pool_index is None:
+            raise ValueError("QSA retraction requires a request pool index")
+        # Full-KV pages preserve offsets within each compression group when
+        # reallocated. Keep logical page order, including the final partial group.
+        compressed = torch.unique_consecutive(indices.long() // self.qsa_compress_ratio)
+        pending = (
+            torch.arange(self.qsa_compress_ratio, device=indices.device)
+            + req_pool_index * self.qsa_compress_ratio
+        )
+        return pending, compressed
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        pending, compressed = self._qsa_cpu_copy_indices(indices, req_pool_index)
+        base = super().get_cpu_copy(indices, mamba_indices, req_pool_index)
+        # Byte views also support FP8 index caches on devices without FP8 gather.
+        pending_cpu = [
+            t.view(torch.uint8)[pending].cpu()
+            for t in [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+        ]
+        compressed_cpu = [
+            t.view(torch.uint8)[compressed].cpu()
+            for t in self.qsa_compressed_k_buffer_pool
+        ]
+        return base, pending_cpu, compressed_cpu
+
+    def load_cpu_copy(
+        self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        pending, compressed = self._qsa_cpu_copy_indices(indices, req_pool_index)
+        base, pending_cpu, compressed_cpu = cache_cpu
+        super().load_cpu_copy(base, indices, mamba_indices, req_pool_index)
+        for tensors, saved, ids in (
+            (
+                [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer],
+                pending_cpu,
+                pending,
+            ),
+            (self.qsa_compressed_k_buffer_pool, compressed_cpu, compressed),
+        ):
+            for tensor, values in zip(tensors, saved, strict=True):
+                tensor.view(torch.uint8).index_copy_(0, ids, values.to(tensor.device))
+        # The caller may release the CPU backup or reuse the request slot next.
+        if indices.is_cuda:
+            torch.cuda.current_stream(indices.device).synchronize()
+
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()
         qsa_k_size = (

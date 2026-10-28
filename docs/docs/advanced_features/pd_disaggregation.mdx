@@ -20,6 +20,87 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## NIXL CPU buffers for TDX/CC deployments
+
+On NVIDIA CUDA deployments where NIXL cannot access GPU memory directly, you can
+stage KV transfers through pageable CPU memory. Enable these options on **both
+prefill and decode**, in addition to `--disaggregation-transfer-backend nixl`:
+
+```bash
+--nixl-use-cpu-buffer --nixl-cpu-buffer-size-gb 16
+```
+
+Each worker allocates its own bounded host pool (16 GiB by default). Prefill
+copies each KV chunk from GPU to CPU, NIXL writes it to the decode worker's host
+pool, and decode copies the assembled request to its GPU KV cache before
+reporting transfer success. NIXL registers the host pool instead of the GPU KV
+buffers. Host allocations are pageable, including when CUDA pinned allocations
+are unavailable in confidential computing (CC) mode.
+
+This option changes the memory path only. It does not enable TDX, GPU CC,
+attestation, or transport encryption. Configure those separately for your
+security requirements. Choose a NIXL backend and transport that support host
+memory in your deployment. For UCX on a TDX/CC guest that rejects CUDA host
+registration, set the following environment variables before starting **both**
+workers:
+
+```bash
+export UCX_TLS=tcp,cuda_copy,self
+export UCX_ACC_DEVICES=''
+```
+
+NIXL versions that check for CUDA support require `cuda_copy` in `UCX_TLS` when
+GPUs are visible. Setting `UCX_ACC_DEVICES` to an empty string disables UCX's
+accelerator memory domains, preventing host registration from calling
+`cuMemHostRegister`. SGLang still performs GPU/CPU copies through PyTorch. Use
+this profile only with CPU-buffer transfers; it does not provide direct GPU
+transfers through UCX.
+
+Use the same SGLang revision, model, KV layout, page size, and attention TP size
+on both sides. This initial path supports contiguous MHA and MLA KV buffers with
+PP, CP, and DCP sizes of one. Hybrid GDN models such as Qwen3.5 and
+Qwen3.8-Flash-Next are supported.
+The final prefill chunk sends the conv and recurrent state, including
+request-scoped PLE state, through the same host pool. For Qwen3.8-Flash-Next,
+it also sends the QSA pending key and RoPE rings and the compressed index-key
+pages for the full prompt. Decode restores both KV and state before allowing
+generation. Both sides must have identical state layouts and attention TP sizes.
+With `--disaggregation-enable-kv-checksum`, verification includes all three state
+components using their respective physical indices.
+
+It does not support speculative decoding, hybrid MLA layouts, other extra state
+components beyond Mamba/GDN and QSA, PLE embedding offload, HiCache,
+HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
+Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.
+Sharding produces noncontiguous send positions, while CPU-buffer transfers
+require contiguous send slices. The server rejects this combination at startup.
+For Qwen3.8-Flash-Next, PLE embedding offload defaults to disabled in this
+mode; explicitly enabling it is rejected. Keep the embedding table on the
+GPU and budget GPU memory accordingly. With the official FP8 checkpoint, pair
+TP2 with EP2 (`--tp-size 2 --ep-size 2`) to keep expert projections aligned with
+the checkpoint's quantization blocks.
+Unsupported local configurations and peer layouts fail explicitly.
+
+On decode, this mode defaults `--disaggregation-decode-retraction-backup` to
+`cpu_tensor`, which uses per-request CPU tensors and preserves QSA pending
+and compressed state when a decode request is retracted. An explicit `none`
+value is preserved. The `host_pool` backend is rejected because it allocates a
+CUDA-registered HiCache pool even when incoming KV uses CPU buffers.
+
+Size the pool for concurrent requests: decode holds every received KV page for
+a request, together with its Mamba/GDN and QSA state when present, until GPU
+restoration completes. Prefill holds each packed chunk until its NIXL transfer
+settles. Pool exhaustion fails the affected
+request instead of waiting for pool space. An aborted decode request
+keeps its host region, GPU KV slots, and auxiliary slot until all TP ranks
+confirm that the required prefill abort acknowledgments have arrived. A timeout
+alone never makes these resources reusable. If a peer is lost, its resources
+can remain reserved until the worker restarts.
+
+CPU copies add latency and host-memory traffic. Measure end-to-end latency,
+throughput, and host-memory use for your workload before enabling this path in
+production.
+
 ## Decode allocation policy
 
 By default, decode reserves each request's destination KV slots before prefill

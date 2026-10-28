@@ -434,6 +434,8 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_decode_extra_slots",
     "disaggregation_decode_polling_interval",
     "optimistic_prefill_attempts",
+    "nixl_use_cpu_buffer",
+    "nixl_cpu_buffer_size_gb",
     "encoder_only",
     "language_only",
     "language_model_only",
