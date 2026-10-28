@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import (
@@ -141,13 +141,13 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         translator: KVIndexTranslator,
         plan: KVLocPlan,
-        kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
-        ``kv_indices``."""
+        ``kv_indices``. Under a ``window`` read, a mask carries the window."""
         device = req_pool_indices.device
         bs = req_pool_indices.numel()
 
@@ -193,7 +193,7 @@ class DFlashVerifyInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
-            kv_start_idx=kv_start_idx,
+            kv_start_idx=None if window is None else window.start,
             kind=kind,
         )
         mask = self.custom_mask
@@ -217,4 +217,12 @@ class DFlashVerifyInput(SpecInput):
                     dim=0,
                 )
                 self.custom_mask = mask
+            if window is not None:
+                # The mask's rows are a uniform block per request.
+                assert layout is None, "a ragged verify takes no window read"
+                mask = window.tree_mask(
+                    mask,
+                    width=self.draft_token_num,
+                    read_lens_sum=paged_kernel_lens_sum,
+                )
         return kv_indices, cum_kv_seq_len, qo_indptr, mask

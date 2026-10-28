@@ -345,10 +345,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         ``window + accepted`` tokens, here evicted window pages, where the
         eager extend reads its last ones. Both now read the window.
 
-        The eager window wrapper is planned with the layer's window, which
-        selects the kernel with the per-query window mask; the graph replay's
-        is planned without it, which is why FlashInfer does not declare a
-        window draft extend under CUDA graphs on translated storage."""
+        BUG REGRESSION. The graph replay planned its window wrapper without
+        the layer's window, so its kernel had no per-query window mask; both
+        now plan with it."""
         window, seq_len, accept = 64, 300, 2
         self._fixture(window, target_window=128)
         # The window side no longer holds the prefix before the window.
@@ -374,7 +373,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             torch.testing.assert_close(graph_plan.ids, eager_plan.ids)
         # Window wrapper, then full wrapper.
         self.assertEqual([p.window_left for p in eager], [window, -1])
-        self.assertEqual([p.window_left for p in graph], [-1, -1])
+        self.assertEqual([p.window_left for p in graph], [window, -1])
 
     def test_flashinfer_window_reads_take_their_own_rail(self):
         """BUG REGRESSION. A flashinfer multi-step draft of a window model

@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -67,10 +67,11 @@ class NgramVerifyInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
-        ``kv_indices``."""
+        ``kv_indices``. Under a ``window`` read, the mask carries the window."""
         bs = req_pool_indices.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
@@ -93,6 +94,7 @@ class NgramVerifyInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            kv_start_idx=None if window is None else window.start,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
@@ -113,6 +115,12 @@ class NgramVerifyInput(SpecInput):
                     ),
                 ],
                 dim=0,
+            )
+        if window is not None:
+            custom_mask = window.tree_mask(
+                custom_mask,
+                width=self.draft_token_num,
+                read_lens_sum=paged_kernel_lens_sum,
             )
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask

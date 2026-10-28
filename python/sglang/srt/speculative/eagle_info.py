@@ -4,7 +4,7 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -97,10 +97,11 @@ class EagleVerifyInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
-        ``kv_indices``."""
+        ``kv_indices``. Under a ``window`` read, the mask carries the window."""
         device = req_pool_indices.device
         batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
@@ -126,6 +127,7 @@ class EagleVerifyInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            kv_start_idx=None if window is None else window.start,
             # The translator tiles the gather over token blocks, sized from
             # the length sum (an upper bound on the longest live row) while
             # it is still a host int.
@@ -151,6 +153,17 @@ class EagleVerifyInput(SpecInput):
                 dim=0,
             )
 
+        if window is not None:
+            return (
+                kv_indices,
+                cum_kv_seq_len,
+                qo_indptr,
+                window.tree_mask(
+                    self.custom_mask,
+                    width=self.draft_token_num,
+                    read_lens_sum=paged_kernel_lens_sum,
+                ),
+            )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
 
@@ -418,12 +431,13 @@ class EagleDraftExtendInput(SpecInput):
         paged_kernel_lens_sum: Optional[int],
         translator: KVIndexTranslator,
         plan: KVLocPlan,
-        kv_start_idx: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
         """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
-        draft-extend window; ``kv_start_idx`` is each row's first column read
-        (a sliding window's start), None for column 0."""
+        draft-extend window; a ``window`` read starts each row at its window's
+        first token, else at column 0. The queries are consecutive positions,
+        so the kernel's causal window masks them exactly."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -454,7 +468,7 @@ class EagleDraftExtendInput(SpecInput):
             seq_lens=paged_kernel_lens,
             indptr=cum_kv_seq_len,
             out=kv_indices,
-            kv_start_idx=kv_start_idx,
+            kv_start_idx=None if window is None else window.start,
             kind=kind,
             num_token_blocks=None,
             kv_lens_sum=host_kv_lens_sum,

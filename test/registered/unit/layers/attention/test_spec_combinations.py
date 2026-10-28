@@ -70,12 +70,7 @@ _TRANSLATED = spec_combinations(*SpecMode, translated=(True,))
 _DECLARED = {
     TritonAttnBackend: _TRANSLATED,
     FlashAttentionBackend: _TRANSLATED,
-    FlashInferAttnBackend: spec_combinations(SpecMode.DRAFT_DECODE, translated=(True,))
-    | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
-    | spec_combinations(
-        SpecMode.DRAFT_EXTEND, window=(True,), cuda_graph=(False,), translated=(True,)
-    )
-    | spec_combinations(SpecMode.TARGET_VERIFY, window=(False,), translated=(True,)),
+    FlashInferAttnBackend: _TRANSLATED,
     TRTLLMHAAttnBackend: spec_combinations(
         SpecMode.TARGET_VERIFY, SpecMode.DRAFT_DECODE, translated=(True,)
     )
@@ -313,24 +308,14 @@ class TestDraftFactory(unittest.TestCase):
                 built = self._decode(cls, name, _combination(SpecMode.DRAFT_DECODE))
                 self.assertEqual(len(built.attn_backends), 2)
 
-    def test_flashinfer_window_draft_extend_builds_eager_only(self):
-        """BUG REGRESSION. A graph replay of a FlashInfer draft extend plans
-        its window wrapper without the window (window_left -1), so the kernel
-        has no per-query window mask; the combination was declared anyway.
-        The eager extend, planned with the window, builds; with CUDA graphs it
-        is refused at init."""
-        eager = _combination(SpecMode.DRAFT_EXTEND, cuda_graph=False)
-        built = self._extend(FlashInferAttnBackend, "flashinfer", eager)
-        self.assertIsInstance(built, FlashInferAttnBackend)
-        graph = _combination(SpecMode.DRAFT_EXTEND)
-        with self.assertRaisesRegex(
-            ValueError,
-            "FlashInferAttnBackend.*draft extend with sliding-window layers, "
-            "with CUDA graphs",
-        ):
-            self._extend(FlashInferAttnBackend, "flashinfer", graph)
-        no_window = _combination(SpecMode.DRAFT_EXTEND, window=False)
-        self._extend(FlashInferAttnBackend, "flashinfer", no_window)
+    def test_flashinfer_window_draft_extend_builds_with_graphs(self):
+        """BUG REGRESSION. A graph replay of a FlashInfer draft extend planned
+        its window wrapper without the window, so the combination was refused;
+        it now plans with the window as the eager extend does, and builds."""
+        for cuda_graph in (False, True):
+            combination = _combination(SpecMode.DRAFT_EXTEND, cuda_graph=cuda_graph)
+            built = self._extend(FlashInferAttnBackend, "flashinfer", combination)
+            self.assertIsInstance(built, FlashInferAttnBackend)
 
     def test_trtllm_mha_refuses_a_fused_window_draft_extend(self):
         combination = _combination(SpecMode.DRAFT_EXTEND)
@@ -392,23 +377,21 @@ class TestRunnerBackend(CustomTestCase):
                 model_runner=runner, resolved=resolved, init_new_workspace=False
             )
 
-    def test_flashinfer_refuses_a_translated_window_target_verify(self):
+    def test_flashinfer_builds_a_translated_window_target_verify(self):
+        """BUG REGRESSION. A FlashInfer EAGLE verify read its window wrapper
+        from column 0, so a translated window target verify was refused; it
+        now reads from the window's start and builds."""
         combination = _combination(SpecMode.TARGET_VERIFY)
-        with self.assertRaisesRegex(
-            ValueError, "FlashInferAttnBackend.*target verify with sliding"
-        ):
-            self._build(FlashInferAttnBackend, FlashInferAttnBackend, combination)
-        no_window = _combination(SpecMode.TARGET_VERIFY, window=False)
-        self._build(FlashInferAttnBackend, FlashInferAttnBackend, no_window)
+        self._build(FlashInferAttnBackend, FlashInferAttnBackend, combination)
 
     def test_a_split_pair_checks_the_child_that_verifies(self):
         combination = _combination(SpecMode.TARGET_VERIFY)
         # Verify on the prefill side (triton) builds; on the decode side
-        # (flashinfer) it is refused.
-        self._build(TritonAttnBackend, FlashInferAttnBackend, combination)
-        with self.assertRaisesRegex(ValueError, "FlashInferAttnBackend"):
+        # (flashinfer_mla) it is refused.
+        self._build(TritonAttnBackend, FlashInferMLAAttnBackend, combination)
+        with self.assertRaisesRegex(ValueError, "FlashInferMLAAttnBackend"):
             self._build(
-                TritonAttnBackend, FlashInferAttnBackend, combination, mode="decode"
+                TritonAttnBackend, FlashInferMLAAttnBackend, combination, mode="decode"
             )
 
     def test_a_draft_runner_checks_draft_extend(self):

@@ -42,7 +42,12 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import (
+    IdSpace,
+    IdSpaceKind,
+    WindowRead,
+    window_read,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -330,23 +335,9 @@ class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
     # On translated storage: a multi-step draft step reads its window layers
-    # through its own window rail. A draft extend with window layers is
-    # declared eager only: a graph replay plans from the draft-extend input
-    # with window_left -1, so its kernel has no per-query window mask. Target
-    # verify is declared without window layers only: an EAGLE verify's gather
-    # starts at column 0 (`EagleVerifyInput.generate_attn_arg_prefill` takes no
-    # window start).
-    implemented_spec_combinations = (
-        STATIC_SPEC_COMBINATIONS
-        | spec_combinations(SpecMode.DRAFT_DECODE, translated=(True,))
-        | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
-        | spec_combinations(
-            SpecMode.DRAFT_EXTEND,
-            window=(True,),
-            cuda_graph=(False,),
-            translated=(True,),
-        )
-        | spec_combinations(SpecMode.TARGET_VERIFY, window=(False,), translated=(True,))
+    # through its own window rail; every other mode through its window read.
+    implemented_spec_combinations = STATIC_SPEC_COMBINATIONS | spec_combinations(
+        *SpecMode, translated=(True,)
     )
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
@@ -2069,29 +2060,27 @@ class FlashInferIndicesUpdaterPrefill:
             prefix_is_full_seq = False
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
+        # One window read for the window wrapper, whatever the mode: extend,
+        # target verify or draft extend, planned eagerly or for a graph replay.
+        # K for a ragged extend's tokens is written after the paged pass, so
+        # that pass reads the prefix alone and masks it itself.
+        window = window_read(
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            window=sliding_window_size,
+            prefix_only=use_ragged,
+        )
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
             if wrapper_id == 0:
+                paged_kernel_lens = window.lens
+                kv_start_idx = window.start
                 if use_ragged:
-                    # K for extend tokens is written after the paged wrapper runs, so
-                    # the paged wrapper sees prefix-only. Trim to the last `window` tokens
-                    # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
-                    effective_start = torch.clamp(
-                        prefix_lens - sliding_window_size, min=0
-                    )
-                    paged_kernel_lens = prefix_lens - effective_start
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = effective_start
                     swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
-                        prefix_lens, seq_lens, effective_start
+                        prefix_lens, seq_lens, kv_start_idx
                     )
                 else:
-                    # window attention use paged only; the trim below is
-                    # request-granular, exactness comes from plan-time window_left
-                    paged_kernel_lens = torch.minimum(
-                        seq_lens,
-                        sliding_window_size + seq_lens - prefix_lens,
-                    )
                     if prefix_is_full_seq and seq_lens_cpu is not None:
                         # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
                         # summing the host mirror avoids draining the stream.
@@ -2100,7 +2089,6 @@ class FlashInferIndicesUpdaterPrefill:
                         )
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = seq_lens - paged_kernel_lens
             elif use_ragged:
                 # Extend K/V lands after the paged pass: plan over the prefix only.
                 paged_kernel_lens = prefix_lens
@@ -2135,13 +2123,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
-                # paged-only SWA path only; ragged keeps its custom prefix
-                # mask, spec-verify keeps its tree mask
-                window_left=(
-                    sliding_window_size
-                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
-                    else -1
-                ),
+                window=window if wrapper_id == 0 else None,
                 plan=plan,
             )
 
@@ -2262,7 +2244,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
-        window_left: int = -1,
+        window: Optional[WindowRead] = None,
         *,
         plan: KVLocPlan,
     ):
@@ -2313,35 +2295,19 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            # A window wrapper reads from the window's first token on
-            # (kv_start_idx). A draft extend replayed from a graph plans here,
-            # and needs it as the eager extend above does.
-            if spec_info.spec_input_type in (
-                SpecInputType.DFLASH_VERIFY,
-                SpecInputType.EAGLE_DRAFT_EXTEND,
-            ):
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        req_pool_indices=req_pool_indices,
-                        paged_kernel_lens=paged_kernel_lens,
-                        paged_kernel_lens_sum=paged_kernel_lens_sum,
-                        translator=translator,
-                        plan=plan,
-                        kind=read_kind,
-                        kv_start_idx=kv_start_idx,
-                    )
+            # Every mode reads from its window read's first token on; a mask
+            # it returns carries the window.
+            kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                spec_info.generate_attn_arg_prefill(
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=translator,
+                    plan=plan,
+                    kind=read_kind,
+                    window=window,
                 )
-            else:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        req_pool_indices=req_pool_indices,
-                        paged_kernel_lens=paged_kernel_lens,
-                        paged_kernel_lens_sum=paged_kernel_lens_sum,
-                        translator=translator,
-                        plan=plan,
-                        kind=read_kind,
-                    )
-                )
+            )
 
         # extend part
         if use_ragged:
@@ -2435,9 +2401,11 @@ class FlashInferIndicesUpdaterPrefill:
             if eagle_verify:
                 paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
-        if window_left >= 0:
-            # selects the module with the per-element window mask compiled in
-            paged_plan_kwargs["window_left"] = window_left
+        # The kernel masks the window itself unless a mask carries it: the
+        # window selects the module with the per-element window mask compiled
+        # in.
+        if window is not None and use_custom_mask is None and window.window_left >= 0:
+            paged_plan_kwargs["window_left"] = window.window_left
 
         wrapper_paged.begin_forward(
             qo_indptr,
