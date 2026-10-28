@@ -61,6 +61,7 @@ try:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
+        alloc_decode_seg_plan,
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
         unified_attention_3d_mtp_decode_func,
@@ -4687,6 +4688,10 @@ class AiterAttnBackend(AttentionBackend):
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
             v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
+        # Split-KV plan of the asm decode kernel, built by the fused KV write below
+        # (one launch instead of arange + plan + write); None -> asm path plans itself.
+        seg_plan = None
+
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
@@ -4737,6 +4742,25 @@ class AiterAttnBackend(AttentionBackend):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                # Same conditions as the asm decode call below, which consumes seg_plan.
+                if (
+                    self.use_triton_unified_attention
+                    and is_gfx95_supported()
+                    and self.forward_metadata.max_q_len == 1
+                    and (
+                        layer.sliding_window_size is None
+                        or layer.sliding_window_size <= -1
+                    )
+                    and sinks is None
+                    and self.page_size == 16
+                    and layer.qk_head_dim == 256
+                    and layer.v_head_dim == 256
+                    # the fused plan maps program i to sequence i (one token each)
+                    and q.shape[0] == forward_batch.seq_lens.shape[0]
+                ):
+                    seg_plan = alloc_decode_seg_plan(
+                        forward_batch.seq_lens, layer.tp_k_head_num
+                    )
                 launch_reshape_and_cache_flash(
                     k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -4749,6 +4773,7 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     k_scale=k_descale,
                     v_scale=v_descale,
+                    seg_plan=seg_plan,
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
@@ -4832,6 +4857,9 @@ class AiterAttnBackend(AttentionBackend):
                         block_table=page_table,
                         k_descale=k_descale,
                         v_descale=v_descale,
+                        # q_len 1 per sequence: cu_seqlens_q is arange(0, bs+1)
+                        cu_seqlens_q=self.qo_indptr_unified_decode[: q.shape[0] + 1],
+                        seg_plan=seg_plan,
                     )
                 ):
                     return o

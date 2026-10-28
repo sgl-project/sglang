@@ -350,6 +350,8 @@ def _get_plan_kernel():
         import triton
         import triton.language as tl
 
+        from sglang.kernels.ops.kvcache.cache_ops import seg_plan_program
+
         @triton.jit
         def _vattn_seg_plan_kernel(
             seq_lens_ptr,
@@ -366,47 +368,16 @@ def _get_plan_kernel():
         ):
             # one program per sequence; every program recomputes the (cheap) batch-wide plan
             pid = tl.program_id(0)
-            b = tl.arange(0, BLOCK_B)
-            bm = b < num_seqs
-            slen = tl.load(seq_lens_ptr + b, mask=bm, other=0).to(tl.int32)
-            nt = (slen + 15) // 16
-            total = tl.sum(nt, axis=0)
-            mx = tl.max(nt, axis=0)
-            # smallest T (tiles per segment) with sum_b ceil(nt_b / T) <= target_wgs and max_b ceil(nt_b / T) <= seg_max
-            lo = tl.maximum(
-                tl.maximum(
-                    (total + target_wgs - 1) // target_wgs,
-                    (mx + seg_max - 1) // seg_max,
-                ),
-                16,  # min KV tiles per segment (= 256 tokens): shorter segments cost more in fp32 partials than they save
-            )
-            slack = target_wgs - num_seqs
-            hi = tl.where(
-                slack > 0,
-                (total + tl.maximum(slack, 1) - 1) // tl.maximum(slack, 1),
-                lo,
-            )
-            hi = tl.maximum(hi, lo)
-            for _ in range(16):
-                mid = (lo + hi) // 2
-                fits = tl.sum((nt + mid - 1) // mid, axis=0) <= target_wgs
-                hi = tl.where(fits, mid, hi)
-                lo = tl.where(fits, lo, mid + 1)
-            T = hi
-            nseg = (nt + T - 1) // T
-            ends = tl.cumsum(nseg, axis=0)
-            tot = tl.sum(nseg, axis=0)
-            my_n = tl.sum(tl.where(b == pid, nseg, 0), axis=0)
-            my_start = tl.sum(tl.where(b == pid, ends, 0), axis=0) - my_n
-            if pid == 0:
-                tl.store(plan_ptr, T)
-            w = tl.arange(0, BLOCK_W)
-            tl.store(plan_ptr + 1 + my_start + w, (pid << 16) | w, mask=w < my_n)
-            idle = tot + pid + w * num_seqs  # idle tail, strided over programs
-            tl.store(
-                plan_ptr + 1 + idle,
-                tl.full((BLOCK_W,), -1, tl.int32),
-                mask=idle < num_work,
+            my_n = seg_plan_program(
+                pid,
+                seq_lens_ptr,
+                plan_ptr,
+                num_seqs,
+                num_work,
+                target_wgs,
+                seg_max,
+                BLOCK_B,
+                BLOCK_W,
             )
             q0 = tl.load(cu_q_ptr + pid).to(tl.int32)
             q1 = tl.load(cu_q_ptr + pid + 1).to(tl.int32)
@@ -426,6 +397,19 @@ def _get_plan_kernel():
 def seg_plan_target_wgs(num_kv_heads: int) -> int:
     """Working WGs to aim for: one per CU, shared over the kv-head grid dim."""
     return max(1, _seg_plan_target_wgs() // max(1, num_kv_heads))
+
+
+def alloc_seg_plan(seq_lens, num_kv_heads):
+    """Output buffers for a plan built by the fused KV-write kernel (decode, one token per sequence):
+    (seq_lens, plan, tok_nseg, seg_max, target_wgs), the ``seg_plan`` argument of
+    launch_reshape_and_cache_flash. Pass (plan, tok_nseg, seg_max) on to mtp_verify_attn_fwd_asm."""
+    num_seqs = seq_lens.shape[0]
+    seg_max = mtp_verify_attn_seg_max(num_seqs, num_kv_heads)
+    plan = torch.empty(
+        1 + seg_max * num_seqs, dtype=torch.int32, device=seq_lens.device
+    )
+    tok_nseg = torch.empty(num_seqs, dtype=torch.int32, device=seq_lens.device)
+    return seq_lens, plan, tok_nseg, seg_max, seg_plan_target_wgs(num_kv_heads)
 
 
 def build_seg_plan(seq_lens, cu_seqlens_q, num_tokens, seg_max, num_kv_heads=1):
@@ -572,16 +556,22 @@ def mtp_verify_attn_fwd_asm(
     num_segments=None,
     out=None,
     use_seg_plan=True,
+    plan=None,
+    tok_nseg=None,
 ):
     """Same contract as aiter.mtp_verify_attn_fwd_asm (see that docstring).
+
+    plan / tok_nseg: a plan already built by the caller (alloc_seg_plan + the fused KV-write
+    kernel); requires num_segments == its seg_max, and skips the plan launch.
 
     use_seg_plan=False forces the fixed per-sequence split of #37465 (used by the tests as the
     reference split); production callers leave it on."""
     num_tokens, num_q_heads, head_size = q.shape
     num_seqs = seq_lens.shape[0]
     num_kv_heads = k_cache.shape[2]
-    plan = tok_nseg = None
-    if num_segments is None:
+    if plan is not None:
+        assert num_segments is not None and tok_nseg is not None
+    elif num_segments is None:
         if use_seg_plan:  # bs=1 too: the plan sizes segments by length
             num_segments = mtp_verify_attn_seg_max(num_seqs, num_kv_heads)
             plan, tok_nseg = _cached_seg_plan(
