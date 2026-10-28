@@ -15,12 +15,9 @@ _BS1_STATE_SLOTS = 3
 def check_bs1_floor(
     *, total_bytes: int, floor_terms: Sequence[Tuple[str, int]], where: str
 ) -> None:
-    """bs=1 feasibility FLOOR -- the retract loop's terminal guarantee.
+    """Reject pools that cannot hold one worst-case request at boot.
 
-    The scheduler retracts requests until the LAST one fits; if one worst-case
-    request running ALONE does not fit in the buffer, under-sizing is a retract
-    LIVELOCK at runtime, not a perf bug. Fail loud at boot, before any pool
-    construction, with the itemized requirement.
+    Retraction cannot make progress below that floor, even at batch size one.
     """
     floor = sum(b for _, b in floor_terms)
     if total_bytes >= floor:

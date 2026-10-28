@@ -1,9 +1,4 @@
-"""Prefix-tree slots for tests that build a cache by hand.
-
-Production takes a cache's slots from its KV storage, whose plan gives each
-sub-pool's family by its lifetime. A hand-built test names component ids
-instead; ``FAMILY_OF`` gives each id the family production gives its sub-pool.
-"""
+"""Prefix-tree slot fixtures for caches built without KV storage."""
 
 from typing import Iterable, Optional, Tuple
 
@@ -16,9 +11,8 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-# A tree-local window component (buffer mode's auxiliary window) is no slot of
-# the KV storage's: tests give it a family of its own and its class through
-# ``component_registry_override``, so the cache's window rules leave it alone.
+# A separate family keeps the auxiliary window outside storage-window rules;
+# tests supply its driver through component_registry_override.
 CUSTOM_WINDOW = "custom_window"
 
 FAMILY_OF = {
@@ -36,10 +30,7 @@ def tree_slots_of(
     window: Optional[int] = None,
     checkpoint_interval: Optional[int] = None,
 ) -> Tuple[TreeSlot, ...]:
-    """The slots of a tree whose components are ``components``, in order. A
-    window slot keeps ``window`` tokens (the test's retained window); a state
-    slot's checkpoint interval defaults to the runtime's chunk size, where
-    production's plan takes it from."""
+    """State checkpoints default to the runtime chunk size, as in production."""
     slots = []
     for c in components:
         family = FAMILY_OF[ComponentType(c)]
@@ -59,17 +50,12 @@ def tree_slots_of(
 
 
 def slot_of(params, component: ComponentType) -> TreeSlot:
-    """The slot ``params`` gives ``component``, for a test that builds a
-    component directly."""
     name = ComponentType(component).name
     return next(slot for slot in params.tree_slots if slot.component == name)
 
 
 def index_slots(cache, components: Iterable[ComponentType]) -> None:
-    """Give a hand-built cache (``object.__new__(UnifiedRadixCache)``) the
-    family-to-slot table its ``__init__`` builds from its slots, for a tree
-    whose components are ``components``. The table names slots only, so the
-    slots carry no numbers."""
+    """Initialize only the family lookup for caches built with ``__new__``."""
     cache._index_slots(
         tuple(
             TreeSlot(

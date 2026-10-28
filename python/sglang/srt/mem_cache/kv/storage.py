@@ -340,9 +340,8 @@ class KVStorage:
         """Give back owner token ids whose window rows `rehome_window` moved."""
         self._allocator.free(ids)
 
-    # -- a running request's state tracking: the scheduler decides when a
-    # request crosses a tracking boundary; the storage hands out and takes back
-    # the slots its ping-pong pair needs, and keeps the table's columns in step.
+    # The scheduler chooses tracking boundaries;
+    # storage owns ping-pong slots and the request table's matching columns.
 
     def take_tracking_slot(self, req, position: int) -> bool:
         """Give ``req`` a tracking slot at ``position`` of its ping-pong pair;
@@ -463,9 +462,7 @@ class KVStorage:
         return self._views[sub_pool]
 
     def accounting_violations(self) -> List[str]:
-        """What the idle leak check reports beyond the per-sub-pool counts: the
-        bytes the chain's bands account for that do not add up. Empty when
-        healthy."""
+        """Byte-accounting violations beyond the idle per-sub-pool leak counts."""
         return self._allocator.verify_byte_accounting()
 
     def usage(self) -> Tuple[SubPoolUsage, ...]:
