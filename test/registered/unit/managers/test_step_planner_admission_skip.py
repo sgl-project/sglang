@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.step_planner import (
     DecodeFirst,
@@ -126,6 +127,7 @@ class _AdmissionCase(CustomTestCase):
         s.token_to_kv_pool_allocator = None
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.hisparse_coordinator = None
+        s.mode_owners = ModeOwners()
         s.request_retirer = Mock()
         s._no_kv_room = {}
         s.tp_worker = SimpleNamespace(

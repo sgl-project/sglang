@@ -2,7 +2,8 @@
 its current prefix match, the row budget counts the new request rows the
 admitted requests take, not the requests, a spent pass budget stops the pass
 before its first candidate, a request HiCache keeps waiting gives back its
-match, and a mixed step reserves its decode part before admission."""
+match, a mixed step reserves its decode part before admission, and a PD
+prefill node's bootstrap queue reaches the priority pass."""
 
 import unittest
 from array import array
@@ -28,6 +29,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.step_planner import (
     DecodeFirst,
@@ -178,6 +180,7 @@ class _PlannerCase(CustomTestCase):
             buffer_pipeline=None, storage_prefetch_retries=None
         )
         s.hisparse_coordinator = None
+        s.mode_owners = ModeOwners()
         # Preemption releases a running request through it.
         s.request_retirer = Mock()
         s._no_kv_room = {}
@@ -402,6 +405,32 @@ class TestHiCacheSkipRevertsTheMatch(_PlannerCase):
             adder = self._admit()
 
         self._assert_reverted(req, mamba_allocator, adder)
+
+
+class TestBootstrapQueueReachesThePriorityPass(_PlannerCase):
+    """The waiting-prefix LRU refresh also touches the prefixes of requests
+    still bootstrapping on a PD prefill node."""
+
+    def setUp(self):
+        super().setUp()
+        self.planner.core_lists.waiting_queue = [_req("w")]
+
+    def test_the_bootstrap_queue_is_passed(self):
+        bootstrapping = [_req("b")]
+        self.planner.mode_owners.disagg_prefill = SimpleNamespace(
+            bootstrap_queue=SimpleNamespace(queue=bootstrapping)
+        )
+
+        self._admit()
+
+        kwargs = self.planner.policy.calc_priority.call_args.kwargs
+        self.assertIs(kwargs["bootstrap_queue"], bootstrapping)
+
+    def test_no_prefill_owner_passes_an_empty_queue(self):
+        self._admit()
+
+        kwargs = self.planner.policy.calc_priority.call_args.kwargs
+        self.assertEqual(kwargs["bootstrap_queue"], [])
 
 
 class TestMixedStep(_PlannerCase):

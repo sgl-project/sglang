@@ -407,10 +407,16 @@ class StepPlanner:
             return None
 
         # Get priority queue
+        disagg_prefill = self.mode_owners.disagg_prefill
         self.policy.calc_priority(
             self.core_lists.waiting_queue,
             running_reqs,
             processed_tokens=self.counters.processed_tokens_counter,
+            bootstrap_queue=(
+                disagg_prefill.bootstrap_queue.queue
+                if disagg_prefill is not None
+                else []
+            ),
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
