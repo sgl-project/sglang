@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -206,7 +207,7 @@ class TestResolveMmPreprocessingDevice(CustomTestCase):
         self.assertEqual(fingerprints[0], fingerprints[2])
 
 
-class _FastImageProcessor:
+class _FastImageProcessor(BaseImageProcessor):
     pass
 
 
