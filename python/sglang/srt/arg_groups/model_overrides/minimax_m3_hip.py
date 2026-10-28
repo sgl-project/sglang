@@ -123,9 +123,11 @@ def _m31_quark_gfx950_overrides(cfg: Any, overrides: dict) -> None:
 
 
 def _m31_gfx950_all_reduce(cfg: Any) -> None:
-    """The quick all-reduce both M3.1 checkpoints take."""
-    # INT4 halves the long-prefill all-reduce at TP4 with GSM8K unchanged; ROCm images
-    # export INT8 for every model, so only another level the user set stays
+    """The quick all-reduce both M3.1 checkpoints take at TP4, where it was measured."""
+    if cfg.tp_size != 4:
+        return
+    # INT4 halves the long-prefill all-reduce with GSM8K unchanged; ROCm images export
+    # INT8 for every model, so only another level the user set stays
     level = "ROCM_QUICK_REDUCE_QUANTIZATION"
     if (
         os.environ.get(level, "INT8") == "INT8"
@@ -137,8 +139,7 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
             "SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4=0 keeps INT8"
         )
     if (
-        cfg.tp_size != 4
-        or os.environ.get(level) != "INT4"
+        os.environ.get(level) != "INT4"
         # the JIT build reduces bf16 cast to fp16 only, as QuickAllReduce sets it up
         or cfg.dtype not in ("auto", "bfloat16")
         or int(os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)) == 0
