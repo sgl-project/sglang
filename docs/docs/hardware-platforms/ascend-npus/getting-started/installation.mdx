@@ -2,7 +2,7 @@
 title: Installation
 description: "Complete installation guide for SGLang on Ascend NPUs, including component version mapping, environment setup, and launching inference services."
 ---
-You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+You can install SGLang using any of the methods below. Please go through [`System Settings`](#system-settings) section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
 ## Component Version Mapping For SGLang
 
@@ -28,7 +28,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -38,7 +38,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
@@ -58,7 +58,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu realses</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
@@ -88,7 +88,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -98,7 +98,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
@@ -118,7 +118,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu realses</a></td>
     </tr>
   </tbody>
 </table>
@@ -261,7 +261,7 @@ and so does a package from a release that predates this module; check with
 
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
-#### Some other dependencies
+#### Additional dependencies
 
 ```bash Command
 # libGL
@@ -292,7 +292,7 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 Ensure sufficient disk space before pulling images. Each Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
-1. Download SGLang image
+- Download SGLang image
 
 <Tip>
 We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes.
@@ -319,7 +319,7 @@ docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/s
   </Tab>
 </Tabs>
 
-2. Build an image based on Dockerfile
+- Build an image based on Dockerfile
 
 ```bash Command
 # Clone the SGLang repository
@@ -334,9 +334,9 @@ cd sglang/docker
 docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
 ```
 
-#### Create Docker
+#### Create Docker Container
 
-__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+**Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
 <Tabs>
   <Tab title="Ascend A3 Series">
