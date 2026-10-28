@@ -469,6 +469,7 @@ def build_kv_cache(
         cache_controller = tree_cache.cache_controller
         if cache_controller is not None:
             cache_controller.load_fence_stream = tp_worker.model_runner.forward_stream
+            cache_controller.write_fence_stream = tp_worker.model_runner.forward_stream
             if get_memory().enable_unified_memory:
                 # Keep device rows stable until host transfers are acknowledged.
                 # Queue reads and relocation both run on the scheduler thread.

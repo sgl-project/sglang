@@ -457,6 +457,9 @@ def assemble_scheduler(
         hicache_draft_plan=(
             draft_worker.hicache_draft_plan if draft_worker is not None else None
         ),
+        draft_swa_window=(
+            draft_worker.draft_swa_window if draft_worker is not None else 0
+        ),
     )
     is_hybrid_swa = result.is_hybrid_swa
     is_hybrid_ssm = result.is_hybrid_ssm

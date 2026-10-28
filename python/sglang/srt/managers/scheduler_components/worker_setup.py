@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_memory,
     get_model,
     get_parallel,
     get_schedule,
@@ -323,6 +324,11 @@ def start_workers(
     tic = time.perf_counter()
     init_memory_pools(tp_worker=tp_worker, draft_worker=draft_worker)
     kv_cache_allocation_time = time.perf_counter() - tic
+    if get_memory().enable_unified_memory:
+        # The first compaction move must not happen while serving with a
+        # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
+        # before graph capture and KV sizing account for its memory.
+        tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
     init_all_attention_backends(tp_worker=tp_worker, draft_worker=draft_worker)
     init_all_cuda_graphs(tp_worker=tp_worker, draft_worker=draft_worker)
