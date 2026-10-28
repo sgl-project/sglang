@@ -682,7 +682,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.topk.topk_config.apply_routed_scaling_factor_on_output = (
             _is_npu or self.experts.should_fuse_routed_scaling_factor_in_topk
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if self.use_block_routing:
             _require_block_routing_runner_compatibility(self.experts, self.top_k)
         # shared expert
