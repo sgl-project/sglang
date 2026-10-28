@@ -21,8 +21,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_hybrid_swa_stack,
     build_kv_host_pool,
+    build_unified_host_stack,
 )
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
@@ -87,13 +87,6 @@ class DecodeKVCacheOffloadManager:
             and router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
         )
         if self._unified_window:
-            full_mapping, swa_mapping = (
-                {
-                    layer_id: router.route(layer_id).index
-                    for layer_id in router.sub_pool(name).layer_ids
-                }
-                for name in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW)
-            )
             params = CacheInitParams(
                 disable=False,
                 req_to_token_pool=self.req_to_token_pool,
@@ -101,18 +94,17 @@ class DecodeKVCacheOffloadManager:
                 page_size=self.page_size,
                 tp_cache_group=tp_group,
             )
-            self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
+            stack = build_unified_host_stack(
+                storage=self.token_to_kv_pool_allocator.storage,
                 params=params,
-                full_kv_pool=self.kv_cache.full_kv_pool,
-                swa_kv_pool=self.kv_cache.swa_kv_pool,
-                full_layer_mapping=full_mapping,
-                swa_layer_mapping=swa_mapping,
+                cache=None,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
                 model_name=get_serving().served_model_name,
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
             )
+            self.decode_host_mem_pool = stack.host_pool_group
+            self.cache_controller = stack.cache_controller
         else:
             if not isinstance(self.kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
                 raise ValueError("Unsupported KV cache type for decode offload")

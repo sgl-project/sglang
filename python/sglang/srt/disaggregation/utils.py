@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.storage import KVStorage
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -1455,12 +1456,41 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(pool):
+def get_kv_transfer_buf_infos(pool, storage: Optional[KVStorage] = None):
+    """The KV entries a PD peer registers: a unified pool's owner sub-pool
+    region, else the pool's own buffers."""
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
+    if storage is not None:
+        region = storage.regions(storage.owner)
+        return list(region.ptrs), list(region.lens), list(region.item_lens)
     if isinstance(pool, MiniMaxSparseKVPool):
         return pool.get_sparse_kv_buf_infos()
     return pool.get_contiguous_buf_infos()
+
+
+def _setup_unified_state_kv_args(kv_args: KVArgs, storage: KVStorage) -> None:
+    """A unified pool's state entries: one per wire entry of its plan, each
+    the region of the sub-pool it carries."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    kv_args.is_hybrid_mla_backend = is_mla_backend(storage.view(storage.owner))
+    for entry in storage.wire_entries():
+        region = storage.regions(entry.sub_pool)
+        state_type = StateType(entry.state_type)
+        append_state_component(
+            kv_args,
+            state_type,
+            list(region.ptrs),
+            list(region.lens),
+            list(region.item_lens),
+            list(region.dim_per_tensor),
+            list(region.conv_shard_groups),
+            list(region.slice_outer_counts),
+            list(region.layer_ids),
+        )
+        if state_type == StateType.SWA:
+            kv_args.swa_kv_cache_layout = region.kv_layout
 
 
 def setup_state_kv_args(
@@ -1469,6 +1499,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     state_pool=None,
+    storage: Optional[KVStorage] = None,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1498,6 +1529,10 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    if storage is not None:
+        _setup_unified_state_kv_args(kv_args, storage)
+        return
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:

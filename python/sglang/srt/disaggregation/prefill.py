@@ -290,8 +290,9 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
+        storage = self.scheduler.token_to_kv_pool_allocator.storage
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            self.token_to_kv_pool
+            self.token_to_kv_pool, storage
         )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
@@ -354,6 +355,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             state_pool=None if state is None else state.pool,
+            storage=storage,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

@@ -22,6 +22,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.kv_loc_plan import IdSpace
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -47,6 +48,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # A request's recurrent state and its slots, when the model has them; the
     # KV cache configurator binds the request table's.
     state: Optional[StateStorage] = None
+    # A unified pool's sub-pools as host and peer transfers read them.
+    storage: Optional[KVStorage] = None
 
     @property
     def state_slots(self):
