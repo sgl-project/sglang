@@ -103,7 +103,9 @@ class RustServer:
         return SamplingParams().max_new_tokens
 
     @classmethod
-    def _server_kwargs(cls, scheduler: Scheduler) -> Dict[str, Any]:
+    def _server_kwargs(
+        cls, *, server_args: ServerArgs, model_config: ModelConfig
+    ) -> Dict[str, Any]:
         """Keyword arguments a model package's own ``Server`` class takes
         beyond the shared ones (see ``_load_extension``)."""
         return {}
@@ -245,7 +247,7 @@ class RustServer:
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
-            **cls._server_kwargs(scheduler),
+            **cls._server_kwargs(server_args=server_args, model_config=model_config),
         )
         instance = cls(server, http_port=listen_port)
 

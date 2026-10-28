@@ -203,6 +203,10 @@ class TestRustServerExtension(CustomTestCase):
                 return extension
 
             @classmethod
+            def _server_kwargs(cls, **_kwargs):
+                return {"model_setting": sentinel.setting}
+
+            @classmethod
             def _resolve_multimodal(cls, **_kwargs):
                 return None
 
