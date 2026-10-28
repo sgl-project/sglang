@@ -1405,17 +1405,23 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
-                ):
-                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                        send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
-                            async_send=True,
-                            msg_type="output",
-                            ready_event=q_event,
-                        )
+                if not target.forward_mode.is_prebuilt():
+                    if _pp_can_skip_output_comm(target):
+                        # The output send's ready_event is what orders the
+                        # scheduler stream after this forward. Keep that wait when
+                        # the send is skipped, so the next chunk's KV transfer
+                        # cannot read pages the forward is still writing.
+                        self.device_module.current_stream().wait_event(q_event)
+                    else:
+                        with torch.profiler.record_function(
+                            "send_res_dict_to_next_stage"
+                        ):
+                            send_output_work = self._pp_send_dict_to_next_stage(
+                                pp_outputs_to_send.tensors,
+                                async_send=True,
+                                msg_type="output",
+                                ready_event=q_event,
+                            )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
@@ -1565,10 +1571,12 @@ class SchedulerPPMixin:
             if target_send is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not target_send.forward_mode.is_prebuilt():
+                    # Order the scheduler stream after this forward even when only
+                    # the skip marker is sent; see _pp_send_output_to_next_stage.
+                    self.device_module.current_stream().wait_event(q_event)
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
-                        self.device_module.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
