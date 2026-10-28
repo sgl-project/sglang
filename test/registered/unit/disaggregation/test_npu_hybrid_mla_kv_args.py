@@ -1,9 +1,4 @@
-"""What a PD peer registers for a hybrid MLA target on NPU, with its MTP draft.
-
-A hybrid pool wraps its MLA token KV view beside recurrent state; the peer
-reads the view's layout, and the draft's layer count from the draft's own
-token KV view, whether the draft is a hybrid wrapper too or a plain pool.
-"""
+"""NPU PD registration uses each hybrid pool's token-KV layout and draft layer count."""
 
 import unittest
 from types import SimpleNamespace
@@ -18,6 +13,7 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -83,7 +79,7 @@ def _register(target, draft):
     return kv_args
 
 
-class TestNpuHybridMlaKvArgs(unittest.TestCase):
+class TestNpuHybridMlaKvArgs(CustomTestCase):
     def setUp(self):
         parallel = patch.object(
             memory_pool_npu,
@@ -102,9 +98,8 @@ class TestNpuHybridMlaKvArgs(unittest.TestCase):
         self.assertIn(StateType.MAMBA, kv_args.state_types)
 
     def test_a_hybrid_draft_counts_the_layers_of_its_token_kv_view(self):
-        """BUG REGRESSION. Registration read the draft's layer count off the
-        hybrid wrapper, which has none of its own: AttributeError at PD
-        init. Two full-attention layers of a three-layer draft hold KV."""
+        """Hybrid drafts expose the KV layer count through their token view;
+        PD registration must not read a missing layer count from the wrapper."""
         draft = _hybrid_npu_mla((0, 2), (1,))
         self.assertIsNot(draft.layer_router.wrapped_view(), draft)
         kv_args = _register(self.target, draft)
