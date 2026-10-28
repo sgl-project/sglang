@@ -37,7 +37,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=37, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
