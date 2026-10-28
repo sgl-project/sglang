@@ -60,14 +60,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    # The legacy "--enable-dp-attention --dp-size" pair is auto-converted to
-    # "--attn-dp-size" on main; spelled out here because the sglang build in
-    # the nightly B-series images predates the new flag. Switch to
-    # "--attn-dp-size", 4, once those images refresh.
-    # "--attn-dp-size",
-    # 4,
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
