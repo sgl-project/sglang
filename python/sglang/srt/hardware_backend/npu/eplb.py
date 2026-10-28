@@ -108,9 +108,8 @@ def prepare_expert_weight_update(
 
     rank = dist.get_rank()
     needs_staging = _validate_migration_weights(weights_by_layer, layer_ids, rank)
-    sample = weights_by_layer[layer_ids[0]]
     staging = ExpertWeightStaging(needs_staging)
-    temp_buffers = staging.create_temp_buffers(sample)
+    temp_buffers: list[torch.Tensor] = []
     group = get_eplb_device_group()
 
     def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> None:
@@ -128,6 +127,9 @@ def prepare_expert_weight_update(
                 for old, new in zip(old_placement, new_placement, strict=True)
             ):
                 return
+        # Populate the shared receive list only when this rank participates.
+        if not temp_buffers:
+            temp_buffers.extend(staging.create_temp_buffers(routed_experts_weights))
         migration_weights = staging.load(routed_experts_weights)
         update_expert_weights_single_layer(
             routed_experts_weights=migration_weights,
@@ -153,7 +155,7 @@ def _validate_migration_weights(
                 tuple(t.shape),
                 t.dtype,
                 t.device,
-                torch_npu.get_npu_format(t) not in (0, 2),
+                torch_npu.get_npu_format(t) not in (0, 2) or not t.is_contiguous(),
             )
             for t in weights
         ]
@@ -182,7 +184,7 @@ class ExpertWeightStaging:
     """
 
     def __init__(self, needs_staging: list[bool]):
-        # Convert whole weights once per layer, then migrate expert slices in ND.
+        # Convert internal formats and pack strided ND before migrating slices.
         self._needs_staging = needs_staging
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -194,7 +196,7 @@ class ExpertWeightStaging:
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
         return [
-            torch.ops.npu.npu_format_cast(weight, 2) if needed else weight
+            torch.ops.npu.npu_format_cast(weight, 2).contiguous() if needed else weight
             for weight, needed in zip(weights, self._needs_staging)
         ]
 

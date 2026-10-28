@@ -29,11 +29,14 @@ It retains upstream rebalance scheduling and thresholds; the earlier automatic
 - Migration validates each local chunk before allocating workspaces. Unchanged
   layers are skipped outside Elastic EP. Unchanged local placements still send
   when needed, but skip writeback; ranks with provably no work skip migration.
-  Receive buffers are reused within a chunk.
-- Each weight tensor migrates separately. Load retains the NZ-to-ND conversion
-  result. Store converts to the original format and copies into original model
-  storage, preserving graph addresses. Only the current layer's conversion
-  results are retained; auxiliary weights are not packed together.
+  Receive buffers are allocated on the first participating layer and reused
+  within a chunk; ranks with no work allocate none.
+- Each weight tensor migrates separately. Load retains NZ-to-ND conversion
+  results and packs strided ND tensors into contiguous migration storage.
+  Contiguous ND tensors are reused directly. Store writes staged tensors back
+  into original model storage, preserving formats, strides and graph addresses.
+  Only the current layer's staging results are retained; auxiliary weights are
+  not packed together.
 - Non-elastic target recorder initialization prewarms statistics and all-peer
   P2P communication, then synchronizes before releasing the tiny buffers. Reuse
   is cached by group identity. This moves channel setup cost to startup.
@@ -57,6 +60,10 @@ the model-runner draft identity. Local source-extracted checks cover target/draf
 statistics, both entry guards, exception-state restoration, and the unchanged GPU
 forward implementation. Scalar gatherer and graph-engine stand-ins do not
 establish device graph execution or full-package import compatibility.
+Targeted CPU checks also cover strided-ND send/receive ordering and original
+storage writeback, deferred allocation, unchanged senders and chunk reuse.
+The wire-order check follows the inspected HCCL pointer/count contract; it is
+not a hardware HCCL execution result.
 
 Before TP reuse, the production sources passed real-package imports, controlled
 NPU mixed-format multi-layer migration with communicating graph replay, and a short
