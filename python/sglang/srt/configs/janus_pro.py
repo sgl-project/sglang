@@ -476,7 +476,7 @@ class VLChatProcessor(ProcessorMixin):
 
         # add image tokens to the input_ids
         image_token_mask: torch.Tensor = (input_ids == self.image_id).to(torch.bool)
-        image_indices = image_token_mask.nonzero()
+        image_indices = torch.where(image_token_mask)[0]
         input_ids, num_image_tokens = self.add_image_token(
             image_indices=image_indices,
             input_ids=input_ids,
