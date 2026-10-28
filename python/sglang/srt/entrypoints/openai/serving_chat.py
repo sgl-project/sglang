@@ -3,14 +3,21 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import math
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+)
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -43,11 +50,10 @@ from jsonschema import Draft202012Validator, SchemaError
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
-    encoding_dsv4,
     encoding_dsv32,
-    encoding_dsv41,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    encode_prompt_segments,
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
@@ -69,9 +75,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokensDetails,
     ResponseParserProtocol,
+    ResponsesRequest,
     SglExt,
     Tool,
     ToolCall,
+    ToolCallConstraint,
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
@@ -94,6 +102,7 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
@@ -108,17 +117,29 @@ from sglang.srt.parser.hunyuan_reasoning import (
 )
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
+    jinja_template_reads_reasoning_content,
     process_content_for_template_format,
 )
+from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
+from sglang.srt.parser.response_template import (
+    GRAMMAR_AFTER_REASONING,
+    GRAMMAR_AT_ANSWER,
+    GRAMMAR_FROM_START,
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+    configure_response_template_request,
+    grammar_holds_calls,
+    tool_close_tokens,
+)
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
+    set_request_reasoning_in_grammar,
 )
-from sglang.srt.utils import ImageData
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -129,6 +150,11 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+
+def _incomplete_tool_call_indices(parser) -> set[int]:
+    detector = getattr(parser, "detector", parser)
+    return getattr(detector, "incomplete_tool_call_indices", set())
 
 
 def normalize_tool_content(role: str, content):
@@ -238,6 +264,89 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
     return value
 
 
+_M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
+_M3_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _validate_minimax_m3_request(request: ChatCompletionRequest) -> str | None:
+    """Request rules of the M3 serving contract that the chat template cannot enforce."""
+    thinking = request.thinking
+    if thinking is not None:
+        thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+        if thinking_type not in _M3_THINKING_TYPES:
+            return (
+                "thinking.type must be 'adaptive', 'enabled' or 'disabled', "
+                f"got {thinking_type!r}."
+            )
+    root_positions = [
+        position
+        for position, message in enumerate(request.messages)
+        if message.role == "root"
+    ]
+    if root_positions not in ([], [0]):
+        return "A root message must be the first message, and at most one is allowed."
+    return _tool_call_pairing_error(request.messages)
+
+
+def _tool_call_pairing_error(messages: list) -> str | None:
+    """Every assistant tool call is answered by exactly one following tool message,
+    unless that assistant message is the last one."""
+    pending: set[str] | None = None
+    unpaired_ids = False
+    for message in messages:
+        if message.role == "tool":
+            if unpaired_ids:
+                continue
+            if pending is None:
+                return (
+                    "A tool message must follow an assistant message with tool_calls."
+                )
+            if message.tool_call_id not in pending:
+                return (
+                    f"tool_call_id {message.tool_call_id!r} does not match an "
+                    "unanswered tool call."
+                )
+            pending.discard(message.tool_call_id)
+            continue
+        if pending:
+            return f"Tool calls {sorted(pending)} have no tool message answering them."
+        pending, unpaired_ids = None, False
+        if (
+            isinstance(message, ChatCompletionMessageGenericParam)
+            and message.role == "assistant"
+            and message.tool_calls
+        ):
+            call_ids = [call.id for call in message.tool_calls]
+            # Calls without ids cannot be paired; leave their results unchecked.
+            unpaired_ids = None in call_ids
+            pending = None if unpaired_ids else set(call_ids)
+    if pending and messages[-1].role == "tool":
+        return f"Tool calls {sorted(pending)} have no tool message answering them."
+    return None
+
+
+def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
+    """Map the thinking config and effort aliases onto what the M3 template reads."""
+    template_kwargs = dict(request.chat_template_kwargs or {})
+    # A template-kwargs effort would override the normalized one when rendering;
+    # entry points that skip the request conversion still carry it here.
+    kwargs_effort = template_kwargs.pop("reasoning_effort", None)
+    effort = (
+        request.reasoning_effort
+        if request.reasoning_effort is not None
+        else kwargs_effort
+    )
+    if request.thinking is not None:
+        template_kwargs.setdefault("thinking_mode", request.thinking["type"])
+    if effort in ("none", "minimal"):
+        template_kwargs.setdefault("thinking_mode", "disabled")
+    if template_kwargs.get("thinking_mode") == "disabled":
+        # An effort means nothing once thinking is off.
+        effort = None
+    request.reasoning_effort = effort if effort in _M3_REASONING_EFFORTS else None
+    request.chat_template_kwargs = template_kwargs
+
+
 def _extract_video_question(request: ChatCompletionRequest) -> str | None:
     """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
@@ -329,31 +438,18 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
+        self.is_minimax_m3 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            == "minimax_m3_vl"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
-        self._dsv4_reasoning_effort_profile = (
-            chat_encoding.resolve_dsv4_reasoning_effort_profile(
-                model_path=self.tokenizer_manager.model_path,
-                revision=get_model().revision,
-                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
-                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
-                ),
-            )
-            if self.chat_encoding_spec == "dsv4"
-            else None
-        )
-
         self._encoding_adapter = self._build_chat_encoding_adapter()
-        self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
-            chat_encoding.default_dsv41_reasoning_effort_from_env(
-                envs.SGLANG_DSV41_REASONING_EFFORT.get()
-            )
-            if self.chat_encoding_spec == "dsv41"
-            else None
-        )
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: ResponseParserProtocol | None = None
@@ -370,6 +466,9 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        self._template_reads_reasoning_content = (
+            self._chat_template_reads_reasoning_content()
+        )
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
@@ -405,6 +504,12 @@ class OpenAIServingChat(OpenAIServingBase):
             # A template that needs kwargs this probe does not supply tells us
             # nothing; keep the long-standing text path.
             return False
+
+    def _chat_template_reads_reasoning_content(self) -> bool:
+        template = self.default_chat_template_kwargs.get("chat_template")
+        if template is None and self.tokenizer_manager.tokenizer is not None:
+            template = self.tokenizer_manager.tokenizer.chat_template
+        return jinja_template_reads_reasoning_content(template)
 
     def _handle_last_assistant_message(
         self,
@@ -457,6 +562,14 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             Updated prompt_ids with assistant prefix appended
         """
+        detector = self._reasoning_detector
+        if isinstance(detector, ResponseTemplateReasoningDetector):
+            prompt = self.tokenizer_manager.tokenizer.decode(
+                prompt_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
+            )
+            assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
@@ -486,6 +599,10 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser=self.tool_call_parser,
         )
 
+    @property
+    def encoding_adapter(self) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        return self._encoding_adapter
+
     def _build_chat_encoding_adapter(
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
@@ -500,6 +617,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_parser=self.reasoning_parser,
                 tool_call_parser=self.tool_call_parser,
                 chat_hooks=chat_encoding_adapters.ChatOutputHooks(
+                    thinking_requested=self._thinking_requested,
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,
@@ -507,6 +625,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 hf_config=self.tokenizer_manager.model_config.hf_config,
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
+                default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
             )
         )
 
@@ -525,7 +644,7 @@ class OpenAIServingChat(OpenAIServingBase):
         for message in request.messages:
             if (
                 isinstance(message, ChatCompletionMessageGenericParam)
-                and message.role in ("system", "developer")
+                and message.role in ("root", "system", "developer")
                 and message.tools
             ):
                 tools.extend(message.tools)
@@ -611,6 +730,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         thinking_mode: ThinkingMode,
         tools: list[dict] | None = None,
+        *,
+        image_data: list,
     ) -> list[int] | None:
         """Encode messages for custom chat_encoding_spec values.
 
@@ -618,7 +739,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if self._encoding_adapter is not None:
             return self._encoding_adapter.encode_messages(
-                messages=messages, request=request, tools=tools
+                messages=messages,
+                request=request,
+                tools=tools,
+                thinking=thinking_mode == ThinkingMode.THINKING,
+                image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
@@ -687,98 +812,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return prompt_ids
         return None
 
-    @staticmethod
-    def _pop_inkling_assistant_prefix(
-        messages: list[dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> str | None:
-        """Extract the trailing assistant text for ``continue_final_message``.
-
-        Only a plain-string assistant message with no tool calls and no
-        reasoning content can be continued; anything else renders as a closed
-        historical turn. Mutates ``messages`` in place (callers pass a copy).
-        """
-        if not request.continue_final_message or not messages:
-            return None
-        last = messages[-1]
-        if (
-            last.get("role") != "assistant"
-            or not isinstance(last.get("content"), str)
-            or last.get("tool_calls")
-            or last.get("reasoning_content")
-        ):
-            return None
-        messages.pop()
-        return last["content"]
-
-    @staticmethod
-    def _parse_inkling_reasoning_effort(
-        value: str | float | None,
-    ) -> float | None:
-        """Convert an OpenAI-style reasoning_effort to an Inkling float."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError("Inkling reasoning_effort must not be a boolean")
-        if isinstance(value, (int, float)):
-            parsed = float(value)
-            if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-                raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-            return parsed
-        _EFFORT_MAP = {
-            "none": 0.0,
-            "minimal": 0.1,
-            "low": 0.2,
-            "medium": 0.7,
-            "high": 0.9,
-            "xhigh": 0.99,
-            "max": 0.99,
-        }
-        if value in _EFFORT_MAP:
-            return _EFFORT_MAP[value]
-        try:
-            parsed = float(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"invalid Inkling reasoning_effort: {value!r}") from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-        return parsed
-
-    def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
-        """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
-        effort = chat_encoding.parse_dsv41_reasoning_effort(value)
-        if effort is not None:
-            return effort
-        if value is not None and value != "none":
-            logger.warning(
-                "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
-                "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
-                "integer budget in [1, 100] via chat_template_kwargs are accepted).",
-                value,
-                self._dsv41_default_reasoning_effort,
-            )
-        return self._dsv41_default_reasoning_effort
-
-    @staticmethod
-    def _get_inkling_default_reasoning_effort() -> float:
-        """Read the default Inkling reasoning effort from the environment."""
-        from sglang.srt.environ import envs
-
-        val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()
-        if not val:
-            return 0.9
-        try:
-            parsed = float(val)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be numeric"
-            ) from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be in [0.0, 0.99]"
-            )
-        return parsed
-
     def _decode_response(self, ret_item: dict[str, Any]) -> str | ErrorResponse:
         """Extract text from response."""
         return ret_item["text"]
@@ -818,7 +851,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _sort_tool_message_run(
-        run: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+        run: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
+        *,
+        sort_text_runs: bool = False,
     ) -> list[dict[str, Any]]:
         """Order a tool-message run by tool_call position.
 
@@ -826,7 +862,8 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_calls order; sorting the run upfront keeps extraction order and
         placeholder order the same. Runs the template itself would refuse to
         associate (missing/duplicate/unknown ids) are left untouched, as are
-        text-only runs, whose order text-only templates may rely on.
+        text-only runs, whose order text-only templates may rely on, unless
+        sort_text_runs is set for a template that pairs results by position.
         """
         if len(run) < 2:
             return run
@@ -848,14 +885,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             for message in run
         )
-        if not has_media:
+        if not has_media and not sort_text_runs:
             return run
         position = {call_id: index for index, call_id in enumerate(call_ids)}
         return sorted(run, key=lambda message: position[message["tool_call_id"]])
 
     @classmethod
     def _canonicalize_tool_message_order(
-        cls, messages: list[dict[str, Any]]
+        cls, messages: list[dict[str, Any]], *, sort_text_runs: bool = False
     ) -> list[dict[str, Any]]:
         canonical = []
         index = 0
@@ -873,7 +910,11 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 run.append(messages[index])
                 index += 1
-            canonical.extend(cls._sort_tool_message_run(run, tool_calls))
+            canonical.extend(
+                cls._sort_tool_message_run(
+                    run, tool_calls, sort_text_runs=sort_text_runs
+                )
+            )
         return canonical
 
     async def _generate_stream_content(
@@ -962,7 +1003,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
         # Handle tool calls
-        if self._tool_call_parsing_active(request):
+        if self._tool_call_parsing_active(request) and not self._answer_started(
+            reasoning_parser_dict.get(index)
+        ):
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -1041,10 +1084,21 @@ class OpenAIServingChat(OpenAIServingBase):
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
         """
-        return bool(
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
+        if not self.tool_call_parser or request._response_parser_json_response_format:
+            return False
+        if not self._effective_tools(request):
+            # With no tools declared, tool_choice only holds its default and limits nothing.
+            detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
+            return detector.parses_without_tools()
+        return request.tool_choice != "none"
+
+    @staticmethod
+    def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
+        """Whether the output opened the answer that the template's grammar
+        admits instead of calls, after which no text is a call."""
+        return reasoning_parser is not None and (
+            isinstance(reasoning_parser.detector, ResponseTemplateReasoningDetector)
+            and reasoning_parser.detector.answer_started
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -1065,6 +1119,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if self.is_minimax_m3:
+            m3_error = _validate_minimax_m3_request(request)
+            if m3_error:
+                return m3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
@@ -1075,7 +1133,7 @@ class OpenAIServingChat(OpenAIServingBase):
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
-            and message.role in ("system", "developer")
+            and message.role in ("root", "system", "developer")
             and message.tools
             for message in request.messages
         )
@@ -1363,12 +1421,388 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        if processed_messages.uses_response_template:
+            self._set_response_parser_context(
+                request,
+                adapted_request,
+                tool_call_constraint=processed_messages.tool_call_constraint,
+                tools=(
+                    self._effective_tools(request)
+                    if self._tool_call_parsing_active(request)
+                    else []
+                ),
+                template_tool_call_grammar=processed_messages.template_tool_call_grammar,
+                message_start_tool_call_constraint=(
+                    processed_messages.message_start_tool_call_constraint
+                ),
+            )
         return adapted_request, request
 
+    def _set_response_parser_context(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        adapted_request: GenerateReqInput,
+        *,
+        tool_call_constraint: ToolCallConstraint | None,
+        tools: List[Tool],
+        template_tool_call_grammar: bool = False,
+        message_start_tool_call_constraint: (
+            Callable[[], ToolCallConstraint | None] | None
+        ) = None,
+    ) -> None:
+        """Give response-template parsers the rendered assistant prefill.
+
+        `tools` are the tools whose calls the tool-call parser reads."""
+        prefix = adapted_request.text
+        if not isinstance(prefix, str) and adapted_request.input_ids:
+            prefix = self.tokenizer_manager.tokenizer.decode(
+                adapted_request.input_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
+            )
+        prefix = prefix or ""
+        request._response_parser_prefix = prefix
+        request._response_parser_tool_grammar = template_tool_call_grammar
+        sampling_params = adapted_request.sampling_params or {}
+        if template_tool_call_grammar:
+            self._fit_tool_call_grammar_to_prefix(
+                request,
+                adapted_request,
+                sampling_params,
+                prefix,
+                message_start_tool_call_constraint,
+            )
+        # Structural tags, regex and EBNF can describe the template's own
+        # framing, so only JSON-schema output bypasses the template.
+        if sampling_params.get("json_schema"):
+            self._set_json_grammar_start(
+                request,
+                adapted_request,
+                sampling_params,
+                prefix,
+                tool_call_constraint,
+                tools,
+            )
+
+    def _fit_tool_call_grammar_to_prefix(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        adapted_request: GenerateReqInput,
+        sampling_params: dict[str, Any],
+        prefix: str,
+        message_start_tool_call_constraint: (
+            Callable[[], ToolCallConstraint | None] | None
+        ),
+    ) -> None:
+        """Fit the template's tool-call grammar to where `prefix` leaves the
+        output: at the message start, inside an answer, or after reasoning."""
+        detector = self._reasoning_detector
+        if not isinstance(detector, ResponseTemplateReasoningDetector):
+            return
+        starts_message = detector.starts_message(prefix)
+        message_start_constraint = (
+            message_start_tool_call_constraint()
+            if starts_message and message_start_tool_call_constraint is not None
+            else None
+        )
+        if message_start_constraint is not None:
+            # Output that starts the assistant message may skip the reasoning,
+            # so the grammar then covers the reasoning from the first token.
+            tag = message_start_constraint[1]
+            sampling_params["structural_tag"] = json.dumps(
+                tag.model_dump(by_alias=True)
+            )
+            set_request_reasoning_in_grammar(
+                sampling_params, adapted_request.require_reasoning
+            )
+        elif (
+            request.tool_choice in ("auto", "none")
+            and (rest := detector.answer_rest_structural_tag(prefix)) is not None
+        ):
+            # A continued answer never reaches the reasoning end the grammar
+            # would wait for, so its grammar covers only the rest of the answer.
+            sampling_params["structural_tag"] = json.dumps(rest)
+            adapted_request.require_reasoning = False
+        elif (
+            request.tool_choice == "auto"
+            and adapted_request.require_reasoning
+            and starts_message
+        ):
+            # The grammar would wait for the reasoning end, which output that
+            # skips the reasoning never reaches.
+            raise ValueError(
+                "cannot enforce automatic tool choice on output that may skip "
+                "the reasoning for this response template"
+            )
+
+    def _set_json_grammar_start(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        adapted_request: GenerateReqInput,
+        sampling_params: dict[str, Any],
+        prefix: str,
+        tool_call_constraint: ToolCallConstraint | None,
+        tools: List[Tool],
+    ) -> None:
+        """Record where JSON-schema output starts, framing a JSON answer with
+        the template's own grammar where it can."""
+        detector = self._reasoning_detector
+        # The scheduler defers the grammar to the reasoning's end only when
+        # the reasoning parser's think_end_token encodes to token ids.
+        reasoning_gated = (
+            adapted_request.require_reasoning
+            and detector is not None
+            and bool(detector.get_think_end_token_ids(self.tokenizer_manager.tokenizer))
+        )
+        request._response_parser_grammar_start = (
+            GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
+        )
+        # Unless the schema is the required/named tool call itself, the JSON
+        # is response data, and template syntax inside its strings is literal.
+        json_answer = (
+            tool_call_constraint is None or tool_call_constraint[0] != "json_schema"
+        )
+        # A JSON answer released at the reasoning end still opens the answer;
+        # the forced tool-call array stays bare JSON.
+        if (
+            reasoning_gated
+            and json_answer
+            and isinstance(detector, ResponseTemplateReasoningDetector)
+        ):
+            tag, from_start = self._json_answer_structural_tag(
+                request,
+                detector,
+                json.loads(sampling_params["json_schema"]),
+                prefix,
+                tools,
+            )
+            if tag is not None:
+                sampling_params["structural_tag"] = json.dumps(tag)
+                del sampling_params["json_schema"]
+                set_request_reasoning_in_grammar(sampling_params, from_start)
+                request._response_parser_grammar_start = GRAMMAR_AT_ANSWER
+        # The template's JSON-answer grammar admits native calls instead of
+        # the answer, which tool extraction still reads.
+        request._response_parser_json_response_format = (
+            json_answer and request._response_parser_grammar_start != GRAMMAR_AT_ANSWER
+        )
+
+    def _json_answer_structural_tag(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        detector: ResponseTemplateReasoningDetector,
+        json_schema: Any,
+        prefix: str,
+        tools: List[Tool],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """The template's tag for a JSON answer, and whether it covers the
+        output from the first token."""
+        # Calls instead of the answer take the template's framing, which only
+        # a response-template tool parser reads.
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        tool_dicts = []
+        if (
+            tools
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        ):
+            parser = FunctionCallParser(
+                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+            )
+            tool_dicts = [tool.model_dump() for tool in parser.structural_tag_tools()]
+        parallel_tool_calls = request.parallel_tool_calls is not False
+        from_start = detector.starts_message(prefix)
+        tag = detector.json_answer_structural_tag(
+            json_schema,
+            tools=tool_dicts,
+            parallel_tool_calls=parallel_tool_calls,
+            message_start=from_start,
+        )
+        if tag is None and from_start:
+            from_start = False
+            tag = detector.json_answer_structural_tag(
+                json_schema,
+                tools=tool_dicts,
+                parallel_tool_calls=parallel_tool_calls,
+            )
+        return tag, from_start
+
+    def _takes_turn_grammar(
+        self, request: ChatCompletionRequest, *, output_constrained: bool
+    ) -> bool:
+        """Whether a turn nothing else constrains takes the template's grammar."""
+        return (
+            request.tool_choice in ("auto", "none")
+            and not (
+                output_constrained
+                or request.regex
+                or request.ebnf
+                or (
+                    request.response_format is not None
+                    and request.response_format.type != "text"
+                )
+            )
+            and self._template_turn_grammar()
+        )
+
+    def _record_template_tool_call_grammar(
+        self,
+        request: ChatCompletionRequest,
+        result: MessageProcessingResult,
+        parser: FunctionCallParser,
+    ) -> None:
+        """Record whether the tool-call constraint is the template's own
+        grammar, which parsing then relies on."""
+        tool_call_constraint = result.tool_call_constraint
+        client_grammar = (
+            request.regex
+            or request.ebnf
+            or (
+                request.response_format is not None
+                and request.response_format.type == "structural_tag"
+            )
+        )
+        # A client grammar replaces the tag that holds automatic calls to strictness
+        # or count; a JSON answer is checked where its tag is derived.
+        if (
+            request.tool_choice == "auto"
+            and tool_call_constraint is not None
+            and client_grammar
+        ):
+            raise ValueError(
+                "cannot enforce strict tools or parallel_tool_calls=False with "
+                "automatic tool choice under another output constraint for "
+                "this response template"
+            )
+        result.template_tool_call_grammar = (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] == "structural_tag"
+            # Another output constraint replaces the tool-call tag.
+            and not (
+                client_grammar
+                or (
+                    request.response_format is not None
+                    and request.response_format.type != "text"
+                )
+            )
+        )
+        if result.template_tool_call_grammar:
+            result.message_start_tool_call_constraint = lambda: (
+                self._message_start_tool_call_constraint(request, result, parser)
+            )
+
+    def _message_start_tool_call_constraint(
+        self,
+        request: ChatCompletionRequest,
+        result: MessageProcessingResult,
+        parser: FunctionCallParser,
+    ) -> ToolCallConstraint | None:
+        """The template tool-call constraint for output that starts the
+        assistant message, which it then covers from the first token."""
+        tag = parser.detector.get_structural_tag(
+            tools=parser.structural_tag_tools(),
+            tool_choice=request.tool_choice,
+            thinking_mode=result.require_reasoning,
+            parallel_tool_calls=request.parallel_tool_calls,
+            message_start=True,
+        )
+        return None if tag is None else ("structural_tag", tag)
+
+    def _settle_response_template_stop(
+        self,
+        text: str,
+        finish_reason: dict[str, Any] | None,
+        request: ChatCompletionRequest | ResponsesRequest,
+        output: str,
+    ) -> str:
+        """Restore a stopped call's closer or trim a stop after an answer."""
+        if not isinstance(finish_reason, dict) or not (
+            request._response_parser_tool_grammar
+            or request._response_parser_grammar_start is not None
+        ):
+            return text
+        matched = finish_reason.get("matched")
+        tokenizer = self.tokenizer_manager.tokenizer
+        closer = tool_close_tokens(self.tool_call_parser, tokenizer).get(matched)
+        if request._response_parser_tool_grammar:
+            if (
+                finish_reason.get("type") != "stop"
+                or not isinstance(matched, int)
+                or (
+                    # A caller's own stop token may end the call anywhere.
+                    isinstance(request, ChatCompletionRequest)
+                    and matched in (request.stop_token_ids or ())
+                )
+            ):
+                return text
+            detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser](
+                tokenizer=tokenizer,
+                prefix=request._response_parser_prefix,
+                tools=request.tools,
+                constrained=True,
+            )
+            if closer is None:
+                return text + (detector.open_call_closer(output) or "")
+            trim = detector.open_call_closer(output[: -len(closer)]) is None
+        else:
+            trim = request._response_parser_grammar_start == GRAMMAR_FROM_START
+        if (
+            not closer
+            or not text.endswith(closer)
+            or (isinstance(request, ChatCompletionRequest) and request.no_stop_trim)
+        ):
+            return text
+        if not request._response_parser_tool_grammar and not trim:
+            # Check the whole output: an earlier streamed chunk may open JSON.
+            detector = self._reasoning_detector
+            if isinstance(detector, ResponseTemplateReasoningDetector):
+                parser = ReasoningParser(
+                    model_type=self.reasoning_parser,
+                    request=request,
+                    tokenizer=tokenizer,
+                )
+                trim = parser.detector.json_output_started(output)
+            else:
+                trim = detector.think_end_token in output
+        return text[: -len(closer)] if trim else text
+
+    def _template_turn_grammar(self) -> bool:
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            envs.SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR.get()
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+            and tool_detector.constrains_every_turn
+            # Other backends cannot compile its structural tag.
+            and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
+        )
+
+    def _requires_response_template_detokenization(
+        self, request: ChatCompletionRequest
+    ) -> bool:
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            return True
+
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            request.tool_choice != "none"
+            and bool(self._effective_tools(request))
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        )
+
     def _process_messages(
-        self, request: ChatCompletionRequest, is_multimodal: bool
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
+        *,
+        output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
@@ -1377,6 +1811,9 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        if self.is_minimax_m3:
+            _normalize_minimax_m3_request(request)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config
@@ -1394,12 +1831,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
         tool_call_constraint = None
+        template_tool_parser = None
 
         effective_tools = self._effective_tools(request)
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
-            self.tool_call_parser == "glm47"
+            FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+            is Glm47MoeDetector
             and bool(effective_tools)
             and request.tool_choice != "none"
             and not any(tool.function.strict for tool in effective_tools)
@@ -1431,6 +1870,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
+                if self.tool_call_parser == "muse" and request._template_tools:
+                    tools = request._template_tools
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
@@ -1446,6 +1887,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_constraint is not None
                     and tool_call_constraint[0] == "structural_tag"
                     and self._reasoning_detector is not None
+                    # Template tags exclude their own field closers,
+                    # which can be the think literals (Beam's <|end|>).
+                    and not isinstance(parser.detector, ResponseTemplateToolDetector)
                 ):
                     # Same ownership rule: the reasoning parser handles think
                     # tokens, so the grammar must not forbid them in free text.
@@ -1457,6 +1901,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         ),
                     )
                 required_parsed_natively = parser.detector.parses_required_natively()
+                if isinstance(parser.detector, ResponseTemplateToolDetector):
+                    template_tool_parser = parser
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
             if (
@@ -1477,6 +1923,26 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+
+        if tool_call_constraint is None and self._takes_turn_grammar(
+            request, output_constrained=output_constrained
+        ):
+            # Unconstrained turns still take the template's framing: reasoning,
+            # then calls with any arguments or the answer.
+            if template_tool_parser is None:
+                template_tool_parser = FunctionCallParser(
+                    [],
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+            tag = template_tool_parser.detector.get_structural_tag(
+                tools=template_tool_parser.structural_tag_tools(),
+                tool_choice=request.tool_choice,
+                thinking_mode=xgrammar_reasoning,
+                parallel_tool_calls=request.parallel_tool_calls,
+            )
+            if tag is not None:
+                tool_call_constraint = ("structural_tag", tag)
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
@@ -1505,8 +1971,17 @@ class OpenAIServingChat(OpenAIServingBase):
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
 
+        # Configured after rendering so the detokenization options never reach
+        # the chat template.
+        if self._requires_response_template_detokenization(request):
+            configure_response_template_request(request)
+            result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
+        if template_tool_parser is not None and result.uses_response_template:
+            self._record_template_tool_call_grammar(
+                request, result, template_tool_parser
+            )
         result.skip_special_tokens = request.skip_special_tokens
         if self.reasoning_parser == "k2_horizon" and thinking_mode:
             parser = ReasoningParser(
@@ -1554,16 +2029,20 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         # Try custom encoding first (override in subclass for custom renderers)
-        thinking_requested = (request.chat_template_kwargs or {}).get(
-            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-        )
         thinking_mode = (
-            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
+            ThinkingMode.THINKING
+            if self._thinking_requested(request)
+            else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
+        strict_tool_call_arguments = (
+            self._encoding_adapter.strict_tool_call_arguments
+            if self._encoding_adapter is not None
+            else self.chat_encoding_spec != "kimi_k3"
+        )
         for message in messages:
             normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
+                message, strict=strict_tool_call_arguments
             )
 
         prompt_ids = self._encode_messages(
@@ -1571,9 +2050,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request,
             thinking_mode,
             tools=tools,
+            image_data=image_data,
         )
 
         if prompt_ids is not None:
+            if image_data and not is_multimodal:
+                raise ValueError("image input is not supported for this model")
             collects_openai_media = (
                 self._encoding_adapter.collects_openai_media
                 if self._encoding_adapter is not None
@@ -1593,33 +2075,30 @@ class OpenAIServingChat(OpenAIServingBase):
                         modalities,
                     )
         elif self.chat_encoding_spec is not None:
-            # dsv4/dsv41/dsv32 encoding path
+            # dsv32 encoding path
             messages = copy.deepcopy(messages)
-            is_dsv41 = self.chat_encoding_spec == "dsv41"
             for msg in messages:
                 if msg.get("content") is None:
                     msg["content"] = ""
 
-            # The V4.1 encoder consumes OpenAI parts lists itself; dsv4/dsv32
-            # are text-only, so their parts-list content is flattened first.
-            if not is_dsv41:
-                for i, msg in enumerate(messages):
-                    if isinstance(msg.get("content"), list):
-                        messages[i] = process_content_for_template_format(
-                            msg, "string", [], [], [], []
-                        )
-
-                for msg in messages:
-                    processed_msg = process_content_for_template_format(
-                        msg,
-                        template_content_format,
-                        image_data,
-                        video_data,
-                        audio_data,
-                        modalities,
-                        use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+            # The dsv32 encoder is text-only, so parts-list content is flattened first.
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = process_content_for_template_format(
+                        msg, "string", [], [], [], []
                     )
-                    msg.update(processed_msg)
+
+            for msg in messages:
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+                )
+                msg.update(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
@@ -1628,78 +2107,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
             request_tools = request.tools if tools else None
 
-            # An empty system message hosts the request tools; dsv41 renders a
-            # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request_tools or not is_dsv41):
+            # An empty system message hosts the request tools.
+            if messages[0]["role"] != "system":
                 messages.insert(0, {"role": "system", "content": ""})
             if request_tools:
-                messages[0]["tools"] = [
-                    (
-                        chat_encoding.dsv41_tool_payload(tool)
-                        if is_dsv41
-                        else tool.model_dump()
-                    )
-                    for tool in request_tools
-                ]
+                messages[0]["tools"] = [tool.model_dump() for tool in request_tools]
 
-            # Default encoding (dsv4/dsv41/dsv32)
-            if self.chat_encoding_spec == "dsv4":
-                effort_source = request.reasoning_effort
-                if effort_source is None:
-                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
-                    if env_val:
-                        effort_source = env_val
-                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
-                assert reasoning_effort_profile is not None
-                accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
-                    reasoning_effort_profile
-                ]
-                v4_reasoning_effort = (
-                    effort_source if effort_source in accepted_efforts else None
-                )
-                if request.task is not None:
-                    encoding_dsv4.attach_task_to_last_user_message(
-                        messages, request.task
-                    )
-                real_input = encoding_dsv4.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=v4_reasoning_effort,
-                    reasoning_effort_profile=reasoning_effort_profile,
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-            elif is_dsv41:
-                if request.task is not None:
-                    encoding_dsv41.attach_task_to_last_user_message(
-                        messages, request.task
-                    )
-                real_input, media = encoding_dsv41.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=self._resolve_dsv41_reasoning_effort(
-                        request.reasoning_effort
-                    ),
-                    return_multi_modal_data=True,
-                )
-                if media["images"]:
-                    if not is_multimodal:
-                        raise ValueError("image input is not supported for this model")
-                    image_data.extend(
-                        ImageData(url=image["url"]) for image in media["images"]
-                    )
-                    tokenizer = self.tokenizer_manager.tokenizer
-                    real_input = real_input.replace(
-                        encoding_dsv41.IMAGE_PLACEHOLDER,
-                        tokenizer.convert_ids_to_tokens(
-                            self.tokenizer_manager.image_token_id
-                        ),
-                    )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-            else:
-                real_input = encoding_dsv32.encode_messages(
-                    messages, thinking_mode=thinking_mode
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            real_input = encoding_dsv32.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
@@ -1707,8 +2124,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            if self.template_manager.jinja_template_may_reorder_tool_results:
-                messages = self._canonicalize_tool_message_order(messages)
+            # The M3 template renders tool results by position, not by tool_call_id.
+            if (
+                self.template_manager.jinja_template_may_reorder_tool_results
+                or self.is_minimax_m3
+            ):
+                messages = self._canonicalize_tool_message_order(
+                    messages, sort_text_runs=self.is_minimax_m3
+                )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
@@ -1730,9 +2153,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages.append(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
-            openai_compatible_messages, assistant_prefix = (
-                self._handle_last_assistant_message(openai_compatible_messages, request)
-            )
+            add_generation_prompt = request._format_add_generation_prompt
+            assistant_prefix = None
+            if add_generation_prompt is None or request.continue_final_message:
+                openai_compatible_messages, assistant_prefix = (
+                    self._handle_last_assistant_message(
+                        openai_compatible_messages, request
+                    )
+                )
 
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
@@ -1757,9 +2185,15 @@ class OpenAIServingChat(OpenAIServingBase):
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
             # avoid double BOS on tokenizers that would add it.
+            add_special_tokens = request._format_add_special_tokens
+            if add_special_tokens and self._prompt_text_round_trip_is_lossy:
+                raise ValueError(
+                    "add_special_tokens is not supported with this tokenizer's "
+                    "chat template"
+                )
             encode_kwargs = (
-                {"add_special_tokens": False}
-                if self._tokenizer_auto_adds_specials
+                {"add_special_tokens": add_special_tokens}
+                if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
             try:
@@ -1769,6 +2203,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
+                    add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1785,6 +2220,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
+                        add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1830,6 +2266,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        add_generation_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
@@ -1846,6 +2283,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools,
                         template_kwargs,
                         encode_kwargs,
+                        add_generation_prompt,
                     ),
                 )
             except TypeError:
@@ -1863,23 +2301,38 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 return_dict=False,
                 **template_kwargs,
             )
         else:
-            rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            prompt_ids = parallel_prompt_encode(
-                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-            )
+            segments = None
+            if self.template_manager.python_chat_template is not None:
+                segments = render_chat_segments(
+                    self.tokenizer_manager.tokenizer,
+                    self.template_manager.python_chat_template,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=add_generation_prompt,
+                    template_kwargs=template_kwargs,
+                )
+            if segments is not None:
+                prompt_ids = encode_prompt_segments(
+                    self.tokenizer_manager.tokenizer, segments, encode_kwargs
+                )
+            else:
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    tools=tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
@@ -2003,6 +2456,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # State tracking for streaming
         is_firsts = {}
         stream_offsets = {}
+        generated_parts = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -2147,6 +2601,26 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     stream_started = True
 
+                # Settle the stop token here, where the whole generated text is
+                # known even when chunks carry only increments.
+                if (
+                    request._response_parser_grammar_start is not None
+                    or request._response_parser_tool_grammar
+                ):
+                    incremental = get_serving().incremental_streaming_output
+                    if incremental:
+                        generated_parts.setdefault(index, []).append(content["text"])
+                    if finish_reason_type is not None:
+                        output = (
+                            "".join(generated_parts[index])
+                            if incremental
+                            else content["text"]
+                        )
+                        text = self._settle_response_template_stop(
+                            content["text"], finish_reason, request, output
+                        )
+                        content = {**content, "text": text}
+
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
                     content=content,
@@ -2172,7 +2646,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
-                if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
+                if (
+                    has_tool_calls.get(idx, False)
+                    and finish_reason_type == "stop"
+                    and not _incomplete_tool_call_indices(parser_dict.get(idx))
+                ):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
@@ -2435,10 +2913,14 @@ class OpenAIServingChat(OpenAIServingBase):
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+            text = self._settle_response_template_stop(
+                text, finish_reason, request, text
+            )
 
             # Handle reasoning content
             reasoning_text = None
             tool_calls = None
+            answer_started = False
             if encoding_output is not None:
                 reasoning_text, text, tool_calls, finish_reason = (
                     encoding_output.parse_chat_response(
@@ -2462,6 +2944,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    answer_started = self._answer_started(parser)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -2472,7 +2955,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             effective_tools = self._effective_tools(request)
-            if encoding_output is None and self._tool_call_parsing_active(request):
+            if (
+                encoding_output is None
+                and self._tool_call_parsing_active(request)
+                and not answer_started
+            ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
@@ -2480,6 +2967,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    request._response_parser_prefix,
+                    grammar_holds_calls(
+                        request._response_parser_tool_grammar,
+                        request._response_parser_grammar_start,
+                    ),
                 )
 
             # Extract prompt_token_ids if requested
@@ -2664,6 +3156,8 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: dict[str, Any],
         tool_choice: str | ToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
+        response_parser_prefix: str = "",
+        constrained: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2678,6 +3172,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                prefix=response_parser_prefix,
+                constrained=constrained,
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
@@ -2883,11 +3379,15 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
-        """Whether the chat encoder takes history as ``reasoning_content`` rather
-        than via :meth:`wrap_reasoning_history`; see
+        """Whether the chat encoder or template takes history as ``reasoning_content``
+        rather than via :meth:`wrap_reasoning_history`; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
-        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
+        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
+            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+            and self.template_manager.chat_template_name is None
+            and self._template_reads_reasoning_content
+        )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
@@ -2954,6 +3454,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "flint":
+            if not enabled:
+                raise ValueError(
+                    "Reasoning parser 'flint' has no thinking toggle and cannot "
+                    "be disabled via Anthropic thinking"
+                )
+            return
+
         if self.reasoning_parser == "iquest_q1":
             request.chat_template_kwargs = {
                 **(request.chat_template_kwargs or {}),
@@ -3011,6 +3519,11 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs = dict(request.chat_template_kwargs or {})
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
+
+    def _thinking_requested(self, request: ChatCompletionRequest) -> bool:
+        return (request.chat_template_kwargs or {}).get(
+            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+        )
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.
@@ -3120,6 +3633,10 @@ class OpenAIServingChat(OpenAIServingBase):
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             )
+            constrained = grammar_holds_calls(
+                request._response_parser_tool_grammar,
+                request._response_parser_grammar_start,
+            )
             # For required/named tool choice: use JsonArrayParser when the
             # constrained output is plain JSON (detector doesn't support
             # structural_tag or no parser configured). Use FunctionCallParser
@@ -3133,6 +3650,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_choice=request.tool_choice,
+                        prefix=request._response_parser_prefix,
+                        constrained=constrained,
                     )
                     use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
@@ -3144,6 +3663,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
+                    constrained=constrained,
                 )
 
         parser = parser_dict[index]
@@ -3152,6 +3673,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
+            if flush:
+                end = parser.finish(effective_tools)
+                normal_text = (normal_text or "") + end.normal_text
+                calls = list(calls) + end.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

@@ -21,7 +21,8 @@ import itertools
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range, should_run_full_tests
+from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -32,9 +33,9 @@ from sglang.kernels.ops.quantization.per_token_group_quant import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=65, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=200, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
 
 G = 128
 FMAX = float(fp8_max)  # 448 for e4m3
@@ -525,6 +526,124 @@ def test_fused_silu(scale_ue8m0, column_major):
 
     deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G) if scale_ue8m0 else x_s
     assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
+
+
+def _check_dense_silu(x, scale_ue8m0, column_major):
+    original = x.view(torch.int16).clone()
+    kwargs = dict(scale_ue8m0=scale_ue8m0, column_major_scales=column_major)
+    expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
+    q, s = per_token_group_quant(
+        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), expected_s.view(torch.int32))
+    assert torch.equal(x.view(torch.int16), original)
+
+
+@pytest.mark.parametrize(
+    "dtype,scale_ue8m0,column_major",
+    get_ci_test_range(
+        list(
+            itertools.product(
+                [torch.bfloat16, torch.float16], [False, True], [False, True]
+            )
+        ),
+        [
+            (torch.bfloat16, True, True),
+            (torch.float16, True, True),
+            (torch.bfloat16, False, False),
+        ],
+    ),
+)
+@pytest.mark.parametrize(
+    "shape",
+    get_ci_test_range(
+        [(1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)],
+        [(1, 768), (32, 14336)],
+    ),
+)
+def test_dense_silu_bitexact(dtype, shape, scale_ue8m0, column_major):
+    """Dense fusion preserves the separately stored activation's rounding.
+
+    The legacy fused mode rounds SiLU before multiplication and fails this
+    comparison. Use the real CUDA activation as the compiler-math reference.
+    """
+    torch.manual_seed(42)
+    m, h = shape
+    x = torch.randn(m, 2 * h, device="cuda", dtype=dtype) * 3
+    x[0, :8] = torch.tensor(
+        [0.0, -0.0, 1e-6, -1e-6, 100, -100, float("inf"), float("nan")],
+        device="cuda",
+        dtype=dtype,
+    )
+    _check_dense_silu(x, scale_ue8m0, column_major)
+
+
+@pytest.mark.skipif(
+    not should_run_full_tests(),
+    reason="Set SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 for the sweep",
+)
+def test_dense_silu_extended():
+    """Opt-in amplitude/layout sweep and all 65,536 BF16/FP16 gate encodings."""
+    torch.manual_seed(20261017)
+    layouts = list(itertools.product((False, True), repeat=2))
+    for dtype in (torch.bfloat16, torch.float16):
+        for (m, k), amplitude in itertools.product(
+            ((1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)),
+            (0, 0.001, 1, 10, 100),
+        ):
+            x = (torch.randn(m, 2 * k, device="cuda") * amplitude).to(dtype)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
+        # Signed zeros, subnormals, finite extremes, infinities and NaNs.
+        gate = (
+            torch.arange(65536, device="cuda", dtype=torch.int32)
+            .to(torch.int16)
+            .view(dtype)
+            .reshape(64, 1024)
+        )
+        for up_value in (0, 0.25, 1, 1.125, -2.25):
+            x = torch.cat((gate, torch.full_like(gate, up_value)), dim=1)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
+
+
+def test_dense_silu_graph_replay():
+    """Replays must use new input values and retain the allocated output buffers."""
+    x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(scale_ue8m0=True, column_major_scales=True)
+    q, s = per_token_group_quant(
+        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        per_token_group_quant(
+            x, q, s, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+        )
+    for amplitude in (0, 0.001, 10):
+        x.normal_().mul_(amplitude)
+        graph.replay()
+        expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
+        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(s, expected_s)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"silu_and_mul_mode": "unknown"},
+        {"fuse_silu_and_mul": False},
+        {"out_dtype": torch.int8},
+        {"group_size": 64},
+        {"masked_m": torch.tensor([1], dtype=torch.int32)},
+    ],
+)
+def test_dense_silu_invalid_mode(overrides):
+    x = torch.zeros(1, 256, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(fuse_silu_and_mul=True, silu_and_mul_mode="dense")
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match="mode"):
+        per_token_group_quant(x, **kwargs)
 
 
 # --------------------------------------------------------------------------- #

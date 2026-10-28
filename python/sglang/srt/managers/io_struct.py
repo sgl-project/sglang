@@ -2271,6 +2271,8 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     decode_cuda_graph_bs: Optional[List[int]] = None
     # Measured graph footprint from a matching decode peer.
     decode_cuda_graph_memory_gb: Optional[float] = None
+    # Internal preflight across DP workers; does not change roles.
+    prepare_only: bool = False
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
@@ -2351,6 +2353,18 @@ class SetInternalStateReq(BaseReq, kw_only=True):
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
+
+
+class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
+    pass
+
+
+class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
+    """Carry the L3 availability envelope, including explicit disabled replies."""
+
+    # Untyped on purpose, like GetInternalStateReqOutput: the layout dict is
+    # sanitized with msgspec_to_builtins and can evolve without a migration.
+    layout: Dict[str, Any]
 
 
 class ProfileReqType(Enum):
