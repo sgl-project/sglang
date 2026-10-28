@@ -480,7 +480,18 @@ def test_model_lazy_resolver_keeps_transformer_scoped_backend():
     assert model._resolved_attention_backend is AttentionBackendEnum.CUBE_SPARSE_ATTN
 
 
-def test_token_refiner_routes_cube_selection_to_exact_fa():
+@pytest.mark.parametrize(
+    "selected_backend,prefix,force_fa",
+    [
+        (AttentionBackendEnum.CUBE_SPARSE_ATTN, "test.attn", True),
+        (AttentionBackendEnum.RAIN_FUSION_ATTN, "token_refiner.blocks.0.attn", True),
+        (AttentionBackendEnum.RAIN_FUSION_ATTN, "blocks.0.attn", False),
+        (AttentionBackendEnum.FA, "token_refiner.blocks.0.attn", False),
+    ],
+)
+def test_refiner_dense_backend_selection(selected_backend, prefix, force_fa):
+    """RF refiner must use FA without changing the backend of the DiT stack."""
+
     class FakeImpl:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -495,28 +506,33 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
         def get_impl_cls(self):
             return FakeImpl
 
-    cube = FakeBackend(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+    selected = FakeBackend(selected_backend)
     fa = FakeBackend(AttentionBackendEnum.FA)
     attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
     attention.head_dim = 128
     attention.num_heads = 8
     attention.softmax_scale = 128**-0.5
-    attention.prefix = "test.attn"
+    attention.prefix = prefix
     attention._cube_sparse_capable = False
 
     with patch(
         "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
         return_value=fa,
     ) as resolve:
-        attention._set_attention_backend(cube)
+        attention._set_attention_backend(selected)
 
-    assert attention._attention_backend_enum is AttentionBackendEnum.FA
-    resolve.assert_called_once_with(
-        128,
-        torch.bfloat16,
-        selected_attention_backend=AttentionBackendEnum.FA,
+    assert attention._attention_backend_enum is (
+        AttentionBackendEnum.FA if force_fa else selected_backend
     )
+    if force_fa:
+        resolve.assert_called_once_with(
+            128,
+            torch.bfloat16,
+            selected_attention_backend=AttentionBackendEnum.FA,
+        )
+    else:
+        resolve.assert_not_called()
 
 
 def test_meta_model_captures_component_attention_override():

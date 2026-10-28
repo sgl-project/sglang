@@ -231,6 +231,7 @@ def minimax_h3_packed_sequence(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "stream_layout": stream_layout,
+        "video_spans": [{"start": video_sl.start, "latent_shape": [latent_t, ph, pw]}],
     }
     if include_video_pos:
         # Conditioning keyframes are images. Only generated video rows are
@@ -581,6 +582,19 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "cond_event_orders": tuple(cond_event_orders),
         "cond_audio_stream_lens": tuple(cond_audio_stream_lens),
     }
+    video_spans = [
+        {
+            "start": item["visual_sl"].start,
+            "latent_shape": [
+                int(item["latent_t"]),
+                int(item["latent_h"]) // _PATCH_H,
+                int(item["latent_w"]) // _PATCH_W,
+            ],
+        }
+        for item in block_slices
+        if item["kind"] in ("video", "video_audio")
+    ]
+    video_spans.append({"start": video_sl.start, "latent_shape": [latent_t, ph, pw]})
     packed = {
         "seq_len": seq_len,
         "img_pos": img_pos,
@@ -592,6 +606,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "stream_layout": stream_layout,
+        "video_spans": video_spans,
     }
     if ref_video_pos_parts is not None:
         # Reference image blocks remain dense; reference videos and the

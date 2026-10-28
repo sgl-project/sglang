@@ -1046,7 +1046,11 @@ class MiniMaxH3Attention(nn.Module):
 
     def _set_attention_backend(self, backend) -> None:
         if (
-            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
+            backend.get_enum()
+            in (
+                AttentionBackendEnum.CUBE_SPARSE_ATTN,
+                AttentionBackendEnum.RAIN_FUSION_ATTN,
+            )
             and not self._cube_sparse_capable
         ):
             backend = get_attn_backend(
