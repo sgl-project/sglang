@@ -1143,6 +1143,8 @@ def _attention_backend_default(view: Any) -> dict:
 @register_post_process
 def _mla_backend_page_constraints(view: Any) -> dict:
     """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
     page_size = view.page_size
     if (
         view.attention_backend == "flashmla"
@@ -1180,7 +1182,9 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         # 128 runs on trtllm-gen's dynamic tokens-per-page kernels (flashinfer
         # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
         # TRTLLMHAAttnBackend init where the model config is known.
-        if page_size not in [16, 32, 64, 128]:
+        if page_size not in [16, 32, 64, 128] and not is_deepseek_dsa(
+            model_config_of(view).hf_config
+        ):
             logger.warning(
                 f"TensorRT-LLM MHA only supports page_size of 16, 32, 64 or 128, changing page_size from {page_size} to 64."
             )
