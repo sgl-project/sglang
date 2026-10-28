@@ -966,17 +966,26 @@ class _PeerShards:
 
 def resolve_engram_config(columns: int) -> EngramConfig:
     """The engram_config the layers run. The one place `auto` becomes a lookup: once
-    per process, at model construction, when the parallel layout is final; the
-    result is recorded in the config so later layers read it."""
+    per process, at model construction, when the parallel layout and the GPUs are
+    known; the result is recorded in the config so later layers read it."""
     config = get_exec().offload.engram_config or EngramConfig()
     if config.lookup != EngramLookup.AUTO:
         return config
     parallel = get_parallel()
     tp = parallel.tp_size
     lookup = EngramLookup.ALL_REDUCE
+    # Measured on GB300, B300 and H200 at TP 2-8 and DP 8-32, reading the owner's
+    # shard in place was faster than every collective, for prefill and decode.
+    if (
+        config.placement == EngramPlacement.GPU
+        and is_cuda()
+        and tp > 1
+        and _tp_in_one_nvlink_domain()
+    ):
+        lookup = EngramLookup.PEER_READ
     # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
     # per rank and for decode from DP 4; elsewhere within tens of microseconds.
-    if (
+    elif (
         is_cuda()
         and tp > 1
         and parallel.attn_dp_size == tp
@@ -988,6 +997,18 @@ def resolve_engram_config(columns: int) -> EngramConfig:
     get_context().override("resolve_engram_config", engram_config=config)
     logger.info("Engram lookup auto -> %s", lookup)
     return config
+
+
+def _tp_in_one_nvlink_domain() -> bool:
+    """Collective over the TP group."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+
+    return in_one_nvlink_domain(
+        get_parallel().tp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
 
 
 def shard_range(
