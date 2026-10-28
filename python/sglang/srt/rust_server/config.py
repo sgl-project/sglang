@@ -106,6 +106,8 @@ def _build_server_args(
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
+        # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
+        "rust_server_endpoints": scheduler.rust_server_endpoints,
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
@@ -116,6 +118,7 @@ def _build_server_args(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -131,6 +134,9 @@ def _build_server_args(
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,

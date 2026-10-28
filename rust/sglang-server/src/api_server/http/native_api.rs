@@ -4,7 +4,7 @@
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
 //! tuples, cumulative vs incremental streams) lives here; submission and
-//! request lifetime belong to the shared [`crate::api_server::core::CoreHandle`].
+//! request lifetime belong to the shared [`crate::api_server::handlers::CoreHandle`].
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use super::app::AppState;
 use super::generate_hook::{GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys};
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{
-    CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
-};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
+use crate::api_server::handlers::{CoreCall, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]
@@ -46,7 +45,7 @@ use sglang_api_types::api::v1 as api;
 /// `/generate` currently exposes only `e2e_latency`; this avoids putting
 /// API-only timestamps onto scheduler messages.
 #[derive(Clone, Debug)]
-struct RequestTiming {
+pub(super) struct RequestTiming {
     // TODO: Move request lifecycle timing into a dedicated tracing/metrics
     // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
@@ -55,7 +54,7 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             created_at: Instant::now(),
             time_to_first_token: None,
@@ -87,7 +86,7 @@ impl RequestTiming {
 /// API-local state for one request: its timing, and the annotator a model
 /// package's [`GenerateHook`](super::generate_hook::GenerateHook) started for
 /// it.
-struct RequestState {
+pub(super) struct RequestState {
     timing: RequestTiming,
     /// The scheduler's decode latency, sent for a finished non-streaming
     /// request: this frontend sees that request's first output only up to
@@ -98,7 +97,7 @@ struct RequestState {
 }
 
 impl RequestState {
-    fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
+    pub(super) fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
         Self {
             timing,
             scheduler_decode_latency: None,
@@ -152,7 +151,7 @@ impl RequestState {
 /// One native `/generate` frame: the `api.v1` frame, plus the keys a model
 /// package's hook added after the schema's own.
 #[derive(Debug)]
-struct NativeFrame {
+pub(super) struct NativeFrame {
     frame: api::GenerateResponse,
     keys: Option<Box<GenerateFrameKeys>>,
 }
@@ -328,41 +327,11 @@ async fn generate(
     {
         return native_error(StatusCode::BAD_REQUEST, &error, false);
     }
-    // Read before the fills below: only a `max_new_tokens` the client sent is
-    // checked against the context window.
-    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    // Launch-time preferred sampling params fill in beneath the request's own
-    // keys before decoding, so an explicit request value (even a default or
-    // null) wins: Python TokenizerManager's precedence.
-    if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
-    {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
-    let default_max_new_tokens = serde_json::json!({
-        "max_new_tokens": state.server_args.default_max_new_tokens,
-    });
-    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // The schema (sglang_api_types) is the contract: decode errors carry
-    // serde's field-level text, as Python's 400s do.
-    let body: api::GenerateRequest = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    let (payloads, is_batch) = match generate_requests(&state, body) {
+        Ok(requests) => requests,
+        Err((code, message, stream)) => return native_error(code, &message, stream),
     };
-    let stream = body.stream.unwrap_or(false);
-    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
-    // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (mut payloads, is_batch) = match into_requests(body, &state.generation_policy) {
-        Ok(v) => v,
-        // Request normalization only returns validation failures.
-        Err(e) => {
-            return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
-        }
-    };
-    client_max_new_tokens.mark(&mut payloads);
+    let stream = payloads.first().is_some_and(|request| request.stream);
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
@@ -380,6 +349,46 @@ async fn generate(
     } else {
         generate_batch(&state, payloads, stream, timing).await
     }
+}
+
+/// Decode a `/generate` body under the launch-time defaults into its requests and
+/// whether it is a batch; an error carries the body's `stream` flag once known.
+pub(super) fn generate_requests(
+    state: &AppState,
+    mut body: serde_json::Value,
+) -> Result<(Vec<GenerateRequest>, bool), (StatusCode, String, bool)> {
+    // Read before the fills below: only a `max_new_tokens` the client sent is
+    // checked against the context window.
+    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
+    // Launch-time preferred sampling params fill in beneath the request's own
+    // keys before decoding, so an explicit request value (even a default or
+    // null) wins: Python TokenizerManager's precedence.
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
+    {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
+    let default_max_new_tokens = serde_json::json!({
+        "max_new_tokens": state.server_args.default_max_new_tokens,
+    });
+    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // The schema (sglang_api_types) is the contract: decode errors carry
+    // serde's field-level text, as Python's 400s do.
+    let body: api::GenerateRequest = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
+    };
+    let stream = body.stream.unwrap_or(false);
+    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
+    // payloads. `is_batch` = list form -> the response is a JSON array.
+    // Request normalization only returns validation failures.
+    let (mut requests, is_batch) = into_requests(body, &state.generation_policy)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string(), stream))?;
+    client_max_new_tokens.mark(&mut requests);
+    Ok((requests, is_batch))
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -420,7 +429,7 @@ async fn generate_single(
 /// failed batch item is its own `{ "error": ... }` entry in the array).
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
-enum GenerateItem {
+pub(super) enum GenerateItem {
     // Boxed: a frame is ~300 bytes against the error's ~40, and a batch
     // array holds one per item.
     Frame(Box<NativeFrame>),
@@ -428,11 +437,26 @@ enum GenerateItem {
 }
 
 /// Fold a unary request to its terminal HTTP result. Shared by single + batch.
-async fn drain_unary(
+pub(super) async fn drain_unary(
+    call: &mut CoreCall,
+    rid_str: &str,
+    request: RequestState,
+) -> (StatusCode, GenerateItem) {
+    match drain_unary_frame(call, rid_str, request).await {
+        Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
+        Err(error) => (
+            error.http_status(),
+            GenerateItem::Error(error.stream_error(None)),
+        ),
+    }
+}
+
+/// [`drain_unary`]'s terminal frame, or the error that failed the call.
+pub(super) async fn drain_unary_frame(
     call: &mut CoreCall,
     rid_str: &str,
     mut request: RequestState,
-) -> (StatusCode, GenerateItem) {
+) -> Result<NativeFrame, CoreError> {
     let mut accumulated = CoreOutput::default();
     while let Some(item) = call.recv().await {
         match item {
@@ -444,25 +468,17 @@ async fn drain_unary(
                 request.finish(&out);
                 accumulated.append_delta(&out);
                 let e2e_latency = Some(e2e_latency(&request.timing));
-                let frame = request.frame(accumulated.frame(rid_str, None, e2e_latency));
-                return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
+                return Ok(request.frame(accumulated.frame(rid_str, None, e2e_latency)));
             }
             CoreEvent::Failed(error) => {
                 request.timing.finish();
-                return (
-                    error.http_status(),
-                    GenerateItem::Error(error.stream_error(None)),
-                );
+                return Err(error);
             }
         }
     }
     // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
-    let truncated = CoreError::ResponseTruncated;
-    (
-        truncated.http_status(),
-        GenerateItem::Error(truncated.stream_error(None)),
-    )
+    Err(CoreError::ResponseTruncated)
 }
 
 /// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
@@ -515,10 +531,22 @@ async fn generate_batch(
 /// Multiplex calls into SSE `data` strings + a final `[DONE]`; `with_index` tags
 /// each frame (batch only), `incremental` = delta vs cumulative. Each call
 /// aborts itself if the stream is dropped while it is unfinished.
-fn generation_event_stream(
+pub(super) fn generation_event_stream(
     calls: Vec<(CoreCall, RequestState)>,
     incremental: bool,
     with_index: bool,
+) -> impl futures::Stream<Item = String> {
+    generation_event_stream_with(calls, incremental, with_index, |error, index| {
+        json_string(&error.stream_error(index))
+    })
+}
+
+/// [`generation_event_stream`], writing a failed call's frame with `error_frame`.
+pub(super) fn generation_event_stream_with(
+    calls: Vec<(CoreCall, RequestState)>,
+    incremental: bool,
+    with_index: bool,
+    error_frame: impl Fn(&CoreError, Option<u32>) -> String,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         use futures::StreamExt;
@@ -557,7 +585,7 @@ fn generation_event_stream(
             let mut terminal = None;   // (finish_reason) of a `Done` in this batch
             let mut failed = None;     // an `Error` in this batch
 
-            for item in items {
+            for item in items.into_iter().map(stream_event) {
                 match item {
                     CoreEvent::Delta(out) => {
                         requests[i].timing.observe_first_output();
@@ -582,7 +610,7 @@ fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                yield json_string(&error.stream_error(idx(i)));
+                yield error_frame(&error, idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
@@ -606,6 +634,20 @@ fn generation_event_stream(
             }
         }
         yield "[DONE]".to_string();
+    }
+}
+
+/// A stream's view of `event`: a scheduler abort that carried an error status
+/// ends a native stream as Python's server ends it, on a normal terminal frame
+/// whose `meta_info.finish_reason` is the abort, status code and message
+/// included. A unary response reports the abort's status instead.
+fn stream_event(event: CoreEvent) -> CoreEvent {
+    match event {
+        CoreEvent::Failed(error) => match error.into_rejected_output() {
+            Ok(output) => CoreEvent::Finished(output),
+            Err(error) => CoreEvent::Failed(error),
+        },
+        event => event,
     }
 }
 
@@ -707,16 +749,17 @@ mod tests {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -724,6 +767,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -749,16 +793,17 @@ mod tests {
             ..Default::default()
         };
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 abort_tx,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: activity.clone(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             ),
@@ -766,6 +811,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         // Each probe that reaches intake counts as scheduler output.
         tokio::spawn(async move {
@@ -788,16 +834,17 @@ mod tests {
     async fn unary_http_generate_round_trips_through_frontend_handle() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             abort_tx,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -807,6 +854,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
 
         let responder = tokio::spawn(async move {
@@ -868,16 +916,17 @@ mod tests {
         items: usize,
     ) -> Vec<(Option<i64>, bool)> {
         let (intake_tx, intake_rx) = flume::unbounded();
-        let core = crate::api_server::core::CoreHandle::new(
+        let core = crate::api_server::handlers::CoreHandle::new(
             intake_tx,
             flume::unbounded().0,
-            crate::api_server::core::CoreConfig {
+            crate::api_server::handlers::CoreConfig {
                 response_capacity: 8,
                 response_activity: Default::default(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
             },
         );
@@ -887,6 +936,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         let responder = tokio::spawn(async move {
             let mut submitted = Vec::new();
@@ -1092,16 +1142,17 @@ mod tests {
             (true, true, false),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
-            let core = crate::api_server::core::CoreHandle::new(
+            let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
                 flume::unbounded().0,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: crate::api_server::core::CoreMetadata::default(),
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                 },
             );
@@ -1114,6 +1165,7 @@ mod tests {
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
+                openai_chat: None,
             });
             // Both items' delta, then both terminals: an incremental stream
             // emits two frames per item.
@@ -1487,30 +1539,50 @@ mod tests {
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
 
+    /// A scheduler abort that carried an error status ends a stream on a
+    /// normal frame, as Python's server ends it: the output so far, the
+    /// request's counts, and the abort as the finish reason, then `[DONE]`.
+    /// A unary response answers with the abort's status and message instead.
     #[tokio::test]
-    async fn scheduler_rejection_preserves_legacy_http_status() {
+    async fn scheduler_abort_ends_a_stream_on_a_frame_and_fails_unary() {
+        let finish_reason = serde_json::json!({
+            "type": "abort",
+            "message": "media decode failed",
+            "status_code": 432,
+            "err_type": "BadRequestError"
+        });
+        let abort = |rid: u64| {
+            ResponseItem::Done(ChunkEvent {
+                rid: Rid::from(rid.to_string()),
+                prompt_tokens: 5,
+                finish_reason: serde_json::from_value(finish_reason.clone()).unwrap(),
+                ..Default::default()
+            })
+        };
+
         let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, false, false);
+        let stream = generation_event_stream(vec![timed_call(10, rx)], false, false);
         futures::pin_mut!(stream);
-
-        tx.send(ResponseItem::Done(ChunkEvent {
-            finish_reason: serde_json::from_value(serde_json::json!({
-                "type": "abort",
-                "message": "media decode failed",
-                "status_code": 432,
-                "err_type": "BadRequestError"
-            }))
-            .unwrap(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-
-        let failure = parse(&stream.next().await.unwrap());
-        assert_eq!(failure["error"]["code"], 432);
-        assert_eq!(failure["error"]["message"], "media decode failed");
+        tx.send(frame(10, "partial")).await.unwrap();
+        assert_eq!(parse(&stream.next().await.unwrap())["text"], "partial");
+        tx.send(abort(10)).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert!(v.get("error").is_none(), "no error item: {v}");
+        assert_eq!(v["text"], "partial");
+        assert_eq!(v["meta_info"]["prompt_tokens"], 5);
+        assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert_eq!(v["meta_info"]["finish_reason"], finish_reason);
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(abort(11)).await.unwrap();
+        let (mut call, timing) = timed_call(11, rx);
+        let (status, item) = drain_unary(&mut call, "11", timing).await;
+        assert_eq!(status.as_u16(), 432);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["error"]["code"], 432);
+        assert_eq!(v["error"]["message"], "media decode failed");
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
