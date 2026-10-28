@@ -81,7 +81,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.enable_unified_cache_external_linker = False
     s.parts.require_mlp_sync = False
     s.parts.spec_algorithm = MagicMock()
-    s.parts.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    s.parts.server_args = MagicMock()
     s.parts.lists.decoding = []
     s.hub.step_planner = MagicMock(spec=StepPlanner)
     s.hub.request_intake = MagicMock()

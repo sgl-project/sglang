@@ -37,7 +37,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
-    get_spec,
     hicache_storage_enabled,
     publish,
     spawn_world_rank,
@@ -1035,7 +1034,6 @@ class Scheduler:
             and stages.select_decode is not None
             and self.parts.require_mlp_sync
             and not self.parts.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
