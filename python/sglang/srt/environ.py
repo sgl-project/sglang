@@ -873,6 +873,11 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    # "te" (classic mooncake.engine) or "tent" (native `tent` module).
+    SGLANG_MOONCAKE_TRANSFER_ENGINE = EnvStr("te")
+    # JSON object deep-merged into the generated TENT config, e.g.
+    # '{"transports": {"rdma": {"numa_penalties": [1.0, 1.5, 10.0]}}}'.
+    SGLANG_TENT_CONFIG_OVERRIDE = EnvStr(None)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(True)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
     SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
