@@ -71,12 +71,9 @@ class TokenSpaceProcessStrategy:
         self.mm_token_expansion_params = {}
 
     def resolve_media_options(
-        self, processor, *, image_device=None, video_device=None, **kwargs
+        self, processor, *, image_device=None, video_device=None
     ) -> dict:
-        """Per-modality options for one request: configured options plus devices.
-
-        Other request kwargs are dropped unless a strategy routes them itself.
-        """
+        """Per-modality options for one request: configured options plus devices."""
         image_options = dict(self.image_config)
         video_options = dict(self.video_config)
         if image_device is not None:
@@ -152,7 +149,6 @@ class TokenSpaceProcessStrategy:
         input_ids: list[int],
         *,
         processor,
-        **kwargs,
     ) -> BatchFeature:
         """Return the batched expanded input_ids with the media fields."""
         return BatchFeature(
