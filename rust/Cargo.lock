@@ -3988,6 +3988,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-disagg"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pyo3",
+]
+
+[[package]]
 name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [

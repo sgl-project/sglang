@@ -1,0 +1,31 @@
+[package]
+name = "sglang-disagg"
+description = "Byte-exact wire codecs and room state machines for the SGLang P/D disaggregation data plane (Python-owned wire formats)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.sglang]
+python-module = "sglang.srt.disaggregation.rust_wire.disagg_wire"
+debug = false
+features = ["python-extension"]
+
+[lib]
+# rlib for workspace tests; cdylib for the Python extension build.
+name = "disagg_wire"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = "1"
+
+[features]
+# Compiles csrc/nixl_shim.cc against the NIXL C++ headers (Linux/CUDA hosts
+# only; NIXL_INCLUDE_DIR overrides the default /usr/local/include search).
+# Feature-off builds — including macOS dev machines — never touch csrc.
+nixl = []
+# PyO3 bindings (src/py.rs) for the wire codecs. Wheel and source builds
+# select this through package metadata; plain workspace builds stay pyo3-free.
+python-extension = ["dep:pyo3"]

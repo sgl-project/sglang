@@ -1101,10 +1101,9 @@ impl ChatResponder {
                 ));
             }
         }
-        if self.tools.is_some() {
+        if let Some(tools) = self.tools.as_ref() {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
-            let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
                 tool_detector(&tools.0, &tools.1).expect("checked when lowering")
             });

@@ -46,6 +46,8 @@ struct PrefillServerInfo {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    decode_allocation_policy: String,
+    enable_kv_cache_sharding: bool,
     prefill_http_port: Option<i64>,
 }
 
@@ -114,6 +116,10 @@ struct Topology {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    /// Python assigns every PUT (all PUTs must agree, enforced by the 400);
+    /// empty only before the first registration, which `_is_ready` excludes.
+    decode_allocation_policy: String,
+    enable_kv_cache_sharding: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -169,6 +175,10 @@ struct Route {
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    decode_allocation_policy: Option<String>,
+    #[serde(default)]
+    enable_kv_cache_sharding: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -184,17 +194,31 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         body.system_dp_rank
     };
 
+    // Python `data.get("decode_allocation_policy", "early")`.
+    let policy = body
+        .decode_allocation_policy
+        .clone()
+        .unwrap_or_else(|| "early".to_string());
+
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
     let mut layout_mismatch = false;
+    let mut policy_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
+        // Python checks dsv41 first and returns before evaluating the policy,
+        // so a layout mismatch suppresses the policy check entirely.
         layout_mismatch =
             topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
         if layout_mismatch {
             return topo;
         }
+        policy_mismatch = topo.registered_count > 0 && topo.decode_allocation_policy != policy;
+        if policy_mismatch {
+            return topo;
+        }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
+        topo.decode_allocation_policy = policy.clone();
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -217,6 +241,8 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        topo.enable_kv_cache_sharding
+            .get_or_insert(body.enable_kv_cache_sharding.unwrap_or(false));
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -232,6 +258,12 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         return json_error(
             StatusCode::BAD_REQUEST,
             "DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+        );
+    }
+    if policy_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Inconsistent prefill allocation policies",
         );
     }
 
@@ -293,6 +325,8 @@ async fn route_get(
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
+            decode_allocation_policy: topo.decode_allocation_policy.clone(),
+            enable_kv_cache_sharding: topo.enable_kv_cache_sharding.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -531,6 +565,8 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "decode_allocation_policy": "early",
+                "enable_kv_cache_sharding": false,
                 "prefill_http_port": 30000,
             })
         );
@@ -575,6 +611,51 @@ mod tests {
         let (_, body) = request(addr, "GET", SENTINEL, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    /// `decode_allocation_policy` is served verbatim and a disagreeing rank
+    /// gets Python's 400 — the decode cross-checks its own policy against
+    /// this key (conn.py `CommonKVReceiver`), so dropping it would silently
+    /// turn "prefill_complete" prefills into "early" and fire false
+    /// mismatch errors (or mask real ones). `enable_kv_cache_sharding` is
+    /// first-wins like Python (`if ... is None`).
+    #[test]
+    fn allocation_policy_conflict_and_kv_sharding() {
+        let (_rt, addr) = start_on_free_port();
+
+        let body = put_route(serde_json::json!({
+            "decode_allocation_policy": "prefill_complete",
+            "enable_kv_cache_sharding": true,
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["decode_allocation_policy"], "prefill_complete");
+        assert_eq!(info["enable_kv_cache_sharding"], true);
+
+        // Same policy keeps registering (ready check is satisfied at 1 rank
+        // here, but the conflict gate keys on registered_count, not ready).
+        let agree = put_route(serde_json::json!({
+            "decode_allocation_policy": "prefill_complete",
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&agree)).0, 200);
+
+        let disagree = put_route(serde_json::json!({
+            "decode_allocation_policy": "early",
+        }));
+        let (status, body) = request(addr, "PUT", "/route", Some(&disagree));
+        assert_eq!(status, 400);
+        assert!(body.contains("Inconsistent prefill allocation policies"));
+
+        // A rejected PUT must not overwrite the stored policy...
+        let (_, body) = request(addr, "GET", SENTINEL, None);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["decode_allocation_policy"], "prefill_complete");
+
+        // ...and kv-sharding stays first-wins even for accepted PUTs.
+        assert_eq!(info["enable_kv_cache_sharding"], true);
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis
