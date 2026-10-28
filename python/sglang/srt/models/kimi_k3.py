@@ -1270,11 +1270,8 @@ class KimiK3MoE(nn.Module):
         skips it as well, so those keep the bf16 contract even though the
         runner backend is the same.
 
-        On the aiter runner only the mxfp4 SiTUv2 A8W4 route reads a strided
-        bf16 slice: its mxfp8 activation quant indexes rows by
-        input.stride(-2). The A16W4 default makes the slice contiguous inside
-        aiter, and A4W4 and the other aiter MoE methods were not checked for
-        strided input, so they keep the dense buffer."""
+        On aiter, the SiTUv2 A8W4 mxfp8 quant indexes rows by input.stride(-2);
+        every other aiter route still gets the dense bf16 buffer."""
         from sglang.srt.layers.quantization.mxfp4 import (
             Mxfp4MoEMethod,
             _aiter_situ_uses_a8w4,

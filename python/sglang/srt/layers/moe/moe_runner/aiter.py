@@ -250,11 +250,7 @@ class AiterRunnerCore(MoeRunnerCore):
             and extra.get("stage2_scatter") is None
             and _aiter_fused_moe_supports_output()
         ):
-            # MORI EPv2 skips staging when this exact arena view is returned; a
-            # buffer published through zero_copy_context saves the caller a copy.
-            # fused_moe raises on a buffer unlike the one it would allocate, so
-            # only a matching published buffer is passed. Older AITER versions,
-            # no_combine and stage2_scatter keep their old path.
+            # Pass MORI EPv2's arena view when set, else a matching published buffer.
             output = runner_input.output
             if output is None:
                 output = zero_copy_context.get_moe_output_spec(
