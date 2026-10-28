@@ -468,6 +468,36 @@ class TestDraftDecodeWindowBackendWiring(unittest.TestCase):
             self.skipTest(f"flashinfer backend import unavailable: {e}")
         self._assert_backend_wires(FlashInferMultiStepDraftBackend)
 
+    def test_ascend_backend_wires_window_sink(self):
+        """Ascend implements sink+window as a KV mask instead of index clipping.
+
+        The multi-step backend must resolve the window/sink and thread them into
+        every per-step backend; the metadata builder must consume them via
+        build_draft_window_mask (the mask equivalent of the kernel passthrough).
+        """
+        try:
+            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                AscendAttnMultiStepDraftBackend,
+            )
+        except ImportError as e:  # pragma: no cover
+            self.skipTest(f"ascend backend import unavailable: {e}")
+        init_src = inspect.getsource(AscendAttnMultiStepDraftBackend.__init__)
+        self.assertIn("resolve_draft_decode_window", init_src)
+        self.assertIn("self.draft_window_size", init_src)
+        self.assertIn("self.draft_sink_size", init_src)
+        from sglang.srt.hardware_backend.npu.attention import ascend_backend
+
+        self.assertIn(
+            "build_draft_window_mask",
+            inspect.getsource(
+                ascend_backend.AscendAttnBackend._apply_cuda_graph_metadata
+            ),
+        )
+        self.assertIn(
+            "build_draft_window_mask",
+            inspect.getsource(ascend_backend.AscendAttnBackend.init_forward_metadata),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

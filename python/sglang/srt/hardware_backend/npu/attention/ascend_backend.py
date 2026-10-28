@@ -120,6 +120,10 @@ class ForwardMetadata:
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
 
+    # draft-decode sink+window mask (True = masked out) for speculative draft
+    # decoding; None unless --speculative-draft-window-size resolved.
+    draft_window_mask: Optional[torch.Tensor] = None
+
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
@@ -311,7 +315,13 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        speculative_step_id: int = 0,
+        draft_window_size: int = 0,
+        draft_sink_size: int = 0,
+    ):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
@@ -320,6 +330,8 @@ class AscendAttnBackend(AttentionBackend):
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
         )
+        self.draft_window_size = draft_window_size
+        self.draft_sink_size = draft_sink_size
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
@@ -637,6 +649,23 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens + self.speculative_step_id + 1
                 )
 
+        if (
+            self.draft_window_size > 0
+            and not self.use_mla
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        ):
+            from sglang.srt.speculative.spec_utils import build_draft_window_mask
+
+            mask_width = self.forward_metadata.block_tables.shape[1] * self.page_size
+            self.forward_metadata.draft_window_mask = build_draft_window_mask(
+                self.forward_metadata.seq_lens,
+                self.forward_metadata.seq_lens + self.speculative_step_id + 1,
+                self.draft_window_size,
+                self.draft_sink_size,
+                mask_width,
+            ).unsqueeze(1)
+
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
         # block_tables (which are also built from the pre-pad batch here).
@@ -809,6 +838,15 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        if self.draft_window_size > 0:
+            # Pre-allocated at max size, sliced per batch size during capture,
+            # content updated via copy_() during replay (same pattern as
+            # swa_mask above).
+            self.graph_metadata["draft_window_mask"] = torch.ones(
+                (max_bs, 1, total_context_len),
+                dtype=torch.bool,
+                device=self.device,
+            )
         # V4-specific extra graph buffers. Default no-op on the base class;
         # DeepseekV4AscendAttnBackend overrides.
         self._init_dsv4_graph_buffers(max_bs=max_bs, max_num_tokens=max_num_tokens)
@@ -861,6 +899,10 @@ class AscendAttnBackend(AttentionBackend):
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
+        if self.draft_window_size > 0:
+            metadata.draft_window_mask = self.graph_metadata["draft_window_mask"][
+                :bs, :, :
+            ]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
@@ -1101,6 +1143,22 @@ class AscendAttnBackend(AttentionBackend):
                     kv_lens = seq_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            if self.draft_window_size > 0:
+                # the visible KV is prefix + step + 1, minus the middle
+                # band [sink, seq_len - window).
+                from sglang.srt.speculative.spec_utils import build_draft_window_mask
+
+                prefix_lens = seq_lens_cpu[:bs].int().to(seq_lens.device)
+                kv_lens = prefix_lens + self.speculative_step_id + 1
+                mask = build_draft_window_mask(
+                    prefix_lens,
+                    kv_lens,
+                    self.draft_window_size,
+                    self.draft_sink_size,
+                    metadata.draft_window_mask.shape[-1],
+                )
+                metadata.draft_window_mask[:bs, 0, :].copy_(mask)
+                metadata.draft_window_mask[bs:, :, :].fill_(True)
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
@@ -2937,7 +2995,8 @@ class AscendAttnBackend(AttentionBackend):
                 attn_mask = self.forward_metadata.swa_mask
             else:
                 block_tables = self.forward_metadata.block_tables
-                attn_mask = None
+                # None unless the draft window is resolved.
+                attn_mask = self.forward_metadata.draft_window_mask
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
@@ -3163,6 +3222,62 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.forward_metadata.draft_window_mask is not None:
+                query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_len_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
+                workspace = (
+                    torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                        query,
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                        ),
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSH",
+                        scale=layer.scaling,
+                        actual_seq_lengths_kv=actual_seq_len_kv,
+                        atten_mask=self.forward_metadata.draft_window_mask,
+                        sparse_mode=0,
+                    )
+                )
+                output = torch.empty(
+                    (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query,
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSH",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    atten_mask=self.forward_metadata.draft_window_mask,
+                    sparse_mode=0,
+                    workspace=workspace,
+                    out=[output, softmax_lse],
+                )
+                return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -3556,10 +3671,57 @@ class AscendAttnMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
 
+        from sglang.srt.speculative.spec_utils import resolve_draft_decode_window
+
+        self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
+            model_runner
+        )
+        if self.draft_window_size > 0 and (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+        ):
+            logger.warning(
+                "Ignoring --speculative-draft-window-size=%d / "
+                "--speculative-draft-sink-size=%d: the Ascend fused decode "
+                "attention operators cannot express the sink+window mask for "
+                "MLA draft attention, so draft-decode windowing stays off "
+                "entirely (the draft keeps full-KV attention).",
+                self.draft_window_size,
+                self.draft_sink_size,
+            )
+            self.draft_window_size, self.draft_sink_size = 0, 0
+        elif self.draft_window_size > 0 and model_runner.is_hybrid_swa:
+            # This draft already windows itself per layer via its own native
+            # SWA (some layers full attention). The backend mask is one
+            # uniform visible set shared by every layer, so applying it would
+            # double-window the SWA layers and wrongly window the full-attention
+            # layers. The draft's native SWA stays authoritative.
+            logger.warning(
+                "Ignoring --speculative-draft-window-size=%d / "
+                "--speculative-draft-sink-size=%d: this draft model applies "
+                "its own per-layer sliding window (hybrid SWA), which "
+                "overrides the backend sink+window mask. The draft keeps its "
+                "native per-layer windowing; the backend mask stays off.",
+                self.draft_window_size,
+                self.draft_sink_size,
+            )
+            self.draft_window_size, self.draft_sink_size = 0, 0
+        if self.draft_window_size > 0:
+            logger.info(
+                "Draft-decode sink+window enabled on Ascend: window_size=%d, "
+                "sink_size=%d.",
+                self.draft_window_size,
+                self.draft_sink_size,
+            )
+
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                AscendAttnBackend(
+                    model_runner,
+                    speculative_step_id=step_id,
+                    draft_window_size=self.draft_window_size,
+                    draft_sink_size=self.draft_sink_size,
+                )
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
 
