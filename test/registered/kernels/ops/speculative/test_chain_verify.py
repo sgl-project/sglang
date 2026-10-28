@@ -29,7 +29,13 @@ def chain_case(bs, width, vocab, g, dev, ties=False):
     retrieve_next_token = torch.arange(1, width + 1, device=dev).repeat(bs, 1)
     retrieve_next_token[:, -1] = -1
     retrieve_next_sibling = torch.full_like(retrieve_next_token, -1)
-    return logits, candidates, retrieve_index, retrieve_next_token, retrieve_next_sibling
+    return (
+        logits,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+    )
 
 
 def reference(logits, candidates, ri, rn, rs, depth):
@@ -67,6 +73,19 @@ class TestGreedyChainVerify(CustomTestCase):
                             got = greedy_chain_verify(*case[:4], width)[:4]
                             for w, o in zip(want, got):
                                 torch.testing.assert_close(o, w, rtol=0, atol=0)
+
+    def test_accept_lens(self):
+        dev = torch.device("cuda")
+        g = torch.Generator(device=dev).manual_seed(1)
+        for bs in (1, 2, 16):
+            with self.subTest(bs=bs):
+                case = chain_case(bs, 4, 154880, g, dev, ties=True)
+                lens = torch.full((bs,), -7, dtype=torch.int32, device=dev)
+                got = greedy_chain_verify(*case[:4], 4, accept_lens=lens)
+                plain = greedy_chain_verify(*case[:4], 4)
+                for w, o in zip(plain[:4], got[:4]):
+                    torch.testing.assert_close(o, w, rtol=0, atol=0)
+                torch.testing.assert_close(lens, got[2] + 1, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
