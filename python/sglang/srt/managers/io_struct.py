@@ -205,9 +205,9 @@ class GenerateReqInput:
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
     # request when each request has one image, or one list of hashes per request.
-    # Routing hints only: they supplement, never replace, the server-computed
-    # identity of actual content, shape, dtype, and processor configuration.
-    # Identical caller hashes cannot authorize sharing between different media.
+    # Legacy routing hints, ignored for cache identity. The server identifies
+    # actual content, shape, dtype, and processor configuration independently;
+    # identical caller hashes cannot authorize sharing between different media.
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
     # Optional `sha256:<64-hex>` identities verified against original media
     # contents. They do not replace the embedding/prefix-cache identity.
