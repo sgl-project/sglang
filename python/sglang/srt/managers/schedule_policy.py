@@ -5,10 +5,13 @@ import logging
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
+    get_context,
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
     get_schedule,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -212,6 +215,7 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
+        bootstrap_queue: List[Req] = [],
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -274,14 +278,20 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._touch_waiting_prefixes(policy, waiting_queue)
+        self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
 
-    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+    def _touch_waiting_prefixes(
+        self,
+        policy: Policy,
+        waiting_queue: List[Req],
+        bootstrap_queue: List[Req] = [],
+    ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
+        bootstrap_max = envs.SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX.get()
         if (
             isinstance(policy, CacheAwarePolicy)
-            or not waiting_queue
+            or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
             or get_memory().radix_eviction_policy.lower() != "lru"
@@ -295,6 +305,9 @@ class SchedulePolicy:
         self._waiting_prefix_refresh_calls += 1
         if not refresh:
             return
+        # Bootstrap-queued requests run after the waiting queue, so touch them first.
+        for r in reversed(bootstrap_queue[:bootstrap_max]):
+            touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
@@ -580,6 +593,27 @@ class _PrefillAdmission:
     replay_len: int
 
 
+def mamba_prefill_chunk_grid() -> int:
+    """Grid a truncated prefill cut must land on, or 1 to leave the cut alone.
+
+    DCP donates a mamba checkpoint only when the cached prefix is a whole
+    number of kernel chunks from the extend start and also on the radix page.
+    A cut off that grid costs the request every later donation. Without DCP,
+    #40907 donates from a prefix-relative snapshot, so rounding the cut would
+    only drop up to one grid of prefill budget. A PrefillAdder built before
+    the server config is published, as in unit tests, also leaves the cut.
+    """
+    ctx = get_context()
+    if not (
+        ctx.is_config_namespace_published("exec")
+        and ctx.is_config_namespace_published("parallel")
+        and get_exec().mamba.enable_mamba_extra_buffer
+        and get_parallel().dcp_enabled
+    ):
+        return 1
+    return mamba_cache_chunk_size()
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -601,6 +635,11 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
     ):
         self.page_size = page_size
+        # DCP donates a checkpoint only on the kernel chunk grid. A cut off
+        # that grid costs the request every later donation, so keep it there.
+        # Without DCP the prefix-relative depth rule already donates, and
+        # rounding would only shorten the chunk.
+        self.mamba_chunk_grid = mamba_prefill_chunk_grid()
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -830,6 +869,17 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
+        """Round a *truncated* chunk down to the mamba kernel chunk grid.
+
+        The chunk that finishes a request may stop anywhere, so only shorten
+        when `trunc_len` really is a cut. Leave the cut alone when rounding
+        would empty it: making no progress is worse than losing a donation.
+        """
+        if self.mamba_chunk_grid <= 1 or trunc_len >= remaining:
+            return trunc_len
+        return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
 
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
@@ -1139,7 +1189,9 @@ class PrefillAdder:
         if _rem_tokens is None:
             return req
         truncated = cand_extend_input_len > _rem_tokens
-        new_len = min(cand_extend_input_len, _rem_tokens)
+        new_len = self.floor_chunked_tokens(
+            min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
+        )
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1312,7 +1364,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self.floor_chunked_tokens(
+                self.rem_chunk_tokens, cand_extend_input_len
+            )
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1409,6 +1463,19 @@ class PrefillAdder:
                 )
             ):
                 return AddReqResult.OTHER
+
+            # Reserve sharded scratch before any load-back is queued: a load
+            # must be consumed by this batch, whose prefix gather waits on it.
+            if self.kv_shard_scratch_spec is not None:
+                scratch_mark = (
+                    self.kv_shard_block_bound_pages,
+                    self.kv_shard_chunk_pages,
+                )
+                reserved_for = (admission.prefix_len, admission.extend_len)
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
 
             if req.needs_host_load_back():
                 load_max_new = min(max_new, admission.max_new_tokens)
@@ -1513,11 +1580,19 @@ class PrefillAdder:
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.cache_protected_len = req.prefix_len
 
-            # Sharded pools cannot load host KV; reserve scratch after all other gates.
-            if not self._kv_shard_reserve_scratch(
-                prefix_len=admission.prefix_len, extend_len=admission.extend_len
+            if (
+                self.kv_shard_scratch_spec is not None
+                and (admission.prefix_len, admission.extend_len) != reserved_for
             ):
-                return AddReqResult.OTHER
+                # No FULL was loaded (sharded trees have no aux components),
+                # so deferring here leaves no H2D without its consumer.
+                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                    scratch_mark
+                )
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
