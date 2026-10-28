@@ -146,6 +146,16 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
 
+    # Before hisparse / V4.1 validation reads the unified-KV gate. V4 Pro on
+    # gfx1250 selects aiter decode; model_type deepseek_v41 does not.
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        maybe_enable_gfx1250_v4_unified_kv,
+    )
+
+    maybe_enable_gfx1250_v4_unified_kv(
+        getattr(model_config_of(server_args).hf_config, "model_type", None)
+    )
+
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
