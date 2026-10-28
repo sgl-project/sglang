@@ -457,6 +457,7 @@ POSITIONAL_FIELD_ORDER = (
     "remote_instance_weight_loader_send_weights_group_ports",
     "remote_instance_weight_loader_backend",
     "remote_instance_weight_loader_start_seed_via_transfer_engine",
+    "remote_instance_weight_loader_start_seed_via_nixl",
     "engine_info_bootstrap_port",
     "modelexpress_config",
     "download_dir",
