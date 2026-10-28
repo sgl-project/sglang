@@ -152,6 +152,12 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
             pass
         else:
             raise AssertionError("the INT4 / INT8 JIT build ran INT6")
+        try:
+            jit.qr_all_reduce(jit_comm, inp.half(), out.half(), _INT8, True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("the bf16-only JIT build took float16")
         jit.qr_destroy(jit_comm)
         aot.qr_destroy(aot_comm)
     finally:
