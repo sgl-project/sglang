@@ -78,6 +78,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.cuda_graph_kv_indices = torch.zeros(256, dtype=torch.int64)
     backend.kv_index_translator = _KVIndexTranslator()
     backend.sliding_window_size = None
+    backend.verify_reads_window_kv_only = False
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
     return backend

@@ -29,6 +29,11 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.minimax_common.minimax_weight_loader import (
+    mxfp8_linear_scale_alias,
+    quark_shared_experts_fusion_disable_reason,
+    remap_llm_compressor_nvfp4_expert,
+)
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
@@ -86,6 +91,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if _is_gfx95_supported:
+            from sglang.srt.models.minimax_common.amd.aiter_intree_tune import (
+                install_m31_aiter_tables,
+            )
+
+            # before any layer looks up an aiter GEMM or fused-MoE config
+            install_m31_aiter_tables(config)
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
@@ -178,6 +190,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in mixed-precision checkpoints."
             )
+        quark_reason = quark_shared_experts_fusion_disable_reason(quant_config)
+        if quark_reason is not None:
+            return quark_reason
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
@@ -425,6 +440,14 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         ):
             return
 
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
+            and "mlp.experts." in name
+        ):
+            name, loaded_weight = remap_llm_compressor_nvfp4_expert(name, loaded_weight)
+
         for param_name, weight_name, shard_id in llm_stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -433,6 +456,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             new_name = name.replace(weight_name, param_name)
             if new_name.endswith(".bias") and new_name not in params_dict:
                 continue
+            new_name = mxfp8_linear_scale_alias(new_name, params_dict)
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
@@ -465,6 +489,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
+        remapped = mxfp8_linear_scale_alias(remapped, params_dict)
         if remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return

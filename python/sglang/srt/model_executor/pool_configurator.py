@@ -28,7 +28,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
-    uses_minimax_m3_nvfp4_native_stack,
+    uses_minimax_m3_packed_nvfp4_kv,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -456,7 +456,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Must match the pool class picked in _build_minimax_sparse_kv_pool;
             # the packed layout is about four times smaller per token.
-            if uses_minimax_m3_nvfp4_native_stack(model_config.quantization):
+            if uses_minimax_m3_packed_nvfp4_kv(
+                model_config.quantization,
+                speculative_algorithm=get_spec().speculative_algorithm,
+            ):
                 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
                     MSA_V1_PAGE_SIZE,
                     msa_v1_page_row_bytes,

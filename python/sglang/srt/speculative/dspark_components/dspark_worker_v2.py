@@ -751,6 +751,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pull_seq_lens_cpu: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
@@ -777,7 +778,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(
+            batch, on_publish, grammar_barrier, pull_seq_lens_cpu=pull_seq_lens_cpu
+        )
 
     def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
@@ -964,6 +967,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish,
         grammar_barrier=None,
         coordination_plan=None,
+        pull_seq_lens_cpu: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -1019,9 +1023,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._prepare_inputs_once
             else None
         )
+        # A deferred pull (HIP) has not filled batch.seq_lens_cpu yet.
         window_seq_lens_cpu = (
             batch.seq_lens_cpu
-            if batch.seq_lens_cpu is not None
+            if batch.seq_lens_cpu is not None and pull_seq_lens_cpu is None
             else draft_input.nxt_kv_lens_cpu
         )
         verify_window = alloc_verify_window(
@@ -1080,6 +1085,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_window=verify_window,
                 seq_lens_cpu=window_seq_lens_cpu,
             )
+        if pull_seq_lens_cpu is not None:
+            # the host waits here for the previous step's publish, with the draft
+            # already queued behind it
+            pull_seq_lens_cpu()
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens

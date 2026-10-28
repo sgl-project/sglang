@@ -449,11 +449,18 @@ class QuarkConfig(QuantizationConfig):
         ):
             return None
 
+        # Quark exports MXFP8 as fp8 per_block [1, 32] with
+        # scale_type=float8_e8m0fnu; the serialized scale is uint8 e8m0, not
+        # fp32, so it has to load through the MXFP8 path.
+        use_mxfp8 = block_size == [1, 32] and "e8m0" in str(
+            weight_config.get("scale_type") or ""
+        )
         return Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
+            use_mxfp8=use_mxfp8,
         )
 
     def is_linear_unquantized(self, prefix: str) -> bool:
@@ -576,6 +583,11 @@ class QuarkConfig(QuantizationConfig):
                     dequantization_config=Nvfp4SourceConfig(),
                     excluded_fp8_config=excluded_fp8_config,
                 )
+
+            from sglang.srt.layers.quantization.quark import mxfp8_base
+
+            if mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
+                return mxfp8_base.QuarkMxfp8BaseConfig.from_source(config, hf_config)
 
             nvfp4_src = _detect_nvfp4_source(config)
             if nvfp4_src is not None:

@@ -15,6 +15,7 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
+import dataclasses
 import logging
 from contextlib import nullcontext
 from functools import partial
@@ -105,6 +106,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
+from sglang.srt.models.minimax_common.minimax_weight_loader import (
+    mxfp8_linear_scale_alias,
+    quark_shared_experts_fusion_disable_reason,
+    remap_llm_compressor_nvfp4_expert,
+)
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
@@ -171,6 +177,7 @@ if _is_hip:
         _has_rocm_qk_norm_rope = True
     except ImportError:
         _has_rocm_qk_norm_rope = False
+    from sglang.srt.models.minimax_common.amd import minimax_m3_hip as _hip
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
@@ -288,6 +295,8 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
             module.maybe_build_fused_qkv_index()
+    if _is_gfx95_supported:
+        _hip.bind_fp8_norms(model)
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -352,6 +361,8 @@ class MiniMaxM3MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+        if _is_gfx95_supported and hidden_act == "swigluoai":
+            self.act_fn = _hip.Gfx950SwigluFp8(self, self.act_fn)
 
     def _swiglu_oai_mxfp8(self, gate_up: torch.Tensor):
         if not (
@@ -932,6 +943,8 @@ class MiniMaxM3Attention(nn.Module):
         )
         self._fused_qkv_index = None
         self._fused_main_size = self.q_size + 2 * self.kv_size
+        if _is_hip:
+            _hip.init_attention(self)
 
         self._combined_qknorm_ok = (
             self.is_sparse_attention_layer
@@ -1399,6 +1412,10 @@ class MiniMaxM3Attention(nn.Module):
         idx_v: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _is_gfx95_supported:
+            return _hip.sparse_qk_index_norm_rope_cache(
+                self, positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+            )
         kv_pool = self._get_sparse_kv_pool()
         # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
         # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
@@ -1631,8 +1648,9 @@ class MiniMaxM3Attention(nn.Module):
             idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
             if idx_v is not None:
                 idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
+            extra = _hip.sparse_attn_kwargs(self, forward_batch, q) if _is_hip else {}
             idx_o, attn_output = self.attn(
-                q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
+                q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v, **extra
             )
             output, _ = self.o_proj(attn_output)
             if self.disable_index_value:
@@ -1684,6 +1702,13 @@ def _uses_push_plane_fusion() -> bool:
     )
 
 
+def _input_rows(hidden_states) -> int:
+    # an input norm that quantized for a projection returns (fp8, scale[, bf16])
+    if isinstance(hidden_states, tuple):
+        return hidden_states[0].shape[0]
+    return hidden_states.shape[0]
+
+
 class MiniMaxM3DecoderLayer(nn.Module):
     attention_cls = MiniMaxM3Attention
 
@@ -1725,7 +1750,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
-            self.mlp = MiniMaxM3MoE(
+            self.mlp = (_hip.moe_cls() if _is_gfx95_supported else MiniMaxM3MoE)(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -1757,6 +1782,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
+        # gfx950 norms quantize for the GEMMs that read them
+        self._norm_quant = _hip.norm_quant(self) if _is_gfx95_supported else None
+
         options = {}
         if _uses_push_plane_fusion():
             from sglang.srt.layers.layer_boundary.fusions.custom_all_reduce_fusion import (
@@ -1769,6 +1797,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 and self.mlp.supports_deferred_finalize,
             )
         attn, ffn = self.stage_facts(config, layer_id)
+        if self._norm_quant is not None:
+            ffn = dataclasses.replace(ffn, read=self._norm_quant.ffn_read())
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm, options),
             (ffn, self.post_attention_layernorm, options),
@@ -1810,6 +1840,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if self._norm_quant is not None:
+            kwargs["quant_format"] = self._norm_quant.attn_quant_format(
+                positions.shape[-1]
+            )
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
@@ -1817,7 +1851,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             **kwargs,
         )
 
-        if hidden_states.shape[0] != 0:
+        if _input_rows(hidden_states) != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1828,7 +1862,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.is_layer_sparse or hidden_states.shape[0] != 0:
+            if self.is_layer_sparse or _input_rows(hidden_states) != 0:
                 hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return ffn_exit.finish(hidden_states)
 
@@ -1987,6 +2021,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if _is_gfx95_supported:
+            from sglang.srt.models.minimax_common.amd.aiter_intree_tune import (
+                install_m31_aiter_tables,
+            )
+
+            # before any layer looks up an aiter GEMM or fused-MoE config
+            install_m31_aiter_tables(config)
 
         self.config = config
         self.quant_config = quant_config
@@ -2033,6 +2074,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in mixed-precision checkpoints."
             )
+        quark_reason = quark_shared_experts_fusion_disable_reason(quant_config)
+        if quark_reason is not None:
+            return quark_reason
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
@@ -2150,6 +2194,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
+        remap_llm_compressor_experts = (
+            self.quant_config is not None and self.quant_config.get_name() == "quark"
+        )
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if layer_id is not None and (
@@ -2158,6 +2206,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 continue
 
             name = name.replace(".block_sparse_moe", ".mlp")
+
+            if remap_llm_compressor_experts and "mlp.experts." in name:
+                name, loaded_weight = remap_llm_compressor_nvfp4_expert(
+                    name, loaded_weight
+                )
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 name = name.replace(
@@ -2185,6 +2238,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                name = mxfp8_linear_scale_alias(name, params_dict)
                 if name not in params_dict:
                     continue
 
@@ -2227,6 +2281,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     if name is None:
                         continue
 
+                    name = mxfp8_linear_scale_alias(name, params_dict)
                     if name in params_dict:
                         param = params_dict[name]
                         weight_loader = getattr(
