@@ -20,7 +20,6 @@ register_npu_ci(
 )
 register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
 register_npu_ci(est_time=1400, suite="nightly-rerun-2-npu-a3", nightly=True)
-register_npu_ci(est_time=1400, suite="nightly-rerun-alt-2-npu-a3", nightly=True)
 
 # The nightly pipeline is also triggered by pull requests via path filters, so the
 # pipeline is identified by GITHUB_WORKFLOW_REF (inherited from the caller's github
