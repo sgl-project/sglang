@@ -1,0 +1,48 @@
+From ea2482df04a608156c5778db4adfd0942c66df1e Mon Sep 17 00:00:00 2001
+From: Xinyi Song <xinyisong0111@gmail.com>
+Date: Mon, 19 Oct 2026 13:49:36 -0700
+Subject: [PATCH] Fix LLVM symbol clash in TRITON_EXT_ENABLED builds (#978)
+
+---
+ CMakeLists.txt            |  3 +++
+ lib/Tools/PluginUtils.cpp | 10 +++++-----
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3f066ea..2e1efe5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -439,4 +439,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
+   endif()
+   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
++  if(TRITON_EXT_ENABLED AND UNIX AND NOT APPLE)
++    target_link_options(triton PRIVATE "LINKER:-Bsymbolic")
++  endif()
+
+   if(NOT TRITON_EXT_ENABLED)
+diff --git a/lib/Tools/PluginUtils.cpp b/lib/Tools/PluginUtils.cpp
+index 5dc41b2..be88e9e 100644
+--- a/lib/Tools/PluginUtils.cpp
++++ b/lib/Tools/PluginUtils.cpp
+@@ -3,4 +3,5 @@
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/Error.h"
++#include <dlfcn.h>
+
+ #define DEBUG_TYPE "triton-plugins"
+@@ -30,11 +31,10 @@ static bool isTritonAndPluginsVersionsMatch(const std::string &pluginVersion) {
+
+ llvm::Expected<TritonPlugin> TritonPlugin::load(const std::string &filename) {
+-  std::string error;
+-  auto library =
+-      llvm::sys::DynamicLibrary::getPermanentLibrary(filename.c_str(), &error);
+-  if (!library.isValid())
++  void *handle = ::dlopen(filename.c_str(), RTLD_NOW | RTLD_LOCAL);
++  if (!handle)
+     return llvm::make_error<llvm::StringError>(
+-        Twine("Could not load library '") + filename + "': " + error,
++        Twine("Could not load library '") + filename + "': " + ::dlerror(),
+         llvm::inconvertibleErrorCode());
++  llvm::sys::DynamicLibrary library(handle);
+
+   TritonPlugin plugin{filename, library};
