@@ -297,6 +297,9 @@ jobs:
       test_type: 'unit'
       test_suite: stage-a-unit-test-npu
       is_nightly_pipeline_job: false
+      # These files register nightly=False, so --nightly is not an option; keep
+      # going after a failing file so one run reports every stale case at once.
+      continue_on_error: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false

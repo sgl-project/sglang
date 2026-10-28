@@ -50,6 +50,10 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
+      continue_on_error:
+        description: 'Pass --continue-on-error so a failing case does not abort the remaining ones (nightly jobs get this implicitly).'
+        type: boolean
+        default: false
       partitions:
         description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
@@ -388,12 +392,17 @@ jobs:
           test_exit_code=0
           cd test
 
-          # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
+          # Append `--nightly` when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
-          # --continue-on-error: Keep running remaining cases even if one fails.
           NIGHTLY_FLAG=""
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
-            NIGHTLY_FLAG="--nightly --continue-on-error"
+            NIGHTLY_FLAG="--nightly"
+          fi
+
+          # --continue-on-error: Keep running remaining cases even if one fails.
+          CONTINUE_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ] || [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            CONTINUE_FLAG="--continue-on-error"
           fi
 
           # Append configuration arguments when the test suite is split into multiple parallel jobs.
@@ -446,7 +455,7 @@ jobs:
           # Run NPU test suite with run_suite.py.
           # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
           # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${CONTINUE_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
