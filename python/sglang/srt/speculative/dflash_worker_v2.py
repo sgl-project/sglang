@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -2105,6 +2106,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if isinstance(attn, DFlashMLAAttention):
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     if self._kv_fuse_store(
                         attn, k, v, positions, cache_loc_2d, commit_lens
@@ -2178,6 +2189,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
