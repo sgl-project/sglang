@@ -79,10 +79,7 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
-    # Both crash on the first request: the draft pool has no HiSparse mapping,
-    # and a mixed batch cannot merge the HiSparse decode batch.
-    if cfg.speculative_algorithm is not None:
-        raise ValueError("--enable-hisparse does not support speculative decoding yet.")
+    # A mixed batch cannot merge the HiSparse decode batch.
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
@@ -114,6 +111,21 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
     validate_hisparse_feature_combos(server_args)
 
+    enable_spec = (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_algorithm.upper() != "NONE"
+    )
+    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
+        raise ValueError(
+            "The minimal HiSparse spec integration supports linear speculation "
+            "only; use --speculative-eagle-topk 1."
+        )
+    if enable_spec and cfg.speculative_adaptive:
+        raise ValueError(
+            "HiSparse speculative decoding uses statically sized swap state; "
+            "--speculative-adaptive is not supported."
+        )
+
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
@@ -121,7 +133,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
         # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

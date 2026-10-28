@@ -97,11 +97,11 @@ SGL_DEVICE T reduce(T value, mask_t active_mask = kFullMask) {
     if constexpr (std::is_same_v<T, float>) {
       if constexpr (OP == ReductionOp::MAX) {
         float result;
-        asm("redux.sync.max.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "r"(active_mask));
+        asm volatile("redux.sync.max.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "r"(active_mask));
         return result;
       } else if constexpr (OP == ReductionOp::MIN) {
         float result;
-        asm("redux.sync.min.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "r"(active_mask));
+        asm volatile("redux.sync.min.f32 %0, %1, %2;" : "=f"(result) : "f"(value), "r"(active_mask));
         return result;
       }
     }

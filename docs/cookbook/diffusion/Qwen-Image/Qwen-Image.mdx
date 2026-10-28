@@ -34,7 +34,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs.
+Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs, Intel Xeon CPUs, and Ascend A2/A3 Series NPUs.
 
 Use the [command builder](#1-quick-start) above.
 
