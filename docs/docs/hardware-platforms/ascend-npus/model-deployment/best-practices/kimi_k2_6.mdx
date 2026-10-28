@@ -10,6 +10,11 @@ This page focuses on optimal configuration and benchmark results for Kimi-K2.6 o
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
@@ -119,7 +124,7 @@ do
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
-        --attn-dp-size 32 \
+        --enable-dp-attention --dp-size 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs-decode 1 \
@@ -876,7 +881,7 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --attn-dp-size 2 \
+        --enable-dp-attention --dp-size 2 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -1011,7 +1016,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --attn-dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
@@ -1120,7 +1125,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --attn-dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 \
@@ -1234,7 +1239,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --attn-dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 5 \
@@ -1262,7 +1267,6 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-attempts 5 \
     --max-concurrency 64 \
     --num-prompts 256 \
     --random-input-len 3500 \
@@ -1346,7 +1350,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --attn-dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 11 12 13 \

@@ -144,7 +144,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                barrier_fn=self._tp_group.barrier,
             ),
         ):
             self._precarve.mint()
