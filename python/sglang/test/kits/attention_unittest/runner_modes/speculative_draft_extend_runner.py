@@ -444,6 +444,7 @@ class _EagleDraftExtendWorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.megakernel = None
         self.model_runner.model = model_forward
 
     @property
@@ -471,6 +472,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.megakernel = None
         self.draft_runner.model = model_forward
         EagleDraftWorker._init_dsa_index_share_state(self)
 
