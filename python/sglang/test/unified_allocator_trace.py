@@ -320,9 +320,39 @@ def _page_tokens(model: HostModel, req: int, upto: int, ps: int) -> List[int]:
     return r.tokens[r.retired : end] if end > r.retired else []
 
 
+def _fill_state_ops(adapter, model: HostModel):
+    # The id-space size bounds successful takes, even when tokens share its bytes.
+    for _ in range(adapter.state_allocator.size + 1):
+        allocated = len(model.states)
+        yield {"op": "state_alloc", "n": 1}
+        if len(model.states) == allocated:
+            yield {"op": "state_alloc", "n": 1, "expect": "refused"}
+            return
+    raise AssertionError("state allocation did not refuse within its id-space bound")
+
+
+def _scenario_ops(adapter, model: HostModel, ops):
+    for op in ops:
+        if op["op"] == "state_fill":
+            yield from _fill_state_ops(adapter, model)
+        else:
+            yield op
+
+
 def apply_op(adapter, model: HostModel, op: dict):
-    """Run one operation on an adapter and update its host model; returns the
-    outcome recorded in the trace."""
+    """Apply an operation and check any scenario precondition or recovery claim."""
+    outcome = _apply_op(adapter, model, op)
+    expected = op.get("expect")
+    if expected == "allocated":
+        assert outcome is not None, f"expected allocation to succeed: {op}"
+    elif expected == "refused":
+        assert outcome is None, f"expected allocation to be refused: {op}"
+    else:
+        assert expected is None, f"unknown expected outcome: {expected!r}"
+    return outcome
+
+
+def _apply_op(adapter, model: HostModel, op: dict):
     kind = op["op"]
     ps = adapter.page_size
     if kind == "extend":
@@ -369,6 +399,10 @@ def apply_op(adapter, model: HostModel, op: dict):
         return None
     if kind == "group":
         adapter.group(op["begin"])
+        return None
+    if kind == "state_fill":
+        for take in _fill_state_ops(adapter, model):
+            apply_op(adapter, model, take)
         return None
     if kind == "state_alloc":
         out = adapter.state_alloc(op["n"])
@@ -484,7 +518,7 @@ def record_run(
     model = HostModel()
     rng = random.Random(seed)
     records = []
-    stream = ops if ops is not None else [None] * steps
+    stream = _scenario_ops(adapter, model, ops) if ops is not None else [None] * steps
     for step, given in enumerate(stream):
         op = given if given is not None else draw_op(rng, model, config)
         outcome = apply_op(adapter, model, op)
@@ -536,7 +570,8 @@ def replay_run(
     adapter = ADAPTERS[adapter_name](config)
     model = HostModel()
     for i, rec in enumerate(records):
-        outcome = apply_op(adapter, model, rec["op"])
+        # Recorded outcomes are the oracle; a failed expectation is a divergence.
+        outcome = _apply_op(adapter, model, rec["op"])
         obs = _record_observables(adapter, full)
         keys = tuple(
             k
@@ -583,7 +618,7 @@ def corner_states(config: TraceConfig) -> Dict[str, List[dict]]:
     if config.chain in STATE_CHAINS:
         # State slots share the buffer, so their count is a byte question: ask
         # until refused.
-        corners["state_full"] = [{"op": "state_alloc", "n": 1} for _ in range(512)]
+        corners["state_full"] = [{"op": "state_fill"}]
     corners["allocator_full"] = [
         {"op": "extend", "req": i, "n": 8 * ps} for i in range(64)
     ]

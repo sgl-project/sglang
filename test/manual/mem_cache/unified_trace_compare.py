@@ -61,11 +61,14 @@ def _scenarios(directory: str):
 
 def _runs(args):
     """(label, config, seed, ops) for every run the arguments select."""
-    for config in _configs(args):
+    configs = tuple(_configs(args))
+    for config in configs:
         for seed in _seeds(args.seeds):
             yield f"{config.key()}/seed{seed}", config, seed, None
+    selected = {config.key() for config in configs}
     for name, config, ops in _scenarios(args.scenarios):
-        yield f"{config.key()}/{name}", config, None, ops
+        if config.key() in selected:
+            yield f"{config.key()}/{name}", config, None, ops
 
 
 def _report(label, divergence) -> None:
