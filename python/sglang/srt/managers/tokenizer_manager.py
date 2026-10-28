@@ -3296,17 +3296,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
-            # A request aborted before its first forward (e.g. a PD bootstrap
-            # or KV transfer failure) processed no prompt tokens.
-            prompt_tokens = recv_obj.prompt_tokens[i]
-            if finish_reason.get("type") == "abort" and not self._entered_forward(
-                recv_obj, i
-            ):
-                prompt_tokens = 0
+            # Aborted before any forward (e.g. PD bootstrap/transfer failure):
+            # no prompt tokens processed, so skip the token metrics.
+            count_tokens = not (
+                finish_reason.get("type") == "abort"
+                and not self._entered_forward(recv_obj, i)
+            )
 
             self.metrics_collector.observe_one_finished_request(
                 labels,
-                prompt_tokens,
+                recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
@@ -3315,6 +3314,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
+                count_tokens=count_tokens,
             )
 
     @staticmethod

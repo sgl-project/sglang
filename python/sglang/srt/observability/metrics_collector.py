@@ -2036,18 +2036,23 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
         time_per_output_token: Optional[float] = None,
+        count_tokens: bool = True,
     ):
+        """``count_tokens=False`` for requests aborted before their first
+        forward: request counters still apply, token metrics do not.
+        """
         stream_labels = {
             **labels,
             "is_streaming": "true" if is_streaming else "false",
         }
-        self.prompt_tokens_total.labels(**stream_labels).inc(prompt_tokens)
-        self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
+        if count_tokens:
+            self.prompt_tokens_total.labels(**stream_labels).inc(prompt_tokens)
+            self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
         if spec_verify_ct > 0:
             self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
         # Report cached tokens with detailed source breakdown
-        if cached_tokens > 0:
+        if count_tokens and cached_tokens > 0:
             if cached_tokens_details:
                 # Report by cache source (device/host, and storage if L3 enabled)
                 def report_cache_source(source: str, value: int):
@@ -2078,13 +2083,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             self.histogram_request_time_per_output_token.labels(
                 **stream_labels
             ).observe(float(time_per_output_token))
-        self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
-        self.uncached_prompt_tokens_histogram.labels(**labels).observe(
-            float(prompt_tokens - cached_tokens)
-        )
-        self.generation_tokens_histogram.labels(**labels).observe(
-            float(generation_tokens)
-        )
+        if count_tokens:
+            self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+            self.uncached_prompt_tokens_histogram.labels(**labels).observe(
+                float(prompt_tokens - cached_tokens)
+            )
+            self.generation_tokens_histogram.labels(**labels).observe(
+                float(generation_tokens)
+            )
 
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool
