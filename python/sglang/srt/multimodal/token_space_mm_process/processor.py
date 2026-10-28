@@ -50,14 +50,13 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         processor_config=None,
         compute_mrope_positions=False,
         pin_io_threads_to_current_device=True,
-        **kwargs,
     ):
         strategy_class = self.strategy_class
         self._pin_io_threads_to_current_device = pin_io_threads_to_current_device
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
-            hf_config, processor, processor_config=processor_config, **kwargs
+            hf_config, processor, processor_config=processor_config
         )
         self.FEATURE_NAMES = sorted(strategy_class.mm_feature_fields)
         self.keep_mm_features_on_device = processor_config.keep_mm_features_on_device
