@@ -158,6 +158,7 @@ class TestTokenSpaceDevices(CustomTestCase):
                 )
             )
             wrapper._disable_fast_image_processor = use_pil
+            wrapper._rl_on_policy_target = None
             platforms = SimpleNamespace(
                 current_platform=SimpleNamespace(
                     is_cuda_alike=lambda: True, device_type="cuda"
