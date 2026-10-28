@@ -524,12 +524,11 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         rust_server = Mock()
         streamer = SchedulerOutputStreamer(
             send_to_detokenizer=None,
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
             rust_server=rust_server,
         )
         streamer._stream_output_generation(
