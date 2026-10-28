@@ -19,6 +19,7 @@ _TRITON_KERNELS = [
     ("dflash", "compute_dflash_correct_drafts_and_bonus"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
+    ("chain_verify", "greedy_chain_verify"),
     ("gather_spec_extras", "gather_spec_extras"),
     ("multi_layer_eagle", "rotate_input_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
