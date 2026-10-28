@@ -145,7 +145,10 @@ class RequestLogger:
         headers = _extract_whitelisted_headers(request)
 
         if hasattr(obj, "model_dump"):
-            obj_to_log = obj.model_dump(exclude_none=True)
+            if self.log_requests_level >= 3:
+                obj_to_log = obj.model_dump(exclude_none=True)
+            else:
+                obj_to_log = _dump_with_tool_summaries(obj)
         else:
             obj_to_log = obj
 
@@ -241,6 +244,32 @@ class RequestLogger:
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
+
+
+_TOOLS_EXCLUDE = {"tools": True, "messages": {"__all__": {"tools"}}}
+_TOOL_NAMES_INCLUDE = {
+    "tools": {"__all__": {"function": {"name"}}},
+    "messages": {"__all__": {"tools": {"__all__": {"function": {"name"}}}}},
+}
+
+
+def _dump_with_tool_summaries(obj: Any) -> Dict[str, Any]:
+    # Below level 3, tool schemas are logged as names: agentic clients send
+    # hundreds of them per request, and level 2 promises only partial input.
+    data = obj.model_dump(exclude_none=True, exclude=_TOOLS_EXCLUDE)
+    names = obj.model_dump(exclude_none=True, include=_TOOL_NAMES_INCLUDE)
+    if "tools" in names:
+        data["tools"] = _summarize_tools(names["tools"])
+    for message, message_names in zip(
+        data.get("messages", ()), names.get("messages", ())
+    ):
+        if "tools" in message_names:
+            message["tools"] = _summarize_tools(message_names["tools"])
+    return data
+
+
+def _summarize_tools(tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"count": len(tools), "names": [tool["function"]["name"] for tool in tools]}
 
 
 def _watermark_redaction_enabled() -> bool:
