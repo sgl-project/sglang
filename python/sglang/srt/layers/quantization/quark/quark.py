@@ -77,6 +77,18 @@ def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
     return [p if p.startswith("re:") else "re:" + fnmatch.translate(p) for p in pats]
 
 
+def _minimax_quark_routed_experts_are_fp4(
+    model_type: Optional[str], quant_config: dict[str, Any]
+) -> bool:
+    """MiniMax Quark stores routed experts as global FP4."""
+    if model_type != "minimax_m3_vl":
+        return False
+    weight = (quant_config.get("global_quant_config") or {}).get("weight") or {}
+    if not isinstance(weight, dict):
+        return False
+    return str(weight.get("dtype", "")).lower() == "fp4"
+
+
 def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
     """Return an Nvfp4SourceConfig if `config` (the checkpoint's
     quantization_config dict) describes a supported NVFP4 source, else None.
@@ -364,6 +376,10 @@ class QuarkConfig(QuantizationConfig):
         # Gates the online shared-expert MXFP4 conversion to the architectures
         # it is supported on; see _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES.
         self.model_type = getattr(hf_config, "model_type", None)
+        # MiniMax Quark marks routed experts via the global weight dtype.
+        self.is_fp4_experts = _minimax_quark_routed_experts_are_fp4(
+            self.model_type, quant_config
+        )
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         # Load-as-is FP8 config for excluded layers of a mixed-precision source
@@ -461,6 +477,10 @@ class QuarkConfig(QuantizationConfig):
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            # True when the scale is a raw E8M0 byte; the MXFP8 path decodes
+            # its own E8M0 scales.
+            weight_scale_is_ue8m0=not use_mxfp8
+            and weight_config.get("scale_type") == "float8_e8m0fnu",
         )
 
     def is_linear_unquantized(self, prefix: str) -> bool:
